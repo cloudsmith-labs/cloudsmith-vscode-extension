@@ -150,3 +150,4 @@ All commands are available via the Command Palette (`Cmd+Shift+P`):
 ## License
 
 Apache 2.0
+
