@@ -6,9 +6,14 @@ const { CloudsmithAPI } = require("./util/cloudsmithAPI");
 const { CredentialManager } = require("./util/credentialManager");
 const { RecentSearches } = require("./util/recentSearches");
 const { RemediationHelper } = require("./util/remediationHelper");
-const { DependencyHealthProvider } = require("./views/dependencyHealthProvider");
+const {
+  DependencyHealthProvider,
+  FILTER_MODES,
+  SORT_MODES,
+} = require("./views/dependencyHealthProvider");
 const { InstallCommandBuilder } = require("./util/installCommandBuilder");
 const { VulnerabilityProvider } = require("./views/vulnerabilityProvider");
+const { ComplianceReportProvider } = require("./views/complianceReportProvider");
 const { QuarantineExplainProvider } = require("./views/quarantineExplainProvider");
 const { DiagnosticsPublisher } = require("./util/diagnosticsPublisher");
 const { SSOAuthManager } = require("./util/ssoAuthManager");
@@ -322,6 +327,223 @@ function buildPresetQuery(preset, customQuery) {
   return builder.build();
 }
 
+async function resolveDependencyScanTarget(context) {
+  const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
+  let scanWorkspace = config.get("dependencyScanWorkspace");
+  let scanRepo = config.get("dependencyScanRepo") || null;
+
+  if (!scanWorkspace) {
+    scanWorkspace = getDefaultWorkspace();
+  }
+
+  if (scanWorkspace) {
+    return {
+      scanWorkspace,
+      scanRepo,
+    };
+  }
+
+  const workspaces = await getWorkspaces(context);
+  if (!workspaces) {
+    return null;
+  }
+  if (workspaces.length === 0) {
+    vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
+    return null;
+  }
+
+  const selectedWorkspace = await vscode.window.showQuickPick(
+    workspaces.map((workspace) => ({
+      label: workspace.name,
+      description: workspace.slug,
+    })),
+    {
+      placeHolder: "Select a Cloudsmith workspace for the scan",
+    }
+  );
+
+  if (!selectedWorkspace) {
+    return null;
+  }
+
+  scanWorkspace = selectedWorkspace.description;
+
+  const selectedScope = await vscode.window.showQuickPick(
+    [
+      {
+        label: "All repositories",
+        description: "Search across the entire workspace",
+        _all: true,
+      },
+      {
+        label: "Select a specific repository",
+        description: "Search one repository",
+        _all: false,
+      },
+    ],
+    {
+      placeHolder: "Select a scan scope",
+    }
+  );
+
+  if (!selectedScope) {
+    return null;
+  }
+
+  if (!selectedScope._all) {
+    const cloudsmithAPI = new CloudsmithAPI(context);
+    const repos = await cloudsmithAPI.get(`repos/${scanWorkspace}/?sort=name`);
+    if (typeof repos !== "string" && Array.isArray(repos) && repos.length > 0) {
+      const selectedRepo = await vscode.window.showQuickPick(
+        repos.map((repository) => ({
+          label: repository.name,
+          description: repository.slug,
+        })),
+        {
+          placeHolder: "Select a repository",
+        }
+      );
+
+      if (selectedRepo) {
+        scanRepo = selectedRepo.description;
+      }
+    }
+  }
+
+  return {
+    scanWorkspace,
+    scanRepo,
+  };
+}
+
+function buildDependencySortFilterItems(provider) {
+  const currentSort = provider.getSortMode();
+  const currentFilter = provider.getFilterMode();
+  return [
+    {
+      label: "Sort",
+      kind: vscode.QuickPickItemKind.Separator,
+    },
+    createDependencyPickerItem(
+      "Alphabetical",
+      "Default ordering",
+      "sort",
+      SORT_MODES.ALPHABETICAL,
+      currentSort === SORT_MODES.ALPHABETICAL
+    ),
+    createDependencyPickerItem(
+      "Severity",
+      "Most severe first",
+      "sort",
+      SORT_MODES.SEVERITY,
+      currentSort === SORT_MODES.SEVERITY
+    ),
+    createDependencyPickerItem(
+      "Coverage",
+      "Not found first",
+      "sort",
+      SORT_MODES.COVERAGE,
+      currentSort === SORT_MODES.COVERAGE
+    ),
+    {
+      label: "Filters",
+      kind: vscode.QuickPickItemKind.Separator,
+    },
+    createDependencyPickerItem(
+      "Vulnerable only",
+      "Toggle vulnerable dependencies",
+      "filter",
+      FILTER_MODES.VULNERABLE,
+      currentFilter === FILTER_MODES.VULNERABLE
+    ),
+    createDependencyPickerItem(
+      "Not in Cloudsmith",
+      "Toggle uncovered dependencies",
+      "filter",
+      FILTER_MODES.UNCOVERED,
+      currentFilter === FILTER_MODES.UNCOVERED
+    ),
+    createDependencyPickerItem(
+      "Restrictive licenses",
+      "Toggle restrictive or weak copyleft results",
+      "filter",
+      FILTER_MODES.RESTRICTIVE_LICENSE,
+      currentFilter === FILTER_MODES.RESTRICTIVE_LICENSE
+    ),
+    createDependencyPickerItem(
+      "Policy violations",
+      "Toggle policy failures",
+      "filter",
+      FILTER_MODES.POLICY_VIOLATION,
+      currentFilter === FILTER_MODES.POLICY_VIOLATION
+    ),
+    createDependencyPickerItem(
+      "Show all dependencies",
+      "Clear active dependency filters",
+      "filter",
+      null,
+      currentFilter === null
+    ),
+  ];
+}
+
+function createDependencyPickerItem(label, description, action, value, active) {
+  return {
+    label: `${active ? "$(check)" : "$(circle-large-outline)"} ${label}`,
+    description,
+    _action: action,
+    _value: value,
+  };
+}
+
+async function showDependencySortFilterPicker(provider) {
+  await new Promise((resolve) => {
+    const quickPick = vscode.window.createQuickPick();
+    const disposables = [];
+
+    const refreshItems = () => {
+      quickPick.items = buildDependencySortFilterItems(provider);
+    };
+
+    quickPick.title = "Sort & filter dependencies";
+    quickPick.matchOnDescription = true;
+    quickPick.ignoreFocusOut = true;
+    refreshItems();
+
+    disposables.push(quickPick.onDidAccept(async () => {
+      const selected = quickPick.selectedItems[0];
+      if (!selected || !selected._action) {
+        quickPick.hide();
+        return;
+      }
+
+      quickPick.busy = true;
+      try {
+        if (selected._action === "sort") {
+          provider.setSortMode(selected._value);
+        } else if (selected._value === null || provider.getFilterMode() === selected._value) {
+          await provider.clearFilter();
+        } else {
+          await provider.setFilterMode(selected._value);
+        }
+        refreshItems();
+      } finally {
+        quickPick.busy = false;
+      }
+    }));
+
+    disposables.push(quickPick.onDidHide(() => {
+      quickPick.dispose();
+      for (const disposable of disposables) {
+        disposable.dispose();
+      }
+      resolve();
+    }));
+
+    quickPick.show();
+  });
+}
+
 
 /**
  * @param {vscode.ExtensionContext} context
@@ -386,7 +608,7 @@ async function activate(context) {
   const dependencyHealthProvider = new DependencyHealthProvider(context, diagnosticsPublisher);
   vscode.window.createTreeView("cloudsmithDependencyHealthView", {
     treeDataProvider: dependencyHealthProvider,
-    showCollapseAll: true,
+    showCollapseAll: false,
   });
 
   context.subscriptions.push(
@@ -412,6 +634,10 @@ async function activate(context) {
   // Create vulnerability WebView provider
   const vulnerabilityProvider = new VulnerabilityProvider(context);
   context.subscriptions.push({ dispose: () => vulnerabilityProvider.dispose() });
+
+  // Create compliance report WebView provider
+  const complianceReportProvider = new ComplianceReportProvider(context);
+  context.subscriptions.push({ dispose: () => complianceReportProvider.dispose() });
 
   // Create quarantine explanation WebView provider
   const quarantineExplainProvider = new QuarantineExplainProvider(context);
@@ -446,28 +672,6 @@ async function activate(context) {
   };
 
   void initializeConnectionContext();
-
-  // Auto-scan dependencies on open if configured
-  const autoScanConfig = vscode.workspace.getConfiguration("cloudsmith-vsc");
-  if (autoScanConfig.get("autoScanOnOpen")) {
-    const scanWorkspace = autoScanConfig.get("dependencyScanWorkspace");
-    if (scanWorkspace) {
-      const scanRepo = autoScanConfig.get("dependencyScanRepo") || null;
-      // Delay to avoid blocking VS Code startup
-      setTimeout(() => {
-        dependencyHealthProvider.scan(scanWorkspace, scanRepo);
-      }, 2000);
-    } else {
-      vscode.window.showInformationMessage(
-        "Auto-scan is enabled but no Cloudsmith workspace is configured.",
-        "Configure"
-      ).then((selection) => {
-        if (selection === "Configure") {
-          vscode.commands.executeCommand("workbench.action.openSettings", "cloudsmith-vsc.dependencyScanWorkspace");
-        }
-      });
-    }
-  }
 
 
   // Shared post-authentication handler: connect, refresh all views, and prompt
@@ -1331,6 +1535,14 @@ async function activate(context) {
       await vulnerabilityProvider.show(item);
     }),
 
+    vscode.commands.registerCommand("cloudsmith-vsc.showDepVulnerabilities", async (item) => {
+      await vscode.commands.executeCommand("cloudsmith-vsc.showVulnerabilities", item);
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.findDepSafeVersion", async (item) => {
+      await vscode.commands.executeCommand("cloudsmith-vsc.findSafeVersion", item);
+    }),
+
     // Register vulnerability filter command — updates a summary node in-place
     vscode.commands.registerCommand("cloudsmith-vsc.filterVulnerabilities", async (vulnSummaryNode) => {
       if (!vulnSummaryNode ||
@@ -1423,99 +1635,99 @@ async function activate(context) {
 
     // Register scan dependencies command
     vscode.commands.registerCommand("cloudsmith-vsc.scanDependencies", async () => {
-      const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
-      let scanWorkspace = config.get("dependencyScanWorkspace");
-      let scanRepo = config.get("dependencyScanRepo") || null;
-
-      // If no dedicated scan workspace, try the default workspace setting
-      if (!scanWorkspace) {
-        scanWorkspace = getDefaultWorkspace();
-      }
-
-      // If still no workspace, prompt user
-      if (!scanWorkspace) {
-        const workspaces = await getWorkspaces(context);
-        if (!workspaces) {
-          return;
-        }
-        if (workspaces.length === 0) {
-          vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
-          return;
-        }
-
-        const wsItems = workspaces.map(ws => ({ label: ws.name, description: ws.slug }));
-        const selectedWs = await vscode.window.showQuickPick(wsItems, {
-          placeHolder: "Select a Cloudsmith workspace for the scan",
-        });
-        if (!selectedWs) {
-          return;
-        }
-        scanWorkspace = selectedWs.description;
-
-        // Optionally select a repo
-        const scopeItems = [
-          { label: "All repositories", description: "Search across the entire workspace", _all: true },
-          { label: "Select a specific repository", description: "Search one repository" },
-        ];
-        const selectedScope = await vscode.window.showQuickPick(scopeItems, {
-          placeHolder: "Select a scan scope",
-        });
-        if (!selectedScope) {
-          return;
-        }
-
-        if (!selectedScope._all) {
-          const cloudsmithAPI = new CloudsmithAPI(context);
-          const repos = await cloudsmithAPI.get(`repos/${scanWorkspace}/?sort=name`);
-          if (typeof repos !== "string" && Array.isArray(repos) && repos.length > 0) {
-            const repoItems = repos.map(r => ({ label: r.name, description: r.slug }));
-            const selectedRepo = await vscode.window.showQuickPick(repoItems, {
-              placeHolder: "Select a repository",
-            });
-            if (selectedRepo) {
-              scanRepo = selectedRepo.description;
-            }
-          }
-        }
-      }
-
-      // Resolve project folder: stored path > workspace folder > prompt
-      // The provider handles the prompt internally if no folder is available
-      await dependencyHealthProvider.scan(scanWorkspace, scanRepo);
-    }),
-
-    // Register rescan dependencies command
-    vscode.commands.registerCommand("cloudsmith-vsc.rescanDependencies", async () => {
-      await dependencyHealthProvider.rescan();
-    }),
-
-    // Register change dependency folder command
-    vscode.commands.registerCommand("cloudsmith-vsc.changeDependencyFolder", async () => {
-      const selected = await vscode.window.showOpenDialog({
-        canSelectFolders: true,
-        canSelectFiles: false,
-        canSelectMany: false,
-        openLabel: "Select project folder to scan",
-      });
-
-      if (!selected || selected.length === 0) {
+      if (dependencyHealthProvider.lastWorkspace) {
+        await dependencyHealthProvider.rescan();
         return;
       }
 
-      dependencyHealthProvider.setProjectFolder(selected[0].fsPath);
-
-      // Re-run scan if we have a previous workspace context
-      if (dependencyHealthProvider.lastWorkspace) {
-        await dependencyHealthProvider.scan(
-          dependencyHealthProvider.lastWorkspace,
-          dependencyHealthProvider.lastRepo
-        );
-      } else {
-        vscode.window.showInformationMessage(
-          `Project folder set to ${selected[0].fsPath}. Run "Scan dependencies" to check against Cloudsmith.`
-        );
-        dependencyHealthProvider.refresh();
+      const scanTarget = await resolveDependencyScanTarget(context);
+      if (!scanTarget) {
+        return;
       }
+
+      await dependencyHealthProvider.scan(scanTarget.scanWorkspace, scanTarget.scanRepo);
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.scanDependenciesPending", async () => {
+      await vscode.commands.executeCommand("cloudsmith-vsc.scanDependencies");
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.scanDependenciesComplete", async () => {
+      await vscode.commands.executeCommand("cloudsmith-vsc.scanDependencies");
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.pullDependencies", async () => {
+      await dependencyHealthProvider.pullDependencies();
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.pullSingleDependency", async (item) => {
+      await dependencyHealthProvider.pullSingleDependency(item);
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.cycleDepView", async () => {
+      await dependencyHealthProvider.cycleViewMode();
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.cycleDepViewDirect", async () => {
+      await vscode.commands.executeCommand("cloudsmith-vsc.cycleDepView");
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.cycleDepViewFlat", async () => {
+      await vscode.commands.executeCommand("cloudsmith-vsc.cycleDepView");
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.cycleDepViewTree", async () => {
+      await vscode.commands.executeCommand("cloudsmith-vsc.cycleDepView");
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.depViewDirect", async () => {
+      await dependencyHealthProvider.setViewMode("direct");
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.depViewFlat", async () => {
+      await dependencyHealthProvider.setViewMode("flat");
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.depViewTree", async () => {
+      await dependencyHealthProvider.setViewMode("tree");
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.depFilterVulnerable", async () => {
+      await dependencyHealthProvider.setFilterMode(FILTER_MODES.VULNERABLE);
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.depFilterUncovered", async () => {
+      await dependencyHealthProvider.setFilterMode(FILTER_MODES.UNCOVERED);
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.depFilterRestrictiveLicense", async () => {
+      await dependencyHealthProvider.setFilterMode(FILTER_MODES.RESTRICTIVE_LICENSE);
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.depFilterPolicyViolation", async () => {
+      await dependencyHealthProvider.setFilterMode(FILTER_MODES.POLICY_VIOLATION);
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.depFilterClear", async () => {
+      await dependencyHealthProvider.clearFilter();
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.depSortFilter", async () => {
+      await showDependencySortFilterPicker(dependencyHealthProvider);
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.depSortFilterActive", async () => {
+      await vscode.commands.executeCommand("cloudsmith-vsc.depSortFilter");
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.viewComplianceReport", async () => {
+      const reportData = dependencyHealthProvider.getReportData();
+      if (!reportData) {
+        vscode.window.showInformationMessage("Run a dependency scan before opening the report.");
+        return;
+      }
+
+      complianceReportProvider.show(reportData);
     }),
 
     // Register copy install command

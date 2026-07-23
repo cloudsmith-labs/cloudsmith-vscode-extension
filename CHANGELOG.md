@@ -1,3 +1,40 @@
+## 2.2.0 - April 2026
+### Transitive Dependency Visibility
+
+#### Transitive Dependency Resolution
+- Dependency Health view now resolves the complete dependency set (direct and transitive) by parsing lockfiles and manifests directly.
+- Ecosystems with lockfiles (npm, Yarn, pnpm, Python/Poetry/uv, Rust, Ruby, Go, NuGet, Dart, PHP, Helm, Swift, Hex) resolve the full transitive tree automatically.
+- Maven and Gradle resolve direct dependencies from pom.xml and build.gradle. The extension prompts when a tree file is not found.
+- Docker and Helm resolve direct dependencies (base images and chart dependencies).
+- Summary bar shows total dependency count with direct/transitive breakdown and per-ecosystem composition for multi-ecosystem projects.
+
+#### Vulnerability, License, and Policy Overlays
+- Resolved dependencies found in Cloudsmith are checked for known vulnerabilities with severity indicators displayed inline.
+- License classification (permissive, weak copyleft, restrictive) and policy compliance status shown for all covered dependencies.
+- Summary bar aggregates vulnerability counts by severity, restrictive license count, and policy violation count.
+
+#### Upstream Proxy Gap Analysis
+- Dependencies not found in Cloudsmith are checked against configured upstream proxies across all repositories.
+- Each uncovered dependency shows whether it's reachable via an existing upstream or requires a new proxy to be configured.
+
+#### Tree Visualization
+- New tree view mode displays the full dependency hierarchy with collapsible parent-child relationships.
+- Diamond dependencies collapsed on subsequent occurrences to prevent exponential tree growth.
+- Filters prune the tree to show only vulnerable, uncovered, or restrictive-license dependency paths.
+- Three-way view toggle: direct only, all (flat), or all (tree).
+
+#### Pull Dependencies Through Upstream
+- New pull action caches uncovered dependencies through a selected repository's upstream proxy directly from the editor.
+- Repository selector shows only repositories with upstream proxies matching the project's dependency formats.
+- Right-click any individual uncovered dependency to pull just that package through an upstream.
+
+#### Compliance Report
+- New report view opens a dependency health summary in a dedicated editor panel with coverage, vulnerability, license, policy, and upstream gap analysis.
+
+#### UX Improvements
+- Toolbar consolidated to five inline actions: scan, pull, view mode cycle, sort and filter, and compliance report.
+- Format-specific icons displayed on uncovered dependencies for at-a-glance ecosystem identification.
+
 ## 2.1.1 - April 2026
 ### Fixed
 - Fixed erroneous error banner displaying in the Upstream Webview when all upstream data loaded successfully.

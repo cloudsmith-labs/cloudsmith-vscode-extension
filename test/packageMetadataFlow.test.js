@@ -1,4 +1,5 @@
 const assert = require("assert");
+const path = require("path");
 const vscode = require("vscode");
 const PackageNode = require("../models/packageNode");
 const SearchResultNode = require("../models/searchResultNode");
@@ -208,5 +209,118 @@ suite("Package Metadata Flow Test Suite", () => {
     assert.strictEqual(licenseItem.label, "License: Custom Enterprise License");
     assert.strictEqual(licenseItem.description, "? Unknown license");
     assert.strictEqual(licenseItem.command, undefined);
+  });
+
+  test("dependency health descriptions use Cloudsmith terminology", () => {
+    const cleanPkg = {
+      ...pkg,
+      license: "MIT",
+      raw_license: "MIT",
+      spdx_license: "MIT",
+    };
+
+    const cleanNode = new DependencyHealthNode({
+      name: "artifact",
+      version: "4.18.2",
+      format: "raw",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: cleanPkg,
+    }, cleanPkg, {});
+
+    const vulnerableNode = new DependencyHealthNode({
+      name: "artifact",
+      version: "4.18.2",
+      format: "raw",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: cleanPkg,
+      vulnerabilities: {
+        count: 2,
+        maxSeverity: "High",
+        severityCounts: { High: 2 },
+        detailsLoaded: true,
+      },
+    }, cleanPkg, {});
+
+    const quarantinedNode = new DependencyHealthNode({
+      name: "artifact",
+      version: "4.18.2",
+      format: "raw",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: {
+        ...pkg,
+        status_str: "Quarantined",
+      },
+    }, {
+      ...pkg,
+      status_str: "Quarantined",
+    }, {});
+
+    assert.strictEqual(cleanNode.getTreeItem().description, "4.18.2 — No issues found");
+    assert.strictEqual(vulnerableNode.getTreeItem().description, "4.18.2 — Vulnerabilities found (2 High)");
+    assert.strictEqual(quarantinedNode.getTreeItem().description, "4.18.2 — Quarantined");
+  });
+
+  test("dependency health tooltips show no-license text only in the tooltip", () => {
+    const node = new DependencyHealthNode({
+      name: "artifact",
+      version: "1.0.0",
+      format: "raw",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: {
+        ...pkg,
+        license: null,
+        raw_license: null,
+        spdx_license: null,
+        license_url: null,
+      },
+    }, {
+      ...pkg,
+      license: null,
+      raw_license: null,
+      spdx_license: null,
+      license_url: null,
+    }, {});
+
+    assert.strictEqual(node.getTreeItem().description, "1.0.0 — No issues found");
+    assert.match(node.getTreeItem().tooltip, /License: No license detected/);
+  });
+
+  test("dependency health missing nodes use format icons and upstream-aware context values", () => {
+    const context = { extensionPath: path.resolve(__dirname, "..") };
+
+    const missingNode = new DependencyHealthNode({
+      name: "express",
+      version: "4.18.2",
+      format: "npm",
+      cloudsmithStatus: "NOT_FOUND",
+    }, null, context);
+    const reachableNode = new DependencyHealthNode({
+      name: "express",
+      version: "4.18.2",
+      format: "npm",
+      cloudsmithStatus: "NOT_FOUND",
+      upstreamStatus: "reachable",
+    }, null, context);
+    const unreachableNode = new DependencyHealthNode({
+      name: "requests",
+      version: "2.31.0",
+      format: "python",
+      cloudsmithStatus: "NOT_FOUND",
+      upstreamStatus: "no_proxy",
+    }, null, context);
+
+    const missingItem = missingNode.getTreeItem();
+    const reachableItem = reachableNode.getTreeItem();
+    const unreachableItem = unreachableNode.getTreeItem();
+
+    assert.strictEqual(missingItem.contextValue, "dependencyHealthMissing");
+    assert.strictEqual(reachableItem.contextValue, "dependencyHealthUpstreamReachable");
+    assert.strictEqual(unreachableItem.contextValue, "dependencyHealthUpstreamUnreachable");
+    assert.ok(missingItem.iconPath);
+    assert.ok(reachableItem.iconPath);
+    assert.ok(unreachableItem.iconPath);
+    assert.ok(missingItem.iconPath.dark.fsPath.endsWith(path.join("media", "vscode_icons", "file_type_npm.svg")));
+    assert.ok(reachableItem.iconPath.dark.fsPath.endsWith(path.join("media", "vscode_icons", "file_type_npm.svg")));
+    assert.ok(unreachableItem.iconPath.dark.fsPath.endsWith(path.join("media", "vscode_icons", "file_type_python.svg")));
   });
 });

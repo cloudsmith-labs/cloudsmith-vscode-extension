@@ -3,7 +3,7 @@
   "publisher": "Cloudsmith",
   "displayName": "Cloudsmith VS Code",
   "description": "Access packages from a Cloudsmith instance.",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "license": "SEE LICENSE IN LICENSE",
   "homepage": "https://github.com/cloudsmith-io/cloudsmith-vscode-extension/blob/main/README.md",
   "bugs": {
@@ -173,6 +173,16 @@
         "category": "Cloudsmith"
       },
       {
+        "command": "cloudsmith-vsc.showDepVulnerabilities",
+        "title": "Show vulnerabilities",
+        "category": "Cloudsmith"
+      },
+      {
+        "command": "cloudsmith-vsc.findDepSafeVersion",
+        "title": "Find safe version",
+        "category": "Cloudsmith"
+      },
+      {
         "command": "cloudsmith-vsc.filterVulnerabilities",
         "title": "Filter vulnerabilities",
         "category": "Cloudsmith",
@@ -190,16 +200,118 @@
         "icon": "$(play)"
       },
       {
-        "command": "cloudsmith-vsc.rescanDependencies",
-        "title": "Rescan dependencies",
+        "command": "cloudsmith-vsc.scanDependenciesPending",
+        "title": "Scan dependencies",
         "category": "Cloudsmith",
-        "icon": "$(refresh)"
+        "icon": "$(play)"
       },
       {
-        "command": "cloudsmith-vsc.changeDependencyFolder",
-        "title": "Change project folder",
+        "command": "cloudsmith-vsc.scanDependenciesComplete",
+        "title": "Rescan dependencies",
         "category": "Cloudsmith",
-        "icon": "$(folder-opened)"
+        "icon": "$(play)"
+      },
+      {
+        "command": "cloudsmith-vsc.pullDependencies",
+        "title": "Pull dependencies",
+        "category": "Cloudsmith",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "cloudsmith-vsc.pullSingleDependency",
+        "title": "Pull Dependency",
+        "category": "Cloudsmith",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "cloudsmith-vsc.cycleDepView",
+        "title": "Cycle dependency view",
+        "category": "Cloudsmith",
+        "icon": "$(symbol-enum)"
+      },
+      {
+        "command": "cloudsmith-vsc.cycleDepViewDirect",
+        "title": "View: Direct only (click to switch)",
+        "category": "Cloudsmith",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "cloudsmith-vsc.cycleDepViewFlat",
+        "title": "View: Flat list (click to switch)",
+        "category": "Cloudsmith",
+        "icon": "$(list-unordered)"
+      },
+      {
+        "command": "cloudsmith-vsc.cycleDepViewTree",
+        "title": "View: Dependency tree (click to switch)",
+        "category": "Cloudsmith",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "cloudsmith-vsc.depViewDirect",
+        "title": "Show direct dependencies",
+        "category": "Cloudsmith",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "cloudsmith-vsc.depViewFlat",
+        "title": "Show all dependencies (flat)",
+        "category": "Cloudsmith",
+        "icon": "$(list-unordered)"
+      },
+      {
+        "command": "cloudsmith-vsc.depViewTree",
+        "title": "Show dependency tree",
+        "category": "Cloudsmith",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "cloudsmith-vsc.depFilterVulnerable",
+        "title": "Show only vulnerable",
+        "category": "Cloudsmith",
+        "icon": "$(warning)"
+      },
+      {
+        "command": "cloudsmith-vsc.depFilterUncovered",
+        "title": "Show only not in Cloudsmith",
+        "category": "Cloudsmith",
+        "icon": "$(package)"
+      },
+      {
+        "command": "cloudsmith-vsc.depFilterRestrictiveLicense",
+        "title": "Show only restrictive licenses",
+        "category": "Cloudsmith",
+        "icon": "$(law)"
+      },
+      {
+        "command": "cloudsmith-vsc.depFilterPolicyViolation",
+        "title": "Show only policy violations",
+        "category": "Cloudsmith",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "cloudsmith-vsc.depFilterClear",
+        "title": "Clear dependency filters",
+        "category": "Cloudsmith",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "cloudsmith-vsc.depSortFilter",
+        "title": "Sort & filter dependencies",
+        "category": "Cloudsmith",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "cloudsmith-vsc.depSortFilterActive",
+        "title": "Sort & filter dependencies",
+        "category": "Cloudsmith",
+        "icon": "$(filter-filled)"
+      },
+      {
+        "command": "cloudsmith-vsc.viewComplianceReport",
+        "title": "View compliance report",
+        "category": "Cloudsmith",
+        "icon": "$(graph)"
       },
       {
         "command": "cloudsmith-vsc.copyInstallCommand",
@@ -347,12 +459,12 @@
         },
         {
           "command": "cloudsmith-vsc.inspectPackage",
-          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealth|dependencyHealthBlocked|dependencyHealthViolated|dependencyHealthSyncing)$/",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable|dependencyHealthQuarantined|dependencyHealthSyncing)$/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.openPackage",
-          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealth|dependencyHealthBlocked|dependencyHealthViolated|dependencyHealthSyncing)$/",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable|dependencyHealthQuarantined|dependencyHealthSyncing)$/",
           "group": "navigation"
         },
         {
@@ -417,7 +529,7 @@
         },
         {
           "command": "cloudsmith-vsc.findSafeVersion",
-          "when": "viewItem =~ /^(package|packageQuarantined|dependencyHealthBlocked|dependencyHealthViolated)$/",
+          "when": "viewItem =~ /^(package|packageQuarantined)$/",
           "group": "navigation"
         },
         {
@@ -427,7 +539,17 @@
         },
         {
           "command": "cloudsmith-vsc.showVulnerabilities",
-          "when": "viewItem =~ /^(package|packageQuarantined|dependencyHealthBlocked|dependencyHealthViolated)$/",
+          "when": "viewItem =~ /^(package|packageQuarantined)$/",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.showDepVulnerabilities",
+          "when": "view == cloudsmithDependencyHealthView && viewItem == dependencyHealthVulnerable",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.findDepSafeVersion",
+          "when": "view == cloudsmithDependencyHealthView && viewItem == dependencyHealthVulnerable",
           "group": "navigation"
         },
         {
@@ -442,17 +564,17 @@
         },
         {
           "command": "cloudsmith-vsc.explainQuarantine",
-          "when": "viewItem =~ /^(packageQuarantined|dependencyHealthBlocked)$/",
+          "when": "viewItem =~ /^(packageQuarantined|dependencyHealthQuarantined)$/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.copyInstallCommand",
-          "when": "viewItem =~ /^(package|dependencyHealth|dependencyHealthViolated)$/",
+          "when": "viewItem =~ /^(package|dependencyHealthFound|dependencyHealthVulnerable)$/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.showInstallCommand",
-          "when": "viewItem =~ /^(package|dependencyHealth|dependencyHealthViolated)$/",
+          "when": "viewItem =~ /^(package|dependencyHealthFound|dependencyHealthVulnerable)$/",
           "group": "navigation"
         },
         {
@@ -467,8 +589,18 @@
         },
         {
           "command": "cloudsmith-vsc.previewUpstreamResolution",
-          "when": "view == cloudsmithDependencyHealthView && viewItem == dependencyHealthNotFound",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthMissing|dependencyHealthUpstreamReachable|dependencyHealthUpstreamUnreachable)$/",
           "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.pullSingleDependency",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthMissing|dependencyHealthUpstreamReachable)$/",
+          "group": "inline"
+        },
+        {
+          "command": "cloudsmith-vsc.pullSingleDependency",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthMissing|dependencyHealthUpstreamReachable)$/",
+          "group": "1_pull"
         },
         {
           "command": "cloudsmith-vsc.showPromotionStatus",
@@ -563,18 +695,63 @@
           "when": "view == cloudsmithSearchView"
         },
         {
-          "command": "cloudsmith-vsc.scanDependencies",
-          "group": "navigation",
+          "command": "cloudsmith-vsc.scanDependenciesPending",
+          "group": "navigation@1",
+          "when": "view == cloudsmithDependencyHealthView && !cloudsmith.depScanComplete"
+        },
+        {
+          "command": "cloudsmith-vsc.scanDependenciesComplete",
+          "group": "navigation@1",
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depScanComplete"
+        },
+        {
+          "command": "cloudsmith-vsc.pullDependencies",
+          "group": "navigation@2",
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depScanComplete"
+        },
+        {
+          "command": "cloudsmith-vsc.cycleDepViewDirect",
+          "group": "navigation@3",
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depViewMode == 'direct'"
+        },
+        {
+          "command": "cloudsmith-vsc.cycleDepViewFlat",
+          "group": "navigation@3",
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depViewMode == 'flat'"
+        },
+        {
+          "command": "cloudsmith-vsc.cycleDepViewTree",
+          "group": "navigation@3",
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depViewMode == 'tree'"
+        },
+        {
+          "command": "cloudsmith-vsc.depSortFilter",
+          "group": "navigation@4",
+          "when": "view == cloudsmithDependencyHealthView && !cloudsmith.depFilterActive"
+        },
+        {
+          "command": "cloudsmith-vsc.depSortFilterActive",
+          "group": "navigation@4",
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depFilterActive"
+        },
+        {
+          "command": "cloudsmith-vsc.viewComplianceReport",
+          "group": "navigation@5",
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depScanComplete"
+        },
+        {
+          "command": "cloudsmith-vsc.depViewDirect",
+          "group": "view@1",
           "when": "view == cloudsmithDependencyHealthView"
         },
         {
-          "command": "cloudsmith-vsc.rescanDependencies",
-          "group": "navigation",
+          "command": "cloudsmith-vsc.depViewFlat",
+          "group": "view@2",
           "when": "view == cloudsmithDependencyHealthView"
         },
         {
-          "command": "cloudsmith-vsc.changeDependencyFolder",
-          "group": "navigation",
+          "command": "cloudsmith-vsc.depViewTree",
+          "group": "view@3",
           "when": "view == cloudsmithDependencyHealthView"
         }
       ]
@@ -645,14 +822,19 @@
         },
         "cloudsmith-vsc.maxDependenciesToScan": {
           "type": "integer",
-          "default": 200,
+          "default": 10000,
           "minimum": 1,
-          "description": "Maximum number of dependencies to scan before truncating a dependency health run."
+          "description": "Maximum number of dependencies to display in the Dependency Health view. Pull operations always process all resolved dependencies."
         },
         "cloudsmith-vsc.showLicenseIndicators": {
           "type": "boolean",
           "default": true,
           "description": "Show license risk classification on packages. When disabled, license nodes are hidden."
+        },
+        "cloudsmith-vsc.flagRestrictiveLicenses": {
+          "type": "boolean",
+          "default": true,
+          "description": "Highlight restrictive licenses inline in the Dependency Health view."
         },
         "cloudsmith-vsc.showDockerDigestCommand": {
           "type": "boolean",
@@ -666,8 +848,14 @@
         },
         "cloudsmith-vsc.resolveTransitiveDependencies": {
           "type": "boolean",
-          "default": false,
-          "description": "Use the package manager CLI to resolve transitive dependencies. Requires the package manager and installed project dependencies."
+          "default": true,
+          "description": "Parse lockfiles to resolve transitive dependencies. When disabled, only direct manifest dependencies are shown."
+        },
+        "cloudsmith-vsc.dependencyTreeDefaultView": {
+          "type": "string",
+          "enum": ["direct", "flat", "tree"],
+          "default": "flat",
+          "description": "Default view mode for the Dependency Health panel."
         },
         "cloudsmith-vsc.showLegacyPolicies": {
           "type": "boolean",

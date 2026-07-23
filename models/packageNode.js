@@ -1,8 +1,8 @@
 // Package node treeview
 
 const vscode = require("vscode");
-const path = require("path");
 const { LicenseClassifier } = require("../util/licenseClassifier");
+const { getFormatIconPath } = require("../util/formatIcons");
 
 class PackageNode {
   constructor(pkg, context) {
@@ -117,8 +117,7 @@ class PackageNode {
     if (format === "raw") {
       return new vscode.ThemeIcon("file-binary");
     }
-    const iconURI = "file_type_" + format + ".svg";
-    return path.join(__filename, "..", "..", "media", "vscode_icons", iconURI);
+    return getFormatIconPath(format, this.context && this.context.extensionPath);
   }
 
   _buildTooltip() {
