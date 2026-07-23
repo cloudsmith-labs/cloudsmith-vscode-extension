@@ -1,0 +1,6 @@
+apiVersion: v2
+name: fixture-chart
+version: 0.1.0
+dependencies:
+  - name: redis
+    version: 19.6.0

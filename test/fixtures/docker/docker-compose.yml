@@ -1,0 +1,7 @@
+services:
+  api:
+    image: redis:7.2
+  worker:
+    build: .
+  db:
+    image: postgres:16

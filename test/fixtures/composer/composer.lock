@@ -1,0 +1,28 @@
+{
+  "packages": [
+    {
+      "name": "laravel/framework",
+      "version": "v11.0.0",
+      "require": {
+        "symfony/http-foundation": "^7.0",
+        "php": "^8.2"
+      }
+    },
+    {
+      "name": "symfony/http-foundation",
+      "version": "v7.0.0",
+      "require": {
+        "php": "^8.2"
+      }
+    }
+  ],
+  "packages-dev": [
+    {
+      "name": "phpunit/phpunit",
+      "version": "11.0.0",
+      "require": {
+        "php": "^8.2"
+      }
+    }
+  ]
+}
