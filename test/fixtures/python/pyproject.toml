@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "fixture-python"
+version = "0.1.0"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+# Web
+flask = "^2.3.0"
+requests = { version = "^2.28.0", optional = true } # client
+
+[project]
+name = "fixture-python"
+dependencies = [
+  "fastapi==0.111.0", # API
+]

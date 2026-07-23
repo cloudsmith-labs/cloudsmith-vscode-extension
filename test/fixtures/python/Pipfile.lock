@@ -1,0 +1,12 @@
+{
+  "default": {
+    "flask": {
+      "version": "==2.3.0"
+    }
+  },
+  "develop": {
+    "pytest": {
+      "version": "==8.2.0"
+    }
+  }
+}

@@ -1,9 +1,11 @@
-// Manifest parser - detects and parses project dependency manifests
-// Supports: npm (package.json), Python (requirements.txt, pyproject.toml),
-// Maven (pom.xml), Go (go.mod), Cargo (Cargo.toml)
-
-const fs = require("fs");
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const path = require("path");
+const { parsePyprojectManifest } = require("./lockfileParsers/manifestHelpers");
+const {
+  getWorkspacePath,
+  pathExists,
+  readUtf8,
+} = require("./lockfileParsers/shared");
 
 class ManifestParser {
   /**
@@ -15,9 +17,7 @@ class ManifestParser {
    * @returns {Array<{filePath: string, format: string, parserMethod: string}>}
    */
   static async detectManifests(workspaceFolderOrPath) {
-    const root = typeof workspaceFolderOrPath === "string"
-      ? workspaceFolderOrPath
-      : workspaceFolderOrPath.uri.fsPath;
+    const root = getWorkspacePath(workspaceFolderOrPath);
     const manifests = [];
 
     const checks = [
@@ -31,15 +31,13 @@ class ManifestParser {
 
     for (const check of checks) {
       const filePath = path.join(root, check.file);
-      try {
-        await fs.promises.access(filePath, fs.constants.R_OK);
+      if (await pathExists(filePath, root)) {
         manifests.push({
-          filePath: filePath,
+          filePath,
           format: check.format,
           parserMethod: check.parserMethod,
+          workspaceFolder: root,
         });
-      } catch (e) {  // eslint-disable-line no-unused-vars
-        // File doesn't exist or isn't readable, skip
       }
     }
 
@@ -54,7 +52,10 @@ class ManifestParser {
    */
   static async parseManifest(manifest) {
     try {
-      const content = await fs.promises.readFile(manifest.filePath, "utf8");
+      const content = await readUtf8(
+        manifest.filePath,
+        manifest.workspaceFolder || path.dirname(manifest.filePath || "")
+      );
       const parser = ManifestParser[manifest.parserMethod];
       if (!parser) {
         return [];
@@ -157,88 +158,17 @@ class ManifestParser {
   }
 
   /**
-   * Parse pyproject.toml — basic line-by-line parsing for
-   * [project.dependencies] and [tool.poetry.dependencies].
-   * Not a full TOML parser; handles the common cases.
+   * Parse pyproject.toml via the shared lockfile manifest helper so
+   * Poetry and PEP 621 formats stay consistent with lockfile resolution.
    */
   static parsePyproject(content, format) {
-    const deps = [];
-    const lines = content.split("\n");
-    let inDepsSection = false;
-    let inPoetryDeps = false;
-
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-
-      // Detect section headers
-      if (line.startsWith("[")) {
-        inDepsSection = line === "[project.dependencies]" ||
-                        line === "[project]";
-        inPoetryDeps = line === "[tool.poetry.dependencies]";
-        continue;
-      }
-
-      // Handle [project] section with dependencies = [...] array
-      if (inDepsSection && line.startsWith("dependencies")) {
-        // dependencies = ["flask>=2.0", "requests"]
-        const arrayMatch = line.match(/dependencies\s*=\s*\[(.*)\]/);
-        if (arrayMatch) {
-          const items = arrayMatch[1].split(",");
-          for (const item of items) {
-            const cleaned = item.trim().replace(/['"]/g, "");
-            if (!cleaned) {
-              continue;
-            }
-            const depMatch = cleaned.match(/^([a-zA-Z0-9_\-.]+)\s*([><=!~]+)?\s*(.*)?/);
-            if (depMatch) {
-              deps.push({
-                name: depMatch[1],
-                version: depMatch[3] ? depMatch[3].trim() : "",
-                devDependency: false,
-                format: format || "python",
-              });
-            }
-          }
-          inDepsSection = false;
-          continue;
-        }
-      }
-
-      // Handle Poetry-style: name = "^version" or name = {version = "^version"}
-      if (inPoetryDeps) {
-        if (!line || line.startsWith("#")) {
-          continue;
-        }
-        // Skip python version requirement
-        if (line.startsWith("python")) {
-          continue;
-        }
-
-        // name = "^1.2.3"
-        const simpleMatch = line.match(/^([a-zA-Z0-9_\-.]+)\s*=\s*"([^"]*)"/);
-        if (simpleMatch) {
-          deps.push({
-            name: simpleMatch[1],
-            version: ManifestParser._stripVersionPrefix(simpleMatch[2]),
-            devDependency: false,
-            format: format || "python",
-          });
-          continue;
-        }
-
-        // name = { version = "^1.2.3", ... }
-        const complexMatch = line.match(/^([a-zA-Z0-9_\-.]+)\s*=\s*\{.*version\s*=\s*"([^"]*)"/);
-        if (complexMatch) {
-          deps.push({
-            name: complexMatch[1],
-            version: ManifestParser._stripVersionPrefix(complexMatch[2]),
-            devDependency: false,
-            format: format || "python",
-          });
-        }
-      }
-    }
-    return deps;
+    const parsed = parsePyprojectManifest(content);
+    return parsed.dependencies.map((dependency) => ({
+      name: dependency.name,
+      version: dependency.version,
+      devDependency: dependency.isDevelopmentDependency,
+      format: format || "python",
+    }));
   }
 
   /**
@@ -414,7 +344,7 @@ class ManifestParser {
    */
   static async findDependencyLocation(filePath, dependencyName, format) {
     try {
-      const content = await fs.promises.readFile(filePath, "utf8");
+      const content = await readUtf8(filePath, path.dirname(filePath));
       const lines = content.split("\n");
 
       switch (format) {
