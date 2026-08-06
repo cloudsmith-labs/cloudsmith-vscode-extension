@@ -54,6 +54,4 @@ for (const runtimeFile of runtimeFiles) {
   }
 }
 
-console.log(
-  `Validated ${runtimeFiles.length} runtime JavaScript files and ${entryPoints.length} extension entry point.`,
-);
+console.log(`Validated ${runtimeFiles.length} runtime JavaScript files.`);
