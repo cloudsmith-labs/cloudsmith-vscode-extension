@@ -5,14 +5,14 @@
   "description": "Access packages from a Cloudsmith instance.",
   "version": "2.2.0",
   "license": "SEE LICENSE IN LICENSE",
-  "homepage": "https://github.com/cloudsmith-io/cloudsmith-vscode-extension/blob/main/README.md",
+  "homepage": "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/blob/main/README.md",
   "bugs": {
-    "url": "https://github.com/cloudsmith-io/cloudsmith-vscode-extension/issues",
+    "url": "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues",
     "email": "support@cloudsmith.io"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/cloudsmith-io/cloudsmith-vscode-extension"
+    "url": "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension"
   },
   "icon": "media/logo.png",
   "engines": {
@@ -898,9 +898,11 @@
     }
   },
   "scripts": {
+    "build": "node scripts/verify-build.js",
     "lint": "eslint .",
     "pretest": "npm run lint",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "vscode:prepublish": "npm run build"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
@@ -908,6 +910,7 @@
     "@types/vscode": "^1.99.0",
     "@vscode/test-cli": "^0.0.10",
     "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.9.2",
     "eslint": "^9.25.1"
   },
   "dependencies": {},
