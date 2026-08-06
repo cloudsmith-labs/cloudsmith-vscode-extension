@@ -324,7 +324,7 @@ class QuarantineExplainProvider {
 
   <div class="actions">
     <button data-command="findSafeVersion">Find safe version</button>
-    ${selfUrl ? `<button data-command="openInCloudsmith">View in Cloudsmith</button>` : ""}
+    ${packageUrl ? `<button data-command="openInCloudsmith">View in Cloudsmith</button>` : ""}
     ${hasCVEs ? `<button data-command="showVulnerabilities">Show vulnerabilities</button>` : ""}
     <button data-command="copyReport">Copy quarantine report</button>
   </div>

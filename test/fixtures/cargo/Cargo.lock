@@ -1,0 +1,25 @@
+[[package]]
+name = "fixture-cargo"
+version = "0.1.0"
+dependencies = [
+ "serde 1.0.0",
+ "tokio 1.37.0"
+]
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "tokio"
+version = "1.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "bytes 1.6.0"
+]
+
+[[package]]
+name = "bytes"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"

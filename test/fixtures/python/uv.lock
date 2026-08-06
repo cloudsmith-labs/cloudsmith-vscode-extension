@@ -1,0 +1,18 @@
+[[package]]
+name = "fixture-python"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "fastapi" }]
+
+[[package]]
+name = "fastapi"
+version = "0.111.0"
+dependencies = ["starlette", "pydantic"]
+
+[[package]]
+name = "starlette"
+version = "0.37.2"
+
+[[package]]
+name = "pydantic"
+version = "2.7.0"

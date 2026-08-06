@@ -1,0 +1,5 @@
+dependencies:
+  - name: redis
+    version: 19.6.0
+digest: sha256:fixture
+generated: "2026-04-05T00:00:00Z"

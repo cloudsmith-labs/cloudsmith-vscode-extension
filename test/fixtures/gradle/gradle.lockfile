@@ -1,0 +1,2 @@
+org.springframework:spring-core:6.1.0=compileClasspath
+junit:junit:4.13.2=testCompileClasspath

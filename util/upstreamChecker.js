@@ -1,6 +1,4 @@
-// Upstream proxy resolution checker.
-// Provides a "what if I pull this?" dry run for packages that don't exist locally.
-
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const { CloudsmithAPI } = require("./cloudsmithAPI");
 const { CredentialManager } = require("./credentialManager");
 const { SearchQueryBuilder } = require("./searchQueryBuilder");
@@ -154,6 +152,19 @@ function isWarningWorthyUpstreamFormatError(message) {
 
 function isAbortError(error) {
   return error && (error.name === "AbortError" || error.code === "ABORT_ERR");
+}
+
+function getActiveUpstreamsFromRepositoryState(state, format) {
+  if (!state || !(state.groupedUpstreams instanceof Map)) {
+    return [];
+  }
+
+  const upstreams = state.groupedUpstreams.get(format);
+  if (!Array.isArray(upstreams)) {
+    return [];
+  }
+
+  return upstreams.filter((upstream) => upstream && upstream.is_active !== false);
 }
 
 function getUpstreamRequestOptions(apiKey, signal) {
@@ -450,6 +461,11 @@ class UpstreamChecker {
     return state.upstreams;
   }
 
+  async getActiveRepositoryUpstreamsForFormat(workspace, repo, format, options = {}) {
+    const state = await this.getRepositoryUpstreamState(workspace, repo, options);
+    return getActiveUpstreamsFromRepositoryState(state, format);
+  }
+
   /**
    * Orchestrate a full upstream resolution preview.
    * Checks local existence and upstream configs for a package preview.
@@ -492,7 +508,7 @@ class UpstreamChecker {
   }
 
   _isCacheObjectRecord(value) {
-    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+    return isCacheObjectRecord(value);
   }
 
   _logRepositoryUpstreamCacheError(action, workspace, repo, error) {
@@ -749,98 +765,15 @@ class UpstreamChecker {
   }
 
   _getRequestOptions(apiKey, signal) {
-    const headers = {
-      accept: "application/json",
-      "content-type": "application/json",
-    };
-
-    if (apiKey) {
-      headers["X-Api-Key"] = apiKey;
-    }
-
-    const requestOptions = {
-      method: "GET",
-      headers,
-    };
-
-    if (signal) {
-      requestOptions.signal = signal;
-    }
-
-    return requestOptions;
+    return getUpstreamRequestOptions(apiKey, signal);
   }
 
   _isAbortError(error) {
-    return error && (error.name === "AbortError" || error.code === "ABORT_ERR");
+    return isAbortError(error);
   }
 
   _isWarningWorthyFormatError(message) {
-    const normalized = typeof message === "string" ? message.toLowerCase() : "";
-    if (!normalized) {
-      return true;
-    }
-
-    const benignKeywords = [
-      "response status: 404",
-      "not found",
-      "unsupported",
-      "not applicable",
-      "unknown format",
-      "no upstream",
-      "does not exist",
-    ];
-    if (benignKeywords.some((keyword) => normalized.includes(keyword))) {
-      return false;
-    }
-
-    const statusMatch = normalized.match(/response status:\s*(\d{3})/);
-    if (statusMatch) {
-      const statusCode = Number(statusMatch[1]);
-      if (
-        statusCode === 401 ||
-        statusCode === 403 ||
-        statusCode === 407 ||
-        statusCode === 408 ||
-        statusCode === 429
-      ) {
-        return true;
-      }
-      if (statusCode >= 500) {
-        return true;
-      }
-      if (statusCode >= 400) {
-        return true;
-      }
-    }
-
-    const warningKeywords = [
-      "blocked ",
-      "redirect",
-      "fetch failed",
-      "network",
-      "timed out",
-      "timeout",
-      "unauthorized",
-      "forbidden",
-      "permission",
-      "access denied",
-      "server error",
-      "bad gateway",
-      "service unavailable",
-      "gateway timeout",
-      "econn",
-      "enotfound",
-      "eai_again",
-      "socket",
-      "tls",
-      "certificate",
-    ];
-
-    if (warningKeywords.some((keyword) => normalized.includes(keyword))) {
-      return true;
-    }
-
-    return true;
+    return isWarningWorthyUpstreamFormatError(message);
   }
 }
 
@@ -857,6 +790,7 @@ async function getUpstreamDataForFormats(context, workspace, repo, formats, opti
 module.exports = {
   getAllUpstreamData,
   getUpstreamDataForFormats,
+  getActiveUpstreamsFromRepositoryState,
   isBenignUpstreamFormatError,
   SUPPORTED_UPSTREAM_FORMATS,
   UpstreamChecker,
