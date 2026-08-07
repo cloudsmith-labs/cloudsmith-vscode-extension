@@ -357,12 +357,12 @@ function buildPresetQuery(preset, customQuery) {
   return builder.build();
 }
 
-async function resolveDependencyScanTarget(context) {
+async function resolveDependencyScanTarget(context, options = {}) {
   const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
-  let scanWorkspace = config.get("dependencyScanWorkspace");
-  let scanRepo = config.get("dependencyScanRepo") || null;
+  let scanWorkspace = options.forcePrompt ? null : config.get("dependencyScanWorkspace");
+  let scanRepo = options.forcePrompt ? null : (config.get("dependencyScanRepo") || null);
 
-  if (!scanWorkspace) {
+  if (!scanWorkspace && !options.forcePrompt) {
     scanWorkspace = getDefaultWorkspace();
   }
 
@@ -444,6 +444,23 @@ async function resolveDependencyScanTarget(context) {
     scanWorkspace,
     scanRepo,
   };
+}
+
+async function runDependencyScan(provider, resolveInitialTarget) {
+  const initialScan = async () => {
+    const scanTarget = await resolveInitialTarget();
+    if (!scanTarget) {
+      return null;
+    }
+
+    return provider.scan(scanTarget.scanWorkspace, scanTarget.scanRepo);
+  };
+
+  if (provider.hasSuccessfulScan()) {
+    return provider.rescan(initialScan);
+  }
+
+  return initialScan();
 }
 
 function buildDependencySortFilterItems(provider) {
@@ -1664,17 +1681,10 @@ async function activate(context) {
 
     // Register scan dependencies command
     vscode.commands.registerCommand("cloudsmith-vsc.scanDependencies", async () => {
-      if (dependencyHealthProvider.lastWorkspace) {
-        await dependencyHealthProvider.rescan();
-        return;
-      }
-
-      const scanTarget = await resolveDependencyScanTarget(context);
-      if (!scanTarget) {
-        return;
-      }
-
-      await dependencyHealthProvider.scan(scanTarget.scanWorkspace, scanTarget.scanRepo);
+      await runDependencyScan(
+        dependencyHealthProvider,
+        () => resolveDependencyScanTarget(context)
+      );
     }),
 
     vscode.commands.registerCommand("cloudsmith-vsc.scanDependenciesPending", async () => {
@@ -1683,6 +1693,29 @@ async function activate(context) {
 
     vscode.commands.registerCommand("cloudsmith-vsc.scanDependenciesComplete", async () => {
       await vscode.commands.executeCommand("cloudsmith-vsc.scanDependencies");
+    }),
+
+    // Historical command IDs remain callable but use the same first-run/refresh behavior.
+    vscode.commands.registerCommand("cloudsmith-vsc.rescanDependencies", async () => {
+      await vscode.commands.executeCommand("cloudsmith-vsc.scanDependencies");
+    }),
+
+    vscode.commands.registerCommand("cloudsmith-vsc.changeDependencyScanScope", async () => {
+      const scanTarget = await resolveDependencyScanTarget(context, { forcePrompt: true });
+      if (!scanTarget) {
+        return;
+      }
+
+      const projectFolder = await dependencyHealthProvider.selectProjectFolder();
+      if (!projectFolder) {
+        return;
+      }
+
+      await dependencyHealthProvider.scan(
+        scanTarget.scanWorkspace,
+        scanTarget.scanRepo,
+        projectFolder
+      );
     }),
 
     vscode.commands.registerCommand("cloudsmith-vsc.pullDependencies", async () => {
@@ -2332,4 +2365,5 @@ module.exports = {
   activate,
   deactivate,
   FORMAT_OPTIONS,
+  runDependencyScan,
 };

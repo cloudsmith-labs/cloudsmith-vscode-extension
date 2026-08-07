@@ -11,16 +11,14 @@ class DiagnosticsPublisher {
   }
 
   /**
-   * Publish diagnostics for scanned dependencies on their manifest files.
+   * Build diagnostics for scanned dependencies without changing the published collection.
    *
    * @param {Array<{filePath: string, format: string}>} manifests
    *        Manifest files detected during the scan.
    * @param {Array} dependencies
    *        DependencyHealthNode instances from the scan.
    */
-  async publish(manifests, dependencies) {
-    this.clear();
-
+  async prepare(manifests, dependencies) {
     // Group dependencies by their format to match to the right manifest
     const depsByFormat = {};
     for (const dep of dependencies) {
@@ -30,6 +28,8 @@ class DiagnosticsPublisher {
       }
       depsByFormat[format].push(dep);
     }
+
+    const entries = [];
 
     // For each manifest, find problematic deps and create diagnostics
     for (const manifest of manifests) {
@@ -78,10 +78,21 @@ class DiagnosticsPublisher {
         diagnostics.push(diagnostic);
       }
 
-      if (diagnostics.length > 0) {
-        this.collection.set(vscode.Uri.file(manifest.filePath), diagnostics);
-      }
+      entries.push([vscode.Uri.file(manifest.filePath), diagnostics]);
     }
+
+    return entries;
+  }
+
+  /** Replace the published diagnostic snapshot in one collection update. */
+  replace(entries) {
+    this.collection.set(entries);
+  }
+
+  /** Build and publish a complete diagnostic snapshot. */
+  async publish(manifests, dependencies) {
+    const entries = await this.prepare(manifests, dependencies);
+    this.replace(entries);
   }
 
   /**

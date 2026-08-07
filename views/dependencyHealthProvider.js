@@ -59,6 +59,15 @@ const SORT_MODES = Object.freeze({
 
 const VIEW_MODES = ["direct", "flat", "tree"];
 
+const SCAN_STATES = Object.freeze({
+  IDLE: "idle",
+  SELECTING: "selecting",
+  RUNNING: "running",
+  SUCCEEDED: "succeeded",
+  FAILED: "failed",
+  CANCELLED: "cancelled",
+});
+
 class DependencyHealthProvider {
   constructor(context, diagnosticsPublisher, options = {}) {
     this.context = context;
@@ -68,7 +77,7 @@ class DependencyHealthProvider {
       enrichLicenses: options.enrichLicenses || enrichLicenses,
       enrichPolicies: options.enrichPolicies || enrichPolicies,
       analyzeUpstreamGaps: options.analyzeUpstreamGaps || analyzeUpstreamGaps,
-      fetchRepositories: options.fetchRepositories || this._fetchWorkspaceRepositories.bind(this),
+      fetchRepositories: options.fetchRepositories || null,
       upstreamPullService: options.upstreamPullService || new UpstreamPullService(context),
     };
     this._reportDateFactory = typeof options.reportDateFactory === "function"
@@ -79,13 +88,9 @@ class DependencyHealthProvider {
     this.dependencies = [];
     this.lastWorkspace = null;
     this.lastRepo = null;
-    this._scanning = false;
-    this._statusMessage = null;
-    this._failureMessage = null;
     this._warnings = [];
     this._lastManifests = [];
     this._projectFolderPath = null;
-    this._hasScannedOnce = false;
     this._noManifestsFolder = null;
     this._fullTrees = [];
     this._displayTrees = [];
@@ -95,6 +100,11 @@ class DependencyHealthProvider {
     this._filterMode = null;
     this._reportData = null;
     this._lastScanTimestamp = null;
+    this._nextScanOperationId = 0;
+    this._activeScanCancellation = null;
+    this._dependencyOperationRunning = false;
+    this._scanOperation = createScanOperation(SCAN_STATES.IDLE, 0);
+    this._hasSuccessfulScan = false;
 
     if (this.context && this.context.secrets && typeof this.context.secrets.onDidChange === "function") {
       this.context.secrets.onDidChange((event) => {
@@ -118,11 +128,48 @@ class DependencyHealthProvider {
   }
 
   async _updateContexts() {
+    const scanRunning = this.isScanRunning();
     await vscode.commands.executeCommand("setContext", "cloudsmith.depView", this._viewMode);
     await vscode.commands.executeCommand("setContext", "cloudsmith.depViewMode", this._viewMode);
     await vscode.commands.executeCommand("setContext", "cloudsmith.depFilterActive", Boolean(this._filterMode));
-    await vscode.commands.executeCommand("setContext", "cloudsmith.depScanComplete", Boolean(this._reportData));
+    await vscode.commands.executeCommand("setContext", "cloudsmith.depScanComplete", this._hasSuccessfulScan);
+    await vscode.commands.executeCommand("setContext", "cloudsmith.depScanSucceeded", this._hasSuccessfulScan);
+    await vscode.commands.executeCommand("setContext", "cloudsmith.depScanRunning", scanRunning);
+    await vscode.commands.executeCommand(
+      "setContext",
+      "cloudsmith.depOperationRunning",
+      scanRunning || this._dependencyOperationRunning
+    );
     await vscode.commands.executeCommand("setContext", "cloudsmith.depRepoSelected", Boolean(this.lastRepo));
+  }
+
+  hasSuccessfulScan() {
+    return this._hasSuccessfulScan;
+  }
+
+  isScanRunning() {
+    return this._scanOperation.status === SCAN_STATES.SELECTING
+      || this._scanOperation.status === SCAN_STATES.RUNNING;
+  }
+
+  getScanState() {
+    return {
+      ...this._scanOperation,
+      hasSuccessfulScan: this._hasSuccessfulScan,
+      successfulScope: this.getLastSuccessfulScope(),
+    };
+  }
+
+  getLastSuccessfulScope() {
+    if (!this._hasSuccessfulScan) {
+      return null;
+    }
+
+    return {
+      workspace: this.lastWorkspace,
+      repository: this.lastRepo,
+      projectFolder: this._projectFolderPath,
+    };
   }
 
   async setViewMode(mode) {
@@ -201,10 +248,6 @@ class DependencyHealthProvider {
     return folders && folders[0] ? folders[0].uri.fsPath : null;
   }
 
-  setProjectFolder(folderPath) {
-    this._projectFolderPath = folderPath;
-  }
-
   async promptForFolder() {
     const choice = await vscode.window.showQuickPick(
       [
@@ -242,40 +285,105 @@ class DependencyHealthProvider {
       return null;
     }
 
-    this._projectFolderPath = selected[0].fsPath;
-    return this._projectFolderPath;
+    return selected[0].fsPath;
+  }
+
+  async selectProjectFolder() {
+    const foldersByPath = new Map();
+    for (const folder of vscode.workspace.workspaceFolders || []) {
+      foldersByPath.set(folder.uri.fsPath, {
+        label: folder.name || path.basename(folder.uri.fsPath),
+        description: folder.uri.fsPath,
+        folderPath: folder.uri.fsPath,
+      });
+    }
+
+    if (this._projectFolderPath && !foldersByPath.has(this._projectFolderPath)) {
+      foldersByPath.set(this._projectFolderPath, {
+        label: path.basename(this._projectFolderPath),
+        description: this._projectFolderPath,
+        folderPath: this._projectFolderPath,
+      });
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      [
+        ...foldersByPath.values(),
+        {
+          label: "$(folder-opened) Browse for a project folder",
+          description: "Select a folder outside the open workspace",
+          browse: true,
+        },
+      ],
+      { placeHolder: "Select a project folder to scan" }
+    );
+
+    if (!selected) {
+      return null;
+    }
+    if (!selected.browse) {
+      return selected.folderPath;
+    }
+
+    const pickedFolders = await vscode.window.showOpenDialog({
+      canSelectFolders: true,
+      canSelectFiles: false,
+      canSelectMany: false,
+      openLabel: "Select project folder",
+    });
+    return pickedFolders && pickedFolders[0] ? pickedFolders[0].fsPath : null;
   }
 
   async scan(cloudsmithWorkspace, cloudsmithRepo, projectFolder) {
-    if (this._scanning) {
-      vscode.window.showWarningMessage("A dependency scan is already in progress.");
-      return;
+    if (this._dependencyOperationRunning) {
+      vscode.window.showWarningMessage("Wait for the current dependency operation to finish.");
+      return { status: "blocked" };
     }
+
+    const operationId = ++this._nextScanOperationId;
+    const previousCancellation = this._activeScanCancellation;
+    if (previousCancellation) {
+      previousCancellation.cancel();
+    }
+
+    this._scanOperation = createScanOperation(SCAN_STATES.SELECTING, operationId, {
+      startedAt: Date.now(),
+      scope: {
+        workspace: cloudsmithWorkspace,
+        repository: cloudsmithRepo || null,
+        projectFolder: projectFolder || null,
+      },
+    });
+    await this._updateContexts();
+    this.refresh();
 
     let folderPath = projectFolder || this.getProjectFolder();
     if (!folderPath) {
       folderPath = await this.promptForFolder();
+      if (!this._isCurrentScan(operationId)) {
+        return { status: "superseded" };
+      }
       if (!folderPath) {
-        return;
+        await this._finishCancelledScan(operationId);
+        return { status: SCAN_STATES.CANCELLED };
       }
     }
 
-    this._scanning = true;
-    this._hasScannedOnce = true;
-    this.lastWorkspace = cloudsmithWorkspace;
-    this.lastRepo = cloudsmithRepo;
-    this._reportData = null;
-    this._failureMessage = null;
-    this._warnings = [];
-    this._noManifestsFolder = null;
-    this._statusMessage = "Parsing lockfiles...";
-    this._displayTrees = [];
-    this._fullTrees = [];
-    this._summary = emptySummary();
+    const scope = {
+      workspace: cloudsmithWorkspace,
+      repository: cloudsmithRepo || null,
+      projectFolder: folderPath,
+    };
+    this._scanOperation = createScanOperation(SCAN_STATES.RUNNING, operationId, {
+      startedAt: this._scanOperation.startedAt,
+      scope,
+    });
     await this._updateContexts();
     this.refresh();
 
     const cancellationSource = new vscode.CancellationTokenSource();
+    this._activeScanCancellation = cancellationSource;
+    const scanWorker = this._createScanWorker(scope);
 
     try {
       const result = await vscode.window.withProgress(
@@ -287,7 +395,7 @@ class DependencyHealthProvider {
         async (progress, token) => {
           const subscription = token.onCancellationRequested(() => cancellationSource.cancel());
           try {
-            return await this._performScan(
+            return await scanWorker._performScan(
               cloudsmithWorkspace,
               cloudsmithRepo,
               folderPath,
@@ -300,30 +408,147 @@ class DependencyHealthProvider {
         }
       );
 
-      if (result && result.canceled) {
-        this._statusMessage = null;
-        if (this._diagnosticsPublisher) {
-          this._diagnosticsPublisher.clear();
-        }
+      if (!this._isCurrentScan(operationId)) {
+        return { status: "superseded" };
+      }
+
+      if ((result && result.canceled) || cancellationSource.token.isCancellationRequested) {
+        await this._finishCancelledScan(operationId);
         vscode.window.showInformationMessage("Dependency scan canceled.");
+        return { status: SCAN_STATES.CANCELLED };
       }
-    } catch (error) {
-      const reason = error && error.message ? error.message : "Check the Cloudsmith connection.";
-      this._displayTrees = [];
-      this._fullTrees = [];
-      this._summary = emptySummary();
+
+      const preparedDiagnostics = await this._prepareDiagnostics(scanWorker);
+      if (!this._isCurrentScan(operationId)) {
+        return { status: "superseded" };
+      }
+
+      if (cancellationSource.token.isCancellationRequested) {
+        await this._finishCancelledScan(operationId);
+        vscode.window.showInformationMessage("Dependency scan canceled.");
+        return { status: SCAN_STATES.CANCELLED };
+      }
+
       if (this._diagnosticsPublisher) {
-        this._diagnosticsPublisher.clear();
+        this._diagnosticsPublisher.replace(preparedDiagnostics);
       }
-      this._statusMessage = null;
-      this._failureMessage = `Scan failed. ${reason}`;
-      vscode.window.showErrorMessage(this._failureMessage);
-    } finally {
-      cancellationSource.dispose();
-      this._scanning = false;
+      this._commitSuccessfulScan(scanWorker, scope, operationId);
       await this._updateContexts();
       this.refresh();
+      return { status: SCAN_STATES.SUCCEEDED };
+    } catch (error) {
+      if (!this._isCurrentScan(operationId)) {
+        return { status: "superseded" };
+      }
+
+      if (cancellationSource.token.isCancellationRequested) {
+        await this._finishCancelledScan(operationId);
+        vscode.window.showInformationMessage("Dependency scan canceled.");
+        return { status: SCAN_STATES.CANCELLED };
+      }
+
+      const reason = error && error.message ? error.message : "Check the Cloudsmith connection.";
+      const message = this._hasSuccessfulScan
+        ? `Dependency refresh failed. Previous scan results are still available. ${reason}`
+        : `Dependency scan failed. ${reason}`;
+      this._scanOperation = createScanOperation(SCAN_STATES.FAILED, operationId, {
+        startedAt: this._scanOperation.startedAt,
+        completedAt: Date.now(),
+        failureMessage: message,
+        scope,
+      });
+      await this._updateContexts();
+      this.refresh();
+      if (this._hasSuccessfulScan) {
+        vscode.window.showWarningMessage(message);
+      } else {
+        vscode.window.showErrorMessage(message);
+      }
+      return { status: SCAN_STATES.FAILED, error };
+    } finally {
+      cancellationSource.dispose();
+      if (this._activeScanCancellation === cancellationSource) {
+        this._activeScanCancellation = null;
+      }
     }
+  }
+
+  _isCurrentScan(operationId) {
+    return this._scanOperation.id === operationId;
+  }
+
+  _createScanWorker(scope) {
+    // Reuse the scan pipeline while giving the operation its own mutable result fields.
+    // Nothing copied from this worker becomes visible until _commitSuccessfulScan runs.
+    const worker = Object.create(this);
+    worker.dependencies = [];
+    worker.lastWorkspace = scope.workspace;
+    worker.lastRepo = scope.repository;
+    worker._warnings = [];
+    worker._lastManifests = [];
+    worker._projectFolderPath = scope.projectFolder;
+    worker._noManifestsFolder = null;
+    worker._fullTrees = [];
+    worker._displayTrees = [];
+    worker._summary = emptySummary();
+    worker._reportData = null;
+    worker._lastScanTimestamp = null;
+    worker._statusMessage = "Parsing lockfiles...";
+    worker._diagnosticsPublisher = null;
+    worker._updateContexts = async () => {};
+    worker.refresh = () => {};
+    return worker;
+  }
+
+  async _finishCancelledScan(operationId) {
+    if (!this._isCurrentScan(operationId)) {
+      return;
+    }
+
+    const currentOperation = this._scanOperation;
+    this._scanOperation = createScanOperation(SCAN_STATES.CANCELLED, operationId, {
+      startedAt: currentOperation.startedAt,
+      completedAt: Date.now(),
+      scope: currentOperation.scope,
+      message: this._hasSuccessfulScan
+        ? "Dependency refresh canceled. Previous scan results are shown."
+        : "Dependency scan canceled.",
+    });
+    await this._updateContexts();
+    this.refresh();
+  }
+
+  _commitSuccessfulScan(scanWorker, scope, operationId) {
+    this.lastWorkspace = scope.workspace;
+    this.lastRepo = scope.repository;
+    this._warnings = scanWorker._warnings;
+    this._lastManifests = scanWorker._lastManifests;
+    this._projectFolderPath = scope.projectFolder;
+    this._noManifestsFolder = scanWorker._noManifestsFolder;
+    this._fullTrees = scanWorker._fullTrees;
+    this._displayTrees = scanWorker._displayTrees;
+    this._reportData = scanWorker._reportData;
+    this._lastScanTimestamp = scanWorker._lastScanTimestamp;
+    this._rebuildSummary();
+    this._hasSuccessfulScan = true;
+    this._scanOperation = createScanOperation(SCAN_STATES.SUCCEEDED, operationId, {
+      startedAt: this._scanOperation.startedAt,
+      completedAt: Date.now(),
+      scope,
+    });
+  }
+
+  async _prepareDiagnostics(scanState) {
+    if (!this._diagnosticsPublisher) {
+      return [];
+    }
+
+    const diagnosticNodes = scanState._fullTrees
+      .flatMap((tree) => tree.dependencies)
+      .filter((dependency) => dependency.isDirect)
+      .map((dependency) => new DependencyHealthNode(dependency, null, this.context));
+
+    return this._diagnosticsPublisher.prepare(scanState._lastManifests, diagnosticNodes);
   }
 
   _getMaxDependenciesToScan() {
@@ -337,6 +562,9 @@ class DependencyHealthProvider {
   async _performScan(cloudsmithWorkspace, cloudsmithRepo, folderPath, progress, token) {
     progress.report({ message: "Parsing lockfiles..." });
     this._lastManifests = await ManifestParser.detectManifests(folderPath);
+    if (token.isCancellationRequested) {
+      return { canceled: true };
+    }
 
     const resolveTransitives = vscode.workspace.getConfiguration("cloudsmith-vsc").get("resolveTransitiveDependencies") !== false;
     const trees = [];
@@ -344,6 +572,9 @@ class DependencyHealthProvider {
 
     if (resolveTransitives) {
       const detections = await LockfileResolver.detectResolvers(folderPath);
+      if (token.isCancellationRequested) {
+        return { canceled: true };
+      }
       for (const detection of detections) {
         if (token.isCancellationRequested) {
           return { canceled: true };
@@ -372,6 +603,9 @@ class DependencyHealthProvider {
 
     if (trees.length === 0) {
       const fallbackTrees = await this._buildManifestFallbackTrees(this._lastManifests);
+      if (token.isCancellationRequested) {
+        return { canceled: true };
+      }
       trees.push(...fallbackTrees);
     }
 
@@ -410,7 +644,6 @@ class DependencyHealthProvider {
       const warning = `Dependency display is capped at ${this._getMaxDependenciesToScan()} items `
         + `out of ${limited.totalDependencies} resolved dependencies.`;
       this._warnings.push(warning);
-      vscode.window.showWarningMessage(warning);
     }
     this._statusMessage = null;
     this._rebuildSummary();
@@ -917,7 +1150,9 @@ class DependencyHealthProvider {
   async _runUpstreamGapAnalysis(uncoveredDependencies, workspace, repo, progress, token) {
     const repositories = repo
       ? [repo]
-      : await this._services.fetchRepositories(workspace, token);
+      : await (this._services.fetchRepositories
+        ? this._services.fetchRepositories(workspace, token)
+        : this._fetchWorkspaceRepositories(workspace, token));
 
     const handler = this._createDebouncedEnrichmentHandler((patchMap) => {
       this._fullTrees = applyUncoveredOverlayPatch(this._fullTrees, patchMap, (dependency, gap) => ({
@@ -1063,7 +1298,7 @@ class DependencyHealthProvider {
   }
 
   async pullDependencies() {
-    if (this._scanning) {
+    if (this.isScanRunning() || this._dependencyOperationRunning) {
       vscode.window.showWarningMessage("Wait for the current dependency operation to finish.");
       return;
     }
@@ -1080,8 +1315,7 @@ class DependencyHealthProvider {
     }
 
     const cancellationSource = new vscode.CancellationTokenSource();
-    this._scanning = true;
-    this._failureMessage = null;
+    this._dependencyOperationRunning = true;
     await this._updateContexts();
 
     try {
@@ -1145,14 +1379,14 @@ class DependencyHealthProvider {
       }
     } finally {
       cancellationSource.dispose();
-      this._scanning = false;
+      this._dependencyOperationRunning = false;
       await this._updateContexts();
       this.refresh();
     }
   }
 
   async pullSingleDependency(item) {
-    if (this._scanning) {
+    if (this.isScanRunning() || this._dependencyOperationRunning) {
       vscode.window.showWarningMessage("Wait for the current dependency operation to finish.");
       return;
     }
@@ -1178,8 +1412,7 @@ class DependencyHealthProvider {
     }
 
     const cancellationSource = new vscode.CancellationTokenSource();
-    this._scanning = true;
-    this._failureMessage = null;
+    this._dependencyOperationRunning = true;
     await this._updateContexts();
 
     try {
@@ -1248,7 +1481,7 @@ class DependencyHealthProvider {
       }
     } finally {
       cancellationSource.dispose();
-      this._scanning = false;
+      this._dependencyOperationRunning = false;
       await this._updateContexts();
       this.refresh();
     }
@@ -1381,12 +1614,14 @@ class DependencyHealthProvider {
     return newlyFoundDependencies;
   }
 
-  async rescan() {
-    if (!this.lastWorkspace) {
-      vscode.window.showInformationMessage('No previous scan. Run "Scan dependencies" first.');
-      return;
+  async rescan(initialScan) {
+    const scope = this.getLastSuccessfulScope();
+    if (!scope) {
+      return typeof initialScan === "function"
+        ? initialScan()
+        : { status: "needs-initial-scan" };
     }
-    await this.scan(this.lastWorkspace, this.lastRepo);
+    return this.scan(scope.workspace, scope.repository, scope.projectFolder);
   }
 
   getTreeItem(element) {
@@ -1398,44 +1633,31 @@ class DependencyHealthProvider {
       return element.getChildren();
     }
 
-    if (this._statusMessage) {
-      return [
-        new InfoNode(
-          this._statusMessage,
-          "",
-          this._statusMessage,
-          "loading~spin",
-          "statusMessage"
-        ),
-      ];
+    const operationNode = this._getScanOperationNode();
+    if (operationNode && !this._hasSuccessfulScan) {
+      return [operationNode];
     }
 
-    if (this._failureMessage) {
-      return [
-        new InfoNode(
-          this._failureMessage,
-          "",
-          this._failureMessage,
-          "error",
-          "statusMessage"
-        ),
-      ];
+    const nodes = [];
+    if (operationNode) {
+      nodes.push(operationNode);
     }
 
     if (this._noManifestsFolder) {
-      return [
+      nodes.push(
         new InfoNode(
           "No dependency manifests or lockfiles found",
           this._noManifestsFolder,
           "Supported formats include npm, Python, Maven, Gradle, Go, Cargo, Ruby, Docker, NuGet, Dart, Composer, Helm, Swift, and Hex.",
           "warning",
           "infoNode"
-        ),
-      ];
+        )
+      );
+      return nodes;
     }
 
     if (this._displayTrees.length > 0) {
-      const nodes = [new DependencySummaryNode(this._summary)];
+      nodes.push(new DependencySummaryNode(this._summary));
       if (this._warnings.length > 0) {
         nodes.push(new InfoNode(
           this._warnings[0],
@@ -1449,7 +1671,7 @@ class DependencyHealthProvider {
       return nodes;
     }
 
-    if (!this._hasScannedOnce) {
+    if (!this._hasSuccessfulScan && this._scanOperation.status === SCAN_STATES.IDLE) {
       const isConnected = this.context && this.context.secrets
         ? await this.context.secrets.get("cloudsmith-vsc.isConnected")
         : "false";
@@ -1477,15 +1699,52 @@ class DependencyHealthProvider {
       ];
     }
 
-    return [
-      new InfoNode(
-        "No dependencies found",
-        "",
-        "The detected dependency files did not contain any dependencies to scan.",
-        "info",
-        "infoNode"
-      ),
-    ];
+    nodes.push(new InfoNode(
+      "No dependencies found",
+      "",
+      "The detected dependency files did not contain any dependencies to scan.",
+      "info",
+      "infoNode"
+    ));
+    return nodes;
+  }
+
+  _getScanOperationNode() {
+    const status = this._scanOperation.status;
+    if (status === SCAN_STATES.SELECTING || status === SCAN_STATES.RUNNING) {
+      const refreshing = this._hasSuccessfulScan;
+      const label = refreshing ? "Refreshing dependencies" : "Scanning dependencies";
+      const detail = refreshing
+        ? "Previous scan results are shown until the refresh finishes."
+        : "Dependency health results will appear when the scan finishes.";
+      return new InfoNode(label, detail, detail, "loading~spin", "statusMessage");
+    }
+
+    if (status === SCAN_STATES.FAILED) {
+      const refreshing = this._hasSuccessfulScan;
+      const label = refreshing ? "Dependency refresh failed" : "Dependency scan failed";
+      const detail = refreshing
+        ? "Previous scan results are shown. Run Scan dependencies to retry."
+        : "Run Scan dependencies to retry.";
+      return new InfoNode(
+        label,
+        detail,
+        this._scanOperation.failureMessage || detail,
+        "error",
+        "statusMessage"
+      );
+    }
+
+    if (status === SCAN_STATES.CANCELLED) {
+      const refreshing = this._hasSuccessfulScan;
+      const label = refreshing ? "Dependency refresh canceled" : "Dependency scan canceled";
+      const detail = refreshing
+        ? "Previous scan results are shown."
+        : "Run Scan dependencies to try again.";
+      return new InfoNode(label, detail, this._scanOperation.message || detail, "info", "statusMessage");
+    }
+
+    return null;
   }
 
   refresh() {
@@ -1498,6 +1757,18 @@ class DependencyHealthProvider {
     });
     this.dependencies = this._displayTrees.flatMap((tree) => tree.dependencies);
   }
+}
+
+function createScanOperation(status, id, values = {}) {
+  return {
+    status,
+    id,
+    startedAt: values.startedAt || null,
+    completedAt: values.completedAt || null,
+    scope: values.scope || null,
+    message: values.message || null,
+    failureMessage: values.failureMessage || null,
+  };
 }
 
 DependencyHealthProvider.packageIndexCache = new Map();
@@ -2816,6 +3087,7 @@ function getDependencyLicenseClassification(dependency) {
 module.exports = {
   DependencyHealthProvider,
   FILTER_MODES,
+  SCAN_STATES,
   SORT_MODES,
   buildComplianceReportData,
   buildDependencyHealthReport,

@@ -1,5 +1,7 @@
 const assert = require("assert");
-const { FORMAT_OPTIONS } = require("../extension");
+const fs = require("fs");
+const path = require("path");
+const { FORMAT_OPTIONS, runDependencyScan } = require("../extension");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
 
 suite("Extension Test Suite", () => {
@@ -8,5 +10,88 @@ suite("Extension Test Suite", () => {
     assert.ok(FORMAT_OPTIONS.includes("conan"));
     assert.ok(FORMAT_OPTIONS.includes("terraform"));
     assert.ok(FORMAT_OPTIONS.includes("raw"));
+  });
+
+  test("primary dependency scan command establishes scope on first use", async () => {
+    const calls = [];
+    const provider = {
+      hasSuccessfulScan() {
+        return false;
+      },
+      async scan(workspace, repo) {
+        calls.push({ workspace, repo });
+        return "scanned";
+      },
+    };
+
+    const result = await runDependencyScan(provider, async () => ({
+      scanWorkspace: "workspace-a",
+      scanRepo: "repo-a",
+    }));
+
+    assert.strictEqual(result, "scanned");
+    assert.deepStrictEqual(calls, [{ workspace: "workspace-a", repo: "repo-a" }]);
+  });
+
+  test("primary dependency scan command reuses successful scope on repeat use", async () => {
+    let initialTargetCalls = 0;
+    let rescanCalls = 0;
+    const provider = {
+      hasSuccessfulScan() {
+        return true;
+      },
+      async rescan() {
+        rescanCalls += 1;
+        return "rescanned";
+      },
+    };
+
+    const result = await runDependencyScan(provider, async () => {
+      initialTargetCalls += 1;
+      return { scanWorkspace: "unused", scanRepo: null };
+    });
+
+    assert.strictEqual(result, "rescanned");
+    assert.strictEqual(rescanCalls, 1);
+    assert.strictEqual(initialTargetCalls, 0);
+  });
+
+  test("dependency health title exposes one Scan dependencies action", () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+    const scanCommands = manifest.contributes.commands.filter((entry) => (
+      entry.command === "cloudsmith-vsc.scanDependencies"
+      || entry.command === "cloudsmith-vsc.scanDependenciesPending"
+      || entry.command === "cloudsmith-vsc.scanDependenciesComplete"
+    ));
+    const titleScanCommands = manifest.contributes.menus["view/title"].filter((entry) => (
+      entry.command === "cloudsmith-vsc.scanDependencies"
+      || entry.command === "cloudsmith-vsc.scanDependenciesPending"
+      || entry.command === "cloudsmith-vsc.scanDependenciesComplete"
+    ));
+
+    assert.deepStrictEqual(scanCommands.map((entry) => entry.command), ["cloudsmith-vsc.scanDependencies"]);
+    assert.strictEqual(scanCommands[0].title, "Scan dependencies");
+    assert.deepStrictEqual(titleScanCommands, [{
+      command: "cloudsmith-vsc.scanDependencies",
+      group: "navigation@1",
+      when: "view == cloudsmithDependencyHealthView && !cloudsmith.depOperationRunning",
+    }]);
+
+    const changeScopeEntry = manifest.contributes.menus["view/title"].find(
+      (entry) => entry.command === "cloudsmith-vsc.changeDependencyScanScope"
+    );
+    assert.deepStrictEqual(changeScopeEntry, {
+      command: "cloudsmith-vsc.changeDependencyScanScope",
+      group: "navigation@1.5",
+      when: "view == cloudsmithDependencyHealthView && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning",
+    });
+  });
+
+  test("historical rescan command IDs remain registered as primary-scan aliases", () => {
+    const source = fs.readFileSync(path.join(__dirname, "..", "extension.js"), "utf8");
+
+    assert.match(source, /registerCommand\("cloudsmith-vsc\.scanDependenciesComplete"/);
+    assert.match(source, /registerCommand\("cloudsmith-vsc\.rescanDependencies"/);
+    assert.match(source, /executeCommand\("cloudsmith-vsc\.scanDependencies"\)/);
   });
 });
