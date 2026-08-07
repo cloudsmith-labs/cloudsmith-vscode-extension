@@ -4,19 +4,48 @@
 const { WEB_APP_BASE_URL, buildRepositoryUrl } = require("./webAppUrls");
 
 const VERIFICATION_BANNER = "# Verify package details before running";
+const CLOUDSMITH_DOWNLOAD_HOST = "dl.cloudsmith.io";
+const DOCKER_REGISTRY = "docker.cloudsmith.io";
+const MAX_IDENTIFIER_LENGTH = 255;
+const MAX_DOCKER_NAME_LENGTH = 255;
+const ASCII_CONTROL_PATTERN = /[\u0000-\u001f\u007f]/;
+const CLOUDSMITH_IDENTIFIER_PATTERN = /^[A-Za-z0-9._-]+$/;
+const COMMAND_FORMAT_PATTERN = /^[a-z0-9][a-z0-9._+-]{0,63}$/;
+const DOCKER_NAME_COMPONENT_PATTERN = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
+const DOCKER_TAG_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+const SHA256_DIGEST_PATTERN = /^(?:sha256:)?([a-fA-F0-9]{64})$/;
+const SHELL_ARGUMENT_FORMATS = new Set([
+  "python", "npm", "nuget", "helm", "cargo", "go",
+  "ruby", "conda", "composer", "dart", "rpm",
+]);
+
+class InstallCommandValidationError extends Error {
+  constructor(field, reason) {
+    super(`${field} ${reason}`);
+    this.name = "InstallCommandValidationError";
+    this.field = field;
+  }
+}
 
 class InstallCommandBuilder {
   /**
-   * Escape a string for safe single-quoted shell usage.
+   * Render one argument using syntax shared by POSIX-compatible shells and PowerShell.
+   * Embedded apostrophes are rejected because those shells escape them differently.
    */
   static shellEscape(str) {
     const value = String(str);
-    return `'${value.replace(/'/g, `'\\''`)}'`;
+    if (value.includes("'")) {
+      throw new InstallCommandValidationError(
+        "Shell argument",
+        "must not contain an apostrophe."
+      );
+    }
+    return `'${value}'`;
   }
 
   /**
-   * Remove the display-only verification banner before copying to the clipboard.
-   * Unknown-format fallback comments are preserved.
+   * Remove the display-only verification banner from an already validated command.
+   * Unknown-format fallback comments are preserved and remain non-executable.
    *
    * @param   {string} command
    * @returns {string}
@@ -82,40 +111,202 @@ class InstallCommandBuilder {
       return null;
     }
 
-    const normalized = InstallCommandBuilder._sanitizeDockerComponent(value);
-    return normalized || null;
-  }
-
-  static _sanitizeDockerComponent(value) {
-    return String(value).trim().replace(/^['"]+|['"]+$/g, "");
+    return DOCKER_TAG_PATTERN.test(value) ? value : null;
   }
 
   static _normalizeDockerDigest(value) {
-    if (typeof value !== "string") {
+    if (value == null || value === "") {
       return null;
     }
 
-    const normalized = InstallCommandBuilder._sanitizeDockerComponent(value).replace(/^sha256:/i, "");
-    return normalized || null;
+    if (typeof value !== "string") {
+      throw new InstallCommandValidationError("Docker digest", "must be a string.");
+    }
+
+    const match = value.match(SHA256_DIGEST_PATTERN);
+    if (!match) {
+      throw new InstallCommandValidationError(
+        "Docker digest",
+        "must be a sha256 digest containing exactly 64 hexadecimal characters."
+      );
+    }
+
+    return match[1].toLowerCase();
   }
 
   static _resolveDockerTag(version, opts) {
-    const explicitTag = InstallCommandBuilder.extractDockerTag(opts);
-    if (explicitTag) {
-      return explicitTag;
+    const candidates = [
+      opts.tags && opts.tags.version,
+      opts.tags_raw && opts.tags_raw.version,
+      opts.cloudsmithMatch && opts.cloudsmithMatch.tags && opts.cloudsmithMatch.tags.version,
+    ];
+
+    for (const candidate of candidates) {
+      const values = Array.isArray(candidate) ? candidate : [candidate];
+      for (const value of values) {
+        if (value == null || value === "") {
+          continue;
+        }
+        if (typeof value !== "string" || !DOCKER_TAG_PATTERN.test(value)) {
+          throw new InstallCommandValidationError(
+            "Docker tag",
+            "must start with an alphanumeric character or underscore, contain only alphanumerics, underscores, periods, or dashes, and be at most 128 characters."
+          );
+        }
+        return value;
+      }
     }
 
-    const normalizedVersion = InstallCommandBuilder._normalizeDockerTag(version);
-    if (normalizedVersion) {
-      return normalizedVersion;
+    if (version === "") {
+      return "latest";
     }
 
-    return "latest";
+    if (!DOCKER_TAG_PATTERN.test(version)) {
+      throw new InstallCommandValidationError(
+        "Docker tag",
+        "must start with an alphanumeric character or underscore, contain only alphanumerics, underscores, periods, or dashes, and be at most 128 characters."
+      );
+    }
+
+    return version;
   }
 
   static _normalizeDockerName(name) {
-    const normalized = InstallCommandBuilder._sanitizeDockerComponent(name);
-    return normalized.endsWith(".sig") ? normalized.slice(0, -4) : normalized;
+    return name.endsWith(".sig") ? name.slice(0, -4) : name;
+  }
+
+  static _validateCommandFormat(format) {
+    if (typeof format !== "string" || !COMMAND_FORMAT_PATTERN.test(format)) {
+      throw new InstallCommandValidationError(
+        "Package format",
+        "must be a lowercase identifier containing only letters, numbers, periods, underscores, plus signs, or dashes."
+      );
+    }
+    return format;
+  }
+
+  static _validateCommandValue(value, field, allowEmpty = false) {
+    if (typeof value !== "string") {
+      throw new InstallCommandValidationError(field, "must be a string.");
+    }
+    if ((!allowEmpty && value.length === 0) || ASCII_CONTROL_PATTERN.test(value)) {
+      throw new InstallCommandValidationError(field, "must be non-empty and contain no control characters or newlines.");
+    }
+    return value;
+  }
+
+  static _validateShellArgument(value, field) {
+    if (value.includes("'")) {
+      throw new InstallCommandValidationError(
+        field,
+        "must not contain an apostrophe because generated commands support both POSIX shells and PowerShell."
+      );
+    }
+    return value;
+  }
+
+  static _validateCloudsmithIdentifier(value, field) {
+    if (
+      typeof value !== "string"
+      || value.length === 0
+      || value.length > MAX_IDENTIFIER_LENGTH
+      || value === "."
+      || value === ".."
+      || !CLOUDSMITH_IDENTIFIER_PATTERN.test(value)
+    ) {
+      throw new InstallCommandValidationError(
+        field,
+        "must be a Cloudsmith slug containing only letters, numbers, periods, underscores, or dashes."
+      );
+    }
+    return value;
+  }
+
+  static _encodeUrlPathSegment(value) {
+    return encodeURIComponent(value).replace(/[!'()*]/g, character =>
+      `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+    );
+  }
+
+  static _validateDockerPathComponent(value, field) {
+    if (!DOCKER_NAME_COMPONENT_PATTERN.test(value)) {
+      throw new InstallCommandValidationError(
+        field,
+        "must be a lowercase Docker repository component using valid periods, underscores, or dashes."
+      );
+    }
+    return value;
+  }
+
+  static _validateDockerImageName(value) {
+    const imageName = InstallCommandBuilder._normalizeDockerName(value);
+    const components = imageName.split("/");
+    if (!imageName || components.some(component => !DOCKER_NAME_COMPONENT_PATTERN.test(component))) {
+      throw new InstallCommandValidationError(
+        "Docker image name",
+        "must be a lowercase slash-delimited Docker repository path."
+      );
+    }
+    return imageName;
+  }
+
+  static _validateRawDownloadUrl(value) {
+    if (
+      typeof value !== "string"
+      || value.length === 0
+      || value !== value.trim()
+      || ASCII_CONTROL_PATTERN.test(value)
+      || /[\\\s]/.test(value)
+      || value.includes("'")
+    ) {
+      throw new InstallCommandValidationError(
+        "Raw download URL",
+        "must be a well-formed HTTPS Cloudsmith download URL without whitespace, backslashes, or apostrophes."
+      );
+    }
+
+    let parsed;
+    try {
+      parsed = new URL(value);
+    } catch {
+      throw new InstallCommandValidationError("Raw download URL", "must be a well-formed URL.");
+    }
+
+    if (parsed.protocol !== "https:") {
+      throw new InstallCommandValidationError("Raw download URL", "must use HTTPS.");
+    }
+    if (parsed.hostname !== CLOUDSMITH_DOWNLOAD_HOST || parsed.port) {
+      throw new InstallCommandValidationError(
+        "Raw download URL",
+        `must use the approved ${CLOUDSMITH_DOWNLOAD_HOST} host.`
+      );
+    }
+    if (parsed.username || parsed.password) {
+      throw new InstallCommandValidationError("Raw download URL", "must not contain embedded credentials.");
+    }
+    if (parsed.hash) {
+      throw new InstallCommandValidationError("Raw download URL", "must not contain a fragment.");
+    }
+
+    return parsed.toString();
+  }
+
+  static _validateFilename(value) {
+    if (
+      typeof value !== "string"
+      || value.length === 0
+      || value === "."
+      || value === ".."
+      || ASCII_CONTROL_PATTERN.test(value)
+      || value.includes("/")
+      || value.includes("\\")
+    ) {
+      throw new InstallCommandValidationError(
+        "Raw package filename",
+        "must be a non-empty filename without control characters or path separators."
+      );
+    }
+    return value;
   }
 
   /**
@@ -134,71 +325,111 @@ class InstallCommandBuilder {
    */
   static build(format, name, version, workspace, repo, opts) {
     const options = opts || {};
-    const safeName = InstallCommandBuilder.shellEscape(name);
-    const safeVersion = InstallCommandBuilder.shellEscape(version);
+    const validatedFormat = InstallCommandBuilder._validateCommandFormat(format);
+    const validatedName = InstallCommandBuilder._validateCommandValue(name, "Package name");
+    const validatedVersion = InstallCommandBuilder._validateCommandValue(
+      version,
+      "Package version",
+      validatedFormat === "docker"
+    );
+    const validatedWorkspace = InstallCommandBuilder._validateCloudsmithIdentifier(workspace, "Workspace slug");
+    const validatedRepo = InstallCommandBuilder._validateCloudsmithIdentifier(repo, "Repository slug");
+    const encodedWorkspace = InstallCommandBuilder._encodeUrlPathSegment(validatedWorkspace);
+    const encodedRepo = InstallCommandBuilder._encodeUrlPathSegment(validatedRepo);
+    const usesShellArguments = SHELL_ARGUMENT_FORMATS.has(validatedFormat);
+    if (usesShellArguments) {
+      InstallCommandBuilder._validateShellArgument(validatedName, "Package name");
+      InstallCommandBuilder._validateShellArgument(validatedVersion, "Package version");
+    }
+    const safeName = usesShellArguments ? InstallCommandBuilder.shellEscape(validatedName) : "";
+    const safeVersion = usesShellArguments ? InstallCommandBuilder.shellEscape(validatedVersion) : "";
+    const shellArgument = value => usesShellArguments ? InstallCommandBuilder.shellEscape(value) : "";
     const commands = {
       python: {
-        command: `# Verify package details before running\npip install ${safeName}==${safeVersion} --index-url https://dl.cloudsmith.io/basic/${workspace}/${repo}/python/simple/`,
+        command: `# Verify package details before running\npip install ${shellArgument(`${validatedName}==${validatedVersion}`)} --index-url https://dl.cloudsmith.io/basic/${encodedWorkspace}/${encodedRepo}/python/simple/`,
         note: 'For private repositories, replace "basic" with an entitlement token.',
       },
       npm: {
-        command: `# Verify package details before running\nnpm install ${safeName}@${safeVersion} --registry=https://npm.cloudsmith.io/${workspace}/${repo}/`,
-        note: "Run `npm login --registry=https://npm.cloudsmith.io/" + workspace + "/" + repo + "/` first for private repositories.",
+        command: `# Verify package details before running\nnpm install ${shellArgument(`${validatedName}@${validatedVersion}`)} --registry=https://npm.cloudsmith.io/${encodedWorkspace}/${encodedRepo}/`,
+        note: "Run `npm login --registry=https://npm.cloudsmith.io/" + encodedWorkspace + "/" + encodedRepo + "/` first for private repositories.",
       },
       maven: {
-        command: InstallCommandBuilder._buildMaven(name, version, workspace, repo),
+        command: InstallCommandBuilder._buildMaven(
+          validatedName,
+          validatedVersion,
+          validatedRepo,
+          encodedWorkspace,
+          encodedRepo
+        ),
         note: 'For private repositories, replace "basic" with an entitlement token in the repository URL.',
       },
       nuget: {
-        command: `# Verify package details before running\ndotnet add package ${safeName} --version ${safeVersion} --source https://nuget.cloudsmith.io/${workspace}/${repo}/v3/index.json`,
+        command: `# Verify package details before running\ndotnet add package ${safeName} --version ${safeVersion} --source https://nuget.cloudsmith.io/${encodedWorkspace}/${encodedRepo}/v3/index.json`,
         note: "For private repositories, configure NuGet source credentials.",
       },
       helm: {
-        command: `# Verify package details before running\nhelm install ${safeName} --repo https://dl.cloudsmith.io/basic/${workspace}/${repo}/helm/charts/ --version ${safeVersion}`,
+        command: `# Verify package details before running\nhelm install ${safeName} --repo https://dl.cloudsmith.io/basic/${encodedWorkspace}/${encodedRepo}/helm/charts/ --version ${safeVersion}`,
         note: 'For private repositories, replace "basic" with an entitlement token.',
       },
       cargo: {
-        command: `# Verify package details before running\ncargo add ${safeName}@${safeVersion}`,
-        note: `Add registry to .cargo/config.toml:\n[registries.cloudsmith]\nindex = "sparse+https://cargo.cloudsmith.io/${workspace}/${repo}/"`,
+        command: `# Verify package details before running\ncargo add ${shellArgument(`${validatedName}@${validatedVersion}`)}`,
+        note: `Add registry to .cargo/config.toml:\n[registries.cloudsmith]\nindex = "sparse+https://cargo.cloudsmith.io/${encodedWorkspace}/${encodedRepo}/"`,
       },
       go: {
-        command: `# Verify package details before running\nGONOSUMCHECK=${safeName} go get ${safeName}@v${safeVersion}`,
-        note: `Set GOPROXY=https://go.cloudsmith.io/basic/${workspace}/${repo}/,direct`,
+        command: `# Verify package details before running\nGONOSUMCHECK=${safeName} go get ${shellArgument(`${validatedName}@v${validatedVersion}`)}`,
+        note: `Set GOPROXY=https://go.cloudsmith.io/basic/${encodedWorkspace}/${encodedRepo}/,direct`,
       },
       ruby: {
-        command: `# Verify package details before running\ngem install ${safeName} -v ${safeVersion} --source https://dl.cloudsmith.io/basic/${workspace}/${repo}/ruby/`,
+        command: `# Verify package details before running\ngem install ${safeName} -v ${safeVersion} --source https://dl.cloudsmith.io/basic/${encodedWorkspace}/${encodedRepo}/ruby/`,
         note: 'For private repositories, replace "basic" with an entitlement token.',
       },
       conda: {
-        command: `# Verify package details before running\nconda install -c https://conda.cloudsmith.io/${workspace}/${repo}/ ${safeName}=${safeVersion}`,
+        command: `# Verify package details before running\nconda install -c https://conda.cloudsmith.io/${encodedWorkspace}/${encodedRepo}/ ${shellArgument(`${validatedName}=${validatedVersion}`)}`,
         note: null,
       },
       composer: {
-        command: `# Verify package details before running\ncomposer require ${safeName}:${safeVersion}`,
-        note: `Add repository to composer.json:\n{"type": "composer", "url": "https://composer.cloudsmith.io/${workspace}/${repo}/"}`,
+        command: `# Verify package details before running\ncomposer require ${shellArgument(`${validatedName}:${validatedVersion}`)}`,
+        note: `Add repository to composer.json:\n{"type": "composer", "url": "https://composer.cloudsmith.io/${encodedWorkspace}/${encodedRepo}/"}`,
       },
       dart: {
-        command: `# Verify package details before running\ndart pub add ${safeName}:${safeVersion}`,
-        note: `Add hosted URL to pubspec.yaml:\n  ${name}:\n    hosted: https://dart.cloudsmith.io/basic/${workspace}/${repo}/pub/\n    version: ${version}`,
+        command: `# Verify package details before running\ndart pub add ${shellArgument(`${validatedName}:${validatedVersion}`)}`,
+        note: `Add hosted URL to pubspec.yaml:\n  ${validatedName}:\n    hosted: https://dart.cloudsmith.io/basic/${encodedWorkspace}/${encodedRepo}/pub/\n    version: ${validatedVersion}`,
       },
     };
 
     // Formats with dedicated handlers
-    if (format === "docker") {
-      return InstallCommandBuilder._buildDocker(name, version, workspace, repo, options);
+    if (validatedFormat === "docker") {
+      return InstallCommandBuilder._buildDocker(
+        validatedName,
+        validatedVersion,
+        validatedWorkspace,
+        validatedRepo,
+        options
+      );
     }
-    if (format === "rpm") {
-      return InstallCommandBuilder._buildRpm(name, version, workspace, repo);
+    if (validatedFormat === "rpm") {
+      return InstallCommandBuilder._buildRpm(
+        validatedName,
+        validatedVersion,
+        encodedWorkspace,
+        encodedRepo
+      );
     }
-    if (format === "raw" || format === "generic") {
-      return InstallCommandBuilder._buildRaw(name, version, workspace, repo, options);
+    if (validatedFormat === "raw" || validatedFormat === "generic") {
+      return InstallCommandBuilder._buildRaw(
+        validatedName,
+        validatedVersion,
+        encodedWorkspace,
+        encodedRepo,
+        options
+      );
     }
 
-    const entry = commands[format];
+    const entry = commands[validatedFormat];
     if (!entry) {
-      const repositoryUrl = buildRepositoryUrl(workspace, repo) || WEB_APP_BASE_URL;
+      const repositoryUrl = buildRepositoryUrl(validatedWorkspace, validatedRepo) || WEB_APP_BASE_URL;
       return {
-        command: `# Verify package details before running\n# No install command template for format: ${format}`,
+        command: `# Verify package details before running\n# No install command template for format: ${validatedFormat}`,
         note: `Visit ${repositoryUrl} for setup instructions.`,
       };
     }
@@ -209,19 +440,27 @@ class InstallCommandBuilder {
    * Build Docker pull command — tag-first with optional digest alternative.
    */
   static _buildDocker(name, version, workspace, repo, opts) {
-    const registry = `docker.cloudsmith.io/${workspace}/${repo}`;
-    const imageName = InstallCommandBuilder._normalizeDockerName(name);
+    InstallCommandBuilder._validateDockerPathComponent(workspace, "Docker workspace slug");
+    InstallCommandBuilder._validateDockerPathComponent(repo, "Docker repository slug");
+    const imageName = InstallCommandBuilder._validateDockerImageName(name);
     const tag = InstallCommandBuilder._resolveDockerTag(version, opts || {});
+    const repositoryName = `${DOCKER_REGISTRY}/${workspace}/${repo}/${imageName}`;
+    if (repositoryName.length > MAX_DOCKER_NAME_LENGTH) {
+      throw new InstallCommandValidationError(
+        "Docker repository name",
+        `must be at most ${MAX_DOCKER_NAME_LENGTH} characters.`
+      );
+    }
     const result = {
-      command: `# Verify package details before running\ndocker pull ${registry}/${imageName}:${tag}`,
-      note: "Run `docker login docker.cloudsmith.io` first for private repositories.",
+      command: `# Verify package details before running\ndocker pull ${repositoryName}:${tag}`,
+      note: `Run \`docker login ${DOCKER_REGISTRY}\` first for private repositories.`,
     };
 
     const digest = InstallCommandBuilder._normalizeDockerDigest((opts || {}).checksumSha256 || (opts || {}).versionDigest);
     if (digest) {
       result.alternatives = [{
         label: "Pull by digest (pinned)",
-        command: `# Verify package details before running\ndocker pull ${registry}/${imageName}@sha256:${digest}`,
+        command: `# Verify package details before running\ndocker pull ${repositoryName}@sha256:${digest}`,
       }];
     }
 
@@ -232,14 +471,13 @@ class InstallCommandBuilder {
    * Build RPM install command — dnf primary, yum alternative.
    */
   static _buildRpm(name, version, workspace, repo) {
-    const safeName = InstallCommandBuilder.shellEscape(name);
-    const safeVersion = InstallCommandBuilder.shellEscape(version);
+    const safeCoordinate = InstallCommandBuilder.shellEscape(`${name}-${version}`);
     return {
-      command: `# Verify package details before running\ndnf install ${safeName}-${safeVersion}`,
+      command: `# Verify package details before running\ndnf install ${safeCoordinate}`,
       note: `Requires a Cloudsmith repository configured in /etc/yum.repos.d/.\nRepository URL: https://dl.cloudsmith.io/basic/${workspace}/${repo}/rpm/`,
       alternatives: [{
         label: "Install via yum",
-        command: `# Verify package details before running\nyum install ${safeName}-${safeVersion}`,
+        command: `# Verify package details before running\nyum install ${safeCoordinate}`,
       }],
     };
   }
@@ -248,16 +486,26 @@ class InstallCommandBuilder {
    * Build Raw/Generic download command — curl primary, wget alternative.
    */
   static _buildRaw(name, version, workspace, repo, opts) {
-    const filename = opts.filename || `${name}-${version}`;
-    const cdnUrl = opts.cdnUrl ||
-      `https://dl.cloudsmith.io/basic/${workspace}/${repo}/raw/names/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}/${encodeURIComponent(filename)}`;
+    let cdnUrl;
+    if (opts.cdnUrl != null && opts.cdnUrl !== "") {
+      cdnUrl = InstallCommandBuilder._validateRawDownloadUrl(opts.cdnUrl);
+    } else {
+      const filename = opts.filename
+        ? InstallCommandBuilder._validateFilename(opts.filename)
+        : `${name}-${version}`;
+      cdnUrl = `https://${CLOUDSMITH_DOWNLOAD_HOST}/basic/${workspace}/${repo}`
+        + `/raw/names/${InstallCommandBuilder._encodeUrlPathSegment(name)}`
+        + `/versions/${InstallCommandBuilder._encodeUrlPathSegment(version)}`
+        + `/${InstallCommandBuilder._encodeUrlPathSegment(filename)}`;
+    }
+    const safeCdnUrl = InstallCommandBuilder.shellEscape(cdnUrl);
 
     return {
-      command: `# Verify package details before running\ncurl -L -O "${cdnUrl}"`,
+      command: `# Verify package details before running\ncurl -L -O ${safeCdnUrl}`,
       note: 'For private repositories, replace "basic" with an entitlement token or use authentication headers.',
       alternatives: [{
         label: "Download via wget",
-        command: `# Verify package details before running\nwget "${cdnUrl}"`,
+        command: `# Verify package details before running\nwget ${safeCdnUrl}`,
       }],
     };
   }
@@ -266,7 +514,7 @@ class InstallCommandBuilder {
    * Build a Maven pom.xml snippet with repository and dependency blocks.
    * Splits name on : to get groupId and artifactId.
    */
-  static _buildMaven(name, version, workspace, repo) {
+  static _buildMaven(name, version, repo, encodedWorkspace, encodedRepo) {
     let groupId;
     let artifactId;
     if (name.includes(":")) {
@@ -288,7 +536,7 @@ class InstallCommandBuilder {
       "<!-- Add to pom.xml repositories -->",
       "<repository>",
       `  <id>cloudsmith-${escapeXml(repo)}</id>`,
-      `  <url>https://dl.cloudsmith.io/basic/${escapeXml(workspace)}/${escapeXml(repo)}/maven/</url>`,
+      `  <url>https://dl.cloudsmith.io/basic/${encodedWorkspace}/${encodedRepo}/maven/</url>`,
       "</repository>",
       "",
       "<!-- Add to dependencies -->",
@@ -301,4 +549,4 @@ class InstallCommandBuilder {
   }
 }
 
-module.exports = { InstallCommandBuilder };
+module.exports = { InstallCommandBuilder, InstallCommandValidationError };

@@ -11,7 +11,10 @@ const {
   FILTER_MODES,
   SORT_MODES,
 } = require("./views/dependencyHealthProvider");
-const { InstallCommandBuilder } = require("./util/installCommandBuilder");
+const {
+  InstallCommandBuilder,
+  InstallCommandValidationError,
+} = require("./util/installCommandBuilder");
 const { VulnerabilityProvider } = require("./views/vulnerabilityProvider");
 const { ComplianceReportProvider } = require("./views/complianceReportProvider");
 const { QuarantineExplainProvider } = require("./views/quarantineExplainProvider");
@@ -146,6 +149,32 @@ function getInstallOptions(item) {
   }
 
   return installOpts;
+}
+
+function buildInstallCommand(format, name, version, workspace, repo, item) {
+  try {
+    return InstallCommandBuilder.build(
+      format,
+      name,
+      version,
+      workspace,
+      repo,
+      getInstallOptions(item)
+    );
+  } catch (error) {
+    if (error instanceof InstallCommandValidationError) {
+      vscode.window.showErrorMessage(`Could not safely generate install command: ${error.message}`);
+      return null;
+    }
+    throw error;
+  }
+}
+
+function commentCommandNote(note) {
+  return String(note)
+    .split(/\r?\n/)
+    .map(line => `# ${line}`)
+    .join("\n");
 }
 
 async function pickInstallCommandVariant(result) {
@@ -1450,14 +1479,15 @@ async function activate(context) {
         if (!action) return;
 
         if (action.id === "install") {
-          const installResult = InstallCommandBuilder.build(
+          const installResult = buildInstallCommand(
             format,
             name,
             pkg.version,
             workspace,
             pkgRepo,
-            getInstallOptions(pkg)
+            pkg
           );
+          if (!installResult) return;
           const chosenCommand = await pickInstallCommandVariant(installResult);
           if (!chosenCommand) return;
           await vscode.env.clipboard.writeText(InstallCommandBuilder.toClipboardCommand(chosenCommand));
@@ -1745,9 +1775,10 @@ async function activate(context) {
         vscode.window.showWarningMessage("Could not determine package details for install command.");
         return;
       }
-      const result = InstallCommandBuilder.build(
-        info.format, info.name, info.version || "latest", info.workspace, info.repo, getInstallOptions(item)
+      const result = buildInstallCommand(
+        info.format, info.name, info.version || "latest", info.workspace, info.repo, item
       );
+      if (!result) return;
       const chosenCommand = await pickInstallCommandVariant(result);
       if (!chosenCommand) return;
       await vscode.env.clipboard.writeText(InstallCommandBuilder.toClipboardCommand(chosenCommand));
@@ -1881,9 +1912,10 @@ async function activate(context) {
         vscode.window.showWarningMessage("Could not determine package details for install command.");
         return;
       }
-      const result = InstallCommandBuilder.build(
-        info.format, info.name, info.version || "latest", info.workspace, info.repo, getInstallOptions(item)
+      const result = buildInstallCommand(
+        info.format, info.name, info.version || "latest", info.workspace, info.repo, item
       );
+      if (!result) return;
       let content = result.command;
       if (result.alternatives && result.alternatives.length > 0) {
         for (const alt of result.alternatives) {
@@ -1891,7 +1923,7 @@ async function activate(context) {
         }
       }
       if (result.note) {
-        content += "\n\n# Note: " + result.note;
+        content += "\n\n# Note\n" + commentCommandNote(result.note);
       }
       const doc = await vscode.workspace.openTextDocument({
         language: info.format === "maven" ? "xml" : "shellscript",

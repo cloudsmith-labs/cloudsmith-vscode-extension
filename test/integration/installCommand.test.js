@@ -74,6 +74,6 @@ suite('Integration: Install Command Builder', function () {
 
   test('shell command formats quote package coordinates', function () {
     const result = InstallCommandBuilder.build('python', 'demo', '1.2.3', 'ws', 'repo');
-    assert.ok(result.command.includes("'demo'=='1.2.3'"), 'Should quote package name and version');
+    assert.ok(result.command.includes("'demo==1.2.3'"), 'Should quote package name and version');
   });
 });
