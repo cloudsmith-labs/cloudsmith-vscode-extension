@@ -71,6 +71,75 @@ suite("Package Metadata Flow Test Suite", () => {
     });
   });
 
+  test("package and search models share format-independent vulnerability status handling", () => {
+    const cleanPayloads = [
+      {
+        ...pkg,
+        name: "clean-npm",
+        format: "npm",
+        security_scan_status: "Scan Detected No Vulnerabilities",
+      },
+      {
+        ...pkg,
+        name: "clean-python",
+        format: "python",
+        num_vulnerabilities: "0",
+        security_scan_status: "Scan Detected No Vulnerabilities",
+      },
+    ];
+
+    for (const cleanPayload of cleanPayloads) {
+      for (const NodeType of [PackageNode, SearchResultNode]) {
+        const node = new NodeType(cleanPayload, {});
+        assert.strictEqual(node.num_vulnerabilities, 0);
+        assert.strictEqual(
+          node.getChildren().some(child => child.getTreeItem().contextValue === "vulnerabilitySummary"),
+          false,
+          `${NodeType.name} exposed a false ${cleanPayload.format} vulnerability summary`
+        );
+      }
+    }
+
+    const vulnerablePayload = {
+      ...pkg,
+      name: "vulnerable-package",
+      format: "npm",
+      num_vulnerabilities: "2",
+      security_scan_status: "Scan Detected Vulnerabilities",
+      max_severity: "High",
+    };
+
+    for (const NodeType of [PackageNode, SearchResultNode]) {
+      const node = new NodeType(vulnerablePayload, {});
+      const summary = node.getChildren().find(
+        child => child.getTreeItem().contextValue === "vulnerabilitySummary"
+      );
+      assert.ok(summary, `${NodeType.name} omitted a real vulnerability summary`);
+      assert.strictEqual(summary.getTreeItem().label, "Vulnerabilities: 2 (High)");
+      assert.strictEqual(
+        summary.getTreeItem().collapsibleState,
+        vscode.TreeItemCollapsibleState.Collapsed
+      );
+    }
+
+    const statusOnlyPayload = {
+      ...pkg,
+      name: "status-only-vulnerable-package",
+      format: "python",
+      security_scan_status: "Scan Detected Vulnerabilities",
+    };
+    delete statusOnlyPayload.num_vulnerabilities;
+
+    for (const NodeType of [PackageNode, SearchResultNode]) {
+      const node = new NodeType(statusOnlyPayload, {});
+      const summary = node.getChildren().find(
+        child => child.getTreeItem().contextValue === "vulnerabilitySummary"
+      );
+      assert.ok(summary, `${NodeType.name} omitted a status-only vulnerability summary`);
+      assert.strictEqual(summary.getTreeItem().label, "Vulnerabilities: detected");
+    }
+  });
+
   test("DependencyHealthNode preserves install-command metadata", () => {
     const node = new DependencyHealthNode({
       name: "artifact",

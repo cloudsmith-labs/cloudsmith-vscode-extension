@@ -1,5 +1,6 @@
 const assert = require('assert');
 const { apiKey, workspace, testRepo, testPackageSlug, createAPI, skipIfNoKey } = require('./setup');
+const { extractVulnerabilityResults } = require('../../util/packageVulnerabilities');
 
 suite('Integration: Vulnerabilities', function () {
   this.timeout(15000);
@@ -41,19 +42,19 @@ suite('Integration: Vulnerabilities', function () {
     );
     assert.ok(scanDetail, 'Expected scan detail response');
     assert.ok(typeof scanDetail !== 'string', `API returned error: ${scanDetail}`);
-    assert.ok(Array.isArray(scanDetail.scans), 'Expected scans array in response');
-    assert.ok(scanDetail.scans.length > 0, 'Expected at least one scan');
-    assert.ok(Array.isArray(scanDetail.scans[0].results), 'Expected results array in first scan');
-    assert.ok(scanDetail.scans[0].results.length > 0, 'Expected at least one CVE result');
+    assert.ok(scanDetail.scan && typeof scanDetail.scan === 'object', 'Expected scan object in response');
+    assert.ok(Array.isArray(scanDetail.scan.results), 'Expected results array in scan response');
+    assert.ok(scanDetail.scan.results.length > 0, 'Expected at least one CVE result');
   });
 
   test('CVE data has expected structure', function () {
-    if (!scanDetail || !scanDetail.scans || !scanDetail.scans[0]) {
+    const results = extractVulnerabilityResults(scanDetail);
+    if (results.length === 0) {
       this.skip();
       return;
     }
 
-    const cve = scanDetail.scans[0].results[0];
+    const cve = results[0];
     assert.ok(cve.vulnerability_id, 'CVE should have vulnerability_id');
     assert.ok(
       cve.vulnerability_id.startsWith('CVE-') || cve.vulnerability_id.startsWith('GHSA-'),
@@ -67,12 +68,12 @@ suite('Integration: Vulnerabilities', function () {
   });
 
   test('fix version extraction works when available', function () {
-    if (!scanDetail || !scanDetail.scans || !scanDetail.scans[0]) {
+    const results = extractVulnerabilityResults(scanDetail);
+    if (results.length === 0) {
       this.skip();
       return;
     }
 
-    const results = scanDetail.scans[0].results;
     const withFix = results.find((r) => r.fixed_version);
     if (!withFix) {
       // No fix available for any CVE — skip rather than fail
