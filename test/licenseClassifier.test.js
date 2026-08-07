@@ -102,6 +102,57 @@ suite("LicenseClassifier Test Suite", () => {
       const result = LicenseClassifier.classify("(MIT OR Apache-2.0) AND GPL-3.0");
       assert.strictEqual(result.tier, "restrictive");
     });
+
+    test("mixed AND and OR operators preserve every identifier", () => {
+      const inspection = LicenseClassifier.inspect("MIT AND Apache-2.0 OR BSD-3-Clause");
+      assert.deepStrictEqual(inspection.identifiers, ["MIT", "Apache-2.0", "BSD-3-Clause"]);
+      assert.strictEqual(inspection.tier, "permissive");
+    });
+
+    test("operators surrounded by multiple spaces are recognized", () => {
+      const inspection = LicenseClassifier.inspect("MIT   OR   GPL-3.0");
+      assert.deepStrictEqual(inspection.identifiers, ["MIT", "GPL-3.0"]);
+      assert.strictEqual(inspection.tier, "restrictive");
+    });
+
+    test("operators surrounded by tabs are recognized", () => {
+      const inspection = LicenseClassifier.inspect("MIT\tAND\tLGPL-3.0");
+      assert.deepStrictEqual(inspection.identifiers, ["MIT", "LGPL-3.0"]);
+      assert.strictEqual(inspection.tier, "cautious");
+    });
+
+    test("operators surrounded by newlines are recognized", () => {
+      const inspection = LicenseClassifier.inspect("MIT\nOR\nGPL-3.0");
+      assert.deepStrictEqual(inspection.identifiers, ["MIT", "GPL-3.0"]);
+      assert.strictEqual(inspection.tier, "restrictive");
+    });
+
+    test("lowercase operators are recognized", () => {
+      const inspection = LicenseClassifier.inspect("MIT and Apache-2.0 or GPL-3.0");
+      assert.deepStrictEqual(inspection.identifiers, ["MIT", "Apache-2.0", "GPL-3.0"]);
+      assert.strictEqual(inspection.tier, "restrictive");
+    });
+
+    test("malformed operators without whitespace boundaries are not split", () => {
+      const license = "MIT ORGPL-3.0";
+      const inspection = LicenseClassifier.inspect(license);
+      assert.deepStrictEqual(inspection.identifiers, [license]);
+      assert.strictEqual(inspection.tier, "unknown");
+    });
+
+    test("license identifiers containing AND or OR letter sequences are not split", () => {
+      const license = "LicenseRef-STANDARD-OR-Clause";
+      const inspection = LicenseClassifier.inspect(license);
+      assert.deepStrictEqual(inspection.identifiers, [license]);
+      assert.strictEqual(inspection.tier, "unknown");
+    });
+
+    test("very long whitespace-heavy malformed input is scanned without partial splitting", () => {
+      const license = `MIT${" ".repeat(25000)}O`;
+      const inspection = LicenseClassifier.inspect(license);
+      assert.deepStrictEqual(inspection.identifiers, [license]);
+      assert.strictEqual(inspection.tier, "unknown");
+    });
   });
 
   // =====================

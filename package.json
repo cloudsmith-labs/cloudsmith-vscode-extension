@@ -200,16 +200,10 @@
         "icon": "$(play)"
       },
       {
-        "command": "cloudsmith-vsc.scanDependenciesPending",
-        "title": "Scan dependencies",
+        "command": "cloudsmith-vsc.changeDependencyScanScope",
+        "title": "Change dependency scan scope",
         "category": "Cloudsmith",
-        "icon": "$(play)"
-      },
-      {
-        "command": "cloudsmith-vsc.scanDependenciesComplete",
-        "title": "Rescan dependencies",
-        "category": "Cloudsmith",
-        "icon": "$(play)"
+        "icon": "$(folder-opened)"
       },
       {
         "command": "cloudsmith-vsc.pullDependencies",
@@ -695,19 +689,19 @@
           "when": "view == cloudsmithSearchView"
         },
         {
-          "command": "cloudsmith-vsc.scanDependenciesPending",
+          "command": "cloudsmith-vsc.scanDependencies",
           "group": "navigation@1",
-          "when": "view == cloudsmithDependencyHealthView && !cloudsmith.depScanComplete"
+          "when": "view == cloudsmithDependencyHealthView && !cloudsmith.depOperationRunning"
         },
         {
-          "command": "cloudsmith-vsc.scanDependenciesComplete",
-          "group": "navigation@1",
-          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depScanComplete"
+          "command": "cloudsmith-vsc.changeDependencyScanScope",
+          "group": "navigation@1.5",
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
         },
         {
           "command": "cloudsmith-vsc.pullDependencies",
           "group": "navigation@2",
-          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depScanComplete"
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depScanComplete && !cloudsmith.depOperationRunning"
         },
         {
           "command": "cloudsmith-vsc.cycleDepViewDirect",
