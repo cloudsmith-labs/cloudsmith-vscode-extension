@@ -3,6 +3,34 @@
 
 const vscode = require("vscode");
 
+function isExpressionWhitespace(character) {
+  return character.trim() === "";
+}
+
+function matchesAsciiLetter(value, index, uppercaseLetter, lowercaseLetter) {
+  const character = value[index];
+  return character === uppercaseLetter || character === lowercaseLetter;
+}
+
+function getCompoundOperatorLength(value, index) {
+  if (
+    matchesAsciiLetter(value, index, "O", "o")
+    && matchesAsciiLetter(value, index + 1, "R", "r")
+  ) {
+    return 2;
+  }
+
+  if (
+    matchesAsciiLetter(value, index, "A", "a")
+    && matchesAsciiLetter(value, index + 1, "N", "n")
+    && matchesAsciiLetter(value, index + 2, "D", "d")
+  ) {
+    return 3;
+  }
+
+  return 0;
+}
+
 class LicenseClassifier {
   static SPDX_LICENSE_BASE_URL = "https://spdx.org/licenses";
 
@@ -138,7 +166,7 @@ class LicenseClassifier {
       return [];
     }
 
-    const parts = normalized.split(/\s+OR\s+|\s+AND\s+/i);
+    const parts = LicenseClassifier._splitCompoundExpression(normalized);
     const identifiers = [];
     const seen = new Set();
 
@@ -151,6 +179,50 @@ class LicenseClassifier {
     }
 
     return identifiers;
+  }
+
+  /**
+   * Split AND/OR operators surrounded by whitespace in one pass.
+   *
+   * @param   {string} expression
+   * @returns {string[]}
+   */
+  static _splitCompoundExpression(expression) {
+    const parts = [];
+    let partStart = 0;
+    let index = 0;
+
+    while (index < expression.length) {
+      if (!isExpressionWhitespace(expression[index])) {
+        index += 1;
+        continue;
+      }
+
+      const separatorStart = index;
+      while (index < expression.length && isExpressionWhitespace(expression[index])) {
+        index += 1;
+      }
+
+      const operatorLength = getCompoundOperatorLength(expression, index);
+      const afterOperator = index + operatorLength;
+      if (
+        operatorLength === 0
+        || afterOperator >= expression.length
+        || !isExpressionWhitespace(expression[afterOperator])
+      ) {
+        continue;
+      }
+
+      parts.push(expression.slice(partStart, separatorStart));
+      index = afterOperator;
+      while (index < expression.length && isExpressionWhitespace(expression[index])) {
+        index += 1;
+      }
+      partStart = index;
+    }
+
+    parts.push(expression.slice(partStart));
+    return parts;
   }
 
   /**
