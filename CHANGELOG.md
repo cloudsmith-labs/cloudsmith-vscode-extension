@@ -1,4 +1,4 @@
-## 2.2.0 - April 2026
+## 2.2.0 - August 2026
 ### Transitive Dependency Visibility
 
 #### Transitive Dependency Resolution

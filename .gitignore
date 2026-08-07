@@ -1,6 +1,14 @@
 node_modules/
 .vscode-test/
 *.vsix
+out/
+dist/
+build/
+coverage/
+.nyc_output/
+*.map
+.tmp-vsix/
+.vsix-package/
 .env
 .DS_Store
 .src/
