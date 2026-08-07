@@ -3,6 +3,7 @@
 
 const vscode = require("vscode");
 const { ManifestParser } = require("./manifestParser");
+const { buildRepositoryUrl } = require("./webAppUrls");
 
 class DiagnosticsPublisher {
   constructor() {
@@ -61,12 +62,17 @@ class DiagnosticsPublisher {
 
         // Add related info if there's a fix version available
         if (dep.cloudsmithMatch && dep.cloudsmithMatch.num_vulnerabilities > 0) {
-          diagnostic.code = {
-            value: `${dep.cloudsmithMatch.num_vulnerabilities} vulnerabilities`,
-            target: vscode.Uri.parse(
-              `https://app.cloudsmith.com/${dep.cloudsmithMatch.namespace}/${dep.cloudsmithMatch.repository}`
-            ),
-          };
+          const repositoryUrl = buildRepositoryUrl(
+            dep.cloudsmithMatch.namespace,
+            dep.cloudsmithMatch.repository
+          );
+          const vulnerabilityCode = `${dep.cloudsmithMatch.num_vulnerabilities} vulnerabilities`;
+          diagnostic.code = repositoryUrl
+            ? {
+              value: vulnerabilityCode,
+              target: vscode.Uri.parse(repositoryUrl),
+            }
+            : vulnerabilityCode;
         }
 
         diagnostics.push(diagnostic);

@@ -1,6 +1,8 @@
 // Install command builder - generates format-native install commands
 // with Cloudsmith registry URLs pre-filled.
 
+const { WEB_APP_BASE_URL, buildRepositoryUrl } = require("./webAppUrls");
+
 const VERIFICATION_BANNER = "# Verify package details before running";
 
 class InstallCommandBuilder {
@@ -194,9 +196,10 @@ class InstallCommandBuilder {
 
     const entry = commands[format];
     if (!entry) {
+      const repositoryUrl = buildRepositoryUrl(workspace, repo) || WEB_APP_BASE_URL;
       return {
         command: `# Verify package details before running\n# No install command template for format: ${format}`,
-        note: `Visit https://app.cloudsmith.com/${workspace}/${repo} for setup instructions.`,
+        note: `Visit ${repositoryUrl} for setup instructions.`,
       };
     }
     return entry;

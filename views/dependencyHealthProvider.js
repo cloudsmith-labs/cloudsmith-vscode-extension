@@ -16,10 +16,8 @@ const {
 const {
   enrichVulnerabilities,
 } = require("../util/dependencyVulnEnricher");
-const {
-  enrichLicenses,
-  getFoundDependencyKey,
-} = require("../util/dependencyLicenseEnricher");
+const { enrichLicenses } = require("../util/dependencyLicenseEnricher");
+const { getFoundDependencyKey } = require("../util/foundDependencyKey");
 const { enrichPolicies } = require("../util/dependencyPolicyEnricher");
 const {
   analyzeUpstreamGaps,

@@ -56,7 +56,6 @@ class DependencyHealthNode {
       this.slug_perm_raw = this.cloudsmithMatch.slug_perm;
       this.version = { id: "Version", value: this.cloudsmithMatch.version };
       this.status_str = { id: "Status", value: this.cloudsmithMatch.status_str };
-      this.self_webapp_url = this.cloudsmithMatch.self_webapp_url || null;
       this.checksum_sha256 = this.cloudsmithMatch.checksum_sha256 || null;
       this.version_digest = this.cloudsmithMatch.version_digest || null;
       this.tags_raw = this.cloudsmithMatch.tags || {};

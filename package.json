@@ -759,11 +759,6 @@
     "configuration": {
       "title": "Cloudsmith",
       "properties": {
-        "cloudsmith-vsc.useLegacyWebApp": {
-          "type": "boolean",
-          "default": false,
-          "description": "Open package links in the legacy web app, cloudsmith.io."
-        },
         "cloudsmith-vsc.inspectOutput": {
           "type": "boolean",
           "default": false,

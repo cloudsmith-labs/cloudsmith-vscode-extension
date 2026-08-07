@@ -5,6 +5,7 @@
 const crypto = require("crypto");
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { buildPackageUrl } = require("../util/webAppUrls");
 
 class QuarantineExplainProvider {
   constructor(context) {
@@ -43,7 +44,7 @@ class QuarantineExplainProvider {
     }
 
     const statusReason = item.status_reason || null;
-    const selfUrl = item.self_webapp_url || null;
+    const packageUrl = buildPackageUrl(workspace, repo, format, name, version, slugPerm);
 
     if (!workspace || !slugPerm) {
       vscode.window.showWarningMessage("Could not determine package details for quarantine explanation.");
@@ -82,7 +83,7 @@ class QuarantineExplainProvider {
     // Render the full panel
     panel.webview.html = this._getHtmlContent(
       nonce, name, version, format, workspace, repo, slugPerm,
-      statusReason, selfUrl, policyTrace
+      statusReason, packageUrl, policyTrace
     );
 
     // Handle messages from the WebView
@@ -91,8 +92,8 @@ class QuarantineExplainProvider {
         vscode.commands.executeCommand("cloudsmith-vsc.findSafeVersion", item);
       } else if (message.command === "showVulnerabilities") {
         vscode.commands.executeCommand("cloudsmith-vsc.showVulnerabilities", item);
-      } else if (message.command === "openInCloudsmith" && selfUrl) {
-        await vscode.env.openExternal(vscode.Uri.parse(selfUrl));
+      } else if (message.command === "openInCloudsmith" && packageUrl) {
+        await vscode.env.openExternal(vscode.Uri.parse(packageUrl));
       } else if (message.command === "copyReport") {
         const report = this._buildPlainTextReport(name, version, statusReason, policyTrace);
         await vscode.env.clipboard.writeText(report);
@@ -175,7 +176,7 @@ class QuarantineExplainProvider {
 </html>`;
   }
 
-  _getHtmlContent(nonce, name, version, format, workspace, repo, slugPerm, statusReason, selfUrl, policyTrace) {
+  _getHtmlContent(nonce, name, version, format, workspace, repo, slugPerm, statusReason, packageUrl, policyTrace) {
     // Determine if this is vulnerability-related by checking for CVE references in decision logs
     const hasCVEs = policyTrace.decisionLogs.some(entry =>
       (entry.reason && /CVE-/i.test(entry.reason)) ||
@@ -323,7 +324,7 @@ class QuarantineExplainProvider {
 
   <div class="actions">
     <button data-command="findSafeVersion">Find safe version</button>
-    ${selfUrl ? `<button data-command="openInCloudsmith">View in Cloudsmith</button>` : ""}
+    ${packageUrl ? `<button data-command="openInCloudsmith">View in Cloudsmith</button>` : ""}
     ${hasCVEs ? `<button data-command="showVulnerabilities">Show vulnerabilities</button>` : ""}
     <button data-command="copyReport">Copy quarantine report</button>
   </div>
