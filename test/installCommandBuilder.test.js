@@ -483,6 +483,7 @@ suite("InstallCommandBuilder Test Suite", () => {
       "https://user:password@dl.cloudsmith.io/file",
       "https://dl.cloudsmith.io/file#fragment",
       "https://dl.cloudsmith.io/file with spaces",
+      "https://dl.cloudsmith.io/file'name",
       "https:\\dl.cloudsmith.io\\file",
       "not a URL",
     ];

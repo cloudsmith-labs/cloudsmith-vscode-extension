@@ -257,10 +257,11 @@ class InstallCommandBuilder {
       || value !== value.trim()
       || ASCII_CONTROL_PATTERN.test(value)
       || /[\\\s]/.test(value)
+      || value.includes("'")
     ) {
       throw new InstallCommandValidationError(
         "Raw download URL",
-        "must be a well-formed HTTPS Cloudsmith download URL without whitespace or backslashes."
+        "must be a well-formed HTTPS Cloudsmith download URL without whitespace, backslashes, or apostrophes."
       );
     }
 
