@@ -5,6 +5,7 @@ const vscode = require("vscode");
 const path = require("path");
 const PackageDetailsNode = require("./packageDetailsNode");
 const { LicenseClassifier } = require("../util/licenseClassifier");
+const { getPackageVulnerabilityCount } = require("../util/packageVulnerabilities");
 
 class SearchResultNode {
     constructor(pkg, context) {
@@ -47,18 +48,10 @@ class SearchResultNode {
         this.slug_perm_raw = (typeof pkg.slug_perm === 'object' && pkg.slug_perm !== null && pkg.slug_perm.value)
             ? pkg.slug_perm.value
             : pkg.slug_perm;
-        this.num_vulnerabilities = pkg.num_vulnerabilities || 0;
+        this.num_vulnerabilities = getPackageVulnerabilityCount(pkg);
         this.max_severity = pkg.max_severity || null;
         this.vulnerability_scan_results_url = pkg.vulnerability_scan_results_url || null;
         this.security_scan_status = pkg.security_scan_status || null;
-
-        // If the list endpoint didn't include num_vulnerabilities but the scan status
-        // indicates vulnerabilities were detected, set a flag so the summary node appears.
-        if (this.num_vulnerabilities === 0 && this.security_scan_status &&
-            this.security_scan_status.toLowerCase().includes("detected")) {
-            this.num_vulnerabilities = -1; // sentinel: "has vulns but count unknown"
-            this.max_severity = this.max_severity || "Unknown";
-        }
 
         // License fields from API response (may be absent in list endpoint)
         this.licenseInfo = LicenseClassifier.inspect(pkg);

@@ -1,6 +1,7 @@
 const assert = require("assert");
 const vscode = require("vscode");
 const UpstreamIndicatorNode = require("../models/upstreamIndicatorNode");
+const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
 
 suite("RepositoryNode Test Suite", () => {
@@ -11,6 +12,7 @@ suite("RepositoryNode Test Suite", () => {
   let upstreamChecker;
   let originalGetAllUpstreamData;
   let originalGetUpstreamDataForFormats;
+  let originalApiGet;
   const terraformExporterPath = require.resolve("../util/terraformExporter");
 
   const context = {
@@ -31,6 +33,7 @@ suite("RepositoryNode Test Suite", () => {
     RepositoryNode = require(repositoryNodePath);
     originalGetAllUpstreamData = upstreamChecker.getAllUpstreamData;
     originalGetUpstreamDataForFormats = upstreamChecker.getUpstreamDataForFormats;
+    originalApiGet = CloudsmithAPI.prototype.get;
 
     vscode.workspace.getConfiguration = () => ({
       get(key) {
@@ -46,6 +49,7 @@ suite("RepositoryNode Test Suite", () => {
     vscode.workspace.getConfiguration = originalGetConfiguration;
     upstreamChecker.getAllUpstreamData = originalGetAllUpstreamData;
     upstreamChecker.getUpstreamDataForFormats = originalGetUpstreamDataForFormats;
+    CloudsmithAPI.prototype.get = originalApiGet;
     delete require.cache[terraformExporterPath];
     delete require.cache[repositoryNodePath];
     delete require.cache[upstreamCheckerPath];
@@ -189,5 +193,59 @@ suite("RepositoryNode Test Suite", () => {
 
     assert.ok(children[0] instanceof UpstreamIndicatorNode);
     assert.strictEqual(children[0].getTreeItem().label, "Upstreams: 1 active of 1 configured");
+  });
+
+  test("repository packages do not expose vulnerability nodes for clean npm and Python scans", async () => {
+    const packageBase = {
+      namespace: "acme",
+      repository: "packages",
+      status_str: "Completed",
+      downloads: 0,
+      uploaded_at: "2026-08-07T00:00:00Z",
+    };
+
+    CloudsmithAPI.prototype.get = async () => ([
+      {
+        ...packageBase,
+        name: "clean-npm",
+        format: "npm",
+        slug: "clean-npm",
+        slug_perm: "clean-npm-perm",
+        version: "1.0.0",
+        security_scan_status: "Scan Detected No Vulnerabilities",
+      },
+      {
+        ...packageBase,
+        name: "clean-python",
+        format: "python",
+        slug: "clean-python",
+        slug_perm: "clean-python-perm",
+        version: "2.0.0",
+        num_vulnerabilities: "0",
+        security_scan_status: "Scan Detected No Vulnerabilities",
+      },
+    ]);
+
+    const repositoryNode = new RepositoryNode(
+      { slug: "packages", slug_perm: "packages", name: "Packages" },
+      "acme",
+      context
+    );
+
+    const packages = await repositoryNode.getPackages();
+
+    assert.strictEqual(packages.length, 2);
+    for (const packageNode of packages) {
+      const children = packageNode.getChildren();
+      assert.strictEqual(
+        children.some(child => child.getTreeItem().contextValue === "vulnerabilitySummary"),
+        false,
+        `${packageNode.format} package exposed a false vulnerability summary`
+      );
+      assert.strictEqual(
+        children.some(child => String(child.getTreeItem().label).includes("Vulnerabilities: detected")),
+        false
+      );
+    }
   });
 });
