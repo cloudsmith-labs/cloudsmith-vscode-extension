@@ -113,18 +113,19 @@ function buildDependencyDeclarationIndex({
 /** Validate source/ecosystem compatibility without parsing the source text. */
 function validateDependencyDeclarationSourceContract(sourceType, ecosystem) {
   const normalizedType = String(sourceType || "").trim().toLowerCase();
-  const rawEcosystem = String(ecosystem || "").trim().toLowerCase();
+  const normalizedEcosystem = String(ecosystem || "").trim().toLowerCase();
+  const format = canonicalFormat(normalizedEcosystem);
   const requiredEcosystem = EXACT_SOURCE_ECOSYSTEMS.get(normalizedType);
-  if (requiredEcosystem && rawEcosystem !== requiredEcosystem) {
+  if (requiredEcosystem && normalizedEcosystem !== requiredEcosystem) {
     throw new DependencyDeclarationIndexError(
-      `Dependency source type ${normalizedType} is incompatible with ecosystem ${rawEcosystem || "<missing>"}.`,
+      `Dependency source type ${normalizedType} is incompatible with ecosystem ${normalizedEcosystem || "<missing>"}.`,
       "ERR_DEPENDENCY_DECLARATION_SOURCE_CONTRACT"
     );
   }
   return Object.freeze({
     sourceType: normalizedType,
-    ecosystem: rawEcosystem,
-    format: canonicalFormat(ecosystem),
+    ecosystem: normalizedEcosystem,
+    format,
   });
 }
 

@@ -21,7 +21,9 @@ const {
 const DependencyHealthNode = require("../models/dependencyHealthNode");
 const {
   buildDependencyDeclarationIndex,
+  validateDependencyDeclarationSourceContract,
 } = require("../util/dependencyDeclarationIndex");
+const { canonicalFormat } = require("../util/packageNameNormalizer");
 
 suite("DiagnosticsPublisher Test Suite", () => {
   let originalCreateDiagnosticCollection;
@@ -157,6 +159,80 @@ suite("DiagnosticsPublisher Test Suite", () => {
     });
     return { occurrence, prepared };
   }
+
+  test("derives dependency source contract fields from one normalized ecosystem", () => {
+    const cases = [
+      {
+        sourceType: "package.json",
+        ecosystem: "npm",
+        expectedSourceType: "package.json",
+        expectedEcosystem: "npm",
+        expectedFormat: "npm",
+      },
+      {
+        sourceType: " PACKAGE.JSON ",
+        ecosystem: " NPM ",
+        expectedSourceType: "package.json",
+        expectedEcosystem: "npm",
+        expectedFormat: "npm",
+      },
+      {
+        sourceType: "requirements.txt",
+        ecosystem: " PyPI ",
+        expectedSourceType: "requirements.txt",
+        expectedEcosystem: "pypi",
+        expectedFormat: "python",
+      },
+      {
+        sourceType: "build.gradle",
+        ecosystem: "Gradle",
+        expectedSourceType: "build.gradle",
+        expectedEcosystem: "gradle",
+        expectedFormat: "maven",
+      },
+    ];
+
+    for (const fixture of cases) {
+      const result = validateDependencyDeclarationSourceContract(
+        fixture.sourceType,
+        fixture.ecosystem
+      );
+
+      assert.strictEqual(result.sourceType, fixture.expectedSourceType);
+      assert.strictEqual(result.ecosystem, fixture.expectedEcosystem);
+      assert.strictEqual(result.format, fixture.expectedFormat);
+      assert.strictEqual(result.format, canonicalFormat(result.ecosystem));
+      assert.strictEqual(Object.isFrozen(result), true);
+    }
+  });
+
+  test("does not reuse stale ecosystem input after contract normalization", () => {
+    let coercions = 0;
+    const ecosystem = {
+      toString() {
+        coercions += 1;
+        return coercions === 1 ? " PyPI " : "npm";
+      },
+    };
+
+    const result = validateDependencyDeclarationSourceContract("requirements.txt", ecosystem);
+
+    assert.strictEqual(coercions, 1);
+    assert.strictEqual(result.ecosystem, "pypi");
+    assert.strictEqual(result.format, "python");
+    assert.strictEqual(result.format, canonicalFormat(result.ecosystem));
+  });
+
+  test("rejects incompatible dependency source ecosystem contracts", () => {
+    assert.throws(
+      () => validateDependencyDeclarationSourceContract("package.json", "maven"),
+      (error) => (
+        error
+        && error.code === "ERR_DEPENDENCY_DECLARATION_SOURCE_CONTRACT"
+        && /source type package\.json is incompatible with ecosystem maven/.test(error.message)
+      )
+    );
+  });
 
   test("uses npm provenance and never guesses across same-format manifests", async () => {
     const firstPath = "/project/app/package.json";
