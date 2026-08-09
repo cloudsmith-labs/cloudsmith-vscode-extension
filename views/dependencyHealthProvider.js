@@ -2,8 +2,10 @@
 const path = require("path");
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
-const { LockfileResolver } = require("../util/lockfileResolver");
-const { ManifestParser } = require("../util/manifestParser");
+const {
+  ADAPTER_RESULT_STATUSES,
+  createDefaultDependencyAdapterRegistry,
+} = require("../util/dependencyAdapterRegistry");
 const { PaginatedFetch } = require("../util/paginatedFetch");
 const { SearchQueryBuilder } = require("../util/searchQueryBuilder");
 const { LicenseClassifier } = require("../util/licenseClassifier");
@@ -80,6 +82,7 @@ class DependencyHealthProvider {
       fetchRepositories: options.fetchRepositories || null,
       upstreamPullService: options.upstreamPullService || new UpstreamPullService(context),
     };
+    this._dependencyAdapters = options.dependencyAdapters || createDefaultDependencyAdapterRegistry();
     this._reportDateFactory = typeof options.reportDateFactory === "function"
       ? options.reportDateFactory
       : () => new Date();
@@ -561,7 +564,7 @@ class DependencyHealthProvider {
 
   async _performScan(cloudsmithWorkspace, cloudsmithRepo, folderPath, progress, token) {
     progress.report({ message: "Parsing lockfiles..." });
-    this._lastManifests = await ManifestParser.detectManifests(folderPath);
+    this._lastManifests = await this._dependencyAdapters.detectManifests(folderPath);
     if (token.isCancellationRequested) {
       return { canceled: true };
     }
@@ -571,7 +574,7 @@ class DependencyHealthProvider {
     const warnings = [];
 
     if (resolveTransitives) {
-      const detections = await LockfileResolver.detectResolvers(folderPath);
+      const detections = await this._dependencyAdapters.detect(folderPath);
       if (token.isCancellationRequested) {
         return { canceled: true };
       }
@@ -579,24 +582,31 @@ class DependencyHealthProvider {
         if (token.isCancellationRequested) {
           return { canceled: true };
         }
-        try {
-          const tree = await LockfileResolver.resolve(
-            detection.resolverName,
-            detection.lockfilePath,
-            detection.manifestPath,
-            {
-              workspaceFolder: folderPath,
-              maxDependenciesToScan: this._getMaxDependenciesToScan(),
-            }
-          );
-          if (tree) {
-            trees.push(tree);
-            if (Array.isArray(tree.warnings) && tree.warnings.length > 0) {
-              warnings.push(...tree.warnings);
-            }
+        const result = await this._dependencyAdapters.parse(detection, {
+          workspaceFolder: folderPath,
+          maxDependenciesToScan: this._getMaxDependenciesToScan(),
+        });
+        if (result.status === ADAPTER_RESULT_STATUSES.ERROR) {
+          warnings.push(result.error && result.error.message
+            ? result.error.message
+            : "A dependency adapter failed.");
+          continue;
+        }
+        if (
+          result.status === ADAPTER_RESULT_STATUSES.SUCCESS
+          || result.status === ADAPTER_RESULT_STATUSES.PARTIAL
+        ) {
+          trees.push({
+            adapterId: result.adapterId,
+            ecosystem: result.ecosystem,
+            sourceFile: result.sourceFile,
+            source: result.source,
+            dependencies: result.dependencies,
+            warnings: result.warnings,
+          });
+          if (result.warnings.length > 0) {
+            warnings.push(...result.warnings);
           }
-        } catch (error) {
-          warnings.push(error && error.message ? error.message : "A lockfile parser failed.");
         }
       }
     }
@@ -685,28 +695,23 @@ class DependencyHealthProvider {
   async _buildManifestFallbackTrees(manifests) {
     const trees = [];
     for (const manifest of manifests) {
-      const parsed = await ManifestParser.parseManifest(manifest);
-      if (!Array.isArray(parsed) || parsed.length === 0) {
+      const result = await this._dependencyAdapters.parseManifest(manifest);
+      if (
+        ![
+          ADAPTER_RESULT_STATUSES.SUCCESS,
+          ADAPTER_RESULT_STATUSES.PARTIAL,
+        ].includes(result.status)
+        || result.dependencies.length === 0
+      ) {
         continue;
       }
       trees.push({
-        ecosystem: manifest.format,
-        sourceFile: path.basename(manifest.filePath),
-        dependencies: parsed.map((dependency) => ({
-          name: dependency.name,
-          version: dependency.version,
-          ecosystem: manifest.format,
-          format: canonicalFormat(manifest.format),
-          isDirect: true,
-          parent: null,
-          parentChain: [],
-          transitives: [],
-          cloudsmithStatus: "CHECKING",
-          cloudsmithPackage: null,
-          sourceFile: path.basename(manifest.filePath),
-          devDependency: Boolean(dependency.devDependency),
-          isDevelopmentDependency: Boolean(dependency.devDependency),
-        })),
+        adapterId: result.adapterId,
+        ecosystem: result.ecosystem,
+        sourceFile: result.sourceFile || path.basename(manifest.filePath),
+        source: result.source,
+        dependencies: result.dependencies,
+        warnings: result.warnings,
       });
     }
     return trees;
@@ -1808,21 +1813,27 @@ function setCachedPackageIndexValue(cacheKey, value) {
 
 function normalizeTree(tree) {
   return {
+    ...tree,
     ecosystem: tree.ecosystem,
     sourceFile: tree.sourceFile,
     dependencies: deduplicateDependenciesWithStatus(
       (tree.dependencies || []).map((dependency) => normalizeDependency(dependency, tree))
     ),
+    warnings: Array.isArray(tree.warnings) ? tree.warnings.slice() : [],
   };
 }
 
 function normalizeDependency(dependency, tree) {
   const ecosystem = dependency.ecosystem || tree.ecosystem;
   const format = dependency.format || canonicalFormat(ecosystem);
+  const compatibilityVersion = Object.prototype.hasOwnProperty.call(dependency, "legacyVersion")
+    ? dependency.legacyVersion
+    : dependency.version;
   return {
     ...dependency,
     ecosystem,
     format,
+    version: String(compatibilityVersion || ""),
     sourceFile: dependency.sourceFile || tree.sourceFile,
     parent: dependency.parent || null,
     parentChain: Array.isArray(dependency.parentChain) ? dependency.parentChain.slice() : [],

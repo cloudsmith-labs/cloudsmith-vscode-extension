@@ -35,6 +35,7 @@ function parsePackageJsonManifest(content) {
       dependencies.push({
         name,
         version: normalizeVersion(version),
+        declaredConstraint: String(version || "").trim() || null,
         isDevelopmentDependency,
       });
       if (isDevelopmentDependency) {
@@ -142,14 +143,16 @@ function parsePyprojectManifest(content) {
       }
 
       const rawValue = parts.value;
-      const version = rawValue.startsWith("{")
-        ? normalizeVersion(parseInlineTomlValue(rawValue, "version"))
-        : normalizeVersion(unquote(rawValue));
+      const declaredConstraint = rawValue.startsWith("{")
+        ? parseInlineTomlValue(rawValue, "version")
+        : unquote(rawValue);
+      const version = normalizeVersion(declaredConstraint);
       const isDevelopmentDependency = section !== "[tool.poetry.dependencies]";
 
       dependencies.push({
         name,
         version: version === "*" ? "" : version,
+        declaredConstraint: declaredConstraint === "*" ? null : declaredConstraint || null,
         isDevelopmentDependency,
       });
 
@@ -184,6 +187,7 @@ function parseRequirementSpec(spec) {
   return {
     name: match[1],
     version: normalizeVersion(match[2] || ""),
+    declaredConstraint: String(match[2] || "").trim() || null,
   };
 }
 
