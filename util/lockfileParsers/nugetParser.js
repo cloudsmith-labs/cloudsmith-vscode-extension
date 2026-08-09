@@ -1,5 +1,4 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
-const fs = require("fs");
 const path = require("path");
 const {
   buildTree,
@@ -9,6 +8,7 @@ const {
   getSourceFileName,
   getWorkspacePath,
   pathExists,
+  readBoundedDirectoryEntries,
   readJson,
   readUtf8,
   resolveWorkspaceFilePath,
@@ -30,7 +30,11 @@ const nugetParser = {
     if (!safeRootPath) {
       return [];
     }
-    const entries = await fs.promises.readdir(safeRootPath);
+    const directory = await readBoundedDirectoryEntries(safeRootPath);
+    const entries = directory.entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name)
+      .sort((left, right) => left.localeCompare(right));
     const csprojPath = entries.find((entry) => entry.toLowerCase().endsWith(".csproj"));
     const lockfilePath = await pathExists(path.join(safeRootPath, "packages.lock.json"), workspaceFolder)
       ? path.join(safeRootPath, "packages.lock.json")
@@ -79,55 +83,59 @@ const nugetParser = {
       throw new Error("Malformed packages.lock.json: missing dependencies object");
     }
 
-    const recordsByName = new Map();
-    for (const frameworkDependencies of Object.values(dependencyRoot)) {
+    const dependencies = [];
+    for (const [targetFramework, frameworkDependencies] of Object.entries(dependencyRoot)) {
       if (!frameworkDependencies || typeof frameworkDependencies !== "object") {
         continue;
       }
+
+      const recordsByName = new Map();
       for (const [name, details] of Object.entries(frameworkDependencies)) {
         const dependencies = details && details.dependencies && typeof details.dependencies === "object"
           ? Object.keys(details.dependencies)
           : [];
-        const existing = recordsByName.get(name.toLowerCase());
         recordsByName.set(name.toLowerCase(), {
           name,
           version: details.resolved || "",
-          dependencies: deduplicateStringValues([...(existing ? existing.dependencies : []), ...dependencies]),
-          isDirect: Boolean(existing && existing.isDirect) || String(details.type || "").toLowerCase() === "direct",
+          dependencies: deduplicateStringValues(dependencies),
+          isDirect: String(details.type || "").toLowerCase() === "direct",
+          targetFramework,
         });
       }
-    }
 
-    const rootRecords = manifestDependencies.length > 0
-      ? manifestDependencies.map((dependency) => recordsByName.get(dependency.name.toLowerCase())).filter(Boolean)
-      : [...recordsByName.values()].filter((record) => record.isDirect);
+      const rootRecords = manifestDependencies.length > 0
+        ? manifestDependencies.map((dependency) => recordsByName.get(dependency.name.toLowerCase())).filter(Boolean)
+        : [...recordsByName.values()].filter((record) => record.isDirect);
 
-    const directRoots = deduplicateDeps(rootRecords.map((record) => buildNugetDependency(
-      record,
-      [],
-      recordsByName,
-      new Set(),
-      sourceFile,
-      directNames
-    )));
-    let dependencies = deduplicateDeps(flattenDependencies(directRoots));
-
-    for (const record of recordsByName.values()) {
-      const key = `${record.name.toLowerCase()}@${record.version.toLowerCase()}`;
-      if (dependencies.some((dependency) => `${dependency.name.toLowerCase()}@${dependency.version.toLowerCase()}` === key)) {
-        continue;
-      }
-      dependencies.push(createDependency({
-        name: record.name,
-        version: record.version,
-        ecosystem: "nuget",
-        isDirect: directNames.has(record.name.toLowerCase()) || record.isDirect,
-        parent: null,
-        parentChain: [],
-        transitives: [],
+      const directRoots = deduplicateDeps(rootRecords.map((record) => buildNugetDependency(
+        record,
+        [],
+        recordsByName,
+        new Set(),
         sourceFile,
-        isDevelopmentDependency: false,
-      }));
+        directNames
+      )));
+      const frameworkResults = deduplicateDeps(flattenDependencies(directRoots));
+
+      for (const record of recordsByName.values()) {
+        const key = `${record.name.toLowerCase()}@${record.version.toLowerCase()}`;
+        if (frameworkResults.some((dependency) => `${dependency.name.toLowerCase()}@${dependency.version.toLowerCase()}` === key)) {
+          continue;
+        }
+        frameworkResults.push(createNugetDependency({
+          name: record.name,
+          version: record.version,
+          ecosystem: "nuget",
+          isDirect: directNames.has(record.name.toLowerCase()) || record.isDirect,
+          parent: null,
+          parentChain: [],
+          transitives: [],
+          sourceFile,
+          isDevelopmentDependency: false,
+        }, targetFramework));
+      }
+
+      dependencies.push(...frameworkResults);
     }
 
     return buildTree("nuget", sourceFile, dependencies);
@@ -137,7 +145,7 @@ const nugetParser = {
 function buildNugetDependency(record, parentChain, recordsByName, visiting, sourceFile, directNames) {
   const key = `${record.name.toLowerCase()}@${record.version.toLowerCase()}`;
   if (visiting.has(key)) {
-    return createDependency({
+    return createNugetDependency({
       name: record.name,
       version: record.version,
       ecosystem: "nuget",
@@ -147,7 +155,7 @@ function buildNugetDependency(record, parentChain, recordsByName, visiting, sour
       transitives: [],
       sourceFile,
       isDevelopmentDependency: false,
-    });
+    }, record.targetFramework);
   }
 
   const nextVisiting = new Set(visiting);
@@ -170,7 +178,7 @@ function buildNugetDependency(record, parentChain, recordsByName, visiting, sour
     ));
   }
 
-  return createDependency({
+  return createNugetDependency({
     name: record.name,
     version: record.version,
     ecosystem: "nuget",
@@ -180,7 +188,14 @@ function buildNugetDependency(record, parentChain, recordsByName, visiting, sour
     transitives: deduplicateDeps(transitives),
     sourceFile,
     isDevelopmentDependency: false,
-  });
+  }, record.targetFramework);
+}
+
+function createNugetDependency(values, targetFramework) {
+  return {
+    ...createDependency(values),
+    targetFramework: String(targetFramework || "").trim() || null,
+  };
 }
 
 function deduplicateStringValues(values) {

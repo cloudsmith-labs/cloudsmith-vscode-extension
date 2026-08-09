@@ -13,7 +13,7 @@ const {
   parseDartArchiveUrl,
   resolveAndValidateRegistryUrl,
 } = require("./registryEndpoints");
-const { canonicalFormat } = require("./packageNameNormalizer");
+const { canonicalFormat, normalizePackageName } = require("./packageNameNormalizer");
 const { UpstreamChecker } = require("./upstreamChecker");
 const { normalizeUpstreamFormat } = require("./upstreamFormats");
 
@@ -79,7 +79,7 @@ class UpstreamPullService {
   }) {
     const uncoveredDependencies = dedupePullDependencies(
       (Array.isArray(dependencies) ? dependencies : [])
-        .filter((dependency) => dependency && dependency.cloudsmithStatus !== "FOUND")
+        .filter((dependency) => dependency && isConclusiveCloudsmithAbsence(dependency.cloudsmithStatus))
     );
 
     if (!workspace) {
@@ -184,6 +184,13 @@ class UpstreamPullService {
 
     if (!normalizedDependency) {
       await this._showWarningMessage("Could not determine the dependency details to pull.");
+      return null;
+    }
+
+    if (!isConclusiveCloudsmithAbsence(normalizedDependency.cloudsmithStatus)) {
+      await this._showWarningMessage(
+        "This dependency cannot be pulled because Cloudsmith package absence was not conclusively established."
+      );
       return null;
     }
 
@@ -1012,11 +1019,18 @@ function dedupePullDependencies(dependencies) {
   return [...unique.values()];
 }
 
+function isConclusiveCloudsmithAbsence(status) {
+  return status === "ABSENT" || status === "NOT_FOUND";
+}
+
 function pullDependencyKey(dependency) {
+  const format = String(
+    canonicalFormat(dependency && (dependency.format || dependency.ecosystem)) || ""
+  ).toLowerCase();
   return [
-    String(canonicalFormat(dependency && (dependency.format || dependency.ecosystem)) || "").toLowerCase(),
-    String(dependency && dependency.name || "").toLowerCase(),
-    String(dependency && dependency.version || "").toLowerCase(),
+    format,
+    normalizePackageName(dependency && dependency.name, format),
+    String(dependency && dependency.version || "").trim(),
   ].join(":");
 }
 

@@ -26,13 +26,15 @@ class DependencyHealthNode {
     this.resolutionSource = dep.resolutionSource || null;
     this.sourceManifest = dep.sourceManifest || null;
     this.normalizedName = dep.normalizedName || null;
+    this.cloudsmithLookupDetail = dep.cloudsmithLookupDetail || null;
     this.legacyVersion = Object.prototype.hasOwnProperty.call(dep, "legacyVersion")
       ? dep.legacyVersion
       : dep.version;
     // Retained for existing display and diagnostic consumers during M4 migration.
-    this.declaredVersion = Object.prototype.hasOwnProperty.call(dep, "version")
-      ? dep.version
-      : dep.legacyVersion;
+    this.declaredVersion = this.resolvedVersion
+      || (this.versionState === "exact-declaration" ? this.legacyVersion : null)
+      || this.declaredConstraint
+      || (Object.prototype.hasOwnProperty.call(dep, "version") ? dep.version : dep.legacyVersion);
     this.format = dep.format || canonicalFormat(dep.ecosystem);
     this.ecosystem = dep.ecosystem || this.format;
     this.sourceFile = dep.sourceFile || null;
@@ -104,8 +106,24 @@ class DependencyHealthNode {
       return "checking";
     }
 
-    if (this.cloudsmithStatus !== "FOUND" || !this.cloudsmithMatch) {
+    if (this.cloudsmithStatus === "ABSENT" || this.cloudsmithStatus === "NOT_FOUND") {
       return "not_found";
+    }
+
+    if (this.cloudsmithStatus === "UNRESOLVED") {
+      return "unresolved";
+    }
+
+    if (this.cloudsmithStatus === "LOOKUP_FAILED") {
+      return "lookup_failed";
+    }
+
+    if (this.cloudsmithStatus === "LOOKUP_INCOMPLETE" || this.cloudsmithStatus === "RATE_LIMITED") {
+      return "lookup_incomplete";
+    }
+
+    if (this.cloudsmithStatus !== "FOUND" || !this.cloudsmithMatch) {
+      return "unknown";
     }
 
     if (this._isQuarantined()) {
@@ -186,7 +204,7 @@ class DependencyHealthNode {
       return "dependencyHealthSyncing";
     }
 
-    if (this.cloudsmithStatus !== "FOUND") {
+    if (this.cloudsmithStatus === "ABSENT" || this.cloudsmithStatus === "NOT_FOUND") {
       if (this.upstreamStatus === "reachable") {
         return "dependencyHealthUpstreamReachable";
       }
@@ -196,6 +214,10 @@ class DependencyHealthNode {
       }
 
       return "dependencyHealthMissing";
+    }
+
+    if (this.cloudsmithStatus !== "FOUND") {
+      return "dependencyHealthUnknown";
     }
 
     if (this._isQuarantined()) {
@@ -216,7 +238,10 @@ class DependencyHealthNode {
 
     if (this.cloudsmithStatus !== "FOUND") {
       return getFormatIconPath(this.format, this.context && this.context.extensionPath, {
-        fallbackIcon: new vscode.ThemeIcon("package", new vscode.ThemeColor("descriptionForeground")),
+        fallbackIcon: new vscode.ThemeIcon(
+          this.state === "not_found" ? "package" : "question",
+          new vscode.ThemeColor("descriptionForeground")
+        ),
       });
     }
 
@@ -240,7 +265,7 @@ class DependencyHealthNode {
   }
 
   _buildVersionPrefix() {
-    return this.declaredVersion ? this.declaredVersion : "Unknown version";
+    return this.declaredVersion || "Unknown version";
   }
 
   _buildVulnerabilityDescription() {
@@ -266,7 +291,21 @@ class DependencyHealthNode {
   }
 
   _buildMissingDescription() {
-    return "Not found in Cloudsmith";
+    switch (this.cloudsmithStatus) {
+      case "ABSENT":
+      case "NOT_FOUND":
+        return "Not found in Cloudsmith";
+      case "UNRESOLVED":
+        return "Version unresolved";
+      case "LOOKUP_FAILED":
+        return "Cloudsmith lookup failed";
+      case "LOOKUP_INCOMPLETE":
+        return "Cloudsmith lookup incomplete";
+      case "RATE_LIMITED":
+        return "Cloudsmith lookup rate limited";
+      default:
+        return "Cloudsmith status unknown";
+    }
   }
 
   _buildDescription() {
@@ -305,7 +344,7 @@ class DependencyHealthNode {
   }
 
   _buildTooltip() {
-    const lines = [`${this.name} ${this.declaredVersion || ""}`.trim()];
+    const lines = [`${this.name} ${this._buildVersionPrefix()}`.trim()];
     lines.push(`Format: ${this.format}`);
     lines.push(`Relationship: ${this._getRelationshipLabel()}`);
     if (this.isDev) {
@@ -316,12 +355,17 @@ class DependencyHealthNode {
 
     if (this.cloudsmithStatus === "CHECKING") {
       lines.push("Coverage check in progress.");
-    } else if (this.cloudsmithStatus !== "FOUND" || !this.cloudsmithMatch) {
+    } else if (this.cloudsmithStatus === "ABSENT" || this.cloudsmithStatus === "NOT_FOUND") {
       lines.push("Not found in the configured Cloudsmith workspace.");
       if (this.upstreamDetail) {
         lines.push(this.upstreamDetail);
       } else {
         lines.push("This package may need to be uploaded or fetched through an upstream.");
+      }
+    } else if (this.cloudsmithStatus !== "FOUND" || !this.cloudsmithMatch) {
+      lines.push(this._buildMissingDescription() + ".");
+      if (this.cloudsmithLookupDetail) {
+        lines.push(this.cloudsmithLookupDetail);
       }
     } else {
       lines.push(`Found in Cloudsmith (${this.cloudsmithMatch.repository})`);

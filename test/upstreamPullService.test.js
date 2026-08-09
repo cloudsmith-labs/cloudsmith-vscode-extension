@@ -117,6 +117,50 @@ suite("UpstreamPullService", () => {
     );
   });
 
+  test("prepare preserves exact versions that differ only by prerelease identifier case", async () => {
+    const service = new UpstreamPullService({}, {
+      fetchRepositories: async () => [{ slug: "repo", name: "Repo" }],
+      upstreamChecker: {
+        async getRepositoryUpstreamState() {
+          return {
+            groupedUpstreams: new Map([
+              ["npm", [{ name: "npm", is_active: true }]],
+            ]),
+          };
+        },
+      },
+      showQuickPick: async (items) => items[0],
+      showWarningMessage: async (_message, _options, action) => action,
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+    });
+
+    const prepared = await service.prepare({
+      workspace: "workspace",
+      repositoryHint: "repo",
+      dependencies: [
+        {
+          name: "shared-package",
+          version: "1.0.0-alpha",
+          format: "npm",
+          cloudsmithStatus: "ABSENT",
+        },
+        {
+          name: "shared-package",
+          version: "1.0.0-ALPHA",
+          format: "npm",
+          cloudsmithStatus: "ABSENT",
+        },
+      ],
+    });
+
+    assert.ok(prepared);
+    assert.deepStrictEqual(
+      prepared.plan.pullableDependencies.map((dependency) => dependency.version),
+      ["1.0.0-alpha", "1.0.0-ALPHA"]
+    );
+  });
+
   test("pulls Python dependencies via same-host redirects using manual auth-preserving requests", async () => {
     const calls = [];
     const initialIndexUrl = "https://dl.cloudsmith.io/basic/workspace/repo/python/simple/requests/";
@@ -308,5 +352,30 @@ suite("UpstreamPullService", () => {
     assert.strictEqual(quickPickCalls[0][0].label, "repo-b");
     assert.match(quickPickCalls[0][0].detail, /Python upstream \(PyPI\)/);
     assert.strictEqual(warningCalls, 0);
+  });
+
+  test("does not offer uncertain dependencies for upstream pull", async () => {
+    const warnings = [];
+    const service = new UpstreamPullService({}, {
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+      showWarningMessage: async (message) => warnings.push(message),
+    });
+
+    for (const cloudsmithStatus of ["UNRESOLVED", "LOOKUP_FAILED", "LOOKUP_INCOMPLETE", "RATE_LIMITED"]) {
+      const prepared = await service.prepareSingle({
+        workspace: "workspace",
+        dependency: {
+          name: "requests",
+          version: "2.31.0",
+          format: "python",
+          cloudsmithStatus,
+        },
+      });
+      assert.strictEqual(prepared, null);
+    }
+
+    assert.strictEqual(warnings.length, 4);
+    assert.ok(warnings.every((message) => /absence was not conclusively established/.test(message)));
   });
 });

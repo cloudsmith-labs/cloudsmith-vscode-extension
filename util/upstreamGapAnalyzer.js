@@ -8,7 +8,7 @@ const UPSTREAM_REPO_CONCURRENCY = 5;
 function getUncoveredDependencyKey(dependency) {
   const format = canonicalFormat(dependency && (dependency.format || dependency.ecosystem));
   const normalizedName = normalizePackageName(dependency && dependency.name, format);
-  const version = String(dependency && dependency.version || "").trim().toLowerCase();
+  const version = String(dependency && dependency.version || "").trim();
 
   if (!format || !normalizedName) {
     return null;
@@ -91,7 +91,7 @@ function buildGapPatch(uncoveredDependencies, snapshots) {
   const patchMap = new Map();
 
   for (const dependency of Array.isArray(uncoveredDependencies) ? uncoveredDependencies : []) {
-    if (dependency.cloudsmithStatus !== "NOT_FOUND") {
+    if (!["ABSENT", "NOT_FOUND"].includes(dependency.cloudsmithStatus)) {
       continue;
     }
 

@@ -49,29 +49,33 @@ const gradleParser = {
   },
 
   async resolve({ lockfilePath, manifestPath, workspaceFolder }) {
-    const directDependencies = parseBuildGradleManifest(await readUtf8(manifestPath, workspaceFolder));
+    const manifestContent = await readUtf8(manifestPath, workspaceFolder);
+    const directDependencies = parseGradleManifest(manifestContent);
     const sourceFile = getSourceFileName(manifestPath);
 
     if (!lockfilePath) {
-      return buildTree("gradle", sourceFile, directDependencies.map((dependency) => createDependency({
-        name: dependency.name,
-        version: dependency.version,
-        ecosystem: "gradle",
-        isDirect: true,
-        parent: null,
-        parentChain: [],
-        transitives: [],
-        sourceFile,
-        isDevelopmentDependency: dependency.isDevelopmentDependency,
-      })));
+      return buildTree("gradle", sourceFile, directDependencies.map((dependency) => (
+        createGradleDependency({
+          name: dependency.name,
+          version: dependency.version,
+          ecosystem: "gradle",
+          isDirect: true,
+          parent: null,
+          parentChain: [],
+          transitives: [],
+          sourceFile,
+          isDevelopmentDependency: dependency.isDevelopmentDependency,
+        }, dependency, false)
+      )));
     }
 
     const lockVersions = parseGradleLockfile(await readUtf8(lockfilePath, workspaceFolder));
     const dependencies = [];
 
     for (const directDependency of directDependencies) {
-      const resolvedVersion = lockVersions.get(directDependency.name) || directDependency.version;
-      dependencies.push(createDependency({
+      const hasResolutionEvidence = lockVersions.has(directDependency.name);
+      const resolvedVersion = hasResolutionEvidence ? lockVersions.get(directDependency.name) : "";
+      dependencies.push(createGradleDependency({
         name: directDependency.name,
         version: resolvedVersion,
         ecosystem: "gradle",
@@ -81,11 +85,11 @@ const gradleParser = {
         transitives: [],
         sourceFile,
         isDevelopmentDependency: directDependency.isDevelopmentDependency,
-      }));
+      }, directDependency, hasResolutionEvidence));
     }
 
     for (const [name, version] of lockVersions.entries()) {
-      dependencies.push(createDependency({
+      dependencies.push(createGradleDependency({
         name,
         version,
         ecosystem: "gradle",
@@ -95,7 +99,7 @@ const gradleParser = {
         transitives: [],
         sourceFile,
         isDevelopmentDependency: false,
-      }));
+      }, null, true));
     }
 
     return buildTree("gradle", sourceFile, deduplicateDeps(dependencies));
@@ -119,6 +123,77 @@ function parseGradleLockfile(content) {
   }
 
   return versions;
+}
+
+function parseGradleManifest(content) {
+  const dependencies = parseBuildGradleManifest(content);
+  const declarations = new Map();
+
+  for (const rawLine of String(content || "").split(/\r?\n/)) {
+    const line = rawLine.replace(/\/\/.*$/, "").trim();
+    const match = line.match(/^([A-Za-z][A-Za-z0-9_-]*)\s*\(?\s*["']([^"']+)["']/);
+    if (!match) {
+      continue;
+    }
+    const coordinates = match[2].split(":");
+    if (coordinates.length < 3 || !coordinates[0] || !coordinates[1]) {
+      continue;
+    }
+    const name = `${coordinates[0]}:${coordinates[1]}`;
+    const isDevelopmentDependency = match[1].toLowerCase().includes("test");
+    const key = gradleManifestDependencyKey(name, isDevelopmentDependency);
+    if (!declarations.has(key)) {
+      declarations.set(key, []);
+    }
+    const declaredConstraint = coordinates.slice(2).join(":").trim() || null;
+    declarations.get(key).push({
+      declaredConstraint,
+      versionState: classifyGradleDeclaredConstraint(declaredConstraint),
+    });
+  }
+
+  return dependencies.map((dependency) => {
+    const key = gradleManifestDependencyKey(dependency.name, dependency.isDevelopmentDependency);
+    const declaration = declarations.get(key) && declarations.get(key).shift();
+    return {
+      ...dependency,
+      declaredConstraint: declaration && declaration.declaredConstraint || null,
+      versionState: declaration && declaration.versionState || "unresolved",
+    };
+  });
+}
+
+function classifyGradleDeclaredConstraint(declaredConstraint) {
+  const value = String(declaredConstraint || "").trim();
+  if (!value) {
+    return "unresolved";
+  }
+  if (value.includes("$") || value.includes("{")) {
+    return "incomplete";
+  }
+  if (
+    value.includes("+")
+    || /[\[\](),]/.test(value)
+    || /^(?:latest|release|integration)(?:[.-]|$)/i.test(value)
+  ) {
+    return "range";
+  }
+  return "exact-declaration";
+}
+
+function createGradleDependency(values, declaration, hasResolutionEvidence) {
+  return {
+    ...createDependency(values),
+    declaredConstraint: declaration && declaration.declaredConstraint || null,
+    versionState: hasResolutionEvidence
+      ? "resolved"
+      : declaration && declaration.versionState || "unresolved",
+    hasResolutionEvidence: Boolean(hasResolutionEvidence),
+  };
+}
+
+function gradleManifestDependencyKey(name, isDevelopmentDependency) {
+  return `${String(name || "").trim()}:${isDevelopmentDependency ? "development" : "runtime"}`;
 }
 
 module.exports = gradleParser;

@@ -91,4 +91,26 @@ suite("DiagnosticsPublisher Test Suite", () => {
     assert.strictEqual(collection.clearCalls, 0);
     assert.strictEqual(collection.setCalls.length, 0);
   });
+
+  test("does not publish diagnostics for unresolved or incomplete lookups", async () => {
+    let locationCalls = 0;
+    ManifestParser.findDependencyLocation = async () => {
+      locationCalls += 1;
+      return { line: 0, startChar: 0, endChar: 4 };
+    };
+    const publisher = new DiagnosticsPublisher();
+    const entries = await publisher.prepare(
+      [{ filePath: "/project/package.json", format: "npm" }],
+      [
+        { format: "npm", state: "unresolved", name: "range-only", declaredVersion: "^1.0.0" },
+        { format: "npm", state: "lookup_failed", name: "failed", declaredVersion: "1.0.0" },
+        { format: "npm", state: "lookup_incomplete", name: "incomplete", declaredVersion: "1.0.0" },
+        { format: "npm", state: "unknown", name: "unknown", declaredVersion: "1.0.0" },
+      ]
+    );
+
+    assert.strictEqual(locationCalls, 0);
+    assert.strictEqual(entries.length, 1);
+    assert.deepStrictEqual(entries[0][1], []);
+  });
 });

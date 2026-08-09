@@ -2,8 +2,10 @@
 const fs = require("fs");
 const path = require("path");
 
-const LARGE_FILE_THRESHOLD_BYTES = 50 * 1024 * 1024;
+const MAX_DEPENDENCY_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_DIRECTORY_ENTRIES = 50000;
 const WORKSPACE_PATH_ERROR = "Refusing to read files outside the workspace folder.";
+const CASE_SENSITIVE_PACKAGE_NAME_ECOSYSTEMS = new Set(["go", "gradle", "maven"]);
 
 function getWorkspacePath(workspaceFolder) {
   if (!workspaceFolder) {
@@ -102,6 +104,13 @@ async function readUtf8(targetPath, workspaceFolder) {
     throw new Error(WORKSPACE_PATH_ERROR);
   }
 
+  const stats = await fs.promises.stat(safePath);
+  if (stats.size > MAX_DEPENDENCY_FILE_BYTES) {
+    throw new Error(
+      `Dependency file exceeds the ${MAX_DEPENDENCY_FILE_BYTES} byte parsing limit.`
+    );
+  }
+
   return fs.promises.readFile(safePath, "utf8");
 }
 
@@ -120,6 +129,26 @@ async function statSafe(targetPath, workspaceFolder) {
   } catch {
     return null;
   }
+}
+
+async function readBoundedDirectoryEntries(directoryPath, maxEntries = MAX_DIRECTORY_ENTRIES) {
+  const requestedLimit = Number.isInteger(maxEntries) && maxEntries > 0
+    ? maxEntries
+    : MAX_DIRECTORY_ENTRIES;
+  const limit = Math.min(requestedLimit, MAX_DIRECTORY_ENTRIES);
+  const directory = await fs.promises.opendir(directoryPath);
+  const entries = [];
+  let truncated = false;
+
+  for await (const entry of directory) {
+    if (entries.length >= limit) {
+      truncated = true;
+      break;
+    }
+    entries.push(entry);
+  }
+
+  return { entries, truncated };
 }
 
 function getSourceFileName(targetPath) {
@@ -178,10 +207,14 @@ function flattenDependencies(dependencies) {
 }
 
 function dependencyKey(dependency) {
+  const ecosystem = String(dependency.ecosystem || "").trim().toLowerCase();
+  const packageName = String(dependency.name || "").trim();
   return [
-    String(dependency.ecosystem || "").trim().toLowerCase(),
-    String(dependency.name || "").trim().toLowerCase(),
-    String(dependency.version || "").trim().toLowerCase(),
+    ecosystem,
+    CASE_SENSITIVE_PACKAGE_NAME_ECOSYSTEMS.has(ecosystem)
+      ? packageName
+      : packageName.toLowerCase(),
+    String(dependency.version || "").trim(),
   ].join(":");
 }
 
@@ -387,7 +420,9 @@ function parseKeyValueLine(line) {
 }
 
 module.exports = {
-  LARGE_FILE_THRESHOLD_BYTES,
+  LARGE_FILE_THRESHOLD_BYTES: MAX_DEPENDENCY_FILE_BYTES,
+  MAX_DEPENDENCY_FILE_BYTES,
+  MAX_DIRECTORY_ENTRIES,
   buildTree,
   countIndent,
   createDependency,
@@ -401,6 +436,7 @@ module.exports = {
   normalizeVersion,
   parseInlineTomlValue,
   readJson,
+  readBoundedDirectoryEntries,
   parseKeyValueLine,
   parseQuotedArray,
   pathExists,

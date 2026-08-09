@@ -11,12 +11,13 @@ const {
   readJson,
   pathExists,
   readUtf8,
-  statSafe,
   stripYamlComment,
 } = require("./shared");
 const { parsePackageJsonManifest } = require("./manifestHelpers");
 
 const LOCKFILE_NAMES = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml"];
+const MAX_GRAPH_DEPTH = 128;
+const MAX_GRAPH_NODES = 50000;
 
 const npmParser = {
   name: "npmParser",
@@ -49,9 +50,16 @@ const npmParser = {
 
   async resolve({ lockfilePath, manifestPath, workspaceFolder, options = {} }) {
     const sourceFile = getSourceFileName(lockfilePath);
-    const manifest = manifestPath && await pathExists(manifestPath, workspaceFolder)
-      ? parsePackageJsonManifest(await readUtf8(manifestPath, workspaceFolder))
-      : { dependencies: [], directNames: new Set(), devNames: new Set() };
+    let manifest = { dependencies: [], directNames: new Set(), devNames: new Set() };
+    if (manifestPath && await pathExists(manifestPath, workspaceFolder)) {
+      const content = await readUtf8(manifestPath, workspaceFolder);
+      try {
+        JSON.parse(content);
+      } catch {
+        throw new Error("Malformed package.json: invalid JSON");
+      }
+      manifest = parsePackageJsonManifest(content);
+    }
 
     if (sourceFile === "package-lock.json") {
       return parsePackageLock(lockfilePath, manifest, workspaceFolder, options);
@@ -71,10 +79,6 @@ const npmParser = {
 
 async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options) {
   const warnings = [];
-  const stats = await statSafe(lockfilePath, workspaceFolder);
-  if (stats && stats.size > 50 * 1024 * 1024) {
-    warnings.push("Large package-lock.json detected. Parsing may take longer than usual.");
-  }
 
   const root = await readJson(lockfilePath, workspaceFolder);
   const packages = root && typeof root === "object" && root.packages && typeof root.packages === "object"
@@ -92,53 +96,42 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
     ...(rootEntry.devDependencies || {}),
   };
 
-  const mergedManifestVersionHints = new Map();
-  for (const dependency of manifest.dependencies) {
-    mergedManifestVersionHints.set(dependency.name, dependency.version);
-  }
-  for (const [name, version] of Object.entries(rootDependencyMap)) {
-    if (!mergedManifestVersionHints.has(name)) {
-      mergedManifestVersionHints.set(name, normalizeVersion(version));
-    }
-  }
-
+  const entriesByPath = new Map();
   const uniqueEntries = new Map();
-  const nameIndex = new Map();
-  const nameIndexKeys = new Map();
 
   for (const [packagePath, packageInfo] of Object.entries(packages)) {
     if (packagePath === "" || !packageInfo || typeof packageInfo !== "object") {
       continue;
     }
 
-    const name = extractPackageLockName(packagePath);
+    const installedName = extractPackageLockName(packagePath);
+    const name = String(packageInfo.name || installedName || "").trim();
     const version = String(packageInfo.version || "").trim();
-    if (!name || !version) {
+    // Local file/workspace links are not registry resolution evidence. Keep a
+    // direct declaration unresolved instead of looking up the workspace's own
+    // package/version in Cloudsmith.
+    if (!installedName || !name || !version || packageInfo.link === true) {
       continue;
     }
 
-    const key = `${name.toLowerCase()}@${version.toLowerCase()}`;
-    const existing = uniqueEntries.get(key);
+    const occurrenceKey = packagePath;
+    const identityKey = npmPackageVersionKey(name, version);
     const dependencies = {
       ...(packageInfo.dependencies || {}),
       ...(packageInfo.optionalDependencies || {}),
     };
-    const merged = existing || {
-      key,
+    const entry = {
+      key: occurrenceKey,
+      packagePath,
+      installedName,
       name,
       version,
-      dependencies: {},
+      dependencies,
+      isDevelopmentDependency: packageInfo.dev === true,
     };
-    Object.assign(merged.dependencies, dependencies);
-    uniqueEntries.set(key, merged);
-
-    const existingByName = nameIndex.get(name) || [];
-    const existingKeys = nameIndexKeys.get(name) || new Set();
-    if (!existingKeys.has(key)) {
-      existingKeys.add(key);
-      existingByName.push(merged);
-      nameIndex.set(name, existingByName);
-      nameIndexKeys.set(name, existingKeys);
+    entriesByPath.set(packagePath, entry);
+    if (!uniqueEntries.has(identityKey)) {
+      uniqueEntries.set(identityKey, entry);
     }
   }
 
@@ -148,15 +141,15 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
 
   const directRoots = [];
   const seenDirectKeys = new Set();
+  const traversalState = createGraphTraversalState();
 
   for (const directName of directNames) {
-    const entry = selectEntryByName(nameIndex, directName, mergedManifestVersionHints.get(directName));
-    const dependency = buildNpmDependency(entry, directName, [], nameIndex, new Set(), {
+    const entry = selectPackageLockEntry(entriesByPath, "", directName);
+    const dependency = buildNpmDependency(entry, directName, [], entriesByPath, new Set(), {
       sourceFile: getSourceFileName(lockfilePath),
-      directNames,
       devNames: manifest.devNames,
-    });
-    const key = `${dependency.name.toLowerCase()}@${dependency.version.toLowerCase()}`;
+    }, manifest.devNames.has(directName), traversalState);
+    const key = npmPackageVersionKey(dependency.name, dependency.version);
     if (!seenDirectKeys.has(key)) {
       seenDirectKeys.add(key);
       directRoots.push(dependency);
@@ -167,12 +160,12 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
   const addedKeys = new Set();
   collectDependencyKeys(dependencies, addedKeys);
   for (const entry of uniqueEntries.values()) {
-    const key = `${entry.name.toLowerCase()}@${entry.version.toLowerCase()}`;
+    const key = npmPackageVersionKey(entry.name, entry.version);
     if (addedKeys.has(key)) {
       continue;
     }
     addedKeys.add(key);
-    dependencies.push(createDependency({
+    dependencies.push(createNpmDependency({
       name: entry.name,
       version: entry.version,
       ecosystem: "npm",
@@ -181,8 +174,8 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
       parentChain: [],
       transitives: [],
       sourceFile: getSourceFileName(lockfilePath),
-      isDevelopmentDependency: manifest.devNames.has(entry.name),
-    }));
+      isDevelopmentDependency: entry.isDevelopmentDependency,
+    }, entry.installedName));
   }
 
   if (options.maxDependenciesToScan && dependencies.length > options.maxDependenciesToScan) {
@@ -191,22 +184,32 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
       `Display is capped at ${options.maxDependenciesToScan} dependencies.`
     );
   }
+  appendGraphLimitWarning(warnings, traversalState);
 
   return buildTree("npm", getSourceFileName(lockfilePath), dependencies, warnings);
 }
 
 function collectDependencyKeys(dependencies, addedKeys) {
   for (const dependency of Array.isArray(dependencies) ? dependencies : []) {
-    addedKeys.add(`${dependency.name.toLowerCase()}@${dependency.version.toLowerCase()}`);
+    addedKeys.add(npmPackageVersionKey(dependency.name, dependency.version));
     if (Array.isArray(dependency.transitives) && dependency.transitives.length > 0) {
       collectDependencyKeys(dependency.transitives, addedKeys);
     }
   }
 }
 
-function buildNpmDependency(entry, fallbackName, parentChain, nameIndex, visiting, context) {
+function buildNpmDependency(
+  entry,
+  fallbackName,
+  parentChain,
+  entriesByPath,
+  visiting,
+  context,
+  inheritedDevelopment,
+  traversalState
+) {
   if (!entry) {
-    return createDependency({
+    return createNpmDependency({
       name: fallbackName,
       version: "",
       ecosystem: "npm",
@@ -215,12 +218,12 @@ function buildNpmDependency(entry, fallbackName, parentChain, nameIndex, visitin
       parentChain,
       transitives: [],
       sourceFile: context.sourceFile,
-      isDevelopmentDependency: context.devNames.has(fallbackName),
-    });
+      isDevelopmentDependency: inheritedDevelopment || context.devNames.has(fallbackName),
+    }, fallbackName);
   }
 
   if (visiting.has(entry.key)) {
-    return createDependency({
+    return createNpmDependency({
       name: entry.name,
       version: entry.version,
       ecosystem: "npm",
@@ -229,17 +232,34 @@ function buildNpmDependency(entry, fallbackName, parentChain, nameIndex, visitin
       parentChain,
       transitives: [],
       sourceFile: context.sourceFile,
-      isDevelopmentDependency: context.devNames.has(entry.name),
-    });
+      isDevelopmentDependency: inheritedDevelopment || entry.isDevelopmentDependency,
+    }, entry.installedName);
   }
 
   const nextVisiting = new Set(visiting);
   nextVisiting.add(entry.key);
   const nextParentChain = parentChain.concat(entry.name);
   const transitives = [];
+  const isDevelopmentDependency = inheritedDevelopment
+    || entry.isDevelopmentDependency
+    || context.devNames.has(entry.installedName);
 
-  for (const [dependencyName, versionHint] of Object.entries(entry.dependencies || {})) {
-    const childEntry = selectEntryByName(nameIndex, dependencyName, normalizeVersion(versionHint));
+  if (!canExpandGraphNode(parentChain, traversalState)) {
+    return createNpmDependency({
+      name: entry.name,
+      version: entry.version,
+      ecosystem: "npm",
+      isDirect: parentChain.length === 0,
+      parent: parentChain[parentChain.length - 1] || null,
+      parentChain,
+      transitives: [],
+      sourceFile: context.sourceFile,
+      isDevelopmentDependency,
+    }, entry.installedName);
+  }
+
+  for (const dependencyName of Object.keys(entry.dependencies || {})) {
+    const childEntry = selectPackageLockEntry(entriesByPath, entry.packagePath, dependencyName);
     if (childEntry && nextVisiting.has(childEntry.key)) {
       continue;
     }
@@ -247,48 +267,57 @@ function buildNpmDependency(entry, fallbackName, parentChain, nameIndex, visitin
       childEntry,
       dependencyName,
       nextParentChain,
-      nameIndex,
+      entriesByPath,
       nextVisiting,
-      context
+      context,
+      isDevelopmentDependency,
+      traversalState
     ));
   }
 
-  return createDependency({
+  return createNpmDependency({
     name: entry.name,
     version: entry.version,
     ecosystem: "npm",
-    isDirect: parentChain.length === 0 || context.directNames.has(entry.name),
+    isDirect: parentChain.length === 0,
     parent: parentChain[parentChain.length - 1] || null,
     parentChain,
     transitives: deduplicateDeps(transitives),
     sourceFile: context.sourceFile,
-    isDevelopmentDependency: context.devNames.has(entry.name),
-  });
+    isDevelopmentDependency,
+  }, entry.installedName);
 }
 
-function selectEntryByName(nameIndex, dependencyName, versionHint) {
-  const entries = nameIndex.get(dependencyName) || [];
-  if (entries.length === 0) {
+function selectPackageLockEntry(entriesByPath, parentPackagePath, dependencyName) {
+  let searchPath = String(parentPackagePath || "");
+  while (true) {
+    const candidatePath = searchPath
+      ? `${searchPath}/node_modules/${dependencyName}`
+      : `node_modules/${dependencyName}`;
+    if (entriesByPath.has(candidatePath)) {
+      return entriesByPath.get(candidatePath);
+    }
+
+    const nestedMarker = searchPath.lastIndexOf("/node_modules/");
+    if (nestedMarker !== -1) {
+      searchPath = searchPath.slice(0, nestedMarker);
+      continue;
+    }
+    if (searchPath) {
+      searchPath = "";
+      continue;
+    }
     return null;
   }
-
-  const normalizedHint = normalizeVersion(versionHint);
-  if (normalizedHint) {
-    const exactMatch = entries.find((entry) => entry.version === normalizedHint);
-    if (exactMatch) {
-      return exactMatch;
-    }
-  }
-
-  return entries[0];
 }
 
 function extractPackageLockName(packagePath) {
   const marker = "node_modules/";
   const lastMarkerIndex = packagePath.lastIndexOf(marker);
-  const relativePath = lastMarkerIndex === -1
-    ? packagePath
-    : packagePath.slice(lastMarkerIndex + marker.length);
+  if (lastMarkerIndex === -1) {
+    return "";
+  }
+  const relativePath = packagePath.slice(lastMarkerIndex + marker.length);
   const segments = relativePath.split("/").filter(Boolean);
   if (segments.length === 0) {
     return "";
@@ -309,13 +338,17 @@ async function parseYarnLock(lockfilePath, manifest, workspaceFolder, options) {
   const sourceFile = getSourceFileName(lockfilePath);
   const manifestVersionHints = new Map();
   for (const dependency of manifest.dependencies) {
-    manifestVersionHints.set(dependency.name, dependency.version);
+    manifestVersionHints.set(
+      dependency.name,
+      dependency.declaredConstraint || dependency.version
+    );
   }
   const directNames = manifest.directNames.size > 0 || manifest.devNames.size > 0
     ? new Set([...manifest.directNames, ...manifest.devNames])
     : new Set([...parsed.entries.values()].map((entry) => entry.name));
 
   const directRoots = [];
+  const traversalState = createGraphTraversalState();
   for (const directName of directNames) {
     const entry = selectYarnEntry(parsed, directName, manifestVersionHints.get(directName));
     directRoots.push(buildYarnDependency(
@@ -325,17 +358,22 @@ async function parseYarnLock(lockfilePath, manifest, workspaceFolder, options) {
       parsed,
       new Set(),
       sourceFile,
-      manifest.devNames
+      manifest.devNames,
+      false,
+      traversalState
     ));
   }
 
   let dependencies = deduplicateDeps(flattenDependencies(directRoots));
   for (const entry of parsed.entries.values()) {
-    const key = `${entry.name.toLowerCase()}@${entry.version.toLowerCase()}`;
-    if (dependencies.some((dependency) => `${dependency.name.toLowerCase()}@${dependency.version.toLowerCase()}` === key)) {
+    const key = npmPackageVersionKey(entry.name, entry.version);
+    if (dependencies.some((dependency) => npmPackageVersionKey(
+      dependency.name,
+      dependency.version
+    ) === key)) {
       continue;
     }
-    dependencies.push(createDependency({
+    dependencies.push(createNpmDependency({
       name: entry.name,
       version: entry.version,
       ecosystem: "npm",
@@ -344,8 +382,8 @@ async function parseYarnLock(lockfilePath, manifest, workspaceFolder, options) {
       parentChain: [],
       transitives: [],
       sourceFile,
-      isDevelopmentDependency: manifest.devNames.has(entry.name),
-    }));
+      isDevelopmentDependency: manifest.devNames.has(entry.installedName || entry.name),
+    }, entry.installedName || entry.name));
   }
 
   const warnings = [];
@@ -355,13 +393,24 @@ async function parseYarnLock(lockfilePath, manifest, workspaceFolder, options) {
       `Display is capped at ${options.maxDependenciesToScan} dependencies.`
     );
   }
+  appendGraphLimitWarning(warnings, traversalState);
 
   return buildTree("npm", sourceFile, dependencies, warnings);
 }
 
-function buildYarnDependency(entry, fallbackName, parentChain, parsedEntries, visiting, sourceFile, devNames) {
+function buildYarnDependency(
+  entry,
+  fallbackName,
+  parentChain,
+  parsedEntries,
+  visiting,
+  sourceFile,
+  devNames,
+  inheritedDevelopment = false,
+  traversalState
+) {
   if (!entry) {
-    return createDependency({
+    return createNpmDependency({
       name: fallbackName,
       version: "",
       ecosystem: "npm",
@@ -370,13 +419,13 @@ function buildYarnDependency(entry, fallbackName, parentChain, parsedEntries, vi
       parentChain,
       transitives: [],
       sourceFile,
-      isDevelopmentDependency: devNames.has(fallbackName),
-    });
+      isDevelopmentDependency: inheritedDevelopment || devNames.has(fallbackName),
+    }, fallbackName);
   }
 
-  const key = `${entry.name.toLowerCase()}@${entry.version.toLowerCase()}`;
+  const key = entry.key || npmPackageVersionKey(entry.name, entry.version);
   if (visiting.has(key)) {
-    return createDependency({
+    return createNpmDependency({
       name: entry.name,
       version: entry.version,
       ecosystem: "npm",
@@ -385,14 +434,30 @@ function buildYarnDependency(entry, fallbackName, parentChain, parsedEntries, vi
       parentChain,
       transitives: [],
       sourceFile,
-      isDevelopmentDependency: devNames.has(entry.name),
-    });
+      isDevelopmentDependency: inheritedDevelopment || devNames.has(entry.installedName || entry.name),
+    }, entry.installedName || entry.name);
   }
 
   const nextVisiting = new Set(visiting);
   nextVisiting.add(key);
   const nextParentChain = parentChain.concat(entry.name);
   const transitives = [];
+  const isDevelopmentDependency = inheritedDevelopment
+    || devNames.has(entry.installedName || entry.name);
+
+  if (!canExpandGraphNode(parentChain, traversalState)) {
+    return createNpmDependency({
+      name: entry.name,
+      version: entry.version,
+      ecosystem: "npm",
+      isDirect: parentChain.length === 0,
+      parent: parentChain[parentChain.length - 1] || null,
+      parentChain,
+      transitives: [],
+      sourceFile,
+      isDevelopmentDependency,
+    }, entry.installedName || entry.name);
+  }
 
   for (const dependencyName of Object.keys(entry.dependencies || {})) {
     const versionHint = entry.dependencies[dependencyName];
@@ -403,11 +468,13 @@ function buildYarnDependency(entry, fallbackName, parentChain, parsedEntries, vi
       parsedEntries,
       nextVisiting,
       sourceFile,
-      devNames
+      devNames,
+      isDevelopmentDependency,
+      traversalState
     ));
   }
 
-  return createDependency({
+  return createNpmDependency({
     name: entry.name,
     version: entry.version,
     ecosystem: "npm",
@@ -416,8 +483,8 @@ function buildYarnDependency(entry, fallbackName, parentChain, parsedEntries, vi
     parentChain,
     transitives: deduplicateDeps(transitives),
     sourceFile,
-    isDevelopmentDependency: devNames.has(entry.name),
-  });
+    isDevelopmentDependency,
+  }, entry.installedName || entry.name);
 }
 
 function parseYarnEntries(content) {
@@ -430,7 +497,11 @@ function parseYarnEntries(content) {
 
   const flushCurrent = () => {
     if (currentEntry && currentEntry.name && currentEntry.version) {
-      const key = `${currentEntry.name.toLowerCase()}@${currentEntry.version.toLowerCase()}`;
+      const key = [
+        currentEntry.installedName.toLowerCase(),
+        currentEntry.name.toLowerCase(),
+        currentEntry.version,
+      ].join("@");
       const existing = entries.get(key);
       if (existing) {
         Object.assign(existing.dependencies, currentEntry.dependencies);
@@ -443,10 +514,10 @@ function parseYarnEntries(content) {
       } else {
         currentEntry.key = key;
         entries.set(key, currentEntry);
-        if (!entriesByName.has(currentEntry.name)) {
-          entriesByName.set(currentEntry.name, []);
+        if (!entriesByName.has(currentEntry.installedName)) {
+          entriesByName.set(currentEntry.installedName, []);
         }
-        entriesByName.get(currentEntry.name).push(currentEntry);
+        entriesByName.get(currentEntry.installedName).push(currentEntry);
         for (const selector of currentEntry.selectors || []) {
           selectorIndex.set(selector, key);
         }
@@ -473,12 +544,14 @@ function parseYarnEntries(content) {
       const header = trimmed.replace(/:$/, "");
       const selectors = header.split(",").map((selector) => selector.trim().replace(/^["']|["']$/g, ""));
       const primarySelector = selectors[0] || "";
-      const name = parseYarnSelectorName(primarySelector);
-      if (!name) {
+      const installedName = parseYarnSelectorName(primarySelector);
+      if (!installedName) {
         continue;
       }
+      const alias = parseNpmAliasSpecifier(primarySelector.slice(installedName.length + 1));
       currentEntry = {
-        name,
+        name: alias ? alias.name : installedName,
+        installedName,
         version: "",
         dependencies: {},
         selectors,
@@ -495,7 +568,7 @@ function parseYarnEntries(content) {
       continue;
     }
 
-    const versionMatch = trimmed.match(/^version\s+"([^"]+)"/);
+    const versionMatch = trimmed.match(/^version(?:\s+|:\s*)["']?([^"'\s]+)["']?/);
     if (versionMatch) {
       currentEntry.version = versionMatch[1];
       inDependencies = false;
@@ -532,10 +605,14 @@ function selectYarnEntry(parsedEntries, dependencyName, versionHint) {
 
   const normalizedHint = String(versionHint || "").trim().replace(/^["']|["']$/g, "");
   if (normalizedHint) {
-    const exactSelectorKey = `${normalizedName}@${normalizedHint}`;
-    const selectedKey = parsedEntries.selectorIndex.get(exactSelectorKey);
-    if (selectedKey && parsedEntries.entries.has(selectedKey)) {
-      return parsedEntries.entries.get(selectedKey);
+    for (const exactSelectorKey of [
+      `${normalizedName}@${normalizedHint}`,
+      `${normalizedName}@npm:${normalizedHint}`,
+    ]) {
+      const selectedKey = parsedEntries.selectorIndex.get(exactSelectorKey);
+      if (selectedKey && parsedEntries.entries.has(selectedKey)) {
+        return parsedEntries.entries.get(selectedKey);
+      }
     }
   }
 
@@ -552,6 +629,34 @@ function selectYarnEntry(parsedEntries, dependencyName, versionHint) {
   }
 
   return candidates[0];
+}
+
+function parseNpmAliasSpecifier(specifier) {
+  const value = String(specifier || "").trim();
+  if (!value.startsWith("npm:")) {
+    return null;
+  }
+  const target = value.slice("npm:".length);
+  const separator = target.lastIndexOf("@");
+  if (separator <= 0) {
+    return null;
+  }
+  const name = target.slice(0, separator);
+  return name ? { name, constraint: target.slice(separator + 1) } : null;
+}
+
+function createNpmDependency(values, declaredName) {
+  return {
+    ...createDependency(values),
+    declaredName: String(declaredName || values.name || "").trim(),
+  };
+}
+
+function npmPackageVersionKey(name, version) {
+  return JSON.stringify([
+    String(name || "").trim().toLowerCase(),
+    String(version || "").trim(),
+  ]);
 }
 
 function parseYarnSelectorName(selector) {
@@ -580,6 +685,7 @@ async function parsePnpmLock(lockfilePath, manifest, workspaceFolder, options) {
     ? new Set([...manifest.directNames, ...manifest.devNames])
     : new Set(parsed.directVersions.keys());
   const directRoots = [];
+  const traversalState = createGraphTraversalState();
 
   for (const directName of directNames) {
     const entry = selectPnpmEntry(parsed.packageEntries, directName, parsed.directVersions.get(directName));
@@ -590,17 +696,21 @@ async function parsePnpmLock(lockfilePath, manifest, workspaceFolder, options) {
       parsed.packageEntries,
       new Set(),
       sourceFile,
-      manifest.devNames
+      manifest.devNames,
+      traversalState
     ));
   }
 
   let dependencies = deduplicateDeps(flattenDependencies(directRoots));
   for (const entry of parsed.packageEntries.values()) {
-    const key = `${entry.name.toLowerCase()}@${entry.version.toLowerCase()}`;
-    if (dependencies.some((dependency) => `${dependency.name.toLowerCase()}@${dependency.version.toLowerCase()}` === key)) {
+    const key = npmPackageVersionKey(entry.name, entry.version);
+    if (dependencies.some((dependency) => npmPackageVersionKey(
+      dependency.name,
+      dependency.version
+    ) === key)) {
       continue;
     }
-    dependencies.push(createDependency({
+    dependencies.push(createNpmDependency({
       name: entry.name,
       version: entry.version,
       ecosystem: "npm",
@@ -610,7 +720,7 @@ async function parsePnpmLock(lockfilePath, manifest, workspaceFolder, options) {
       transitives: [],
       sourceFile,
       isDevelopmentDependency: manifest.devNames.has(entry.name),
-    }));
+    }, entry.name));
   }
 
   const warnings = [];
@@ -620,13 +730,23 @@ async function parsePnpmLock(lockfilePath, manifest, workspaceFolder, options) {
       `Display is capped at ${options.maxDependenciesToScan} dependencies.`
     );
   }
+  appendGraphLimitWarning(warnings, traversalState);
 
   return buildTree("npm", sourceFile, dependencies, warnings);
 }
 
-function buildPnpmDependency(entry, fallbackName, parentChain, packageEntries, visiting, sourceFile, devNames) {
+function buildPnpmDependency(
+  entry,
+  fallbackName,
+  parentChain,
+  packageEntries,
+  visiting,
+  sourceFile,
+  devNames,
+  traversalState
+) {
   if (!entry) {
-    return createDependency({
+    return createNpmDependency({
       name: fallbackName,
       version: "",
       ecosystem: "npm",
@@ -636,12 +756,12 @@ function buildPnpmDependency(entry, fallbackName, parentChain, packageEntries, v
       transitives: [],
       sourceFile,
       isDevelopmentDependency: devNames.has(fallbackName),
-    });
+    }, fallbackName);
   }
 
-  const key = `${entry.name.toLowerCase()}@${entry.version.toLowerCase()}`;
+  const key = npmPackageVersionKey(entry.name, entry.version);
   if (visiting.has(key)) {
-    return createDependency({
+    return createNpmDependency({
       name: entry.name,
       version: entry.version,
       ecosystem: "npm",
@@ -650,14 +770,28 @@ function buildPnpmDependency(entry, fallbackName, parentChain, packageEntries, v
       parentChain,
       transitives: [],
       sourceFile,
-      isDevelopmentDependency: devNames.has(entry.name),
-    });
+      isDevelopmentDependency: devNames.has(entry.installedName || entry.name),
+    }, entry.installedName || entry.name);
   }
 
   const nextVisiting = new Set(visiting);
   nextVisiting.add(key);
   const nextParentChain = parentChain.concat(entry.name);
   const transitives = [];
+
+  if (!canExpandGraphNode(parentChain, traversalState)) {
+    return createNpmDependency({
+      name: entry.name,
+      version: entry.version,
+      ecosystem: "npm",
+      isDirect: parentChain.length === 0,
+      parent: parentChain[parentChain.length - 1] || null,
+      parentChain,
+      transitives: [],
+      sourceFile,
+      isDevelopmentDependency: devNames.has(entry.installedName || entry.name),
+    }, entry.installedName || entry.name);
+  }
 
   for (const [dependencyName, versionHint] of Object.entries(entry.dependencies || {})) {
     transitives.push(buildPnpmDependency(
@@ -667,11 +801,12 @@ function buildPnpmDependency(entry, fallbackName, parentChain, packageEntries, v
       packageEntries,
       nextVisiting,
       sourceFile,
-      devNames
+      devNames,
+      traversalState
     ));
   }
 
-  return createDependency({
+  return createNpmDependency({
     name: entry.name,
     version: entry.version,
     ecosystem: "npm",
@@ -680,23 +815,79 @@ function buildPnpmDependency(entry, fallbackName, parentChain, packageEntries, v
     parentChain,
     transitives: deduplicateDeps(transitives),
     sourceFile,
-    isDevelopmentDependency: devNames.has(entry.name),
-  });
+    isDevelopmentDependency: devNames.has(entry.installedName || entry.name),
+  }, entry.installedName || entry.name);
+}
+
+function createGraphTraversalState() {
+  return { expandedNodes: 0, truncated: false };
+}
+
+function canExpandGraphNode(parentChain, state) {
+  if (!state) {
+    return true;
+  }
+  if (parentChain.length >= MAX_GRAPH_DEPTH || state.expandedNodes >= MAX_GRAPH_NODES) {
+    state.truncated = true;
+    return false;
+  }
+  state.expandedNodes += 1;
+  return true;
+}
+
+function appendGraphLimitWarning(warnings, state) {
+  if (state && state.truncated) {
+    warnings.push(
+      `npm dependency graph expansion reached its bounded limit `
+      + `(${MAX_GRAPH_NODES} nodes or depth ${MAX_GRAPH_DEPTH}); deeper relationships were omitted.`
+    );
+  }
 }
 
 function selectPnpmEntry(packageEntries, dependencyName, versionHint) {
-  const normalizedHint = normalizeVersion(versionHint).split("(")[0].trim();
-  const entries = [...packageEntries.values()].filter((entry) => entry.name === dependencyName);
+  const reference = parsePnpmReference(dependencyName, versionHint);
+  if (reference.local) {
+    return null;
+  }
+  const entries = [...packageEntries.values()].filter((entry) => entry.name === reference.name);
   if (entries.length === 0) {
     return null;
   }
-  if (normalizedHint) {
-    const exactMatch = entries.find((entry) => entry.version === normalizedHint);
+  if (reference.version) {
+    const exactMatch = entries.find((entry) => entry.version === reference.version);
     if (exactMatch) {
-      return exactMatch;
+      return { ...exactMatch, installedName: dependencyName };
     }
   }
-  return entries[0];
+  return { ...entries[0], installedName: dependencyName };
+}
+
+function parsePnpmReference(dependencyName, versionHint) {
+  let value = String(versionHint || "")
+    .trim()
+    .replace(/^['"]|['"]$/g, "")
+    .split("(")[0]
+    .trim();
+  if (/^(?:link|workspace|file):/i.test(value)) {
+    return { name: dependencyName, version: "", local: true };
+  }
+  if (value.startsWith("npm:")) {
+    value = value.slice("npm:".length);
+  }
+
+  const separator = value.lastIndexOf("@");
+  if (separator > 0) {
+    return {
+      name: value.slice(0, separator),
+      version: normalizeVersion(value.slice(separator + 1)),
+      local: false,
+    };
+  }
+  return {
+    name: dependencyName,
+    version: normalizeVersion(value),
+    local: false,
+  };
 }
 
 function parsePnpmEntries(content) {
@@ -716,7 +907,7 @@ function parsePnpmEntries(content) {
       currentPackageSubsection = "";
       return;
     }
-    packageEntries.set(`${currentPackage.name.toLowerCase()}@${currentPackage.version.toLowerCase()}`, currentPackage);
+    packageEntries.set(npmPackageVersionKey(currentPackage.name, currentPackage.version), currentPackage);
     currentPackage = null;
     currentPackageSubsection = "";
   };

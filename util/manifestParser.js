@@ -1,9 +1,8 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const path = require("path");
+const { discoverDependencyManifests } = require("./dependencyManifestDiscovery");
 const { parsePyprojectManifest } = require("./lockfileParsers/manifestHelpers");
 const {
-  getWorkspacePath,
-  pathExists,
   readUtf8,
 } = require("./lockfileParsers/shared");
 
@@ -17,31 +16,8 @@ class ManifestParser {
    * @returns {Array<{filePath: string, format: string, parserMethod: string}>}
    */
   static async detectManifests(workspaceFolderOrPath) {
-    const root = getWorkspacePath(workspaceFolderOrPath);
-    const manifests = [];
-
-    const checks = [
-      { file: "package.json", format: "npm", parserMethod: "parseNpm" },
-      { file: "requirements.txt", format: "python", parserMethod: "parsePythonRequirements" },
-      { file: "pyproject.toml", format: "python", parserMethod: "parsePyproject" },
-      { file: "pom.xml", format: "maven", parserMethod: "parseMaven" },
-      { file: "go.mod", format: "go", parserMethod: "parseGoMod" },
-      { file: "Cargo.toml", format: "cargo", parserMethod: "parseCargo" },
-    ];
-
-    for (const check of checks) {
-      const filePath = path.join(root, check.file);
-      if (await pathExists(filePath, root)) {
-        manifests.push({
-          filePath,
-          format: check.format,
-          parserMethod: check.parserMethod,
-          workspaceFolder: root,
-        });
-      }
-    }
-
-    return manifests;
+    const discovery = await discoverDependencyManifests(workspaceFolderOrPath);
+    return discovery.manifests;
   }
 
   /**
@@ -171,6 +147,7 @@ class ManifestParser {
       name: dependency.name,
       version: dependency.version,
       declaredConstraint: dependency.declaredConstraint || null,
+      environmentMarker: dependency.environmentMarker || null,
       devDependency: dependency.isDevelopmentDependency,
       format: format || "python",
     }));

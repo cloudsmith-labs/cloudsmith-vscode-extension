@@ -133,4 +133,26 @@ suite("upstreamGapAnalyzer", () => {
     assert.strictEqual(enriched[0].upstreamStatus, "reachable");
     assert.strictEqual(enriched[0].upstreamDetail, "npm proxy on repo-9");
   });
+
+  test("accepts conclusive absence and ignores unresolved lookup states", async () => {
+    const dependencies = [
+      {
+        name: "absent-package",
+        version: "1.0.0",
+        format: "npm",
+        cloudsmithStatus: "ABSENT",
+      },
+      {
+        name: "unresolved-package",
+        version: "",
+        format: "npm",
+        cloudsmithStatus: "UNRESOLVED",
+      },
+    ];
+
+    const enriched = await analyzeUpstreamGaps(dependencies, "workspace-a", [], {});
+
+    assert.strictEqual(enriched[0].upstreamStatus, "no_proxy");
+    assert.strictEqual(enriched[1].upstreamStatus, undefined);
+  });
 });

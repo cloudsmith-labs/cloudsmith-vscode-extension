@@ -1,0 +1,5 @@
+[INFO] +- com.example:root-a:jar:1.5.0:compile
+[INFO] |  \- com.example:common:jar:1.0.0:compile
+[INFO] +- com.example:root-b:jar:1.0.0:compile -> 1.1.0
+[INFO] |  \- com.example:common:jar:2.0.0:compile
+[INFO] \- com.example:classified:jar:tests:2.1.0:test

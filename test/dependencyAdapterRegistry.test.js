@@ -197,6 +197,55 @@ suite("dependencyAdapterRegistry", () => {
     assert.strictEqual(malformed.error.code, "parse-error");
   });
 
+  test("surfaces a malformed npm manifest paired with a valid lockfile", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "package.json");
+    const lockfilePath = path.join(workspace, "package-lock.json");
+    await writeTextFile(manifestPath, "{ not valid JSON\n");
+    await writeTextFile(lockfilePath, JSON.stringify({
+      lockfileVersion: 3,
+      packages: { "": {} },
+    }));
+
+    const result = await createDefaultDependencyAdapterRegistry().parse({
+      adapterId: "npmParser",
+      resolverName: "npmParser",
+      ecosystem: "npm",
+      workspaceFolder: workspace,
+      lockfilePath,
+      manifestPath,
+      sourceFile: "package-lock.json",
+    });
+
+    assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.ERROR);
+    assert.deepStrictEqual(result.dependencies, []);
+    assert.strictEqual(result.error.code, "parse-error");
+    assert.match(result.error.message, /Malformed package\.json: invalid JSON/);
+  });
+
+  test("surfaces a malformed Composer manifest paired with a valid lockfile", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "composer.json");
+    const lockfilePath = path.join(workspace, "composer.lock");
+    await writeTextFile(manifestPath, "{ not valid JSON\n");
+    await writeTextFile(lockfilePath, JSON.stringify({ packages: [], "packages-dev": [] }));
+
+    const result = await createDefaultDependencyAdapterRegistry().parse({
+      adapterId: "composerParser",
+      resolverName: "composerParser",
+      ecosystem: "composer",
+      workspaceFolder: workspace,
+      lockfilePath,
+      manifestPath,
+      sourceFile: "composer.lock",
+    });
+
+    assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.ERROR);
+    assert.deepStrictEqual(result.dependencies, []);
+    assert.strictEqual(result.error.code, "parse-error");
+    assert.match(result.error.message, /Malformed composer\.json: invalid JSON/);
+  });
+
   test("retains distinct provenance for same-ecosystem manifests", async () => {
     const workspace = await createWorkspace();
     const firstPath = path.join(workspace, "package.json");
@@ -229,6 +278,40 @@ suite("dependencyAdapterRegistry", () => {
     );
   });
 
+  test("detects and parses a bounded nested npm project from the workspace root", async () => {
+    const workspace = await createWorkspace();
+    const projectRoot = path.join(workspace, "packages", "application");
+    const manifestPath = path.join(projectRoot, "package.json");
+    const lockfilePath = path.join(projectRoot, "package-lock.json");
+    await writeTextFile(manifestPath, JSON.stringify({
+      dependencies: { "package-a": "^1.0.0" },
+    }, null, 2));
+    await writeTextFile(lockfilePath, JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        "": { dependencies: { "package-a": "^1.0.0" } },
+        "node_modules/package-a": { version: "1.4.0" },
+      },
+    }, null, 2));
+    const registry = createDefaultDependencyAdapterRegistry();
+
+    const detections = await registry.detect(workspace);
+    const detection = detections.find((candidate) => candidate.adapterId === "npmParser");
+    const realWorkspace = await fs.promises.realpath(workspace);
+    const realProjectRoot = path.join(realWorkspace, "packages", "application");
+    assert.ok(detection);
+    assert.strictEqual(detection.projectFolder, realProjectRoot);
+    assert.strictEqual(detection.workspaceFolder, workspace);
+    assert.strictEqual(detection.manifestPath, path.join(realProjectRoot, "package.json"));
+    assert.strictEqual(detection.lockfilePath, path.join(realProjectRoot, "package-lock.json"));
+
+    const result = await registry.parse(detection, { workspaceFolder: workspace });
+    assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.SUCCESS);
+    assert.strictEqual(result.dependencies[0].declaredConstraint, "^1.0.0");
+    assert.strictEqual(result.dependencies[0].resolvedVersion, "1.4.0");
+    assert.strictEqual(result.dependencies[0].sourceManifest.filePath, path.join(realProjectRoot, "package.json"));
+  });
+
   test("adapts the npm fixture without losing its raw declaration or resolution provenance", async () => {
     const manifestPath = path.join(fixtureDir, "package.json");
     const lockfilePath = path.join(fixtureDir, "package-lock.json");
@@ -255,6 +338,246 @@ suite("dependencyAdapterRegistry", () => {
     assert.strictEqual(express.sourceManifest.filePath, manifestPath);
     assert.strictEqual(express.resolutionSource.kind, RESOLUTION_SOURCE_KINDS.LOCKFILE);
     assert.strictEqual(express.resolutionSource.filePath, lockfilePath);
+  });
+
+  test("classifies npm partial and wildcard declarations as ranges", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "package.json");
+    await writeTextFile(manifestPath, JSON.stringify({
+      dependencies: {
+        major: "1",
+        minor: "1.2",
+        wildcard: "1.x",
+        wildcardPatch: "1.2.X",
+        exact: "1.2.3",
+        prerelease: "1.2.3-beta.1",
+      },
+    }));
+
+    const result = await createDefaultDependencyAdapterRegistry().parseManifest({
+      filePath: manifestPath,
+      format: "npm",
+      workspaceFolder: workspace,
+    });
+    const states = new Map(result.dependencies.map((dependency) => [
+      dependency.name,
+      dependency.versionState,
+    ]));
+
+    assert.strictEqual(states.get("major"), DEPENDENCY_VERSION_STATES.RANGE);
+    assert.strictEqual(states.get("minor"), DEPENDENCY_VERSION_STATES.RANGE);
+    assert.strictEqual(states.get("wildcard"), DEPENDENCY_VERSION_STATES.RANGE);
+    assert.strictEqual(states.get("wildcardPatch"), DEPENDENCY_VERSION_STATES.RANGE);
+    assert.strictEqual(states.get("exact"), DEPENDENCY_VERSION_STATES.EXACT_DECLARATION);
+    assert.strictEqual(states.get("prerelease"), DEPENDENCY_VERSION_STATES.EXACT_DECLARATION);
+  });
+
+  test("routes supported manifest-only Gradle parsing through its ecosystem adapter", async () => {
+    const filePath = path.join(__dirname, "fixtures", "gradle", "build.gradle");
+    const result = await createDefaultDependencyAdapterRegistry().parseManifest({
+      filePath,
+      format: "gradle",
+      workspaceFolder: path.dirname(filePath),
+    });
+
+    assert.notStrictEqual(result.status, ADAPTER_RESULT_STATUSES.UNSUPPORTED);
+    assert.ok(result.dependencies.length > 0);
+    assert.strictEqual(result.dependencies.every((dependency) => dependency.resolvedVersion === null), true);
+  });
+
+  test("keeps local Go replacements incomplete through manifest-only parsing", async () => {
+    const workspace = await createWorkspace();
+    const filePath = path.join(workspace, "go.mod");
+    await writeTextFile(filePath, [
+      "module example.com/application",
+      "go 1.22",
+      "require example.com/Owner/Module v1.2.3",
+      "replace example.com/Owner/Module => ../local-module",
+    ].join("\n"));
+
+    const result = await createDefaultDependencyAdapterRegistry().parseManifest({
+      filePath,
+      format: "go",
+      workspaceFolder: workspace,
+    });
+    const dependency = result.dependencies.find((entry) => entry.name === "example.com/Owner/Module");
+
+    assert.ok(dependency);
+    assert.strictEqual(dependency.resolvedVersion, null);
+    assert.strictEqual(dependency.versionState, DEPENDENCY_VERSION_STATES.INCOMPLETE);
+  });
+
+  test("retains Python include provenance and does not make ranges or markers concrete", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "requirements.txt");
+    const includedPath = path.join(workspace, "requirements", "base.txt");
+    await writeTextFile(manifestPath, [
+      "-r requirements/base.txt",
+      "requests>=2.0,<3",
+      "conditional==4.5.6; python_version >= '3.12'",
+      "",
+    ].join("\n"));
+    await writeTextFile(includedPath, "urllib3==2.2.2\n");
+
+    const result = await createDefaultDependencyAdapterRegistry().parseManifest({
+      filePath: manifestPath,
+      format: "python",
+      workspaceFolder: workspace,
+    });
+    const requests = result.dependencies.find((dependency) => dependency.name === "requests");
+    const urllib3 = result.dependencies.find((dependency) => dependency.name === "urllib3");
+    const conditional = result.dependencies.find((dependency) => dependency.name === "conditional");
+
+    assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.PARTIAL);
+    assert.strictEqual(requests.declaredConstraint, ">=2.0,<3");
+    assert.strictEqual(requests.resolvedVersion, null);
+    assert.strictEqual(requests.versionState, DEPENDENCY_VERSION_STATES.RANGE);
+    assert.strictEqual(urllib3.declaredConstraint, "==2.2.2");
+    assert.strictEqual(urllib3.resolvedVersion, null);
+    assert.strictEqual(urllib3.versionState, DEPENDENCY_VERSION_STATES.EXACT_DECLARATION);
+    assert.strictEqual(urllib3.legacyVersion, "2.2.2");
+    assert.strictEqual(urllib3.sourceManifest.filePath, await fs.promises.realpath(includedPath));
+    assert.strictEqual(conditional.resolvedVersion, null);
+    assert.strictEqual(conditional.versionState, DEPENDENCY_VERSION_STATES.INCOMPLETE);
+    assert.strictEqual(conditional.environmentMarker, "python_version >= '3.12'");
+  });
+
+  test("keeps conditional Poetry declarations unresolved", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "pyproject.toml");
+    await writeTextFile(manifestPath, [
+      "[tool.poetry.dependencies]",
+      "requests = { version = \"2.32.3\", markers = \"python_version < '3.12'\" }",
+    ].join("\n"));
+
+    const result = await createDefaultDependencyAdapterRegistry().parseManifest({
+      filePath: manifestPath,
+      format: "python",
+      workspaceFolder: workspace,
+    });
+    const requests = result.dependencies.find((dependency) => dependency.name === "requests");
+
+    assert.ok(requests);
+    assert.strictEqual(requests.declaredConstraint, "2.32.3");
+    assert.strictEqual(requests.legacyVersion, "");
+    assert.strictEqual(requests.versionState, DEPENDENCY_VERSION_STATES.INCOMPLETE);
+    assert.strictEqual(requests.environmentMarker, "python_version < '3.12'");
+  });
+
+  test("keeps conditional exact PEP 621 declarations unresolved", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "pyproject.toml");
+    await writeTextFile(manifestPath, [
+      "[project]",
+      "name = \"fixture\"",
+      "dependencies = [",
+      "  \"requests==2.32.3; python_version < '3.12'\",",
+      "]",
+    ].join("\n"));
+
+    const result = await createDefaultDependencyAdapterRegistry().parseManifest({
+      filePath: manifestPath,
+      format: "python",
+      workspaceFolder: workspace,
+    });
+    const requests = result.dependencies.find((dependency) => dependency.name === "requests");
+
+    assert.ok(requests);
+    assert.strictEqual(requests.declaredConstraint, "==2.32.3");
+    assert.strictEqual(requests.resolvedVersion, null);
+    assert.strictEqual(requests.legacyVersion, "");
+    assert.strictEqual(requests.versionState, DEPENDENCY_VERSION_STATES.INCOMPLETE);
+    assert.strictEqual(requests.environmentMarker, "python_version < '3.12'");
+  });
+
+  test("preserves conditional Poetry and PEP 621 declarations across lockfile joins", async () => {
+    const cases = [
+      {
+        lockfileName: "uv.lock",
+        manifestLines: [
+          "[project]",
+          "name = \"fixture\"",
+          "dependencies = [\"requests==2.32.3; python_version < '3.12'\"]",
+        ],
+      },
+      {
+        lockfileName: "poetry.lock",
+        manifestLines: [
+          "[tool.poetry]",
+          "name = \"fixture\"",
+          "[tool.poetry.dependencies]",
+          "requests = { version = \"2.32.3\", markers = \"python_version < '3.12'\" }",
+        ],
+      },
+    ];
+
+    for (const testCase of cases) {
+      const workspace = await createWorkspace();
+      const manifestPath = path.join(workspace, "pyproject.toml");
+      const lockfilePath = path.join(workspace, testCase.lockfileName);
+      await writeTextFile(manifestPath, testCase.manifestLines.join("\n"));
+      await writeTextFile(lockfilePath, [
+        "[[package]]",
+        "name = \"requests\"",
+        "version = \"2.32.3\"",
+      ].join("\n"));
+
+      const result = await createDefaultDependencyAdapterRegistry().parse({
+        adapterId: "pythonParser",
+        resolverName: "pythonParser",
+        ecosystem: "python",
+        workspaceFolder: workspace,
+        lockfilePath,
+        manifestPath,
+        sourceFile: testCase.lockfileName,
+      });
+      const requests = result.dependencies.find((dependency) => dependency.name === "requests");
+
+      assert.ok(requests, `${testCase.lockfileName} should retain the direct dependency`);
+      assert.strictEqual(requests.isDirect, true);
+      assert.strictEqual(requests.declaredConstraint, testCase.lockfileName === "uv.lock"
+        ? "==2.32.3"
+        : "2.32.3");
+      assert.strictEqual(requests.resolvedVersion, null);
+      assert.strictEqual(requests.resolutionSource, null);
+      assert.strictEqual(requests.legacyVersion, "2.32.3");
+      assert.strictEqual(requests.versionState, DEPENDENCY_VERSION_STATES.INCOMPLETE);
+      assert.strictEqual(requests.environmentMarker, "python_version < '3.12'");
+    }
+  });
+
+  test("uses bounded Maven manifest evidence without manufacturing property resolutions", async () => {
+    const registry = createDefaultDependencyAdapterRegistry();
+    const workspace = await createWorkspace();
+    const filePath = path.join(workspace, "pom.xml");
+    const fixturePath = path.join(__dirname, "fixtures", "maven", "resolution-semantics-pom.xml");
+    await writeTextFile(filePath, await fs.promises.readFile(fixturePath, "utf8"));
+    const result = await registry.parseManifest({
+      filePath,
+      format: "maven",
+      workspaceFolder: workspace,
+    });
+    const literal = result.dependencies.find((dependency) => dependency.name === "org.literal:library");
+    const localProperty = result.dependencies.find((dependency) => dependency.name === "org.property:library");
+    const unknownProperty = result.dependencies.find((dependency) => dependency.name === "org.unknown:library");
+    const managed = result.dependencies.find((dependency) => dependency.name === "org.managed:managed-core");
+
+    assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.PARTIAL);
+    assert.strictEqual(result.dependencies.some((dependency) => dependency.name === "org.managed:management-only"), false);
+    assert.strictEqual(literal.declaredConstraint, "1.0.0");
+    assert.strictEqual(literal.resolvedVersion, null);
+    assert.strictEqual(literal.versionState, DEPENDENCY_VERSION_STATES.EXACT_DECLARATION);
+    assert.strictEqual(localProperty.declaredConstraint, "${resolved.version}");
+    assert.strictEqual(localProperty.legacyVersion, "6.1.2");
+    assert.strictEqual(localProperty.resolvedVersion, null);
+    assert.strictEqual(localProperty.versionState, DEPENDENCY_VERSION_STATES.EXACT_DECLARATION);
+    assert.strictEqual(unknownProperty.declaredConstraint, "${missing.version}");
+    assert.strictEqual(unknownProperty.resolvedVersion, null);
+    assert.strictEqual(unknownProperty.versionState, DEPENDENCY_VERSION_STATES.UNRESOLVED);
+    assert.strictEqual(managed.declaredConstraint, "${managed.version}");
+    assert.strictEqual(managed.legacyVersion, "5.0.1");
+    assert.strictEqual(managed.resolvedVersion, null);
+    assert.strictEqual(managed.versionState, DEPENDENCY_VERSION_STATES.EXACT_DECLARATION);
   });
 
   test("preserves the workspace trust boundary on adapter detections", async () => {

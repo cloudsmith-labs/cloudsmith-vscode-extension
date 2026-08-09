@@ -392,4 +392,38 @@ suite("Package Metadata Flow Test Suite", () => {
     assert.ok(reachableItem.iconPath.dark.fsPath.endsWith(path.join("media", "vscode_icons", "file_type_npm.svg")));
     assert.ok(unreachableItem.iconPath.dark.fsPath.endsWith(path.join("media", "vscode_icons", "file_type_python.svg")));
   });
+
+  test("dependency health uncertainty never renders as not found", () => {
+    const cases = [
+      ["UNRESOLVED", "^4.18.0", "Version unresolved"],
+      ["LOOKUP_FAILED", "4.18.2", "Cloudsmith lookup failed"],
+      ["LOOKUP_INCOMPLETE", "4.18.2", "Cloudsmith lookup incomplete"],
+      ["RATE_LIMITED", "4.18.2", "Cloudsmith lookup rate limited"],
+    ];
+
+    for (const [cloudsmithStatus, displayVersion, expectedDetail] of cases) {
+      const node = new DependencyHealthNode({
+        name: "express",
+        version: displayVersion,
+        legacyVersion: cloudsmithStatus === "UNRESOLVED" ? "4.18.0" : displayVersion,
+        declaredConstraint: cloudsmithStatus === "UNRESOLVED" ? displayVersion : null,
+        resolvedVersion: cloudsmithStatus === "UNRESOLVED" ? null : displayVersion,
+        versionState: cloudsmithStatus === "UNRESOLVED" ? "range" : "resolved",
+        format: "npm",
+        cloudsmithStatus,
+        cloudsmithLookupDetail: "Evidence was incomplete.",
+      }, null, {});
+      const item = node.getTreeItem();
+
+      assert.strictEqual(item.contextValue, "dependencyHealthUnknown");
+      assert.match(item.description, new RegExp(expectedDetail));
+      assert.doesNotMatch(item.description, /Not found/);
+      assert.doesNotMatch(item.tooltip, /Not found/);
+      assert.match(item.tooltip, /Evidence was incomplete/);
+      if (cloudsmithStatus === "UNRESOLVED") {
+        assert.match(item.description, /^\^4\.18\.0/);
+        assert.doesNotMatch(item.description, /^4\.18\.0/);
+      }
+    }
+  });
 });

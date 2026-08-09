@@ -1,0 +1,26 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>tree-fixture</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>root-a</artifactId>
+      <version>[1.0,2.0)</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>root-b</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>classified</artifactId>
+      <type>jar</type>
+      <classifier>tests</classifier>
+      <version>2.0.0</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>

@@ -45,9 +45,16 @@ const composerParser = {
 
   async resolve({ lockfilePath, manifestPath, workspaceFolder }) {
     const sourceFile = getSourceFileName(lockfilePath || manifestPath);
-    const manifestDependencies = manifestPath && await pathExists(manifestPath, workspaceFolder)
-      ? parseComposerManifest(await readUtf8(manifestPath, workspaceFolder))
-      : [];
+    let manifestDependencies = [];
+    if (manifestPath && await pathExists(manifestPath, workspaceFolder)) {
+      const content = await readUtf8(manifestPath, workspaceFolder);
+      try {
+        JSON.parse(content);
+      } catch {
+        throw new Error("Malformed composer.json: invalid JSON");
+      }
+      manifestDependencies = parseComposerManifest(content);
+    }
 
     if (!lockfilePath) {
       return buildTree("composer", sourceFile, manifestDependencies.map((dependency) => createDependency({
@@ -63,7 +70,7 @@ const composerParser = {
       })));
     }
 
-    const root = await readJson(lockfilePath);
+    const root = await readJson(lockfilePath, workspaceFolder);
     const records = [];
 
     for (const record of [...(root.packages || []), ...(root["packages-dev"] || [])]) {

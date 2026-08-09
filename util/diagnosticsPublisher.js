@@ -37,8 +37,10 @@ class DiagnosticsPublisher {
       const diagnostics = [];
 
       for (const dep of depsForManifest) {
-        // Only publish diagnostics for deps with issues
-        if (dep.state === "available" || dep.state === "syncing") {
+        // Only evidence-backed package results can produce diagnostics. Lookup
+        // uncertainty is represented in the tree without implying a package,
+        // vulnerability, or policy result.
+        if (!["quarantined", "violated", "not_found"].includes(dep.state)) {
           continue;
         }
 
