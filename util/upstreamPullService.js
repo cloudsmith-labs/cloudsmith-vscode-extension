@@ -1,7 +1,9 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("./cloudsmithAPI");
+const { apiEndpoint } = require("./apiEndpoint");
 const { CredentialManager } = require("./credentialManager");
+const { formatApiError } = require("./errorFormatter");
 const { PaginatedFetch } = require("./paginatedFetch");
 const {
   buildRegistryTriggerPlan,
@@ -21,7 +23,14 @@ const MAX_CONCURRENT_PULLS = 5;
 const INITIAL_AUTH_PROBE_CONCURRENCY = 3;
 const MAX_REGISTRY_REDIRECTS = 5;
 const REQUEST_TIMEOUT_MS = 30 * 1000;
+const MAX_REGISTRY_METADATA_BYTES = 1024 * 1024;
 const WORKSPACE_REPOSITORY_PAGE_SIZE = 500;
+const SAFE_REGISTRY_ERROR_MESSAGES = new Set([
+  "Refused to send Cloudsmith credentials to an untrusted registry host.",
+  "Registry metadata response exceeded the size limit.",
+  "Registry redirect target was rejected.",
+  "Registry request exceeded the redirect limit.",
+]);
 
 const PULL_STATUS = Object.freeze({
   PENDING: "pending",
@@ -47,6 +56,8 @@ class UpstreamPullService {
     this._api = options.api || new CloudsmithAPI(context);
     this._credentialManager = options.credentialManager || new CredentialManager(context);
     this._fetchImpl = options.fetchImpl || fetch;
+    this._setTimeout = options.setTimeout || setTimeout;
+    this._clearTimeout = options.clearTimeout || clearTimeout;
     this._fetchRepositories = options.fetchRepositories || this._fetchWorkspaceRepositories.bind(this);
     this._showQuickPick = options.showQuickPick || vscode.window.showQuickPick.bind(vscode.window);
     this._showErrorMessage = options.showErrorMessage || vscode.window.showErrorMessage.bind(vscode.window);
@@ -490,14 +501,20 @@ class UpstreamPullService {
 
   async _fetchWorkspaceRepositories(workspace) {
     const paginatedFetch = new PaginatedFetch(this._api);
-    const endpoint = `repos/${workspace}/?sort=name`;
+    const endpoint = apiEndpoint(["repos", workspace], { query: { sort: "name" } });
     const repositories = [];
     let page = 1;
 
     while (true) {
-      const result = await paginatedFetch.fetchPage(endpoint, page, WORKSPACE_REPOSITORY_PAGE_SIZE);
+      const result = await paginatedFetch.fetchPage(
+        endpoint,
+        page,
+        WORKSPACE_REPOSITORY_PAGE_SIZE,
+        null,
+        { validate: isRepositoryArray, retry: "never" }
+      );
       if (result.error) {
-        throw new Error(`Could not fetch workspace repositories. ${result.error}`);
+        throw new Error(`Could not fetch workspace repositories. ${formatApiError(result.error)}`);
       }
 
       repositories.push(...(Array.isArray(result.data) ? result.data : []));
@@ -532,7 +549,12 @@ class UpstreamPullService {
       };
     }
 
-    const metadataAttempt = await this._requestRegistry(plan.request, apiKey, token);
+    const metadataAttempt = await this._requestRegistry(
+      plan.request,
+      apiKey,
+      token,
+      { captureBody: plan.strategy !== "direct" }
+    );
     if (metadataAttempt.canceled) {
       return metadataAttempt;
     }
@@ -584,7 +606,8 @@ class UpstreamPullService {
         headers: {},
       },
       apiKey,
-      token
+      token,
+      { captureBody: false }
     );
 
     if (artifactAttempt.canceled) {
@@ -594,19 +617,31 @@ class UpstreamPullService {
     return mapRegistryAttempt(dependency, artifactAttempt, artifactUrl, format);
   }
 
-  async _requestRegistry(request, apiKey, token) {
+  async _requestRegistry(request, apiKey, token, options = {}) {
     const controller = new AbortController();
-    let didTimeout = false;
-    const timeoutHandle = setTimeout(() => {
-      didTimeout = true;
+    let abortCause = null;
+    const abort = (cause) => {
+      if (abortCause) {
+        return;
+      }
+      abortCause = cause;
       controller.abort();
+    };
+    const timeoutHandle = this._setTimeout(() => {
+      abort("timeout");
     }, REQUEST_TIMEOUT_MS);
 
     const cancellationDisposable = token && typeof token.onCancellationRequested === "function"
-      ? token.onCancellationRequested(() => controller.abort())
+      ? token.onCancellationRequested(() => abort("cancelled"))
       : null;
+    if (token && token.isCancellationRequested) {
+      abort("cancelled");
+    }
 
     try {
+      if (abortCause === "cancelled") {
+        return { canceled: true };
+      }
       const response = await this._fetchRegistryResponse(
         request,
         apiKey,
@@ -614,25 +649,36 @@ class UpstreamPullService {
         0
       );
 
+      const body = options.captureBody === false
+        ? await discardRegistryBody(response, controller.signal)
+        : await readRegistryBody(response, MAX_REGISTRY_METADATA_BYTES, controller.signal);
+
+      if (abortCause === "cancelled" || (token && token.isCancellationRequested)) {
+        return { canceled: true };
+      }
+      if (abortCause === "timeout" || controller.signal.aborted) {
+        throw new Error("Registry request was aborted.");
+      }
+
       return {
         statusCode: response.status,
-        body: await response.text(),
+        body,
       };
     } catch (error) {
-      if (token && token.isCancellationRequested) {
+      if (abortCause === "cancelled" || (token && token.isCancellationRequested)) {
         return { canceled: true };
       }
 
       return {
         statusCode: 0,
         body: "",
-        errorMessage: didTimeout
+        errorMessage: abortCause === "timeout"
           ? "Registry request timed out."
           : buildRegistryErrorMessage(request.url, error),
-        networkError: isNetworkError(error) || didTimeout,
+        networkError: isNetworkError(error) || abortCause === "timeout",
       };
     } finally {
-      clearTimeout(timeoutHandle);
+      this._clearTimeout(timeoutHandle);
       if (cancellationDisposable && typeof cancellationDisposable.dispose === "function") {
         cancellationDisposable.dispose();
       }
@@ -644,21 +690,29 @@ class UpstreamPullService {
       throw new Error("Refused to send Cloudsmith credentials to an untrusted registry host.");
     }
 
-    const response = await this._fetchImpl(request.url, {
+    const fetchResult = await this._awaitRegistryAbortable(this._fetchImpl(request.url, {
       method: request.method || "GET",
       headers: {
         Authorization: buildBasicAuthHeader(apiKey),
-        ...(request.headers || {}),
+        ...buildRegistryRequestHeaders(request.headers),
       },
       redirect: "manual",
       signal,
-    });
+    }), signal, cancelRegistryBody);
+    if (fetchResult.aborted) {
+      throw new Error("Registry request was aborted.");
+    }
+    if (!fetchResult.ok) {
+      throw fetchResult.error;
+    }
+    const response = fetchResult.value;
 
     if (!isRedirectStatus(response.status)) {
       return response;
     }
 
     if (redirectCount >= MAX_REGISTRY_REDIRECTS) {
+      await cancelRegistryBody(response);
       throw new Error("Registry request exceeded the redirect limit.");
     }
 
@@ -666,9 +720,14 @@ class UpstreamPullService {
       ? response.headers.get("location")
       : "";
     const redirectUrl = resolveAndValidateRegistryUrl(location, request.url);
-    if (!redirectUrl || !isTrustedRegistryUrl(redirectUrl)) {
+    const currentUrl = new URL(request.url);
+    const nextUrl = redirectUrl ? new URL(redirectUrl) : null;
+    if (!nextUrl || nextUrl.hostname !== currentUrl.hostname) {
+      await cancelRegistryBody(response);
       throw new Error("Registry redirect target was rejected.");
     }
+
+    await cancelRegistryBody(response);
 
     return this._fetchRegistryResponse(
       {
@@ -680,6 +739,228 @@ class UpstreamPullService {
       redirectCount + 1
     );
   }
+
+  _awaitRegistryAbortable(promise, signal, onLateValue = null) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return false;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve(result);
+        return true;
+      };
+      const onAbort = () => finish({ aborted: true });
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+      }
+      Promise.resolve(promise).then(
+        (value) => {
+          if (!finish({ ok: true, value }) && typeof onLateValue === "function") {
+            try {
+              Promise.resolve(onLateValue(value)).catch(() => {});
+            } catch {
+              // Late response cleanup is best effort.
+            }
+          }
+        },
+        error => finish({ ok: false, error })
+      );
+      if (signal.aborted) {
+        onAbort();
+      }
+    });
+  }
+}
+
+function isRepositoryArray(value) {
+  return Array.isArray(value) && value.every(repository => (
+    repository
+    && typeof repository === "object"
+    && !Array.isArray(repository)
+    && typeof repository.slug === "string"
+    && repository.slug.length > 0
+    && typeof repository.name === "string"
+    && repository.name.length > 0
+  ));
+}
+
+function buildRegistryRequestHeaders(headers) {
+  if (!headers || typeof headers !== "object") {
+    return {};
+  }
+  const accept = headers.Accept || headers.accept;
+  if (typeof accept !== "string" || accept.length > 1024 || /[\r\n]/.test(accept)) {
+    return {};
+  }
+  return { Accept: accept };
+}
+
+function cancelRegistryBody(response) {
+  if (response && response.body && typeof response.body.cancel === "function") {
+    try {
+      Promise.resolve(response.body.cancel()).catch(() => {});
+    } catch {
+      // The connection may already have been closed by the fetch implementation.
+    }
+  }
+}
+
+async function discardRegistryBody(response, signal) {
+  if (!response || !response.body) {
+    return "";
+  }
+  if (typeof response.body.getReader !== "function") {
+    await cancelRegistryBody(response);
+    throw new Error("Registry response did not provide a readable body stream.");
+  }
+
+  const reader = response.body.getReader();
+  try {
+    while (true) {
+      if (signal && signal.aborted) {
+        cancelRegistryReader(reader);
+        throw new Error("Registry response body read was aborted.");
+      }
+      const chunkResult = await readRegistryChunk(reader, signal);
+      if (chunkResult.aborted) {
+        throw new Error("Registry response body read was aborted.");
+      }
+      if (!chunkResult.ok) {
+        throw chunkResult.error;
+      }
+      const chunk = chunkResult.value;
+      if (chunk.done) {
+        break;
+      }
+    }
+    if (signal && signal.aborted) {
+      throw new Error("Registry response body read was aborted.");
+    }
+    return "";
+  } catch (error) {
+    try {
+      cancelRegistryReader(reader);
+    } catch {
+      // The connection may already be closed.
+    }
+    throw error;
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // The stream may already be detached.
+    }
+  }
+}
+
+async function readRegistryBody(response, byteLimit, signal) {
+  const contentLength = response && response.headers && typeof response.headers.get === "function"
+    ? Number(response.headers.get("content-length"))
+    : NaN;
+  if (Number.isFinite(contentLength) && contentLength > byteLimit) {
+    await cancelRegistryBody(response);
+    throw new Error("Registry metadata response exceeded the size limit.");
+  }
+
+  if (!response || !response.body) {
+    return "";
+  }
+  if (typeof response.body.getReader !== "function") {
+    await cancelRegistryBody(response);
+    throw new Error("Registry metadata response did not provide a readable body stream.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytesRead = 0;
+  let text = "";
+  let completed = false;
+  try {
+    while (true) {
+      if (signal && signal.aborted) {
+        cancelRegistryReader(reader);
+        throw new Error("Registry metadata response read was aborted.");
+      }
+      const chunkResult = await readRegistryChunk(reader, signal);
+      if (chunkResult.aborted) {
+        throw new Error("Registry metadata response read was aborted.");
+      }
+      if (!chunkResult.ok) {
+        throw chunkResult.error;
+      }
+      const chunk = chunkResult.value;
+      if (chunk.done) {
+        break;
+      }
+      bytesRead += chunk.value.byteLength;
+      if (bytesRead > byteLimit) {
+        cancelRegistryReader(reader);
+        throw new Error("Registry metadata response exceeded the size limit.");
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    if (signal && signal.aborted) {
+      throw new Error("Registry metadata response read was aborted.");
+    }
+    text += decoder.decode();
+    completed = true;
+    return text;
+  } catch (error) {
+    if (!completed) {
+      try {
+        cancelRegistryReader(reader);
+      } catch {
+        // The connection may already be closed.
+      }
+    }
+    throw error;
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // The stream may already be detached.
+    }
+  }
+}
+
+function cancelRegistryReader(reader) {
+  if (!reader || typeof reader.cancel !== "function") {
+    return;
+  }
+  try {
+    Promise.resolve(reader.cancel()).catch(() => {});
+  } catch {
+    // The stream may already be closed or detached.
+  }
+}
+
+function readRegistryChunk(reader, signal) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(result);
+    };
+    const onAbort = () => {
+      cancelRegistryReader(reader);
+      finish({ aborted: true });
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    Promise.resolve()
+      .then(() => reader.read())
+      .then(value => finish({ ok: true, value }), error => finish({ ok: false, error }));
+    if (signal.aborted) {
+      onAbort();
+    }
+  });
 }
 
 function buildPullExecutionPlan(workspace, repo, dependencies, activeUpstreamFormats) {
@@ -961,9 +1242,11 @@ function buildRegistryErrorMessage(url, error) {
     return "Cannot reach the Cloudsmith registry. Check your network connection.";
   }
 
+  if (error && SAFE_REGISTRY_ERROR_MESSAGES.has(error.message)) {
+    return error.message;
+  }
   const host = safeHost(url);
-  const message = error && error.message ? error.message : "Registry request failed.";
-  return host ? `${message} (${host})` : message;
+  return host ? `Registry request failed (${host}).` : "Registry request failed.";
 }
 
 function isNetworkError(error) {

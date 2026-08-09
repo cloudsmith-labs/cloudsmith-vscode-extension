@@ -151,7 +151,12 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
       return;
     }
 
-    const state = await upstreamChecker.getRepositoryUpstreamState(workspace, repo);
+    const state = await upstreamChecker.getRepositoryUpstreamState(workspace, repo, {
+      cancellationToken,
+    });
+    if (cancellationToken && cancellationToken.isCancellationRequested) {
+      return;
+    }
     repoUpstreamStates.set(repo, {
       repo,
       groupedUpstreams: state && state.groupedUpstreams instanceof Map

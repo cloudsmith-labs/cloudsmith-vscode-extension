@@ -2,6 +2,7 @@ const assert = require("assert");
 const vscode = require("vscode");
 const { PaginatedFetch } = require("../util/paginatedFetch");
 const workspaceRepositoryFetcher = require("../util/workspaceRepositoryFetcher");
+const { apiFailure } = require("./apiResultHelpers");
 
 suite("WorkspaceRepositoryFetcher Test Suite", () => {
   let originalConsole;
@@ -194,10 +195,14 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
   });
 
   test("returns an error when the first page fails", async () => {
+    const failure = apiFailure("server_error", {
+      status: 500,
+      message: "The Cloudsmith API returned an internal error.",
+    }).error;
     PaginatedFetch.prototype.fetchPage = async () => ({
       data: [],
       pagination: { page: 1, pageTotal: 1, count: 0, pageSize: 500 },
-      error: "Response status: 500",
+      error: failure,
     });
 
     const result = await workspaceRepositoryFetcher.fetchWorkspaceRepositories(
@@ -205,7 +210,7 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
       "workspace-a"
     );
 
-    assert.strictEqual(result.error, "Response status: 500");
+    assert.strictEqual(result.error, failure);
     assert.strictEqual(result.partial, false);
     assert.deepStrictEqual(result.repositories, []);
   });
@@ -224,7 +229,10 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
       return {
         data: [],
         pagination: { page: 2, pageTotal: 2, count: 600, pageSize },
-        error: "Response status: 502",
+        error: apiFailure("server_error", {
+          status: 502,
+          message: "The Cloudsmith API returned an internal error.",
+        }).error,
       };
     };
 
@@ -235,13 +243,13 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
 
     assert.strictEqual(result.error, null);
     assert.strictEqual(result.partial, true);
-    assert.strictEqual(result.warning, "Response status: 502");
+    assert.strictEqual(result.warning.kind, "server_error");
     assert.strictEqual(result.repositories.length, 500);
     assert.strictEqual(result.repositories[0].name, "repo-001");
     assert.strictEqual(result.repositories[499].name, "repo-500");
     assert.deepStrictEqual(warnCalls, [
       [
-        "[WorkspaceRepositories] Failed to load additional repositories for workspace-a on page 2: Response status: 502",
+        "[WorkspaceRepositories] Failed to load an additional repository page: The Cloudsmith API returned an internal error.",
       ],
     ]);
   });

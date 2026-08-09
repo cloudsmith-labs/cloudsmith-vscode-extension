@@ -3,6 +3,7 @@ const { CloudsmithProvider } = require("./views/cloudsmithProvider");
 const { helpProvider } = require("./views/helpProvider");
 const { SearchProvider } = require("./views/searchProvider");
 const { CloudsmithAPI } = require("./util/cloudsmithAPI");
+const { apiEndpoint } = require("./util/apiEndpoint");
 const { CredentialManager } = require("./util/credentialManager");
 const { RecentSearches } = require("./util/recentSearches");
 const { RemediationHelper } = require("./util/remediationHelper");
@@ -26,6 +27,7 @@ const { UpstreamDetailProvider } = require("./views/upstreamDetailProvider");
 const { PromotionProvider } = require("./views/promotionProvider");
 const { SearchQueryBuilder } = require("./util/searchQueryBuilder");
 const { formatApiError } = require("./util/errorFormatter");
+const { buildExactPackageQuery, packageMatchesExactIdentity } = require("./util/packageQuery");
 const { LicenseClassifier } = require("./util/licenseClassifier");
 const { fetchRepositoryUpstreams, generateTerraformConfig } = require("./util/terraformExporter");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("./util/upstreamFormats");
@@ -74,6 +76,42 @@ function extractPackageInfo(item) {
     slugPerm: unwrapValue(item.slug_perm),
     slug: unwrapValue(item.slug),
   };
+}
+
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isRecordArray(value) {
+  return Array.isArray(value) && value.every(isRecord);
+}
+
+function isWorkspaceArray(value) {
+  return isRecordArray(value) && value.every(workspace => (
+    typeof workspace.slug === "string" && workspace.slug.length > 0
+  ));
+}
+
+function isRepositoryArray(value) {
+  return isRecordArray(value) && value.every(repo => (
+    typeof repo.slug === "string"
+    && repo.slug.length > 0
+    && typeof repo.name === "string"
+    && repo.name.length > 0
+  ));
+}
+
+function isPackageLocationArray(value) {
+  return isRecordArray(value) && value.every(pkg => (
+    typeof pkg.name === "string"
+    && pkg.name.length > 0
+    && (typeof pkg.version === "string" || typeof pkg.version === "number")
+    && String(pkg.version).length > 0
+    && typeof pkg.format === "string"
+    && pkg.format.length > 0
+    && typeof pkg.repository === "string"
+    && pkg.repository.length > 0
+  ));
 }
 
 function getNestedInstallField(item, fieldName) {
@@ -313,18 +351,28 @@ async function getWorkspaces(context) {
         }
     }
     const cloudsmithAPI = new CloudsmithAPI(context);
-    const result = await cloudsmithAPI.get("namespaces/?sort=slug");
-    if (typeof result === 'string') {
+    const result = await cloudsmithAPI.get("namespaces/?sort=slug", {
+        responseType: "array",
+        validate: isWorkspaceArray,
+        retry: "safe-read",
+    });
+    if (!result.ok) {
         await setHasMultipleWorkspacesContext(false);
-        vscode.window.showErrorMessage("Failed to load workspaces: " + result);
+        vscode.window.showErrorMessage(`Failed to load workspaces: ${formatApiError(result.error)}`);
         return null;
     }
-    if (!result || result.length === 0) {
+    if (result.data.length === 0) {
         await setHasMultipleWorkspacesContext(false);
         return [];
     }
-    await setHasMultipleWorkspacesContext(result.length > 1);
-    return result;
+    const workspaces = result.data.map(workspace => ({
+        ...workspace,
+        name: typeof workspace.name === "string" && workspace.name.length > 0
+            ? workspace.name
+            : workspace.slug,
+    }));
+    await setHasMultipleWorkspacesContext(workspaces.length > 1);
+    return workspaces;
 }
 
 async function getPreferredTextDocumentLanguage() {
@@ -422,10 +470,24 @@ async function resolveDependencyScanTarget(context, options = {}) {
 
   if (!selectedScope._all) {
     const cloudsmithAPI = new CloudsmithAPI(context);
-    const repos = await cloudsmithAPI.get(`repos/${scanWorkspace}/?sort=name`);
-    if (typeof repos !== "string" && Array.isArray(repos) && repos.length > 0) {
+    let endpoint;
+    try {
+      endpoint = apiEndpoint(["repos", scanWorkspace], { query: { sort: "name" } });
+    } catch {
+      return null;
+    }
+    const repos = await cloudsmithAPI.get(endpoint, {
+      responseType: "array",
+      validate: isRepositoryArray,
+      retry: "safe-read",
+    });
+    if (!repos.ok) {
+      vscode.window.showErrorMessage(`Could not load repositories. ${formatApiError(repos.error)}`);
+      return null;
+    }
+    if (repos.ok && repos.data.length > 0) {
       const selectedRepo = await vscode.window.showQuickPick(
-        repos.map((repository) => ({
+        repos.data.map((repository) => ({
           label: repository.name,
           description: repository.slug,
         })),
@@ -437,6 +499,9 @@ async function resolveDependencyScanTarget(context, options = {}) {
       if (selectedRepo) {
         scanRepo = selectedRepo.description;
       }
+    } else {
+      vscode.window.showInformationMessage("No repositories were found in this workspace.");
+      return null;
     }
   }
 
@@ -908,14 +973,23 @@ async function activate(context) {
 
 
         if (identifier) {
-          const result = await cloudsmithAPI.get(
-            `packages/${workspace}/${repo}/${identifier}`
-          );
-          if (typeof result === "string") {
-            vscode.window.showErrorMessage(formatApiError(result));
+          let endpoint;
+          try {
+            endpoint = apiEndpoint(["packages", workspace, repo, identifier]);
+          } catch {
+            vscode.window.showErrorMessage("Could not inspect the package because its identifier was invalid.");
             return;
           }
-          const jsonContent = JSON.stringify(result, null, 2);
+          const result = await cloudsmithAPI.get(endpoint, {
+            responseType: "object",
+            validate: isRecord,
+            retry: "safe-read",
+          });
+          if (!result.ok) {
+            vscode.window.showErrorMessage(formatApiError(result.error));
+            return;
+          }
+          const jsonContent = JSON.stringify(result.data, null, 2);
 
           const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
           const inspectOutput = await config.get("inspectOutput");
@@ -957,14 +1031,24 @@ async function activate(context) {
         const repo = typeof item === "string" ? item : item.repo;
 
         if (name) {
-          const result = await cloudsmithAPI.get(
-            `packages/${workspace}/${repo}/?query=name:"${name}"`
-          );
-          if (typeof result === "string") {
-            vscode.window.showErrorMessage(formatApiError(result));
+          let endpoint;
+          try {
+            const query = new SearchQueryBuilder().name(name).build();
+            endpoint = apiEndpoint(["packages", workspace, repo], { query: { query } });
+          } catch {
+            vscode.window.showErrorMessage("Could not inspect the package group because its identity was invalid.");
             return;
           }
-          const jsonContent = JSON.stringify(result, null, 2);
+          const result = await cloudsmithAPI.get(endpoint, {
+            responseType: "array",
+            validate: isRecordArray,
+            retry: "safe-read",
+          });
+          if (!result.ok) {
+            vscode.window.showErrorMessage(formatApiError(result.error));
+            return;
+          }
+          const jsonContent = JSON.stringify(result.data, null, 2);
 
           const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
           const inspectOutput = await config.get("inspectOutput");
@@ -1232,12 +1316,27 @@ async function activate(context) {
       let selectedRepos = null;
       if (selectedScope.label === "Select specific repositories") {
         const cloudsmithAPI = new CloudsmithAPI(context);
-        const repos = await cloudsmithAPI.get(`repos/${workspaceSlug}/?sort=name`);
-        if (typeof repos === 'string' || !repos || repos.length === 0) {
+        let endpoint;
+        try {
+          endpoint = apiEndpoint(["repos", workspaceSlug], { query: { sort: "name" } });
+        } catch {
+          vscode.window.showErrorMessage("The selected workspace identifier was invalid.");
+          return;
+        }
+        const repos = await cloudsmithAPI.get(endpoint, {
+          responseType: "array",
+          validate: isRepositoryArray,
+          retry: "safe-read",
+        });
+        if (!repos.ok) {
+          vscode.window.showErrorMessage(`Could not load repositories. ${formatApiError(repos.error)}`);
+          return;
+        }
+        if (repos.data.length === 0) {
           vscode.window.showErrorMessage("No repositories found in this workspace.");
           return;
         }
-        const repoItems = repos.map(r => ({ label: r.name, description: r.slug }));
+        const repoItems = repos.data.map(r => ({ label: r.name, description: r.slug }));
         const picked = await vscode.window.showQuickPick(repoItems, {
           placeHolder: "Select repositories to search",
           canPickMany: true,
@@ -2005,17 +2104,41 @@ async function activate(context) {
       const abortController = new AbortController();
       exportTerraformAbortController = abortController;
       const cloudsmithAPI = new CloudsmithAPI(context);
+      let repoEndpoint;
+      let retentionEndpoint;
+      try {
+        repoEndpoint = apiEndpoint(["repos", workspace, repoSlug]);
+        retentionEndpoint = apiEndpoint(["repos", workspace, repoSlug, "retention"]);
+      } catch {
+        if (exportTerraformAbortController === abortController) {
+          exportTerraformAbortController = null;
+        }
+        vscode.window.showErrorMessage("Could not export the repository because its identity was invalid.");
+        return;
+      }
 
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: "Generating Terraform configuration...",
+          cancellable: true,
         },
-        async () => {
+        async (_progress, token) => {
+          const cancellationSubscription = token.onCancellationRequested(() => abortController.abort());
           try {
             const [repoResult, retentionResult, upstreamResult] = await Promise.all([
-              cloudsmithAPI.get(`repos/${workspace}/${repoSlug}`),
-              cloudsmithAPI.get(`repos/${workspace}/${repoSlug}/retention`),
+              cloudsmithAPI.get(repoEndpoint, {
+                responseType: "object",
+                validate: isRecord,
+                retry: "safe-read",
+                signal: abortController.signal,
+              }),
+              cloudsmithAPI.get(retentionEndpoint, {
+                responseType: "object",
+                validate: isRecord,
+                retry: "safe-read",
+                signal: abortController.signal,
+              }),
               fetchRepositoryUpstreams(context, workspace, repoSlug, {
                 signal: abortController.signal,
               }),
@@ -2025,24 +2148,21 @@ async function activate(context) {
               return;
             }
 
-            if (typeof repoResult === "string") {
+            if (!repoResult.ok) {
+              if (repoResult.error.kind === "cancelled") {
+                return;
+              }
               vscode.window.showErrorMessage(
-                `Could not export repository. ${formatApiError(repoResult)}`
+                `Could not export repository. ${formatApiError(repoResult.error)}`
               );
               return;
             }
 
             const upstreamLoadFailed = Boolean(upstreamResult && upstreamResult.error);
-            const retentionRules = (
-              typeof retentionResult === "string" ||
-              !retentionResult ||
-              typeof retentionResult !== "object"
-            )
-              ? null
-              : retentionResult;
+            const retentionRules = retentionResult.ok ? retentionResult.data : null;
 
             const hclContent = generateTerraformConfig({
-              repo: repoResult,
+              repo: repoResult.data,
               workspace,
               upstreams: upstreamLoadFailed ? [] : upstreamResult.data,
               retention: retentionRules,
@@ -2070,6 +2190,7 @@ async function activate(context) {
               `Could not export repository. ${formatApiError(message)}`
             );
           } finally {
+            cancellationSubscription.dispose();
             if (exportTerraformAbortController === abortController) {
               exportTerraformAbortController = null;
             }
@@ -2124,13 +2245,28 @@ async function activate(context) {
 
       // Select repo
       const cloudsmithAPI = new CloudsmithAPI(context);
-      const repos = await cloudsmithAPI.get(`repos/${wsSlug}/?sort=name`);
-      if (typeof repos === "string" || !repos || repos.length === 0) {
+      let reposEndpoint;
+      try {
+        reposEndpoint = apiEndpoint(["repos", wsSlug], { query: { sort: "name" } });
+      } catch {
+        vscode.window.showErrorMessage("The workspace identifier was invalid.");
+        return;
+      }
+      const repos = await cloudsmithAPI.get(reposEndpoint, {
+        responseType: "array",
+        validate: isRepositoryArray,
+        retry: "safe-read",
+      });
+      if (!repos.ok) {
+        vscode.window.showErrorMessage(`Could not load repositories. ${formatApiError(repos.error)}`);
+        return;
+      }
+      if (repos.data.length === 0) {
         vscode.window.showErrorMessage("No repositories found.");
         return;
       }
       const repoPick = await vscode.window.showQuickPick(
-        repos.map(r => ({ label: r.name, description: r.slug })),
+        repos.data.map(r => ({ label: r.name, description: r.slug })),
         { placeHolder: "Select target repository" }
       );
       if (!repoPick) return;
@@ -2153,7 +2289,7 @@ async function activate(context) {
       recentPackages.add(item);
 
       const info = extractPackageInfo(item);
-      if (!info.workspace || !info.name || !info.version) {
+      if (!info.workspace || !info.name || !info.version || !info.format) {
         vscode.window.showWarningMessage("Could not determine package details.");
         return;
       }
@@ -2161,9 +2297,17 @@ async function activate(context) {
       const pipeline = promotionProvider.getPipeline();
       if (pipeline.length > 0) {
         // Pipeline mode: show status across configured repos
-        const status = await promotionProvider.getPromotionStatus(
+        const statusResult = await promotionProvider.getPromotionStatus(
           info.workspace, info.name, info.version, info.format
         );
+
+        if (statusResult.error) {
+          vscode.window.showErrorMessage(
+            `Could not load promotion status. ${formatApiError(statusResult.error)}`
+          );
+          return;
+        }
+        const status = statusResult.items;
 
         if (status.length === 0) {
           vscode.window.showInformationMessage("No pipeline repositories found.");
@@ -2180,17 +2324,37 @@ async function activate(context) {
       } else {
         // No pipeline: search workspace-wide for this package name+version
         const cloudsmithAPI = new CloudsmithAPI(context);
-        const query = encodeURIComponent(`name:^${info.name}$ AND version:${info.version}`);
-        const results = await cloudsmithAPI.get(
-          `packages/${info.workspace}/?query=${query}&page_size=100`
-        );
+        let endpoint;
+        try {
+          endpoint = apiEndpoint(["packages", info.workspace], {
+            query: {
+              query: buildExactPackageQuery(info.name, info.version, info.format),
+              page_size: 100,
+            },
+          });
+        } catch {
+          vscode.window.showErrorMessage("The package search parameters were invalid.");
+          return;
+        }
+        const results = await cloudsmithAPI.get(endpoint, {
+          responseType: "array",
+          validate: isPackageLocationArray,
+          retry: "never",
+        });
 
-        if (typeof results === "string" || !Array.isArray(results) || results.length === 0) {
+        if (!results.ok) {
+          vscode.window.showErrorMessage(
+            `Could not load package locations. ${formatApiError(results.error)}`
+          );
+          return;
+        }
+        const exactPackages = results.data.filter(pkg => packageMatchesExactIdentity(pkg, info));
+        if (exactPackages.length === 0) {
           vscode.window.showInformationMessage(`${info.name} ${info.version} was not found in any other repository.`);
           return;
         }
 
-        const lines = results.map(pkg => {
+        const lines = exactPackages.map(pkg => {
           const icon = pkg.status_str === "Quarantined" ? "\u274C" : (pkg.policy_violated ? "\u26A0\uFE0F" : "\u2705");
           return `${icon} ${pkg.repository}: ${pkg.status_str || "Unknown"}`;
         });
@@ -2209,7 +2373,14 @@ async function activate(context) {
       recentPackages.add(item);
 
       const info = extractPackageInfo(item);
-      if (!info.workspace || !info.repo || !info.slugPerm) {
+      if (
+        !info.workspace
+        || !info.repo
+        || !info.slugPerm
+        || !info.name
+        || !info.version
+        || !info.format
+      ) {
         vscode.window.showWarningMessage("Could not determine package details.");
         return;
       }
@@ -2241,13 +2412,30 @@ async function activate(context) {
         targetItems = eligibleTargets.map(r => ({ label: r, description: r, _slug: r }));
       } else {
         // No pipeline: show all workspace repos except the source
-        const repos = await cloudsmithAPI.get(`repos/${info.workspace}/?sort=name`);
-        if (typeof repos === "string" || !Array.isArray(repos) || repos.length === 0) {
-          vscode.window.showErrorMessage("Could not fetch workspace repositories.");
+        let reposEndpoint;
+        try {
+          reposEndpoint = apiEndpoint(["repos", info.workspace], { query: { sort: "name" } });
+        } catch {
+          vscode.window.showErrorMessage("The workspace identifier was invalid.");
+          return;
+        }
+        const repos = await cloudsmithAPI.get(reposEndpoint, {
+          responseType: "array",
+          validate: isRepositoryArray,
+          retry: "safe-read",
+        });
+        if (!repos.ok) {
+          vscode.window.showErrorMessage(
+            `Could not fetch workspace repositories. ${formatApiError(repos.error)}`
+          );
+          return;
+        }
+        if (repos.data.length === 0) {
+          vscode.window.showErrorMessage("No target repositories were found.");
           return;
         }
 
-        targetItems = repos
+        targetItems = repos.data
           .filter(r => r.slug !== info.repo)
           .map(r => ({ label: r.name, description: r.slug, _slug: r.slug }));
       }
@@ -2258,22 +2446,39 @@ async function activate(context) {
       const recentTargets = (history[info.repo] || []).slice(0, 5);
 
       // Check where this package already exists (workspace-wide search)
-      let existingRepoMap = {};
+      const existingRepoMap = new Map();
       if (info.name && info.version) {
-        const query = encodeURIComponent(`name:^${info.name}$ AND version:${info.version}`);
-        const existingResults = await cloudsmithAPI.get(
-          `packages/${info.workspace}/?query=${query}&page_size=100`
-        );
-        if (Array.isArray(existingResults)) {
-          for (const pkg of existingResults) {
-            existingRepoMap[pkg.repository] = pkg.status_str || "Unknown";
-          }
+        let existingEndpoint;
+        try {
+          existingEndpoint = apiEndpoint(["packages", info.workspace], {
+            query: {
+              query: buildExactPackageQuery(info.name, info.version, info.format),
+              page_size: 100,
+            },
+          });
+        } catch {
+          vscode.window.showErrorMessage("The package search parameters were invalid.");
+          return;
+        }
+        const existingResults = await cloudsmithAPI.get(existingEndpoint, {
+          responseType: "array",
+          validate: isPackageLocationArray,
+          retry: "never",
+        });
+        if (!existingResults.ok) {
+          vscode.window.showErrorMessage(
+            `Could not check existing package locations. ${formatApiError(existingResults.error)}`
+          );
+          return;
+        }
+        for (const pkg of existingResults.data.filter(pkg => packageMatchesExactIdentity(pkg, info))) {
+            existingRepoMap.set(pkg.repository, pkg.status_str || "Unknown");
         }
       }
 
       // Annotate target items with existence status
       for (const ti of targetItems) {
-        const existingStatus = existingRepoMap[ti._slug];
+        const existingStatus = existingRepoMap.get(ti._slug);
         if (existingStatus) {
           ti.description = `${ti._slug} — already exists (${existingStatus})`;
         } else {

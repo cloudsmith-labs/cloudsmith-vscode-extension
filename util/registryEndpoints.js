@@ -4,8 +4,17 @@ const {
   sanitizePackageNameInput,
 } = require("./packageNameNormalizer");
 
-const CLOUDSMITH_HOST_SUFFIX = ".cloudsmith.io";
 const MAX_REGISTRY_VALUE_LENGTH = 4096;
+const TRUSTED_REGISTRY_HOSTS = new Set([
+  "cargo.cloudsmith.io",
+  "composer.cloudsmith.io",
+  "dart.cloudsmith.io",
+  "dl.cloudsmith.io",
+  "docker.cloudsmith.io",
+  "golang.cloudsmith.io",
+  "npm.cloudsmith.io",
+  "nuget.cloudsmith.io",
+]);
 
 const UNSUPPORTED_PULL_FORMATS = new Set([
   "alpine",
@@ -38,33 +47,49 @@ function isPullUnsupportedFormat(format) {
 }
 
 function encodePathSegment(value) {
-  const normalized = String(value == null ? "" : value)
-    .replace(/\0/g, "")
-    .trim();
+  const raw = String(value == null ? "" : value);
+  const normalized = raw.trim();
 
-  if (!normalized || normalized.length > MAX_REGISTRY_VALUE_LENGTH) {
+  if (
+    !normalized
+    || normalized !== raw
+    || normalized.length > MAX_REGISTRY_VALUE_LENGTH
+    || /[\u0000-\u001f\u007f\\/?#]/.test(normalized)
+  ) {
     return "";
   }
 
-  if (normalized === ".") {
-    return "%2E";
+  let decoded = normalized;
+  for (let depth = 0; depth < 3; depth += 1) {
+    let next;
+    try {
+      next = decodeURIComponent(decoded);
+    } catch {
+      return "";
+    }
+    if (next === decoded) {
+      break;
+    }
+    decoded = next;
   }
-
-  if (normalized === "..") {
-    return "%2E%2E";
+  if (decoded === "." || decoded === ".." || /[\u0000-\u001f\u007f\\/?#]/.test(decoded)) {
+    return "";
   }
 
   return encodeURIComponent(normalized);
 }
 
 function encodePath(value) {
-  return String(value == null ? "" : value)
-    .replace(/\0/g, "")
-    .trim()
-    .split("/")
-    .filter(Boolean)
-    .map((segment) => encodePathSegment(segment))
-    .join("/");
+  const raw = String(value == null ? "" : value);
+  if (!raw || raw !== raw.trim() || /[\\?#\u0000-\u001f\u007f]/.test(raw)) {
+    return "";
+  }
+  const segments = raw.split("/");
+  if (segments.some(segment => !segment)) {
+    return "";
+  }
+  const encoded = segments.map(encodePathSegment);
+  return encoded.every(Boolean) ? encoded.join("/") : "";
 }
 
 function normalizePythonName(name) {
@@ -72,17 +97,23 @@ function normalizePythonName(name) {
 }
 
 function encodeGoModulePath(modulePath) {
-  return [...String(modulePath || "")]
-    .map((character) => {
-      if (character === "!") {
-        return "!!";
-      }
-      if (character >= "A" && character <= "Z") {
-        return `!${character.toLowerCase()}`;
-      }
-      return character;
-    })
-    .join("");
+  const raw = String(modulePath || "");
+  if (!raw || raw !== raw.trim() || /[\\?#\u0000-\u001f\u007f]/.test(raw)) {
+    return "";
+  }
+  const segments = raw.split("/");
+  if (segments.some(segment => !encodePathSegment(segment))) {
+    return "";
+  }
+  return segments.map(segment => encodePathSegment(
+    [...segment]
+      .map((character) => {
+        if (character === "!") return "!!";
+        if (character >= "A" && character <= "Z") return `!${character.toLowerCase()}`;
+        return character;
+      })
+      .join("")
+  )).join("/");
 }
 
 function cargoIndexPath(crateName) {
@@ -159,20 +190,17 @@ function buildMavenCoordinates(dependency) {
     return null;
   }
 
-  const groupPath = groupId
-    .split(".")
-    .filter(Boolean)
-    .map((segment) => encodePathSegment(segment))
-    .join("/");
-
-  if (!groupPath) {
+  const groupSegments = groupId.split(".").map(segment => encodePathSegment(segment));
+  const encodedArtifactId = encodePathSegment(artifactId);
+  const encodedVersion = encodePathSegment(version);
+  if (!groupSegments.every(Boolean) || !encodedArtifactId || !encodedVersion) {
     return null;
   }
 
   return {
-    groupPath,
-    artifactId: encodePathSegment(artifactId),
-    version: encodePathSegment(version),
+    groupPath: groupSegments.join("/"),
+    artifactId: encodedArtifactId,
+    version: encodedVersion,
   };
 }
 
@@ -198,8 +226,9 @@ function buildComposerCoordinates(name) {
 }
 
 function buildSwiftCoordinates(name) {
-  const parts = sanitizePackageNameInput(name).split("/").filter(Boolean);
-  if (parts.length < 2) {
+  const rawName = sanitizePackageNameInput(name);
+  const parts = rawName.split("/");
+  if (parts.length < 2 || parts.some(part => !encodePathSegment(part))) {
     return null;
   }
 
@@ -209,7 +238,7 @@ function buildSwiftCoordinates(name) {
   };
 }
 
-function buildRegistryTriggerPlan(workspace, repo, dependency) {
+function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
   const format = formatForDependency(dependency);
   if (!format || isPullUnsupportedFormat(format)) {
     return null;
@@ -218,6 +247,9 @@ function buildRegistryTriggerPlan(workspace, repo, dependency) {
   const safeWorkspace = encodePathSegment(workspace);
   const safeRepo = encodePathSegment(repo);
   const version = encodePathSegment(dependency && dependency.version);
+  if (!safeWorkspace || !safeRepo) {
+    return null;
+  }
 
   switch (format) {
     case "maven": {
@@ -423,15 +455,68 @@ function buildRegistryTriggerPlan(workspace, repo, dependency) {
   }
 }
 
+function buildRegistryTriggerPlan(workspace, repo, dependency) {
+  const safeWorkspace = encodePathSegment(workspace);
+  const safeRepo = encodePathSegment(repo);
+  const rawName = String(dependency && dependency.name || "");
+  const rawVersion = String(dependency && dependency.version || "");
+  if (
+    !safeWorkspace
+    || !safeRepo
+    || !rawName
+    || /[\u0000-\u001f\u007f\\?#]/.test(rawName)
+    || /[\u0000-\u001f\u007f\\/?#]/.test(rawVersion)
+    || rawName.split("/").some(segment => segment === "." || segment === ".." || segment === "")
+  ) {
+    return null;
+  }
+  const plan = buildRegistryTriggerPlanUnchecked(workspace, repo, dependency);
+  if (!plan || !plan.request || typeof plan.request.url !== "string") {
+    return null;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(plan.request.url);
+  } catch {
+    return null;
+  }
+  if (!isTrustedRegistryUrl(parsed.toString()) || parsed.search || parsed.hash) {
+    return null;
+  }
+  const expectedPrefix = parsed.hostname === "docker.cloudsmith.io"
+    ? `/v2/${safeWorkspace}/${safeRepo}/`
+    : parsed.hostname === "dl.cloudsmith.io"
+      ? `/basic/${safeWorkspace}/${safeRepo}/`
+      : `/${safeWorkspace}/${safeRepo}/`;
+  if (!parsed.pathname.startsWith(expectedPrefix)) {
+    return null;
+  }
+  const remainingSegments = parsed.pathname.slice(expectedPrefix.length).split("/");
+  if (remainingSegments[remainingSegments.length - 1] === "") {
+    if (plan.strategy !== "python-simple-index") {
+      return null;
+    }
+    remainingSegments.pop();
+  }
+  return remainingSegments.length > 0 && remainingSegments.every(Boolean) ? plan : null;
+}
+
 function isTrustedCloudsmithHost(host) {
   const normalizedHost = String(host || "").trim().toLowerCase();
-  return normalizedHost === "cloudsmith.io" || normalizedHost.endsWith(CLOUDSMITH_HOST_SUFFIX);
+  return TRUSTED_REGISTRY_HOSTS.has(normalizedHost);
 }
 
 function isTrustedRegistryUrl(candidateUrl) {
   try {
     const parsed = new URL(candidateUrl);
-    return parsed.protocol === "https:" && isTrustedCloudsmithHost(parsed.host);
+    return parsed.protocol === "https:"
+      && parsed.origin === `https://${parsed.hostname}`
+      && parsed.port === ""
+      && parsed.username === ""
+      && parsed.password === ""
+      && parsed.hash === ""
+      && isTrustedCloudsmithHost(parsed.hostname);
   } catch {
     return false;
   }
@@ -457,16 +542,51 @@ function resolveAndValidateRegistryUrl(candidate, baseUrl) {
 }
 
 function collectHrefValues(html) {
+  const source = String(html || "");
+  const lower = source.toLowerCase();
   const hrefs = [];
-  const pattern = /<a\b[^>]*\bhref\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))/gi;
-  let match = pattern.exec(String(html || ""));
+  const maximumTagLength = 4096;
+  const maximumCandidates = 500;
+  let cursor = 0;
 
-  while (match) {
-    hrefs.push(match[1] || match[2] || match[3] || "");
-    match = pattern.exec(String(html || ""));
+  while (cursor < source.length && hrefs.length < maximumCandidates) {
+    const anchorStart = lower.indexOf("<a", cursor);
+    if (anchorStart < 0) {
+      break;
+    }
+    const boundary = lower[anchorStart + 2];
+    if (boundary && !/[\s/>]/.test(boundary)) {
+      cursor = anchorStart + 2;
+      continue;
+    }
+
+    let tagEnd = anchorStart + 2;
+    const tagLimit = Math.min(source.length, anchorStart + maximumTagLength + 1);
+    while (tagEnd < tagLimit && source[tagEnd] !== "<" && source[tagEnd] !== ">") {
+      tagEnd += 1;
+    }
+    if (tagEnd >= source.length) {
+      break;
+    }
+    if (source[tagEnd] === "<") {
+      cursor = tagEnd;
+      continue;
+    }
+    if (tagEnd >= tagLimit) {
+      cursor = tagEnd;
+      continue;
+    }
+
+    const tag = source.slice(anchorStart, tagEnd + 1);
+    const match = /\bhref\s*=\s*(?:"([^"<>]{1,4096})"|'([^'<>]{1,4096})'|([^\s<>]{1,4096}))/i.exec(tag);
+    const href = match && (match[1] || match[2] || match[3]);
+    if (href) {
+      hrefs.push(href);
+    }
+    cursor = tagEnd + 1;
   }
 
-  return hrefs.filter(Boolean);
+  return hrefs;
 }
 
 function scorePythonArtifact(url, version) {

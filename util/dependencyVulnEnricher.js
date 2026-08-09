@@ -1,5 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const { CloudsmithAPI } = require("./cloudsmithAPI");
+const { apiEndpoint } = require("./apiEndpoint");
 const { getFoundDependencyKey } = require("./foundDependencyKey");
 
 const VULNERABILITY_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -336,26 +337,37 @@ async function fetchVulnerabilitySummary(api, packageModel, fallbackSummary, can
     return fallbackSummary;
   }
 
-  const workspace = encodeURIComponent(String(packageModel.namespace || "").trim());
-  const repo = encodeURIComponent(String(packageModel.repository || "").trim());
-  const identifier = encodeURIComponent(String(
+  const workspace = String(packageModel.namespace || "").trim();
+  const repo = String(packageModel.repository || "").trim();
+  const identifier = String(
     packageModel.slug_perm
       || packageModel.slugPerm
       || packageModel.slug
       || packageModel.identifier
       || ""
-  ).trim());
+  ).trim();
 
   if (!workspace || !repo || !identifier) {
     return fallbackSummary;
   }
 
-  const response = await api.getV2(`vulnerabilities/${workspace}/${repo}/${identifier}/`);
-  if (typeof response === "string") {
-    return fallbackSummary;
+  let endpoint;
+  try {
+    endpoint = apiEndpoint(["vulnerabilities", workspace, repo, identifier]);
+  } catch {
+    return null;
+  }
+  const response = await api.getV2(endpoint, {
+    responseType: "json",
+    validate: isRecognizedVulnerabilityDetail,
+    retry: "never",
+    cancellationToken,
+  });
+  if (!response.ok || isCancellationRequested(cancellationToken)) {
+    return null;
   }
 
-  const summary = summarizeEntries(extractVulnerabilityEntries(response), fallbackSummary);
+  const summary = summarizeEntries(extractVulnerabilityEntries(response.data), fallbackSummary);
   setCachedVulnerabilitySummary(packageKey, summary);
   return summary;
 }
@@ -415,11 +427,13 @@ async function enrichVulnerabilities(dependencies, workspace, options = {}) {
       cancellationToken
     );
 
-    patchMap.set(target.key, summary);
+    if (summary) {
+      patchMap.set(target.key, summary);
+    }
     completed += 1;
 
     if (onProgress) {
-      onProgress(new Map([[target.key, summary]]), {
+      onProgress(summary ? new Map([[target.key, summary]]) : new Map(), {
         completed,
         total: detailTargets.length,
         workspace,
@@ -429,6 +443,42 @@ async function enrichVulnerabilities(dependencies, workspace, options = {}) {
   });
 
   return applyVulnerabilityPatch(dependencies, patchMap);
+}
+
+function isRecognizedVulnerabilityDetail(value) {
+  if (Array.isArray(value)) {
+    return isVulnerabilityRecordArray(value);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "results")) {
+    return Array.isArray(value.results) && isVulnerabilityRecordArray(value.results);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "vulnerabilities")) {
+    return Array.isArray(value.vulnerabilities) && isVulnerabilityRecordArray(value.vulnerabilities);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "items")) {
+    return Array.isArray(value.items) && isVulnerabilityRecordArray(value.items);
+  }
+  return Array.isArray(value.scans) && value.scans.every(scan => (
+    scan
+    && typeof scan === "object"
+    && !Array.isArray(scan)
+    && Array.isArray(scan.results)
+    && isVulnerabilityRecordArray(scan.results)
+  ));
+}
+
+function isVulnerabilityRecordArray(value) {
+  return Array.isArray(value) && value.every(entry => (
+    Boolean(entry)
+    && typeof entry === "object"
+    && !Array.isArray(entry)
+    && [entry.vulnerability_id, entry.identifier, entry.id, entry.name]
+      .some(identifier => typeof identifier === "string" && identifier.trim().length > 0)
+    && (entry.severity === undefined || entry.severity === null || typeof entry.severity === "string")
+  ));
 }
 
 module.exports = {

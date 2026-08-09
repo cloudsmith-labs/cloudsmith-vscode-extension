@@ -1,6 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const { CloudsmithAPI } = require("./cloudsmithAPI");
-const { CredentialManager } = require("./credentialManager");
+const { apiEndpoint } = require("./apiEndpoint");
 const { SearchQueryBuilder } = require("./searchQueryBuilder");
 const {
   getSupportedUpstreamFormats,
@@ -65,6 +65,7 @@ function getCachedUpstreamResponse(globalState, cacheKey, workspace, repo) {
   const isValidCacheEntry = isCacheObjectRecord(cached)
     && Number.isFinite(cached.timestamp)
     && Array.isArray(cached.upstreams)
+    && cached.upstreams.every(isUpstreamRecord)
     && Number.isFinite(cached.active)
     && Number.isFinite(cached.total)
     && Array.isArray(cached.failedFormats)
@@ -104,50 +105,12 @@ async function persistUpstreamResponse(globalState, cacheKey, workspace, repo, r
   }
 }
 
-function getUpstreamErrorStatusCode(message) {
-  const normalized = typeof message === "string" ? message.toLowerCase() : "";
-  const statusMatch = normalized.match(/response status:\s*(\d{3})/);
-  if (!statusMatch) {
-    return null;
-  }
-
-  return Number(statusMatch[1]);
+function isBenignUpstreamFormatError(error) {
+  return Boolean(error) && BENIGN_UPSTREAM_FORMAT_STATUS_CODES.has(error.status);
 }
 
-function isBenignUpstreamFormatError(message) {
-  const normalized = typeof message === "string" ? message.toLowerCase() : "";
-  if (!normalized) {
-    return false;
-  }
-
-  const statusCode = getUpstreamErrorStatusCode(normalized);
-  if (statusCode !== null) {
-    return BENIGN_UPSTREAM_FORMAT_STATUS_CODES.has(statusCode);
-  }
-
-  const benignKeywords = [
-    "not found",
-    "unsupported",
-    "not applicable",
-    "unknown format",
-    "no upstream",
-    "does not exist",
-  ];
-
-  if (benignKeywords.some((keyword) => normalized.includes(keyword))) {
-    return true;
-  }
-
-  return false;
-}
-
-function isWarningWorthyUpstreamFormatError(message) {
-  const normalized = typeof message === "string" ? message.toLowerCase() : "";
-  if (!normalized) {
-    return true;
-  }
-
-  return !isBenignUpstreamFormatError(normalized);
+function isWarningWorthyUpstreamFormatError(error) {
+  return !isBenignUpstreamFormatError(error);
 }
 
 function isAbortError(error) {
@@ -167,23 +130,6 @@ function getActiveUpstreamsFromRepositoryState(state, format) {
   return upstreams.filter((upstream) => upstream && upstream.is_active !== false);
 }
 
-function getUpstreamRequestOptions(apiKey, signal) {
-  const headers = {
-    accept: "application/json",
-    "content-type": "application/json",
-  };
-
-  if (apiKey) {
-    headers["X-Api-Key"] = apiKey;
-  }
-
-  return {
-    method: "GET",
-    headers,
-    signal,
-  };
-}
-
 function sortUpstreams(left, right) {
   const leftName = typeof left.name === "string" ? left.name : "";
   const rightName = typeof right.name === "string" ? right.name : "";
@@ -201,42 +147,43 @@ function sortUpstreams(left, right) {
   return leftFormat.localeCompare(rightFormat, undefined, { sensitivity: "base" });
 }
 
-async function fetchFormatUpstreams(api, workspace, repo, format, apiKey, signal) {
+async function fetchFormatUpstreams(api, workspace, repo, format, options = {}) {
+  const { signal, cancellationToken } = options;
   try {
     if (signal && signal.aborted) {
       return { format, status: "aborted", upstreams: [] };
     }
 
-    const result = await api.makeRequest(
-      `repos/${workspace}/${repo}/upstream/${format}/`,
-      getUpstreamRequestOptions(apiKey, signal)
+    const result = await api.get(
+      apiEndpoint(["repos", workspace, repo, "upstream", format]),
+      {
+        responseType: "array",
+        validate: isUpstreamArray,
+        retry: "never",
+        signal,
+        cancellationToken,
+      }
     );
 
     if (signal && signal.aborted) {
       return { format, status: "aborted", upstreams: [] };
     }
 
-    if (typeof result === "string") {
-      if (isWarningWorthyUpstreamFormatError(result)) {
-        return { format, status: "failed", error: result, upstreams: [] };
+    if (!result.ok) {
+      if (result.error.kind === "cancelled") {
+        return { format, status: "aborted", upstreams: [] };
+      }
+      if (isWarningWorthyUpstreamFormatError(result.error)) {
+        return { format, status: "failed", error: result.error, upstreams: [] };
       }
 
       return { format, status: "loaded", upstreams: [] };
     }
 
-    if (!Array.isArray(result)) {
-      return {
-        format,
-        status: "failed",
-        error: `Unexpected upstream response for format "${format}".`,
-        upstreams: [],
-      };
-    }
-
     return {
       format,
       status: "loaded",
-      upstreams: result.map((upstream) => ({
+      upstreams: result.data.map((upstream) => ({
         ...upstream,
         _format: format,
         format,
@@ -247,12 +194,7 @@ async function fetchFormatUpstreams(api, workspace, repo, format, apiKey, signal
       return { format, status: "aborted", upstreams: [] };
     }
 
-    const message = error && error.message ? error.message : String(error);
-    if (!isWarningWorthyUpstreamFormatError(message)) {
-      return { format, status: "loaded", upstreams: [] };
-    }
-
-    return { format, status: "failed", error: message, upstreams: [] };
+    return { format, status: "failed", error, upstreams: [] };
   }
 }
 
@@ -273,17 +215,26 @@ class UpstreamChecker {
    */
   async existsLocally(workspace, repo, name, format) {
     const qb = new SearchQueryBuilder();
-    const query = encodeURIComponent(qb.name(name).format(format).build());
-    const result = await this.api.get(
-      `packages/${workspace}/${repo}/?query=${query}&page_size=1`
-    );
-    if (typeof result === "string") {
-      return { data: null, error: result };
+    let endpoint;
+    try {
+      endpoint = apiEndpoint(["packages", workspace, repo], {
+        query: { query: qb.name(name).format(format).build(), page_size: 1 },
+      });
+    } catch (error) {
+      return { data: null, error };
     }
-    if (!Array.isArray(result) || result.length === 0) {
+    const result = await this.api.get(endpoint, {
+      responseType: "array",
+      validate: isPackageArray,
+      retry: "safe-read",
+    });
+    if (!result.ok) {
+      return { data: null, error: result.error };
+    }
+    if (result.data.length === 0) {
       return { data: null, error: null };
     }
-    return { data: result[0], error: null };
+    return { data: result.data[0], error: null };
   }
 
   /**
@@ -295,18 +246,27 @@ class UpstreamChecker {
    * @returns {Array}             Array of upstream config objects.
    */
   async getUpstreamsForFormat(workspace, repo, format) {
-    const result = await this.api.get(`repos/${workspace}/${repo}/upstream/${format}/`);
-    if (typeof result === "string") {
-      return { data: [], error: result };
+    let endpoint;
+    try {
+      endpoint = apiEndpoint(["repos", workspace, repo, "upstream", format]);
+    } catch (error) {
+      return { data: [], error };
     }
-    if (!Array.isArray(result)) {
-      return { data: [], error: null };
+    const result = await this.api.get(endpoint, {
+      responseType: "array",
+      validate: isUpstreamArray,
+      retry: "safe-read",
+    });
+    if (!result.ok) {
+      return isBenignUpstreamFormatError(result.error)
+        ? { data: [], error: null }
+        : { data: [], error: result.error };
     }
-    return { data: result, error: null };
+    return { data: result.data, error: null };
   }
 
   async getUpstreamDataForFormats(workspace, repo, formats, options = {}) {
-    const { signal } = options;
+    const { signal, cancellationToken } = options;
     const requestedFormats = getSupportedUpstreamFormats(formats);
 
     if (signal && signal.aborted) {
@@ -333,14 +293,6 @@ class UpstreamChecker {
       return cached;
     }
 
-    let apiKey = null;
-    try {
-      const credentialManager = new CredentialManager(this.context);
-      apiKey = await credentialManager.getApiKey();
-    } catch {
-      apiKey = null;
-    }
-
     if (signal && signal.aborted) {
       return null;
     }
@@ -356,7 +308,10 @@ class UpstreamChecker {
 
       const batch = requestedFormats.slice(index, index + UPSTREAM_FETCH_BATCH_SIZE);
       const batchResults = await Promise.all(
-        batch.map((format) => fetchFormatUpstreams(this.api, workspace, repo, format, apiKey, signal))
+        batch.map((format) => fetchFormatUpstreams(this.api, workspace, repo, format, {
+          signal,
+          cancellationToken,
+        }))
       );
 
       if (signal && signal.aborted) {
@@ -439,9 +394,19 @@ class UpstreamChecker {
     }
 
     const signal = options && options.signal ? options.signal : null;
-    const fetchState = await this._fetchRepositoryUpstreamState(workspace, repo, signal);
+    const cancellationToken = options && options.cancellationToken
+      ? options.cancellationToken
+      : null;
+    const fetchState = await this._fetchRepositoryUpstreamState(workspace, repo, {
+      signal,
+      cancellationToken,
+    });
 
-    if (!signal?.aborted && fetchState.failedFormats.length === 0) {
+    if (
+      !signal?.aborted
+      && !cancellationToken?.isCancellationRequested
+      && fetchState.failedFormats.length === 0
+    ) {
       await this._cacheRepositoryUpstreamState(workspace, repo, fetchState);
     }
 
@@ -548,7 +513,8 @@ class UpstreamChecker {
     const cached = globalState.get(this._getRepositoryUpstreamCacheKey(workspace, repo));
     const isValidCacheEntry = this._isCacheObjectRecord(cached)
       && Number.isFinite(cached.timestamp)
-      && this._isCacheObjectRecord(cached.groupedUpstreams);
+      && this._isCacheObjectRecord(cached.groupedUpstreams)
+      && Object.values(cached.groupedUpstreams).every(isUpstreamArray);
 
     if (!isValidCacheEntry) {
       if (cached !== undefined) {
@@ -594,33 +560,18 @@ class UpstreamChecker {
     }
   }
 
-  async _fetchRepositoryUpstreamState(workspace, repo, signal) {
+  async _fetchRepositoryUpstreamState(workspace, repo, options = {}) {
+    const { signal, cancellationToken } = options;
     const groupedUpstreams = new Map();
     const failedFormats = [];
     let successfulFormats = 0;
-    let apiKey = null;
-
-    try {
-      const credentialManager = new CredentialManager(this.context);
-      apiKey = await credentialManager.getApiKey();
-    } catch (error) {
-      if (this._isAbortError(error) || signal?.aborted) {
-        return this._buildRepositoryUpstreamState(groupedUpstreams, failedFormats, successfulFormats);
-      }
-
-      return this._buildRepositoryUpstreamState(
-        groupedUpstreams,
-        [...SUPPORTED_UPSTREAM_FORMATS],
-        successfulFormats
-      );
-    }
 
     for (
       let index = 0;
       index < SUPPORTED_UPSTREAM_FORMATS.length;
       index += UPSTREAM_FETCH_BATCH_SIZE
     ) {
-      if (signal?.aborted) {
+      if (signal?.aborted || cancellationToken?.isCancellationRequested) {
         return this._buildRepositoryUpstreamState(groupedUpstreams, failedFormats, successfulFormats);
       }
 
@@ -631,11 +582,11 @@ class UpstreamChecker {
 
       const batchResults = await Promise.all(
         batch.map((format) =>
-          this._fetchFormatUpstreams(workspace, repo, format, apiKey, signal)
+          this._fetchFormatUpstreams(workspace, repo, format, options)
         )
       );
 
-      if (signal?.aborted) {
+      if (signal?.aborted || cancellationToken?.isCancellationRequested) {
         return this._buildRepositoryUpstreamState(groupedUpstreams, failedFormats, successfulFormats);
       }
 
@@ -662,45 +613,46 @@ class UpstreamChecker {
     return this._buildRepositoryUpstreamState(groupedUpstreams, failedFormats, successfulFormats);
   }
 
-  async _fetchFormatUpstreams(workspace, repo, format, apiKey, signal) {
+  async _fetchFormatUpstreams(workspace, repo, format, options = {}) {
+    const { signal, cancellationToken } = options;
     try {
-      if (signal?.aborted) {
+      if (signal?.aborted || cancellationToken?.isCancellationRequested) {
         return { format, status: "aborted", upstreams: [] };
       }
 
-      const result = await this.api.makeRequest(
-        `repos/${workspace}/${repo}/upstream/${format}/`,
-        this._getRequestOptions(apiKey, signal)
+      const result = await this.api.get(
+        apiEndpoint(["repos", workspace, repo, "upstream", format]),
+        {
+          responseType: "array",
+          validate: isUpstreamArray,
+          retry: "never",
+          signal,
+          cancellationToken,
+        }
       );
 
-      if (signal?.aborted) {
+      if (signal?.aborted || cancellationToken?.isCancellationRequested) {
         return { format, status: "aborted", upstreams: [] };
       }
 
-      if (typeof result === "string") {
-        if (this._isWarningWorthyFormatError(result)) {
+      if (!result.ok) {
+        if (result.error.kind === "cancelled") {
+          return { format, status: "aborted", upstreams: [] };
+        }
+        if (this._isWarningWorthyFormatError(result.error)) {
           return { format, status: "failed", upstreams: [] };
         }
         return { format, status: "loaded", upstreams: [] };
       }
 
-      if (!Array.isArray(result)) {
-        return { format, status: "failed", upstreams: [] };
-      }
-
       return {
         format,
         status: "loaded",
-        upstreams: result.map((upstream) => ({ ...upstream, format })),
+        upstreams: result.data.map((upstream) => ({ ...upstream, format })),
       };
     } catch (error) {
       if (this._isAbortError(error) || signal?.aborted) {
         return { format, status: "aborted", upstreams: [] };
-      }
-
-      const message = error && error.message ? error.message : "";
-      if (!this._isWarningWorthyFormatError(message)) {
-        return { format, status: "loaded", upstreams: [] };
       }
 
       return { format, status: "failed", upstreams: [] };
@@ -764,17 +716,41 @@ class UpstreamChecker {
     return grouped;
   }
 
-  _getRequestOptions(apiKey, signal) {
-    return getUpstreamRequestOptions(apiKey, signal);
-  }
-
   _isAbortError(error) {
     return isAbortError(error);
   }
 
-  _isWarningWorthyFormatError(message) {
-    return isWarningWorthyUpstreamFormatError(message);
+  _isWarningWorthyFormatError(error) {
+    return isWarningWorthyUpstreamFormatError(error);
   }
+}
+
+function isRecordArray(value) {
+  return Array.isArray(value) && value.every(item => (
+    Boolean(item) && typeof item === "object" && !Array.isArray(item)
+  ));
+}
+
+function isPackageArray(value) {
+  return isRecordArray(value) && value.every(item => (
+    typeof item.name === "string"
+    && item.name.length > 0
+    && typeof item.format === "string"
+    && item.format.length > 0
+  ));
+}
+
+function isUpstreamRecord(value) {
+  return Boolean(value)
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && typeof value.name === "string"
+    && value.name.trim().length > 0
+    && (value.is_active === undefined || typeof value.is_active === "boolean");
+}
+
+function isUpstreamArray(value) {
+  return Array.isArray(value) && value.every(isUpstreamRecord);
 }
 
 async function getAllUpstreamData(context, workspace, repo, options = {}) {

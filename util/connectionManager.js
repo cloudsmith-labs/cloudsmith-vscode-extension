@@ -16,12 +16,16 @@ class ConnectionManager {
     const { CloudsmithAPI } = require("./cloudsmithAPI");
     let checkPassed = "false";
     const cloudsmithAPI = new CloudsmithAPI(this.context);
-    const userAuthenticated = await cloudsmithAPI.get("user/self", apiKey);
+    const result = await cloudsmithAPI.get("user/self", {
+      apiKey,
+      responseType: "object",
+      validate: value => typeof value.authenticated === "boolean",
+      retry: "never",
+    });
 
-    if (!userAuthenticated.authenticated) {
-      // Store the raw error for better messaging
-      this._lastError = typeof userAuthenticated === "string" ? userAuthenticated : null;
-      if (userAuthenticated.authenticated === undefined) {
+    if (!result.ok || !result.data.authenticated) {
+      this._lastError = result.ok ? null : result.error;
+      if (!result.ok) {
         checkPassed = "error";
       } else {
         checkPassed = "false";

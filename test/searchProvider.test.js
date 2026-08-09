@@ -82,6 +82,37 @@ suite("SearchProvider Test Suite", () => {
     assert.strictEqual(provider.currentRepo, null);
   });
 
+  test("search cancellation reaches pagination and preserves the prior result snapshot", async () => {
+    const priorResults = [{ marker: "prior" }];
+    const token = { isCancellationRequested: true };
+    let progressOptions;
+    let requestOptions;
+    provider.searchResults = priorResults;
+    provider.currentWorkspace = "workspace-before";
+    provider.currentQuery = "before";
+
+    vscode.window.withProgress = async (options, task) => {
+      progressOptions = options;
+      return task({ report() {} }, token);
+    };
+    PaginatedFetch.prototype.fetchPage = async (_endpoint, _page, _pageSize, _query, options) => {
+      requestOptions = options;
+      return {
+        data: [],
+        pagination: null,
+        error: { kind: "cancelled", message: "The request was canceled." },
+      };
+    };
+
+    await provider.search("workspace-a", "name:artifact");
+
+    assert.strictEqual(progressOptions.cancellable, true);
+    assert.strictEqual(requestOptions.cancellationToken, token);
+    assert.strictEqual(provider.searchResults, priorResults);
+    assert.strictEqual(provider.currentWorkspace, "workspace-before");
+    assert.strictEqual(provider.currentQuery, "before");
+  });
+
   test("getChildren() shows the signed-out state when disconnected and idle", async () => {
     provider = new SearchProvider({
       secrets: {

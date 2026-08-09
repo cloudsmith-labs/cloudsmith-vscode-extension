@@ -1,5 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
+const { apiEndpoint, encodeApiPathSegment } = require("./apiEndpoint");
+
 const VULNERABILITIES_DETECTED_STATUS = "scan detected vulnerabilities";
 
 function unwrapValue(value) {
@@ -116,19 +118,26 @@ function result(error, results = [], maxSeverity = "Unknown", numVulns = 0) {
  * Fetch the latest package scan and its vulnerability records from the v1 API.
  * API failures remain distinct from a successful zero-vulnerability response.
  */
-async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifier, expectedCount = 0) {
+async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifier, expectedCount = 0, options = {}) {
   const fallbackCount = expectedCount > 0 ? expectedCount : 0;
-  const path = [workspace, repo, packageIdentifier]
-    .map(value => encodeURIComponent(String(value || "").trim()))
-    .join("/");
+  let scanListEndpoint;
+  try {
+    scanListEndpoint = apiEndpoint(["vulnerabilities", workspace, repo, packageIdentifier]);
+  } catch (error) {
+    return result(error, [], "Unknown", fallbackCount);
+  }
 
-  const scanList = await api.get(`vulnerabilities/${path}/`);
-  if (typeof scanList === "string") {
-    return result(scanList, [], "Unknown", fallbackCount);
+  const scanListResult = await api.get(scanListEndpoint, {
+    responseType: "array",
+    validate: isScanRecordArray,
+    retry: options.retry || "safe-read",
+    signal: options.signal,
+    cancellationToken: options.cancellationToken,
+  });
+  if (!scanListResult.ok) {
+    return result(scanListResult.error, [], "Unknown", fallbackCount);
   }
-  if (!Array.isArray(scanList)) {
-    return result("The Cloudsmith API returned an invalid vulnerability scan list.", [], "Unknown", fallbackCount);
-  }
+  const scanList = scanListResult.data;
   if (scanList.length === 0) {
     if (fallbackCount > 0 || expectedCount < 0) {
       return result("No vulnerability scan details were returned for this package.", [], "Unknown", fallbackCount);
@@ -152,17 +161,34 @@ async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifi
     return result(null, [], maxSeverity, 0);
   }
 
-  const scanDetail = await api.get(
-    `vulnerabilities/${path}/${encodeURIComponent(String(scanId))}/`
-  );
-  if (typeof scanDetail === "string") {
-    return result(scanDetail, [], maxSeverity, numVulns);
-  }
-  if (!scanDetail || typeof scanDetail !== "object") {
-    return result("The Cloudsmith API returned invalid vulnerability scan details.", [], maxSeverity, numVulns);
+  let scanDetailEndpoint;
+  try {
+    scanDetailEndpoint = apiEndpoint(["vulnerabilities", workspace, repo, packageIdentifier, scanId]);
+  } catch {
+    return result(
+      new Error("The vulnerability scan identifier was invalid."),
+      [],
+      maxSeverity,
+      numVulns
+    );
   }
 
-  const results = extractVulnerabilityResults(scanDetail);
+  const scanDetailResult = await api.get(
+    scanDetailEndpoint,
+    {
+      responseType: "object",
+      validate: isRecognizedVulnerabilityPayload,
+      retry: options.retry || "safe-read",
+      signal: options.signal,
+      cancellationToken: options.cancellationToken,
+    }
+  );
+  if (!scanDetailResult.ok) {
+    return result(scanDetailResult.error, [], maxSeverity, numVulns);
+  }
+  const scanDetail = scanDetailResult.data;
+
+  const results = extractVulnerabilityResults(scanDetail).map(normalizeVulnerabilityRecord);
   if (results.length === 0 && (numVulns > 0 || scanReportsVulnerabilities(targetScan))) {
     return result(
       "The scan reports vulnerabilities, but no vulnerability detail records were returned.",
@@ -173,6 +199,93 @@ async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifi
   }
 
   return result(null, results, maxSeverity, results.length || numVulns);
+}
+
+function isRecordArray(value) {
+  return Array.isArray(value) && value.every(item => (
+    Boolean(item) && typeof item === "object" && !Array.isArray(item)
+  ));
+}
+
+function hasUsableScanIdentifier(value) {
+  const identifier = unwrapValue(value && value.identifier);
+  if (typeof identifier !== "string" || identifier.length === 0) {
+    return false;
+  }
+  try {
+    encodeApiPathSegment(identifier);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isScanRecordArray(value) {
+  return isRecordArray(value) && value.every(hasUsableScanIdentifier);
+}
+
+function isVulnerabilityRecordArray(value) {
+  return isRecordArray(value) && value.every(isVulnerabilityRecord);
+}
+
+function vulnerabilityIdentifier(value) {
+  const candidate = value && (
+    value.vulnerability_id
+    || value.identifier
+    || value.id
+    || value.name
+  );
+  return typeof candidate === "string" && candidate.trim().length > 0
+    ? candidate.trim()
+    : null;
+}
+
+function isVulnerabilityRecord(value) {
+  return Boolean(vulnerabilityIdentifier(value))
+    && (value.severity === undefined || value.severity === null || typeof value.severity === "string");
+}
+
+function normalizeVulnerabilityRecord(value) {
+  return typeof value.vulnerability_id === "string" && value.vulnerability_id.trim().length > 0
+    ? value
+    : { ...value, vulnerability_id: vulnerabilityIdentifier(value) };
+}
+
+function hasRecognizedVulnerabilityArray(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "results")) {
+    return Array.isArray(value.results) && isVulnerabilityRecordArray(value.results);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "vulnerabilities")) {
+    return Array.isArray(value.vulnerabilities) && isVulnerabilityRecordArray(value.vulnerabilities);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "Vulnerabilities")) {
+    return Array.isArray(value.Vulnerabilities) && isVulnerabilityRecordArray(value.Vulnerabilities);
+  }
+  return false;
+}
+
+function isRecognizedVulnerabilityPayload(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "results")) {
+    return Array.isArray(value.results) && isVulnerabilityRecordArray(value.results);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "vulnerabilities")) {
+    return Array.isArray(value.vulnerabilities) && isVulnerabilityRecordArray(value.vulnerabilities);
+  }
+  if (Array.isArray(value.scan)) {
+    return value.scan.every(hasRecognizedVulnerabilityArray);
+  }
+  if (value.scan && typeof value.scan === "object") {
+    return hasRecognizedVulnerabilityArray(value.scan);
+  }
+  return Array.isArray(value.scans) && value.scans.every(scan => (
+    hasRecognizedVulnerabilityArray(scan)
+  ));
 }
 
 module.exports = {

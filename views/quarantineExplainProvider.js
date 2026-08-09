@@ -5,6 +5,8 @@
 const crypto = require("crypto");
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { apiEndpoint } = require("../util/apiEndpoint");
+const { formatApiError } = require("../util/errorFormatter");
 const { buildPackageUrl } = require("../util/webAppUrls");
 
 class QuarantineExplainProvider {
@@ -63,10 +65,14 @@ class QuarantineExplainProvider {
       { enableScripts: true }
     );
     this._panel = panel;
+    const requestController = new AbortController();
     const nonce = this._getNonce();
 
     panel.onDidDispose(() => {
-      this._panel = null;
+      requestController.abort();
+      if (this._panel === panel) {
+        this._panel = null;
+      }
     });
 
     // Show loading state
@@ -74,7 +80,13 @@ class QuarantineExplainProvider {
 
     // Fetch policy decision trace
     const cloudsmithAPI = new CloudsmithAPI(this.context);
-    const policyTrace = await this._fetchPolicyDecisionTrace(cloudsmithAPI, workspace, slugPerm, statusReason);
+    const policyTrace = await this._fetchPolicyDecisionTrace(
+      cloudsmithAPI,
+      workspace,
+      slugPerm,
+      statusReason,
+      requestController.signal
+    );
 
     if (this._panel !== panel) {
       return;
@@ -108,7 +120,7 @@ class QuarantineExplainProvider {
    *
    * @returns {Object} { parsedReason, decisionLogs: [...], policyDetail: Object|null }
    */
-  async _fetchPolicyDecisionTrace(cloudsmithAPI, workspace, slugPerm, statusReason) {
+  async _fetchPolicyDecisionTrace(cloudsmithAPI, workspace, slugPerm, statusReason, signal) {
     const trace = {
       parsedReason: null,
       decisionLogs: [],
@@ -131,12 +143,18 @@ class QuarantineExplainProvider {
 
     // Fetch decision logs from v2 API
     try {
-      const logsResult = await cloudsmithAPI.getV2(
-        `workspaces/${workspace}/policies/decision/logs/?page_size=100`
-      );
+      const logsEndpoint = apiEndpoint(["workspaces", workspace, "policies", "decision", "logs"], {
+        query: { page_size: 100 },
+      });
+      const logsResult = await cloudsmithAPI.getV2(logsEndpoint, {
+        responseType: "json",
+        validate: isArrayOrResultsEnvelope,
+        retry: "never",
+        signal,
+      });
 
-      if (typeof logsResult !== "string" && logsResult) {
-        const logs = Array.isArray(logsResult) ? logsResult : (logsResult.results || []);
+      if (logsResult.ok) {
+        const logs = Array.isArray(logsResult.data) ? logsResult.data : logsResult.data.results;
         trace.decisionLogs = logs.filter(entry => {
           if (entry.package && entry.package.identifier === slugPerm) {
             return true;
@@ -146,21 +164,34 @@ class QuarantineExplainProvider {
           }
           return false;
         });
+      } else if (logsResult.error.kind !== "cancelled") {
+        console.warn(`[Quarantine] Policy decision logs unavailable: ${formatApiError(logsResult.error)}`);
       }
-    } catch (e) { // eslint-disable-line no-unused-vars
+    } catch (error) { // eslint-disable-line no-unused-vars
       // v2 policy decision log endpoint may not be available
     }
 
     // If we have a policy slug, fetch the policy detail for the description
     if (trace.parsedReason && trace.parsedReason.policySlug) {
       try {
-        const policyResult = await cloudsmithAPI.getV2(
-          `workspaces/${workspace}/policies/${trace.parsedReason.policySlug}/`
-        );
-        if (typeof policyResult !== "string" && policyResult) {
-          trace.policyDetail = policyResult;
+        const policyEndpoint = apiEndpoint([
+          "workspaces",
+          workspace,
+          "policies",
+          trace.parsedReason.policySlug,
+        ]);
+        const policyResult = await cloudsmithAPI.getV2(policyEndpoint, {
+          responseType: "object",
+          validate: isRecord,
+          retry: "never",
+          signal,
+        });
+        if (policyResult.ok) {
+          trace.policyDetail = policyResult.data;
+        } else if (policyResult.error.kind !== "cancelled") {
+          console.warn(`[Quarantine] Policy detail unavailable: ${formatApiError(policyResult.error)}`);
         }
-      } catch (e) { // eslint-disable-line no-unused-vars
+      } catch (error) { // eslint-disable-line no-unused-vars
         // Policy detail may not be accessible
       }
     }
@@ -389,6 +420,17 @@ class QuarantineExplainProvider {
       this._panel = null;
     }
   }
+}
+
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isArrayOrResultsEnvelope(value) {
+  if (Array.isArray(value)) {
+    return value.every(isRecord);
+  }
+  return isRecord(value) && Array.isArray(value.results) && value.results.every(isRecord);
 }
 
 module.exports = { QuarantineExplainProvider };

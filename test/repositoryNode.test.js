@@ -3,6 +3,7 @@ const vscode = require("vscode");
 const UpstreamIndicatorNode = require("../models/upstreamIndicatorNode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
+const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
 suite("RepositoryNode Test Suite", () => {
   const repositoryNodePath = require.resolve("../models/repositoryNode");
@@ -204,7 +205,7 @@ suite("RepositoryNode Test Suite", () => {
       uploaded_at: "2026-08-07T00:00:00Z",
     };
 
-    CloudsmithAPI.prototype.get = async () => ([
+    CloudsmithAPI.prototype.get = async () => apiSuccess([
       {
         ...packageBase,
         name: "clean-npm",
@@ -247,5 +248,56 @@ suite("RepositoryNode Test Suite", () => {
         false
       );
     }
+  });
+
+  test("a malformed package array cannot be published as an empty successful repository", async () => {
+    CloudsmithAPI.prototype.get = async (_endpoint, options) => {
+      const malformed = [{ name: "artifact" }, null];
+      assert.strictEqual(options.validate(malformed), false);
+      return apiFailure("invalid_response", { status: 200 });
+    };
+    const repositoryNode = new RepositoryNode(
+      { slug: "packages", slug_perm: "packages", name: "Packages" },
+      "acme",
+      context
+    );
+
+    const packages = await repositoryNode.getPackages();
+
+    assert.deepStrictEqual(packages, []);
+    assert.strictEqual(repositoryNode._lastApiFailed, true);
+  });
+
+  test("group and entitlement validators reject blank records", async () => {
+    vscode.workspace.getConfiguration = () => ({
+      get(key) {
+        if (key === "groupByPackageGroups") return true;
+        if (key === "showMaxPackages") return 10;
+        return false;
+      },
+    });
+    let requestCount = 0;
+    CloudsmithAPI.prototype.get = async (_endpoint, options) => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        assert.strictEqual(options.validate({ results: [{}] }), false);
+        assert.strictEqual(options.validate({ results: [{ name: "artifact", format: "npm" }] }), true);
+      } else {
+        assert.strictEqual(options.validate([{}]), false);
+        assert.strictEqual(options.validate([{ name: "token", is_active: false }]), true);
+      }
+      return apiFailure("invalid_response", { status: 200 });
+    };
+    const repositoryNode = new RepositoryNode(
+      { slug: "packages", slug_perm: "packages", name: "Packages" },
+      "acme",
+      context
+    );
+
+    assert.deepStrictEqual(await repositoryNode.getPackages(), []);
+    await assert.rejects(
+      () => repositoryNode.getEntitlements(),
+      error => error && error.kind === "invalid_response"
+    );
   });
 });
