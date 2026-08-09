@@ -2,6 +2,7 @@
 const path = require("path");
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { apiEndpoint, appendApiQuery } = require("../util/apiEndpoint");
 const {
   ADAPTER_RESULT_STATUSES,
   createDefaultDependencyAdapterRegistry,
@@ -1178,14 +1179,26 @@ class DependencyHealthProvider {
   async _fetchWorkspaceRepositories(workspace, token) {
     const api = new CloudsmithAPI(this.context);
     const paginatedFetch = new PaginatedFetch(api);
-    const endpoint = `repos/${workspace}/?sort=name`;
+    let endpoint;
+    try {
+      endpoint = apiEndpoint(["repos", workspace], { query: { sort: "name" } });
+    } catch {
+      this._warnings.push("Could not load repositories for upstream analysis. The workspace identifier was invalid.");
+      return [];
+    }
     const repositories = [];
     let page = 1;
 
     while (!token || !token.isCancellationRequested) {
-      const result = await paginatedFetch.fetchPage(endpoint, page, WORKSPACE_REPOSITORY_PAGE_SIZE);
+      const result = await paginatedFetch.fetchPage(
+        endpoint,
+        page,
+        WORKSPACE_REPOSITORY_PAGE_SIZE,
+        null,
+        { cancellationToken: token, retry: "never", validate: isRepositoryPageArray }
+      );
       if (result.error) {
-        this._warnings.push(`Could not load repositories for upstream analysis. ${result.error}`);
+        this._warnings.push(`Could not load repositories for upstream analysis. ${result.error.message}`);
         break;
       }
 
@@ -1749,6 +1762,18 @@ class DependencyHealthProvider {
   }
 }
 
+function isRepositoryPageArray(value) {
+  return Array.isArray(value) && value.every(repository => (
+    repository
+    && typeof repository === "object"
+    && !Array.isArray(repository)
+    && typeof repository.slug === "string"
+    && repository.slug.length > 0
+    && typeof repository.name === "string"
+    && repository.name.length > 0
+  ));
+}
+
 function createScanOperation(status, id, values = {}) {
   return {
     status,
@@ -1867,7 +1892,7 @@ async function lookupExactDependency({
     || !format
     || lookupNames.length === 0
     || !api
-    || typeof api.getWithHeaders !== "function"
+    || typeof api.get !== "function"
   ) {
     return createCoverageLookupResult(
       CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED,
@@ -1911,26 +1936,29 @@ async function lookupExactDependency({
         );
       }
 
-      let response;
+      let requestEndpoint;
       try {
-        response = await api.getWithHeaders(
-          `${endpoint}?page=${page}&page_size=${LOOKUP_PAGE_SIZE}&query=${encodeURIComponent(query)}`
-        );
-      } catch (error) {
-        const status = isRateLimitError(error)
-          ? CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED
-          : pagesFetched > 0
-            ? CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
-            : CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED;
+        requestEndpoint = appendApiQuery(endpoint, {
+          page,
+          page_size: LOOKUP_PAGE_SIZE,
+          query,
+        });
+      } catch {
         return createCoverageLookupResult(
-          status,
+          pagesFetched > 0
+            ? CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
+            : CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED,
           null,
-          status === CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED
-            ? "Cloudsmith rate limited the dependency lookup."
-            : "The Cloudsmith lookup did not complete successfully.",
+          "The Cloudsmith lookup endpoint could not be constructed safely.",
           pagesFetched
         );
       }
+      const response = await api.get(requestEndpoint, {
+        responseType: "array",
+        validate: isPackageCandidateArray,
+        retry: "never",
+        cancellationToken: token,
+      });
       if (token && token.isCancellationRequested) {
         return createCoverageLookupResult(
           CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE,
@@ -1939,8 +1967,8 @@ async function lookupExactDependency({
           pagesFetched
         );
       }
-      if (typeof response === "string") {
-        const status = isRateLimitError(response)
+      if (!response.ok) {
+        const status = response.error.kind === "rate_limited"
           ? CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED
           : pagesFetched > 0
             ? CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
@@ -1954,17 +1982,6 @@ async function lookupExactDependency({
           pagesFetched
         );
       }
-      if (!response || typeof response !== "object" || !Array.isArray(response.data)) {
-        return createCoverageLookupResult(
-          pagesFetched > 0
-            ? CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
-            : CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED,
-          null,
-          "Cloudsmith returned an unexpected dependency lookup response.",
-          pagesFetched
-        );
-      }
-
       pagesFetched += 1;
       const match = matchCoverageCandidates(response.data, dependency, concreteVersion);
       if (match) {
@@ -1977,7 +1994,7 @@ async function lookupExactDependency({
       }
 
       const pagination = getLookupPaginationDirective(
-        response.headers,
+        normalizeLookupHeaders(response.headers),
         page,
         response.data.length,
         LOOKUP_PAGE_SIZE
@@ -2012,9 +2029,13 @@ function buildPackageLookupEndpoint(cloudsmithWorkspace, cloudsmithRepo) {
     return null;
   }
 
-  return repo
-    ? `packages/${encodeURIComponent(workspace)}/${encodeURIComponent(repo)}/`
-    : `packages/${encodeURIComponent(workspace)}/`;
+  try {
+    return repo
+      ? apiEndpoint(["packages", workspace, repo])
+      : apiEndpoint(["packages", workspace]);
+  } catch {
+    return null;
+  }
 }
 
 function getDependencyLookupNames(dependency) {
@@ -2163,8 +2184,24 @@ function parseOptionalNonNegativeInteger(value) {
   };
 }
 
-function isRateLimitError(message) {
-  return /(?:response\s+status\s*:\s*|\b)429\b/i.test(String(message || ""));
+function normalizeLookupHeaders(headers) {
+  return {
+    page: headers && headers["x-pagination-page"],
+    pageTotal: headers && headers["x-pagination-pagetotal"],
+    count: headers && headers["x-pagination-count"],
+    pageSize: headers && headers["x-pagination-pagesize"],
+  };
+}
+
+function isPackageCandidateArray(value) {
+  return Array.isArray(value) && value.every(candidate => (
+    candidate
+    && typeof candidate === "object"
+    && !Array.isArray(candidate)
+    && nonEmptyString(candidate.name)
+    && nonEmptyString(candidate.format)
+    && nonEmptyString(candidate.version)
+  ));
 }
 
 function isAbsentCoverageStatus(status) {

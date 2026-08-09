@@ -1,6 +1,7 @@
 const assert = require('assert');
 const { apiKey, workspace, testRepo, testPackageSlug, createAPI, skipIfNoKey } = require('./setup');
 const { extractVulnerabilityResults } = require('../../util/packageVulnerabilities');
+const { apiEndpoint } = require('../../util/apiEndpoint');
 
 suite('Integration: Vulnerabilities', function () {
   this.timeout(15000);
@@ -15,11 +16,12 @@ suite('Integration: Vulnerabilities', function () {
   });
 
   test('step 1: list scans for a package returns scan entries', async function () {
-    const scans = await api.get(
-      `vulnerabilities/${workspace}/${testRepo}/${testPackageSlug}/`,
-      apiKey
+    const result = await api.get(
+      apiEndpoint(['vulnerabilities', workspace, testRepo, testPackageSlug]),
+      { apiKey, responseType: 'array' }
     );
-    assert.ok(Array.isArray(scans), `Expected array, got: ${typeof scans}`);
+    assert.strictEqual(result.ok, true, result.error && result.error.message);
+    const scans = result.data;
     assert.ok(scans.length > 0, 'Expected at least one scan result');
 
     const scan = scans.find((s) => s.has_vulnerabilities) || scans[0];
@@ -36,12 +38,13 @@ suite('Integration: Vulnerabilities', function () {
       return;
     }
 
-    scanDetail = await api.get(
-      `vulnerabilities/${workspace}/${testRepo}/${testPackageSlug}/${scanId}/`,
-      apiKey
+    const result = await api.get(
+      apiEndpoint(['vulnerabilities', workspace, testRepo, testPackageSlug, scanId]),
+      { apiKey, responseType: 'object' }
     );
+    assert.strictEqual(result.ok, true, result.error && result.error.message);
+    scanDetail = result.data;
     assert.ok(scanDetail, 'Expected scan detail response');
-    assert.ok(typeof scanDetail !== 'string', `API returned error: ${scanDetail}`);
     assert.ok(scanDetail.scan && typeof scanDetail.scan === 'object', 'Expected scan object in response');
     assert.ok(Array.isArray(scanDetail.scan.results), 'Expected results array in scan response');
     assert.ok(scanDetail.scan.results.length > 0, 'Expected at least one CVE result');

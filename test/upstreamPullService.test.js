@@ -1,24 +1,14 @@
 const assert = require("assert");
 const {
   buildRegistryTriggerPlan,
+  findPythonDistributionUrl,
 } = require("../util/registryEndpoints");
 const {
   UpstreamPullService,
 } = require("../util/upstreamPullService");
 
 function createResponse(status, body, headers = {}) {
-  return {
-    status,
-    headers: {
-      get(name) {
-        const lowerName = String(name || "").toLowerCase();
-        return headers[lowerName] || headers[name] || null;
-      },
-    },
-    async text() {
-      return body;
-    },
-  };
+  return new Response(body, { status, headers });
 }
 
 suite("UpstreamPullService", () => {
@@ -62,6 +52,55 @@ suite("UpstreamPullService", () => {
       cargoPlan.request.url,
       "https://cargo.cloudsmith.io/workspace/repo/se/rd/serde"
     );
+  });
+
+  test("rejects registry path traversal and query injection across ecosystems", () => {
+    const hostileDependencies = [
+      { format: "docker", name: "../../other/image", version: "1.0.0" },
+      { format: "npm", name: "..", version: "1.0.0" },
+      { format: "cargo", name: "..", version: "1.0.0" },
+      { format: "swift", name: "../secret", version: "1.0.0" },
+      { format: "go", name: "../../other/repo/pkg?admin=true", version: "v1.0.0" },
+      { format: "composer", name: "../secret", version: "1.0.0" },
+      { format: "maven", name: "com.example:..", version: "1.0.0" },
+      { format: "ruby", name: "bad\\name", version: "1.0.0" },
+      { format: "nuget", name: "bad\nname", version: "1.0.0" },
+      { format: "python", name: "requests", version: "../other" },
+      { format: "npm", name: "%ZZ", version: "1.0.0" },
+      { format: "python", name: "a/b", version: "1.0.0" },
+      { format: "cargo", name: "a/b", version: "1.0.0" },
+      { format: "maven", name: "a.b:foo/bar", version: "1.0.0" },
+    ];
+
+    for (const dependency of hostileDependencies) {
+      assert.strictEqual(
+        buildRegistryTriggerPlan("workspace", "repo", dependency),
+        null,
+        `${dependency.format}:${dependency.name}`
+      );
+    }
+    assert.strictEqual(
+      buildRegistryTriggerPlan("..", "repo", { format: "npm", name: "safe", version: "1.0.0" }),
+      null
+    );
+    assert.strictEqual(
+      buildRegistryTriggerPlan("workspace", "repo?admin=true", { format: "npm", name: "safe", version: "1.0.0" }),
+      null
+    );
+  });
+
+  test("Python artifact discovery stays bounded on repeated incomplete anchors", () => {
+    const hostileHtml = "<a ".repeat(150000);
+    const startedAt = Date.now();
+    const result = findPythonDistributionUrl(
+      hostileHtml,
+      "1.0.0",
+      "https://dl.cloudsmith.io/basic/workspace/repo/python/simple/artifact/"
+    );
+    const elapsed = Date.now() - startedAt;
+
+    assert.strictEqual(result, null);
+    assert.ok(elapsed < 1000, `hostile anchor scan took ${elapsed}ms`);
   });
 
   test("prepare builds a mixed-ecosystem confirmation with skipped formats", async () => {
@@ -259,6 +298,211 @@ suite("UpstreamPullService", () => {
     assert.strictEqual(result.pullResult.errors, 1);
     assert.strictEqual(calls.length, 1);
     assert.match(result.pullResult.details[0].errorMessage, /redirect target was rejected/i);
+  });
+
+  test("registry requests ignore caller authorization overrides and drain artifact bodies", async () => {
+    let capturedRequest;
+    let bodyCanceled = false;
+    let textRead = false;
+    let bodyReads = 0;
+    const service = new UpstreamPullService({}, {
+      fetchImpl: async (_url, options) => {
+        capturedRequest = options;
+        return {
+          status: 200,
+          headers: { get() { return null; } },
+          body: {
+            getReader() {
+              return {
+                async read() {
+                  bodyReads += 1;
+                  return bodyReads === 1
+                    ? { done: false, value: new Uint8Array([1, 2, 3]) }
+                    : { done: true, value: undefined };
+                },
+                async cancel() { bodyCanceled = true; },
+                releaseLock() {},
+              };
+            },
+          },
+          async text() { textRead = true; return "large artifact"; },
+        };
+      },
+    });
+
+    const result = await service._requestRegistry({
+      method: "GET",
+      url: "https://dl.cloudsmith.io/basic/workspace/repo/raw/file.bin",
+      headers: { Authorization: "Bearer hostile", Accept: "application/octet-stream" },
+    }, "api-key", null, { captureBody: false });
+
+    assert.strictEqual(result.statusCode, 200);
+    assert.strictEqual(
+      capturedRequest.headers.Authorization,
+      `Basic ${Buffer.from("token:api-key").toString("base64")}`
+    );
+    assert.strictEqual(capturedRequest.headers.Accept, "application/octet-stream");
+    assert.strictEqual(bodyReads, 2);
+    assert.strictEqual(bodyCanceled, false);
+    assert.strictEqual(textRead, false);
+  });
+
+  test("registry metadata bodies are bounded before retention", async () => {
+    let bodyCanceled = false;
+    const service = new UpstreamPullService({}, {
+      fetchImpl: async () => ({
+        status: 200,
+        headers: {
+          get(name) {
+            return String(name).toLowerCase() === "content-length"
+              ? String(2 * 1024 * 1024)
+              : null;
+          },
+        },
+        body: { async cancel() { bodyCanceled = true; } },
+      }),
+    });
+
+    const result = await service._requestRegistry({
+      method: "GET",
+      url: "https://dl.cloudsmith.io/basic/workspace/repo/python/simple/artifact/",
+      headers: {},
+    }, "api-key", null, { captureBody: true });
+
+    assert.strictEqual(result.statusCode, 0);
+    assert.match(result.errorMessage, /size limit/i);
+    assert.strictEqual(bodyCanceled, true);
+  });
+
+  test("registry readers reject non-streaming bodies and unknown-length oversized chunks", async () => {
+    let fallbackTextRead = false;
+    let fallbackCanceled = false;
+    const fallbackService = new UpstreamPullService({}, {
+      fetchImpl: async () => ({
+        status: 200,
+        headers: { get() { return null; } },
+        body: { async cancel() { fallbackCanceled = true; } },
+        async text() { fallbackTextRead = true; return "unbounded"; },
+      }),
+    });
+    const fallback = await fallbackService._requestRegistry({
+      method: "GET",
+      url: "https://dl.cloudsmith.io/basic/workspace/repo/python/simple/artifact/",
+      headers: {},
+    }, "api-key", null, { captureBody: true });
+    assert.strictEqual(fallback.statusCode, 0);
+    assert.strictEqual(fallbackTextRead, false);
+    assert.strictEqual(fallbackCanceled, true);
+
+    let oversizedCanceled = false;
+    let reads = 0;
+    const oversizedService = new UpstreamPullService({}, {
+      fetchImpl: async () => ({
+        status: 200,
+        headers: { get() { return null; } },
+        body: {
+          getReader() {
+            return {
+              async read() {
+                reads += 1;
+                return { done: false, value: new Uint8Array((1024 * 1024) + 1) };
+              },
+              async cancel() { oversizedCanceled = true; },
+              releaseLock() {},
+            };
+          },
+        },
+      }),
+    });
+    const oversized = await oversizedService._requestRegistry({
+      method: "GET",
+      url: "https://dl.cloudsmith.io/basic/workspace/repo/python/simple/artifact/",
+      headers: {},
+    }, "api-key", null, { captureBody: true });
+    assert.strictEqual(oversized.statusCode, 0);
+    assert.strictEqual(reads, 1);
+    assert.strictEqual(oversizedCanceled, true);
+  });
+
+  test("registry timeout settles ignored fetch and body reads without awaiting cancellation", async () => {
+    let timeoutCallback;
+    let lateResolve;
+    let lateCancelCalled = false;
+    const lateService = new UpstreamPullService({}, {
+      fetchImpl: async () => new Promise(resolve => { lateResolve = resolve; }),
+      setTimeout(callback) { timeoutCallback = callback; return {}; },
+      clearTimeout() {},
+    });
+    const latePending = lateService._requestRegistry({
+      method: "GET",
+      url: "https://dl.cloudsmith.io/basic/workspace/repo/raw/file.bin",
+      headers: {},
+    }, "api-key", null, { captureBody: false });
+    await new Promise(resolve => setImmediate(resolve));
+    timeoutCallback();
+    const lateResult = await latePending;
+    assert.strictEqual(lateResult.statusCode, 0);
+    assert.match(lateResult.errorMessage, /timed out/i);
+    lateResolve({
+      status: 200,
+      headers: { get() { return null; } },
+      body: { cancel() { lateCancelCalled = true; return new Promise(() => {}); } },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(lateCancelCalled, true);
+
+    let bodyTimeoutCallback;
+    let readerCancelCalled = false;
+    const bodyService = new UpstreamPullService({}, {
+      fetchImpl: async () => ({
+        status: 200,
+        headers: { get() { return null; } },
+        body: {
+          getReader() {
+            return {
+              read() { return new Promise(() => {}); },
+              cancel() { readerCancelCalled = true; return new Promise(() => {}); },
+              releaseLock() {},
+            };
+          },
+        },
+      }),
+      setTimeout(callback) { bodyTimeoutCallback = callback; return {}; },
+      clearTimeout() {},
+    });
+    const bodyPending = bodyService._requestRegistry({
+      method: "GET",
+      url: "https://dl.cloudsmith.io/basic/workspace/repo/raw/file.bin",
+      headers: {},
+    }, "api-key", null, { captureBody: false });
+    await new Promise(resolve => setImmediate(resolve));
+    bodyTimeoutCallback();
+    const bodyResult = await bodyPending;
+    assert.strictEqual(bodyResult.statusCode, 0);
+    assert.match(bodyResult.errorMessage, /timed out/i);
+    assert.strictEqual(readerCancelCalled, true);
+  });
+
+  test("registry redirects cannot move credentials between allowed Cloudsmith hosts", async () => {
+    let calls = 0;
+    const service = new UpstreamPullService({}, {
+      fetchImpl: async () => {
+        calls += 1;
+        return createResponse(302, "", {
+          location: "https://npm.cloudsmith.io/workspace/repo/package.tgz",
+        });
+      },
+    });
+
+    const result = await service._requestRegistry({
+      method: "GET",
+      url: "https://dl.cloudsmith.io/basic/workspace/repo/python/simple/artifact/",
+      headers: {},
+    }, "api-key", null, { captureBody: true });
+
+    assert.strictEqual(result.statusCode, 0);
+    assert.match(result.errorMessage, /redirect target was rejected/i);
+    assert.strictEqual(calls, 1);
   });
 
   test("stops after three authentication failures before expanding concurrency", async () => {

@@ -2,6 +2,7 @@
 
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { apiEndpoint } = require("../util/apiEndpoint");
 const { PaginatedFetch } = require("../util/paginatedFetch");
 const SearchResultNode = require("../models/searchResultNode");
 const LoadMoreNode = require("../models/loadMoreNode");
@@ -37,29 +38,48 @@ class SearchProvider {
      * @param   repo       Optional repo slug for repo-scoped search
      */
     async search(workspace, query, page = 1, repo = null) {
-        this.currentWorkspace = workspace;
-        this.currentQuery = query;
-        this.currentPage = page;
-        this.currentRepo = repo ? repo : null;
-
         const cloudsmithAPI = new CloudsmithAPI(this.context);
         const paginatedFetch = new PaginatedFetch(cloudsmithAPI);
 
         const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
         const pageSize = config.get("searchPageSize") || 50;
 
-        const endpoint = repo
-            ? `packages/${workspace}/${repo}/`
-            : `packages/${workspace}/`;
+        let endpoint;
+        try {
+            endpoint = repo
+                ? apiEndpoint(["packages", workspace, repo])
+                : apiEndpoint(["packages", workspace]);
+        } catch {
+            vscode.window.showErrorMessage("Could not search packages. The search scope was invalid.");
+            return;
+        }
         const result = await vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: "Searching packages..." },
-            () => paginatedFetch.fetchPage(endpoint, page, pageSize, query)
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: "Searching packages...",
+                cancellable: true,
+            },
+            (_progress, token) => paginatedFetch.fetchPage(
+                endpoint,
+                page,
+                pageSize,
+                query,
+                { cancellationToken: token, retry: "never", validate: isPackageSearchArray }
+            )
         );
 
         if (result.error) {
+            if (result.error.kind === "cancelled") {
+                return;
+            }
             vscode.window.showErrorMessage(`Could not search packages. ${formatApiError(result.error)}`);
             return;
         }
+
+        this.currentWorkspace = workspace;
+        this.currentQuery = query;
+        this.currentPage = page;
+        this.currentRepo = repo ? repo : null;
 
         const newNodes = result.data.map(pkg => new SearchResultNode(pkg, this.context));
 
@@ -98,11 +118,6 @@ class SearchProvider {
      * @param   query      Cloudsmith search query string
      */
     async searchRepos(workspace, repos, query) {
-        this.currentWorkspace = workspace;
-        this.currentQuery = query;
-        this.currentPage = 1;
-        this.currentRepo = null;
-
         const cloudsmithAPI = new CloudsmithAPI(this.context);
         const paginatedFetch = new PaginatedFetch(cloudsmithAPI);
 
@@ -111,8 +126,19 @@ class SearchProvider {
 
         // Fetch first page from each repo in parallel
         const promises = repos.map(repo => {
-            const endpoint = `packages/${workspace}/${repo}/`;
-            return paginatedFetch.fetchPage(endpoint, 1, pageSize, query);
+            let endpoint;
+            try {
+                endpoint = apiEndpoint(["packages", workspace, repo]);
+            } catch {
+                return Promise.resolve({
+                    data: [],
+                    error: { kind: "invalid_request", message: "The repository identifier was invalid." },
+                });
+            }
+            return paginatedFetch.fetchPage(endpoint, 1, pageSize, query, {
+                retry: "never",
+                validate: isPackageSearchArray,
+            });
         });
         const results = await Promise.all(promises);
 
@@ -132,6 +158,10 @@ class SearchProvider {
 
         this.searchResults = allNodes;
         this.pagination = null; // No unified pagination for multi-repo search
+        this.currentWorkspace = workspace;
+        this.currentQuery = query;
+        this.currentPage = 1;
+        this.currentRepo = null;
 
         if (failedRepos.length > 0) {
             vscode.window.showWarningMessage(`Could not search some repositories: ${failedRepos.join(", ")}.`);
@@ -218,6 +248,34 @@ class SearchProvider {
     refresh() {
         this._onDidChangeTreeData.fire();
     }
+}
+
+function unwrapIdentifier(value) {
+    if (typeof value === "string" && value.length > 0) {
+        return value;
+    }
+    return value && typeof value === "object" && typeof value.value === "string" && value.value.length > 0
+        ? value.value
+        : null;
+}
+
+function isPackageSearchArray(value) {
+    return Array.isArray(value) && value.every(pkg => (
+        pkg
+        && typeof pkg === "object"
+        && !Array.isArray(pkg)
+        && typeof pkg.name === "string"
+        && pkg.name.length > 0
+        && typeof pkg.format === "string"
+        && pkg.format.length > 0
+        && (typeof pkg.version === "string" || typeof pkg.version === "number")
+        && String(pkg.version).length > 0
+        && typeof pkg.repository === "string"
+        && pkg.repository.length > 0
+        && typeof pkg.namespace === "string"
+        && pkg.namespace.length > 0
+        && Boolean(unwrapIdentifier(pkg.slug_perm || pkg.slug_perm_raw || pkg.slug))
+    ));
 }
 
 module.exports = { SearchProvider };

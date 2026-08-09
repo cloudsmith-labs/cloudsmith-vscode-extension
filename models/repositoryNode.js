@@ -2,6 +2,7 @@
 
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { apiEndpoint } = require("../util/apiEndpoint");
 const upstreamChecker = require("../util/upstreamChecker");
 const {
   normalizeUpstreamFormat,
@@ -118,29 +119,43 @@ class RepositoryNode {
 
     const activeFilter = this._getActiveFilter();
     const filterQuery = activeFilter ? (activeFilter.query || activeFilter) : null;
-    const filterParam = filterQuery ? `&query=${encodeURIComponent(filterQuery)}` : '';
-
-
     let apiFailed = false;
-    if (!groupByPackageGroup) {
-      const apiUrl = "packages/" + workspace + "/" + repo + "/?sort=-date&page_size=" + maxPackages + filterParam;
-      packages = await cloudsmithAPI.get(apiUrl);
-      // Guard against error string from API
-      if (typeof packages === 'string' || !Array.isArray(packages)) {
-        apiFailed = true;
-        packages = [];
-      }
-    } else {
-      const groups = await cloudsmithAPI.get(
-        "packages/" + workspace + "/" + repo + "/groups/?sort=-last_push&page_size=" + maxPackages + filterParam
-      );
-      // Guard against error string from API
-      if (typeof groups === 'string' || !groups || !groups.results) {
-        apiFailed = true;
-        packages = [];
+    try {
+      const query = {
+        sort: groupByPackageGroup ? "-last_push" : "-date",
+        page_size: maxPackages,
+        ...(filterQuery ? { query: filterQuery } : {}),
+      };
+      if (!groupByPackageGroup) {
+        const result = await cloudsmithAPI.get(
+          apiEndpoint(["packages", workspace, repo], { query }),
+          { responseType: "array", validate: isPackageArray, retry: "safe-read" }
+        );
+        if (result.ok) {
+          packages = result.data;
+        } else {
+          apiFailed = true;
+          packages = [];
+        }
       } else {
-        packages = groups.results;
+        const result = await cloudsmithAPI.get(
+          apiEndpoint(["packages", workspace, repo, "groups"], { query }),
+          {
+            responseType: "object",
+            validate: value => isPackageGroupArray(value.results),
+            retry: "safe-read",
+          }
+        );
+        if (result.ok) {
+          packages = result.data.results;
+        } else {
+          apiFailed = true;
+          packages = [];
+        }
       }
+    } catch {
+      apiFailed = true;
+      packages = [];
     }
     this._lastApiFailed = apiFailed;
 
@@ -238,13 +253,23 @@ class RepositoryNode {
    */
   async getEntitlements() {
     const cloudsmithAPI = new CloudsmithAPI(this.context);
-    const result = await cloudsmithAPI.get(
-      `entitlements/${this.workspace}/${this.slug}/?page_size=50`
-    );
-    if (typeof result === "string" || !Array.isArray(result)) {
-      return [];
+    let endpoint;
+    try {
+      endpoint = apiEndpoint(["entitlements", this.workspace, this.slug], {
+        query: { page_size: 50 },
+      });
+    } catch {
+      throw new Error("The entitlement endpoint was invalid.");
     }
-    return result;
+    const result = await cloudsmithAPI.get(endpoint, {
+      responseType: "array",
+      validate: isEntitlementArray,
+      retry: "safe-read",
+    });
+    if (!result.ok) {
+      throw result.error;
+    }
+    return result.data;
   }
 
   async getChildren() {
@@ -341,6 +366,50 @@ class RepositoryNode {
 
     return children;
   }
+}
+
+function isRecordArray(value) {
+  return Array.isArray(value) && value.every(item => (
+    Boolean(item) && typeof item === "object" && !Array.isArray(item)
+  ));
+}
+
+function unwrapIdentifier(value) {
+  if (typeof value === "string" && value.length > 0) {
+    return value;
+  }
+  return value && typeof value === "object" && typeof value.value === "string" && value.value.length > 0
+    ? value.value
+    : null;
+}
+
+function isPackageArray(value) {
+  return isRecordArray(value) && value.every(pkg => (
+    typeof pkg.name === "string" && pkg.name.length > 0
+    && typeof pkg.format === "string" && pkg.format.length > 0
+    && (typeof pkg.version === "string" || typeof pkg.version === "number")
+    && String(pkg.version).length > 0
+    && typeof pkg.repository === "string" && pkg.repository.length > 0
+    && typeof pkg.namespace === "string" && pkg.namespace.length > 0
+    && Boolean(unwrapIdentifier(pkg.slug_perm || pkg.slug_perm_raw || pkg.slug))
+  ));
+}
+
+function isPackageGroupArray(value) {
+  return isRecordArray(value) && value.every(group => (
+    typeof group.name === "string"
+    && group.name.length > 0
+    && [group.format, group.package_format, group.packageFormat]
+      .some(format => typeof format === "string" && format.length > 0)
+  ));
+}
+
+function isEntitlementArray(value) {
+  return isRecordArray(value) && value.every(entitlement => (
+    typeof entitlement.name === "string"
+    && entitlement.name.trim().length > 0
+    && (entitlement.is_active === undefined || typeof entitlement.is_active === "boolean")
+  ));
 }
 
 module.exports = RepositoryNode;

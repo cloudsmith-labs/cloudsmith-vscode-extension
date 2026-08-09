@@ -2,6 +2,7 @@ const assert = require("assert");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const workspaceRepositoryFetcher = require("../util/workspaceRepositoryFetcher");
 const WorkspaceNode = require("../models/workspaceNode");
+const { apiFailure } = require("./apiResultHelpers");
 
 suite("WorkspaceNode Test Suite", () => {
   let originalGet;
@@ -22,7 +23,7 @@ suite("WorkspaceNode Test Suite", () => {
       },
     };
 
-    CloudsmithAPI.prototype.get = async () => "quota unavailable";
+    CloudsmithAPI.prototype.get = async () => apiFailure("forbidden", { status: 403 });
   });
 
   teardown(() => {
@@ -34,7 +35,7 @@ suite("WorkspaceNode Test Suite", () => {
   test("shows an error child when the first repository page fails", async () => {
     workspaceRepositoryFetcher.fetchWorkspaceRepositories = async () => ({
       repositories: [],
-      error: "Response status: 500",
+      error: apiFailure("server_error", { status: 500 }).error,
       warning: null,
       partial: false,
     });

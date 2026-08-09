@@ -21,6 +21,7 @@ const {
   createDependencyRecord,
   createDependencySource,
 } = require("../util/dependencyRecord");
+const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
 suite("DependencyHealthProvider Test Suite", () => {
   let originalWithProgress;
@@ -194,10 +195,28 @@ suite("DependencyHealthProvider Test Suite", () => {
   function createLookupApi(handler) {
     return {
       calls: [],
-      async getWithHeaders(endpoint) {
+      callOptions: [],
+      async get(endpoint, options) {
         this.calls.push(endpoint);
-        return handler(endpoint, this.calls.length);
+        this.callOptions.push(options);
+        const response = await handler(endpoint, this.calls.length);
+        if (response && typeof response === "object" && typeof response.ok === "boolean") {
+          return response;
+        }
+        if (response && typeof response === "object" && Array.isArray(response.data)) {
+          return apiSuccess(response.data, { headers: normalizeTestLookupHeaders(response.headers) });
+        }
+        return apiSuccess(response);
       },
+    };
+  }
+
+  function normalizeTestLookupHeaders(headers = {}) {
+    return {
+      ...(headers.page === undefined ? {} : { "x-pagination-page": headers.page }),
+      ...(headers.pageTotal === undefined ? {} : { "x-pagination-pagetotal": headers.pageTotal }),
+      ...(headers.count === undefined ? {} : { "x-pagination-count": headers.count }),
+      ...(headers.pageSize === undefined ? {} : { "x-pagination-pagesize": headers.pageSize }),
     };
   }
 
@@ -582,6 +601,109 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(diagnostics.current, priorDiagnostics);
     assert.strictEqual(diagnostics.replacements.length, 1);
     assert.strictEqual(provider.isScanRunning(), false);
+  });
+
+  test("12/12 upstream progress waits for vulnerability enrichment and cancellation preserves the prior scan", async () => {
+    const diagnostics = createDiagnosticsPublisher();
+    const upstreamComplete = deferred();
+    const vulnerabilityStarted = deferred();
+    const progressMessages = [];
+    let cancelProgress;
+    let vulnerabilityCancellationDisposed = false;
+    let scanNumber = 0;
+
+    vscode.window.withProgress = async (_options, task) => {
+      const progressToken = {
+        onCancellationRequested(listener) {
+          cancelProgress = listener;
+          return { dispose() {} };
+        },
+      };
+      return task({
+        report(update) {
+          if (update && update.message) progressMessages.push(update.message);
+        },
+      }, progressToken);
+    };
+
+    const provider = new DependencyHealthProvider(createContext(), diagnostics, {
+      async enrichVulnerabilities(_dependencies, _workspace, { cancellationToken }) {
+        vulnerabilityStarted.resolve();
+        if (cancellationToken.isCancellationRequested) return;
+        await new Promise((resolve) => {
+          const subscription = cancellationToken.onCancellationRequested(() => {
+            subscription.dispose();
+            vulnerabilityCancellationDisposed = true;
+            resolve();
+          });
+        });
+      },
+      async enrichLicenses() {},
+      async enrichPolicies() {},
+      async analyzeUpstreamGaps(_dependencies, _workspace, _repositories, { onProgress }) {
+        onProgress(new Map(), { completed: 12, total: 12 });
+        upstreamComplete.resolve();
+      },
+    });
+
+    provider._performScan = async function (workspace, repository, _folder, progress, token) {
+      scanNumber += 1;
+      const name = scanNumber === 1 ? "known-good" : "partial-replacement";
+      const dependency = createProblemDependency(name, "1.0.0", `/${name}.json`);
+      this._lastManifests = [{ filePath: `/${name}.json`, format: "npm" }];
+      this._fullTrees = [{ ecosystem: "npm", sourceFile: `${name}.json`, dependencies: [dependency] }];
+      this._displayTrees = cloneTrees(this._fullTrees);
+      this._warnings = [];
+      this._rebuildSummary();
+
+      if (scanNumber > 1) {
+        await DependencyHealthProvider.prototype._runEnrichmentPasses.call(
+          this,
+          workspace,
+          repository,
+          progress,
+          token
+        );
+        if (token.isCancellationRequested) return { canceled: true };
+      }
+
+      await this._storeReportData(new Date("2026-08-09T12:00:00.000Z"));
+      return { canceled: false };
+    };
+
+    assert.strictEqual(
+      (await provider.scan("workspace-a", "repo-a", "/project-a")).status,
+      SCAN_STATES.SUCCEEDED
+    );
+    const priorDependencies = provider.dependencies;
+    const priorReport = provider.getReportData();
+    const priorDiagnostics = diagnostics.current;
+
+    let rescanSettled = false;
+    const rescanPromise = provider.rescan().then((result) => {
+      rescanSettled = true;
+      return result;
+    });
+    await Promise.all([upstreamComplete.promise, vulnerabilityStarted.promise]);
+    await waitForTurn();
+
+    assert.ok(progressMessages.includes("Checking upstream coverage... 12/12"));
+    assert.strictEqual(rescanSettled, false);
+    assert.strictEqual(provider.dependencies, priorDependencies);
+    assert.strictEqual(provider.getReportData(), priorReport);
+    assert.strictEqual(diagnostics.current, priorDiagnostics);
+    assert.strictEqual(diagnostics.replacements.length, 1);
+
+    cancelProgress();
+    const result = await rescanPromise;
+
+    assert.strictEqual(result.status, SCAN_STATES.CANCELLED);
+    assert.strictEqual(vulnerabilityCancellationDisposed, true);
+    assert.strictEqual(provider.dependencies, priorDependencies);
+    assert.strictEqual(provider.dependencies[0].name, "known-good");
+    assert.strictEqual(provider.getReportData(), priorReport);
+    assert.strictEqual(diagnostics.current, priorDiagnostics);
+    assert.strictEqual(diagnostics.replacements.length, 1);
   });
 
   test("successful retry clears the failed operation state", async () => {
@@ -1329,7 +1451,7 @@ suite("DependencyHealthProvider Test Suite", () => {
 
   test("lookup failure and partial failure remain distinct from package absence", async () => {
     const failed = await lookupExactDependency({
-      api: createLookupApi(() => "Response status: 503 - Service Unavailable"),
+      api: createLookupApi(() => apiFailure("server_error", { status: 503 })),
       cloudsmithWorkspace: "workspace",
       cloudsmithRepo: "repo",
       dependency: createDependency("left-pad", "1.0.0"),
@@ -1338,7 +1460,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     const partialApi = createLookupApi((_endpoint, callCount) => (
       callCount === 1
         ? lookupPage([{ name: "other", version: "1.0.0" }], 1, 2, 2, 1)
-        : "Response status: 503 - Service Unavailable"
+        : apiFailure("server_error", { status: 503 })
     ));
     const incomplete = await lookupExactDependency({
       api: partialApi,
@@ -1352,9 +1474,21 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(incomplete.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
   });
 
-  test("rejected lookup requests remain explicit failures", async () => {
+  test("network lookup failures remain explicit failures", async () => {
     const result = await lookupExactDependency({
-      api: createLookupApi(() => Promise.reject(new Error("network unavailable"))),
+      api: createLookupApi(() => apiFailure("network_error", { retryable: true })),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED);
+  });
+
+  test("a malformed dependency lookup payload cannot prove package absence", async () => {
+    const result = await lookupExactDependency({
+      api: createLookupApi(() => apiFailure("invalid_response", { status: 200 })),
       cloudsmithWorkspace: "workspace",
       cloudsmithRepo: "repo",
       dependency: createDependency("left-pad", "1.0.0"),
@@ -1455,7 +1589,7 @@ suite("DependencyHealthProvider Test Suite", () => {
 
   test("rate limiting is explicit and is not converted to absence", async () => {
     const result = await lookupExactDependency({
-      api: createLookupApi(() => "Response status: 429 - Too Many Requests"),
+      api: createLookupApi(() => apiFailure("rate_limited", { status: 429 })),
       cloudsmithWorkspace: "workspace",
       cloudsmithRepo: "repo",
       dependency: createDependency("left-pad", "1.0.0"),
@@ -1897,7 +2031,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(dependency.declaredConstraint, ">=2.0,<3.0");
     assert.strictEqual(dependency.resolvedVersion, null);
     const lookup = await lookupExactDependency({
-      api: { async getWithHeaders() { throw new Error("range-only dependency must not be queried"); } },
+      api: { async get() { throw new Error("range-only dependency must not be queried"); } },
       cloudsmithWorkspace: "workspace",
       cloudsmithRepo: "repository",
       dependency,

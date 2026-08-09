@@ -3,6 +3,8 @@
 const vscode = require("vscode");
 const path = require("path");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { apiEndpoint } = require("../util/apiEndpoint");
+const { formatApiError } = require("../util/errorFormatter");
 const InfoNode = require("./infoNode");
 const repositoryNode = require("./repositoryNode");
 const { WorkspaceInfoNode } = require("./workspaceInfoNode");
@@ -43,7 +45,7 @@ class WorkspaceNode {
       return [new InfoNode(
         "Failed to load repositories",
         "Check your connection and try refreshing",
-        `Failed to load repositories for ${workspace}: ${result.error}`,
+        `Failed to load repositories for ${workspace}: ${formatApiError(result.error)}`,
         "warning"
       )];
     }
@@ -73,10 +75,13 @@ class WorkspaceNode {
 
     try {
       const cloudsmithAPI = new CloudsmithAPI(this.context);
-      const result = await cloudsmithAPI.get(`quota/${this.workspace}/`);
+      const result = await cloudsmithAPI.get(apiEndpoint(["quota", this.workspace]), {
+        responseType: "object",
+        retry: "safe-read",
+      });
 
-      if (typeof result !== "string" && result && result.usage) {
-        quotaData = result;
+      if (result.ok && result.data.usage && typeof result.data.usage === "object") {
+        quotaData = result.data;
       }
     } catch {
       // Quota access is optional for this node.

@@ -3,6 +3,7 @@
 
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { apiEndpoint } = require("../util/apiEndpoint");
 const { ConnectionManager } = require("../util/connectionManager");
 const InfoNode = require("../models/infoNode");
 const { WorkspaceInfoNode } = require("../models/workspaceInfoNode");
@@ -84,14 +85,32 @@ class CloudsmithProvider {
       )];
     }
 
-    workspaces = await cloudsmithAPI.get("namespaces/?sort=slug");
+    const result = await cloudsmithAPI.get("namespaces/?sort=slug", {
+      responseType: "array",
+      validate: value => value.every(workspace => (
+        workspace
+        && typeof workspace === "object"
+        && !Array.isArray(workspace)
+        && typeof workspace.slug === "string"
+        && workspace.slug.length > 0
+      )),
+      retry: "safe-read",
+    });
+    workspaces = result.ok
+      ? result.data.map(workspace => ({
+        ...workspace,
+        name: typeof workspace.name === "string" && workspace.name.length > 0
+          ? workspace.name
+          : workspace.slug,
+      }))
+      : null;
 
     if (this._treeView) {
       this._treeView.message = undefined;
     }
 
     const WorkspaceNodes = [];
-    if (typeof workspaces === 'string' || !workspaces || !Array.isArray(workspaces)) {
+    if (!workspaces) {
       await vscode.commands.executeCommand("setContext", "cloudsmith.hasMultipleWorkspaces", false);
       return [new InfoNode(
         "Could not load workspaces",
@@ -179,9 +198,12 @@ class CloudsmithProvider {
     let quotaData = null;
 
     try {
-      const quotaResult = await cloudsmithAPI.get(`quota/${workspaceSlug}/`);
-      if (typeof quotaResult !== "string" && quotaResult && quotaResult.usage) {
-        quotaData = quotaResult;
+      const quotaResult = await cloudsmithAPI.get(apiEndpoint(["quota", workspaceSlug]), {
+        responseType: "object",
+        retry: "safe-read",
+      });
+      if (quotaResult.ok && quotaResult.data.usage && typeof quotaResult.data.usage === "object") {
+        quotaData = quotaResult.data;
       }
     } catch {
       // Quota access is optional for the workspace summary row.

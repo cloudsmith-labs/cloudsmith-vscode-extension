@@ -9,9 +9,20 @@ const {
 const {
   SUPPORTED_UPSTREAM_FORMATS: SHARED_SUPPORTED_UPSTREAM_FORMATS,
 } = require("../util/upstreamFormats");
+const { apiFailure, apiSuccess } = require("./apiResultHelpers");
+
+function toApiResult(response) {
+  if (response && typeof response === "object" && typeof response.ok === "boolean") {
+    return response;
+  }
+  if (response instanceof Error) {
+    return apiFailure("server_error", { status: 503, message: response.message });
+  }
+  return apiSuccess(response === undefined ? [] : response);
+}
 
 suite("UpstreamChecker repository upstream cache", () => {
-  let originalMakeRequest;
+  let originalGet;
   let originalGetApiKey;
   let formatResponses;
   let requestCount;
@@ -19,7 +30,7 @@ suite("UpstreamChecker repository upstream cache", () => {
   let context;
 
   setup(() => {
-    originalMakeRequest = CloudsmithAPI.prototype.makeRequest;
+    originalGet = CloudsmithAPI.prototype.get;
     originalGetApiKey = CredentialManager.prototype.getApiKey;
     formatResponses = {};
     requestCount = 0;
@@ -40,30 +51,35 @@ suite("UpstreamChecker repository upstream cache", () => {
     };
 
     CredentialManager.prototype.getApiKey = async () => "test-api-key";
-    CloudsmithAPI.prototype.makeRequest = async function(endpoint) {
+    CloudsmithAPI.prototype.get = async function(endpoint, options = {}) {
       requestCount += 1;
       const match = endpoint.match(/upstream\/([^/]+)\/$/);
       const format = match ? match[1] : null;
       const response = formatResponses[format];
 
-      if (response instanceof Error) {
-        throw response;
+      try {
+        if (typeof response === "function") {
+          const result = toApiResult(response());
+          return result.ok && typeof options.validate === "function" && options.validate(result.data) !== true
+            ? apiFailure("invalid_response", { status: 200 })
+            : result;
+        }
+        if (response !== undefined) {
+          const result = toApiResult(response);
+          return result.ok && typeof options.validate === "function" && options.validate(result.data) !== true
+            ? apiFailure("invalid_response", { status: 200 })
+            : result;
+        }
+      } catch {
+        return apiFailure("server_error", { status: 503 });
       }
 
-      if (typeof response === "function") {
-        return response();
-      }
-
-      if (response !== undefined) {
-        return response;
-      }
-
-      return [];
+      return apiSuccess([]);
     };
   });
 
   teardown(() => {
-    CloudsmithAPI.prototype.makeRequest = originalMakeRequest;
+    CloudsmithAPI.prototype.get = originalGet;
     CredentialManager.prototype.getApiKey = originalGetApiKey;
   });
 
@@ -107,7 +123,7 @@ suite("UpstreamChecker repository upstream cache", () => {
       docker: [
         { name: "Docker Hub", upstream_url: "https://registry-1.docker.io/" },
       ],
-      conda: "Response status: 404 - Not Found - ",
+      conda: apiFailure("not_found", { status: 404 }),
     };
 
     const checker = new UpstreamChecker(context);
@@ -137,7 +153,7 @@ suite("UpstreamChecker repository upstream cache", () => {
         { name: "PyPI", upstream_url: "https://pypi.org/simple/" },
       ],
       npm: () => {
-        throw new Error("Response status: 503 - Service Unavailable - ");
+        return apiFailure("server_error", { status: 503 });
       },
     };
 
@@ -152,6 +168,18 @@ suite("UpstreamChecker repository upstream cache", () => {
     await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
 
     assert.strictEqual(requestCount, SUPPORTED_UPSTREAM_FORMATS.length * 2);
+    assert.strictEqual(store.size, 0);
+  });
+
+  test("rejects blank upstream records instead of reporting false active reachability", async () => {
+    formatResponses = { python: [{}] };
+
+    const checker = new UpstreamChecker(context);
+    const state = await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
+
+    assert.strictEqual(state.active, 0);
+    assert.strictEqual(state.total, 0);
+    assert.ok(state.failedFormats.includes("python"));
     assert.strictEqual(store.size, 0);
   });
 
@@ -177,6 +205,10 @@ suite("UpstreamChecker repository upstream cache", () => {
 
   test("treats non-object groupedUpstreams as an invalid cached repository upstream state", async () => {
     await assertInvalidCachedEntry(createCachedEntry({ groupedUpstreams: [] }));
+  });
+
+  test("treats unnamed cached upstream records as invalid", async () => {
+    await assertInvalidCachedEntry(createCachedEntry({ groupedUpstreams: { python: [{}] } }));
   });
 
   test("treats expired cached repository upstream state as invalid", () => {
@@ -293,25 +325,24 @@ suite("UpstreamChecker shared helper and format handling", () => {
     let requestCount = 0;
     const checker = new UpstreamChecker(context);
 
-    checker.api.makeRequest = async (endpoint) => {
+    checker.api.get = async (endpoint) => {
       requestCount += 1;
       const match = endpoint.match(/upstream\/([^/]+)\/$/);
       const format = match ? match[1] : null;
       const response = formatResponses[format];
 
-      if (response instanceof Error) {
-        throw response;
+      try {
+        if (typeof response === "function") {
+          return toApiResult(response());
+        }
+        if (response !== undefined) {
+          return toApiResult(response);
+        }
+      } catch {
+        return apiFailure("server_error", { status: 503 });
       }
 
-      if (typeof response === "function") {
-        return response();
-      }
-
-      if (response !== undefined) {
-        return response;
-      }
-
-      return [];
+      return apiSuccess([]);
     };
 
     return {
@@ -357,7 +388,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
   [400, 404, 405, 422].forEach((statusCode) => {
     test(`${statusCode} is classified as a benign upstream format error`, () => {
       assert.strictEqual(
-        isBenignUpstreamFormatError(`Response status: ${statusCode}`),
+        isBenignUpstreamFormatError({ status: statusCode }),
         true
       );
     });
@@ -366,7 +397,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
   [401, 403, 407, 408, 429].forEach((statusCode) => {
     test(`${statusCode} is classified as a non-benign upstream format error`, () => {
       assert.strictEqual(
-        isBenignUpstreamFormatError(`Response status: ${statusCode}`),
+        isBenignUpstreamFormatError({ status: statusCode }),
         false
       );
     });
@@ -387,7 +418,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
       docker: [
         { name: "Docker Hub", upstream_url: "https://registry-1.docker.io/" },
       ],
-      conda: "Response status: 404 - Not Found - ",
+      conda: apiFailure("not_found", { status: 404 }),
     });
 
     const firstState = await checker.getAllUpstreamData("workspace-a", "repo-a");
@@ -421,7 +452,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
         { name: "PyPI", upstream_url: "https://pypi.org/simple/" },
       ],
       npm: () => {
-        throw new Error("Response status: 503 - Service Unavailable - ");
+        return apiFailure("server_error", { status: 503 });
       },
     });
 
@@ -544,7 +575,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
     const { context, updates } = createContext();
     const checker = new UpstreamChecker(context);
 
-    checker.api.makeRequest = async () => "Response status: 401";
+    checker.api.get = async () => apiFailure("unauthorized", { status: 401 });
 
     const result = await checker.getUpstreamDataForFormats("acme", "example-repo", ["python"]);
 

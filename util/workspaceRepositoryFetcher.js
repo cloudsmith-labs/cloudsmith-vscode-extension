@@ -1,5 +1,7 @@
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("./cloudsmithAPI");
+const { apiEndpoint } = require("./apiEndpoint");
+const { formatApiError } = require("./errorFormatter");
 const { PaginatedFetch } = require("./paginatedFetch");
 
 const WORKSPACE_REPOSITORY_PAGE_SIZE = 500;
@@ -16,10 +18,20 @@ function sortRepositories(repositories) {
   });
 }
 
-async function fetchWorkspaceRepositories(context, workspace) {
+async function fetchWorkspaceRepositories(context, workspace, options = {}) {
   const cloudsmithAPI = new CloudsmithAPI(context);
   const paginatedFetch = new PaginatedFetch(cloudsmithAPI);
-  const endpoint = `repos/${workspace}/?sort=name`;
+  let endpoint;
+  try {
+    endpoint = apiEndpoint(["repos", workspace], { query: { sort: "name" } });
+  } catch {
+    return {
+      repositories: [],
+      error: Object.freeze({ kind: "invalid_request", message: "The workspace identifier is invalid." }),
+      warning: null,
+      partial: false,
+    };
+  }
 
   return vscode.window.withProgress(
     {
@@ -39,7 +51,9 @@ async function fetchWorkspaceRepositories(context, workspace) {
         const result = await paginatedFetch.fetchPage(
           endpoint,
           page,
-          WORKSPACE_REPOSITORY_PAGE_SIZE
+          WORKSPACE_REPOSITORY_PAGE_SIZE,
+          null,
+          { ...options, validate: isRepositoryArray }
         );
 
         if (result.error) {
@@ -53,7 +67,7 @@ async function fetchWorkspaceRepositories(context, workspace) {
           }
 
           console.warn(
-            `[WorkspaceRepositories] Failed to load additional repositories for ${workspace} on page ${page}: ${result.error}`
+            `[WorkspaceRepositories] Failed to load an additional repository page: ${formatApiError(result.error)}`
           );
 
           return {
@@ -109,6 +123,18 @@ async function fetchWorkspaceRepositories(context, workspace) {
       };
     }
   );
+}
+
+function isRepositoryArray(value) {
+  return Array.isArray(value) && value.every(repository => (
+    repository
+    && typeof repository === "object"
+    && !Array.isArray(repository)
+    && typeof repository.slug === "string"
+    && repository.slug.length > 0
+    && typeof repository.name === "string"
+    && repository.name.length > 0
+  ));
 }
 
 module.exports = {

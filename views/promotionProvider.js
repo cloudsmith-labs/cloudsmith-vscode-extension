@@ -4,42 +4,14 @@
 
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { apiEndpoint, encodeApiPathSegment } = require("../util/apiEndpoint");
+const { formatApiError } = require("../util/errorFormatter");
+const { buildExactPackageQuery, packageMatchesExactIdentity } = require("../util/packageQuery");
 
 class PromotionProvider {
   constructor(context) {
     this.context = context;
     this.api = new CloudsmithAPI(context);
-  }
-
-  _normalizeFieldValue(value) {
-    if (value == null) {
-      return null;
-    }
-    return String(value);
-  }
-
-  _escapeQueryValue(value) {
-    if (value == null) {
-      return "";
-    }
-
-    return String(value)
-      .replace(/(\\|&&|\|\||[+\-!(){}\[\]^"~*?:/|&])/g, (match) => `\\${match}`)
-      .replace(/[\u0000-\u001f\u007f]/g, " ");
-  }
-
-  _buildExactPackageQuery(name, version, format) {
-    return `name:"${this._escapeQueryValue(name)}" AND version:"${this._escapeQueryValue(version)}" AND format:"${this._escapeQueryValue(format)}"`;
-  }
-
-  _packageMatchesExpected(pkg, expected) {
-    if (!pkg || typeof pkg !== "object" || !expected) {
-      return false;
-    }
-
-    return this._normalizeFieldValue(pkg.name) === this._normalizeFieldValue(expected.name)
-      && this._normalizeFieldValue(pkg.version) === this._normalizeFieldValue(expected.version)
-      && this._normalizeFieldValue(pkg.format) === this._normalizeFieldValue(expected.format);
   }
 
   _getPackageIdentifier(pkg) {
@@ -54,6 +26,9 @@ class PromotionProvider {
     }
     if (typeof pkg.slug_perm_raw === "string") {
       return pkg.slug_perm_raw;
+    }
+    if (typeof pkg.slug === "string") {
+      return pkg.slug;
     }
     return null;
   }
@@ -85,15 +60,25 @@ class PromotionProvider {
       return false;
     }
 
-    const tagPayload = JSON.stringify({ action: "add", tags });
+    let endpoint;
+    try {
+      endpoint = apiEndpoint(["packages", workspace, repo, identifier, "tag"]);
+    } catch {
+      console.warn(`[Promotion] Skipping ${label} tags because the package endpoint was invalid.`);
+      return false;
+    }
     const tagResult = await this.api.post(
-      `packages/${workspace}/${repo}/${identifier}/tag/`,
-      tagPayload,
-      apiKey
+      endpoint,
+      { action: "add", tags },
+      {
+        apiKey,
+        responseType: "object",
+        validate: isPackageWriteRecord,
+      }
     );
 
-    if (typeof tagResult === "string") {
-      console.warn(`[Promotion] Failed to apply ${label} tags for ${workspace}/${repo}/${identifier}: ${tagResult}`);
+    if (!tagResult.ok) {
+      console.warn(`[Promotion] Failed to apply ${label} tags: ${formatApiError(tagResult.error)}`);
       return false;
     }
 
@@ -105,25 +90,36 @@ class PromotionProvider {
       return null;
     }
 
-    const query = encodeURIComponent(
-      this._buildExactPackageQuery(packageInfo.name, packageInfo.version, packageInfo.format)
-    );
+    let endpoint;
+    try {
+      const query = buildExactPackageQuery(packageInfo.name, packageInfo.version, packageInfo.format);
+      endpoint = apiEndpoint(["packages", workspace, targetRepo], {
+        query: { query, page_size: 100 },
+      });
+    } catch {
+      return null;
+    }
     const results = await this.api.get(
-      `packages/${workspace}/${targetRepo}/?query=${query}&page_size=100`,
-      apiKey
+      endpoint,
+      {
+        apiKey,
+        responseType: "array",
+        validate: isPackageWriteArray,
+        retry: "never",
+      }
     );
 
-    if (typeof results === "string") {
-      console.warn(`[Promotion] Could not locate copied package in ${workspace}/${targetRepo}: ${results}`);
+    if (!results.ok) {
+      console.warn(`[Promotion] Could not locate copied package: ${formatApiError(results.error)}`);
       return null;
     }
 
-    if (!Array.isArray(results) || results.length === 0) {
+    if (results.data.length === 0) {
       console.warn(`[Promotion] Could not locate copied package in ${workspace}/${targetRepo}: no matching package found.`);
       return null;
     }
 
-    const exactResults = results.filter(pkg => this._packageMatchesExpected(pkg, packageInfo));
+    const exactResults = results.data.filter(pkg => packageMatchesExactIdentity(pkg, packageInfo));
     if (exactResults.length === 0) {
       console.warn(
         `[Promotion] Could not locate copied package in ${workspace}/${targetRepo}: query returned packages but none matched ${packageInfo.name}@${packageInfo.version} (${packageInfo.format}).`
@@ -165,11 +161,21 @@ class PromotionProvider {
     if (!defaultWs) {
       return;
     }
-    const repos = await this.api.get(`repos/${defaultWs}/?sort=name`);
-    if (typeof repos === "string" || !Array.isArray(repos)) {
+    let endpoint;
+    try {
+      endpoint = apiEndpoint(["repos", defaultWs], { query: { sort: "name" } });
+    } catch {
       return;
     }
-    const validSlugs = new Set(repos.map(r => r.slug));
+    const repos = await this.api.get(endpoint, {
+      responseType: "array",
+      validate: isRepositoryArray,
+      retry: "safe-read",
+    });
+    if (!repos.ok) {
+      return;
+    }
+    const validSlugs = new Set(repos.data.map(r => r.slug));
     const invalidSlugs = pipeline.filter(s => !validSlugs.has(s));
     if (invalidSlugs.length > 0) {
       vscode.window.showWarningMessage(
@@ -197,39 +203,48 @@ class PromotionProvider {
    * @param   {string} name       Package name.
    * @param   {string} version    Package version.
    * @param   {string} format     Package format.
-   * @returns {Array}             Array of { repo, found, status, pkg } for each pipeline repo.
+   * @returns {Object}            Structured status items and an optional error.
    */
   async getPromotionStatus(workspace, name, version, format) {
     const pipeline = this.getPipeline();
     if (pipeline.length === 0) {
-      return [];
+      return { items: [], error: null };
     }
     if (!name || !version || !format) {
-      return [];
+      return { items: [], error: new Error("Package identity is incomplete.") };
     }
 
     // Search workspace-wide for this package name+version
-    const query = encodeURIComponent(
-      this._buildExactPackageQuery(name, version, format)
-    );
+    let endpoint;
+    try {
+      const query = buildExactPackageQuery(name, version, format);
+      endpoint = apiEndpoint(["packages", workspace], {
+        query: { query, page_size: 100 },
+      });
+    } catch (error) {
+      return { items: [], error };
+    }
     const results = await this.api.get(
-      `packages/${workspace}/?query=${query}&page_size=100`
+      endpoint,
+      { responseType: "array", validate: isPromotionStatusArray, retry: "never" }
     );
 
+    if (!results.ok) {
+      return { items: [], error: results.error };
+    }
+
     // Build a map of repo slug -> package data
-    const repoMap = {};
-    if (Array.isArray(results)) {
-      const exactResults = results.filter(pkg =>
-        this._packageMatchesExpected(pkg, { name, version, format })
-      );
-      for (const pkg of exactResults) {
-        repoMap[pkg.repository] = pkg;
-      }
+    const repoMap = new Map();
+    const exactResults = results.data.filter(pkg =>
+      packageMatchesExactIdentity(pkg, { name, version, format })
+    );
+    for (const pkg of exactResults) {
+      repoMap.set(pkg.repository, pkg);
     }
 
     // Map pipeline repos to their status
-    return pipeline.map(repo => {
-      const pkg = repoMap[repo] || null;
+    return { items: pipeline.map(repo => {
+      const pkg = repoMap.get(repo) || null;
       return {
         repo,
         found: !!pkg,
@@ -238,7 +253,7 @@ class PromotionProvider {
         policyViolated: pkg ? (pkg.policy_violated || false) : false,
         pkg,
       };
-    });
+    }), error: null };
   }
 
   /**
@@ -257,25 +272,39 @@ class PromotionProvider {
     const templates = this.getTagTemplates();
     const dateStr = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
 
-    const sourcePackageResult = await this.api.get(
-      `packages/${workspace}/${sourceRepo}/${slugPerm}/`,
-      apiKey
-    );
+    let sourceEndpoint;
+    let copyEndpoint;
+    try {
+      sourceEndpoint = apiEndpoint(["packages", workspace, sourceRepo, slugPerm]);
+      copyEndpoint = apiEndpoint(["packages", workspace, sourceRepo, slugPerm, "copy"]);
+      encodeApiPathSegment(targetRepo);
+    } catch (error) {
+      return { success: false, error };
+    }
+    const sourcePackageResult = await this.api.get(sourceEndpoint, {
+      apiKey,
+      responseType: "object",
+      validate: isPackageIdentityRecord,
+      retry: "never",
+    });
     const sourcePackage = this._normalizePackage(
-      typeof sourcePackageResult === "string" ? null : sourcePackageResult
+      sourcePackageResult.ok ? sourcePackageResult.data : null
     );
 
     // Step 1: Copy the package to the target repo
-    const copyEndpoint = `packages/${workspace}/${sourceRepo}/${slugPerm}/copy/`;
-    const copyPayload = JSON.stringify({
+    const copyPayload = {
       destination: `${workspace}/${targetRepo}`,
+    };
+
+    const copyResult = await this.api.post(copyEndpoint, copyPayload, {
+      apiKey,
+      responseType: "object",
+      validate: isPackageWriteRecord,
     });
 
-    const copyResult = await this.api.post(copyEndpoint, copyPayload, apiKey);
-
-    if (typeof copyResult === "string") {
-      console.warn(`[Promotion] Copy failed: ${copyResult}`);
-      return { success: false, error: copyResult };
+    if (!copyResult.ok) {
+      console.warn(`[Promotion] Copy failed: ${formatApiError(copyResult.error)}`);
+      return { success: false, error: copyResult.error };
     }
 
     if (templates.onPromote && templates.onPromote.length > 0) {
@@ -286,7 +315,7 @@ class PromotionProvider {
     }
 
     if (templates.onReceive && templates.onReceive.length > 0) {
-      const copiedPackage = this._normalizePackage(copyResult) || sourcePackage;
+      const copiedPackage = this._normalizePackage(copyResult.data) || sourcePackage;
       const locatedPackage = await this._locateCopiedPackage(
         workspace,
         targetRepo,
@@ -309,6 +338,54 @@ class PromotionProvider {
 
     return { success: true, error: null };
   }
+}
+
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isRecordArray(value) {
+  return Array.isArray(value) && value.every(isRecord);
+}
+
+function packageIdentifier(value) {
+  if (typeof value === "string" && value.length > 0) {
+    return value;
+  }
+  return value && typeof value === "object" && typeof value.value === "string" && value.value.length > 0
+    ? value.value
+    : null;
+}
+
+function isPackageIdentityRecord(value) {
+  return isRecord(value)
+    && typeof value.name === "string" && value.name.length > 0
+    && (typeof value.version === "string" || typeof value.version === "number")
+    && String(value.version).length > 0
+    && typeof value.format === "string" && value.format.length > 0;
+}
+
+function isPackageWriteRecord(value) {
+  return isPackageIdentityRecord(value)
+    && Boolean(packageIdentifier(value.slug_perm || value.slug_perm_raw || value.slug));
+}
+
+function isPackageWriteArray(value) {
+  return Array.isArray(value) && value.every(isPackageWriteRecord);
+}
+
+function isPromotionStatusArray(value) {
+  return Array.isArray(value) && value.every(pkg => (
+    isPackageIdentityRecord(pkg)
+    && typeof pkg.repository === "string"
+    && pkg.repository.length > 0
+  ));
+}
+
+function isRepositoryArray(value) {
+  return isRecordArray(value) && value.every(repo => (
+    typeof repo.slug === "string" && repo.slug.length > 0
+  ));
 }
 
 module.exports = { PromotionProvider };

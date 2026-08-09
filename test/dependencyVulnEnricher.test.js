@@ -4,6 +4,8 @@ const {
   enrichVulnerabilities,
   getVulnerabilityCacheSize,
 } = require("../util/dependencyVulnEnricher");
+const { apiFailure, apiSuccess } = require("./apiResultHelpers");
+const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 
 suite("dependencyVulnEnricher", () => {
   function createFoundDependency(slug, count = 1) {
@@ -36,7 +38,7 @@ suite("dependencyVulnEnricher", () => {
       cloudsmithAPI: {
         async getV2(endpoint) {
           calls.push(endpoint);
-          return {
+          return apiSuccess({
             results: [
               {
                 vulnerability_id: "CVE-2024-1234",
@@ -48,7 +50,7 @@ suite("dependencyVulnEnricher", () => {
                 severity: "Medium",
               },
             ],
-          };
+          });
         },
       },
     });
@@ -85,13 +87,29 @@ suite("dependencyVulnEnricher", () => {
       cloudsmithAPI: {
         async getV2() {
           calls += 1;
-          return { results: [] };
+          return apiSuccess({ results: [] });
         },
       },
     });
 
     assert.strictEqual(calls, 0);
     assert.strictEqual(enriched[0].vulnerabilities, undefined);
+  });
+
+  test("malformed nested vulnerability entries are rejected and never cached as clean", async () => {
+    const enriched = await enrichVulnerabilities([createFoundDependency("pkg-malformed")], "workspace-a", {
+      cloudsmithAPI: {
+        async getV2(_endpoint, options) {
+          const payload = { results: [null] };
+          assert.strictEqual(options.validate(payload), false);
+          return apiFailure("invalid_response", { status: 200 });
+        },
+      },
+    });
+
+    assert.strictEqual(enriched[0].vulnerabilities.detailsLoaded, false);
+    assert.strictEqual(enriched[0].vulnerabilities.count, 1);
+    assert.strictEqual(getVulnerabilityCacheSize(), 0);
   });
 
   test("deletes expired cache entries on read when the refresh does not replace them", async () => {
@@ -107,12 +125,12 @@ suite("dependencyVulnEnricher", () => {
       ], "workspace-a", {
         cloudsmithAPI: {
           async getV2() {
-            return {
+            return apiSuccess({
               results: [{
                 vulnerability_id: "CVE-2024-1234",
                 severity: "High",
               }],
-            };
+            });
           },
         },
       });
@@ -124,7 +142,7 @@ suite("dependencyVulnEnricher", () => {
       const enriched = await enrichVulnerabilities([createFoundDependency("pkg-1")], "workspace-a", {
         cloudsmithAPI: {
           async getV2() {
-            return "temporarily unavailable";
+            return apiFailure("network_error", { retryable: true });
           },
         },
       });
@@ -148,12 +166,12 @@ suite("dependencyVulnEnricher", () => {
       await enrichVulnerabilities(dependencies, "workspace-a", {
         cloudsmithAPI: {
           async getV2() {
-            return {
+            return apiSuccess({
               results: [{
                 vulnerability_id: "CVE-2024-1234",
                 severity: "High",
               }],
-            };
+            });
           },
         },
       });
@@ -165,12 +183,12 @@ suite("dependencyVulnEnricher", () => {
       await enrichVulnerabilities([createFoundDependency("pkg-fresh")], "workspace-a", {
         cloudsmithAPI: {
           async getV2() {
-            return {
+            return apiSuccess({
               results: [{
                 vulnerability_id: "CVE-2024-5678",
                 severity: "Medium",
               }],
-            };
+            });
           },
         },
       });
@@ -179,5 +197,45 @@ suite("dependencyVulnEnricher", () => {
     } finally {
       Date.now = originalNow;
     }
+  });
+
+  test("scan cancellation aborts a hanging vulnerability fetch and does not cache a clean result", async () => {
+    let cancellationListener;
+    let disposedListeners = 0;
+    let fetchSignal;
+    const cancellationToken = {
+      isCancellationRequested: false,
+      onCancellationRequested(listener) {
+        cancellationListener = listener;
+        return { dispose() { disposedListeners += 1; } };
+      },
+    };
+    const api = new CloudsmithAPI({}, {
+      credentialManager: { async getApiKey() { return "test-key"; } },
+      fetchImpl: async (_url, options) => {
+        fetchSignal = options.signal;
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener("abort", () => {
+            reject(new DOMException("aborted", "AbortError"));
+          }, { once: true });
+        });
+      },
+    });
+
+    const pending = enrichVulnerabilities([createFoundDependency("pkg-hanging")], "workspace-a", {
+      cloudsmithAPI: api,
+      cancellationToken,
+    });
+    while (!fetchSignal) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    cancellationToken.isCancellationRequested = true;
+    cancellationListener();
+    const enriched = await pending;
+
+    assert.strictEqual(fetchSignal.aborted, true);
+    assert.strictEqual(disposedListeners, 1);
+    assert.strictEqual(enriched[0].vulnerabilities.detailsLoaded, false);
+    assert.strictEqual(getVulnerabilityCacheSize(), 0);
   });
 });

@@ -64,7 +64,7 @@ suite("UpstreamPreviewProvider Test Suite", () => {
           active: 0,
           configs: [],
         },
-        error: "Response status: 503 - Service Unavailable",
+        error: "Upstream availability could not be determined.",
       },
       canResolveViaUpstream: false,
     });
