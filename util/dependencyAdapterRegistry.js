@@ -24,6 +24,7 @@ const ADAPTER_RESULT_STATUSES = Object.freeze({
   ERROR: "error",
   UNSUPPORTED: "unsupported",
 });
+const ADAPTER_RESULT_STATUS_VALUES = new Set(Object.values(ADAPTER_RESULT_STATUSES));
 
 const RESOLUTION_AVAILABILITY = Object.freeze({
   AVAILABLE: "available",
@@ -135,7 +136,10 @@ class DependencyAdapterRegistry {
     const workspaceRoot = getWorkspacePath(workspaceFolder);
     const detections = [];
     for (const adapter of this._adapters.values()) {
-      const adapterDetections = await adapter.detect(workspaceFolder);
+      const adapterDetections = validateDetectionResult(
+        adapter,
+        await adapter.detect(workspaceFolder)
+      );
       for (const detection of adapterDetections) {
         detections.push({
           ...detection,
@@ -178,7 +182,7 @@ class DependencyAdapterRegistry {
       });
     }
 
-    return adapter.parse(detection, options);
+    return validateAdapterResult(adapter, "parse", await adapter.parse(detection, options));
   }
 
   async parseManifest(manifest) {
@@ -198,7 +202,7 @@ class DependencyAdapterRegistry {
       });
     }
 
-    return adapter.parseManifest(manifest);
+    return validateAdapterResult(adapter, "parseManifest", await adapter.parseManifest(manifest));
   }
 }
 
@@ -225,7 +229,7 @@ function createResolverAdapter(resolver) {
       const detections = typeof resolver.detect === "function"
         ? await resolver.detect(rootPath)
         : [];
-      return Array.isArray(detections) ? detections : [];
+      return detections;
     },
     async parse(detection, options) {
       try {
@@ -534,6 +538,17 @@ function classifyDeclaredConstraint(constraint) {
 }
 
 function createAdapterResult(values) {
+  const adapterId = values.adapterId || "<unknown>";
+  if (!ADAPTER_RESULT_STATUS_VALUES.has(values.status)) {
+    throw new TypeError(`Dependency adapter "${adapterId}" result must use a supported status.`);
+  }
+  if (values.dependencies != null && !Array.isArray(values.dependencies)) {
+    throw new TypeError(`Dependency adapter "${adapterId}" result dependencies must be an array.`);
+  }
+  if (values.warnings != null && !Array.isArray(values.warnings)) {
+    throw new TypeError(`Dependency adapter "${adapterId}" result warnings must be an array.`);
+  }
+
   const error = values.error
     ? Object.freeze({
       code: String(values.error.code || "unknown-error"),
@@ -551,6 +566,30 @@ function createAdapterResult(values) {
     error,
     resolutionAvailability: values.resolutionAvailability || RESOLUTION_AVAILABILITY.NOT_APPLICABLE,
   });
+}
+
+function validateDetectionResult(adapter, detections) {
+  if (!Array.isArray(detections)) {
+    throw new TypeError(`Dependency adapter "${adapter.id}" detect() must return an array.`);
+  }
+  return detections;
+}
+
+function validateAdapterResult(adapter, methodName, result) {
+  const methodLabel = `Dependency adapter "${adapter.id}" ${methodName}()`;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new TypeError(`${methodLabel} must return an adapter result object.`);
+  }
+  if (!ADAPTER_RESULT_STATUS_VALUES.has(result.status)) {
+    throw new TypeError(`${methodLabel} result must use a supported status.`);
+  }
+  if (!Array.isArray(result.dependencies)) {
+    throw new TypeError(`${methodLabel} result dependencies must be an array.`);
+  }
+  if (!Array.isArray(result.warnings)) {
+    throw new TypeError(`${methodLabel} result warnings must be an array.`);
+  }
+  return result;
 }
 
 function missingResolutionAvailability(adapterId) {

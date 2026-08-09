@@ -23,6 +23,7 @@ const RESOLUTION_SOURCE_KINDS = Object.freeze({
 
 const VERSION_STATE_VALUES = new Set(Object.values(DEPENDENCY_VERSION_STATES));
 const SOURCE_KIND_VALUES = new Set(Object.values(RESOLUTION_SOURCE_KINDS));
+const CANONICAL_DEPENDENCY_RECORDS = new WeakSet();
 
 /**
  * @typedef {{line: number, character: number}} DependencySourcePosition
@@ -95,58 +96,73 @@ function createDependencySource(values) {
  * @returns {DependencyRecord}
  */
 function createDependencyRecord(values) {
-  const ecosystem = sanitizePackageNameInput(values && values.ecosystem).toLowerCase();
-  const format = canonicalFormat(values && (values.format || ecosystem));
-  const name = sanitizePackageNameInput(values && values.name);
-  if (!ecosystem || !format || !name) {
-    throw new TypeError("Dependency records require an ecosystem, format, and package name.");
+  return createDependencyRecordInternal(values, new WeakSet());
+}
+
+function createDependencyRecordInternal(values, ancestors) {
+  const input = values && typeof values === "object" && !Array.isArray(values)
+    ? values
+    : null;
+  if (input && ancestors.has(input)) {
+    throw new TypeError("Dependency transitive graphs must not contain cycles.");
+  }
+  if (input) {
+    ancestors.add(input);
   }
 
-  const declaredConstraint = optionalString(values && values.declaredConstraint);
-  const resolvedVersion = optionalString(values && values.resolvedVersion);
-  const versionState = String(
-    values && values.versionState
-      || (resolvedVersion ? DEPENDENCY_VERSION_STATES.RESOLVED : DEPENDENCY_VERSION_STATES.UNRESOLVED)
-  ).trim();
-  if (!VERSION_STATE_VALUES.has(versionState)) {
-    throw new TypeError(`Unsupported dependency version state: ${versionState || "<empty>"}`);
-  }
-  if (versionState === DEPENDENCY_VERSION_STATES.RESOLVED && !resolvedVersion) {
-    throw new TypeError("Resolved dependency records require a resolved version.");
-  }
-  if (resolvedVersion && versionState !== DEPENDENCY_VERSION_STATES.RESOLVED) {
-    throw new TypeError("Dependencies with a resolved version must use the resolved version state.");
-  }
+  try {
+    const ecosystem = sanitizePackageNameInput(values && values.ecosystem).toLowerCase();
+    const format = canonicalFormat(values && (values.format || ecosystem));
+    const name = sanitizePackageNameInput(values && values.name);
+    if (!ecosystem || !format || !name) {
+      throw new TypeError("Dependency records require an ecosystem, format, and package name.");
+    }
 
-  const sourceManifest = copyDependencySource(values && values.sourceManifest);
-  if (sourceManifest && sourceManifest.kind !== RESOLUTION_SOURCE_KINDS.MANIFEST) {
-    throw new TypeError("sourceManifest must use the manifest source kind.");
+    const declaredConstraint = optionalString(values && values.declaredConstraint);
+    const resolvedVersion = optionalString(values && values.resolvedVersion);
+    const versionState = String(
+      values && values.versionState
+        || (resolvedVersion ? DEPENDENCY_VERSION_STATES.RESOLVED : DEPENDENCY_VERSION_STATES.UNRESOLVED)
+    ).trim();
+    if (!VERSION_STATE_VALUES.has(versionState)) {
+      throw new TypeError(`Unsupported dependency version state: ${versionState || "<empty>"}`);
+    }
+    if (versionState === DEPENDENCY_VERSION_STATES.RESOLVED && !resolvedVersion) {
+      throw new TypeError("Resolved dependency records require a resolved version.");
+    }
+    if (resolvedVersion && versionState !== DEPENDENCY_VERSION_STATES.RESOLVED) {
+      throw new TypeError("Dependencies with a resolved version must use the resolved version state.");
+    }
+
+    const sourceManifest = copyDependencySource(values && values.sourceManifest);
+    if (sourceManifest && sourceManifest.kind !== RESOLUTION_SOURCE_KINDS.MANIFEST) {
+      throw new TypeError("sourceManifest must use the manifest source kind.");
+    }
+
+    const record = Object.freeze({
+      ecosystem,
+      format,
+      name,
+      normalizedName: normalizePackageName(name, format),
+      declaredConstraint,
+      resolvedVersion,
+      versionState,
+      resolutionSource: copyDependencySource(values && values.resolutionSource),
+      sourceManifest,
+      isDirect: Boolean(values && values.isDirect),
+      isDevelopmentDependency: Boolean(values && values.isDevelopmentDependency),
+      parent: optionalString(values && values.parent),
+      parentChain: Object.freeze(copyStringArray(values && values.parentChain)),
+      transitives: copyTransitives(values && values.transitives, ancestors),
+      legacyVersion: String(values && values.legacyVersion || "").trim(),
+    });
+    CANONICAL_DEPENDENCY_RECORDS.add(record);
+    return record;
+  } finally {
+    if (input) {
+      ancestors.delete(input);
+    }
   }
-
-  const parentChain = Object.freeze(copyStringArray(values && values.parentChain));
-  // Children are canonical records and are therefore already immutable. Copy
-  // the collection so callers cannot later add or remove graph entries.
-  const transitives = Object.freeze(Array.isArray(values && values.transitives)
-    ? values.transitives.slice()
-    : []);
-
-  return Object.freeze({
-    ecosystem,
-    format,
-    name,
-    normalizedName: normalizePackageName(name, format),
-    declaredConstraint,
-    resolvedVersion,
-    versionState,
-    resolutionSource: copyDependencySource(values && values.resolutionSource),
-    sourceManifest,
-    isDirect: Boolean(values && values.isDirect),
-    isDevelopmentDependency: Boolean(values && values.isDevelopmentDependency),
-    parent: optionalString(values && values.parent),
-    parentChain,
-    transitives,
-    legacyVersion: String(values && values.legacyVersion || "").trim(),
-  });
 }
 
 /**
@@ -190,6 +206,25 @@ function copyDependencySource(source) {
     type: source.type,
     range: source.range,
   });
+}
+
+function copyTransitives(transitives, ancestors) {
+  if (transitives == null) {
+    return Object.freeze([]);
+  }
+  if (!Array.isArray(transitives)) {
+    throw new TypeError("Dependency record transitives must be an array.");
+  }
+
+  return Object.freeze(transitives.map((child) => {
+    if (CANONICAL_DEPENDENCY_RECORDS.has(child)) {
+      return child;
+    }
+    if (!child || typeof child !== "object" || Array.isArray(child)) {
+      throw new TypeError("Dependency transitives must contain dependency record objects.");
+    }
+    return createDependencyRecordInternal(child, ancestors);
+  }));
 }
 
 function copySourceRange(range) {

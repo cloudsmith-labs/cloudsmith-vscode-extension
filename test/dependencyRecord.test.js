@@ -46,7 +46,16 @@ suite("dependencyRecord", () => {
       type: "package-lock.json",
     });
     const parentChain = ["fixture-app"];
-    const transitives = [{ name: "child-package" }];
+    const transitive = createDependencyRecord({
+      ecosystem: "npm",
+      name: "child-package",
+      resolvedVersion: "1.0.0",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      parent: "package-a",
+      parentChain: ["package-a"],
+      legacyVersion: "1.0.0",
+    });
+    const transitives = [transitive];
     const dependency = createDependencyRecord({
       ecosystem: "npm",
       format: "npm",
@@ -65,7 +74,10 @@ suite("dependencyRecord", () => {
     });
 
     parentChain.push("mutated-parent");
-    transitives.push({ name: "mutated-child" });
+    transitives.push(createDependencyRecord({
+      ecosystem: "npm",
+      name: "mutated-child",
+    }));
 
     assert.strictEqual(Object.isFrozen(dependency), true);
     assert.strictEqual(dependency.ecosystem, "npm");
@@ -81,10 +93,88 @@ suite("dependencyRecord", () => {
     assert.strictEqual(dependency.isDevelopmentDependency, false);
     assert.strictEqual(dependency.parent, "fixture-app");
     assert.deepStrictEqual(dependency.parentChain, ["fixture-app"]);
-    assert.deepStrictEqual(dependency.transitives, [{ name: "child-package" }]);
+    assert.deepStrictEqual(dependency.transitives, [transitive]);
     assert.strictEqual(dependency.legacyVersion, "1.7.4");
     assert.strictEqual(Object.isFrozen(dependency.parentChain), true);
     assert.strictEqual(Object.isFrozen(dependency.transitives), true);
+    assert.strictEqual(Object.isFrozen(dependency.transitives[0]), true);
+  });
+
+  test("canonicalizes nested transitive inputs without mutating caller-owned objects", () => {
+    const grandchildInput = {
+      ecosystem: "npm",
+      name: "grandchild-package",
+      resolvedVersion: "3.0.0",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      parent: "child-package",
+      parentChain: ["root-package", "child-package"],
+      transitives: [],
+      legacyVersion: "3.0.0",
+    };
+    const childParentChain = ["root-package"];
+    const childTransitives = [grandchildInput];
+    const childInput = {
+      ecosystem: "npm",
+      name: "child-package",
+      resolvedVersion: "2.0.0",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      parent: "root-package",
+      parentChain: childParentChain,
+      transitives: childTransitives,
+      legacyVersion: "2.0.0",
+    };
+    const dependency = createDependencyRecord({
+      ecosystem: "npm",
+      name: "root-package",
+      resolvedVersion: "1.0.0",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      transitives: [childInput],
+      legacyVersion: "1.0.0",
+    });
+    const child = dependency.transitives[0];
+    const grandchild = child.transitives[0];
+
+    assert.notStrictEqual(child, childInput);
+    assert.notStrictEqual(grandchild, grandchildInput);
+    assert.strictEqual(Object.isFrozen(dependency.transitives), true);
+    assert.strictEqual(Object.isFrozen(child), true);
+    assert.strictEqual(Object.isFrozen(child.parentChain), true);
+    assert.strictEqual(Object.isFrozen(child.transitives), true);
+    assert.strictEqual(Object.isFrozen(grandchild), true);
+    assert.strictEqual(Object.isFrozen(grandchild.parentChain), true);
+    assert.strictEqual(Object.isFrozen(grandchild.transitives), true);
+
+    childInput.name = "mutated-child";
+    childParentChain.push("mutated-parent");
+    grandchildInput.name = "mutated-grandchild";
+    childTransitives.push({ name: "mutated-entry" });
+    child.name = "mutated-canonical-child";
+
+    assert.strictEqual(child.name, "child-package");
+    assert.deepStrictEqual(child.parentChain, ["root-package"]);
+    assert.strictEqual(child.transitives.length, 1);
+    assert.strictEqual(grandchild.name, "grandchild-package");
+    assert.strictEqual(Object.isFrozen(childInput), false);
+    assert.strictEqual(Object.isFrozen(childParentChain), false);
+    assert.strictEqual(Object.isFrozen(childTransitives), false);
+    assert.strictEqual(Object.isFrozen(grandchildInput), false);
+    assert.throws(() => dependency.transitives.push(child), TypeError);
+    assert.throws(() => child.parentChain.push("another-parent"), TypeError);
+  });
+
+  test("rejects cyclic transitive input without recursive overflow", () => {
+    const cyclicInput = {
+      ecosystem: "npm",
+      name: "cyclic-package",
+      versionState: DEPENDENCY_VERSION_STATES.UNRESOLVED,
+      transitives: [],
+    };
+    cyclicInput.transitives.push(cyclicInput);
+
+    assert.throws(
+      () => createDependencyRecord(cyclicInput),
+      /Dependency transitive graphs must not contain cycles\./
+    );
   });
 
   test("represents an unresolved range without inventing a resolved version", () => {

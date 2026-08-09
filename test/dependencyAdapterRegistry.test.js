@@ -26,6 +26,22 @@ suite("dependencyAdapterRegistry", () => {
     return workspace;
   }
 
+  function createContractAdapter(id, detect) {
+    return {
+      id,
+      ecosystem: "npm",
+      manifestTypes: [],
+      detect,
+      async parse() {
+        return {
+          status: ADAPTER_RESULT_STATUSES.SUCCESS,
+          dependencies: [],
+          warnings: [],
+        };
+      },
+    };
+  }
+
   suiteTeardown(async () => {
     await Promise.all(tempDirs.map((tempDir) => removeDirectory(tempDir)));
   });
@@ -38,6 +54,75 @@ suite("dependencyAdapterRegistry", () => {
     assert.ok(adapter);
     assert.strictEqual(adapter.id, "npmParser");
     assert.strictEqual(adapter.ecosystem, "npm");
+  });
+
+  test("accepts an empty adapter detection array", async () => {
+    const registry = new DependencyAdapterRegistry([
+      createContractAdapter("empty-detector", async () => []),
+    ]);
+
+    assert.deepStrictEqual(await registry.detect("/workspace"), []);
+  });
+
+  test("preserves valid adapter detections", async () => {
+    const registry = new DependencyAdapterRegistry([
+      createContractAdapter("valid-detector", async () => [{ sourceFile: "package.json" }]),
+    ]);
+
+    assert.deepStrictEqual(await registry.detect("/workspace"), [{
+      sourceFile: "package.json",
+      adapterId: "valid-detector",
+      resolverName: "valid-detector",
+      ecosystem: "npm",
+      workspaceFolder: "/workspace",
+    }]);
+  });
+
+  for (const [label, invalidResult] of [
+    ["null", null],
+    ["undefined", undefined],
+    ["an object", {}],
+    ["a string", "package.json"],
+  ]) {
+    test(`rejects ${label} adapter detection output with an actionable contract error`, async () => {
+      const adapterId = `invalid-${label.replace(/\s+/g, "-")}-detector`;
+      const registry = new DependencyAdapterRegistry([
+        createContractAdapter(adapterId, async () => invalidResult),
+      ]);
+
+      await assert.rejects(
+        () => registry.detect("/workspace"),
+        (error) => {
+          assert.ok(error instanceof TypeError);
+          assert.strictEqual(
+            error.message,
+            `Dependency adapter "${adapterId}" detect() must return an array.`
+          );
+          return true;
+        }
+      );
+    });
+  }
+
+  test("rejects invalid parse result objects at equivalent adapter boundaries", async () => {
+    const parseAdapter = createContractAdapter("invalid-parser", async () => []);
+    parseAdapter.parse = async () => null;
+    const parseRegistry = new DependencyAdapterRegistry([parseAdapter]);
+
+    await assert.rejects(
+      () => parseRegistry.parse({ adapterId: "invalid-parser" }),
+      /Dependency adapter "invalid-parser" parse\(\) must return an adapter result object\./
+    );
+
+    const manifestAdapter = createContractAdapter("invalid-manifest-parser", async () => []);
+    manifestAdapter.manifestTypes = ["package.json"];
+    manifestAdapter.parseManifest = async () => "not-a-result";
+    const manifestRegistry = new DependencyAdapterRegistry([manifestAdapter]);
+
+    await assert.rejects(
+      () => manifestRegistry.parseManifest({ manifestType: "package.json" }),
+      /Dependency adapter "invalid-manifest-parser" parseManifest\(\) must return an adapter result object\./
+    );
   });
 
   test("returns an explicit unsupported result for unknown manifests", async () => {
