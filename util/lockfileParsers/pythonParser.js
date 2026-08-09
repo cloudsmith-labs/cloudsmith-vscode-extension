@@ -14,15 +14,20 @@ const {
   parseQuotedArray,
   pathExists,
   readUtf8,
+  resolveWorkspaceFilePath,
   stripTomlComment,
 } = require("./shared");
 const {
+  hasCompleteTomlArray,
   parsePyprojectManifest,
   parseRequirementSpec,
 } = require("./manifestHelpers");
 const { normalizePackageName } = require("../packageNameNormalizer");
 
 const SOURCE_PRIORITY = ["uv.lock", "poetry.lock", "Pipfile.lock", "requirements.txt"];
+const MAX_REQUIREMENTS_INCLUDE_DEPTH = 32;
+const MAX_REQUIREMENTS_FILES = 128;
+const MAX_REQUIREMENT_LINE_LENGTH = 64 * 1024;
 
 const pythonParser = {
   name: "pythonParser",
@@ -72,33 +77,173 @@ const pythonParser = {
 };
 
 async function parseRequirements(lockfilePath, workspaceFolder) {
-  const dependencies = [];
+  const rootPath = getWorkspacePath(workspaceFolder) || path.dirname(lockfilePath);
+  const state = {
+    dependencies: [],
+    activePaths: new Set(),
+    visitedPaths: new Set(),
+    filesRead: 0,
+    environmentMarkerCount: 0,
+  };
 
-  for (const rawLine of String(await readUtf8(lockfilePath, workspaceFolder)).split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#") || line.startsWith("-")) {
-      continue;
-    }
-    const parsed = parseRequirementSpec(line);
-    if (!parsed) {
-      throw new Error(`Malformed requirements.txt entry: ${line}`);
-    }
-    dependencies.push(createDependency({
-      name: parsed.name,
-      version: parsed.version,
-      ecosystem: "python",
-      isDirect: true,
-      parent: null,
-      parentChain: [],
-      transitives: [],
-      sourceFile: getSourceFileName(lockfilePath),
-      isDevelopmentDependency: false,
-    }));
+  await parseRequirementsFile(lockfilePath, rootPath, state, 0);
+
+  const warnings = [
+    "requirements.txt does not encode transitive dependencies. Showing direct requirements only.",
+  ];
+  if (state.environmentMarkerCount > 0) {
+    warnings.push(
+      "Python environment markers were not evaluated. Conditional requirements are retained without a concrete version."
+    );
   }
 
-  return buildTree("python", getSourceFileName(lockfilePath), dependencies, [
-    "requirements.txt does not encode transitive dependencies. Showing direct requirements only.",
-  ]);
+  return buildTree(
+    "python",
+    getSourceFileName(lockfilePath),
+    deduplicateDeps(state.dependencies),
+    warnings
+  );
+}
+
+async function parseRequirementsFile(filePath, workspaceRoot, state, depth) {
+  if (depth > MAX_REQUIREMENTS_INCLUDE_DEPTH) {
+    throw new Error(`requirements.txt include depth exceeds ${MAX_REQUIREMENTS_INCLUDE_DEPTH}`);
+  }
+
+  const safePath = await resolveWorkspaceFilePath(filePath, workspaceRoot);
+  if (!safePath) {
+    if (depth === 0) {
+      throw new Error("Refusing to read files outside the workspace folder.");
+    }
+    throw new Error("Requirements include paths must stay within the workspace folder.");
+  }
+  if (state.activePaths.has(safePath)) {
+    throw new Error(`Circular requirements.txt include: ${getSourceFileName(safePath)}`);
+  }
+  if (state.visitedPaths.has(safePath)) {
+    return;
+  }
+  if (state.filesRead >= MAX_REQUIREMENTS_FILES) {
+    throw new Error(`requirements.txt includes exceed ${MAX_REQUIREMENTS_FILES} files`);
+  }
+
+  state.filesRead += 1;
+  state.activePaths.add(safePath);
+  try {
+    const content = await readUtf8(safePath, workspaceRoot);
+    for (const rawLine of buildLogicalRequirementLines(content)) {
+      const line = stripRequirementComment(rawLine).trim();
+      if (!line) {
+        continue;
+      }
+
+      const includeTarget = parseRequirementsIncludeTarget(line);
+      if (includeTarget) {
+        await parseRequirementsFile(
+          path.resolve(path.dirname(safePath), includeTarget),
+          workspaceRoot,
+          state,
+          depth + 1
+        );
+        continue;
+      }
+
+      if (line.startsWith("-")) {
+        continue;
+      }
+
+      const requirementText = stripRequirementOptions(line);
+      const marker = getEnvironmentMarker(requirementText);
+      const parsed = parseRequirementSpec(requirementText);
+      if (!parsed || !isSupportedRequirementConstraint(parsed.declaredConstraint)) {
+        throw new Error(`Malformed requirements.txt entry: ${line}`);
+      }
+
+      if (marker) {
+        state.environmentMarkerCount += 1;
+      }
+      const dependency = createDependency({
+        name: parsed.name,
+        version: marker ? "" : getExactRequirementVersion(parsed.declaredConstraint),
+        ecosystem: "python",
+        isDirect: true,
+        parent: null,
+        parentChain: [],
+        transitives: [],
+        sourceFile: getSourceFileName(safePath),
+        isDevelopmentDependency: false,
+      });
+      dependency.declaredConstraint = parsed.declaredConstraint;
+      dependency.environmentMarker = marker;
+      dependency.sourceManifestPath = safePath;
+      state.dependencies.push(dependency);
+    }
+    state.visitedPaths.add(safePath);
+  } finally {
+    state.activePaths.delete(safePath);
+  }
+}
+
+function buildLogicalRequirementLines(content) {
+  const lines = [];
+  let current = "";
+
+  for (const rawLine of String(content || "").split(/\r?\n/)) {
+    const trimmedEnd = rawLine.trimEnd();
+    const continues = trimmedEnd.endsWith("\\");
+    const segment = continues ? trimmedEnd.slice(0, -1).trimEnd() : trimmedEnd;
+    current += current ? ` ${segment.trimStart()}` : segment;
+    if (current.length > MAX_REQUIREMENT_LINE_LENGTH) {
+      throw new Error(`requirements.txt entries must not exceed ${MAX_REQUIREMENT_LINE_LENGTH} characters`);
+    }
+    if (!continues) {
+      lines.push(current);
+      current = "";
+    }
+  }
+
+  if (current) {
+    lines.push(current);
+  }
+  return lines;
+}
+
+function stripRequirementComment(line) {
+  const commentIndex = String(line || "").search(/(^|\s)#/);
+  return commentIndex === -1 ? String(line || "") : String(line || "").slice(0, commentIndex).trimEnd();
+}
+
+function parseRequirementsIncludeTarget(line) {
+  const match = String(line || "").match(/^(?:-r\s*|--requirement(?:\s+|=))(.+)$/i);
+  if (!match) {
+    return null;
+  }
+
+  return match[1].trim().replace(/^["']|["']$/g, "") || null;
+}
+
+function stripRequirementOptions(line) {
+  const optionMatch = String(line || "").match(/\s+--(?:hash|config-settings|global-option|install-option)(?:=|\s)/);
+  return optionMatch ? line.slice(0, optionMatch.index).trim() : String(line || "").trim();
+}
+
+function getEnvironmentMarker(requirement) {
+  const markerIndex = String(requirement || "").indexOf(";");
+  return markerIndex === -1 ? null : String(requirement).slice(markerIndex + 1).trim() || null;
+}
+
+function isSupportedRequirementConstraint(constraint) {
+  const value = String(constraint || "").trim().replace(/^\(|\)$/g, "").trim();
+  return !value || value.startsWith("@") || /^(?:===|==|~=|!=|<=|>=|<|>)/.test(value);
+}
+
+function getExactRequirementVersion(constraint) {
+  const value = String(constraint || "").trim().replace(/^\(|\)$/g, "").trim();
+  const match = value.match(/^(?:===|==)\s*([^\s,]+)$/);
+  if (!match || match[1].includes("*")) {
+    return "";
+  }
+  return match[1];
 }
 
 async function parsePipfile(lockfilePath, workspaceFolder) {
@@ -170,8 +315,12 @@ async function parseTomlLock(lockfilePath, pyproject, workspaceFolder, skipEdita
   }
 
   const rootRecords = normalizedDirectNames.size > 0
-    ? [...normalizedDirectNames].map((name) => (recordsByName.get(name) || [])[0]).filter(Boolean)
+    ? [...normalizedDirectNames].flatMap((name) => recordsByName.get(name) || [])
     : records.filter((record) => !incomingCounts.get(record.normalizedName));
+
+  const normalizedDevNames = new Set(
+    [...pyproject.devNames].map((name) => normalizePackageName(name, "python"))
+  );
 
   const directRoots = deduplicateDeps(rootRecords.map((record) => buildPythonDependency(
     record,
@@ -179,7 +328,7 @@ async function parseTomlLock(lockfilePath, pyproject, workspaceFolder, skipEdita
     recordsByName,
     new Set(),
     sourceFile,
-    new Set([...pyproject.devNames].map((name) => normalizePackageName(name, "python")))
+    normalizedDevNames
   )));
 
   let dependencies = deduplicateDeps(flattenDependencies(directRoots));
@@ -200,7 +349,7 @@ async function parseTomlLock(lockfilePath, pyproject, workspaceFolder, skipEdita
       parentChain: [],
       transitives: [],
       sourceFile,
-      isDevelopmentDependency: false,
+      isDevelopmentDependency: normalizedDevNames.has(record.normalizedName),
     }));
   }
 
@@ -230,18 +379,17 @@ function buildPythonDependency(record, parentChain, recordsByName, visiting, sou
 
   for (const dependencyName of record.dependencies) {
     const normalizedDependencyName = normalizePackageName(dependencyName, "python");
-    const childRecord = (recordsByName.get(normalizedDependencyName) || [])[0];
-    if (!childRecord) {
-      continue;
+    const childRecords = recordsByName.get(normalizedDependencyName) || [];
+    for (const childRecord of childRecords) {
+      transitives.push(buildPythonDependency(
+        childRecord,
+        nextParentChain,
+        recordsByName,
+        nextVisiting,
+        sourceFile,
+        normalizedDevNames
+      ));
     }
-    transitives.push(buildPythonDependency(
-      childRecord,
-      nextParentChain,
-      recordsByName,
-      nextVisiting,
-      sourceFile,
-      normalizedDevNames
-    ));
   }
 
   return createDependency({
@@ -262,6 +410,8 @@ function parsePythonPackageRecords(content, skipEditableRoot) {
   let current = null;
   let section = "";
   let metadataDirectNames = [];
+  let dependencyArrayBuffer = "";
+  let metadataArrayBuffer = "";
 
   const flushCurrent = () => {
     if (!current || !current.name || !current.version) {
@@ -282,6 +432,25 @@ function parsePythonPackageRecords(content, skipEditableRoot) {
   for (const rawLine of String(content || "").split(/\r?\n/)) {
     const line = stripTomlComment(rawLine).trim();
     if (!line || line.startsWith("#")) {
+      continue;
+    }
+
+    if (dependencyArrayBuffer) {
+      dependencyArrayBuffer += ` ${line}`;
+      if (hasCompleteTomlArray(dependencyArrayBuffer)) {
+        current.dependencies.push(...parsePythonDependencyArray(dependencyArrayBuffer));
+        dependencyArrayBuffer = "";
+      }
+      continue;
+    }
+
+    if (metadataArrayBuffer) {
+      metadataArrayBuffer += ` ${line}`;
+      if (hasCompleteTomlArray(metadataArrayBuffer)) {
+        metadataDirectNames = parseQuotedArray(metadataArrayBuffer)
+          .map((name) => normalizePackageName(name, "python"));
+        metadataArrayBuffer = "";
+      }
       continue;
     }
 
@@ -329,7 +498,11 @@ function parsePythonPackageRecords(content, skipEditableRoot) {
       if (line.startsWith("dependencies =")) {
         const value = parseKeyValueLine(line).value;
         if (value.startsWith("[")) {
-          current.dependencies.push(...parsePythonDependencyArray(value));
+          if (hasCompleteTomlArray(value)) {
+            current.dependencies.push(...parsePythonDependencyArray(value));
+          } else {
+            dependencyArrayBuffer = value;
+          }
         } else if (value.startsWith("{")) {
           current.dependencies.push(...parsePythonDependencyInlineObjects(value));
         }
@@ -347,17 +520,34 @@ function parsePythonPackageRecords(content, skipEditableRoot) {
 
     if (section === "metadata") {
       if (line.startsWith("direct-dependencies =") || line.startsWith("root-dependencies =")) {
-        metadataDirectNames = parseQuotedArray(parseKeyValueLine(line).value)
-          .map((name) => normalizePackageName(name, "python"));
+        const value = parseKeyValueLine(line).value;
+        if (hasCompleteTomlArray(value)) {
+          metadataDirectNames = parseQuotedArray(value)
+            .map((name) => normalizePackageName(name, "python"));
+        } else {
+          metadataArrayBuffer = value;
+        }
       }
     }
   }
 
+  if (dependencyArrayBuffer || metadataArrayBuffer) {
+    throw new Error("Malformed Python lockfile: unterminated dependency array");
+  }
+
   flushCurrent();
+  for (const record of records) {
+    record.isRootDependency = metadataDirectNames.includes(record.normalizedName);
+  }
   return records;
 }
 
 function parsePythonDependencyArray(value) {
+  const inlineObjectNames = parsePythonDependencyInlineObjects(value);
+  if (inlineObjectNames.length > 0) {
+    return inlineObjectNames;
+  }
+
   const names = [];
   for (const item of parseQuotedArray(value)) {
     const parsed = parseRequirementSpec(item);
@@ -365,10 +555,7 @@ function parsePythonDependencyArray(value) {
       names.push(parsed.name);
     }
   }
-  if (names.length > 0) {
-    return names;
-  }
-  return parsePythonDependencyInlineObjects(value);
+  return names;
 }
 
 function parsePythonDependencyInlineObjects(value) {

@@ -104,6 +104,8 @@ suite("LockfileResolver Test Suite", () => {
     const match = findCoverageMatch(index, {
       name: "scikit_learn",
       version: "1.4.0",
+      legacyVersion: "1.4.0",
+      versionState: "exact-declaration",
       format: "python",
     });
 
@@ -127,6 +129,8 @@ suite("LockfileResolver Test Suite", () => {
       const match = findCoverageMatch(index, {
         name: variant,
         version: "0.10.0",
+        legacyVersion: "0.10.0",
+        versionState: "exact-declaration",
         format: "python",
       });
       assert.strictEqual(match, cloudsmithPackage);
@@ -147,6 +151,8 @@ suite("LockfileResolver Test Suite", () => {
     const match = findCoverageMatch(index, {
       name: "org.springframework.boot:spring-boot-starter",
       version: "3.2.0",
+      legacyVersion: "3.2.0",
+      versionState: "exact-declaration",
       format: "maven",
     });
 

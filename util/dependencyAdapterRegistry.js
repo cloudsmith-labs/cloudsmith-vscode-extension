@@ -2,6 +2,7 @@
 const path = require("path");
 const { ManifestParser } = require("./manifestParser");
 const { LockfileResolver } = require("./lockfileResolver");
+const { discoverDependencyManifests } = require("./dependencyManifestDiscovery");
 const {
   DEPENDENCY_VERSION_STATES,
   RESOLUTION_SOURCE_KINDS,
@@ -80,10 +81,31 @@ const PACKAGE_MANAGER_OUTPUT_TYPES = new Set([
   "dependency-tree.txt",
 ]);
 
+const RESOLVER_DIRECT_MANIFEST_TYPES = new Set([
+  "build.gradle",
+  "build.gradle.kts",
+  "chart.yaml",
+  "composer.json",
+  "compose.yaml",
+  "compose.yml",
+  "docker-compose.yaml",
+  "docker-compose.yml",
+  "dockerfile",
+  "gemfile",
+  "requirements.txt",
+  "pom.xml",
+  "package.swift",
+  "pubspec.yaml",
+  "mix.exs",
+  "go.mod",
+  "cargo.toml",
+]);
+
 class DependencyAdapterRegistry {
   constructor(adapters = []) {
     this._adapters = new Map();
     this._manifestAdapters = new Map();
+    this._discoveryWarnings = [];
 
     for (const adapter of adapters) {
       this.register(adapter);
@@ -134,27 +156,72 @@ class DependencyAdapterRegistry {
 
   async detect(workspaceFolder) {
     const workspaceRoot = getWorkspacePath(workspaceFolder);
+    const discovery = await discoverDependencyManifests(workspaceRoot);
+    this._discoveryWarnings = discovery.warnings.slice();
+    const nestedAdapterRoots = new Map();
+    for (const manifest of discovery.manifests) {
+      const projectRoot = path.dirname(manifest.filePath);
+      if (path.resolve(projectRoot) === path.resolve(workspaceRoot)) {
+        continue;
+      }
+      const adapter = this.getAdapterForManifest(path.basename(manifest.filePath));
+      if (!adapter) {
+        continue;
+      }
+      if (!nestedAdapterRoots.has(projectRoot)) {
+        nestedAdapterRoots.set(projectRoot, new Set());
+      }
+      nestedAdapterRoots.get(projectRoot).add(adapter.id);
+    }
+
     const detections = [];
-    for (const adapter of this._adapters.values()) {
-      const adapterDetections = validateDetectionResult(
-        adapter,
-        await adapter.detect(workspaceFolder)
-      );
-      for (const detection of adapterDetections) {
-        detections.push({
-          ...detection,
-          adapterId: adapter.id,
-          resolverName: adapter.id,
-          ecosystem: detection.ecosystem || adapter.ecosystem,
-          workspaceFolder: workspaceRoot,
-        });
+    const detectionTargets = [
+      [workspaceRoot, new Set(this._adapters.keys())],
+      ...nestedAdapterRoots.entries(),
+    ];
+    const seen = new Set();
+    for (const [projectRoot, adapterIds] of detectionTargets) {
+      for (const adapterId of adapterIds) {
+        const adapter = this._adapters.get(adapterId);
+        const adapterDetections = validateDetectionResult(
+          adapter,
+          await adapter.detect(projectRoot)
+        );
+        for (const detection of adapterDetections) {
+          const detectionKey = JSON.stringify([
+            adapter.id,
+            detection.lockfilePath || null,
+            detection.manifestPath || null,
+            detection.sourceFile || null,
+          ]);
+          if (seen.has(detectionKey)) {
+            continue;
+          }
+          seen.add(detectionKey);
+          detections.push({
+            ...detection,
+            adapterId: adapter.id,
+            resolverName: adapter.id,
+            ecosystem: detection.ecosystem || adapter.ecosystem,
+            workspaceFolder: workspaceRoot,
+            ...(path.resolve(projectRoot) === path.resolve(workspaceRoot)
+              ? {}
+              : { projectFolder: projectRoot }),
+          });
+        }
       }
     }
     return detections;
   }
 
+  getDiscoveryWarnings() {
+    return this._discoveryWarnings.slice();
+  }
+
   async detectManifests(workspaceFolder) {
-    const manifests = await ManifestParser.detectManifests(workspaceFolder);
+    const discovery = await discoverDependencyManifests(workspaceFolder);
+    this._discoveryWarnings = discovery.warnings.slice();
+    const manifests = discovery.manifests;
     return manifests.map((manifest) => {
       const adapter = this.getAdapterForManifest(path.basename(manifest.filePath));
       return {
@@ -253,7 +320,13 @@ function createResolverAdapter(resolver) {
           safeDetection.workspaceFolder
         );
         const dependencies = (legacyTree && legacyTree.dependencies || []).map((dependency) => (
-          adaptLegacyDependency(dependency, legacyTree, sources, declaredConstraints)
+          adaptLegacyDependency(
+            dependency,
+            legacyTree,
+            sources,
+            declaredConstraints,
+            safeDetection.workspaceFolder
+          )
         ));
         const warnings = Array.isArray(legacyTree && legacyTree.warnings)
           ? legacyTree.warnings.slice()
@@ -287,7 +360,7 @@ function createResolverAdapter(resolver) {
         });
       }
     },
-    parseManifest: manifestTypes.some((manifestType) => LEGACY_MANIFEST_PARSERS[normalizeManifestType(manifestType)])
+    parseManifest: manifestTypes.length > 0 || resolver.name === "nugetParser"
       ? (manifest) => parseLegacyManifest(resolver, manifest)
       : undefined,
   });
@@ -296,7 +369,10 @@ function createResolverAdapter(resolver) {
 async function parseLegacyManifest(resolver, manifest) {
   const manifestType = normalizeManifestType(path.basename(String(manifest && manifest.filePath || "")));
   const parser = LEGACY_MANIFEST_PARSERS[manifestType];
-  if (!parser) {
+  const useResolverDirectly = RESOLVER_DIRECT_MANIFEST_TYPES.has(manifestType)
+    || (resolver.name === "dockerParser" && manifestType.startsWith("dockerfile."))
+    || (resolver.name === "nugetParser" && manifestType.endsWith(".csproj"));
+  if (!parser && !useResolverDirectly) {
     return createAdapterResult({
       status: ADAPTER_RESULT_STATUSES.UNSUPPORTED,
       adapterId: resolver.name,
@@ -315,6 +391,7 @@ async function parseLegacyManifest(resolver, manifest) {
     if (!workspaceFolder) {
       throw new Error("Dependency manifests require a workspace folder.");
     }
+    const safeWorkspaceFolder = await resolveWorkspaceFilePath(workspaceFolder, workspaceFolder);
     const safeFilePath = await resolveWorkspaceFilePath(manifest.filePath, workspaceFolder);
     if (!safeFilePath) {
       throw new Error("Manifest paths must stay within the workspace folder.");
@@ -329,6 +406,14 @@ async function parseLegacyManifest(resolver, manifest) {
       filePath: safeFilePath,
       type: path.basename(safeFilePath),
     });
+    if (useResolverDirectly) {
+      return parseResolverManifest(
+        resolver,
+        safeFilePath,
+        safeWorkspaceFolder || workspaceFolder,
+        sourceManifest
+      );
+    }
     const dependencies = parser(content).map((dependency) => adaptLegacyManifestDependency(
       dependency,
       resolver.ecosystem,
@@ -359,6 +444,55 @@ async function parseLegacyManifest(resolver, manifest) {
   }
 }
 
+async function parseResolverManifest(resolver, safeFilePath, workspaceFolder, sourceManifest) {
+  const manifestType = normalizeManifestType(path.basename(safeFilePath));
+  const isLockfileShapedManifest = manifestType === "requirements.txt"
+    || manifestType === "dockerfile"
+    || manifestType.startsWith("dockerfile.")
+    || ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"].includes(manifestType);
+  const legacyTree = await LockfileResolver.resolve(
+    resolver.name,
+    isLockfileShapedManifest ? safeFilePath : null,
+    isLockfileShapedManifest ? null : safeFilePath,
+    { workspaceFolder }
+  );
+  const sources = Object.freeze({
+    manifest: sourceManifest,
+    resolution: null,
+    adapterId: resolver.name,
+  });
+  const declaredConstraints = await readDeclaredConstraintIndex(
+    sourceManifest,
+    resolver.ecosystem,
+    workspaceFolder
+  );
+  const dependencies = (legacyTree && legacyTree.dependencies || []).map((dependency) => (
+    adaptLegacyDependency(
+      dependency,
+      legacyTree,
+      sources,
+      declaredConstraints,
+      workspaceFolder
+    )
+  ));
+  const warnings = Array.isArray(legacyTree && legacyTree.warnings)
+    ? legacyTree.warnings.slice()
+    : [];
+
+  return createAdapterResult({
+    status: warnings.length > 0
+      ? ADAPTER_RESULT_STATUSES.PARTIAL
+      : ADAPTER_RESULT_STATUSES.SUCCESS,
+    adapterId: resolver.name,
+    ecosystem: resolver.ecosystem,
+    sourceFile: legacyTree && legacyTree.sourceFile || path.basename(safeFilePath),
+    source: sources,
+    dependencies,
+    warnings,
+    resolutionAvailability: missingResolutionAvailability(resolver.name),
+  });
+}
+
 async function resolveDetectionPaths(detection, callerWorkspaceFolder) {
   const workspaceFolder = getWorkspacePath(
     callerWorkspaceFolder || detection && detection.workspaceFolder
@@ -366,6 +500,7 @@ async function resolveDetectionPaths(detection, callerWorkspaceFolder) {
   if (!workspaceFolder) {
     throw new Error("Dependency detections require a workspace folder.");
   }
+  const safeWorkspaceFolder = await resolveWorkspaceFilePath(workspaceFolder, workspaceFolder);
 
   const lockfilePath = detection && detection.lockfilePath
     ? await resolveWorkspaceFilePath(detection.lockfilePath, workspaceFolder)
@@ -382,7 +517,7 @@ async function resolveDetectionPaths(detection, callerWorkspaceFolder) {
 
   return {
     ...detection,
-    workspaceFolder,
+    workspaceFolder: safeWorkspaceFolder || workspaceFolder,
     lockfilePath,
     manifestPath,
     sourceFile: detection && detection.sourceFile
@@ -443,52 +578,82 @@ async function readDeclaredConstraintIndex(sourceManifest, ecosystem, workspaceF
   }
 
   const content = await readUtf8(sourceManifest.filePath, workspaceFolder);
+  if (normalizeManifestType(sourceManifest.type) === "package.json") {
+    JSON.parse(content);
+  }
   for (const dependency of parser(content)) {
     const name = normalizePackageName(dependency.name, ecosystem);
     if (!name || index.has(name)) {
       continue;
     }
-    index.set(name, dependency.declaredConstraint != null
-      ? String(dependency.declaredConstraint).trim()
-      : String(dependency.version || "").trim());
+    index.set(name, Object.freeze({
+      declaredConstraint: dependency.declaredConstraint != null
+        ? String(dependency.declaredConstraint).trim()
+        : String(dependency.version || "").trim(),
+      environmentMarker: optionalConstraint(dependency.environmentMarker),
+    }));
   }
   return index;
 }
 
-function adaptLegacyDependency(dependency, tree, sources, declaredConstraints) {
+function adaptLegacyDependency(dependency, tree, sources, declaredConstraints, workspaceFolder) {
   const ecosystem = dependency.ecosystem || tree.ecosystem;
   const format = dependency.format || canonicalFormat(ecosystem);
   const name = String(dependency.name || "").trim();
-  const declaredConstraint = dependency.isDirect
-    ? declaredConstraints.get(normalizePackageName(name, format)) || null
+  const declarationName = String(dependency.declaredName || dependency.declarationName || name).trim();
+  const indexedDeclaration = dependency.isDirect
+    ? declaredConstraints.get(normalizePackageName(declarationName, format)) || null
     : null;
-  const hasUncertainMavenDirectResolution = ecosystem === "maven"
-    && dependency.isDirect
-    && sources.resolution
-    && sources.resolution.kind === RESOLUTION_SOURCE_KINDS.PACKAGE_MANAGER
-    && declaredConstraint;
-  const resolvedVersion = sources.resolution && dependency.version && !hasUncertainMavenDirectResolution
-    ? String(dependency.version).trim()
-    : null;
-  let versionState = classifyDeclaredConstraint(declaredConstraint);
-  if (hasUncertainMavenDirectResolution) {
+  const indexedConstraint = indexedDeclaration && indexedDeclaration.declaredConstraint || null;
+  const declaredConstraint = optionalConstraint(dependency.declaredConstraint) || indexedConstraint;
+  const environmentMarker = optionalConstraint(dependency.environmentMarker)
+    || (indexedDeclaration && indexedDeclaration.environmentMarker)
+    || null;
+  const explicitResolvedVersion = optionalConstraint(dependency.resolvedVersion);
+  const candidateResolvedVersion = explicitResolvedVersion || optionalConstraint(dependency.version);
+  const hasExplicitResolutionFlag = Object.prototype.hasOwnProperty.call(
+    dependency,
+    "hasResolutionEvidence"
+  );
+  const hasResolutionEvidence = Boolean(
+    sources.resolution
+    && candidateResolvedVersion
+    && !environmentMarker
+    && (!hasExplicitResolutionFlag || dependency.hasResolutionEvidence === true)
+  );
+  const resolvedVersion = hasResolutionEvidence ? candidateResolvedVersion : null;
+  let versionState = normalizeVersionState(
+    dependency.versionState || dependency.manifestVersionState
+  ) || classifyDeclaredConstraint(declaredConstraint, ecosystem);
+  if (environmentMarker) {
     versionState = DEPENDENCY_VERSION_STATES.INCOMPLETE;
   } else if (resolvedVersion) {
     versionState = DEPENDENCY_VERSION_STATES.RESOLVED;
   }
   const transitives = Array.isArray(dependency.transitives)
-    ? dependency.transitives.map((child) => adaptLegacyDependency(child, tree, sources, declaredConstraints))
+    ? dependency.transitives.map((child) => adaptLegacyDependency(
+      child,
+      tree,
+      sources,
+      declaredConstraints,
+      workspaceFolder
+    ))
     : [];
+  const sourceManifest = dependency.isDirect
+    ? createDependencyManifestSource(dependency, sources.manifest, workspaceFolder)
+    : null;
 
   return createDependencyRecord({
     ecosystem,
     format,
     name,
+    declarationName,
     declaredConstraint,
     resolvedVersion,
     versionState,
     resolutionSource: resolvedVersion ? sources.resolution : null,
-    sourceManifest: dependency.isDirect ? sources.manifest : null,
+    sourceManifest,
+    environmentMarker,
     isDirect: dependency.isDirect,
     isDevelopmentDependency: dependency.isDevelopmentDependency || dependency.devDependency,
     parent: dependency.parent,
@@ -502,15 +667,21 @@ function adaptLegacyManifestDependency(dependency, ecosystem, sourceManifest) {
   const declaredConstraint = dependency.declaredConstraint != null
     ? String(dependency.declaredConstraint).trim()
     : String(dependency.version || "").trim() || null;
+  const versionState = dependency.environmentMarker
+    ? DEPENDENCY_VERSION_STATES.INCOMPLETE
+    : normalizeVersionState(dependency.versionState || dependency.manifestVersionState)
+      || classifyDeclaredConstraint(declaredConstraint, ecosystem);
   return createDependencyRecord({
     ecosystem,
     format: dependency.format || canonicalFormat(ecosystem),
     name: dependency.name,
+    declarationName: dependency.declaredName || dependency.declarationName || dependency.name,
     declaredConstraint,
     resolvedVersion: null,
-    versionState: classifyDeclaredConstraint(declaredConstraint),
+    versionState,
     resolutionSource: null,
     sourceManifest,
+    environmentMarker: dependency.environmentMarker,
     isDirect: true,
     isDevelopmentDependency: dependency.isDevelopmentDependency || dependency.devDependency,
     parent: null,
@@ -520,13 +691,56 @@ function adaptLegacyManifestDependency(dependency, ecosystem, sourceManifest) {
   });
 }
 
-function classifyDeclaredConstraint(constraint) {
+function classifyDeclaredConstraint(constraint, ecosystem) {
   const value = String(constraint || "").trim();
   if (!value) {
     return DEPENDENCY_VERSION_STATES.UNRESOLVED;
   }
-  if (value.includes("${") || /^(?:workspace|file|git|path|link):/i.test(value)) {
+  if (
+    value.includes("${")
+    || /^(?:workspace|file|git|path|link|https?):/i.test(value)
+    || /^npm:[^@]+(?:@|$)/i.test(value)
+  ) {
     return DEPENDENCY_VERSION_STATES.INCOMPLETE;
+  }
+
+  const normalizedEcosystem = canonicalFormat(ecosystem);
+  if (normalizedEcosystem === "npm") {
+    const exactCandidate = /^=\s*/.test(value) && !/^==/.test(value)
+      ? value.replace(/^=\s*/, "")
+      : value;
+    if (isExactNpmVersion(exactCandidate)) {
+      return DEPENDENCY_VERSION_STATES.EXACT_DECLARATION;
+    }
+    if (
+      /^(?:v?\d+|v?\d+\.\d+)$/.test(value)
+      || /(?:^|\.)[xX*](?:\.|$)/.test(value)
+      || value === "*"
+      || /[~^<>=!|,]/.test(value)
+      || /\s+-\s+/.test(value)
+    ) {
+      return DEPENDENCY_VERSION_STATES.RANGE;
+    }
+    return DEPENDENCY_VERSION_STATES.INCOMPLETE;
+  }
+  if (normalizedEcosystem === "python") {
+    if (/^={2,3}\s*[^*\s,;]+$/.test(value)) {
+      return DEPENDENCY_VERSION_STATES.EXACT_DECLARATION;
+    }
+    if (/^v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?$/.test(value)) {
+      return DEPENDENCY_VERSION_STATES.EXACT_DECLARATION;
+    }
+    return DEPENDENCY_VERSION_STATES.RANGE;
+  }
+  if (normalizedEcosystem === "cargo") {
+    return /^=\s*v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?$/.test(value)
+      ? DEPENDENCY_VERSION_STATES.EXACT_DECLARATION
+      : DEPENDENCY_VERSION_STATES.RANGE;
+  }
+  if (normalizedEcosystem === "nuget") {
+    return /^\[\s*[^,\]]+\s*]$/.test(value)
+      ? DEPENDENCY_VERSION_STATES.EXACT_DECLARATION
+      : DEPENDENCY_VERSION_STATES.RANGE;
   }
   if (/^v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?$/.test(value)) {
     return DEPENDENCY_VERSION_STATES.EXACT_DECLARATION;
@@ -535,6 +749,40 @@ function classifyDeclaredConstraint(constraint) {
     return DEPENDENCY_VERSION_STATES.RANGE;
   }
   return DEPENDENCY_VERSION_STATES.INCOMPLETE;
+}
+
+function isExactNpmVersion(value) {
+  return /^v?(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(
+    String(value || "")
+  );
+}
+
+function normalizeVersionState(versionState) {
+  const value = String(versionState || "").trim();
+  return Object.values(DEPENDENCY_VERSION_STATES).includes(value) ? value : null;
+}
+
+function optionalConstraint(value) {
+  const normalized = String(value == null ? "" : value).trim();
+  return normalized || null;
+}
+
+function createDependencyManifestSource(dependency, fallbackSource, workspaceFolder) {
+  const candidate = optionalConstraint(dependency.sourceManifestPath);
+  if (!candidate) {
+    return fallbackSource;
+  }
+  const workspaceRoot = path.resolve(getWorkspacePath(workspaceFolder));
+  const candidatePath = path.resolve(candidate);
+  const relativePath = path.relative(workspaceRoot, candidatePath);
+  if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+    return fallbackSource;
+  }
+  return createDependencySource({
+    kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
+    filePath: candidatePath,
+    type: path.basename(candidatePath),
+  });
 }
 
 function createAdapterResult(values) {

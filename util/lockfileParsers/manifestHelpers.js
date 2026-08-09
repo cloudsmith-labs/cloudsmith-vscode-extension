@@ -96,7 +96,7 @@ function parsePyprojectManifest(content) {
 
     if (collectingProjectDependencies) {
       projectDependenciesBuffer += projectDependenciesBuffer ? ` ${line}` : line;
-      if (projectDependenciesBuffer.includes("]")) {
+      if (hasCompleteTomlArray(projectDependenciesBuffer)) {
         flushProjectDependencies();
       }
       continue;
@@ -119,7 +119,7 @@ function parsePyprojectManifest(content) {
 
     if (section === "[project]" && line.startsWith("dependencies")) {
       projectDependenciesBuffer = parseKeyValueLine(line).value;
-      if (projectDependenciesBuffer.includes("]")) {
+      if (hasCompleteTomlArray(projectDependenciesBuffer)) {
         flushProjectDependencies();
       } else {
         collectingProjectDependencies = true;
@@ -146,13 +146,17 @@ function parsePyprojectManifest(content) {
       const declaredConstraint = rawValue.startsWith("{")
         ? parseInlineTomlValue(rawValue, "version")
         : unquote(rawValue);
+      const environmentMarker = rawValue.startsWith("{")
+        ? parseInlineTomlValue(rawValue, "markers") || null
+        : null;
       const version = normalizeVersion(declaredConstraint);
       const isDevelopmentDependency = section !== "[tool.poetry.dependencies]";
 
       dependencies.push({
         name,
-        version: version === "*" ? "" : version,
+        version: version === "*" || environmentMarker ? "" : version,
         declaredConstraint: declaredConstraint === "*" ? null : declaredConstraint || null,
+        environmentMarker,
         isDevelopmentDependency,
       });
 
@@ -164,6 +168,10 @@ function parsePyprojectManifest(content) {
     }
   }
 
+  if (collectingProjectDependencies) {
+    throw new Error("Malformed pyproject.toml: unterminated project dependencies array");
+  }
+
   return {
     projectName,
     dependencies,
@@ -173,22 +181,88 @@ function parsePyprojectManifest(content) {
 }
 
 function parseRequirementSpec(spec) {
-  const rawSpec = String(spec || "").trim().replace(/^["']|["']$/g, "");
+  const trimmedSpec = String(spec || "").trim();
+  const enclosingQuote = trimmedSpec[0];
+  const rawSpec = (enclosingQuote === "\"" || enclosingQuote === "'")
+    && trimmedSpec.endsWith(enclosingQuote)
+    ? trimmedSpec.slice(1, -1)
+    : trimmedSpec;
   if (!rawSpec) {
     return null;
   }
 
-  const withoutMarker = rawSpec.split(";")[0].trim();
+  const markerSeparator = rawSpec.indexOf(";");
+  const withoutMarker = (markerSeparator >= 0
+    ? rawSpec.slice(0, markerSeparator)
+    : rawSpec).trim();
+  const environmentMarker = markerSeparator >= 0
+    ? rawSpec.slice(markerSeparator + 1).trim() || null
+    : null;
   const match = withoutMarker.match(/^([A-Za-z0-9_.-]+)(?:\[[^\]]+])?\s*(.*)$/);
   if (!match) {
     return null;
   }
 
+  const declaredConstraint = String(match[2] || "").trim() || null;
+  if (!isValidPep508Constraint(declaredConstraint)) {
+    return null;
+  }
+
   return {
     name: match[1],
-    version: normalizeVersion(match[2] || ""),
-    declaredConstraint: String(match[2] || "").trim() || null,
+    version: environmentMarker ? "" : normalizeVersion(declaredConstraint || ""),
+    declaredConstraint,
+    environmentMarker,
   };
+}
+
+function isValidPep508Constraint(constraint) {
+  if (!constraint) {
+    return true;
+  }
+  const value = String(constraint).trim().replace(/^\(|\)$/g, "").trim();
+  if (value.startsWith("@")) {
+    return Boolean(value.slice(1).trim());
+  }
+  return /^(?:===|==|~=|!=|<=|>=|<|>)/.test(value);
+}
+
+function hasCompleteTomlArray(value) {
+  let quote = "";
+  let escaped = false;
+  let depth = 0;
+  let opened = false;
+
+  for (const character of String(value || "")) {
+    if (quote) {
+      if (quote === '"' && character === "\\" && !escaped) {
+        escaped = true;
+        continue;
+      }
+      if (character === quote && !escaped) {
+        quote = "";
+      }
+      escaped = false;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === "[") {
+      opened = true;
+      depth += 1;
+      continue;
+    }
+    if (character === "]" && opened) {
+      depth -= 1;
+      if (depth === 0) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 function parseCargoTomlManifest(content) {
@@ -291,7 +365,7 @@ function parseBuildGradleManifest(content) {
     }
   }
 
-  return dedupeManifestDeps(dependencies);
+  return dedupeManifestDeps(dependencies, { caseSensitiveName: true });
 }
 
 function parseGradleDependencyLine(line) {
@@ -569,11 +643,13 @@ function parseSimpleYamlDependencyList(content, sectionName) {
   return dedupeManifestDeps(dependencies);
 }
 
-function dedupeManifestDeps(dependencies) {
+function dedupeManifestDeps(dependencies, options = {}) {
   const seen = new Set();
   const results = [];
   for (const dependency of dependencies) {
-    const key = `${dependency.name.toLowerCase()}:${dependency.version.toLowerCase()}:${dependency.isDevelopmentDependency}`;
+    const rawName = String(dependency.name || "");
+    const name = options.caseSensitiveName ? rawName : rawName.toLowerCase();
+    const key = `${name}:${String(dependency.version || "")}:${dependency.isDevelopmentDependency}`;
     if (seen.has(key)) {
       continue;
     }
@@ -638,6 +714,7 @@ function matchXmlValue(block, tagName) {
 
 module.exports = {
   normalizeSwiftIdentity,
+  hasCompleteTomlArray,
   parseBuildGradleManifest,
   parseCargoTomlManifest,
   parseChartManifest,

@@ -90,10 +90,10 @@ suite("ComplianceReportProvider", () => {
       scanDate: "2026-04-05T12:30:00Z",
     });
 
-    assert.strictEqual(reportData.summary.total, 4);
+    assert.strictEqual(reportData.summary.total, 5);
     assert.strictEqual(reportData.summary.found, 3);
-    assert.strictEqual(reportData.summary.notFound, 1);
-    assert.strictEqual(reportData.summary.coveragePct, 75);
+    assert.strictEqual(reportData.summary.notFound, 2);
+    assert.strictEqual(reportData.summary.coveragePct, 60);
     assert.strictEqual(reportData.summary.vulnCount, 1);
     assert.strictEqual(reportData.summary.restrictiveLicenseCount, 1);
     assert.strictEqual(reportData.summary.policyViolationCount, 1);

@@ -6,6 +6,7 @@ const {
   createDependency,
   getSourceFileName,
   getWorkspacePath,
+  readBoundedDirectoryEntries,
   readUtf8,
   resolveWorkspaceFilePath,
   stripYamlComment,
@@ -27,7 +28,10 @@ const dockerParser = {
       return [];
     }
     const entries = [];
-    const allFiles = await require("fs").promises.readdir(safeRootPath);
+    const directory = await readBoundedDirectoryEntries(safeRootPath);
+    const allFiles = directory.entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name);
 
     for (const fileName of allFiles.sort()) {
       const isDockerfile = fileName === "Dockerfile" || fileName.startsWith("Dockerfile.");

@@ -2,8 +2,19 @@
 const fs = require("fs");
 const path = require("path");
 
-const LARGE_FILE_THRESHOLD_BYTES = 50 * 1024 * 1024;
+const MAX_DEPENDENCY_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_DIRECTORY_ENTRIES = 50000;
 const WORKSPACE_PATH_ERROR = "Refusing to read files outside the workspace folder.";
+const DEPENDENCY_FILE_ERROR_CODES = Object.freeze({
+  CHANGED: "ERR_DEPENDENCY_FILE_CHANGED",
+  MISSING: "ERR_DEPENDENCY_FILE_MISSING",
+  NOT_REGULAR: "ERR_DEPENDENCY_FILE_NOT_REGULAR",
+  OUTSIDE_WORKSPACE: "ERR_DEPENDENCY_FILE_OUTSIDE_WORKSPACE",
+  SYMLINK_ESCAPE: "ERR_DEPENDENCY_FILE_SYMLINK_ESCAPE",
+  TOO_LARGE: "ERR_DEPENDENCY_FILE_TOO_LARGE",
+  UNREADABLE: "ERR_DEPENDENCY_FILE_UNREADABLE",
+});
+const CASE_SENSITIVE_PACKAGE_NAME_ECOSYSTEMS = new Set(["go", "gradle", "maven"]);
 
 function getWorkspacePath(workspaceFolder) {
   if (!workspaceFolder) {
@@ -69,7 +80,11 @@ function isWithinWorkspace(workspaceRoot, targetPath) {
 
   const relativePath = path.relative(workspaceRoot, targetPath);
   return relativePath === ""
-    || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+    || (
+      relativePath !== ".."
+      && !relativePath.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(relativePath)
+    );
 }
 
 async function resolveWorkspaceFilePath(targetPath, workspaceFolder) {
@@ -96,13 +111,210 @@ async function resolveWorkspaceFilePath(targetPath, workspaceFolder) {
     : null;
 }
 
-async function readUtf8(targetPath, workspaceFolder) {
-  const safePath = await resolveWorkspaceFilePath(targetPath, workspaceFolder);
-  if (!safePath) {
-    throw new Error(WORKSPACE_PATH_ERROR);
+async function resolveWorkspaceReadPath(targetPath, workspaceFolder) {
+  const rawTargetPath = String(targetPath || "").trim();
+  if (!rawTargetPath) {
+    throw createDependencyFileError(
+      DEPENDENCY_FILE_ERROR_CODES.OUTSIDE_WORKSPACE,
+      WORKSPACE_PATH_ERROR
+    );
   }
 
-  return fs.promises.readFile(safePath, "utf8");
+  const resolvedTargetPath = path.resolve(rawTargetPath);
+  const candidateWorkspaceRoot = getCandidateWorkspaceRoot(resolvedTargetPath, workspaceFolder);
+  if (!candidateWorkspaceRoot) {
+    throw createDependencyFileError(
+      DEPENDENCY_FILE_ERROR_CODES.OUTSIDE_WORKSPACE,
+      WORKSPACE_PATH_ERROR
+    );
+  }
+
+  const workspaceRoot = await resolveWorkspaceRoot(resolvedTargetPath, workspaceFolder);
+  const isLexicallyContained = isWithinWorkspace(
+    path.resolve(candidateWorkspaceRoot),
+    resolvedTargetPath
+  );
+  const isCanonicalPathContained = isWithinWorkspace(workspaceRoot, resolvedTargetPath);
+  let realTargetPath;
+  try {
+    realTargetPath = await fs.promises.realpath(resolvedTargetPath);
+  } catch (error) {
+    if (!isLexicallyContained && !isCanonicalPathContained) {
+      throw createDependencyFileError(
+        DEPENDENCY_FILE_ERROR_CODES.OUTSIDE_WORKSPACE,
+        WORKSPACE_PATH_ERROR,
+        error
+      );
+    }
+    throw createReadFileSystemError(error);
+  }
+
+  if (!isWithinWorkspace(workspaceRoot, realTargetPath)) {
+    if (!isLexicallyContained && !isCanonicalPathContained) {
+      throw createDependencyFileError(
+        DEPENDENCY_FILE_ERROR_CODES.OUTSIDE_WORKSPACE,
+        WORKSPACE_PATH_ERROR
+      );
+    }
+    throw createDependencyFileError(
+      DEPENDENCY_FILE_ERROR_CODES.SYMLINK_ESCAPE,
+      "Dependency file symlink targets must stay within the workspace folder."
+    );
+  }
+
+  return { safePath: realTargetPath, workspaceRoot };
+}
+
+async function readUtf8(targetPath, workspaceFolder) {
+  const { safePath, workspaceRoot } = await resolveWorkspaceReadPath(targetPath, workspaceFolder);
+  const noFollowFlag = Number.isInteger(fs.constants.O_NOFOLLOW)
+    ? fs.constants.O_NOFOLLOW
+    : 0;
+  let fileHandle;
+  try {
+    fileHandle = await fs.promises.open(safePath, fs.constants.O_RDONLY | noFollowFlag);
+  } catch (error) {
+    if (error && error.code === "ELOOP") {
+      throw createDependencyFileError(
+        DEPENDENCY_FILE_ERROR_CODES.CHANGED,
+        "Dependency file changed while it was being opened.",
+        error
+      );
+    }
+    throw createReadFileSystemError(error);
+  }
+
+  let readError = null;
+  try {
+    const stats = await validateOpenedWorkspaceFile(
+      fileHandle,
+      safePath,
+      workspaceRoot
+    );
+    if (!stats.isFile()) {
+      throw createDependencyFileError(
+        DEPENDENCY_FILE_ERROR_CODES.NOT_REGULAR,
+        "Dependency paths must refer to regular files."
+      );
+    }
+    if (stats.size > MAX_DEPENDENCY_FILE_BYTES) {
+      throw createDependencyFileError(
+        DEPENDENCY_FILE_ERROR_CODES.TOO_LARGE,
+        `Dependency file exceeds the ${MAX_DEPENDENCY_FILE_BYTES} byte parsing limit.`
+      );
+    }
+
+    return await readFileHandleUtf8(fileHandle);
+  } catch (error) {
+    readError = error;
+    if (isDependencyFileError(error)) {
+      throw error;
+    }
+    throw createReadFileSystemError(error);
+  } finally {
+    try {
+      await fileHandle.close();
+    } catch (error) {
+      if (!readError) {
+        throw createReadFileSystemError(error);
+      }
+    }
+  }
+}
+
+async function validateOpenedWorkspaceFile(fileHandle, safePath, workspaceRoot) {
+  const openedStats = await fileHandle.stat({ bigint: true });
+  let currentRealPath;
+  let currentPathStats;
+  try {
+    currentRealPath = await fs.promises.realpath(safePath);
+    if (!isWithinWorkspace(workspaceRoot, currentRealPath)) {
+      throw createDependencyFileChangedError();
+    }
+    currentPathStats = await fs.promises.lstat(currentRealPath, { bigint: true });
+  } catch (error) {
+    if (isDependencyFileError(error)) {
+      throw error;
+    }
+    throw createDependencyFileChangedError(error);
+  }
+
+  if (currentPathStats.isSymbolicLink() || !isSameFileIdentity(openedStats, currentPathStats)) {
+    throw createDependencyFileChangedError();
+  }
+
+  return openedStats;
+}
+
+function isSameFileIdentity(left, right) {
+  return left && right
+    && left.dev === right.dev
+    && left.ino === right.ino;
+}
+
+function createDependencyFileChangedError(cause) {
+  return createDependencyFileError(
+    DEPENDENCY_FILE_ERROR_CODES.CHANGED,
+    "Dependency file changed while it was being opened.",
+    cause
+  );
+}
+
+async function readFileHandleUtf8(fileHandle) {
+  const chunks = [];
+  let totalBytes = 0;
+
+  while (totalBytes <= MAX_DEPENDENCY_FILE_BYTES) {
+    const bytesRemaining = (MAX_DEPENDENCY_FILE_BYTES + 1) - totalBytes;
+    const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, bytesRemaining));
+    const { bytesRead } = await fileHandle.read(buffer, 0, buffer.length, null);
+    if (bytesRead === 0) {
+      return Buffer.concat(chunks, totalBytes).toString("utf8");
+    }
+
+    totalBytes += bytesRead;
+    if (totalBytes > MAX_DEPENDENCY_FILE_BYTES) {
+      throw createDependencyFileError(
+        DEPENDENCY_FILE_ERROR_CODES.TOO_LARGE,
+        `Dependency file exceeds the ${MAX_DEPENDENCY_FILE_BYTES} byte parsing limit.`
+      );
+    }
+    chunks.push(buffer.subarray(0, bytesRead));
+  }
+
+  throw createDependencyFileError(
+    DEPENDENCY_FILE_ERROR_CODES.TOO_LARGE,
+    `Dependency file exceeds the ${MAX_DEPENDENCY_FILE_BYTES} byte parsing limit.`
+  );
+}
+
+function createReadFileSystemError(error) {
+  if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
+    return createDependencyFileError(
+      DEPENDENCY_FILE_ERROR_CODES.MISSING,
+      "Dependency file does not exist.",
+      error
+    );
+  }
+
+  return createDependencyFileError(
+    DEPENDENCY_FILE_ERROR_CODES.UNREADABLE,
+    "Dependency file could not be read.",
+    error
+  );
+}
+
+function createDependencyFileError(code, message, cause) {
+  const error = new Error(message);
+  error.code = code;
+  if (cause) {
+    error.cause = cause;
+  }
+  return error;
+}
+
+function isDependencyFileError(error) {
+  return Boolean(error && Object.values(DEPENDENCY_FILE_ERROR_CODES).includes(error.code));
 }
 
 async function readJson(targetPath, workspaceFolder) {
@@ -120,6 +332,26 @@ async function statSafe(targetPath, workspaceFolder) {
   } catch {
     return null;
   }
+}
+
+async function readBoundedDirectoryEntries(directoryPath, maxEntries = MAX_DIRECTORY_ENTRIES) {
+  const requestedLimit = Number.isInteger(maxEntries) && maxEntries > 0
+    ? maxEntries
+    : MAX_DIRECTORY_ENTRIES;
+  const limit = Math.min(requestedLimit, MAX_DIRECTORY_ENTRIES);
+  const directory = await fs.promises.opendir(directoryPath);
+  const entries = [];
+  let truncated = false;
+
+  for await (const entry of directory) {
+    if (entries.length >= limit) {
+      truncated = true;
+      break;
+    }
+    entries.push(entry);
+  }
+
+  return { entries, truncated };
 }
 
 function getSourceFileName(targetPath) {
@@ -178,10 +410,14 @@ function flattenDependencies(dependencies) {
 }
 
 function dependencyKey(dependency) {
+  const ecosystem = String(dependency.ecosystem || "").trim().toLowerCase();
+  const packageName = String(dependency.name || "").trim();
   return [
-    String(dependency.ecosystem || "").trim().toLowerCase(),
-    String(dependency.name || "").trim().toLowerCase(),
-    String(dependency.version || "").trim().toLowerCase(),
+    ecosystem,
+    CASE_SENSITIVE_PACKAGE_NAME_ECOSYSTEMS.has(ecosystem)
+      ? packageName
+      : packageName.toLowerCase(),
+    String(dependency.version || "").trim(),
   ].join(":");
 }
 
@@ -387,7 +623,10 @@ function parseKeyValueLine(line) {
 }
 
 module.exports = {
-  LARGE_FILE_THRESHOLD_BYTES,
+  DEPENDENCY_FILE_ERROR_CODES,
+  LARGE_FILE_THRESHOLD_BYTES: MAX_DEPENDENCY_FILE_BYTES,
+  MAX_DEPENDENCY_FILE_BYTES,
+  MAX_DIRECTORY_ENTRIES,
   buildTree,
   countIndent,
   createDependency,
@@ -401,6 +640,7 @@ module.exports = {
   normalizeVersion,
   parseInlineTomlValue,
   readJson,
+  readBoundedDirectoryEntries,
   parseKeyValueLine,
   parseQuotedArray,
   pathExists,

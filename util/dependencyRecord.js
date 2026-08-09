@@ -40,11 +40,13 @@ const CANONICAL_DEPENDENCY_RECORDS = new WeakSet();
  *   format: string,
  *   name: string,
  *   normalizedName: string,
+ *   declarationName: string,
  *   declaredConstraint: string|null,
  *   resolvedVersion: string|null,
  *   versionState: "resolved"|"exact-declaration"|"range"|"unresolved"|"incomplete",
  *   resolutionSource: DependencySource|null,
  *   sourceManifest: DependencySource|null,
+ *   environmentMarker: string|null,
  *   isDirect: boolean,
  *   isDevelopmentDependency: boolean,
  *   parent: string|null,
@@ -144,11 +146,13 @@ function createDependencyRecordInternal(values, ancestors) {
       format,
       name,
       normalizedName: normalizePackageName(name, format),
+      declarationName: optionalString(values && (values.declarationName || values.declaredName)) || name,
       declaredConstraint,
       resolvedVersion,
       versionState,
       resolutionSource: copyDependencySource(values && values.resolutionSource),
       sourceManifest,
+      environmentMarker: optionalString(values && values.environmentMarker),
       isDirect: Boolean(values && values.isDirect),
       isDevelopmentDependency: Boolean(values && values.isDevelopmentDependency),
       parent: optionalString(values && values.parent),
@@ -173,14 +177,22 @@ function createDependencyRecordInternal(values, ancestors) {
  * @returns {string}
  */
 function getDependencyOccurrenceKey(dependency) {
+  const format = canonicalFormat(dependency && (dependency.format || dependency.ecosystem));
+  const caseSensitive = format === "maven" || format === "go";
+  const normalizeIdentityPart = (value) => {
+    const normalized = String(value || "");
+    return caseSensitive ? normalized : normalized.toLowerCase();
+  };
   return JSON.stringify([
     String(dependency && dependency.ecosystem || "").toLowerCase(),
-    String(dependency && dependency.normalizedName || "").toLowerCase(),
+    normalizeIdentityPart(dependency && dependency.normalizedName),
+    normalizeIdentityPart(dependency && dependency.declarationName),
     String(dependency && dependency.resolvedVersion || ""),
     String(dependency && dependency.declaredConstraint || ""),
     String(dependency && dependency.legacyVersion || ""),
     sourceIdentity(dependency && dependency.sourceManifest),
     sourceIdentity(dependency && dependency.resolutionSource),
+    String(dependency && dependency.environmentMarker || ""),
     dependency && dependency.isDirect ? "direct" : "transitive",
     dependency && dependency.isDevelopmentDependency ? "development" : "runtime",
     String(dependency && dependency.parent || ""),

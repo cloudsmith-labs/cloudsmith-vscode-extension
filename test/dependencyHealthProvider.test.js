@@ -1,18 +1,26 @@
 const assert = require("assert");
+const path = require("path");
 const vscode = require("vscode");
 const {
+  CLOUDSMITH_COVERAGE_STATUS,
   DependencyHealthProvider,
   SCAN_STATES,
+  buildComplianceReportData,
+  getConcreteDependencyVersion,
+  lookupExactDependency,
   matchCoverageCandidates,
 } = require("../views/dependencyHealthProvider");
-const { ADAPTER_RESULT_STATUSES } = require("../util/dependencyAdapterRegistry");
+const {
+  ADAPTER_RESULT_STATUSES,
+  createDefaultDependencyAdapterRegistry,
+} = require("../util/dependencyAdapterRegistry");
+const DependencyHealthNode = require("../models/dependencyHealthNode");
 const {
   DEPENDENCY_VERSION_STATES,
   RESOLUTION_SOURCE_KINDS,
   createDependencyRecord,
   createDependencySource,
 } = require("../util/dependencyRecord");
-const { normalizePackageName } = require("../util/packageNameNormalizer");
 
 suite("DependencyHealthProvider Test Suite", () => {
   let originalWithProgress;
@@ -44,6 +52,10 @@ suite("DependencyHealthProvider Test Suite", () => {
     return {
       name,
       version,
+      legacyVersion: version,
+      declaredConstraint: version,
+      resolvedVersion: null,
+      versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
       format,
       ecosystem: format,
       isDirect: true,
@@ -149,26 +161,65 @@ suite("DependencyHealthProvider Test Suite", () => {
     };
   }
 
-  function buildCoverageIndex(dependencies) {
-    const index = new Map();
+  function createLookupApi(handler) {
+    return {
+      calls: [],
+      async getWithHeaders(endpoint) {
+        this.calls.push(endpoint);
+        return handler(endpoint, this.calls.length);
+      },
+    };
+  }
 
-    for (const dependency of dependencies) {
-      const nameKey = normalizePackageName(dependency.name, dependency.format);
-      const versionKey = dependency.version.toLowerCase();
-      if (!index.has(nameKey)) {
-        index.set(nameKey, new Map());
-      }
-      index.get(nameKey).set(versionKey, [{
-        name: dependency.name,
-        version: dependency.version,
-      }]);
-    }
+  function lookupPage(data, page = 1, pageTotal = 1, count = data.length, pageSize = 100) {
+    return {
+      data,
+      headers: {
+        page: String(page),
+        pageTotal: String(pageTotal),
+        count: String(count),
+        pageSize: String(pageSize),
+      },
+    };
+  }
 
-    return index;
+  async function runFixtureThroughLookupAndNode(ecosystem, fixtureName, dependencyName, candidate) {
+    const workspace = path.join(__dirname, "fixtures", fixtureName);
+    const registry = createDefaultDependencyAdapterRegistry();
+    const detections = await registry.detect(workspace);
+    const detection = detections.find((entry) => entry.ecosystem === ecosystem);
+    assert.ok(detection, `expected a ${ecosystem} adapter detection`);
+    const adapterResult = await registry.parse(detection, {
+      workspaceFolder: workspace,
+      maxDependenciesToScan: 10000,
+    });
+    assert.ok([
+      ADAPTER_RESULT_STATUSES.SUCCESS,
+      ADAPTER_RESULT_STATUSES.PARTIAL,
+    ].includes(adapterResult.status));
+    const dependency = adapterResult.dependencies.find((entry) => entry.name === dependencyName);
+    assert.ok(dependency, `expected ${dependencyName} in the canonical adapter result`);
+
+    const lookup = await lookupExactDependency({
+      api: createLookupApi(() => lookupPage([candidate])),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repository",
+      dependency,
+    });
+    assert.strictEqual(lookup.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
+
+    const node = new DependencyHealthNode({
+      ...dependency,
+      cloudsmithStatus: lookup.status,
+      cloudsmithPackage: lookup.package,
+      cloudsmithLookupDetail: lookup.detail,
+    }, {});
+    assert.strictEqual(node.state, "available");
+    assert.strictEqual(node.version.value, candidate.version);
+    return { adapterResult, dependency, lookup, node };
   }
 
   setup(() => {
-    DependencyHealthProvider.packageIndexCache.clear();
     originalWithProgress = vscode.window.withProgress;
     originalShowInformationMessage = vscode.window.showInformationMessage;
     originalShowWarningMessage = vscode.window.showWarningMessage;
@@ -561,6 +612,332 @@ suite("DependencyHealthProvider Test Suite", () => {
     }
   });
 
+  test("_performScan does not treat an all-parser failure as a valid empty project", async () => {
+    const originalGetConfiguration = vscode.workspace.getConfiguration;
+    vscode.workspace.getConfiguration = () => ({
+      get(key) {
+        return key === "resolveTransitiveDependencies" ? false : 10000;
+      },
+    });
+    const dependencyAdapters = {
+      async detectManifests() {
+        return [{
+          adapterId: "npmParser",
+          filePath: "/project/package.json",
+          format: "npm",
+          manifestType: "package.json",
+        }];
+      },
+      getDiscoveryWarnings() {
+        return [];
+      },
+      async parseManifest() {
+        return {
+          status: ADAPTER_RESULT_STATUSES.ERROR,
+          adapterId: "npmParser",
+          ecosystem: "npm",
+          sourceFile: "package.json",
+          dependencies: [],
+          warnings: [],
+          error: { code: "parse-error", message: "Malformed package.json." },
+        };
+      },
+    };
+
+    try {
+      const provider = new DependencyHealthProvider(createContext(), null, { dependencyAdapters });
+      await assert.rejects(
+        () => provider._performScan(
+          "workspace-a",
+          "repo-a",
+          "/project",
+          { report() {} },
+          { isCancellationRequested: false }
+        ),
+        /parsing did not complete.*Malformed package\.json/
+      );
+      assert.deepStrictEqual(provider._fullTrees, []);
+      assert.deepStrictEqual(provider._displayTrees, []);
+    } finally {
+      vscode.workspace.getConfiguration = originalGetConfiguration;
+    }
+  });
+
+  test("_performScan treats an empty requirements.txt as a valid empty project", async () => {
+    const originalGetConfiguration = vscode.workspace.getConfiguration;
+    vscode.workspace.getConfiguration = () => ({
+      get(key) {
+        return key === "resolveTransitiveDependencies" ? false : 10000;
+      },
+    });
+    const dependencyAdapters = {
+      async detectManifests() {
+        return [{
+          adapterId: "pythonParser",
+          filePath: "/project/requirements.txt",
+          format: "python",
+          manifestType: "requirements.txt",
+        }];
+      },
+      getDiscoveryWarnings() {
+        return [];
+      },
+      async parseManifest() {
+        return {
+          status: ADAPTER_RESULT_STATUSES.PARTIAL,
+          adapterId: "pythonParser",
+          ecosystem: "python",
+          sourceFile: "requirements.txt",
+          dependencies: [],
+          warnings: [
+            "requirements.txt does not encode transitive dependencies. Showing direct requirements only.",
+          ],
+          error: null,
+        };
+      },
+    };
+
+    try {
+      const provider = new DependencyHealthProvider(createContext(), null, { dependencyAdapters });
+      provider._storeReportData = async () => {};
+
+      const result = await provider._performScan(
+        "workspace-a",
+        "repo-a",
+        "/project",
+        { report() {} },
+        { isCancellationRequested: false }
+      );
+
+      assert.deepStrictEqual(result, { canceled: false });
+      assert.deepStrictEqual(provider._fullTrees, []);
+      assert.deepStrictEqual(provider._displayTrees, []);
+    } finally {
+      vscode.workspace.getConfiguration = originalGetConfiguration;
+    }
+  });
+
+  test("_performScan composes lock-backed and uncovered manifest-only projects", async () => {
+    const originalGetConfiguration = vscode.workspace.getConfiguration;
+    vscode.workspace.getConfiguration = () => ({ get: () => 10000 });
+    const rootSource = createDependencySource({
+      kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
+      filePath: "/project/package.json",
+      type: "package.json",
+    });
+    const nestedSource = createDependencySource({
+      kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
+      filePath: "/project/packages/tool/requirements.txt",
+      type: "requirements.txt",
+    });
+    const rootDependency = createDependencyRecord({
+      ecosystem: "npm",
+      format: "npm",
+      name: "root-package",
+      declaredConstraint: "^1.0.0",
+      resolvedVersion: "1.4.0",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      resolutionSource: createDependencySource({
+        kind: RESOLUTION_SOURCE_KINDS.LOCKFILE,
+        filePath: "/project/package-lock.json",
+        type: "package-lock.json",
+      }),
+      sourceManifest: rootSource,
+      isDirect: true,
+      legacyVersion: "1.4.0",
+    });
+    const nestedDependency = createDependencyRecord({
+      ecosystem: "python",
+      format: "python",
+      name: "nested-package",
+      declaredConstraint: ">=2",
+      resolvedVersion: null,
+      versionState: DEPENDENCY_VERSION_STATES.RANGE,
+      sourceManifest: nestedSource,
+      isDirect: true,
+      legacyVersion: "2",
+    });
+    const parsedManifestPaths = [];
+    const dependencyAdapters = {
+      async detectManifests() {
+        return [
+          { filePath: rootSource.filePath, format: "npm", manifestType: "package.json" },
+          { filePath: nestedSource.filePath, format: "python", manifestType: "requirements.txt" },
+        ];
+      },
+      getDiscoveryWarnings() { return []; },
+      async detect() {
+        return [{ adapterId: "npmParser", sourceFile: "package-lock.json" }];
+      },
+      async parse() {
+        return {
+          status: ADAPTER_RESULT_STATUSES.SUCCESS,
+          adapterId: "npmParser",
+          ecosystem: "npm",
+          sourceFile: "package-lock.json",
+          source: { manifest: rootSource },
+          dependencies: [rootDependency],
+          warnings: [],
+        };
+      },
+      async parseManifest(manifest) {
+        parsedManifestPaths.push(manifest.filePath);
+        return {
+          status: ADAPTER_RESULT_STATUSES.SUCCESS,
+          adapterId: "pythonParser",
+          ecosystem: "python",
+          sourceFile: "requirements.txt",
+          source: { manifest: nestedSource },
+          dependencies: [nestedDependency],
+          warnings: [],
+        };
+      },
+    };
+
+    try {
+      const provider = new DependencyHealthProvider(createContext(), null, { dependencyAdapters });
+      provider._runCoverageChecks = async () => {};
+      provider._runEnrichmentPasses = async () => {};
+      provider._publishDiagnostics = async () => {};
+      provider._storeReportData = async () => {};
+      provider.refresh = () => {};
+
+      await provider._performScan(
+        "workspace-a",
+        "repo-a",
+        "/project",
+        { report() {} },
+        { isCancellationRequested: false }
+      );
+
+      assert.deepStrictEqual(parsedManifestPaths, [nestedSource.filePath]);
+      assert.deepStrictEqual(
+        provider._fullTrees.flatMap((tree) => tree.dependencies).map((dependency) => dependency.name).sort(),
+        ["nested-package", "root-package"]
+      );
+    } finally {
+      vscode.workspace.getConfiguration = originalGetConfiguration;
+    }
+  });
+
+  test("_performScan retains an uncovered manifest failure beside successful results", async () => {
+    const originalGetConfiguration = vscode.workspace.getConfiguration;
+    vscode.workspace.getConfiguration = () => ({ get: () => 10000 });
+    const sourceManifest = createDependencySource({
+      kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
+      filePath: "/project/package.json",
+      type: "package.json",
+    });
+    const dependencyAdapters = {
+      async detectManifests() {
+        return [
+          { filePath: sourceManifest.filePath, format: "npm" },
+          { filePath: "/project/nested/pyproject.toml", format: "python" },
+        ];
+      },
+      getDiscoveryWarnings() { return []; },
+      async detect() { return [{ adapterId: "npmParser" }]; },
+      async parse() {
+        return {
+          status: ADAPTER_RESULT_STATUSES.SUCCESS,
+          adapterId: "npmParser",
+          ecosystem: "npm",
+          sourceFile: "package-lock.json",
+          source: { manifest: sourceManifest },
+          dependencies: [createDependencyRecord({
+            ecosystem: "npm",
+            format: "npm",
+            name: "root-package",
+            resolvedVersion: "1.0.0",
+            versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+            resolutionSource: createDependencySource({
+              kind: RESOLUTION_SOURCE_KINDS.LOCKFILE,
+              filePath: "/project/package-lock.json",
+              type: "package-lock.json",
+            }),
+            sourceManifest,
+            isDirect: true,
+            legacyVersion: "1.0.0",
+          })],
+          warnings: [],
+        };
+      },
+      async parseManifest() {
+        return {
+          status: ADAPTER_RESULT_STATUSES.ERROR,
+          adapterId: "pythonParser",
+          ecosystem: "python",
+          sourceFile: "pyproject.toml",
+          dependencies: [],
+          warnings: [],
+          error: { message: "Malformed nested pyproject.toml." },
+        };
+      },
+    };
+
+    try {
+      const provider = new DependencyHealthProvider(createContext(), null, { dependencyAdapters });
+      provider._runCoverageChecks = async () => {};
+      provider._runEnrichmentPasses = async () => {};
+      provider._publishDiagnostics = async () => {};
+      provider._storeReportData = async () => {};
+      provider.refresh = () => {};
+
+      await provider._performScan(
+        "workspace-a",
+        "repo-a",
+        "/project",
+        { report() {} },
+        { isCancellationRequested: false }
+      );
+
+      assert.strictEqual(provider._fullTrees[0].dependencies[0].name, "root-package");
+      assert.ok(provider._warnings.includes("Malformed nested pyproject.toml."));
+    } finally {
+      vscode.workspace.getConfiguration = originalGetConfiguration;
+    }
+  });
+
+  test("_performScan does not treat an unsupported-only manifest as empty", async () => {
+    const originalGetConfiguration = vscode.workspace.getConfiguration;
+    vscode.workspace.getConfiguration = () => ({
+      get(key) { return key === "resolveTransitiveDependencies" ? false : 10000; },
+    });
+    const dependencyAdapters = {
+      async detectManifests() {
+        return [{ filePath: "/project/build.gradle", format: "gradle" }];
+      },
+      getDiscoveryWarnings() { return []; },
+      async parseManifest() {
+        return {
+          status: ADAPTER_RESULT_STATUSES.UNSUPPORTED,
+          adapterId: "gradleParser",
+          ecosystem: "gradle",
+          sourceFile: "build.gradle",
+          dependencies: [],
+          warnings: [],
+          error: { message: "No direct manifest parser supports build.gradle." },
+        };
+      },
+    };
+
+    try {
+      const provider = new DependencyHealthProvider(createContext(), null, { dependencyAdapters });
+      await assert.rejects(
+        () => provider._performScan(
+          "workspace-a",
+          "repo-a",
+          "/project",
+          { report() {} },
+          { isCancellationRequested: false }
+        ),
+        /parsing did not complete.*No direct manifest parser supports build\.gradle/
+      );
+    } finally {
+      vscode.workspace.getConfiguration = originalGetConfiguration;
+    }
+  });
+
   test("_runCoverageChecks batches tree rebuilds and refreshes while preserving matches", async () => {
     const provider = new DependencyHealthProvider(createContext());
     const dependencies = Array.from({ length: 51 }, (_, index) => createDependency(`package-${index}`, "1.0.0"));
@@ -583,10 +960,19 @@ suite("DependencyHealthProvider Test Suite", () => {
     provider.refresh = () => {
       refreshCount += 1;
     };
-    provider._fetchPackageIndex = async () => ({
-      error: null,
-      tooLarge: false,
-      index: buildCoverageIndex(dependencies),
+    provider._services.createCloudsmithAPI = () => createLookupApi((endpoint) => {
+      const query = new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("query");
+      const normalizedQuery = query.replace(/\\/g, "");
+      const queriedName = normalizedQuery
+        .split(" AND ")
+        .find((term) => term.startsWith("name:"))
+        .slice("name:".length);
+      const dependency = dependencies.find((candidate) => candidate.name === queriedName);
+      return lookupPage([{
+        name: dependency.name,
+        version: dependency.version,
+        format: dependency.format,
+      }]);
     });
 
     await provider._runCoverageChecks(
@@ -616,49 +1002,76 @@ suite("DependencyHealthProvider Test Suite", () => {
     );
   });
 
-  test("_runCoverageChecks fetches package indices for multiple formats in parallel", async () => {
+  test("_runCoverageChecks bounds exact lookup concurrency", async () => {
     const provider = new DependencyHealthProvider(createContext());
-    const npmDependency = createDependency("left-pad", "1.0.0", "npm");
-    const pythonDependency = createDependency("requests", "2.31.0", "python");
-
-    provider._fullTrees = [
-      {
-        ecosystem: "npm",
-        sourceFile: "package-lock.json",
-        dependencies: [npmDependency],
-      },
-      {
-        ecosystem: "python",
-        sourceFile: "requirements.txt",
-        dependencies: [pythonDependency],
-      },
-    ];
+    const dependencies = Array.from({ length: 20 }, (_, index) => (
+      createDependency(`package-${index}`, "1.0.0", "npm")
+    ));
+    provider._fullTrees = [{
+      ecosystem: "npm",
+      sourceFile: "package-lock.json",
+      dependencies,
+    }];
     provider._displayTrees = cloneTrees(provider._fullTrees);
 
-    const resolvers = new Map();
     let inFlight = 0;
     let maxInFlight = 0;
-
     provider._rebuildSummary = () => {};
     provider.refresh = () => {};
-    provider._fetchPackageIndex = async (_workspace, _repo, format) => {
+    provider._services.createCloudsmithAPI = () => createLookupApi(async (endpoint) => {
       inFlight += 1;
       maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setImmediate(resolve));
+      inFlight -= 1;
+      const query = new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("query");
+      const normalizedQuery = query.replace(/\\/g, "");
+      const dependency = dependencies.find((candidate) =>
+        normalizedQuery.includes(`name:${candidate.name}`)
+      );
+      return lookupPage([{ name: dependency.name, version: dependency.version, format: "npm" }]);
+    });
 
-      return new Promise((resolve) => {
-        resolvers.set(format, () => {
-          inFlight -= 1;
-          const dependency = format === "npm" ? npmDependency : pythonDependency;
-          resolve({
-            error: null,
-            tooLarge: false,
-            index: buildCoverageIndex([dependency]),
-          });
-        });
-      });
-    };
+    await provider._runCoverageChecks(
+      "workspace",
+      "repo",
+      dependencies.length,
+      { report() {} },
+      { isCancellationRequested: false }
+    );
 
-    const runPromise = provider._runCoverageChecks(
+    assert.strictEqual(maxInFlight, 8);
+  });
+
+  test("scan-wide lookup budget counts pages across formats and marks remaining work incomplete", async () => {
+    const npmDependency = createDependency("first-package", "1.0.0", "npm");
+    const pythonDependency = createDependency("second-package", "2.0.0", "python");
+    const api = createLookupApi((endpoint) => {
+      const url = new URL(endpoint, "https://api.cloudsmith.io/v1/");
+      const query = url.searchParams.get("query").replace(/\\/g, "");
+      const page = Number(url.searchParams.get("page"));
+      if (!query.includes("name:first-package")) {
+        throw new Error("the exhausted scan-wide budget must prevent later format requests");
+      }
+      return page === 1
+        ? lookupPage([{ name: "other", version: "1.0.0", format: "npm" }], 1, 2, 2, 1)
+        : lookupPage([{
+          name: npmDependency.name,
+          version: npmDependency.version,
+          format: npmDependency.format,
+        }], 2, 2, 2, 1);
+    });
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCloudsmithAPI: () => api,
+      lookupRequestLimit: 2,
+    });
+    provider._fullTrees = [
+      { ecosystem: "npm", sourceFile: "package-lock.json", dependencies: [npmDependency] },
+      { ecosystem: "python", sourceFile: "requirements.txt", dependencies: [pythonDependency] },
+    ];
+    provider._displayTrees = cloneTrees(provider._fullTrees);
+    provider.refresh = () => {};
+
+    await provider._runCoverageChecks(
       "workspace",
       "repo",
       2,
@@ -666,65 +1079,519 @@ suite("DependencyHealthProvider Test Suite", () => {
       { isCancellationRequested: false }
     );
 
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.strictEqual(maxInFlight, 2);
-
-    resolvers.get("npm")();
-    resolvers.get("python")();
-    await runPromise;
+    assert.strictEqual(api.calls.length, 2);
+    assert.strictEqual(
+      provider._fullTrees[0].dependencies[0].cloudsmithStatus,
+      CLOUDSMITH_COVERAGE_STATUS.FOUND
+    );
+    assert.strictEqual(
+      provider._fullTrees[1].dependencies[0].cloudsmithStatus,
+      CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
+    );
+    assert.match(
+      provider._fullTrees[1].dependencies[0].cloudsmithLookupDetail,
+      /request budget was exhausted/
+    );
   });
 
-  test("_fetchPackageIndex fetches remaining pages concurrently after page one", async () => {
-    const provider = new DependencyHealthProvider(createContext());
-    const requestedPages = [];
-    const pageResolvers = new Map();
+  test("exact lookup finds a package on the first page with escaped name and version terms", async () => {
+    const expectedPackage = { name: "@scope/pkg", version: "1.0.0", format: "npm" };
+    const api = createLookupApi(() => lookupPage([expectedPackage]));
 
-    provider._fetchSinglePage = async (_workspace, _repo, _format, page) => {
-      requestedPages.push(page);
-      if (page === 1) {
-        return {
-          error: null,
-          pagination: {
-            count: 3,
-            pageTotal: 3,
-          },
-          data: [{
-            name: "page-one",
-            version: "1.0.0",
-          }],
-        };
-      }
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("@scope/pkg", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
 
-      return new Promise((resolve) => {
-        pageResolvers.set(page, resolve);
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
+    assert.strictEqual(result.package, expectedPackage);
+    assert.strictEqual(result.pagesFetched, 1);
+    const query = new URL(api.calls[0], "https://api.cloudsmith.io/v1/").searchParams.get("query");
+    assert.ok(query.includes("name:@scope\\/pkg"));
+    assert.ok(query.includes("version:1.0.0"));
+  });
+
+  test("exact lookup follows pagination until a later-page match is found", async () => {
+    const expectedPackage = { name: "left-pad", version: "1.0.0", format: "npm" };
+    const api = createLookupApi((endpoint) => {
+      const page = Number(new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("page"));
+      return page === 1
+        ? lookupPage([{ name: "left-pad", version: "9.0.0", format: "npm" }], 1, 2, 2, 1)
+        : lookupPage([expectedPackage], 2, 2, 2, 1);
+    });
+
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: null,
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
+    assert.strictEqual(result.package, expectedPackage);
+    assert.strictEqual(result.pagesFetched, 2);
+    assert.deepStrictEqual(
+      api.calls.map((endpoint) => Number(new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("page"))),
+      [1, 2]
+    );
+  });
+
+  test("exact lookup reports absence only after pagination is conclusively exhausted", async () => {
+    const api = createLookupApi((endpoint) => {
+      const page = Number(new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("page"));
+      return page === 1
+        ? lookupPage([{ name: "other-package", version: "1.0.0", format: "npm" }], 1, 2, 2, 1)
+        : lookupPage([{ name: "another-package", version: "2.0.0", format: "npm" }], 2, 2, 2, 1);
+    });
+
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.ABSENT);
+    assert.strictEqual(result.package, null);
+    assert.strictEqual(result.pagesFetched, 2);
+  });
+
+  test("lookup failure and partial failure remain distinct from package absence", async () => {
+    const failed = await lookupExactDependency({
+      api: createLookupApi(() => "Response status: 503 - Service Unavailable"),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+    const partialApi = createLookupApi((_endpoint, callCount) => (
+      callCount === 1
+        ? lookupPage([{ name: "other", version: "1.0.0" }], 1, 2, 2, 1)
+        : "Response status: 503 - Service Unavailable"
+    ));
+    const incomplete = await lookupExactDependency({
+      api: partialApi,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(failed.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED);
+    assert.strictEqual(incomplete.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+  });
+
+  test("rejected lookup requests remain explicit failures", async () => {
+    const result = await lookupExactDependency({
+      api: createLookupApi(() => Promise.reject(new Error("network unavailable"))),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED);
+  });
+
+  test("inconsistent pagination metadata cannot prove package absence", async () => {
+    const result = await lookupExactDependency({
+      api: createLookupApi(() => ({
+        data: [{ name: "other", version: "1.0.0", format: "npm" }],
+        headers: { page: "1", count: "0", pageSize: "100" },
+      })),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+  });
+
+  test("contradictory page totals and counts cannot prove package absence", async () => {
+    const result = await lookupExactDependency({
+      api: createLookupApi(() => ({
+        data: [{ name: "other", version: "1.0.0", format: "npm" }],
+        headers: {
+          page: "1",
+          pageTotal: "1",
+          count: "200",
+          pageSize: "100",
+        },
+      })),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+  });
+
+  test("a response omitting count-backed page items cannot prove package absence", async () => {
+    const result = await lookupExactDependency({
+      api: createLookupApi(() => ({
+        data: [],
+        headers: {
+          page: "1",
+          pageTotal: "1",
+          count: "50",
+          pageSize: "100",
+        },
+      })),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+  });
+
+  test("full pages without continuation metadata produce an incomplete lookup", async () => {
+    const fullPage = Array.from({ length: 100 }, (_, index) => ({
+      name: `other-${index}`,
+      version: "1.0.0",
+      format: "npm",
+    }));
+    const result = await lookupExactDependency({
+      api: createLookupApi(() => ({ data: fullPage, headers: {} })),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+  });
+
+  test("short and empty pages without continuation metadata remain incomplete", async () => {
+    for (const data of [
+      [],
+      [{ name: "other", version: "1.0.0", format: "npm" }],
+    ]) {
+      const result = await lookupExactDependency({
+        api: createLookupApi(() => ({ data, headers: {} })),
+        cloudsmithWorkspace: "workspace",
+        cloudsmithRepo: "repo",
+        dependency: createDependency("left-pad", "1.0.0"),
+        token: { isCancellationRequested: false },
       });
+
+      assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+    }
+  });
+
+  test("rate limiting is explicit and is not converted to absence", async () => {
+    const result = await lookupExactDependency({
+      api: createLookupApi(() => "Response status: 429 - Too Many Requests"),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED);
+  });
+
+  test("range-only dependencies remain unresolved without issuing an API request", async () => {
+    const dependency = createDependencyRecord({
+      ecosystem: "npm",
+      format: "npm",
+      name: "left-pad",
+      declaredConstraint: "^1.0.0",
+      resolvedVersion: null,
+      versionState: DEPENDENCY_VERSION_STATES.RANGE,
+      isDirect: true,
+      legacyVersion: "1.0.0",
+    });
+    const api = createLookupApi(() => {
+      throw new Error("unresolved dependencies must not be queried");
+    });
+
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency,
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(getConcreteDependencyVersion(dependency), null);
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.UNRESOLVED);
+    assert.strictEqual(api.calls.length, 0);
+  });
+
+  test("legacy plain versions without evidence remain unresolved", async () => {
+    const dependency = {
+      name: "left-pad",
+      version: "1.0.0",
+      format: "npm",
+      ecosystem: "npm",
     };
-
-    const fetchPromise = provider._fetchPackageIndex("workspace", "repo", "npm");
-    await new Promise((resolve) => setImmediate(resolve));
-
-    assert.deepStrictEqual(requestedPages, [1, 2, 3]);
-
-    pageResolvers.get(2)({
-      error: null,
-      data: [{
-        name: "page-two",
-        version: "1.0.0",
-      }],
-    });
-    pageResolvers.get(3)({
-      error: null,
-      data: [{
-        name: "page-three",
-        version: "1.0.0",
-      }],
+    const api = createLookupApi(() => {
+      throw new Error("an unevidenced legacy version must not be queried");
     });
 
-    const result = await fetchPromise;
-    assert.strictEqual(result.error, null);
-    assert.strictEqual(result.totalCount, 3);
-    assert.strictEqual(result.index.get("page-two").has("1.0.0"), true);
-    assert.strictEqual(result.index.get("page-three").has("1.0.0"), true);
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency,
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(getConcreteDependencyVersion(dependency), null);
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.UNRESOLVED);
+    assert.strictEqual(api.calls.length, 0);
+  });
+
+  test("provider coverage keeps unresolved dependencies out of absent and upstream analysis", async () => {
+    const dependency = createDependencyRecord({
+      ecosystem: "npm",
+      format: "npm",
+      name: "left-pad",
+      declaredConstraint: ">=1.0.0 <2.0.0",
+      resolvedVersion: null,
+      versionState: DEPENDENCY_VERSION_STATES.RANGE,
+      isDirect: true,
+      legacyVersion: "1.0.0 <2.0.0",
+    });
+    let upstreamCalls = 0;
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCloudsmithAPI() {
+        throw new Error("unresolved dependencies must not create an API client");
+      },
+      async analyzeUpstreamGaps() {
+        upstreamCalls += 1;
+        return [];
+      },
+    });
+    provider._fullTrees = [{ ecosystem: "npm", sourceFile: "package.json", dependencies: [dependency] }];
+    provider._displayTrees = provider._fullTrees;
+    provider.refresh = () => {};
+
+    await provider._runCoverageChecks(
+      "workspace",
+      "repo",
+      1,
+      { report() {} },
+      { isCancellationRequested: false }
+    );
+    await provider._runEnrichmentPasses(
+      "workspace",
+      "repo",
+      { report() {} },
+      { isCancellationRequested: false }
+    );
+
+    assert.strictEqual(provider._fullTrees[0].dependencies[0].cloudsmithStatus, "UNRESOLVED");
+    assert.strictEqual(provider._summary.notFound, 0);
+    assert.strictEqual(provider._summary.unresolved, 1);
+    assert.strictEqual(upstreamCalls, 0);
+  });
+
+  test("an exact manifest declaration can be evaluated without pretending it was lockfile-resolved", async () => {
+    const dependency = createDependencyRecord({
+      ecosystem: "npm",
+      format: "npm",
+      name: "left-pad",
+      declaredConstraint: "1.0.0",
+      resolvedVersion: null,
+      versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
+      isDirect: true,
+      legacyVersion: "1.0.0",
+    });
+    const api = createLookupApi(() => lookupPage([{ name: "left-pad", version: "1.0.0", format: "npm" }]));
+
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency,
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(dependency.resolvedVersion, null);
+    assert.strictEqual(getConcreteDependencyVersion(dependency), "1.0.0");
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
+  });
+
+  test("an exact declaration can use its ecosystem-specific constraint when compatibility is empty", () => {
+    const dependency = createDependencyRecord({
+      ecosystem: "python",
+      format: "python",
+      name: "requests",
+      declaredConstraint: "==2.32.3",
+      resolvedVersion: null,
+      versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
+      isDirect: true,
+      legacyVersion: "",
+    });
+
+    assert.strictEqual(getConcreteDependencyVersion(dependency), "2.32.3");
+  });
+
+  test("Maven matching requires group and artifact identity, not artifact name alone", async () => {
+    const correct = {
+      name: "shared-artifact",
+      version: "1.0.0",
+      format: "maven",
+      identifiers: { group_id: "com.expected" },
+    };
+    const api = createLookupApi((endpoint) => {
+      const page = Number(new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("page"));
+      return page === 1
+        ? lookupPage([{
+          name: "shared-artifact",
+          version: "1.0.0",
+          format: "maven",
+          identifiers: { group_id: "com.wrong" },
+        }], 1, 2, 2, 1)
+        : lookupPage([correct], 2, 2, 2, 1);
+    });
+
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("com.expected:shared-artifact", "1.0.0", "maven"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
+    assert.strictEqual(result.package, correct);
+    const firstQuery = new URL(
+      api.calls[0],
+      "https://api.cloudsmith.io/v1/"
+    ).searchParams.get("query").replace(/\\/g, "");
+    assert.ok(firstQuery.includes("name:com.expected:shared-artifact"));
+  });
+
+  test("Maven and Go package identities preserve case", async () => {
+    const mavenMatch = matchCoverageCandidates(
+      [{
+        name: "Library",
+        version: "1.0.0",
+        format: "maven",
+        identifiers: { group_id: "com.example" },
+      }],
+      createDependency("com.Example:Library", "1.0.0", "maven")
+    );
+    assert.strictEqual(mavenMatch, null);
+
+    const dependencies = [
+      createDependency("Example.com/Org/Module", "v1.0.0", "go"),
+      createDependency("example.com/org/module", "v1.0.0", "go"),
+    ];
+    const api = createLookupApi((endpoint) => {
+      const query = new URL(endpoint, "https://api.cloudsmith.io/v1/")
+        .searchParams.get("query")
+        .replace(/\\/g, "");
+      const dependency = dependencies.find((candidate) => query.includes(`name:${candidate.name}`));
+      return lookupPage([{
+        name: dependency.name,
+        version: dependency.version,
+        format: "go",
+      }]);
+    });
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCloudsmithAPI: () => api,
+    });
+    provider._fullTrees = [{ ecosystem: "go", sourceFile: "go.mod", dependencies }];
+    provider._displayTrees = cloneTrees(provider._fullTrees);
+    provider.refresh = () => {};
+
+    await provider._runCoverageChecks(
+      "workspace",
+      "repo",
+      dependencies.length,
+      { report() {} },
+      { isCancellationRequested: false }
+    );
+
+    assert.strictEqual(api.calls.length, 2);
+    assert.deepStrictEqual(
+      provider._fullTrees[0].dependencies.map((dependency) => dependency.cloudsmithStatus),
+      [CLOUDSMITH_COVERAGE_STATUS.FOUND, CLOUDSMITH_COVERAGE_STATUS.FOUND]
+    );
+  });
+
+  test("multiple resolved versions remain distinct and a popular package cannot starve another dependency", async () => {
+    const dependencies = [
+      createDependency("popular", "1.0.0"),
+      createDependency("popular", "2.0.0"),
+      createDependency("other", "3.0.0"),
+    ];
+    const api = createLookupApi((endpoint) => {
+      const url = new URL(endpoint, "https://api.cloudsmith.io/v1/");
+      const query = url.searchParams.get("query");
+      const page = Number(url.searchParams.get("page"));
+      const dependency = dependencies.find((candidate) => (
+        query.includes(`name:${candidate.name}`) && query.includes(`version:${candidate.version}`)
+      ));
+      if (dependency.name === "popular" && dependency.version === "1.0.0" && page === 1) {
+        return lookupPage(Array.from({ length: 100 }, (_, index) => ({
+          name: "popular",
+          version: `9.0.${index}`,
+          format: "npm",
+        })), 1, 2, 101);
+      }
+      return lookupPage([{
+        name: dependency.name,
+        version: dependency.version,
+        format: "npm",
+        slug_perm: `${dependency.name}-${dependency.version}`,
+      }], page, page, page === 2 ? 101 : 1, 100);
+    });
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCloudsmithAPI: () => api,
+    });
+    provider._fullTrees = [{ ecosystem: "npm", sourceFile: "package-lock.json", dependencies }];
+    provider._displayTrees = cloneTrees(provider._fullTrees);
+    provider.refresh = () => {};
+
+    await provider._runCoverageChecks(
+      "workspace",
+      "repo",
+      dependencies.length,
+      { report() {} },
+      { isCancellationRequested: false }
+    );
+
+    const evaluated = provider._fullTrees[0].dependencies;
+    assert.deepStrictEqual(
+      evaluated.map((dependency) => `${dependency.name}@${dependency.version}:${dependency.cloudsmithStatus}`),
+      ["popular@1.0.0:FOUND", "popular@2.0.0:FOUND", "other@3.0.0:FOUND"]
+    );
+    assert.deepStrictEqual(
+      evaluated.map((dependency) => dependency.cloudsmithPackage.version),
+      ["1.0.0", "2.0.0", "3.0.0"]
+    );
+  });
+
+  test("pagination terminates at the safety limit and remains incomplete", async () => {
+    const api = createLookupApi((endpoint) => {
+      const page = Number(new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("page"));
+      return lookupPage([{ name: "other", version: "1.0.0" }], page, 101, 101, 1);
+    });
+
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+    assert.strictEqual(result.pagesFetched, 100);
+    assert.strictEqual(api.calls.length, 100);
   });
 
   test("matchCoverageCandidates returns null when fallback results do not match the dependency name", () => {
@@ -739,7 +1606,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(match, null);
   });
 
-  test("matchCoverageCandidates falls back to a name match when versions differ", () => {
+  test("matchCoverageCandidates refuses a name-only fallback when versions differ", () => {
     const nameOnlyMatch = { name: "left-pad", version: "1.1.0", format: "npm" };
     const match = matchCoverageCandidates(
       [
@@ -749,7 +1616,134 @@ suite("DependencyHealthProvider Test Suite", () => {
       createDependency("left-pad", "1.0.0")
     );
 
-    assert.strictEqual(match, nameOnlyMatch);
+    assert.strictEqual(match, null);
+  });
+
+  test("matchCoverageCandidates rejects an exact name and version from another format", () => {
+    const match = matchCoverageCandidates(
+      [{ name: "left-pad", version: "1.0.0", format: "python" }],
+      createDependency("left-pad", "1.0.0", "npm")
+    );
+
+    assert.strictEqual(match, null);
+  });
+
+  test("compliance dedup preserves occurrences and uncertainty over absence", () => {
+    const sourceA = { kind: "manifest", uri: "file:///workspace/a/package.json", range: null };
+    const sourceB = { kind: "manifest", uri: "file:///workspace/b/package.json", range: null };
+    const base = {
+      name: "left-pad",
+      version: "1.0.0",
+      legacyVersion: "1.0.0",
+      declaredConstraint: "^1.0.0",
+      resolvedVersion: null,
+      versionState: DEPENDENCY_VERSION_STATES.RANGE,
+      format: "npm",
+      ecosystem: "npm",
+      isDirect: true,
+      sourceManifest: sourceA,
+    };
+    const report = buildComplianceReportData("workspace", [
+      { ...base, cloudsmithStatus: CLOUDSMITH_COVERAGE_STATUS.ABSENT },
+      { ...base, cloudsmithStatus: CLOUDSMITH_COVERAGE_STATUS.UNRESOLVED },
+      {
+        ...base,
+        sourceManifest: sourceB,
+        cloudsmithStatus: CLOUDSMITH_COVERAGE_STATUS.ABSENT,
+      },
+    ], { scanDate: "2026-08-09T00:00:00.000Z" });
+
+    assert.strictEqual(report.summary.total, 2);
+    assert.strictEqual(report.summary.unresolved, 1);
+    assert.strictEqual(report.summary.notFound, 1);
+  });
+
+  test("npm fixture flows from adapter resolution through exact lookup to health node", async () => {
+    const result = await runFixtureThroughLookupAndNode(
+      "npm",
+      "npm",
+      "express",
+      {
+        name: "express",
+        version: "4.18.2",
+        format: "npm",
+        namespace: "workspace",
+        repository: "repository",
+        slug_perm: "express/4.18.2",
+        status_str: "Completed",
+      }
+    );
+
+    assert.strictEqual(result.dependency.declaredConstraint, "^4.18.2");
+    assert.strictEqual(result.dependency.resolvedVersion, "4.18.2");
+    assert.strictEqual(result.node.declaredVersion, "4.18.2");
+  });
+
+  test("Python fixture flows from lock resolution through exact lookup to health node", async () => {
+    const result = await runFixtureThroughLookupAndNode(
+      "python",
+      "python",
+      "fastapi",
+      {
+        name: "fastapi",
+        version: "0.111.0",
+        format: "python",
+        namespace: "workspace",
+        repository: "repository",
+        slug_perm: "fastapi/0.111.0",
+        status_str: "Completed",
+      }
+    );
+
+    assert.strictEqual(result.dependency.resolvedVersion, "0.111.0");
+    assert.strictEqual(result.node.declaredVersion, "0.111.0");
+  });
+
+  test("Maven fixture flows from dependency-tree resolution through exact lookup to health node", async () => {
+    const result = await runFixtureThroughLookupAndNode(
+      "maven",
+      "maven",
+      "org.springframework.boot:spring-boot-starter-web",
+      {
+        name: "spring-boot-starter-web",
+        version: "3.2.0",
+        format: "maven",
+        namespace: "workspace",
+        repository: "repository",
+        slug_perm: "spring-boot-starter-web/3.2.0",
+        status_str: "Completed",
+        identifiers: { group_id: "org.springframework.boot" },
+      }
+    );
+
+    assert.strictEqual(result.dependency.declaredConstraint, "3.2.0");
+    assert.strictEqual(result.dependency.resolvedVersion, "3.2.0");
+  });
+
+  test("range-only Python fixture flows to an unresolved health node without lookup", async () => {
+    const workspace = path.join(__dirname, "fixtures", "python-unresolved");
+    const registry = createDefaultDependencyAdapterRegistry();
+    const detection = (await registry.detect(workspace)).find((entry) => entry.ecosystem === "python");
+    const adapterResult = await registry.parse(detection, { workspaceFolder: workspace });
+    const dependency = adapterResult.dependencies.find((entry) => entry.name === "requests");
+
+    assert.ok(dependency);
+    assert.strictEqual(dependency.declaredConstraint, ">=2.0,<3.0");
+    assert.strictEqual(dependency.resolvedVersion, null);
+    const lookup = await lookupExactDependency({
+      api: { async getWithHeaders() { throw new Error("range-only dependency must not be queried"); } },
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repository",
+      dependency,
+    });
+    const node = new DependencyHealthNode({
+      ...dependency,
+      cloudsmithStatus: lookup.status,
+      cloudsmithPackage: lookup.package,
+    }, {});
+
+    assert.strictEqual(lookup.status, CLOUDSMITH_COVERAGE_STATUS.UNRESOLVED);
+    assert.strictEqual(node.state, "unresolved");
   });
 
   test("_runLicenseEnrichment flushes multiple progress patches in one refresh", async () => {

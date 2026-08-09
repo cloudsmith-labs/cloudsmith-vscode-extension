@@ -6,6 +6,7 @@ const {
   ADAPTER_RESULT_STATUSES,
   createDefaultDependencyAdapterRegistry,
 } = require("../util/dependencyAdapterRegistry");
+const { DEPENDENCY_VERSION_STATES } = require("../util/dependencyRecord");
 const { PaginatedFetch } = require("../util/paginatedFetch");
 const { SearchQueryBuilder } = require("../util/searchQueryBuilder");
 const { LicenseClassifier } = require("../util/licenseClassifier");
@@ -14,6 +15,7 @@ const {
   getCloudsmithPackageLookupKeys,
   getPackageLookupKeys,
   normalizePackageName,
+  sanitizePackageNameInput,
 } = require("../util/packageNameNormalizer");
 const {
   enrichVulnerabilities,
@@ -36,15 +38,23 @@ const DependencySummaryNode = require("../models/dependencySummaryNode");
 const InfoNode = require("../models/infoNode");
 
 const DEFAULT_MAX_DEPENDENCIES_TO_SCAN = 10000;
-const PACKAGE_INDEX_TTL_MS = 10 * 60 * 1000;
-const PACKAGE_INDEX_CACHE_MAX_SIZE = 5000;
-const PACKAGE_INDEX_PAGE_SIZE = 500;
-const PACKAGE_INDEX_FALLBACK_THRESHOLD = 10000;
-const FALLBACK_QUERY_PAGE_SIZE = 25;
-const FALLBACK_QUERY_CONCURRENCY = 8;
+const LOOKUP_PAGE_SIZE = 100;
+const LOOKUP_MAX_PAGES = 100;
+const LOOKUP_CONCURRENCY = 8;
+const LOOKUP_MAX_REQUESTS_PER_RESOLUTION = 2000;
 const WORKSPACE_REPOSITORY_PAGE_SIZE = 500;
 const COVERAGE_MATCH_BATCH_SIZE = 50;
 const ENRICHMENT_PROGRESS_DEBOUNCE_MS = 500;
+
+const CLOUDSMITH_COVERAGE_STATUS = Object.freeze({
+  CHECKING: "CHECKING",
+  FOUND: "FOUND",
+  ABSENT: "ABSENT",
+  UNRESOLVED: "UNRESOLVED",
+  LOOKUP_FAILED: "LOOKUP_FAILED",
+  LOOKUP_INCOMPLETE: "LOOKUP_INCOMPLETE",
+  RATE_LIMITED: "RATE_LIMITED",
+});
 
 const FILTER_MODES = Object.freeze({
   VULNERABLE: "vulnerable",
@@ -81,8 +91,13 @@ class DependencyHealthProvider {
       analyzeUpstreamGaps: options.analyzeUpstreamGaps || analyzeUpstreamGaps,
       fetchRepositories: options.fetchRepositories || null,
       upstreamPullService: options.upstreamPullService || new UpstreamPullService(context),
+      createCloudsmithAPI: options.createCloudsmithAPI || (() => new CloudsmithAPI(this.context)),
     };
     this._dependencyAdapters = options.dependencyAdapters || createDefaultDependencyAdapterRegistry();
+    this._lookupRequestLimit = Number.isInteger(options.lookupRequestLimit)
+      && options.lookupRequestLimit > 0
+      ? Math.min(options.lookupRequestLimit, LOOKUP_MAX_REQUESTS_PER_RESOLUTION)
+      : LOOKUP_MAX_REQUESTS_PER_RESOLUTION;
     this._reportDateFactory = typeof options.reportDateFactory === "function"
       ? options.reportDateFactory
       : () => new Date();
@@ -564,17 +579,29 @@ class DependencyHealthProvider {
 
   async _performScan(cloudsmithWorkspace, cloudsmithRepo, folderPath, progress, token) {
     progress.report({ message: "Parsing lockfiles..." });
+    const warnings = [];
+    const parserErrors = [];
     this._lastManifests = await this._dependencyAdapters.detectManifests(folderPath);
+    if (typeof this._dependencyAdapters.getDiscoveryWarnings === "function") {
+      warnings.push(...this._dependencyAdapters.getDiscoveryWarnings());
+    }
     if (token.isCancellationRequested) {
       return { canceled: true };
     }
 
     const resolveTransitives = vscode.workspace.getConfiguration("cloudsmith-vsc").get("resolveTransitiveDependencies") !== false;
     const trees = [];
-    const warnings = [];
+    const coveredManifestPaths = new Set();
 
     if (resolveTransitives) {
       const detections = await this._dependencyAdapters.detect(folderPath);
+      if (typeof this._dependencyAdapters.getDiscoveryWarnings === "function") {
+        for (const warning of this._dependencyAdapters.getDiscoveryWarnings()) {
+          if (!warnings.includes(warning)) {
+            warnings.push(warning);
+          }
+        }
+      }
       if (token.isCancellationRequested) {
         return { canceled: true };
       }
@@ -587,9 +614,11 @@ class DependencyHealthProvider {
           maxDependenciesToScan: this._getMaxDependenciesToScan(),
         });
         if (result.status === ADAPTER_RESULT_STATUSES.ERROR) {
-          warnings.push(result.error && result.error.message
+          const message = result.error && result.error.message
             ? result.error.message
-            : "A dependency adapter failed.");
+            : "A dependency adapter failed.";
+          warnings.push(message);
+          parserErrors.push(message);
           continue;
         }
         if (
@@ -604,6 +633,12 @@ class DependencyHealthProvider {
             dependencies: result.dependencies,
             warnings: result.warnings,
           });
+          const sourceManifestPath = result.source
+            && result.source.manifest
+            && result.source.manifest.filePath;
+          if (sourceManifestPath) {
+            coveredManifestPaths.add(path.resolve(sourceManifestPath));
+          }
           if (result.warnings.length > 0) {
             warnings.push(...result.warnings);
           }
@@ -611,15 +646,25 @@ class DependencyHealthProvider {
       }
     }
 
-    if (trees.length === 0) {
-      const fallbackTrees = await this._buildManifestFallbackTrees(this._lastManifests);
-      if (token.isCancellationRequested) {
-        return { canceled: true };
-      }
-      trees.push(...fallbackTrees);
+    const uncoveredManifests = this._lastManifests.filter((manifest) => (
+      !coveredManifestPaths.has(path.resolve(manifest.filePath))
+    ));
+    const fallbackTrees = await this._buildManifestFallbackTrees(
+      uncoveredManifests,
+      warnings,
+      parserErrors
+    );
+    if (token.isCancellationRequested) {
+      return { canceled: true };
     }
+    trees.push(...fallbackTrees);
 
     if (trees.length === 0) {
+      if (parserErrors.length > 0) {
+        throw new Error(
+          `Dependency files were detected, but parsing did not complete. ${parserErrors[0]}`
+        );
+      }
       this._displayTrees = [];
       this._fullTrees = [];
       this._summary = emptySummary();
@@ -636,6 +681,11 @@ class DependencyHealthProvider {
       .filter((tree) => Array.isArray(tree.dependencies) && tree.dependencies.length > 0);
 
     if (normalizedTrees.length === 0) {
+      if (parserErrors.length > 0) {
+        throw new Error(
+          `Dependency files were detected, but parsing did not complete. ${parserErrors[0]}`
+        );
+      }
       this._displayTrees = [];
       this._fullTrees = [];
       this._summary = emptySummary();
@@ -692,10 +742,30 @@ class DependencyHealthProvider {
     return { canceled: false };
   }
 
-  async _buildManifestFallbackTrees(manifests) {
+  async _buildManifestFallbackTrees(manifests, warnings = [], parserErrors = []) {
     const trees = [];
     for (const manifest of manifests) {
       const result = await this._dependencyAdapters.parseManifest(manifest);
+      if (
+        result.status === ADAPTER_RESULT_STATUSES.ERROR
+        || result.status === ADAPTER_RESULT_STATUSES.UNSUPPORTED
+      ) {
+        const message = result.error && result.error.message
+          ? result.error.message
+          : `Could not parse ${path.basename(manifest.filePath)}.`;
+        if (!warnings.includes(message)) {
+          warnings.push(message);
+        }
+        if (!parserErrors.includes(message)) {
+          parserErrors.push(message);
+        }
+        continue;
+      }
+      for (const warning of result.warnings || []) {
+        if (!warnings.includes(warning)) {
+          warnings.push(warning);
+        }
+      }
       if (
         ![
           ADAPTER_RESULT_STATUSES.SUCCESS,
@@ -744,83 +814,29 @@ class DependencyHealthProvider {
   ) {
     const formats = Object.keys(dependenciesByFormat);
     const progressLabel = options.progressLabel || "Matching coverage";
-    const packageIndexFailureVerb = options.packageIndexFailureVerb || "fetch";
 
     if (formats.length === 0 || totalDependencies === 0) {
       return 0;
     }
 
-    const indexEntries = await Promise.all(
-      formats.map(async (format) => ({
-        format,
-        dependencies: uniqueDependenciesForCoverage(dependenciesByFormat[format]),
-        packageIndex: await this._fetchPackageIndex(cloudsmithWorkspace, cloudsmithRepo, format),
-      }))
-    );
-
     let completed = 0;
-    for (const { format, dependencies, packageIndex } of indexEntries) {
+    const requestBudget = createLookupRequestBudget(this._lookupRequestLimit);
+    for (const format of formats) {
       if (token.isCancellationRequested) {
         return completed;
       }
 
-      if (packageIndex.error) {
-        this._warnings.push(`Could not ${packageIndexFailureVerb} the ${format} package index. ${packageIndex.error}`);
-      }
-
-      if (packageIndex.tooLarge || packageIndex.error) {
-        completed = await this._resolveCoverageWithFallbackQueries(
-          cloudsmithWorkspace,
-          cloudsmithRepo,
-          format,
-          dependencies,
-          completed,
-          totalDependencies,
-          progress,
-          token,
-          progressLabel
-        );
-        continue;
-      }
-
-      completed = await this._matchCoverageBatch(
-        dependencies,
-        packageIndex.index,
+      completed = await this._resolveCoverageWithExactQueries(
+        cloudsmithWorkspace,
+        cloudsmithRepo,
+        format,
+        uniqueDependenciesForCoverage(dependenciesByFormat[format]),
         completed,
         totalDependencies,
         progress,
         token,
-        progressLabel
-      );
-    }
-
-    return completed;
-  }
-
-  async _matchCoverageBatch(dependencies, packageIndex, completed, totalDependencies, progress, token, progressLabel) {
-    const pendingMatches = [];
-
-    for (let index = 0; index < dependencies.length; index += 1) {
-      if (token.isCancellationRequested) {
-        return completed;
-      }
-
-      const dependency = dependencies[index];
-      pendingMatches.push({
-        dependency,
-        match: findCoverageMatch(packageIndex, dependency),
-      });
-
-      if (pendingMatches.length < COVERAGE_MATCH_BATCH_SIZE && index < dependencies.length - 1) {
-        continue;
-      }
-
-      completed = await this._flushCoverageMatchBatch(
-        pendingMatches,
-        completed,
-        totalDependencies,
-        progress,
-        progressLabel
+        progressLabel,
+        requestBudget
       );
     }
 
@@ -855,11 +871,14 @@ class DependencyHealthProvider {
     }
 
     const matchMap = new Map();
-    for (const { dependency, match } of matches) {
+    for (const { dependency, result } of matches) {
       matchMap.set(coverageLookupKey(dependency), {
-        cloudsmithStatus: match ? "FOUND" : "NOT_FOUND",
-        cloudsmithPackage: match || null,
-        ...(match ? { upstreamStatus: null, upstreamDetail: null } : {}),
+        cloudsmithStatus: result.status,
+        cloudsmithPackage: result.package || null,
+        cloudsmithLookupDetail: result.detail || null,
+        ...(result.status === CLOUDSMITH_COVERAGE_STATUS.FOUND
+          ? { upstreamStatus: null, upstreamDetail: null }
+          : {}),
       });
     }
 
@@ -907,7 +926,7 @@ class DependencyHealthProvider {
     };
   }
 
-  async _resolveCoverageWithFallbackQueries(
+  async _resolveCoverageWithExactQueries(
     cloudsmithWorkspace,
     cloudsmithRepo,
     format,
@@ -916,13 +935,14 @@ class DependencyHealthProvider {
     totalDependencies,
     progress,
     token,
-    progressLabel = "Matching coverage"
+    progressLabel = "Matching coverage",
+    requestBudget = null
   ) {
-    const api = new CloudsmithAPI(this.context);
-    const endpoint = cloudsmithRepo
-      ? `packages/${cloudsmithWorkspace}/${cloudsmithRepo}/`
-      : `packages/${cloudsmithWorkspace}/`;
     const uniqueDependencies = dependencies.slice();
+    const api = uniqueDependencies.some((dependency) => getConcreteDependencyVersion(dependency))
+      ? this._services.createCloudsmithAPI()
+      : null;
+    const statusCounts = new Map();
 
     for (let index = 0; index < uniqueDependencies.length; index += COVERAGE_MATCH_BATCH_SIZE) {
       if (token.isCancellationRequested) {
@@ -932,31 +952,21 @@ class DependencyHealthProvider {
       const dependencyBatch = uniqueDependencies.slice(index, index + COVERAGE_MATCH_BATCH_SIZE);
       const pendingMatches = [];
 
-      await runPromisePool(dependencyBatch, FALLBACK_QUERY_CONCURRENCY, async (dependency) => {
+      await runPromisePool(dependencyBatch, LOOKUP_CONCURRENCY, async (dependency) => {
         if (token.isCancellationRequested) {
           return;
         }
 
-        let match = null;
-        for (const lookupName of getPackageLookupKeys(dependency.name, dependency.format)) {
-          const query = new SearchQueryBuilder()
-            .format(dependency.format)
-            .name(lookupName)
-            .build();
-          const result = await api.get(`${endpoint}?query=${encodeURIComponent(query)}&page_size=${FALLBACK_QUERY_PAGE_SIZE}`);
-          if (typeof result === "string") {
-            this._warnings.push(`Coverage lookup failed for ${dependency.name}. ${result}`);
-            continue;
-          }
-          if (Array.isArray(result) && result.length > 0) {
-            match = matchCoverageCandidates(result, dependency);
-            if (match) {
-              break;
-            }
-          }
-        }
-
-        pendingMatches.push({ dependency, match });
+        const result = await lookupExactDependency({
+          api,
+          cloudsmithWorkspace,
+          cloudsmithRepo,
+          dependency,
+          token,
+          requestBudget,
+        });
+        statusCounts.set(result.status, (statusCounts.get(result.status) || 0) + 1);
+        pendingMatches.push({ dependency, result });
       });
 
       completed = await this._flushCoverageMatchBatch(
@@ -972,80 +982,8 @@ class DependencyHealthProvider {
       }
     }
 
+    appendCoverageLookupWarnings(this._warnings, format, statusCounts);
     return completed;
-  }
-
-  async _fetchPackageIndex(cloudsmithWorkspace, cloudsmithRepo, format) {
-    const cacheKey = `${String(cloudsmithWorkspace || "").toLowerCase()}:${String(cloudsmithRepo || "<all>").toLowerCase()}:${format}`;
-    const cachedValue = getCachedPackageIndexValue(cacheKey);
-    if (cachedValue) {
-      return cachedValue;
-    }
-
-    const firstPage = await this._fetchSinglePage(
-      cloudsmithWorkspace,
-      cloudsmithRepo,
-      format,
-      1,
-      PACKAGE_INDEX_PAGE_SIZE
-    );
-    if (firstPage.error) {
-      const value = { error: firstPage.error, tooLarge: false, index: new Map() };
-      setCachedPackageIndexValue(cacheKey, value);
-      return value;
-    }
-
-    const totalCount = firstPage.pagination.count || firstPage.data.length;
-    if (totalCount > PACKAGE_INDEX_FALLBACK_THRESHOLD) {
-      const value = { error: null, tooLarge: true, index: new Map(), totalCount };
-      setCachedPackageIndexValue(cacheKey, value);
-      return value;
-    }
-
-    const packages = [...firstPage.data];
-    const pageTotal = firstPage.pagination && firstPage.pagination.pageTotal
-      ? firstPage.pagination.pageTotal
-      : Math.ceil(totalCount / PACKAGE_INDEX_PAGE_SIZE) || 1;
-
-    if (pageTotal > 1) {
-      const remainingPages = await Promise.all(
-        Array.from({ length: pageTotal - 1 }, (_, index) => this._fetchSinglePage(
-          cloudsmithWorkspace,
-          cloudsmithRepo,
-          format,
-          index + 2,
-          PACKAGE_INDEX_PAGE_SIZE
-        ))
-      );
-
-      for (const nextPage of remainingPages) {
-        if (nextPage.error) {
-          const value = { error: nextPage.error, tooLarge: false, index: new Map() };
-          setCachedPackageIndexValue(cacheKey, value);
-          return value;
-        }
-        packages.push(...nextPage.data);
-      }
-    }
-
-    const value = {
-      error: null,
-      tooLarge: false,
-      index: buildPackageIndex(packages, format),
-      totalCount,
-    };
-    setCachedPackageIndexValue(cacheKey, value);
-    return value;
-  }
-
-  async _fetchSinglePage(cloudsmithWorkspace, cloudsmithRepo, format, page, pageSize) {
-    const api = new CloudsmithAPI(this.context);
-    const paginatedFetch = new PaginatedFetch(api);
-    const endpoint = cloudsmithRepo
-      ? `packages/${cloudsmithWorkspace}/${cloudsmithRepo}/`
-      : `packages/${cloudsmithWorkspace}/`;
-
-    return paginatedFetch.fetchPage(endpoint, page, pageSize, `format:${format}`);
   }
 
   async _runEnrichmentPasses(cloudsmithWorkspace, cloudsmithRepo, progress, token) {
@@ -1056,7 +994,7 @@ class DependencyHealthProvider {
       this._runPolicyEnrichment(dependencies, token),
     ];
 
-    const uncoveredDependencies = dependencies.filter((dependency) => dependency.cloudsmithStatus === "NOT_FOUND");
+    const uncoveredDependencies = dependencies.filter((dependency) => isAbsentCoverageStatus(dependency.cloudsmithStatus));
     if (uncoveredDependencies.length > 0) {
       tasks.push(this._runUpstreamGapAnalysis(uncoveredDependencies, cloudsmithWorkspace, cloudsmithRepo, progress, token));
     }
@@ -1173,7 +1111,11 @@ class DependencyHealthProvider {
     });
 
     try {
-      await this._services.analyzeUpstreamGaps(uncoveredDependencies, workspace, repositories, {
+      const legacyCompatibleDependencies = uncoveredDependencies.map((dependency) => ({
+        ...dependency,
+        cloudsmithStatus: "NOT_FOUND",
+      }));
+      await this._services.analyzeUpstreamGaps(legacyCompatibleDependencies, workspace, repositories, {
         context: this.context,
         cancellationToken: token,
         onProgress: (patchMap, meta = {}) => {
@@ -1493,7 +1435,6 @@ class DependencyHealthProvider {
   }
 
   async _refreshCoverageAfterPull(cloudsmithWorkspace, cloudsmithRepo, progress, token) {
-    clearPackageIndexCache(cloudsmithWorkspace, cloudsmithRepo);
     await this._refreshCoverageForDependencies(
       cloudsmithWorkspace,
       cloudsmithRepo,
@@ -1505,7 +1446,6 @@ class DependencyHealthProvider {
   }
 
   async _refreshSingleDependencyAfterPull(cloudsmithWorkspace, cloudsmithRepo, dependency, progress, token) {
-    clearPackageIndexCache(cloudsmithWorkspace, cloudsmithRepo, dependency.format || dependency.ecosystem);
     await this._refreshCoverageForDependencies(
       cloudsmithWorkspace,
       cloudsmithRepo,
@@ -1532,7 +1472,7 @@ class DependencyHealthProvider {
       this._fullTrees
         .flatMap((tree) => tree.dependencies)
         .filter((dependency) => (
-          dependency.cloudsmithStatus !== "FOUND"
+          isAbsentCoverageStatus(dependency.cloudsmithStatus)
           && (targetKeys.size === 0 || targetKeys.has(coverageLookupKey(dependency)))
         ))
     );
@@ -1598,7 +1538,7 @@ class DependencyHealthProvider {
     if (options.refreshRemainingUpstream) {
       const remainingUncovered = this._fullTrees
         .flatMap((tree) => tree.dependencies)
-        .filter((dependency) => dependency.cloudsmithStatus === "NOT_FOUND");
+        .filter((dependency) => isAbsentCoverageStatus(dependency.cloudsmithStatus));
       if (remainingUncovered.length > 0) {
         progress.report({ message: "Refreshing upstream availability..." });
         await this._runUpstreamGapAnalysis(
@@ -1776,39 +1716,427 @@ function createScanOperation(status, id, values = {}) {
   };
 }
 
-DependencyHealthProvider.packageIndexCache = new Map();
-
-function pruneExpiredPackageIndexCache(now = Date.now()) {
-  for (const [cacheKey, cacheEntry] of DependencyHealthProvider.packageIndexCache.entries()) {
-    if (!cacheEntry || cacheEntry.expiresAt <= now) {
-      DependencyHealthProvider.packageIndexCache.delete(cacheKey);
-    }
-  }
-}
-
-function getCachedPackageIndexValue(cacheKey) {
-  const cached = DependencyHealthProvider.packageIndexCache.get(cacheKey);
-  if (!cached) {
+function getConcreteDependencyVersion(dependency) {
+  if (!dependency || typeof dependency !== "object") {
     return null;
   }
 
-  if (cached.expiresAt > Date.now()) {
-    return cached.value;
+  const versionState = String(dependency.versionState || "").trim();
+  if (versionState === DEPENDENCY_VERSION_STATES.RESOLVED) {
+    return nonEmptyString(dependency.resolvedVersion);
+  }
+  if (versionState === DEPENDENCY_VERSION_STATES.EXACT_DECLARATION) {
+    const compatibilityVersion = nonEmptyString(
+      Object.prototype.hasOwnProperty.call(dependency, "legacyVersion")
+        ? dependency.legacyVersion
+        : dependency.version
+    );
+    return compatibilityVersion || exactVersionFromDeclaredConstraint(
+      dependency.declaredConstraint,
+      dependency.format || dependency.ecosystem
+    );
+  }
+  if (versionState) {
+    return null;
   }
 
-  DependencyHealthProvider.packageIndexCache.delete(cacheKey);
-  return null;
+  return nonEmptyString(dependency.resolvedVersion);
 }
 
-function setCachedPackageIndexValue(cacheKey, value) {
-  if (DependencyHealthProvider.packageIndexCache.size >= PACKAGE_INDEX_CACHE_MAX_SIZE) {
-    pruneExpiredPackageIndexCache();
+function exactVersionFromDeclaredConstraint(constraint, ecosystemOrFormat) {
+  const value = nonEmptyString(constraint);
+  if (!value) {
+    return null;
+  }
+  const format = canonicalFormat(ecosystemOrFormat);
+  if (format === "python") {
+    return nonEmptyString(value.replace(/^={2,3}\s*/, ""));
+  }
+  if (format === "npm" || format === "cargo") {
+    return nonEmptyString(value.replace(/^=\s*/, ""));
+  }
+  if (format === "nuget") {
+    const singleton = value.match(/^\[\s*([^,\]]+)\s*]$/);
+    return singleton ? nonEmptyString(singleton[1]) : null;
+  }
+  return value.includes("${") ? null : value;
+}
+
+function nonEmptyString(value) {
+  const normalized = String(value == null ? "" : value).trim();
+  return normalized || null;
+}
+
+function createCoverageLookupResult(status, pkg, detail, pagesFetched = 0) {
+  return {
+    status,
+    package: pkg || null,
+    detail: detail || null,
+    pagesFetched,
+  };
+}
+
+function createLookupRequestBudget(limit) {
+  const maximum = Number.isInteger(limit) && limit > 0 ? limit : 0;
+  let consumed = 0;
+  return {
+    tryConsume() {
+      if (consumed >= maximum) {
+        return false;
+      }
+      consumed += 1;
+      return true;
+    },
+  };
+}
+
+async function lookupExactDependency({
+  api,
+  cloudsmithWorkspace,
+  cloudsmithRepo,
+  dependency,
+  token,
+  requestBudget = null,
+}) {
+  const concreteVersion = getConcreteDependencyVersion(dependency);
+  if (!concreteVersion) {
+    return createCoverageLookupResult(
+      CLOUDSMITH_COVERAGE_STATUS.UNRESOLVED,
+      null,
+      "No concrete dependency version is supported by the available resolution evidence."
+    );
   }
 
-  DependencyHealthProvider.packageIndexCache.set(cacheKey, {
-    expiresAt: Date.now() + PACKAGE_INDEX_TTL_MS,
-    value,
+  const endpoint = buildPackageLookupEndpoint(cloudsmithWorkspace, cloudsmithRepo);
+  const lookupNames = getDependencyLookupNames(dependency);
+  const format = canonicalFormat(dependency && (dependency.format || dependency.ecosystem));
+  if (
+    !endpoint
+    || !format
+    || lookupNames.length === 0
+    || !api
+    || typeof api.getWithHeaders !== "function"
+  ) {
+    return createCoverageLookupResult(
+      CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED,
+      null,
+      "The Cloudsmith package identity could not be constructed safely."
+    );
+  }
+
+  let pagesFetched = 0;
+  for (const lookupName of lookupNames) {
+    const query = new SearchQueryBuilder()
+      .format(format)
+      .name(lookupName)
+      .version(concreteVersion)
+      .build();
+    let page = 1;
+
+    while (true) {
+      if (token && token.isCancellationRequested) {
+        return createCoverageLookupResult(
+          CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE,
+          null,
+          "The Cloudsmith lookup was canceled before it completed.",
+          pagesFetched
+        );
+      }
+      if (pagesFetched >= LOOKUP_MAX_PAGES) {
+        return createCoverageLookupResult(
+          CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE,
+          null,
+          `The Cloudsmith lookup exceeded the ${LOOKUP_MAX_PAGES}-page safety limit.`,
+          pagesFetched
+        );
+      }
+      if (requestBudget && !requestBudget.tryConsume()) {
+        return createCoverageLookupResult(
+          CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE,
+          null,
+          "The scan-wide Cloudsmith lookup request budget was exhausted.",
+          pagesFetched
+        );
+      }
+
+      let response;
+      try {
+        response = await api.getWithHeaders(
+          `${endpoint}?page=${page}&page_size=${LOOKUP_PAGE_SIZE}&query=${encodeURIComponent(query)}`
+        );
+      } catch (error) {
+        const status = isRateLimitError(error)
+          ? CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED
+          : pagesFetched > 0
+            ? CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
+            : CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED;
+        return createCoverageLookupResult(
+          status,
+          null,
+          status === CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED
+            ? "Cloudsmith rate limited the dependency lookup."
+            : "The Cloudsmith lookup did not complete successfully.",
+          pagesFetched
+        );
+      }
+      if (token && token.isCancellationRequested) {
+        return createCoverageLookupResult(
+          CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE,
+          null,
+          "The Cloudsmith lookup was canceled before it completed.",
+          pagesFetched
+        );
+      }
+      if (typeof response === "string") {
+        const status = isRateLimitError(response)
+          ? CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED
+          : pagesFetched > 0
+            ? CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
+            : CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED;
+        return createCoverageLookupResult(
+          status,
+          null,
+          status === CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED
+            ? "Cloudsmith rate limited the dependency lookup."
+            : "The Cloudsmith lookup did not complete successfully.",
+          pagesFetched
+        );
+      }
+      if (!response || typeof response !== "object" || !Array.isArray(response.data)) {
+        return createCoverageLookupResult(
+          pagesFetched > 0
+            ? CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
+            : CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED,
+          null,
+          "Cloudsmith returned an unexpected dependency lookup response.",
+          pagesFetched
+        );
+      }
+
+      pagesFetched += 1;
+      const match = matchCoverageCandidates(response.data, dependency, concreteVersion);
+      if (match) {
+        return createCoverageLookupResult(
+          CLOUDSMITH_COVERAGE_STATUS.FOUND,
+          match,
+          null,
+          pagesFetched
+        );
+      }
+
+      const pagination = getLookupPaginationDirective(
+        response.headers,
+        page,
+        response.data.length,
+        LOOKUP_PAGE_SIZE
+      );
+      if (pagination === "incomplete") {
+        return createCoverageLookupResult(
+          CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE,
+          null,
+          "Cloudsmith did not provide enough pagination evidence to prove package absence.",
+          pagesFetched
+        );
+      }
+      if (pagination === "exhausted") {
+        break;
+      }
+      page += 1;
+    }
+  }
+
+  return createCoverageLookupResult(
+    CLOUDSMITH_COVERAGE_STATUS.ABSENT,
+    null,
+    null,
+    pagesFetched
+  );
+}
+
+function buildPackageLookupEndpoint(cloudsmithWorkspace, cloudsmithRepo) {
+  const workspace = nonEmptyString(cloudsmithWorkspace);
+  const repo = nonEmptyString(cloudsmithRepo);
+  if (!workspace || workspace === "." || workspace === ".." || repo === "." || repo === "..") {
+    return null;
+  }
+
+  return repo
+    ? `packages/${encodeURIComponent(workspace)}/${encodeURIComponent(repo)}/`
+    : `packages/${encodeURIComponent(workspace)}/`;
+}
+
+function getDependencyLookupNames(dependency) {
+  const format = canonicalFormat(dependency && (dependency.format || dependency.ecosystem));
+  const names = getCaseAwarePackageLookupKeys(dependency && dependency.name, format);
+  if (format !== "maven") {
+    return names;
+  }
+
+  return names.slice().sort((left, right) => {
+    const leftQualified = left.includes(":");
+    const rightQualified = right.includes(":");
+    return Number(rightQualified) - Number(leftQualified);
   });
+}
+
+function packageIdentityName(name, ecosystemOrFormat) {
+  const format = canonicalFormat(ecosystemOrFormat);
+  const rawName = sanitizePackageNameInput(name);
+  if (!rawName) {
+    return "";
+  }
+  return ["maven", "go"].includes(format)
+    ? rawName
+    : normalizePackageName(rawName, format);
+}
+
+function getCaseAwarePackageLookupKeys(name, ecosystemOrFormat) {
+  const format = canonicalFormat(ecosystemOrFormat);
+  const rawName = sanitizePackageNameInput(name);
+  if (!rawName) {
+    return [];
+  }
+  if (format === "maven") {
+    const separator = rawName.indexOf(":");
+    const artifact = separator === -1 ? rawName : rawName.slice(separator + 1);
+    return [...new Set([rawName, artifact].filter(Boolean))];
+  }
+  if (format === "go") {
+    return [rawName];
+  }
+  return getPackageLookupKeys(rawName, format);
+}
+
+function getCaseAwareCloudsmithPackageLookupKeys(candidate, ecosystemOrFormat) {
+  if (!candidate || typeof candidate !== "object") {
+    return [];
+  }
+  const format = canonicalFormat(ecosystemOrFormat || candidate.format || candidate.ecosystem);
+  const rawName = sanitizePackageNameInput(candidate.name);
+  if (!rawName) {
+    return [];
+  }
+  if (format === "maven") {
+    const keys = [rawName];
+    const identifiers = candidate.identifiers && typeof candidate.identifiers === "object"
+      ? candidate.identifiers
+      : {};
+    const groupId = sanitizePackageNameInput(identifiers.group_id);
+    if (groupId) {
+      keys.push(`${groupId}:${rawName}`);
+    }
+    return [...new Set(keys)];
+  }
+  if (format === "go") {
+    return [rawName];
+  }
+  return getCloudsmithPackageLookupKeys(candidate, format);
+}
+
+function getLookupPaginationDirective(headers, requestedPage, itemCount, requestedPageSize) {
+  const metadata = headers && typeof headers === "object" ? headers : {};
+  const currentPage = parseOptionalNonNegativeInteger(metadata.page);
+  if (currentPage.present && (!currentPage.valid || currentPage.value !== requestedPage)) {
+    return "incomplete";
+  }
+
+  const pageTotal = parseOptionalNonNegativeInteger(metadata.pageTotal);
+  const count = parseOptionalNonNegativeInteger(metadata.count);
+  const responsePageSize = parseOptionalNonNegativeInteger(metadata.pageSize);
+  if (count.present && (!count.valid || count.value < itemCount)) {
+    return "incomplete";
+  }
+  if (responsePageSize.present && (!responsePageSize.valid || responsePageSize.value < 1)) {
+    return "incomplete";
+  }
+  const effectivePageSize = responsePageSize.present
+    ? responsePageSize.value
+    : requestedPageSize;
+  if (itemCount > effectivePageSize) {
+    return "incomplete";
+  }
+  if (count.present) {
+    const expectedItemCount = Math.min(
+      effectivePageSize,
+      Math.max(0, count.value - ((requestedPage - 1) * effectivePageSize))
+    );
+    if (itemCount !== expectedItemCount) {
+      return "incomplete";
+    }
+  }
+
+  if (pageTotal.present) {
+    if (!pageTotal.valid || pageTotal.value < requestedPage) {
+      return pageTotal.valid && pageTotal.value === 0 && itemCount === 0
+        ? "exhausted"
+        : "incomplete";
+    }
+    if (count.present) {
+      const calculatedTotal = count.value === 0
+        ? 1
+        : Math.ceil(count.value / effectivePageSize);
+      if (
+        (count.value === 0 && itemCount !== 0)
+        || (count.value === 0 && pageTotal.value > 1)
+        || (count.value > 0 && calculatedTotal !== pageTotal.value)
+      ) {
+        return "incomplete";
+      }
+    }
+    return requestedPage >= pageTotal.value ? "exhausted" : "next";
+  }
+
+  if (count.present) {
+    const calculatedTotal = Math.ceil(count.value / effectivePageSize);
+    if (calculatedTotal < requestedPage) {
+      return count.value === 0 && itemCount === 0 && requestedPage === 1
+        ? "exhausted"
+        : "incomplete";
+    }
+    return requestedPage >= calculatedTotal ? "exhausted" : "next";
+  }
+
+  return "incomplete";
+}
+
+function parseOptionalNonNegativeInteger(value) {
+  if (value == null || value === "") {
+    return { present: false, valid: false, value: null };
+  }
+  const normalized = typeof value === "number" ? value : Number(String(value).trim());
+  return {
+    present: true,
+    valid: Number.isInteger(normalized) && normalized >= 0,
+    value: normalized,
+  };
+}
+
+function isRateLimitError(message) {
+  return /(?:response\s+status\s*:\s*|\b)429\b/i.test(String(message || ""));
+}
+
+function isAbsentCoverageStatus(status) {
+  return status === CLOUDSMITH_COVERAGE_STATUS.ABSENT || status === "NOT_FOUND";
+}
+
+function appendCoverageLookupWarnings(warnings, format, statusCounts) {
+  const unresolved = statusCounts.get(CLOUDSMITH_COVERAGE_STATUS.UNRESOLVED) || 0;
+  const failed = statusCounts.get(CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED) || 0;
+  const incomplete = statusCounts.get(CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE) || 0;
+  const rateLimited = statusCounts.get(CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED) || 0;
+
+  if (unresolved > 0) {
+    warnings.push(`${unresolved} ${format} dependencies were not checked because no concrete version was resolved.`);
+  }
+  if (failed > 0) {
+    warnings.push(`${failed} ${format} dependency lookups failed without proving package absence.`);
+  }
+  if (incomplete > 0) {
+    warnings.push(`${incomplete} ${format} dependency lookups were incomplete and were not reported as absent.`);
+  }
+  if (rateLimited > 0) {
+    warnings.push(`${rateLimited} ${format} dependency lookups were rate limited and were not reported as absent.`);
+  }
 }
 
 function normalizeTree(tree) {
@@ -1842,6 +2170,7 @@ function normalizeDependency(dependency, tree) {
       : [],
     cloudsmithStatus: dependency.cloudsmithStatus || null,
     cloudsmithPackage: dependency.cloudsmithPackage || null,
+    cloudsmithLookupDetail: dependency.cloudsmithLookupDetail || null,
     devDependency: Boolean(dependency.devDependency || dependency.isDevelopmentDependency),
     isDevelopmentDependency: Boolean(dependency.isDevelopmentDependency || dependency.devDependency),
     vulnerabilities: dependency.vulnerabilities || null,
@@ -1878,22 +2207,32 @@ function deduplicateDependenciesWithStatus(dependencies) {
 }
 
 function displayDependencyKey(dependency) {
-  return [
+  const format = canonicalFormat(dependency.format || dependency.ecosystem);
+  return JSON.stringify([
     dependency.sourceFile || "",
-    dependency.format || "",
-    dependency.name || "",
+    format,
+    packageIdentityName(dependency.name, format),
     dependency.version || "",
     dependency.isDirect ? "direct" : "transitive",
     (dependency.parentChain || []).join(">"),
-  ].join(":").toLowerCase();
+  ]);
 }
 
 function coverageLookupKey(dependency) {
-  return [
-    canonicalFormat(dependency.format || dependency.ecosystem),
-    normalizePackageName(dependency.name, dependency.format || dependency.ecosystem),
-    String(dependency.version || "").toLowerCase(),
-  ].join(":");
+  const format = canonicalFormat(dependency.format || dependency.ecosystem);
+  const concreteVersion = getConcreteDependencyVersion(dependency);
+  const versionIdentity = concreteVersion
+    ? ["exact", concreteVersion]
+    : [
+      "unresolved",
+      String(dependency.versionState || "legacy-unversioned"),
+      String(dependency.declaredConstraint || ""),
+    ];
+  return JSON.stringify([
+    format,
+    packageIdentityName(dependency.name, format),
+    ...versionIdentity,
+  ]);
 }
 
 function groupDependenciesByFormat(trees) {
@@ -1928,29 +2267,11 @@ function countCoverageDependencies(trees) {
     .reduce((count, dependencies) => count + uniqueDependenciesForCoverage(dependencies).length, 0);
 }
 
-function clearPackageIndexCache(workspace, repo, format) {
-  const workspaceKey = String(workspace || "").toLowerCase();
-  const repoKey = String(repo || "<all>").toLowerCase();
-  const formatKey = format ? String(canonicalFormat(format) || format).toLowerCase() : null;
-
-  for (const cacheKey of DependencyHealthProvider.packageIndexCache.keys()) {
-    if (!cacheKey.startsWith(`${workspaceKey}:${repoKey}:`)) {
-      continue;
-    }
-
-    if (formatKey && !cacheKey.endsWith(`:${formatKey}`)) {
-      continue;
-    }
-
-    DependencyHealthProvider.packageIndexCache.delete(cacheKey);
-  }
-}
-
 function buildPackageIndex(packages, format) {
   const index = new Map();
   for (const pkg of packages) {
-    const versionKey = String(pkg.version || "").toLowerCase();
-    for (const nameKey of getCloudsmithPackageLookupKeys(pkg, format)) {
+    const versionKey = String(pkg.version || "").trim();
+    for (const nameKey of getCaseAwareCloudsmithPackageLookupKeys(pkg, format)) {
       if (!index.has(nameKey)) {
         index.set(nameKey, new Map());
       }
@@ -1965,41 +2286,66 @@ function buildPackageIndex(packages, format) {
 }
 
 function findCoverageMatch(packageIndex, dependency) {
-  for (const lookupKey of getPackageLookupKeys(dependency.name, dependency.format)) {
+  const concreteVersion = getConcreteDependencyVersion(dependency);
+  if (!concreteVersion) {
+    return null;
+  }
+
+  for (const lookupKey of getCaseAwarePackageLookupKeys(dependency.name, dependency.format)) {
     const versions = packageIndex.get(lookupKey);
     if (!versions) {
       continue;
     }
-    const versionKey = String(dependency.version || "").toLowerCase();
-    if (versionKey && versions.has(versionKey)) {
-      return versions.get(versionKey)[0] || null;
-    }
-    const firstMatch = [...versions.values()][0];
-    if (firstMatch && firstMatch[0]) {
-      return firstMatch[0];
+    const versionKey = concreteVersion;
+    if (versions.has(versionKey)) {
+      const match = matchCoverageCandidates(versions.get(versionKey), dependency, concreteVersion);
+      if (match) {
+        return match;
+      }
     }
   }
   return null;
 }
 
-function matchCoverageCandidates(candidates, dependency) {
-  const dependencyKeys = getPackageLookupKeys(dependency.name, dependency.format);
-  let nameMatch = null;
+function matchCoverageCandidates(candidates, dependency, expectedVersion = getConcreteDependencyVersion(dependency)) {
+  if (!expectedVersion) {
+    return null;
+  }
 
-  for (const candidate of candidates) {
-    const candidateKeys = new Set(getCloudsmithPackageLookupKeys(candidate, dependency.format));
-    const nameMatches = dependencyKeys.some((key) => candidateKeys.has(key));
-    if (!nameMatches) {
+  const dependencyFormat = canonicalFormat(
+    dependency && (dependency.format || dependency.ecosystem)
+  );
+
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const candidateFormat = canonicalFormat(candidate && (candidate.format || candidate.ecosystem));
+    if (!dependencyFormat || candidateFormat !== dependencyFormat) {
       continue;
     }
-    if (!dependency.version || candidate.version === dependency.version) {
+    if (!packageNameMatchesDependency(candidate, dependency)) {
+      continue;
+    }
+    if (String(candidate.version || "").trim() === expectedVersion) {
       return candidate;
     }
-    if (!nameMatch) {
-      nameMatch = candidate;
-    }
   }
-  return nameMatch;
+  return null;
+}
+
+function packageNameMatchesDependency(candidate, dependency) {
+  const format = canonicalFormat(dependency && (dependency.format || dependency.ecosystem));
+  const dependencyName = packageIdentityName(dependency && dependency.name, format);
+  if (!dependencyName) {
+    return false;
+  }
+
+  if (format === "maven" && dependencyName.includes(":")) {
+    const candidateKeys = getCaseAwareCloudsmithPackageLookupKeys(candidate, format);
+    return candidateKeys.some((key) => key.includes(":") && key === dependencyName);
+  }
+
+  const dependencyKeys = getCaseAwarePackageLookupKeys(dependency && dependency.name, format);
+  const candidateKeys = new Set(getCaseAwareCloudsmithPackageLookupKeys(candidate, format));
+  return dependencyKeys.some((key) => candidateKeys.has(key));
 }
 
 function applyCoverageMatchBatchToTrees(trees, matchMap) {
@@ -2007,6 +2353,7 @@ function applyCoverageMatchBatchToTrees(trees, matchMap) {
     ...dependency,
     cloudsmithStatus: patch.cloudsmithStatus,
     cloudsmithPackage: patch.cloudsmithPackage,
+    cloudsmithLookupDetail: patch.cloudsmithLookupDetail,
     upstreamStatus: Object.prototype.hasOwnProperty.call(patch, "upstreamStatus")
       ? patch.upstreamStatus
       : dependency.upstreamStatus,
@@ -2088,8 +2435,9 @@ function markTreesAsChecking(trees) {
       () => true,
       (candidate) => ({
         ...candidate,
-        cloudsmithStatus: "CHECKING",
+        cloudsmithStatus: CLOUDSMITH_COVERAGE_STATUS.CHECKING,
         cloudsmithPackage: null,
+        cloudsmithLookupDetail: null,
         vulnerabilities: null,
         license: null,
         policy: null,
@@ -2193,18 +2541,18 @@ function compareDependencies(left, right, sortMode, preferDirect) {
 }
 
 function dependencyCoverageSortGroup(dependency) {
-  if (dependency.cloudsmithStatus === "NOT_FOUND") {
+  if (isAbsentCoverageStatus(dependency.cloudsmithStatus)) {
     return 0;
   }
-  if (dependency.cloudsmithStatus === "CHECKING") {
+  if (dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.CHECKING) {
     return 2;
   }
   return 1;
 }
 
 function dependencySeveritySortGroup(dependency) {
-  if (dependency.cloudsmithStatus !== "FOUND") {
-    return dependency.cloudsmithStatus === "NOT_FOUND" ? 5 : 6;
+  if (dependency.cloudsmithStatus !== CLOUDSMITH_COVERAGE_STATUS.FOUND) {
+    return isAbsentCoverageStatus(dependency.cloudsmithStatus) ? 5 : 6;
   }
 
   const policy = getDependencyPolicyData(dependency);
@@ -2291,12 +2639,13 @@ function annotateDuplicateWrappers(wrappers, seen, ancestry) {
 }
 
 function buildDuplicateKey(dependency) {
-  const name = String(dependency.name || "").trim().toLowerCase();
-  const version = String(dependency.version || "").trim().toLowerCase();
+  const format = canonicalFormat(dependency.format || dependency.ecosystem);
+  const name = packageIdentityName(dependency.name, format);
+  const version = String(dependency.version || "").trim();
   if (!name) {
     return null;
   }
-  return `${name}:${version}`;
+  return `${format}:${name}:${version}`;
 }
 
 function matchesFilter(dependency, filterMode) {
@@ -2312,7 +2661,7 @@ function matchesFilter(dependency, filterMode) {
     case FILTER_MODES.VULNERABLE:
       return Boolean(vulnerabilities && vulnerabilities.count > 0);
     case FILTER_MODES.UNCOVERED:
-      return dependency.cloudsmithStatus === "NOT_FOUND";
+      return isAbsentCoverageStatus(dependency.cloudsmithStatus);
     case FILTER_MODES.RESTRICTIVE_LICENSE:
       return licenseClassification === "restrictive";
     case FILTER_MODES.POLICY_VIOLATION:
@@ -2348,14 +2697,21 @@ function buildDependencySummary(fullTrees, displayTrees, options = {}) {
     ecosystems[tree.ecosystem] = (ecosystems[tree.ecosystem] || 0) + tree.dependencies.length;
   }
 
-  const found = summaryDependencies.filter((dependency) => dependency.cloudsmithStatus === "FOUND").length;
-  const notFound = summaryDependencies.filter((dependency) => dependency.cloudsmithStatus === "NOT_FOUND").length;
-  const checking = summaryDependencies.filter((dependency) => dependency.cloudsmithStatus === "CHECKING").length;
+  const found = summaryDependencies.filter((dependency) => dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.FOUND).length;
+  const notFound = summaryDependencies.filter((dependency) => isAbsentCoverageStatus(dependency.cloudsmithStatus)).length;
+  const checking = summaryDependencies.filter((dependency) => dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.CHECKING).length;
+  const unresolved = summaryDependencies.filter((dependency) => dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.UNRESOLVED).length;
+  const lookupFailed = summaryDependencies.filter((dependency) => dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED).length;
+  const lookupIncomplete = summaryDependencies.filter((dependency) => (
+    dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
+    || dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED
+  )).length;
+  const rateLimited = summaryDependencies.filter((dependency) => dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED).length;
   const reachableViaUpstream = summaryDependencies.filter((dependency) => (
-    dependency.cloudsmithStatus === "NOT_FOUND" && dependency.upstreamStatus === "reachable"
+    isAbsentCoverageStatus(dependency.cloudsmithStatus) && dependency.upstreamStatus === "reachable"
   )).length;
   const unreachableViaUpstream = summaryDependencies.filter((dependency) => (
-    dependency.cloudsmithStatus === "NOT_FOUND"
+    isAbsentCoverageStatus(dependency.cloudsmithStatus)
     && (dependency.upstreamStatus === "no_proxy" || dependency.upstreamStatus === "unreachable")
   )).length;
   const vulnerable = summaryDependencies.filter((dependency) => {
@@ -2407,6 +2763,10 @@ function buildDependencySummary(fullTrees, displayTrees, options = {}) {
     transitive: fullDependencies.length - direct,
     found,
     notFound,
+    unresolved,
+    lookupFailed,
+    lookupIncomplete,
+    rateLimited,
     reachableViaUpstream,
     unreachableViaUpstream,
     ecosystems,
@@ -2435,6 +2795,10 @@ function emptySummary() {
     transitive: 0,
     found: 0,
     notFound: 0,
+    unresolved: 0,
+    lookupFailed: 0,
+    lookupIncomplete: 0,
+    rateLimited: 0,
     reachableViaUpstream: 0,
     unreachableViaUpstream: 0,
     ecosystems: {},
@@ -2680,7 +3044,7 @@ function buildComplianceReportData(projectName, dependencies, options = {}) {
     .sort(compareCompliancePolicyRows);
 
   const uncoveredDeps = uniqueDependencies
-    .filter((dependency) => dependency.cloudsmithStatus === "NOT_FOUND")
+    .filter((dependency) => isAbsentCoverageStatus(dependency.cloudsmithStatus))
     .map((dependency) => ({
       name: dependency.name,
       version: dependency.version || "",
@@ -2692,8 +3056,14 @@ function buildComplianceReportData(projectName, dependencies, options = {}) {
 
   const total = uniqueDependencies.length;
   const direct = uniqueDependencies.filter((dependency) => dependency.isDirect).length;
-  const found = uniqueDependencies.filter((dependency) => dependency.cloudsmithStatus === "FOUND").length;
-  const notFound = uniqueDependencies.filter((dependency) => dependency.cloudsmithStatus === "NOT_FOUND").length;
+  const found = uniqueDependencies.filter((dependency) => dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.FOUND).length;
+  const notFound = uniqueDependencies.filter((dependency) => isAbsentCoverageStatus(dependency.cloudsmithStatus)).length;
+  const unresolved = uniqueDependencies.filter((dependency) => dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.UNRESOLVED).length;
+  const lookupFailed = uniqueDependencies.filter((dependency) => dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED).length;
+  const lookupIncomplete = uniqueDependencies.filter((dependency) => (
+    dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
+    || dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED
+  )).length;
   const upstreamReachable = uncoveredDeps.filter((dependency) => dependency.upstreamStatus === "reachable").length;
   const upstreamNoProxy = uncoveredDeps.filter((dependency) => dependency.upstreamStatus === "no_proxy").length;
   const upstreamUnreachable = uncoveredDeps.filter((dependency) => dependency.upstreamStatus === "unreachable").length;
@@ -2707,6 +3077,9 @@ function buildComplianceReportData(projectName, dependencies, options = {}) {
       transitive: Math.max(total - direct, 0),
       found,
       notFound,
+      unresolved,
+      lookupFailed,
+      lookupIncomplete,
       coveragePct: total === 0 ? 0 : Math.round((found / total) * 100),
       vulnCount: vulnerableDeps.length,
       criticalCount: severityCounts.Critical || 0,
@@ -2744,19 +3117,49 @@ function dedupeComplianceDependencies(dependencies) {
 }
 
 function complianceDependencyKey(dependency) {
+  const format = canonicalFormat(dependency.format || dependency.ecosystem);
+  return JSON.stringify([
+    format,
+    packageIdentityName(dependency.name, format),
+    String(dependency.declarationName || dependency.name || ""),
+    String(dependency.versionState || ""),
+    String(dependency.resolvedVersion || ""),
+    String(dependency.declaredConstraint || ""),
+    String(dependency.legacyVersion || dependency.version || ""),
+    complianceSourceIdentity(dependency.sourceManifest),
+    complianceSourceIdentity(dependency.resolutionSource),
+    String(dependency.sourceFile || ""),
+    String(dependency.environmentMarker || ""),
+    dependency.isDirect ? "direct" : "transitive",
+    dependency.isDevelopmentDependency ? "development" : "runtime",
+    String(dependency.parent || ""),
+    Array.isArray(dependency.parentChain) ? dependency.parentChain : [],
+  ]);
+}
+
+function complianceSourceIdentity(source) {
+  if (!source || typeof source !== "object") {
+    return null;
+  }
   return [
-    String(dependency.format || dependency.ecosystem || "").toLowerCase(),
-    String(dependency.name || "").toLowerCase(),
-    String(dependency.version || "").toLowerCase(),
-  ].join(":");
+    String(source.kind || ""),
+    String(source.uri || source.filePath || ""),
+    source.range || null,
+  ];
 }
 
 function mergeComplianceDependency(existing, candidate) {
+  const cloudsmithStatus = pickBetterCoverageStatus(
+    existing.cloudsmithStatus,
+    candidate.cloudsmithStatus
+  );
   return {
     ...existing,
     isDirect: Boolean(existing.isDirect || candidate.isDirect),
-    cloudsmithStatus: pickBetterCoverageStatus(existing.cloudsmithStatus, candidate.cloudsmithStatus),
-    cloudsmithPackage: existing.cloudsmithPackage || candidate.cloudsmithPackage || null,
+    cloudsmithStatus,
+    cloudsmithPackage: cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.FOUND
+      ? existing.cloudsmithPackage || candidate.cloudsmithPackage || null
+      : null,
     vulnerabilities: pickRicherVulnerabilityData(existing.vulnerabilities, candidate.vulnerabilities),
     license: existing.license || candidate.license || null,
     policy: pickRicherPolicyData(existing.policy, candidate.policy),
@@ -2767,9 +3170,14 @@ function mergeComplianceDependency(existing, candidate) {
 
 function pickBetterCoverageStatus(left, right) {
   const priorities = {
-    FOUND: 3,
+    FOUND: 8,
+    RATE_LIMITED: 7,
+    LOOKUP_INCOMPLETE: 6,
+    LOOKUP_FAILED: 5,
+    UNRESOLVED: 4,
+    CHECKING: 3,
+    ABSENT: 2,
     NOT_FOUND: 2,
-    CHECKING: 1,
   };
   const leftPriority = priorities[left] || 0;
   const rightPriority = priorities[right] || 0;
@@ -2932,7 +3340,7 @@ function buildDependencyHealthReport(projectName, dependencies, summary, generat
     .filter((dependency) => dependency.vulnerabilities && dependency.vulnerabilities.count > 0)
     .sort((left, right) => compareDependencies(left, right, SORT_MODES.SEVERITY, false));
   const uncoveredDependencies = dependencies
-    .filter((dependency) => dependency.cloudsmithStatus === "NOT_FOUND")
+    .filter((dependency) => isAbsentCoverageStatus(dependency.cloudsmithStatus))
     .sort((left, right) => compareDependencies(left, right, SORT_MODES.COVERAGE, false));
   const policyViolations = dependencies
     .filter((dependency) => dependency.policy && dependency.policy.violated)
@@ -3096,6 +3504,7 @@ function getDependencyLicenseClassification(dependency) {
 }
 
 module.exports = {
+  CLOUDSMITH_COVERAGE_STATUS,
   DependencyHealthProvider,
   FILTER_MODES,
   SCAN_STATES,
@@ -3106,7 +3515,11 @@ module.exports = {
   buildFilteredTreeWrapper,
   buildPackageIndex,
   findCoverageMatch,
+  getConcreteDependencyVersion,
   getFilterLabel,
+  getLookupPaginationDirective,
+  lookupExactDependency,
   matchesFilter,
   matchCoverageCandidates,
+  packageNameMatchesDependency,
 };

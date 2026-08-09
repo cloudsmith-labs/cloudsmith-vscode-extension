@@ -60,11 +60,13 @@ suite("dependencyRecord", () => {
       ecosystem: "npm",
       format: "npm",
       name: "package-a",
+      declarationName: "package-alias",
       declaredConstraint: "^1.2.3",
       resolvedVersion: "1.7.4",
       versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
       resolutionSource: lockfileSource,
       sourceManifest: manifestSource,
+      environmentMarker: "node_version >= '20'",
       isDirect: true,
       isDevelopmentDependency: false,
       parent: "fixture-app",
@@ -84,11 +86,13 @@ suite("dependencyRecord", () => {
     assert.strictEqual(dependency.format, "npm");
     assert.strictEqual(dependency.name, "package-a");
     assert.strictEqual(dependency.normalizedName, "package-a");
+    assert.strictEqual(dependency.declarationName, "package-alias");
     assert.strictEqual(dependency.declaredConstraint, "^1.2.3");
     assert.strictEqual(dependency.resolvedVersion, "1.7.4");
     assert.strictEqual(dependency.versionState, DEPENDENCY_VERSION_STATES.RESOLVED);
     assert.strictEqual(dependency.resolutionSource.kind, RESOLUTION_SOURCE_KINDS.LOCKFILE);
     assert.strictEqual(dependency.sourceManifest.kind, RESOLUTION_SOURCE_KINDS.MANIFEST);
+    assert.strictEqual(dependency.environmentMarker, "node_version >= '20'");
     assert.strictEqual(dependency.isDirect, true);
     assert.strictEqual(dependency.isDevelopmentDependency, false);
     assert.strictEqual(dependency.parent, "fixture-app");
@@ -251,6 +255,37 @@ suite("dependencyRecord", () => {
       ["1.0.0", "2.0.0"]
     );
     assert.notStrictEqual(versionOne.sourceManifest.uri, secondManifestVersionOne.sourceManifest.uri);
+  });
+
+  test("preserves case-sensitive Maven and Go occurrence identities", () => {
+    const upperGo = createDependencyRecord({
+      ecosystem: "go",
+      name: "example.com/Owner/Module",
+      declaredConstraint: "v1.0.0",
+      versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
+      legacyVersion: "v1.0.0",
+    });
+    const lowerGo = createDependencyRecord({
+      ecosystem: "go",
+      name: "example.com/owner/module",
+      declaredConstraint: "v1.0.0",
+      versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
+      legacyVersion: "v1.0.0",
+    });
+    const upperMaven = createDependencyRecord({
+      ecosystem: "maven",
+      name: "Com.Example:Library",
+      declaredConstraint: "1.0.0",
+      versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
+      legacyVersion: "1.0.0",
+    });
+
+    assert.strictEqual(upperGo.normalizedName, "example.com/Owner/Module");
+    assert.strictEqual(upperMaven.normalizedName, "Com.Example:Library");
+    assert.notStrictEqual(
+      getDependencyOccurrenceKey(upperGo),
+      getDependencyOccurrenceKey(lowerGo)
+    );
   });
 
   test("includes declaration ranges, resolution sources, and parent paths in occurrence identity", () => {

@@ -60,7 +60,7 @@ const swiftParser = {
     const manifestDirectNames = manifestPath && await pathExists(manifestPath, workspaceFolder)
       ? new Set(parsePackageSwiftManifest(await readUtf8(manifestPath, workspaceFolder)).map((dependency) => dependency.name))
       : new Set();
-    const root = await readJson(lockfilePath);
+    const root = await readJson(lockfilePath, workspaceFolder);
     const pins = Array.isArray(root.pins)
       ? root.pins
       : (root.object && Array.isArray(root.object.pins) ? root.object.pins : []);
@@ -71,17 +71,23 @@ const swiftParser = {
     return buildTree("swift", sourceFile, pins.map((pin) => {
       const state = pin.state || {};
       const identity = normalizeSwiftIdentity(pin.identity || pin.package || pin.location || "");
-      return createDependency({
-        name: identity,
-        version: state.version || state.revision || state.branch || "",
-        ecosystem: "swift",
-        isDirect: manifestDirectNames.size === 0 || manifestDirectNames.has(identity),
-        parent: null,
-        parentChain: [],
-        transitives: [],
-        sourceFile,
-        isDevelopmentDependency: false,
-      });
+      return {
+        ...createDependency({
+          name: identity,
+          // A branch or commit revision is concrete source-control evidence,
+          // but it is not a package version that can be matched as such.
+          version: state.version || "",
+          ecosystem: "swift",
+          isDirect: manifestDirectNames.size === 0 || manifestDirectNames.has(identity),
+          parent: null,
+          parentChain: [],
+          transitives: [],
+          sourceFile,
+          isDevelopmentDependency: false,
+        }),
+        sourceRevision: state.revision || null,
+        sourceBranch: state.branch || null,
+      };
     }));
   },
 };

@@ -14,6 +14,10 @@ class DependencySummaryNode {
       ecosystems: {},
       coveragePercent: 0,
       checking: 0,
+      unresolved: 0,
+      lookupFailed: 0,
+      lookupIncomplete: 0,
+      rateLimited: 0,
       vulnerable: 0,
       severityCounts: {},
       restrictiveLicenses: 0,
@@ -91,6 +95,18 @@ function buildSecondaryLabel(summary) {
     parts.push(upstreamParts.join(" · "));
   }
 
+  if (summary.unresolved > 0) {
+    parts.push(`${summary.unresolved} unresolved versions`);
+  }
+
+  if (summary.lookupFailed > 0) {
+    parts.push(`${summary.lookupFailed} lookup failures`);
+  }
+
+  if (summary.lookupIncomplete > 0) {
+    parts.push(`${summary.lookupIncomplete} incomplete lookups`);
+  }
+
   if (parts.length > 0) {
     return parts.join(" · ");
   }
@@ -119,6 +135,9 @@ function buildTooltip(summary) {
     `${summary.transitive} transitive`,
     `${summary.found} covered in Cloudsmith`,
     `${summary.notFound} not found`,
+    `${summary.unresolved} unresolved`,
+    `${summary.lookupFailed} lookup failures`,
+    `${summary.lookupIncomplete} incomplete lookups`,
     `${summary.coveragePercent}% coverage`,
   ];
 

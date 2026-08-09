@@ -48,6 +48,10 @@ function normalizePackageName(name, ecosystemOrFormat) {
     return rawName.toLowerCase().replace(/[-_.]+/g, "-");
   }
 
+  if (format === "maven" || format === "go") {
+    return rawName;
+  }
+
   return rawName.toLowerCase();
 }
 
