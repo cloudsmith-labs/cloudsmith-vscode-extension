@@ -543,7 +543,16 @@ suite("DiagnosticsPublisher Test Suite", () => {
       start: { line: 1, character: 21 },
       end: { line: 1, character: 27 },
     });
-    const { publisher, reads } = createMemoryPublisher(new Map([[filePath, content]]));
+    let buildIndexCalls = 0;
+    const { publisher, reads } = createMemoryPublisher(
+      new Map([[filePath, content]]),
+      {
+        buildIndex() {
+          buildIndexCalls += 1;
+          throw new Error("exact provenance must not require declaration indexing");
+        },
+      }
+    );
     const prepared = await publisher.prepare({
       workspaceFolder: "/project",
       candidates: [
@@ -553,11 +562,151 @@ suite("DiagnosticsPublisher Test Suite", () => {
     });
 
     assert.strictEqual(reads.length, 1);
+    assert.strictEqual(buildIndexCalls, 0);
     assert.strictEqual(prepared.entries[0][1].length, 2);
     assert.deepStrictEqual(
       prepared.entries[0][1].map((diagnostic) => diagnostic.range.start.character),
       [21, 21]
     );
+    assert.strictEqual(prepared.stats.indexedSources, 0);
+    assert.strictEqual(prepared.stats.truncatedSourceIndexes, 0);
+    assert.strictEqual(prepared.stats.exactRanges, 2);
+  });
+
+  test("rejects invalid exact provenance ranges without declaration indexing", async () => {
+    const filePath = "/project/package.json";
+    let buildIndexCalls = 0;
+    const { publisher } = createMemoryPublisher(
+      new Map([[filePath, '{"dependencies":{"alpha":"1.0.0"}}']]),
+      {
+        buildIndex() {
+          buildIndexCalls += 1;
+          throw new Error("invalid exact provenance must fail before declaration indexing");
+        },
+      }
+    );
+
+    await assert.rejects(
+      publisher.prepare({
+        workspaceFolder: "/project",
+        candidates: [candidate({
+          name: "alpha",
+          manifest: source(filePath, "package.json", {
+            start: { line: 4, character: 0 },
+            end: { line: 4, character: 5 },
+          }),
+        })],
+      }),
+      /source range exceeds its source file/
+    );
+    assert.strictEqual(buildIndexCalls, 0);
+  });
+
+  test("keeps exact provenance diagnostics when their JSON source is malformed", async () => {
+    const filePath = "/project/package.json";
+    const content = "{not-json";
+    let buildIndexCalls = 0;
+    const { publisher } = createMemoryPublisher(
+      new Map([[filePath, content]]),
+      {
+        buildIndex(options) {
+          buildIndexCalls += 1;
+          return buildDependencyDeclarationIndex(options);
+        },
+      }
+    );
+    const prepared = await publisher.prepare({
+      workspaceFolder: "/project",
+      candidates: [candidate({
+        name: "not",
+        manifest: source(filePath, "package.json", {
+          start: { line: 0, character: 1 },
+          end: { line: 0, character: 4 },
+        }),
+      })],
+    });
+
+    assert.strictEqual(buildIndexCalls, 0);
+    assert.strictEqual(prepared.stats.indexedSources, 0);
+    assert.strictEqual(prepared.stats.truncatedSourceIndexes, 0);
+    assert.strictEqual(prepared.stats.diagnostics, 1);
+    assert.strictEqual(highlightedText(content, prepared.entries[0][1][0]), "not");
+  });
+
+  test("validates exact provenance source contracts without declaration indexing", async () => {
+    const filePath = "/project/package.json";
+    let buildIndexCalls = 0;
+    const { publisher } = createMemoryPublisher(
+      new Map([[filePath, '{"dependencies":{"alpha":"1.0.0"}}']]),
+      {
+        buildIndex() {
+          buildIndexCalls += 1;
+          throw new Error("exact provenance must not require declaration indexing");
+        },
+      }
+    );
+
+    await assert.rejects(
+      publisher.prepare({
+        workspaceFolder: "/project",
+        candidates: [candidate({
+          ecosystem: "maven",
+          name: "alpha",
+          manifest: source(filePath, "package.json", {
+            start: { line: 0, character: 18 },
+            end: { line: 0, character: 23 },
+          }),
+        })],
+      }),
+      /source type package\.json is incompatible with ecosystem maven/
+    );
+    assert.strictEqual(buildIndexCalls, 0);
+  });
+
+  test("indexes only missing provenance once for a mixed source", async () => {
+    const filePath = "/project/package.json";
+    const content = [
+      "{",
+      '  "dependencies": {',
+      '    "exact-package": "1.0.0",',
+      '    "indexed-package": "2.0.0"',
+      "  }",
+      "}",
+    ].join("\n");
+    let buildIndexCalls = 0;
+    let indexedNames = null;
+    const { publisher } = createMemoryPublisher(
+      new Map([[filePath, content]]),
+      {
+        buildIndex(options) {
+          buildIndexCalls += 1;
+          indexedNames = options.wantedNames.slice();
+          return buildDependencyDeclarationIndex(options);
+        },
+      }
+    );
+    const prepared = await publisher.prepare({
+      workspaceFolder: "/project",
+      candidates: [
+        candidate({
+          name: "exact-package",
+          manifest: source(filePath, "package.json", {
+            start: { line: 2, character: 5 },
+            end: { line: 2, character: 18 },
+          }),
+        }),
+        candidate({ name: "indexed-package", manifest: source(filePath) }),
+      ],
+    });
+    const diagnostics = prepared.entries[0][1];
+
+    assert.strictEqual(buildIndexCalls, 1);
+    assert.deepStrictEqual(indexedNames, ["indexed-package"]);
+    assert.strictEqual(prepared.stats.indexedSources, 1);
+    assert.strictEqual(prepared.stats.truncatedSourceIndexes, 0);
+    assert.strictEqual(prepared.stats.diagnostics, 2);
+    assert.strictEqual(highlightedText(content, diagnostics[0]), "exact-package");
+    assert.strictEqual(highlightedText(content, diagnostics[1]), "indexed-package");
   });
 
   test("uses a correct file-level fallback for unsupported precise locations", async () => {
@@ -655,10 +804,20 @@ suite("DiagnosticsPublisher Test Suite", () => {
       candidates.push(candidate({ name, manifest }));
     }
     const content = JSON.stringify({ dependencies });
-    const { publisher, reads } = createMemoryPublisher(new Map([[filePath, content]]));
+    let buildIndexCalls = 0;
+    const { publisher, reads } = createMemoryPublisher(
+      new Map([[filePath, content]]),
+      {
+        buildIndex(options) {
+          buildIndexCalls += 1;
+          return buildDependencyDeclarationIndex(options);
+        },
+      }
+    );
     const prepared = await publisher.prepare({ workspaceFolder: "/project", candidates });
 
     assert.strictEqual(reads.length, 1);
+    assert.strictEqual(buildIndexCalls, 1);
     assert.strictEqual(prepared.stats.sourceReads, 1);
     assert.strictEqual(prepared.stats.indexedSources, 1);
     assert.strictEqual(prepared.stats.diagnostics, 1000);
@@ -720,7 +879,16 @@ suite("DiagnosticsPublisher Test Suite", () => {
       { length: 10001 },
       (_, index) => `repeated-package==${index}`
     ).join("\n");
-    const { publisher, reads } = createMemoryPublisher(new Map([[filePath, content]]));
+    let buildIndexCalls = 0;
+    const { publisher, reads } = createMemoryPublisher(
+      new Map([[filePath, content]]),
+      {
+        buildIndex(options) {
+          buildIndexCalls += 1;
+          return buildDependencyDeclarationIndex(options);
+        },
+      }
+    );
     const prepared = await publisher.prepare({
       workspaceFolder: "/project",
       candidates: [candidate({
@@ -733,6 +901,7 @@ suite("DiagnosticsPublisher Test Suite", () => {
     const range = prepared.entries[0][1][0].range;
 
     assert.strictEqual(reads.length, 1);
+    assert.strictEqual(buildIndexCalls, 1);
     assert.deepStrictEqual(
       [range.start.line, range.start.character, range.end.line, range.end.character],
       [0, 0, 0, 0]
