@@ -12,6 +12,7 @@ const {
   buildDependencyDeclarationIndex,
   findDependencyDeclarationOffsets,
   offsetRangesToSourceRanges,
+  validateDependencyDeclarationSourceContract,
   validateSourceRanges,
 } = require("./dependencyDeclarationIndex");
 const { readUtf8 } = require("./lockfileParsers/shared");
@@ -254,31 +255,40 @@ class DiagnosticsPublisher {
       if (typeof content !== "string") {
         throw new TypeError("Dependency source readers must return UTF-8 text.");
       }
+      validateDependencyDeclarationSourceContract(
+        group.source.type,
+        group.indexingContract.ecosystem
+      );
 
       const rangedCandidates = group.candidates.filter((candidate) => (
         candidate.occurrence.sourceManifest.range
       ));
-      validateSourceRanges(
-        content,
-        rangedCandidates.map((candidate) => candidate.occurrence.sourceManifest.range),
-        isCancelled
-      );
+      if (rangedCandidates.length > 0) {
+        validateSourceRanges(
+          content,
+          rangedCandidates.map((candidate) => candidate.occurrence.sourceManifest.range),
+          isCancelled
+        );
+      }
       const candidatesNeedingIndex = group.candidates.filter((candidate) => (
         !candidate.occurrence.sourceManifest.range
       ));
-      const wantedNames = candidatesNeedingIndex.map((candidate) => (
-        candidate.occurrence.declarationName
-      ));
-      const index = this._buildIndex({
-        content,
-        sourceType: group.source.type,
-        ecosystem: group.indexingContract.ecosystem,
-        wantedNames,
-        shouldCancel: isCancelled,
-      });
-      indexedSources += 1;
-      if (index.truncated) {
-        truncatedSourceIndexes += 1;
+      let index = null;
+      if (candidatesNeedingIndex.length > 0) {
+        const wantedNames = candidatesNeedingIndex.map((candidate) => (
+          candidate.occurrence.declarationName
+        ));
+        index = this._buildIndex({
+          content,
+          sourceType: group.source.type,
+          ecosystem: group.indexingContract.ecosystem,
+          wantedNames,
+          shouldCancel: isCancelled,
+        });
+        indexedSources += 1;
+        if (index.truncated) {
+          truncatedSourceIndexes += 1;
+        }
       }
 
       const plans = [];
@@ -293,6 +303,9 @@ class DiagnosticsPublisher {
           continue;
         }
 
+        if (!index) {
+          throw new TypeError("A dependency declaration index is required for missing source ranges.");
+        }
         const offsets = findDependencyDeclarationOffsets(index, candidate.occurrence);
         if (offsets.length === 0) {
           plans.push({ candidate, range: fileLevelRange(), precision: "file" });

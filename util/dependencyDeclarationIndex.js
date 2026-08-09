@@ -43,16 +43,9 @@ function buildDependencyDeclarationIndex({
   maxDeclarations = MAX_INDEXED_DECLARATIONS,
 }) {
   const text = String(content || "");
-  const rawEcosystem = String(ecosystem || "").trim().toLowerCase();
-  const format = canonicalFormat(ecosystem);
-  const normalizedType = String(sourceType || "").trim().toLowerCase();
-  const requiredEcosystem = EXACT_SOURCE_ECOSYSTEMS.get(normalizedType);
-  if (requiredEcosystem && rawEcosystem !== requiredEcosystem) {
-    throw new DependencyDeclarationIndexError(
-      `Dependency source type ${normalizedType} is incompatible with ecosystem ${rawEcosystem || "<missing>"}.`,
-      "ERR_DEPENDENCY_DECLARATION_SOURCE_CONTRACT"
-    );
-  }
+  const contract = validateDependencyDeclarationSourceContract(sourceType, ecosystem);
+  const format = contract.format;
+  const normalizedType = contract.sourceType;
   const wantedKeys = new Set();
   for (const name of Array.isArray(wantedNames) ? wantedNames : []) {
     const key = declarationKey(name, format);
@@ -114,6 +107,25 @@ function buildDependencyDeclarationIndex({
     bySelector: state.bySelector,
     truncated: state.truncated,
     declarationCount: state.count,
+  });
+}
+
+/** Validate source/ecosystem compatibility without parsing the source text. */
+function validateDependencyDeclarationSourceContract(sourceType, ecosystem) {
+  const normalizedType = String(sourceType || "").trim().toLowerCase();
+  const normalizedEcosystem = String(ecosystem || "").trim().toLowerCase();
+  const format = canonicalFormat(normalizedEcosystem);
+  const requiredEcosystem = EXACT_SOURCE_ECOSYSTEMS.get(normalizedType);
+  if (requiredEcosystem && normalizedEcosystem !== requiredEcosystem) {
+    throw new DependencyDeclarationIndexError(
+      `Dependency source type ${normalizedType} is incompatible with ecosystem ${normalizedEcosystem || "<missing>"}.`,
+      "ERR_DEPENDENCY_DECLARATION_SOURCE_CONTRACT"
+    );
+  }
+  return Object.freeze({
+    sourceType: normalizedType,
+    ecosystem: normalizedEcosystem,
+    format,
   });
 }
 
@@ -1126,5 +1138,6 @@ module.exports = {
   buildDependencyDeclarationIndex,
   findDependencyDeclarationOffsets,
   offsetRangesToSourceRanges,
+  validateDependencyDeclarationSourceContract,
   validateSourceRanges,
 };
