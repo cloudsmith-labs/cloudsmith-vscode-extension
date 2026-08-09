@@ -20,11 +20,13 @@ class DependencyHealthNode {
     this.context = hasExplicitCloudsmithMatch ? maybeContext : cloudsmithMatchOrContext;
     this.options = hasExplicitCloudsmithMatch ? (maybeOptions || {}) : (maybeContext || {});
     this.name = dep.name;
+    this.declarationName = dep.declarationName || dep.name;
     this.declaredConstraint = dep.declaredConstraint || null;
     this.resolvedVersion = dep.resolvedVersion || null;
     this.versionState = dep.versionState || null;
     this.resolutionSource = dep.resolutionSource || null;
     this.sourceManifest = dep.sourceManifest || null;
+    this.environmentMarker = dep.environmentMarker || null;
     this.normalizedName = dep.normalizedName || null;
     this.cloudsmithLookupDetail = dep.cloudsmithLookupDetail || null;
     this.legacyVersion = Object.prototype.hasOwnProperty.call(dep, "legacyVersion")
@@ -39,6 +41,7 @@ class DependencyHealthNode {
     this.ecosystem = dep.ecosystem || this.format;
     this.sourceFile = dep.sourceFile || null;
     this.isDev = Boolean(dep.devDependency || dep.isDevelopmentDependency);
+    this.isDevelopmentDependency = this.isDev;
     this.isDirect = dep.isDirect !== false;
     this.parent = dep.parent || (Array.isArray(dep.parentChain) ? dep.parentChain[dep.parentChain.length - 1] : null);
     this.parentChain = Array.isArray(dep.parentChain) ? dep.parentChain.slice() : [];

@@ -6,7 +6,14 @@ const {
   ADAPTER_RESULT_STATUSES,
   createDefaultDependencyAdapterRegistry,
 } = require("../util/dependencyAdapterRegistry");
-const { DEPENDENCY_VERSION_STATES } = require("../util/dependencyRecord");
+const {
+  DEPENDENCY_VERSION_STATES,
+  getDependencyOccurrenceKey,
+} = require("../util/dependencyRecord");
+const {
+  MAX_DIAGNOSTIC_OCCURRENCES,
+  createDiagnosticCandidate,
+} = require("../util/diagnosticsPublisher");
 const { PaginatedFetch } = require("../util/paginatedFetch");
 const { SearchQueryBuilder } = require("../util/searchQueryBuilder");
 const { LicenseClassifier } = require("../util/licenseClassifier");
@@ -436,7 +443,10 @@ class DependencyHealthProvider {
         return { status: SCAN_STATES.CANCELLED };
       }
 
-      const preparedDiagnostics = await this._prepareDiagnostics(scanWorker);
+      const preparedDiagnostics = await this._prepareDiagnostics(
+        scanWorker,
+        cancellationSource.token
+      );
       if (!this._isCurrentScan(operationId)) {
         return { status: "superseded" };
       }
@@ -448,7 +458,7 @@ class DependencyHealthProvider {
       }
 
       if (this._diagnosticsPublisher) {
-        this._diagnosticsPublisher.replace(preparedDiagnostics);
+        this._diagnosticsPublisher.replace(preparedDiagnostics.entries);
       }
       this._commitSuccessfulScan(scanWorker, scope, operationId);
       await this._updateContexts();
@@ -556,17 +566,51 @@ class DependencyHealthProvider {
     });
   }
 
-  async _prepareDiagnostics(scanState) {
+  async _prepareDiagnostics(scanState, cancellationToken) {
     if (!this._diagnosticsPublisher) {
-      return [];
+      return { entries: [], warnings: [], stats: null };
     }
 
-    const diagnosticNodes = scanState._fullTrees
-      .flatMap((tree) => tree.dependencies)
-      .filter((dependency) => dependency.isDirect)
-      .map((dependency) => new DependencyHealthNode(dependency, null, this.context));
+    const candidates = [];
+    let examinedDirectDependencies = 0;
+    let candidateLimitReached = false;
+    outer: for (const tree of scanState._fullTrees) {
+      for (const dependency of Array.isArray(tree.dependencies) ? tree.dependencies : []) {
+        if (!dependency || dependency.isDirect !== true) {
+          continue;
+        }
+        if (examinedDirectDependencies >= MAX_DIAGNOSTIC_OCCURRENCES) {
+          candidateLimitReached = true;
+          break outer;
+        }
+        examinedDirectDependencies += 1;
+        const healthNode = new DependencyHealthNode(dependency, null, this.context);
+        if (!["quarantined", "violated", "not_found"].includes(healthNode.state)) {
+          continue;
+        }
+        candidates.push(createDiagnosticCandidate(dependency, {
+          state: healthNode.state,
+          displayVersion: healthNode.declaredVersion || null,
+          cloudsmithMatch: healthNode.cloudsmithMatch || null,
+        }));
+      }
+    }
+    if (candidateLimitReached) {
+      appendUniqueWarning(
+        scanState._warnings,
+        `Dependency diagnostic evaluation was capped at ${MAX_DIAGNOSTIC_OCCURRENCES} direct occurrences; dependency health results remain complete.`
+      );
+    }
 
-    return this._diagnosticsPublisher.prepare(scanState._lastManifests, diagnosticNodes);
+    const prepared = await this._diagnosticsPublisher.prepare({
+      workspaceFolder: scanState._projectFolderPath,
+      candidates,
+      cancellationToken,
+    });
+    for (const warning of prepared.warnings) {
+      appendUniqueWarning(scanState._warnings, warning);
+    }
+    return prepared;
   }
 
   _getMaxDependenciesToScan() {
@@ -736,7 +780,6 @@ class DependencyHealthProvider {
       return { canceled: true };
     }
 
-    await this._publishDiagnostics();
     this._rebuildSummary();
     await this._storeReportData(this._reportDateFactory());
     return { canceled: false };
@@ -1164,17 +1207,16 @@ class DependencyHealthProvider {
     return [...new Set(repositories)];
   }
 
-  async _publishDiagnostics() {
+  async _publishDiagnostics(cancellationToken) {
     if (!this._diagnosticsPublisher) {
       return;
     }
 
-    const diagnosticNodes = this._fullTrees
-      .flatMap((tree) => tree.dependencies)
-      .filter((dependency) => dependency.isDirect)
-      .map((dependency) => new DependencyHealthNode(dependency, null, this.context));
-
-    await this._diagnosticsPublisher.publish(this._lastManifests, diagnosticNodes);
+    const prepared = await this._prepareDiagnostics(this, cancellationToken);
+    if (cancellationToken && cancellationToken.isCancellationRequested) {
+      return;
+    }
+    this._diagnosticsPublisher.replace(prepared.entries);
   }
 
   buildDependencyNodesForTree(tree) {
@@ -1349,20 +1391,21 @@ class DependencyHealthProvider {
       return;
     }
 
-    const prepared = await this._services.upstreamPullService.prepareSingle({
-      workspace: this.lastWorkspace,
-      repositoryHint: this.lastRepo,
-      dependency,
-    });
-    if (!prepared) {
-      return;
-    }
-
-    const cancellationSource = new vscode.CancellationTokenSource();
     this._dependencyOperationRunning = true;
-    await this._updateContexts();
+    let cancellationSource = null;
 
     try {
+      await this._updateContexts();
+      const prepared = await this._services.upstreamPullService.prepareSingle({
+        workspace: this.lastWorkspace,
+        repositoryHint: this.lastRepo,
+        dependency,
+      });
+      if (!prepared) {
+        return;
+      }
+
+      cancellationSource = new vscode.CancellationTokenSource();
       const result = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -1427,7 +1470,9 @@ class DependencyHealthProvider {
         vscode.window.showInformationMessage(notification.message);
       }
     } finally {
-      cancellationSource.dispose();
+      if (cancellationSource) {
+        cancellationSource.dispose();
+      }
       this._dependencyOperationRunning = false;
       await this._updateContexts();
       this.refresh();
@@ -1479,7 +1524,7 @@ class DependencyHealthProvider {
     const totalDependencies = unresolvedDependencies.length;
 
     if (totalDependencies === 0) {
-      await this._publishDiagnostics();
+      await this._publishDiagnostics(token);
       this._rebuildSummary();
       await this._storeReportData(this._reportDateFactory());
       return [];
@@ -1551,7 +1596,7 @@ class DependencyHealthProvider {
       }
     }
 
-    await this._publishDiagnostics();
+    await this._publishDiagnostics(token);
     this._rebuildSummary();
     await this._storeReportData(this._reportDateFactory());
     this.refresh();
@@ -1714,6 +1759,13 @@ function createScanOperation(status, id, values = {}) {
     message: values.message || null,
     failureMessage: values.failureMessage || null,
   };
+}
+
+function appendUniqueWarning(warnings, warning) {
+  if (!Array.isArray(warnings) || typeof warning !== "string" || !warning || warnings.includes(warning)) {
+    return;
+  }
+  warnings.push(warning);
 }
 
 function getConcreteDependencyVersion(dependency) {
@@ -2207,15 +2259,7 @@ function deduplicateDependenciesWithStatus(dependencies) {
 }
 
 function displayDependencyKey(dependency) {
-  const format = canonicalFormat(dependency.format || dependency.ecosystem);
-  return JSON.stringify([
-    dependency.sourceFile || "",
-    format,
-    packageIdentityName(dependency.name, format),
-    dependency.version || "",
-    dependency.isDirect ? "direct" : "transitive",
-    (dependency.parentChain || []).join(">"),
-  ]);
+  return getDependencyOccurrenceKey(dependency);
 }
 
 function coverageLookupKey(dependency) {

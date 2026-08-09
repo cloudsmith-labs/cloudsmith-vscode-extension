@@ -1123,7 +1123,6 @@ async function activate(context) {
     // Register clear search command
     vscode.commands.registerCommand("cloudsmith-vsc.clearSearch", () => {
       searchProvider.clear();
-      diagnosticsPublisher.clear();
     }),
 
     // Register load next page command

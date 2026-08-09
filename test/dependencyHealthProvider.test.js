@@ -49,8 +49,10 @@ suite("DependencyHealthProvider Test Suite", () => {
   }
 
   function createDependency(name, version, format = "npm") {
+    const manifestPath = "/project/package.json";
     return {
       name,
+      declarationName: name,
       version,
       legacyVersion: version,
       declaredConstraint: version,
@@ -62,6 +64,13 @@ suite("DependencyHealthProvider Test Suite", () => {
       parent: null,
       parentChain: [],
       transitives: [],
+      sourceManifest: createDependencySource({
+        kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
+        filePath: manifestPath,
+        type: "package.json",
+      }),
+      resolutionSource: null,
+      environmentMarker: null,
       cloudsmithStatus: "CHECKING",
       cloudsmithPackage: null,
       sourceFile: "package-lock.json",
@@ -78,6 +87,20 @@ suite("DependencyHealthProvider Test Suite", () => {
         repository: "repo",
         slug_perm: `${name}/${version}`,
       },
+    };
+  }
+
+  function createProblemDependency(name, version, manifestPath) {
+    return {
+      ...createDependency(name, version),
+      sourceFile: path.basename(manifestPath),
+      sourceManifest: createDependencySource({
+        kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
+        filePath: manifestPath,
+        type: "package.json",
+      }),
+      cloudsmithStatus: "NOT_FOUND",
+      cloudsmithPackage: null,
     };
   }
 
@@ -104,13 +127,15 @@ suite("DependencyHealthProvider Test Suite", () => {
       current: ["existing-diagnostic"],
       prepared: [],
       replacements: [],
-      async prepare(manifests, nodes) {
+      async prepare({ candidates }) {
         const snapshot = {
-          manifests: manifests.map((manifest) => manifest.filePath),
-          dependencies: nodes.map((node) => node.name),
+          manifests: candidates.map((candidate) => (
+            candidate.occurrence.sourceManifest.filePath
+          )),
+          dependencies: candidates.map((candidate) => candidate.occurrence.name),
         };
         this.prepared.push(snapshot);
-        return snapshot;
+        return { entries: snapshot, warnings: [], stats: null };
       },
       replace(snapshot) {
         this.current = snapshot;
@@ -135,14 +160,19 @@ suite("DependencyHealthProvider Test Suite", () => {
         await step.gate.promise;
       }
 
-      const dependency = createFoundDependency(step.name || "dependency", step.version || "1.0.0");
+      const manifestPath = `/${step.name || "dependency"}.json`;
+      const dependency = createProblemDependency(
+        step.name || "dependency",
+        step.version || "1.0.0",
+        manifestPath
+      );
       const trees = [{
         ecosystem: "npm",
         sourceFile: `${step.name || "dependency"}.json`,
         dependencies: [dependency],
       }];
       this._lastManifests = [{
-        filePath: `/${step.name || "dependency"}.json`,
+        filePath: manifestPath,
         format: "npm",
       }];
       this._fullTrees = cloneTrees(trees);
@@ -376,6 +406,142 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(nodes[0].getTreeItem().label, "Dependency refresh failed");
     assert.ok(nodes.length > 1);
     assert.strictEqual(provider.isScanRunning(), false);
+  });
+
+  test("diagnostic preparation failure preserves the prior committed snapshot", async () => {
+    const diagnostics = createDiagnosticsPublisher();
+    const prepare = diagnostics.prepare.bind(diagnostics);
+    let prepareCalls = 0;
+    diagnostics.prepare = async (options) => {
+      prepareCalls += 1;
+      if (prepareCalls === 2) {
+        throw new Error("diagnostic index unavailable");
+      }
+      return prepare(options);
+    };
+    const provider = new DependencyHealthProvider(createContext(), diagnostics);
+    installScanSteps(provider, [
+      { name: "known-good" },
+      { name: "uncommitted-replacement" },
+    ]);
+
+    await provider.scan("workspace-a", "repo-a", "/project-a");
+    const priorDiagnostics = diagnostics.current;
+    const result = await provider.scan("workspace-b", "repo-b", "/project-b");
+
+    assert.strictEqual(result.status, SCAN_STATES.FAILED);
+    assert.strictEqual(provider.dependencies[0].name, "known-good");
+    assert.strictEqual(diagnostics.current, priorDiagnostics);
+    assert.strictEqual(diagnostics.replacements.length, 1);
+    assert.match(provider.getScanState().failureMessage, /diagnostic index unavailable/);
+  });
+
+  test("cancellation during diagnostic preparation preserves the prior snapshot", async () => {
+    const diagnostics = createDiagnosticsPublisher();
+    const prepare = diagnostics.prepare.bind(diagnostics);
+    const preparationStarted = deferred();
+    const preparationGate = deferred();
+    let prepareCalls = 0;
+    diagnostics.prepare = async (options) => {
+      prepareCalls += 1;
+      if (prepareCalls === 2) {
+        preparationStarted.resolve();
+        await preparationGate.promise;
+      }
+      return prepare(options);
+    };
+    const provider = new DependencyHealthProvider(createContext(), diagnostics);
+    installScanSteps(provider, [
+      { name: "known-good" },
+      { name: "cancelled-replacement" },
+    ]);
+
+    await provider.scan("workspace-a", "repo-a", "/project-a");
+    const priorDiagnostics = diagnostics.current;
+    const refreshPromise = provider.rescan();
+    await preparationStarted.promise;
+    provider._activeScanCancellation.cancel();
+    preparationGate.resolve();
+    const result = await refreshPromise;
+
+    assert.strictEqual(result.status, SCAN_STATES.CANCELLED);
+    assert.strictEqual(provider.dependencies[0].name, "known-good");
+    assert.strictEqual(diagnostics.current, priorDiagnostics);
+    assert.strictEqual(diagnostics.replacements.length, 1);
+  });
+
+  test("superseded diagnostic preparation cannot replace a newer scan", async () => {
+    const diagnostics = createDiagnosticsPublisher();
+    const prepare = diagnostics.prepare.bind(diagnostics);
+    const firstPreparationStarted = deferred();
+    const firstPreparationGate = deferred();
+    diagnostics.prepare = async (options) => {
+      if (options.candidates[0].occurrence.name === "scan-a") {
+        firstPreparationStarted.resolve();
+        await firstPreparationGate.promise;
+      }
+      return prepare(options);
+    };
+    const provider = new DependencyHealthProvider(createContext(), diagnostics);
+    installScanSteps(provider, [
+      { name: "scan-a" },
+      { name: "scan-b" },
+    ]);
+
+    const firstPromise = provider.scan("workspace-a", "repo-a", "/project-a");
+    await firstPreparationStarted.promise;
+    const secondPromise = provider.scan("workspace-b", "repo-b", "/project-b");
+    assert.strictEqual((await secondPromise).status, SCAN_STATES.SUCCEEDED);
+    firstPreparationGate.resolve();
+    assert.strictEqual((await firstPromise).status, "superseded");
+
+    assert.strictEqual(provider.dependencies[0].name, "scan-b");
+    assert.deepStrictEqual(diagnostics.current.dependencies, ["scan-b"]);
+    assert.strictEqual(diagnostics.replacements.length, 1);
+  });
+
+  test("diagnostic evaluation bounds direct occurrences before committing its warning", async () => {
+    let capturedCandidates = null;
+    const diagnostics = {
+      async prepare({ candidates }) {
+        capturedCandidates = candidates;
+        return { entries: [], warnings: [], stats: null };
+      },
+      replace() {},
+    };
+    const provider = new DependencyHealthProvider(createContext(), diagnostics);
+    provider._warnings = ["previous successful warning"];
+    const dependencies = Array.from({ length: 10001 }, (_, index) => (
+      createProblemDependency(`bounded-${index}`, "1.0.0", "/project/package.json")
+    ));
+    const scanWorker = {
+      _warnings: [],
+      _lastManifests: [],
+      _projectFolderPath: "/project",
+      _noManifestsFolder: null,
+      _fullTrees: [{ ecosystem: "npm", sourceFile: "package.json", dependencies }],
+      _displayTrees: [],
+      _reportData: null,
+      _lastScanTimestamp: new Date("2026-08-09T12:00:00.000Z"),
+    };
+
+    await provider._prepareDiagnostics(scanWorker, { isCancellationRequested: false });
+
+    assert.strictEqual(capturedCandidates.length, 10000);
+    assert.ok(capturedCandidates.every((candidate) => (
+      Object.isFrozen(candidate)
+      && Object.isFrozen(candidate.occurrence)
+      && candidate.occurrence.transitives.length === 0
+    )));
+    assert.deepStrictEqual(provider._warnings, ["previous successful warning"]);
+    assert.match(scanWorker._warnings[0], /capped at 10000 direct occurrences/);
+
+    provider._commitSuccessfulScan(scanWorker, {
+      workspace: "workspace-a",
+      repository: "repo-a",
+      projectFolder: "/project",
+    }, 1);
+    assert.match(provider._warnings[0], /capped at 10000 direct occurrences/);
   });
 
   test("scope change can select a different project folder without mutating successful scope", async () => {
@@ -1874,5 +2040,96 @@ suite("DependencyHealthProvider Test Suite", () => {
       vscode.window.showInformationMessage = originalShowInformationMessage;
       vscode.window.showErrorMessage = originalShowErrorMessage;
     }
+  });
+
+  test("pullSingleDependency reserves the operation before asynchronous preparation", async () => {
+    const preparationStarted = deferred();
+    const preparationGate = deferred();
+    const warnings = [];
+    let preparationCalls = 0;
+    let executionCalls = 0;
+    let refreshCalls = 0;
+    let diagnosticReplacements = 0;
+    vscode.window.showWarningMessage = async (message) => {
+      warnings.push(message);
+    };
+    const diagnostics = {
+      async prepare() {
+        return { entries: [], warnings: [], stats: null };
+      },
+      replace() {
+        diagnosticReplacements += 1;
+      },
+    };
+    const provider = new DependencyHealthProvider(createContext(), diagnostics, {
+      upstreamPullService: {
+        async prepareSingle({ dependency }) {
+          preparationCalls += 1;
+          preparationStarted.resolve();
+          await preparationGate.promise;
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-b" },
+            dependency,
+            plan: { skippedDependencies: [] },
+          };
+        },
+        async execute() {
+          executionCalls += 1;
+          return {
+            canceled: false,
+            pullResult: {
+              total: 1,
+              cached: 1,
+              alreadyExisted: 0,
+              notFound: 0,
+              formatMismatched: 0,
+              errors: 0,
+              networkErrors: 0,
+              authFailed: 0,
+              skipped: 0,
+              details: [{ status: "cached" }],
+            },
+          };
+        },
+      },
+    });
+    provider.lastWorkspace = "workspace-a";
+    provider.lastRepo = "repo-a";
+    provider._projectFolderPath = "/project";
+    provider._warnings = [];
+    provider._fullTrees = [{
+      ecosystem: "npm",
+      sourceFile: "package.json",
+      dependencies: [createProblemDependency("single-package", "1.0.0", "/project/package.json")],
+    }];
+    provider._updateContexts = async () => {};
+    provider.refresh = () => {};
+    provider._refreshSingleDependencyAfterPull = async (_workspace, _repo, _dependency, _progress, token) => {
+      refreshCalls += 1;
+      await provider._publishDiagnostics(token);
+    };
+    const item = {
+      name: "single-package",
+      version: "1.0.0",
+      format: "npm",
+      ecosystem: "npm",
+    };
+
+    const firstPull = provider.pullSingleDependency(item);
+    await preparationStarted.promise;
+    await provider.pullSingleDependency(item);
+
+    assert.strictEqual(preparationCalls, 1);
+    assert.strictEqual(executionCalls, 0);
+    assert.strictEqual(refreshCalls, 0);
+    assert.deepStrictEqual(warnings, ["Wait for the current dependency operation to finish."]);
+
+    preparationGate.resolve();
+    await firstPull;
+
+    assert.strictEqual(executionCalls, 1);
+    assert.strictEqual(refreshCalls, 1);
+    assert.strictEqual(diagnosticReplacements, 1);
   });
 });
