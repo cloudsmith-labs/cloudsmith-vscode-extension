@@ -20,7 +20,19 @@ class DependencyHealthNode {
     this.context = hasExplicitCloudsmithMatch ? maybeContext : cloudsmithMatchOrContext;
     this.options = hasExplicitCloudsmithMatch ? (maybeOptions || {}) : (maybeContext || {});
     this.name = dep.name;
-    this.declaredVersion = dep.version;
+    this.declaredConstraint = dep.declaredConstraint || null;
+    this.resolvedVersion = dep.resolvedVersion || null;
+    this.versionState = dep.versionState || null;
+    this.resolutionSource = dep.resolutionSource || null;
+    this.sourceManifest = dep.sourceManifest || null;
+    this.normalizedName = dep.normalizedName || null;
+    this.legacyVersion = Object.prototype.hasOwnProperty.call(dep, "legacyVersion")
+      ? dep.legacyVersion
+      : dep.version;
+    // Retained for existing display and diagnostic consumers during M4 migration.
+    this.declaredVersion = Object.prototype.hasOwnProperty.call(dep, "version")
+      ? dep.version
+      : dep.legacyVersion;
     this.format = dep.format || canonicalFormat(dep.ecosystem);
     this.ecosystem = dep.ecosystem || this.format;
     this.sourceFile = dep.sourceFile || null;

@@ -5,6 +5,13 @@ const {
   SCAN_STATES,
   matchCoverageCandidates,
 } = require("../views/dependencyHealthProvider");
+const { ADAPTER_RESULT_STATUSES } = require("../util/dependencyAdapterRegistry");
+const {
+  DEPENDENCY_VERSION_STATES,
+  RESOLUTION_SOURCE_KINDS,
+  createDependencyRecord,
+  createDependencySource,
+} = require("../util/dependencyRecord");
 const { normalizePackageName } = require("../util/packageNameNormalizer");
 
 suite("DependencyHealthProvider Test Suite", () => {
@@ -474,6 +481,84 @@ suite("DependencyHealthProvider Test Suite", () => {
 
     assert.strictEqual(nodes.length, 1);
     assert.strictEqual(nodes[0].getTreeItem().label, "Connect to Cloudsmith");
+  });
+
+  test("_performScan projects canonical adapter records into the compatibility tree", async () => {
+    const originalGetConfiguration = vscode.workspace.getConfiguration;
+    const manifestSource = createDependencySource({
+      kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
+      filePath: "/project/package.json",
+      type: "package.json",
+    });
+    const dependency = createDependencyRecord({
+      ecosystem: "npm",
+      format: "npm",
+      name: "left-pad",
+      declaredConstraint: "^1.0.0",
+      resolvedVersion: null,
+      versionState: DEPENDENCY_VERSION_STATES.RANGE,
+      sourceManifest: manifestSource,
+      isDirect: true,
+      legacyVersion: "1.0.0",
+    });
+    const dependencyAdapters = {
+      async detectManifests() {
+        return [{
+          adapterId: "npmParser",
+          filePath: "/project/package.json",
+          format: "npm",
+          manifestType: "package.json",
+        }];
+      },
+      async detect() {
+        return [];
+      },
+      async parseManifest() {
+        return {
+          status: ADAPTER_RESULT_STATUSES.SUCCESS,
+          adapterId: "npmParser",
+          ecosystem: "npm",
+          sourceFile: "package.json",
+          source: { manifest: manifestSource, resolution: null },
+          dependencies: [dependency],
+          warnings: [],
+          error: null,
+        };
+      },
+    };
+
+    vscode.workspace.getConfiguration = () => ({
+      get(key) {
+        return key === "resolveTransitiveDependencies" ? false : 10000;
+      },
+    });
+
+    try {
+      const provider = new DependencyHealthProvider(createContext(), null, { dependencyAdapters });
+      provider._runCoverageChecks = async () => {};
+      provider._runEnrichmentPasses = async () => {};
+      provider._publishDiagnostics = async () => {};
+      provider._storeReportData = async () => {};
+      provider.refresh = () => {};
+
+      const result = await provider._performScan(
+        "workspace-a",
+        "repo-a",
+        "/project",
+        { report() {} },
+        { isCancellationRequested: false }
+      );
+      const projected = provider._fullTrees[0].dependencies[0];
+
+      assert.deepStrictEqual(result, { canceled: false });
+      assert.strictEqual(projected.version, "1.0.0");
+      assert.strictEqual(projected.declaredConstraint, "^1.0.0");
+      assert.strictEqual(projected.resolvedVersion, null);
+      assert.strictEqual(projected.sourceManifest.filePath, "/project/package.json");
+      assert.strictEqual(projected.cloudsmithStatus, "CHECKING");
+    } finally {
+      vscode.workspace.getConfiguration = originalGetConfiguration;
+    }
   });
 
   test("_runCoverageChecks batches tree rebuilds and refreshes while preserving matches", async () => {

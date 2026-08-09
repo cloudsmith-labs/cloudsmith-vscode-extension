@@ -91,6 +91,7 @@ class ManifestParser {
           deps.push({
             name: name,
             version: ManifestParser._stripVersionPrefix(version),
+            declaredConstraint: String(version || "").trim() || null,
             devDependency: false,
             format: format || "npm",
           });
@@ -102,6 +103,7 @@ class ManifestParser {
           deps.push({
             name: name,
             version: ManifestParser._stripVersionPrefix(version),
+            declaredConstraint: String(version || "").trim() || null,
             devDependency: true,
             format: format || "npm",
           });
@@ -138,6 +140,7 @@ class ManifestParser {
         deps.push({
           name: match[1],
           version: match[3].trim().split(/[,;]/)[0].trim(),
+          declaredConstraint: `${match[2]}${match[3].trim().split(";")[0].trim()}`,
           devDependency: false,
           format: format || "python",
         });
@@ -148,6 +151,7 @@ class ManifestParser {
           deps.push({
             name: bareMatch[1],
             version: "",
+            declaredConstraint: null,
             devDependency: false,
             format: format || "python",
           });
@@ -166,6 +170,7 @@ class ManifestParser {
     return parsed.dependencies.map((dependency) => ({
       name: dependency.name,
       version: dependency.version,
+      declaredConstraint: dependency.declaredConstraint || null,
       devDependency: dependency.isDevelopmentDependency,
       format: format || "python",
     }));
@@ -208,6 +213,7 @@ class ManifestParser {
       deps.push({
         name: `${groupId[1].trim()}:${artifactId[1].trim()}`,
         version: versionStr,
+        declaredConstraint: versionStr || null,
         devDependency: isTest,
         format: format || "maven",
       });
@@ -235,6 +241,7 @@ class ManifestParser {
           deps.push({
             name: match[1],
             version: match[2],
+            declaredConstraint: match[2] || null,
             devDependency: false,
             format: format || "go",
           });
@@ -264,6 +271,7 @@ class ManifestParser {
           deps.push({
             name: match[1],
             version: match[2],
+            declaredConstraint: match[2] || null,
             devDependency: isIndirect,
             format: format || "go",
           });
@@ -313,6 +321,7 @@ class ManifestParser {
         deps.push({
           name: simpleMatch[1],
           version: ManifestParser._stripVersionPrefix(simpleMatch[2]),
+          declaredConstraint: simpleMatch[2] || null,
           devDependency: isDev,
           format: format || "cargo",
         });
@@ -325,6 +334,7 @@ class ManifestParser {
         deps.push({
           name: complexMatch[1],
           version: ManifestParser._stripVersionPrefix(complexMatch[2]),
+          declaredConstraint: complexMatch[2] || null,
           devDependency: isDev,
           format: format || "cargo",
         });
