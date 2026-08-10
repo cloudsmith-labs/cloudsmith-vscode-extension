@@ -66,6 +66,13 @@ suite("Safe package promotion workflow", () => {
       ...overrides,
     });
 
+    function validatedSuccess(data, requestOptions, pageOptions = null) {
+      if (requestOptions?.validate && !requestOptions.validate(data)) {
+        return apiFailure("invalid_response", { outcomeUnknown: false });
+      }
+      return pageOptions === null ? apiSuccess(data) : page(data, pageOptions);
+    }
+
     const api = {
       async get(endpoint, requestOptions) {
         calls.get.push({ endpoint, options: requestOptions });
@@ -83,13 +90,16 @@ suite("Safe package promotion workflow", () => {
           const overrides = typeof options.sourceOverrides === "function"
             ? options.sourceOverrides(sourceReadCount)
             : options.sourceOverrides || {};
-          return apiSuccess(sourceRecord(overrides));
+          return validatedSuccess(sourceRecord(overrides), requestOptions);
         }
         if (endpoint === "repos/workspace/target/") {
           if (options.targetRepositoryFailure) {
             return apiFailure("forbidden", { status: 403, outcomeUnknown: false });
           }
-          return apiSuccess({ name: "Target", slug: "target", namespace: "workspace" });
+          return validatedSuccess(
+            { name: "Target", slug: "target", namespace: "workspace" },
+            requestOptions
+          );
         }
         if (endpoint.startsWith("packages/workspace/target/?")) {
           targetQueryCount += 1;
@@ -104,7 +114,10 @@ suite("Safe package promotion workflow", () => {
           if (options.duplicateTargetAt === targetQueryCount && targetExists) {
             data.push(targetRecord({ slug_perm: "second-target-package-id" }));
           }
-          const result = page(data, {
+          if (options.targetLocationOverrides) {
+            data.push(targetRecord(options.targetLocationOverrides));
+          }
+          const result = validatedSuccess(data, requestOptions, {
             pageTotal: options.targetPageTotalAt === targetQueryCount ? 21 : 1,
             count: options.targetPageTotalAt === targetQueryCount ? 2100 : data.length,
           });
@@ -117,8 +130,12 @@ suite("Safe package promotion workflow", () => {
           if (options.presenceHintFailure) {
             return apiFailure("network_error", { outcomeUnknown: false });
           }
-          const data = options.hintExists || targetExists ? [targetRecord()] : [];
-          return page(data);
+          const data = options.presenceLocationOverrides
+            ? [targetRecord(options.presenceLocationOverrides)]
+            : options.hintExists || targetExists
+              ? [targetRecord()]
+              : [];
+          return validatedSuccess(data, requestOptions, {});
         }
         throw new Error(`Unexpected GET ${endpoint}`);
       },
@@ -138,8 +155,8 @@ suite("Safe package promotion workflow", () => {
             });
           }
           targetExists = true;
-          if (options.copyMalformedResponse) return apiSuccess({});
-          return apiSuccess(targetRecord(options.copyResponseOverrides));
+          if (options.copyMalformedResponse) return validatedSuccess({}, requestOptions);
+          return validatedSuccess(targetRecord(options.copyResponseOverrides), requestOptions);
         }
         if (endpoint === "packages/workspace/source/source-package-id/tag/") {
           if (options.sourceTagFailure) {
@@ -151,10 +168,12 @@ suite("Safe package promotion workflow", () => {
               outcomeUnknown: options.sourceTagAmbiguous === true,
             });
           }
-          if (options.sourceTagMalformedResponse) return apiSuccess({});
-          if (options.sourceTagPretendSuccess) return apiSuccess(sourceRecord());
+          if (options.sourceTagMalformedResponse) return validatedSuccess({}, requestOptions);
+          if (options.sourceTagPretendSuccess) {
+            return validatedSuccess(sourceRecord(), requestOptions);
+          }
           for (const tag of json.tags) sourceTags.add(tag);
-          return apiSuccess(sourceRecord());
+          return validatedSuccess(sourceRecord(), requestOptions);
         }
         if (endpoint === "packages/workspace/target/target-package-id/tag/") {
           if (options.targetTagFailure) {
@@ -167,7 +186,7 @@ suite("Safe package promotion workflow", () => {
             });
           }
           for (const tag of json.tags) targetTags.add(tag);
-          return apiSuccess(targetRecord(options.targetTagResponseOverrides));
+          return validatedSuccess(targetRecord(options.targetTagResponseOverrides), requestOptions);
         }
         throw new Error(`Unexpected POST ${endpoint}`);
       },
@@ -360,6 +379,9 @@ suite("Safe package promotion workflow", () => {
       { sourceFailureAt: 1, expected: "source_missing" },
       { sourceOverrides: { is_copyable: "false" }, expected: "malformed_copyability" },
       { sourceOverrides: { slug_perm: "different" }, expected: "source_identity_changed" },
+      { sourceOverrides: { name: "   " }, expected: "malformed_source_package" },
+      { sourceOverrides: { version: 1 }, expected: "malformed_source_package" },
+      { sourceOverrides: { format: "" }, expected: "malformed_source_package" },
       { sourceOverrides: { checksum_sha256: null, version_digest: null }, expected: "missing_package_fingerprint" },
     ];
     for (const testCase of cases) {
@@ -397,6 +419,54 @@ suite("Safe package promotion workflow", () => {
       assert.strictEqual(outcome.overall, "failed");
       assert.strictEqual(harness.calls.post.length, 0);
     }
+  });
+
+  test("malformed package-location arrays cannot map status, publish hints, or pass preflight", async () => {
+    const statusHarness = createHarness({ pipeline: ["source", "target"] });
+    statusHarness.provider.api = {
+      async get(_endpoint, requestOptions) {
+        const data = [
+          statusHarness.sourceRecord(),
+          statusHarness.sourceRecord({ name: "" }),
+        ];
+        return requestOptions.validate(data)
+          ? apiSuccess(data)
+          : apiFailure("invalid_response", { outcomeUnknown: false });
+      },
+    };
+    const status = await statusHarness.provider.getPromotionStatus(
+      "workspace",
+      "artifact",
+      "1.0.0",
+      "npm"
+    );
+    assert.deepStrictEqual(status.items, []);
+    assert.strictEqual(status.error.kind, "invalid_response");
+
+    const hints = createHarness({
+      cancelTargetSelection: true,
+      presenceLocationOverrides: { slug_perm_raw: "conflicting-package-id" },
+    });
+    const cancelled = await hints.provider.runPromotionWorkflow(hints.item);
+    assert.strictEqual(cancelled.overall, "cancelled");
+    assert.strictEqual(hints.calls.post.length, 0);
+    assert(hints.calls.quickPick[0].every(item => !item.detail.includes("Already contains")));
+
+    const preflight = createHarness({
+      presenceHintFailure: true,
+      targetLocationOverrides: { repository: "   " },
+    });
+    const failed = await preflight.provider.runPromotionWorkflow(preflight.item);
+    assert.strictEqual(failed.overall, "failed");
+    assert.strictEqual(failed.errorCode, "target_state_malformed");
+    assert.strictEqual(preflight.calls.post.length, 0);
+    assert.strictEqual(
+      preflight.calls.warning.some(call => call.action === "Promote package"),
+      false
+    );
+    assert.deepStrictEqual(preflight.calls.error, [
+      "Cloudsmith returned malformed target package data. No changes were made.",
+    ]);
   });
 
   test("post-confirmation target drift invalidates approval before every write", async () => {
@@ -755,11 +825,13 @@ suite("Safe package promotion workflow", () => {
 
     const filtered = createHarness({ pipeline: ["source", "target"] });
     filtered.provider.api = {
-      async get() {
-        return apiSuccess([
-          { name: "artifact", version: "1.0.0", format: "python", repository: "source" },
-          { name: "artifact", version: "1.0.0", format: "npm", repository: "source", status_str: "Completed" },
-        ]);
+      async get(_endpoint, requestOptions) {
+        const data = [
+          filtered.sourceRecord({ format: "python" }),
+          filtered.sourceRecord({ status_str: "Completed" }),
+        ];
+        assert.strictEqual(requestOptions.validate(data), true);
+        return apiSuccess(data);
       },
     };
     const status = await filtered.provider.getPromotionStatus("workspace", "artifact", "1.0.0", "npm");

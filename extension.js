@@ -30,6 +30,10 @@ const { UpstreamChecker } = require("./util/upstreamChecker");
 const { UpstreamPreviewProvider } = require("./views/upstreamPreviewProvider");
 const { UpstreamDetailProvider } = require("./views/upstreamDetailProvider");
 const { PromotionProvider } = require("./views/promotionProvider");
+const {
+  isPackageLocationArray,
+  normalizePackageQueryIdentity,
+} = require("./util/promotionContracts");
 const { SearchQueryBuilder } = require("./util/searchQueryBuilder");
 const { formatApiError } = require("./util/errorFormatter");
 const { buildExactPackageQuery, packageMatchesExactIdentity } = require("./util/packageQuery");
@@ -108,19 +112,6 @@ function isRepositoryArray(value) {
     && repo.slug.length > 0
     && typeof repo.name === "string"
     && repo.name.length > 0
-  ));
-}
-
-function isPackageLocationArray(value) {
-  return isRecordArray(value) && value.every(pkg => (
-    typeof pkg.name === "string"
-    && pkg.name.length > 0
-    && (typeof pkg.version === "string" || typeof pkg.version === "number")
-    && String(pkg.version).length > 0
-    && typeof pkg.format === "string"
-    && pkg.format.length > 0
-    && typeof pkg.repository === "string"
-    && pkg.repository.length > 0
   ));
 }
 
@@ -2462,7 +2453,15 @@ async function activate(context) {
       recentPackages.add(item);
 
       const info = extractPackageInfo(item);
-      if (!info.workspace || !info.name || !info.version || !info.format) {
+      let promotionIdentity;
+      try {
+        promotionIdentity = normalizePackageQueryIdentity(
+          info.workspace,
+          info.name,
+          info.version,
+          info.format
+        );
+      } catch {
         vscode.window.showWarningMessage("Could not determine package details.");
         return;
       }
@@ -2471,7 +2470,10 @@ async function activate(context) {
       if (pipeline.length > 0) {
         // Pipeline mode: show status across configured repos
         const statusResult = await promotionProvider.getPromotionStatus(
-          info.workspace, info.name, info.version, info.format
+          promotionIdentity.workspace,
+          promotionIdentity.name,
+          promotionIdentity.version,
+          promotionIdentity.format
         );
 
         if (statusResult.error) {
@@ -2492,16 +2494,20 @@ async function activate(context) {
           return `${icon} ${s.repo}: ${s.status}`;
         });
         vscode.window.showInformationMessage(
-          `Pipeline for ${info.name} ${info.version}: ${lines.join(" \u2192 ")}`
+          `Pipeline for ${promotionIdentity.name} ${promotionIdentity.version}: ${lines.join(" \u2192 ")}`
         );
       } else {
         // No pipeline: search workspace-wide for this package name+version
         const cloudsmithAPI = new CloudsmithAPI(context);
         let endpoint;
         try {
-          endpoint = apiEndpoint(["packages", info.workspace], {
+          endpoint = apiEndpoint(["packages", promotionIdentity.workspace], {
             query: {
-              query: buildExactPackageQuery(info.name, info.version, info.format),
+              query: buildExactPackageQuery(
+                promotionIdentity.name,
+                promotionIdentity.version,
+                promotionIdentity.format
+              ),
               page_size: 100,
             },
           });
@@ -2521,9 +2527,13 @@ async function activate(context) {
           );
           return;
         }
-        const exactPackages = results.data.filter(pkg => packageMatchesExactIdentity(pkg, info));
+        const exactPackages = results.data.filter(pkg => (
+          packageMatchesExactIdentity(pkg, promotionIdentity)
+        ));
         if (exactPackages.length === 0) {
-          vscode.window.showInformationMessage(`${info.name} ${info.version} was not found in any other repository.`);
+          vscode.window.showInformationMessage(
+            `${promotionIdentity.name} ${promotionIdentity.version} was not found in any other repository.`
+          );
           return;
         }
 
@@ -2532,7 +2542,7 @@ async function activate(context) {
           return `${icon} ${pkg.repository}: ${pkg.status_str || "Unknown"}`;
         });
         vscode.window.showInformationMessage(
-          `${info.name} ${info.version} found in: ${lines.join(", ")}`
+          `${promotionIdentity.name} ${promotionIdentity.version} found in: ${lines.join(", ")}`
         );
       }
     }),
