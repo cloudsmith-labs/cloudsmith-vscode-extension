@@ -42,7 +42,7 @@ suite("UpstreamPreviewProvider Test Suite", () => {
     assert.ok(html.includes("PyPI"));
     assert.ok(html.includes("Legacy mirror"));
     assert.ok(html.includes("<th>Origin</th>"));
-    assert.ok(html.includes("https://pypi.org"));
+    assert.match(html, /<td class="mono">https:\/\/pypi\.org<\/td>/);
     assert.ok(!html.includes("/simple/"));
     assert.ok(html.includes("Upstreams (1 active of 2)"));
     assert.ok(!html.includes("Active policies"));
@@ -111,7 +111,7 @@ suite("UpstreamPreviewProvider Test Suite", () => {
     });
 
     assert.ok(html.includes("Request failed"));
-    assert.ok(html.includes("https://example.com"));
+    assert.match(html, /<td class="mono">https:\/\/example\.com<\/td>/);
     assert.ok(!html.includes("[object Object]"));
     assert.ok(!html.includes("user:pass"));
     assert.ok(!html.includes("private/path"));

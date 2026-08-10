@@ -30,7 +30,10 @@ suite("UpstreamDetailProvider Test Suite", () => {
 
     assert.ok(html.includes("PyPI"));
     assert.ok(html.includes("Origin"));
-    assert.ok(html.includes("https://pypi.org"));
+    assert.match(
+      html,
+      /<div class="detail-label">Origin<\/div><div class="detail-value mono">https:\/\/pypi\.org<\/div>/
+    );
     assert.ok(!html.includes("user:pass"));
     assert.ok(!html.includes("/simple/"));
     assert.ok(!html.includes("token=secret"));
