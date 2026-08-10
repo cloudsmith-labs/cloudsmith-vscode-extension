@@ -403,7 +403,6 @@ class UpstreamPullService {
           dependency,
           status: PULL_STATUS.PULLING,
           errorMessage: null,
-          requestUrl: buildPullRequestUrl(prepared.workspace, prepared.repository.slug, dependency),
         };
         await publishStatus(onStatus, pullingDetail);
         if (!this._isPreparedAccountCurrent(prepared)) {
@@ -425,7 +424,6 @@ class UpstreamPullService {
         } catch {
           result = createPullFailure(
             dependency,
-            pullingDetail.requestUrl,
             "The upstream pull failed unexpectedly."
           );
         }
@@ -442,6 +440,7 @@ class UpstreamPullService {
           return;
         }
 
+        result = toPublicPullDetail(result);
         details.push(result);
         updateResultCounts(counts, result);
 
@@ -477,7 +476,6 @@ class UpstreamPullService {
       } catch {
         const failure = createPullFailure(
           dependency,
-          buildPullRequestUrl(prepared.workspace, prepared.repository.slug, dependency),
           "The upstream pull failed unexpectedly."
         );
         details.push(failure);
@@ -531,7 +529,6 @@ class UpstreamPullService {
           dependency,
           status: PULL_STATUS.AUTH_FAILED,
           errorMessage: "Skipped after repeated authentication failures.",
-          requestUrl: buildPullRequestUrl(prepared.workspace, prepared.repository.slug, dependency),
           networkError: false,
         });
       }
@@ -710,7 +707,6 @@ class UpstreamPullService {
         dependency,
         status: PULL_STATUS.FORMAT_MISMATCH,
         errorMessage,
-        requestUrl: null,
         networkError: false,
       };
     }
@@ -726,19 +722,19 @@ class UpstreamPullService {
     }
 
     if (plan.strategy === "direct") {
-      return mapRegistryAttempt(dependency, metadataAttempt, plan.request.url, format);
+      return mapRegistryAttempt(dependency, metadataAttempt, format);
     }
 
     if (metadataAttempt.statusCode === 401 || metadataAttempt.statusCode === 403) {
-      return mapRegistryAttempt(dependency, metadataAttempt, plan.request.url, format);
+      return mapRegistryAttempt(dependency, metadataAttempt, format);
     }
 
     if (metadataAttempt.statusCode === 404) {
-      return mapRegistryAttempt(dependency, metadataAttempt, plan.request.url, format);
+      return mapRegistryAttempt(dependency, metadataAttempt, format);
     }
 
     if (metadataAttempt.statusCode < 200 || metadataAttempt.statusCode >= 300) {
-      return mapRegistryAttempt(dependency, metadataAttempt, plan.request.url, format);
+      return mapRegistryAttempt(dependency, metadataAttempt, format);
     }
 
     let artifactUrl = null;
@@ -760,7 +756,6 @@ class UpstreamPullService {
         dependency,
         status: PULL_STATUS.NOT_FOUND,
         errorMessage: missingArtifactMessage(plan.strategy, dependency.version),
-        requestUrl: plan.request.url,
         networkError: false,
       };
     }
@@ -784,7 +779,7 @@ class UpstreamPullService {
       return artifactAttempt;
     }
 
-    return mapRegistryAttempt(dependency, artifactAttempt, artifactUrl, format);
+    return mapRegistryAttempt(dependency, artifactAttempt, format);
   }
 
   async _requestRegistry(request, apiKey, token, options = {}) {
@@ -1343,13 +1338,12 @@ function recomputeResultCounts(counts, results) {
   Object.assign(counts, next);
 }
 
-function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
+function mapRegistryAttempt(dependency, attempt, format) {
   if (attempt.statusCode >= 200 && attempt.statusCode < 300) {
     return {
       dependency,
       status: PULL_STATUS.CACHED,
       errorMessage: null,
-      requestUrl,
       networkError: false,
     };
   }
@@ -1359,7 +1353,6 @@ function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
       dependency,
       status: PULL_STATUS.ALREADY_EXISTS,
       errorMessage: null,
-      requestUrl,
       networkError: false,
     };
   }
@@ -1369,7 +1362,6 @@ function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
       dependency,
       status: PULL_STATUS.AUTH_FAILED,
       errorMessage: "Authentication failed.",
-      requestUrl,
       networkError: false,
     };
   }
@@ -1379,7 +1371,6 @@ function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
       dependency,
       status: PULL_STATUS.NOT_FOUND,
       errorMessage: defaultNotFoundMessage(format),
-      requestUrl,
       networkError: false,
     };
   }
@@ -1389,7 +1380,6 @@ function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
       dependency,
       status: PULL_STATUS.ERROR,
       errorMessage: attempt.errorMessage || "Registry request failed.",
-      requestUrl,
       networkError: Boolean(attempt.networkError),
     };
   }
@@ -1398,7 +1388,6 @@ function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
     dependency,
     status: PULL_STATUS.ERROR,
     errorMessage: `Registry request returned HTTP ${attempt.statusCode}.`,
-    requestUrl,
     networkError: false,
   };
 }
@@ -1476,11 +1465,6 @@ function safeHost(url) {
   } catch {
     return "";
   }
-}
-
-function buildPullRequestUrl(workspace, repo, dependency) {
-  const plan = buildRegistryTriggerPlan(workspace, repo, dependency);
-  return plan && plan.request ? plan.request.url : null;
 }
 
 function dedupePullDependencies(dependencies) {
@@ -1737,13 +1721,21 @@ function publishProgress(progress, update) {
   }
 }
 
-function createPullFailure(dependency, requestUrl, errorMessage) {
+function createPullFailure(dependency, errorMessage) {
   return {
     dependency,
     status: PULL_STATUS.ERROR,
     errorMessage,
-    requestUrl,
     networkError: false,
+  };
+}
+
+function toPublicPullDetail(result) {
+  return {
+    dependency: result.dependency,
+    status: result.status,
+    errorMessage: result.errorMessage || null,
+    networkError: result.networkError === true,
   };
 }
 

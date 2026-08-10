@@ -1234,7 +1234,11 @@ suite("RepositoryNode Test Suite", () => {
 
   test("preserves upstream failures in the indicator instead of claiming a configured total", async () => {
     const indicator = new UpstreamIndicatorNode(
-      [{ name: "PyPI", upstream_url: "https://pypi.org/", is_active: true }],
+      [{
+        name: "PyPI",
+        upstream_url: "https://user:pass@pypi.org/simple/?token=secret#fragment",
+        is_active: true,
+      }],
       {},
       context,
       { complete: false, failedFormats: ["npm"] }
@@ -1242,6 +1246,11 @@ suite("RepositoryNode Test Suite", () => {
     const item = indicator.getTreeItem();
     assert.strictEqual(item.label, "Upstreams: 1 active among 1 loaded (partial)");
     assert.ok(item.tooltip.includes("Could not load formats: npm"));
+    assert.ok(item.tooltip.includes("PyPI (https://pypi.org)"));
+    assert.ok(!item.tooltip.includes("user:pass"));
+    assert.ok(!item.tooltip.includes("/simple/"));
+    assert.ok(!item.tooltip.includes("token=secret"));
+    assert.ok(!item.tooltip.includes("#fragment"));
 
     const summaryCached = new UpstreamIndicatorNode(
       [{ name: "Summary-only PyPI", _format: "python", is_active: true }],
@@ -1249,8 +1258,23 @@ suite("RepositoryNode Test Suite", () => {
       context,
       { complete: true }
     ).getTreeItem();
-    assert.strictEqual(summaryCached.tooltip, "Summary-only PyPI");
+    assert.strictEqual(summaryCached.tooltip, "Summary-only PyPI (Origin unavailable)");
     assert(!summaryCached.tooltip.includes("undefined"));
+  });
+
+  test("upstream tooltip handles missing and malformed URLs and caps displayed entries", () => {
+    const upstreams = Array.from({ length: 21 }, (_, index) => ({
+      name: `Mirror ${index}`,
+      upstream_url: index === 0 ? undefined : (index === 1 ? "not a URL" : `https://m${index}.example/path`),
+      is_active: true,
+    }));
+    const item = new UpstreamIndicatorNode(upstreams, {}, context, { complete: true }).getTreeItem();
+
+    assert.ok(item.tooltip.includes("Mirror 0 (Origin unavailable)"));
+    assert.ok(item.tooltip.includes("Mirror 1 (Origin unavailable)"));
+    assert.ok(item.tooltip.includes("Showing 20 of 21 loaded upstreams."));
+    assert.ok(!item.tooltip.includes("not a URL"));
+    assert.ok(!item.tooltip.includes("Mirror 20"));
   });
 
   test("entitlement summaries distinguish authoritative totals from partial collections", () => {

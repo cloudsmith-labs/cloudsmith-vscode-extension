@@ -1046,4 +1046,40 @@ suite("UpstreamChecker preview resolution", () => {
     assert.strictEqual(result.upstreams.data.active, 1);
     assert.strictEqual(result.upstreams.data.configs[0].name, "PyPI");
   });
+
+  test("previewResolution settles sibling failures and exposes only normalized error strings", async () => {
+    const checker = createChecker({});
+    checker.existsLocally = async () => {
+      throw new Error("https://user:pass@example.com/private?token=secret\nprivate stack");
+    };
+    checker.getUpstreamsForFormat = async () => ({
+      data: [{ name: "PyPI", upstream_url: "https://pypi.org/simple/", is_active: true }],
+      error: null,
+      complete: true,
+    });
+
+    const result = await checker.previewResolution("acme", "repo", "flask", "python");
+
+    assert.strictEqual(result.local.errorMessage, "The local package collection could not be verified.");
+    assert.strictEqual(typeof result.local.errorMessage, "string");
+    assert.strictEqual(result.upstreams.data.total, 1);
+    assert.strictEqual(result.canResolveViaUpstream, true);
+    assert.ok(!JSON.stringify(result).includes("user:pass"));
+    assert.ok(!JSON.stringify(result).includes("token=secret"));
+  });
+
+  test("previewResolution normalizes structured upstream failures", async () => {
+    const checker = createChecker({});
+    checker.existsLocally = async () => ({ data: null, error: null, complete: true });
+    checker.getUpstreamsForFormat = async () => ({
+      data: [],
+      error: { message: "Upstream request failed", status: 500, body: "private body" },
+      complete: false,
+    });
+
+    const result = await checker.previewResolution("acme", "repo", "flask", "python");
+    assert.strictEqual(result.upstreams.errorMessage, "Upstream request failed");
+    assert.strictEqual("error" in result.upstreams, false);
+    assert.ok(!JSON.stringify(result).includes("private body"));
+  });
 });

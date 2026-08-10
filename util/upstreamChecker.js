@@ -14,6 +14,7 @@ const {
   SUPPORTED_UPSTREAM_FORMATS,
 } = require("./upstreamFormats");
 const { UpstreamOperationScheduler } = require("./upstreamOperationScheduler");
+const { formatUpstreamError } = require("./upstreamPresentation");
 
 const UPSTREAM_CACHE_SCHEMA_VERSION = 3;
 const UPSTREAM_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -760,11 +761,17 @@ class UpstreamChecker {
     const account = this._captureAccount(options);
     if (!account) return null;
     const sharedOptions = { ...options, account };
-    const [localPkg, upstreams] = await Promise.all([
+    const [localResult, upstreamResult] = await Promise.allSettled([
       this.existsLocally(workspace, repo, name, format, sharedOptions),
       this.getUpstreamsForFormat(workspace, repo, format, sharedOptions),
     ]);
     if (!isAccountCurrent(this.connectionManager, account)) return null;
+    const localPkg = localResult.status === "fulfilled"
+      ? localResult.value
+      : { data: null, error: localResult.reason, complete: false };
+    const upstreams = upstreamResult.status === "fulfilled"
+      ? upstreamResult.value
+      : { data: [], error: upstreamResult.reason, complete: false };
     const configs = Array.isArray(upstreams.data) ? upstreams.data : [];
     const active = configs.filter(upstream => upstream.is_active !== false);
     return {
@@ -772,10 +779,14 @@ class UpstreamChecker {
       format,
       workspace,
       repo,
-      local: localPkg,
+      local: {
+        data: localPkg.data || null,
+        errorMessage: localPkg.error ? formatUpstreamError(localPkg.error, "local") : null,
+        complete: localPkg.complete === true,
+      },
       upstreams: {
         data: { total: configs.length, active: active.length, configs },
-        error: upstreams.error,
+        errorMessage: upstreams.error ? formatUpstreamError(upstreams.error, "upstream") : null,
         complete: upstreams.complete === true,
       },
       canResolveViaUpstream: active.length > 0,

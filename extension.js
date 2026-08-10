@@ -924,8 +924,8 @@ async function activate(context) {
     dependencyHealthProvider.refresh();
   };
   const connectionSubscription = connectionManager.onDidChange(state => {
-    void handleConnectionStateChange(state).catch(error => {
-      console.warn("[Cloudsmith] Could not refresh all account-scoped state:", error);
+    void handleConnectionStateChange(state).catch(() => {
+      console.warn("[Cloudsmith] Could not refresh all account-scoped state.");
     });
   });
   context.subscriptions.push(connectionSubscription);
@@ -2440,14 +2440,13 @@ async function activate(context) {
             }
 
             await vscode.window.showTextDocument(doc);
-          } catch (error) {
+          } catch {
             if (abortController.signal.aborted) {
               return;
             }
 
-            const message = error && error.message ? error.message : String(error);
             vscode.window.showErrorMessage(
-              `Could not export repository. ${formatApiError(message)}`
+              "Could not export repository because an unexpected error occurred."
             );
           } finally {
             cancellationSubscription.dispose();

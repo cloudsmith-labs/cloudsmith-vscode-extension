@@ -634,6 +634,43 @@ suite("UpstreamPullService", () => {
     assert.strictEqual(result.pullResult.errors, 1);
   });
 
+  test("never exposes registry request URLs through status or terminal details", async () => {
+    const statuses = [];
+    const dependency = {
+      name: "private-package",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "NOT_FOUND",
+    };
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+      showWarningMessage: async () => {},
+    });
+    service._pullDependency = async () => ({
+      dependency,
+      status: "cached",
+      errorMessage: null,
+      requestUrl: "https://user:pass@npm.cloudsmith.io/private/repo/package?token=secret#fragment",
+      networkError: false,
+    });
+
+    const result = await service.execute({
+      workspace: "private-workspace",
+      repository: { slug: "private-repo" },
+      plan: { pullableDependencies: [dependency], skippedDependencies: [] },
+    }, {
+      onStatus(detail) { statuses.push(detail); },
+    });
+
+    assert.ok(statuses.length >= 2);
+    assert.ok(statuses.every(detail => !("requestUrl" in detail)));
+    assert.ok(result.pullResult.details.every(detail => !("requestUrl" in detail)));
+    assert.ok(!JSON.stringify(statuses).includes("token=secret"));
+    assert.ok(!JSON.stringify(result.pullResult).includes("private-workspace"));
+  });
+
   test("does not dispatch after the prepared account changes while loading credentials", async () => {
     let accountState = {
       activationId: "account-a",

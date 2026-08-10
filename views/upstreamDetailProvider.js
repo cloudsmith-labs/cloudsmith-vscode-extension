@@ -1,8 +1,14 @@
 const vscode = require("vscode");
 const { getAllUpstreamData } = require("../util/upstreamChecker");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
+const {
+  formatUpstreamOrigin,
+  formatUpstreamText,
+} = require("../util/upstreamPresentation");
 
 const SUPPORTED_FORMATS = SUPPORTED_UPSTREAM_FORMATS;
+const MAX_RENDERED_UPSTREAMS = 200;
+const MAX_DISTRIBUTION_VERSIONS = 20;
 
 class UpstreamDetailProvider {
   constructor(context) {
@@ -29,7 +35,7 @@ class UpstreamDetailProvider {
         return;
       }
 
-      panel.title = `Upstreams: ${repoName}`;
+      panel.title = `Upstreams: ${formatUpstreamText(repoName, "Unknown repository")}`;
       panel.webview.html = this._getLoadingHtml(workspace, repoSlug, repoName);
 
       const fetchState = await this._fetchGroupedUpstreams(workspace, repoSlug, abortController.signal);
@@ -51,7 +57,7 @@ class UpstreamDetailProvider {
         return;
       }
 
-      panel.title = `Upstreams: ${repoName}`;
+      panel.title = `Upstreams: ${formatUpstreamText(repoName, "Unknown repository")}`;
       panel.webview.html = this._getHtmlContent(workspace, repoSlug, repoName, fetchState);
     } finally {
       if (this._abortController === abortController) {
@@ -68,7 +74,7 @@ class UpstreamDetailProvider {
 
     const panel = vscode.window.createWebviewPanel(
       "cloudsmithUpstreams",
-      `Upstreams: ${repoName}`,
+      `Upstreams: ${formatUpstreamText(repoName, "Unknown repository")}`,
       vscode.ViewColumn.One,
       {
         enableScripts: false,
@@ -198,6 +204,8 @@ class UpstreamDetailProvider {
     const hasLoadedUpstreams = groupedUpstreams.size > 0;
     const unavailableFormats = [...new Set([...failedFormats, ...uninspectedFormats])];
     const hasFailures = unavailableFormats.length > 0 || fetchState.complete === false;
+    let renderedCount = 0;
+    let loadedCount = 0;
 
     for (const format of SUPPORTED_UPSTREAM_FORMATS) {
       const upstreams = groupedUpstreams.get(format);
@@ -205,7 +213,12 @@ class UpstreamDetailProvider {
         continue;
       }
 
-      const cards = upstreams.map((upstream) => this._renderUpstreamCard(upstream)).join("\n");
+      loadedCount += upstreams.length;
+      const remaining = Math.max(0, MAX_RENDERED_UPSTREAMS - renderedCount);
+      const displayed = upstreams.slice(0, remaining);
+      renderedCount += displayed.length;
+      if (displayed.length === 0) continue;
+      const cards = displayed.map((upstream) => this._renderUpstreamCard(upstream)).join("\n");
       formatSections.push(`<section class="format-group">
   <div class="format-header">${this._escape(format)}</div>
   <div class="card-list">
@@ -222,8 +235,11 @@ class UpstreamDetailProvider {
   )} is incomplete.
 </div>`
       : "";
+    const displayLimitNotice = loadedCount > renderedCount
+      ? `<p class="subtle">Showing ${renderedCount} of ${loadedCount} loaded upstreams.</p>`
+      : "";
     const contentHtml = hasLoadedUpstreams
-      ? `${partialWarning}${formatSections.join("\n")}`
+      ? `${partialWarning}${displayLimitNotice}${formatSections.join("\n")}`
       : this._getEmptyOrErrorState(hasFailures, successfulFormats);
 
     return `<!DOCTYPE html>
@@ -399,7 +415,7 @@ class UpstreamDetailProvider {
     const statusClass = isActive ? "status-badge-active" : "status-badge-inactive";
 
     const details = [
-      this._renderDetail("URL", upstream.upstream_url, "mono"),
+      this._renderDetail("Origin", formatUpstreamOrigin(upstream.upstream_url), "mono"),
       this._renderDetail("Mode", typeof upstream.mode === "string" ? upstream.mode : "", ""),
       this._renderDetail("Priority", this._getPriority(upstream), ""),
       this._renderDetail("SSL verification", this._getSslVerification(upstream), ""),
@@ -413,7 +429,7 @@ class UpstreamDetailProvider {
 
     return `<article class="upstream-card">
   <div class="card-header">
-    <div class="card-title">${this._escape(typeof upstream.name === "string" && upstream.name ? upstream.name : "Unnamed")}</div>
+    <div class="card-title">${this._escape(formatUpstreamText(upstream.name, "Unnamed"))}</div>
     <span class="status-badge ${statusClass}">${this._escape(statusLabel)}</span>
   </div>
   <div class="details-grid">
@@ -424,12 +440,11 @@ class UpstreamDetailProvider {
   }
 
   _renderDetail(label, value, valueClass) {
-    if (!value) {
-      return "";
-    }
+    const displayValue = formatUpstreamText(value);
+    if (!displayValue) return "";
 
     const className = valueClass ? `detail-value ${valueClass}` : "detail-value";
-    return `<div class="detail-label">${label}</div><div class="${className}">${this._escape(value)}</div>`;
+    return `<div class="detail-label">${label}</div><div class="${className}">${this._escape(displayValue)}</div>`;
   }
 
   _renderTrustDetail(upstream) {
@@ -468,7 +483,7 @@ class UpstreamDetailProvider {
   }
 
   _getIndexingDisplay(upstream) {
-    const indexStatus = typeof upstream.index_status === "string" ? upstream.index_status : "";
+    const indexStatus = formatUpstreamText(upstream.index_status);
     const packageCount = this._formatIndexPackageCount(upstream.index_package_count);
 
     if (!indexStatus && !packageCount) {
@@ -505,8 +520,10 @@ class UpstreamDetailProvider {
       const label = indexPackageCount === 1 ? "package" : "packages";
       return `${indexPackageCount.toLocaleString()} ${label}`;
     }
-    if (typeof indexPackageCount === "string" && indexPackageCount.trim()) {
-      const numericValue = Number(indexPackageCount);
+    if (typeof indexPackageCount === "string") {
+      const displayValue = formatUpstreamText(indexPackageCount);
+      if (!displayValue) return "";
+      const numericValue = Number(displayValue);
       if (Number.isFinite(numericValue)) {
         const label = numericValue === 1 ? "package" : "packages";
         return `${numericValue.toLocaleString()} ${label}`;
@@ -519,31 +536,32 @@ class UpstreamDetailProvider {
     if (typeof upstream.priority === "number" && Number.isFinite(upstream.priority)) {
       return String(upstream.priority);
     }
-    if (typeof upstream.priority === "string" && upstream.priority.trim()) {
-      return upstream.priority;
+    if (typeof upstream.priority === "string") {
+      return formatUpstreamText(upstream.priority);
     }
     return "";
   }
 
   _getDistribution(upstream) {
     if (typeof upstream.distribution === "string" && upstream.distribution) {
-      return upstream.distribution;
+      return formatUpstreamText(upstream.distribution);
     }
     if (Array.isArray(upstream.distro_versions) && upstream.distro_versions.length > 0) {
-      return upstream.distro_versions.join(", ");
+      const versions = upstream.distro_versions
+        .slice(0, MAX_DISTRIBUTION_VERSIONS)
+        .map(value => formatUpstreamText(value))
+        .filter(Boolean);
+      if (versions.length === 0) return "";
+      return `${versions.join(", ")}${upstream.distro_versions.length > versions.length ? ", …" : ""}`;
     }
     if (typeof upstream.upstream_distribution === "string" && upstream.upstream_distribution) {
-      return upstream.upstream_distribution;
+      return formatUpstreamText(upstream.upstream_distribution);
     }
     return "";
   }
 
   _escape(value) {
-    if (value == null) {
-      return "";
-    }
-
-    return String(value)
+    return formatUpstreamText(value)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
@@ -552,16 +570,17 @@ class UpstreamDetailProvider {
   }
 
   _formatCreatedAt(createdAt) {
-    if (typeof createdAt !== "string" || !createdAt) {
+    const displayValue = formatUpstreamText(createdAt);
+    if (!displayValue) {
       return "";
     }
 
-    const parsed = new Date(createdAt);
+    const parsed = new Date(displayValue);
     if (!Number.isNaN(parsed.getTime())) {
       return parsed.toLocaleDateString();
     }
 
-    return createdAt.slice(0, 10);
+    return displayValue.slice(0, 10);
   }
 
   dispose() {

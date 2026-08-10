@@ -15,7 +15,7 @@ suite("UpstreamDetailProvider Test Suite", () => {
         [
           {
             name: "PyPI",
-            upstream_url: "https://pypi.org/",
+            upstream_url: "https://user:pass@pypi.org/simple/?token=secret#fragment",
             is_active: true,
           },
         ],
@@ -29,9 +29,69 @@ suite("UpstreamDetailProvider Test Suite", () => {
     });
 
     assert.ok(html.includes("PyPI"));
+    assert.ok(html.includes("Origin"));
+    assert.ok(html.includes("https://pypi.org"));
+    assert.ok(!html.includes("user:pass"));
+    assert.ok(!html.includes("/simple/"));
+    assert.ok(!html.includes("token=secret"));
+    assert.ok(!html.includes("#fragment"));
     assert.ok(html.includes("Some upstream data could not be loaded."));
     assert.ok(html.includes("alpine"));
     assert.ok(!html.includes("Could not load upstreams."));
+  });
+
+  test("malformed and unsupported URLs fail closed without breaking cards", () => {
+    const provider = new UpstreamDetailProvider({});
+    const groupedUpstreams = new Map([
+      ["python", [
+        {
+          name: "Malformed\u202ename",
+          upstream_url: "not a URL",
+          is_active: true,
+          mode: { private: true },
+          index_status: { private: true },
+          distro_versions: ["version\u202eone", { private: true }, "x".repeat(10_000)],
+        },
+        { name: "Local file", upstream_url: "file:///tmp/secret", is_active: false },
+      ]],
+    ]);
+
+    const html = provider._getHtmlContent("acme", "repo", "Repo", {
+      groupedUpstreams,
+      failedFormats: [],
+      uninspectedFormats: [],
+      successfulFormats: 26,
+      complete: true,
+    });
+
+    assert.ok(html.includes("Malformed name"));
+    assert.ok(html.includes("Local file"));
+    assert.ok(html.includes("Origin unavailable"));
+    assert.ok(!html.includes("not a URL"));
+    assert.ok(!html.includes("file:///"));
+    assert.ok(!html.includes("[object Object]"));
+    assert.ok(!html.includes("\u202e"));
+    assert.ok(html.length < 20_000);
+  });
+
+  test("caps rendered cards before joining HTML", () => {
+    const provider = new UpstreamDetailProvider({});
+    const groupedUpstreams = new Map([
+      ["python", Array.from({ length: 201 }, (_, index) => ({
+        name: `Mirror ${index}`,
+        upstream_url: `https://mirror-${index}.example/path`,
+      }))],
+    ]);
+
+    const html = provider._getHtmlContent("acme", "repo", "Repo", {
+      groupedUpstreams,
+      failedFormats: [],
+      uninspectedFormats: [],
+      successfulFormats: 26,
+      complete: true,
+    });
+    assert.ok(html.includes("Showing 200 of 201 loaded upstreams."));
+    assert.ok(!html.includes("Mirror 200"));
   });
 
   test("shows an error state when upstream data cannot be determined", () => {

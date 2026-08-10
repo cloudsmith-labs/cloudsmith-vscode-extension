@@ -2,6 +2,12 @@
 // Appears at the top of a repository's package list when upstream sources are configured.
 
 const vscode = require("vscode");
+const {
+    formatUpstreamOrigin,
+    formatUpstreamText,
+} = require("../util/upstreamPresentation");
+
+const MAX_TOOLTIP_UPSTREAMS = 20;
 
 class UpstreamIndicatorNode {
     constructor(upstreams, repositoryContext = {}, context, options = {}) {
@@ -36,16 +42,17 @@ class UpstreamIndicatorNode {
             ? `\nCould not load formats: ${unavailableFormats.join(", ")}`
             : partial ? "\nThe configured total could not be verified." : "";
 
-        const loadedUpstreamDetail = this.upstreams.map((upstream) => {
-            const url = typeof upstream.upstream_url === "string" && upstream.upstream_url.length > 0
-                ? ` (${upstream.upstream_url})`
-                : "";
-            return `${upstream.name}${url}`;
-        }).join('\n');
+        const displayedUpstreams = this.upstreams.slice(0, MAX_TOOLTIP_UPSTREAMS);
+        const loadedUpstreamDetail = displayedUpstreams.map((upstream) => (
+            `${formatUpstreamText(upstream.name, "Unnamed")} (${formatUpstreamOrigin(upstream.upstream_url)})`
+        )).join("\n");
+        const omittedDetail = this.upstreams.length > displayedUpstreams.length
+            ? `\nShowing ${displayedUpstreams.length} of ${this.upstreams.length} loaded upstreams.`
+            : "";
 
         return {
             label,
-            tooltip: `${loadedUpstreamDetail}${failureDetail}`,
+            tooltip: `${loadedUpstreamDetail}${omittedDetail}${failureDetail}`,
             collapsibleState: vscode.TreeItemCollapsibleState.None,
             contextValue: "upstreamIndicator",
             iconPath: new vscode.ThemeIcon('cloud'),
