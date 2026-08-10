@@ -8,11 +8,24 @@ const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiEndpoint } = require("../util/apiEndpoint");
 const { formatApiError } = require("../util/errorFormatter");
 const { buildPackageUrl } = require("../util/webAppUrls");
+const {
+  captureAccount,
+  isAccountCurrent,
+  resolveConnectionManager,
+} = require("../util/accountOperation");
+const {
+  fetchPackageDecisionLogs,
+  normalizePolicyStatusReason,
+  parsePolicyStatusReason,
+} = require("../util/policyDecisionLogs");
 
 class QuarantineExplainProvider {
-  constructor(context) {
+  constructor(context, options = {}) {
     this.context = context;
     this._panel = null;
+    this._operation = null;
+    this._connectionManager = resolveConnectionManager(context, options.connectionManager);
+    this._cloudsmithAPI = options.cloudsmithAPI || null;
   }
 
   /**
@@ -45,13 +58,16 @@ class QuarantineExplainProvider {
       version = typeof version.value === "object" ? version.value.value : version.value;
     }
 
-    const statusReason = item.status_reason || null;
+    const statusReason = normalizePolicyStatusReason(item.status_reason);
     const packageUrl = buildPackageUrl(workspace, repo, format, name, version, slugPerm);
 
     if (!workspace || !slugPerm) {
       vscode.window.showWarningMessage("Could not determine package details for quarantine explanation.");
       return;
     }
+
+    const account = captureAccount(this._connectionManager);
+    if (!account || !isAccountCurrent(this._connectionManager, account)) return;
 
     // Create or reveal the WebView panel
     if (this._panel) {
@@ -66,6 +82,8 @@ class QuarantineExplainProvider {
     );
     this._panel = panel;
     const requestController = new AbortController();
+    const operation = { account, controller: requestController, panel };
+    this._operation = operation;
     const nonce = this._getNonce();
 
     panel.onDidDispose(() => {
@@ -73,13 +91,14 @@ class QuarantineExplainProvider {
       if (this._panel === panel) {
         this._panel = null;
       }
+      if (this._operation === operation) this._operation = null;
     });
 
     // Show loading state
     panel.webview.html = this._getLoadingHtml(name, version);
 
     // Fetch policy decision trace
-    const cloudsmithAPI = new CloudsmithAPI(this.context);
+    const cloudsmithAPI = this._cloudsmithAPI || new CloudsmithAPI(this.context);
     const policyTrace = await this._fetchPolicyDecisionTrace(
       cloudsmithAPI,
       workspace,
@@ -88,7 +107,7 @@ class QuarantineExplainProvider {
       requestController.signal
     );
 
-    if (this._panel !== panel) {
+    if (!this._isOperationCurrent(operation)) {
       return;
     }
 
@@ -100,16 +119,19 @@ class QuarantineExplainProvider {
 
     // Handle messages from the WebView
     panel.webview.onDidReceiveMessage(async (message) => {
+      if (!this._isOperationCurrent(operation)) return;
       if (message.command === "findSafeVersion") {
-        vscode.commands.executeCommand("cloudsmith-vsc.findSafeVersion", item);
+        await vscode.commands.executeCommand("cloudsmith-vsc.findSafeVersion", item);
       } else if (message.command === "showVulnerabilities") {
-        vscode.commands.executeCommand("cloudsmith-vsc.showVulnerabilities", item);
+        await vscode.commands.executeCommand("cloudsmith-vsc.showVulnerabilities", item);
       } else if (message.command === "openInCloudsmith" && packageUrl) {
         await vscode.env.openExternal(vscode.Uri.parse(packageUrl));
       } else if (message.command === "copyReport") {
         const report = this._buildPlainTextReport(name, version, statusReason, policyTrace);
         await vscode.env.clipboard.writeText(report);
-        vscode.window.showInformationMessage("Quarantine report copied.");
+        if (this._isOperationCurrent(operation)) {
+          vscode.window.showInformationMessage("Quarantine report copied.");
+        }
       }
     });
   }
@@ -124,55 +146,36 @@ class QuarantineExplainProvider {
     const trace = {
       parsedReason: null,
       decisionLogs: [],
+      decisionLogsComplete: false,
+      decisionLogsPartial: false,
+      decisionLogsIncomplete: true,
+      decisionLogsFailureCount: 0,
       policyDetail: null,
     };
 
     // Parse the status_reason field if present
-    if (statusReason) {
-      const policyMatch = statusReason.match(/Quarantined by (.+?)\.(.+?)(?:\(Policy:\s*(.+?)\))?$/);
-      if (policyMatch) {
-        trace.parsedReason = {
-          policyName: policyMatch[1].trim(),
-          description: policyMatch[2].trim(),
-          policySlug: policyMatch[3] ? policyMatch[3].trim() : null,
-        };
-      } else {
-        trace.parsedReason = { raw: statusReason };
-      }
-    }
+    trace.parsedReason = parsePolicyStatusReason(statusReason);
 
     // Fetch decision logs from v2 API
     try {
-      const logsEndpoint = apiEndpoint(["workspaces", workspace, "policies", "decision", "logs"], {
-        query: { page_size: 100 },
-      });
-      const logsResult = await cloudsmithAPI.getV2(logsEndpoint, {
-        responseType: "json",
-        validate: isArrayOrResultsEnvelope,
-        retry: "never",
+      const logsResult = await fetchPackageDecisionLogs(cloudsmithAPI, workspace, slugPerm, {
         signal,
       });
-
-      if (logsResult.ok) {
-        const logs = Array.isArray(logsResult.data) ? logsResult.data : logsResult.data.results;
-        trace.decisionLogs = logs.filter(entry => {
-          if (entry.package && entry.package.identifier === slugPerm) {
-            return true;
-          }
-          if (entry.package_slug_perm === slugPerm) {
-            return true;
-          }
-          return false;
-        });
-      } else if (logsResult.error.kind !== "cancelled") {
-        console.warn(`[Quarantine] Policy decision logs unavailable: ${formatApiError(logsResult.error)}`);
-      }
-    } catch (error) { // eslint-disable-line no-unused-vars
-      // v2 policy decision log endpoint may not be available
+      if (signal && signal.aborted) return trace;
+      trace.decisionLogs = [...logsResult.items];
+      trace.decisionLogsComplete = logsResult.complete;
+      trace.decisionLogsPartial = logsResult.partial;
+      trace.decisionLogsIncomplete = logsResult.incomplete;
+      trace.decisionLogsFailureCount = logsResult.failureCount;
+    } catch {
+      trace.decisionLogsComplete = false;
+      trace.decisionLogsPartial = false;
+      trace.decisionLogsIncomplete = true;
+      trace.decisionLogsFailureCount = 1;
     }
 
     // If we have a policy slug, fetch the policy detail for the description
-    if (trace.parsedReason && trace.parsedReason.policySlug) {
+    if (trace.parsedReason && trace.parsedReason.policySlug && !(signal && signal.aborted)) {
       try {
         const policyEndpoint = apiEndpoint([
           "workspaces",
@@ -186,6 +189,7 @@ class QuarantineExplainProvider {
           retry: "never",
           signal,
         });
+        if (signal && signal.aborted) return trace;
         if (policyResult.ok) {
           trace.policyDetail = policyResult.data;
         } else if (policyResult.error.kind !== "cancelled") {
@@ -250,7 +254,7 @@ class QuarantineExplainProvider {
       for (const entry of policyTrace.decisionLogs) {
         decisionLogsHtml += `<tr>
           <td>${this._esc(entry.policy_name || entry.name || "Unknown")}</td>
-          <td>${this._esc(entry.matched ? "Yes" : "No")}</td>
+          <td>${this._esc(entry.matched === true ? "Yes" : entry.matched === false ? "No" : "Unknown")}</td>
           <td>${this._esc(entry.action || entry.actions_taken || "\u2014")}</td>
           <td>${this._esc(entry.reason || "\u2014")}</td>
         </tr>`;
@@ -259,7 +263,10 @@ class QuarantineExplainProvider {
     }
 
     // Non-vulnerability notice
-    const nonVulnNotice = !hasCVEs
+    const decisionLogsWarning = policyTrace.decisionLogsComplete === false
+      ? `<div class="warning-banner">Policy decision log history is incomplete. Loaded entries are shown, but additional policy or vulnerability decisions may exist.</div>`
+      : "";
+    const nonVulnNotice = !hasCVEs && policyTrace.decisionLogsComplete === true
       ? `<div class="info-banner">This quarantine was triggered by policy rules, not a specific vulnerability.</div>`
       : "";
 
@@ -340,6 +347,13 @@ class QuarantineExplainProvider {
     margin: 16px 0;
     color: var(--vscode-descriptionForeground);
   }
+  .warning-banner {
+    background: var(--vscode-inputValidation-warningBackground, rgba(255,200,0,0.08));
+    border: 1px solid var(--vscode-inputValidation-warningBorder, #c8a000);
+    border-radius: 4px;
+    padding: 10px 14px;
+    margin: 16px 0;
+  }
 </style>
 </head>
 <body>
@@ -350,6 +364,7 @@ class QuarantineExplainProvider {
   <span class="quarantine-badge">\u26D4 Quarantined</span>
 
   ${policyInfoHtml}
+  ${decisionLogsWarning}
   ${nonVulnNotice}
   ${decisionLogsHtml}
 
@@ -398,6 +413,9 @@ class QuarantineExplainProvider {
         lines.push(`  - ${entry.policy_name || entry.name || "Unknown"}: ${entry.reason || entry.action || "\u2014"}`);
       }
     }
+    if (policyTrace.decisionLogsComplete === false) {
+      lines.push("Policy decision log history is incomplete; additional entries may exist.");
+    }
     return lines.join("\n");
   }
 
@@ -414,23 +432,32 @@ class QuarantineExplainProvider {
     return crypto.randomBytes(16).toString("hex");
   }
 
+  _isOperationCurrent(operation) {
+    return Boolean(
+      operation
+      && this._operation === operation
+      && this._panel === operation.panel
+      && !operation.controller.signal.aborted
+      && isAccountCurrent(this._connectionManager, operation.account)
+    );
+  }
+
+  resetForAccountChange() {
+    const operation = this._operation;
+    this._operation = null;
+    if (operation) operation.controller.abort();
+    const panel = this._panel;
+    this._panel = null;
+    if (panel) panel.dispose();
+  }
+
   dispose() {
-    if (this._panel) {
-      this._panel.dispose();
-      this._panel = null;
-    }
+    this.resetForAccountChange();
   }
 }
 
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function isArrayOrResultsEnvelope(value) {
-  if (Array.isArray(value)) {
-    return value.every(isRecord);
-  }
-  return isRecord(value) && Array.isArray(value.results) && value.results.every(isRecord);
 }
 
 module.exports = { QuarantineExplainProvider };

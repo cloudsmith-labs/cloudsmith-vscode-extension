@@ -107,7 +107,7 @@ suite("ComplianceReportProvider", () => {
     assert.match(html, /proxy &lt;prod&gt;/);
     assert.match(html, /Blocked by policy &lt;rule&gt;/);
     assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
-    assert.match(html, /Vulnerable Dependencies/);
+    assert.match(html, /Vulnerability Findings/);
     assert.match(html, /License Summary/);
     assert.match(html, /Policy Compliance/);
     assert.match(html, /Uncovered Dependencies/);
@@ -146,5 +146,52 @@ suite("ComplianceReportProvider", () => {
     } finally {
       vscode.window.createWebviewPanel = originalCreateWebviewPanel;
     }
+  });
+
+  test("renders unknown vulnerability totals without manufacturing zero CVEs", () => {
+    const reportData = buildComplianceReportData("fixture", [{
+      name: "unknown-package",
+      version: "1.0.0",
+      format: "npm",
+      isDirect: true,
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: { num_vulnerabilities: "0x10" },
+    }]);
+    assert.strictEqual(reportData.summary.vulnCount, 0);
+    assert.strictEqual(reportData.summary.vulnUnknownCount, 1);
+    assert.strictEqual(reportData.vulnerableDeps[0].cveCount, null);
+    assert.strictEqual(reportData.vulnerableDeps[0].vulnerabilityStatus, "Unknown");
+
+    const provider = new ComplianceReportProvider({});
+    const html = provider._getHtml(reportData);
+
+    assert.match(html, /CVE Count \/ Status/);
+    assert.match(html, />Unknown<\/td>/);
+    assert.match(html, /1 Unknown/);
+    assert.doesNotMatch(html, /unknown-package[\s\S]*?<td>0<\/td>/);
+  });
+
+  test("does not render an incomplete lookup set as clean or unreachable", () => {
+    const provider = new ComplianceReportProvider({});
+    const incompleteHtml = provider._getHtml({
+      projectName: "fixture",
+      summary: { lookupIncomplete: 2 },
+    });
+    assert.match(incompleteHtml, /Compliance status incomplete/);
+    assert.doesNotMatch(incompleteHtml, /No compliance issues detected/);
+
+    const upstreamHtml = provider._getHtml({
+      projectName: "fixture",
+      summary: { notFound: 1 },
+      uncoveredDeps: [{
+        name: "unknown-package",
+        version: "1.0.0",
+        ecosystem: "npm",
+        upstreamStatus: "unknown",
+        upstreamDetail: "Inspection incomplete",
+      }],
+    });
+    assert.match(upstreamHtml, /Reachability unknown/);
+    assert.doesNotMatch(upstreamHtml, /<h3>Not reachable<\/h3>/);
   });
 });

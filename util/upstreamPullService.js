@@ -1,10 +1,8 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("./cloudsmithAPI");
-const { apiEndpoint } = require("./apiEndpoint");
 const { CredentialManager } = require("./credentialManager");
-const { formatApiError } = require("./errorFormatter");
-const { PaginatedFetch } = require("./paginatedFetch");
+const { fetchWorkspaceRepositories } = require("./workspaceRepositoryFetcher");
 const {
   buildRegistryTriggerPlan,
   findPythonDistributionUrl,
@@ -17,14 +15,19 @@ const {
 } = require("./registryEndpoints");
 const { canonicalFormat, normalizePackageName } = require("./packageNameNormalizer");
 const { UpstreamChecker } = require("./upstreamChecker");
+const { UpstreamOperationScheduler } = require("./upstreamOperationScheduler");
 const { normalizeUpstreamFormat } = require("./upstreamFormats");
+const {
+  captureAccount,
+  isAccountCurrent,
+  resolveConnectionManager,
+} = require("./accountOperation");
 
 const MAX_CONCURRENT_PULLS = 5;
 const INITIAL_AUTH_PROBE_CONCURRENCY = 3;
 const MAX_REGISTRY_REDIRECTS = 5;
 const REQUEST_TIMEOUT_MS = 30 * 1000;
 const MAX_REGISTRY_METADATA_BYTES = 1024 * 1024;
-const WORKSPACE_REPOSITORY_PAGE_SIZE = 500;
 const SAFE_REGISTRY_ERROR_MESSAGES = new Set([
   "Refused to send Cloudsmith credentials to an untrusted registry host.",
   "Registry metadata response exceeded the size limit.",
@@ -64,6 +67,7 @@ class UpstreamPullService {
     this._showInformationMessage = options.showInformationMessage || vscode.window.showInformationMessage.bind(vscode.window);
     this._showWarningMessage = options.showWarningMessage || vscode.window.showWarningMessage.bind(vscode.window);
     this._upstreamChecker = options.upstreamChecker || new UpstreamChecker(context);
+    this._connectionManager = resolveConnectionManager(context, options.connectionManager);
   }
 
   async run(options) {
@@ -87,7 +91,12 @@ class UpstreamPullService {
     workspace,
     repositoryHint,
     dependencies,
+    token = null,
+    cancellationToken = null,
+    signal = null,
   }) {
+    const operation = this._createPreparationOperation(cancellationToken || token, signal);
+    if (!this._isPreparationCurrent(operation)) return null;
     const uncoveredDependencies = dedupePullDependencies(
       (Array.isArray(dependencies) ? dependencies : [])
         .filter((dependency) => dependency && isConclusiveCloudsmithAbsence(dependency.cloudsmithStatus))
@@ -116,24 +125,40 @@ class UpstreamPullService {
       return null;
     }
 
-    let repositories;
+    let repositoryCollection;
     try {
-      repositories = await this._fetchRepositories(workspace);
-    } catch (error) {
-      const message = error && error.message ? error.message : "Could not fetch workspace repositories.";
-      await this._showErrorMessage(message);
-      return null;
-    }
-
-    const repositoryMatches = await this._findMatchingRepositories(workspace, repositories, projectFormats);
-    if (repositoryMatches.length === 0) {
-      await this._showInformationMessage(
-        `No repositories have upstream proxies configured for the dependency formats in this project (${formatListLabel(projectFormats)}). Configure an upstream proxy in Cloudsmith to enable pull-through caching.`
+      repositoryCollection = normalizeRepositoryCollection(
+        await this._fetchRepositories(workspace, operation)
       );
+    } catch (error) {
+      if (!this._isPreparationCurrent(operation)) return null;
+      await this._showErrorMessage(repositoryCollectionFailureMessage(error));
+      return null;
+    }
+    if (!this._isPreparationCurrent(operation)) return null;
+
+    const repositorySearch = await this._findMatchingRepositories(
+      workspace,
+      repositoryCollection.items,
+      projectFormats,
+      operation
+    );
+    if (!this._isPreparationCurrent(operation)) return null;
+    if (repositorySearch.matches.length === 0) {
+      const incomplete = !repositoryCollection.complete || !repositorySearch.complete;
+      const message = incomplete
+        ? `Repository upstream inspection was incomplete for ${formatListLabel(projectFormats)}. No matching proxy was found in the repositories that could be inspected.`
+        : `No repositories have upstream proxies configured for the dependency formats in this project (${formatListLabel(projectFormats)}). Configure an upstream proxy in Cloudsmith to enable pull-through caching.`;
+      await (incomplete ? this._showWarningMessage(message) : this._showInformationMessage(message));
       return null;
     }
 
-    const orderedMatches = sortRepositoryMatches(repositoryMatches, repositoryHint);
+    if (!repositoryCollection.complete || !repositorySearch.complete) {
+      await this._showWarningMessage(
+        "Repository upstream inspection was incomplete. Verified matching repositories are shown, but additional matches may exist."
+      );
+    }
+    const orderedMatches = sortRepositoryMatches(repositorySearch.matches, repositoryHint);
     const selected = await this._showQuickPick(
       orderedMatches.map((match) => ({
         label: match.repo.slug || match.repo.name,
@@ -148,7 +173,7 @@ class UpstreamPullService {
       }
     );
 
-    if (!selected || !selected._match) {
+    if (!this._isPreparationCurrent(operation) || !selected || !selected._match) {
       return null;
     }
 
@@ -171,7 +196,7 @@ class UpstreamPullService {
       "Pull dependencies"
     );
 
-    if (confirmation !== "Pull dependencies") {
+    if (!this._isPreparationCurrent(operation) || confirmation !== "Pull dependencies") {
       return null;
     }
 
@@ -179,6 +204,8 @@ class UpstreamPullService {
       workspace,
       repository,
       plan,
+      account: operation.account,
+      repositorySearchComplete: repositoryCollection.complete && repositorySearch.complete,
     };
   }
 
@@ -186,7 +213,12 @@ class UpstreamPullService {
     workspace,
     repositoryHint,
     dependency,
+    token = null,
+    cancellationToken = null,
+    signal = null,
   }) {
+    const operation = this._createPreparationOperation(cancellationToken || token, signal);
+    if (!this._isPreparationCurrent(operation)) return null;
     const normalizedDependency = normalizeSingleDependency(dependency);
     if (!workspace) {
       await this._showErrorMessage("Run a dependency scan against a Cloudsmith workspace first.");
@@ -213,24 +245,40 @@ class UpstreamPullService {
       return null;
     }
 
-    let repositories;
+    let repositoryCollection;
     try {
-      repositories = await this._fetchRepositories(workspace);
-    } catch (error) {
-      const message = error && error.message ? error.message : "Could not fetch workspace repositories.";
-      await this._showErrorMessage(message);
-      return null;
-    }
-
-    const repositoryMatches = await this._findMatchingRepositories(workspace, repositories, [dependencyFormat]);
-    if (repositoryMatches.length === 0) {
-      await this._showInformationMessage(
-        `No repositories have a ${formatDisplayName(dependencyFormat)} upstream configured. Add one in Cloudsmith to pull this dependency.`
+      repositoryCollection = normalizeRepositoryCollection(
+        await this._fetchRepositories(workspace, operation)
       );
+    } catch (error) {
+      if (!this._isPreparationCurrent(operation)) return null;
+      await this._showErrorMessage(repositoryCollectionFailureMessage(error));
+      return null;
+    }
+    if (!this._isPreparationCurrent(operation)) return null;
+
+    const repositorySearch = await this._findMatchingRepositories(
+      workspace,
+      repositoryCollection.items,
+      [dependencyFormat],
+      operation
+    );
+    if (!this._isPreparationCurrent(operation)) return null;
+    if (repositorySearch.matches.length === 0) {
+      const incomplete = !repositoryCollection.complete || !repositorySearch.complete;
+      const message = incomplete
+        ? `Repository upstream inspection was incomplete. No ${formatDisplayName(dependencyFormat)} proxy was found in the repositories that could be inspected.`
+        : `No repositories have a ${formatDisplayName(dependencyFormat)} upstream configured. Add one in Cloudsmith to pull this dependency.`;
+      await (incomplete ? this._showWarningMessage(message) : this._showInformationMessage(message));
       return null;
     }
 
-    const orderedMatches = sortRepositoryMatches(repositoryMatches, repositoryHint);
+    if (!repositoryCollection.complete || !repositorySearch.complete) {
+      await this._showWarningMessage(
+        "Repository upstream inspection was incomplete. Verified matching repositories are shown, but additional matches may exist."
+      );
+    }
+    const orderedMatches = sortRepositoryMatches(repositorySearch.matches, repositoryHint);
     const selected = await this._showQuickPick(
       orderedMatches.map((match) => ({
         label: match.repo.slug || match.repo.name,
@@ -245,7 +293,7 @@ class UpstreamPullService {
       }
     );
 
-    if (!selected || !selected._match) {
+    if (!this._isPreparationCurrent(operation) || !selected || !selected._match) {
       return null;
     }
 
@@ -267,11 +315,28 @@ class UpstreamPullService {
       repository,
       plan,
       dependency: normalizedDependency,
+      account: operation.account,
+      repositorySearchComplete: repositoryCollection.complete && repositorySearch.complete,
     };
   }
 
   async execute(prepared, options = {}) {
-    const apiKey = await this._credentialManager.getApiKey();
+    if (!this._isPreparedAccountCurrent(prepared)) {
+      return { canceled: true, stale: true };
+    }
+    let apiKey;
+    try {
+      apiKey = await this._credentialManager.getApiKey();
+    } catch {
+      if (!this._isPreparedAccountCurrent(prepared)) {
+        return { canceled: true, stale: true };
+      }
+      await this._showErrorMessage("Authentication failed. Check your API key in Cloudsmith settings.");
+      return null;
+    }
+    if (!this._isPreparedAccountCurrent(prepared)) {
+      return { canceled: true, stale: true };
+    }
     if (!apiKey) {
       await this._showErrorMessage("Authentication failed. Check your API key in Cloudsmith settings.");
       return null;
@@ -294,8 +359,10 @@ class UpstreamPullService {
         INITIAL_AUTH_PROBE_CONCURRENCY
       ),
       expandedConcurrency: false,
+      stale: false,
     };
     const pending = new Set();
+    const launchedTasks = [];
     let activeCount = 0;
     let launchedCount = 0;
 
@@ -310,6 +377,11 @@ class UpstreamPullService {
     };
 
     const processNext = async () => {
+      if (!this._isPreparedAccountCurrent(prepared)) {
+        state.canceled = true;
+        state.stale = true;
+        return;
+      }
       if (token && token.isCancellationRequested) {
         state.canceled = true;
         return;
@@ -331,25 +403,44 @@ class UpstreamPullService {
           dependency,
           status: PULL_STATUS.PULLING,
           errorMessage: null,
-          requestUrl: buildPullRequestUrl(prepared.workspace, prepared.repository.slug, dependency),
         };
-        if (onStatus) {
-          await onStatus(pullingDetail);
-        }
-
-        const result = await this._pullDependency(
-          prepared.workspace,
-          prepared.repository.slug,
-          dependency,
-          apiKey,
-          token
-        );
-
-        if (result.canceled) {
+        await publishStatus(onStatus, pullingDetail);
+        if (!this._isPreparedAccountCurrent(prepared)) {
           state.canceled = true;
+          state.stale = true;
           return;
         }
 
+        let result;
+        try {
+          result = await this._pullDependency(
+            prepared.workspace,
+            prepared.repository.slug,
+            dependency,
+            apiKey,
+            token,
+            () => this._isPreparedAccountCurrent(prepared)
+          );
+        } catch {
+          result = createPullFailure(
+            dependency,
+            "The upstream pull failed unexpectedly."
+          );
+        }
+
+        if (!this._isPreparedAccountCurrent(prepared)) {
+          state.canceled = true;
+          state.stale = true;
+          return;
+        }
+
+        if (result.canceled) {
+          state.canceled = true;
+          state.stale = result.stale === true;
+          return;
+        }
+
+        result = toPublicPullDetail(result);
         details.push(result);
         updateResultCounts(counts, result);
 
@@ -376,16 +467,19 @@ class UpstreamPullService {
           state.expandedConcurrency = true;
         }
 
-        if (progress) {
-          progress.report({
-            message: buildProgressMessage(counts),
-            increment: counts.total > 0 ? 100 / counts.total : 100,
-          });
-        }
+        publishProgress(progress, {
+          message: buildProgressMessage(counts),
+          increment: counts.total > 0 ? 100 / counts.total : 100,
+        });
 
-        if (onStatus) {
-          await onStatus(result);
-        }
+        await publishStatus(onStatus, result);
+      } catch {
+        const failure = createPullFailure(
+          dependency,
+          "The upstream pull failed unexpectedly."
+        );
+        details.push(failure);
+        updateResultCounts(counts, failure);
       } finally {
         activeCount -= 1;
         fillConcurrency();
@@ -398,12 +492,21 @@ class UpstreamPullService {
         && (state.expandedConcurrency || launchedCount < INITIAL_AUTH_PROBE_CONCURRENCY)
         && nextDependencyIndex < queue.length
         && !(token && token.isCancellationRequested)
+        && this._isPreparedAccountCurrent(prepared)
         && !state.stopForAuthFailure
       ) {
         launchedCount += 1;
         const promise = processNext();
         pending.add(promise);
-        promise.finally(() => pending.delete(promise));
+        launchedTasks.push(promise);
+        promise.then(
+          () => pending.delete(promise),
+          () => pending.delete(promise)
+        );
+      }
+      if (!this._isPreparedAccountCurrent(prepared)) {
+        state.canceled = true;
+        state.stale = true;
       }
     };
 
@@ -411,6 +514,11 @@ class UpstreamPullService {
 
     while (pending.size > 0) {
       await Promise.race([...pending]);
+    }
+    await Promise.allSettled(launchedTasks);
+
+    if (state.stale || !this._isPreparedAccountCurrent(prepared)) {
+      return { canceled: true, stale: true };
     }
 
     if (state.stopForAuthFailure) {
@@ -421,7 +529,6 @@ class UpstreamPullService {
           dependency,
           status: PULL_STATUS.AUTH_FAILED,
           errorMessage: "Skipped after repeated authentication failures.",
-          requestUrl: buildPullRequestUrl(prepared.workspace, prepared.repository.slug, dependency),
           networkError: false,
         });
       }
@@ -456,82 +563,138 @@ class UpstreamPullService {
     };
   }
 
-  async _findMatchingRepositories(workspace, repositories, projectFormats) {
+  async _findMatchingRepositories(
+    workspace,
+    repositories,
+    projectFormats,
+    operation
+  ) {
     const matches = [];
+    let complete = true;
+    const scheduler = new UpstreamOperationScheduler();
+    const cancellationToken = operation && operation.cancellationToken;
+    const signal = operation && operation.signal;
+    const cancellationDisposable = cancellationToken
+      && typeof cancellationToken.onCancellationRequested === "function"
+      ? cancellationToken.onCancellationRequested(() => scheduler.cancel())
+      : null;
+    const abortListener = () => scheduler.cancel();
+    if (signal && typeof signal.addEventListener === "function") {
+      signal.addEventListener("abort", abortListener, { once: true });
+    }
 
-    await runPromisePool(repositories, 5, async (repo) => {
-      const repoSlug = repo && repo.slug ? repo.slug : null;
-      if (!repoSlug) {
-        return;
-      }
-
-      const state = await this._upstreamChecker.getRepositoryUpstreamState(workspace, repoSlug);
-      const activeUpstreamsByFormat = new Map();
-      const activeFormats = projectFormats.filter((format) => {
-        const upstreams = state && state.groupedUpstreams instanceof Map
-          ? state.groupedUpstreams.get(format)
-          : [];
-        const activeUpstreams = Array.isArray(upstreams)
-          ? upstreams.filter((upstream) => upstream && upstream.is_active !== false)
-          : [];
-        if (activeUpstreams.length > 0) {
-          activeUpstreamsByFormat.set(format, activeUpstreams);
+    try {
+      await runPromisePool(repositories, 4, async (repo) => {
+        if (!this._isPreparationCurrent(operation) || scheduler.stopped) {
+          complete = false;
+          return false;
+        }
+        const repoSlug = repo && repo.slug ? repo.slug : null;
+        if (!repoSlug) {
+          complete = false;
           return true;
         }
-        return false;
-      });
 
-      if (activeFormats.length === 0) {
-        return;
+        let state;
+        try {
+          const requestOptions = {
+            scheduler,
+            cancellationToken,
+            signal,
+            account: operation.account,
+          };
+          state = typeof this._upstreamChecker.getRepositoryUpstreamStateForFormats === "function"
+            ? await this._upstreamChecker.getRepositoryUpstreamStateForFormats(
+              workspace,
+              repoSlug,
+              projectFormats,
+              requestOptions
+            )
+            : await this._upstreamChecker.getRepositoryUpstreamState(
+              workspace,
+              repoSlug,
+              requestOptions
+            );
+        } catch {
+          complete = false;
+          return this._isPreparationCurrent(operation) && !scheduler.stopped;
+        }
+        if (!isRepositoryInspectionCompleteForFormats(state, projectFormats)) complete = false;
+        const activeUpstreamsByFormat = new Map();
+        const activeFormats = projectFormats.filter((format) => {
+          const upstreams = state && state.groupedUpstreams instanceof Map
+            ? state.groupedUpstreams.get(format)
+            : [];
+          const activeUpstreams = Array.isArray(upstreams)
+            ? upstreams.filter((upstream) => upstream && upstream.is_active !== false)
+            : [];
+          if (activeUpstreams.length > 0) {
+            activeUpstreamsByFormat.set(format, activeUpstreams);
+            return true;
+          }
+          return false;
+        });
+
+        if (activeFormats.length === 0) {
+          return true;
+        }
+
+        matches.push({
+          repo,
+          activeFormats,
+          activeUpstreamsByFormat,
+        });
+        return true;
+      });
+    } finally {
+      if (!this._isPreparationCurrent(operation)) scheduler.cancel();
+      if (cancellationDisposable) cancellationDisposable.dispose();
+      if (signal && typeof signal.removeEventListener === "function") {
+        signal.removeEventListener("abort", abortListener);
       }
+    }
+    if (!this._isPreparationCurrent(operation)) complete = false;
 
-      matches.push({
-        repo,
-        activeFormats,
-        activeUpstreamsByFormat,
-      });
-    });
-
-    return matches.sort((left, right) => {
+    const sortedMatches = matches.sort((left, right) => {
       const leftSlug = String(left.repo.slug || left.repo.name || "");
       const rightSlug = String(right.repo.slug || right.repo.name || "");
       return leftSlug.localeCompare(rightSlug, undefined, { sensitivity: "base" });
     });
+    return { matches: sortedMatches, complete };
   }
 
-  async _fetchWorkspaceRepositories(workspace) {
-    const paginatedFetch = new PaginatedFetch(this._api);
-    const endpoint = apiEndpoint(["repos", workspace], { query: { sort: "name" } });
-    const repositories = [];
-    let page = 1;
-
-    while (true) {
-      const result = await paginatedFetch.fetchPage(
-        endpoint,
-        page,
-        WORKSPACE_REPOSITORY_PAGE_SIZE,
-        null,
-        { validate: isRepositoryArray, retry: "never" }
-      );
-      if (result.error) {
-        throw new Error(`Could not fetch workspace repositories. ${formatApiError(result.error)}`);
-      }
-
-      repositories.push(...(Array.isArray(result.data) ? result.data : []));
-
-      const pageTotal = result.pagination && result.pagination.pageTotal
-        ? result.pagination.pageTotal
-        : 1;
-      if (page >= pageTotal) {
-        break;
-      }
-      page += 1;
-    }
-
-    return repositories;
+  async _fetchWorkspaceRepositories(workspace, operation = {}) {
+    return fetchWorkspaceRepositories(this.context, workspace, {
+      cloudsmithAPI: this._api,
+      connectionManager: this._connectionManager,
+      retry: "never",
+      cancellationToken: operation.cancellationToken,
+      signal: operation.signal,
+      account: operation.account,
+    });
   }
 
-  async _pullDependency(workspace, repo, dependency, apiKey, token) {
+  _createPreparationOperation(cancellationToken, signal) {
+    const account = this._connectionManager ? captureAccount(this._connectionManager) : null;
+    return { cancellationToken, signal, account };
+  }
+
+  _isPreparationCurrent(operation) {
+    if (
+      !operation
+      || isCancellationRequested(operation.cancellationToken)
+      || operation.signal?.aborted
+    ) return false;
+    return !this._connectionManager
+      || Boolean(operation.account && isAccountCurrent(this._connectionManager, operation.account));
+  }
+
+  _isPreparedAccountCurrent(prepared) {
+    return !this._connectionManager
+      || Boolean(prepared?.account && isAccountCurrent(this._connectionManager, prepared.account));
+  }
+
+  async _pullDependency(workspace, repo, dependency, apiKey, token, isCurrent = null) {
     const plan = buildRegistryTriggerPlan(workspace, repo, dependency);
     const format = formatForDependency(dependency);
 
@@ -544,7 +707,6 @@ class UpstreamPullService {
         dependency,
         status: PULL_STATUS.FORMAT_MISMATCH,
         errorMessage,
-        requestUrl: null,
         networkError: false,
       };
     }
@@ -553,26 +715,26 @@ class UpstreamPullService {
       plan.request,
       apiKey,
       token,
-      { captureBody: plan.strategy !== "direct" }
+      { captureBody: plan.strategy !== "direct", isCurrent }
     );
     if (metadataAttempt.canceled) {
       return metadataAttempt;
     }
 
     if (plan.strategy === "direct") {
-      return mapRegistryAttempt(dependency, metadataAttempt, plan.request.url, format);
+      return mapRegistryAttempt(dependency, metadataAttempt, format);
     }
 
     if (metadataAttempt.statusCode === 401 || metadataAttempt.statusCode === 403) {
-      return mapRegistryAttempt(dependency, metadataAttempt, plan.request.url, format);
+      return mapRegistryAttempt(dependency, metadataAttempt, format);
     }
 
     if (metadataAttempt.statusCode === 404) {
-      return mapRegistryAttempt(dependency, metadataAttempt, plan.request.url, format);
+      return mapRegistryAttempt(dependency, metadataAttempt, format);
     }
 
     if (metadataAttempt.statusCode < 200 || metadataAttempt.statusCode >= 300) {
-      return mapRegistryAttempt(dependency, metadataAttempt, plan.request.url, format);
+      return mapRegistryAttempt(dependency, metadataAttempt, format);
     }
 
     let artifactUrl = null;
@@ -594,9 +756,12 @@ class UpstreamPullService {
         dependency,
         status: PULL_STATUS.NOT_FOUND,
         errorMessage: missingArtifactMessage(plan.strategy, dependency.version),
-        requestUrl: plan.request.url,
         networkError: false,
       };
+    }
+
+    if (isCurrent && !isCurrent()) {
+      return { canceled: true, stale: true };
     }
 
     const artifactAttempt = await this._requestRegistry(
@@ -607,17 +772,21 @@ class UpstreamPullService {
       },
       apiKey,
       token,
-      { captureBody: false }
+      { captureBody: false, isCurrent }
     );
 
     if (artifactAttempt.canceled) {
       return artifactAttempt;
     }
 
-    return mapRegistryAttempt(dependency, artifactAttempt, artifactUrl, format);
+    return mapRegistryAttempt(dependency, artifactAttempt, format);
   }
 
   async _requestRegistry(request, apiKey, token, options = {}) {
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (isCurrent && !isCurrent()) {
+      return { canceled: true, stale: true };
+    }
     const controller = new AbortController();
     let abortCause = null;
     const abort = (cause) => {
@@ -646,7 +815,8 @@ class UpstreamPullService {
         request,
         apiKey,
         controller.signal,
-        0
+        0,
+        isCurrent
       );
 
       const body = options.captureBody === false
@@ -665,6 +835,9 @@ class UpstreamPullService {
         body,
       };
     } catch (error) {
+      if (isCurrent && !isCurrent()) {
+        return { canceled: true, stale: true };
+      }
       if (abortCause === "cancelled" || (token && token.isCancellationRequested)) {
         return { canceled: true };
       }
@@ -685,9 +858,12 @@ class UpstreamPullService {
     }
   }
 
-  async _fetchRegistryResponse(request, apiKey, signal, redirectCount) {
+  async _fetchRegistryResponse(request, apiKey, signal, redirectCount, isCurrent = null) {
     if (!request || !isTrustedRegistryUrl(request.url)) {
       throw new Error("Refused to send Cloudsmith credentials to an untrusted registry host.");
+    }
+    if (isCurrent && !isCurrent()) {
+      throw new Error("The Cloudsmith account changed during the registry request.");
     }
 
     const fetchResult = await this._awaitRegistryAbortable(this._fetchImpl(request.url, {
@@ -729,6 +905,10 @@ class UpstreamPullService {
 
     await cancelRegistryBody(response);
 
+    if (isCurrent && !isCurrent()) {
+      throw new Error("The Cloudsmith account changed during the registry request.");
+    }
+
     return this._fetchRegistryResponse(
       {
         ...request,
@@ -736,7 +916,8 @@ class UpstreamPullService {
       },
       apiKey,
       signal,
-      redirectCount + 1
+      redirectCount + 1,
+      isCurrent
     );
   }
 
@@ -774,16 +955,24 @@ class UpstreamPullService {
   }
 }
 
-function isRepositoryArray(value) {
-  return Array.isArray(value) && value.every(repository => (
-    repository
-    && typeof repository === "object"
-    && !Array.isArray(repository)
-    && typeof repository.slug === "string"
-    && repository.slug.length > 0
-    && typeof repository.name === "string"
-    && repository.name.length > 0
-  ));
+function normalizeRepositoryCollection(value) {
+  if (!value || typeof value !== "object") return { items: [], complete: false };
+  const items = Array.isArray(value.items) ? value.items : [];
+  return {
+    items,
+    complete: value.complete === true && value.stale !== true,
+  };
+}
+
+function isRepositoryInspectionCompleteForFormats(state, formats) {
+  if (!state || typeof state !== "object") return false;
+  if (state.complete === true) return true;
+  const unavailable = [
+    ...(Array.isArray(state.failedFormats) ? state.failedFormats : []),
+    ...(Array.isArray(state.uninspectedFormats) ? state.uninspectedFormats : []),
+  ];
+  if (unavailable.length === 0) return false;
+  return !(Array.isArray(formats) ? formats : []).some(format => unavailable.includes(format));
 }
 
 function buildRegistryRequestHeaders(headers) {
@@ -1149,13 +1338,12 @@ function recomputeResultCounts(counts, results) {
   Object.assign(counts, next);
 }
 
-function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
+function mapRegistryAttempt(dependency, attempt, format) {
   if (attempt.statusCode >= 200 && attempt.statusCode < 300) {
     return {
       dependency,
       status: PULL_STATUS.CACHED,
       errorMessage: null,
-      requestUrl,
       networkError: false,
     };
   }
@@ -1165,7 +1353,6 @@ function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
       dependency,
       status: PULL_STATUS.ALREADY_EXISTS,
       errorMessage: null,
-      requestUrl,
       networkError: false,
     };
   }
@@ -1175,7 +1362,6 @@ function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
       dependency,
       status: PULL_STATUS.AUTH_FAILED,
       errorMessage: "Authentication failed.",
-      requestUrl,
       networkError: false,
     };
   }
@@ -1185,7 +1371,6 @@ function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
       dependency,
       status: PULL_STATUS.NOT_FOUND,
       errorMessage: defaultNotFoundMessage(format),
-      requestUrl,
       networkError: false,
     };
   }
@@ -1195,7 +1380,6 @@ function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
       dependency,
       status: PULL_STATUS.ERROR,
       errorMessage: attempt.errorMessage || "Registry request failed.",
-      requestUrl,
       networkError: Boolean(attempt.networkError),
     };
   }
@@ -1204,7 +1388,6 @@ function mapRegistryAttempt(dependency, attempt, requestUrl, format) {
     dependency,
     status: PULL_STATUS.ERROR,
     errorMessage: `Registry request returned HTTP ${attempt.statusCode}.`,
-    requestUrl,
     networkError: false,
   };
 }
@@ -1282,11 +1465,6 @@ function safeHost(url) {
   } catch {
     return "";
   }
-}
-
-function buildPullRequestUrl(workspace, repo, dependency) {
-  const plan = buildRegistryTriggerPlan(workspace, repo, dependency);
-  return plan && plan.request ? plan.request.url : null;
 }
 
 function dedupePullDependencies(dependencies) {
@@ -1512,12 +1690,65 @@ async function runPromisePool(items, concurrency, worker) {
         if (item === undefined) {
           break;
         }
-        await worker(item);
+        if (await worker(item) === false) break;
       }
     })());
   }
 
-  await Promise.all(workers);
+  await Promise.allSettled(workers);
+}
+
+function isCancellationRequested(token) {
+  return Boolean(token && token.isCancellationRequested);
+}
+
+async function publishStatus(onStatus, detail) {
+  if (!onStatus) return true;
+  try {
+    await onStatus(detail);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function publishProgress(progress, update) {
+  if (!progress || typeof progress.report !== "function") return;
+  try {
+    progress.report(update);
+  } catch {
+    // Progress is observational; a disposed or faulty reporter must not alter pull outcomes.
+  }
+}
+
+function createPullFailure(dependency, errorMessage) {
+  return {
+    dependency,
+    status: PULL_STATUS.ERROR,
+    errorMessage,
+    networkError: false,
+  };
+}
+
+function toPublicPullDetail(result) {
+  return {
+    dependency: result.dependency,
+    status: result.status,
+    errorMessage: result.errorMessage || null,
+    networkError: result.networkError === true,
+  };
+}
+
+function repositoryCollectionFailureMessage(error) {
+  switch (error && error.kind) {
+    case "rate_limited":
+      return "Cloudsmith rate limited the repository lookup. Try again later.";
+    case "unauthorized":
+    case "forbidden":
+      return "Cloudsmith repository access could not be authorized.";
+    default:
+      return "Could not fetch workspace repositories.";
+  }
 }
 
 module.exports = {

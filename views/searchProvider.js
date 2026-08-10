@@ -8,21 +8,33 @@ const SearchResultNode = require("../models/searchResultNode");
 const LoadMoreNode = require("../models/loadMoreNode");
 const InfoNode = require("../models/infoNode");
 const { formatApiError } = require("../util/errorFormatter");
+const {
+    getPackagePolicyFlags,
+    getPackageVulnerabilityState,
+} = require("../util/packageVulnerabilities");
+const {
+    MAX_COLLECTION_IDENTITY_PART_LENGTH,
+    packageCollectionIdentity,
+} = require("../util/collectionIdentity");
 
 const MAX_RESULTS = 5000;
-const MAX_REPOSITORIES = 100;
+const MAX_REPOSITORIES = 1000;
 const MAX_WORKSPACE_LENGTH = 200;
 const MAX_REPOSITORY_LENGTH = 200;
 const MAX_QUERY_LENGTH = 2048;
 const MAX_PACKAGE_NAME_LENGTH = 2048;
 const MAX_PACKAGE_FORMAT_LENGTH = 100;
 const MAX_PACKAGE_VERSION_LENGTH = 2048;
-const MAX_PACKAGE_IDENTITY_LENGTH = 2048;
+const MAX_PACKAGE_IDENTITY_LENGTH = MAX_COLLECTION_IDENTITY_PART_LENGTH;
 const MAX_PACKAGE_OPTIONAL_STRING_LENGTH = 4096;
 const MAX_PACKAGE_URL_LENGTH = 8192;
 const MAX_PACKAGE_TAGS = 100;
 const MAX_PACKAGE_TAG_LENGTH = 500;
 const MULTI_REPO_CONCURRENCY = 4;
+const MAX_MULTI_REPO_REQUESTS = 2000;
+const MAX_MULTI_REPO_PAGES = 20;
+const MAX_SINGLE_SEARCH_PAGES = 20;
+const MAX_SINGLE_SEARCH_REQUESTS = 24;
 const MAX_FAILURE_DETAILS = 20;
 
 class SearchProvider {
@@ -270,14 +282,14 @@ class SearchProvider {
             return;
         }
 
-        let nodes;
+        let builtRoot;
         try {
-            nodes = buildUniqueNodes(
+            builtRoot = buildUniqueNodes(
                 result.data,
                 this.context,
                 new Set(),
                 this.connectionManager
-            ).nodes;
+            );
         } catch (error) {
             this._failRoot(operation, `Could not display search results. ${safeErrorMessage(error)}`, null, "invalid_response");
             return;
@@ -285,12 +297,27 @@ class SearchProvider {
         if (!this._isCurrentRoot(operation)) {
             return;
         }
+        if (builtRoot.duplicateCount > 0) {
+            this._failRoot(
+                operation,
+                "Could not search packages. Cloudsmith returned duplicate package identities.",
+                null,
+                "invalid_response"
+            );
+            return;
+        }
 
-        const keptNodes = nodes.slice(0, MAX_RESULTS);
-        const droppedResultCount = nodes.length - keptNodes.length;
+        const keptNodes = builtRoot.nodes.slice(0, MAX_RESULTS);
+        const droppedResultCount = builtRoot.nodes.length - keptNodes.length;
         const pagination = freezePagination(result.pagination);
-        const capReached = keptNodes.length >= MAX_RESULTS
+        const resultLimitReached = keptNodes.length >= MAX_RESULTS
             && pagination.page < pagination.pageTotal;
+        // This is a per-search session bound, independent of the API page at
+        // which an explicitly requested root search began.
+        const successfulPageCount = 1;
+        const pageLimitReached = successfulPageCount >= MAX_SINGLE_SEARCH_PAGES
+            && pagination.page < pagination.pageTotal;
+        const capReached = resultLimitReached || pageLimitReached;
         this._commitRoot(operation, {
             descriptor,
             results: keptNodes,
@@ -303,6 +330,10 @@ class SearchProvider {
                 unsearchedRepositoryCount: 0,
                 droppedResultCount,
                 capReached,
+                partial: capReached || droppedResultCount > 0,
+                requestCount: 1,
+                pageCount: successfulPageCount,
+                pageLimitReached,
             },
         });
         if (keptNodes.length === 0) {
@@ -313,93 +344,38 @@ class SearchProvider {
     async _executeRepositorySearch(operation) {
         const { descriptor } = operation;
         const pageSize = clampPageSize(this._getPageSize());
-        const searchableCount = Math.min(
-            descriptor.repositories.length,
-            Math.floor(MAX_RESULTS / pageSize)
-        );
-        const searchedRepositories = descriptor.repositories.slice(0, searchableCount);
-        const unsearchedRepositoryCount = descriptor.repositories.length - searchedRepositories.length;
         const paginatedFetch = this._createPaginatedFetch(this._createCloudsmithAPI());
         if (!this._isCurrentRoot(operation)) {
             this._discardRoot(operation);
             return;
         }
 
-        let repositoryResults;
+        let collection;
         try {
             const outcome = await this._withProgress(progressOptions(), async (_progress, token) => {
-                const results = await mapWithConcurrency(
-                    searchedRepositories,
-                    MULTI_REPO_CONCURRENCY,
-                    async repository => {
-                        if (!this._isCurrentRoot(operation)) {
-                            return staleRepositoryResult(repository);
-                        }
-                        let endpoint;
-                        try {
-                            endpoint = apiEndpoint(["packages", descriptor.workspace, repository]);
-                        } catch {
-                            return failedRepositoryResult(repository, localSearchError(
-                                "invalid_request",
-                                "The repository identifier was invalid."
-                            ));
-                        }
-                        let result;
-                        try {
-                            result = await paginatedFetch.fetchPage(
-                                endpoint,
-                                1,
-                                pageSize,
-                                descriptor.query,
-                                {
-                                    cancellationToken: token,
-                                    retry: "never",
-                                    signal: operation.controller.signal,
-                                    validate: isPackageSearchArray,
-                                }
-                            );
-                        } catch (error) {
-                            return failedRepositoryResult(repository, localSearchError(
-                                "unexpected",
-                                safeErrorMessage(error)
-                            ));
-                        }
-                        if (!this._isCurrentRoot(operation)) {
-                            return staleRepositoryResult(repository);
-                        }
-                        if (result.error) {
-                            return failedRepositoryResult(repository, result.error);
-                        }
-                        if (!isValidFetchedPage(result, 1, pageSize)) {
-                            return failedRepositoryResult(repository, localSearchError(
-                                "invalid_response",
-                                "Cloudsmith returned an invalid result page."
-                            ));
-                        }
-                        if (!hasExactPackageScope(result.data, {
-                            kind: "repository",
-                            workspace: descriptor.workspace,
-                            repository,
-                        })) {
-                            return failedRepositoryResult(repository, localSearchError(
-                                "invalid_response",
-                                "Cloudsmith returned packages outside the requested scope."
-                            ));
-                        }
-                        return Object.freeze({ repository, result, stale: false });
-                    },
-                    () => this._isCurrentRoot(operation) && !token?.isCancellationRequested
-                );
-                return { results, cancelled: Boolean(token?.isCancellationRequested) };
+                const run = createRepositorySearchRun(descriptor);
+                await runRepositorySearchWorkers({
+                    run,
+                    operation,
+                    pageSize,
+                    paginatedFetch,
+                    token,
+                    isCurrent: () => this._isCurrentRoot(operation),
+                });
+                return {
+                    run,
+                    cancelled: Boolean(token?.isCancellationRequested || run.cancelled),
+                    stale: run.stale,
+                };
             });
             if (!this._isCurrentRoot(operation)) {
                 return;
             }
-            if (outcome.cancelled) {
+            if (outcome.cancelled || outcome.stale) {
                 this._cancelRoot(operation);
                 return;
             }
-            repositoryResults = outcome.results;
+            collection = finalizeRepositorySearchRun(outcome.run);
         } catch (error) {
             if (!this._isCurrentRoot(operation)) {
                 return;
@@ -411,39 +387,31 @@ class SearchProvider {
         if (!this._isCurrentRoot(operation)) {
             return;
         }
-        const completedResults = repositoryResults.filter(result => result && !result.stale);
-        const failures = completedResults.filter(result => result.error);
-        const successes = completedResults.filter(result => !result.error);
-        if (successes.length === 0) {
-            const detail = failures.length > 0
-                ? ` ${formatApiError(failures[0].error)}`
+        if (collection.successfulPageCount === 0) {
+            const detail = collection.failureDetails.length > 0
+                ? ` ${collection.failureDetails[0].message}`
                 : " No repository search completed.";
             this._failRoot(
                 operation,
                 `Could not search the selected repositories.${detail}`,
-                failures[0]?.error || null,
-                failures[0]?.error?.kind || "search_failed"
+                null,
+                collection.firstFailureKind || "search_failed"
             );
             return;
         }
 
         let built;
         try {
-            const seen = new Set();
-            const nodes = [];
-            for (const success of successes) {
-                const next = buildUniqueNodes(
-                    success.result.data,
-                    this.context,
-                    seen,
-                    this.connectionManager
-                );
-                nodes.push(...next.nodes);
-            }
+            const nodes = buildUniqueNodes(
+                collection.packages,
+                this.context,
+                new Set(),
+                this.connectionManager
+            ).nodes;
             const keptNodes = nodes.slice(0, MAX_RESULTS);
             built = {
                 nodes: keptNodes,
-                droppedResultCount: nodes.length - keptNodes.length,
+                droppedResultCount: collection.droppedResultCount + nodes.length - keptNodes.length,
             };
         } catch (error) {
             this._failRoot(operation, `Could not display search results. ${safeErrorMessage(error)}`, null, "invalid_response");
@@ -453,62 +421,42 @@ class SearchProvider {
             return;
         }
 
-        const failureDetails = failures.slice(0, MAX_FAILURE_DETAILS).map(({ repository, error }) => ({
-            repository,
-            message: formatApiError(error),
-        }));
-        const truncatedRepositories = successes.filter(({ result }) => (
-            result.pagination.page < result.pagination.pageTotal
-            || result.pagination.count > result.data.length
-        ));
-        const truncationDetails = truncatedRepositories
-            .slice(0, MAX_FAILURE_DETAILS)
-            .map(({ repository, result }) => ({
-                repository,
-                loadedCount: result.data.length,
-                totalCount: result.pagination.count,
-                page: result.pagination.page,
-                pageTotal: result.pagination.pageTotal,
-            }));
-        const matchedResultCount = boundedCountSum(
-            successes.map(({ result }) => result.pagination.count)
-        );
-        const truncatedResultCount = boundedCountSum(
-            truncatedRepositories.map(({ result }) => (
-                Math.max(0, result.pagination.count - result.data.length)
-            ))
-        );
-        const partial = failures.length > 0
-            || unsearchedRepositoryCount > 0
-            || truncatedRepositories.length > 0
-            || built.droppedResultCount > 0;
+        const partial = !collection.complete || built.droppedResultCount > 0;
         this._commitRoot(operation, {
             descriptor,
             results: built.nodes,
             pagination: null,
             pageable: false,
-            totalCount: matchedResultCount,
+            totalCount: collection.totalCount,
             diagnostics: {
-                failedRepositoryCount: failures.length,
-                failureDetails,
-                unsearchedRepositoryCount,
-                truncatedRepositoryCount: truncatedRepositories.length,
-                truncationDetails,
-                truncatedResultCount,
+                failedRepositoryCount: collection.failedRepositoryCount,
+                failureDetails: collection.failureDetails,
+                unsearchedRepositoryCount: collection.unsearchedRepositoryCount,
+                truncatedRepositoryCount: collection.truncatedRepositoryCount,
+                truncationDetails: collection.truncationDetails,
+                truncatedResultCount: collection.truncatedResultCount,
                 droppedResultCount: built.droppedResultCount,
                 partial,
-                capReached: built.nodes.length >= MAX_RESULTS
-                    || unsearchedRepositoryCount > 0
-                    || truncatedRepositories.length > 0,
+                capReached: built.droppedResultCount > 0
+                    || collection.requestLimitReached
+                    || collection.pageLimitReached
+                    || collection.resultLimitReached,
+                requestCount: collection.requestCount,
+                pageCount: collection.pageCount,
+                rateLimited: collection.rateLimited,
+                requestLimitReached: collection.requestLimitReached,
+                pageLimitReached: collection.pageLimitReached,
             },
         });
 
-        if (failures.length > 0) {
-            const names = failures.slice(0, MAX_FAILURE_DETAILS).map(result => result.repository);
-            const suffix = failures.length > names.length ? `, and ${failures.length - names.length} more` : "";
+        if (collection.failedRepositoryCount > 0) {
+            const names = collection.failureDetails.map(detail => detail.repository);
+            const suffix = collection.failedRepositoryCount > names.length
+                ? `, and ${collection.failedRepositoryCount - names.length} more`
+                : "";
             this._notify("warning", `Could not search some repositories: ${names.join(", ")}${suffix}.`);
         }
-        if (built.nodes.length === 0) {
+        if (built.nodes.length === 0 && !partial) {
             this._notify("information", `No packages found for "${descriptor.query}".`);
         }
     }
@@ -546,6 +494,7 @@ class SearchProvider {
             targetPage,
             account,
             controller: new AbortController(),
+            attemptRequestCount: committed.diagnostics.requestCount + 1,
         });
         const promise = Promise.resolve()
             .then(() => this._executePage(operation))
@@ -585,7 +534,13 @@ class SearchProvider {
                 ? apiEndpoint(["packages", descriptor.workspace, descriptor.repository])
                 : apiEndpoint(["packages", descriptor.workspace]);
         } catch {
-            this._failPage(operation, "Could not load more packages. The search scope was invalid.", null, "invalid_request");
+            this._failPage(
+                operation,
+                "Could not load more packages. The search scope was invalid.",
+                null,
+                "invalid_request",
+                true
+            );
             return;
         }
 
@@ -614,7 +569,13 @@ class SearchProvider {
             if (!this._isCurrentPage(operation)) {
                 return;
             }
-            this._failPage(operation, `Could not load more packages. ${safeErrorMessage(error)}`, null, "unexpected");
+            this._failPage(
+                operation,
+                `Could not load more packages. ${safeErrorMessage(error)}`,
+                null,
+                "unexpected",
+                true
+            );
             return;
         }
 
@@ -631,7 +592,8 @@ class SearchProvider {
                 operation,
                 `Could not load more packages. ${formatApiError(result.error)}`,
                 result.error,
-                result.error.kind
+                result.error.kind,
+                !isRetryablePageFailure(result.error)
             );
             return;
         }
@@ -640,7 +602,18 @@ class SearchProvider {
                 operation,
                 "Could not load more packages. Cloudsmith returned an invalid result page.",
                 null,
-                "invalid_response"
+                "invalid_response",
+                true
+            );
+            return;
+        }
+        if (!samePaginationAnchor(committed.pagination, result.pagination)) {
+            this._failPage(
+                operation,
+                "Could not load more packages. Cloudsmith changed pagination metadata between pages.",
+                null,
+                "invalid_response",
+                true
             );
             return;
         }
@@ -649,7 +622,8 @@ class SearchProvider {
                 operation,
                 "Could not load more packages. Cloudsmith returned an unexpected page or package scope.",
                 null,
-                "invalid_response"
+                "invalid_response",
+                true
             );
             return;
         }
@@ -664,7 +638,23 @@ class SearchProvider {
                 this.connectionManager
             );
         } catch (error) {
-            this._failPage(operation, `Could not display more search results. ${safeErrorMessage(error)}`, null, "invalid_response");
+            this._failPage(
+                operation,
+                `Could not display more search results. ${safeErrorMessage(error)}`,
+                null,
+                "invalid_response",
+                true
+            );
+            return;
+        }
+        if (built.duplicateCount > 0) {
+            this._failPage(
+                operation,
+                "Could not load more packages. Cloudsmith repeated a package identity.",
+                null,
+                "invalid_response",
+                true
+            );
             return;
         }
         if (!this._isCurrentPage(operation)) {
@@ -676,7 +666,15 @@ class SearchProvider {
         const results = [...committed.results, ...appended];
         const pagination = freezePagination(result.pagination);
         const pageDropped = built.nodes.length - appended.length;
-        const capReached = results.length >= MAX_RESULTS && pagination.page < pagination.pageTotal;
+        const requestCount = operation.attemptRequestCount;
+        const pageCount = committed.diagnostics.pageCount + 1;
+        const resultLimitReached = results.length >= MAX_RESULTS
+            && pagination.page < pagination.pageTotal;
+        const pageLimitReached = pageCount >= MAX_SINGLE_SEARCH_PAGES
+            && pagination.page < pagination.pageTotal;
+        const requestLimitReached = requestCount >= MAX_SINGLE_SEARCH_REQUESTS
+            && pagination.page < pagination.pageTotal;
+        const capReached = resultLimitReached || pageLimitReached || requestLimitReached;
         const nextCommitted = freezeCommitted({
             ...committed,
             results,
@@ -688,6 +686,11 @@ class SearchProvider {
                 ...committed.diagnostics,
                 droppedResultCount: committed.diagnostics.droppedResultCount + pageDropped,
                 capReached: committed.diagnostics.capReached || capReached,
+                partial: committed.diagnostics.partial || capReached || pageDropped > 0,
+                requestCount,
+                pageCount,
+                requestLimitReached,
+                pageLimitReached,
             },
         });
         this._state = freezeState({ committed: nextCommitted, pending: null, failure: null });
@@ -746,18 +749,19 @@ class SearchProvider {
         this.refresh();
     }
 
-    _failPage(operation, message, _error, kind) {
+    _failPage(operation, message, _error, kind, terminal = false) {
         if (!this._isCurrentPage(operation)) {
             return;
         }
+        const committed = commitPageAttempt(operation, { terminal, failed: true });
         this._state = freezeState({
-            committed: operation.committed,
+            committed,
             pending: null,
             failure: {
                 operationId: operation.id,
                 activationId: operation.account.activationId,
                 accountEpoch: operation.account.accountEpoch,
-                descriptor: operation.committed.descriptor,
+                descriptor: committed.descriptor,
                 kind: kind || "page_failed",
                 message,
             },
@@ -770,7 +774,11 @@ class SearchProvider {
         if (!this._isCurrentPage(operation)) {
             return;
         }
-        this._state = freezeState({ committed: operation.committed, pending: null, failure: null });
+        this._state = freezeState({
+            committed: commitPageAttempt(operation),
+            pending: null,
+            failure: null,
+        });
         this.refresh();
     }
 
@@ -925,7 +933,8 @@ class SearchProvider {
             children.push(new LoadMoreNode(
                 committed.pagination.page,
                 committed.pagination.pageTotal,
-                committed.pagination.count
+                committed.pagination.count,
+                committed.results.length
             ));
         }
         return children;
@@ -982,13 +991,13 @@ function normalizeDescriptor(value) {
     }
     if (value.kind === "repositories") {
         if (!Array.isArray(value.repositories)) {
-            throw new Error("Select between 1 and 100 repositories to search.");
+            throw new Error("Select between 1 and 1,000 repositories to search.");
         }
         const repositories = [...new Set(value.repositories.map(repository => (
             normalizeRequiredString(repository, "repository", MAX_REPOSITORY_LENGTH)
         )))];
         if (repositories.length < 1 || repositories.length > MAX_REPOSITORIES) {
-            throw new Error("Select between 1 and 100 repositories to search.");
+            throw new Error("Select between 1 and 1,000 repositories to search.");
         }
         return freezeDescriptor({ kind: "repositories", workspace, repositories, query, page: 1 });
     }
@@ -1073,15 +1082,18 @@ function canonicalizeSearchPackage(pkg) {
     const repository = requiredString(pkg.repository, MAX_REPOSITORY_LENGTH);
     const namespace = requiredString(pkg.namespace, MAX_WORKSPACE_LENGTH);
     const slugPerm = requiredString(pkg.slug_perm, MAX_PACKAGE_IDENTITY_LENGTH);
-    if (!name || !format || !version || !repository || !namespace || !slugPerm) return null;
+    const policyFlags = getPackagePolicyFlags(pkg);
+    if (!name || !format || !version || !repository || !namespace || !slugPerm || !policyFlags) {
+        return null;
+    }
 
     const downloads = Number.isSafeInteger(pkg.downloads) && pkg.downloads >= 0
         ? pkg.downloads
         : 0;
-    const numVulnerabilities = Number.isSafeInteger(pkg.num_vulnerabilities)
-        && pkg.num_vulnerabilities >= 0
-        ? pkg.num_vulnerabilities
-        : undefined;
+    const vulnerabilityState = getPackageVulnerabilityState(pkg);
+    const numVulnerabilities = vulnerabilityState.count === null
+        ? undefined
+        : vulnerabilityState.count;
     return {
         name,
         format,
@@ -1103,16 +1115,11 @@ function canonicalizeSearchPackage(pkg) {
         version_digest: optionalString(pkg.version_digest),
         cdn_url: optionalString(pkg.cdn_url, MAX_PACKAGE_URL_LENGTH),
         filename: optionalString(pkg.filename),
-        policy_violated: pkg.policy_violated === true,
-        deny_policy_violated: pkg.deny_policy_violated === true,
-        license_policy_violated: pkg.license_policy_violated === true,
-        vulnerability_policy_violated: pkg.vulnerability_policy_violated === true,
+        ...policyFlags,
         num_vulnerabilities: numVulnerabilities,
-        has_vulnerabilities: pkg.has_vulnerabilities === true
-            ? true
-            : pkg.has_vulnerabilities === false
-                ? false
-                : undefined,
+        // Canonicalize all list-response aliases through the shared indicator contract.
+        // Omitting both fields intentionally remains "unknown" to downstream nodes.
+        has_vulnerabilities: vulnerabilityState.detected ? true : undefined,
         max_severity: optionalString(pkg.max_severity),
         vulnerability_scan_results_url: optionalString(
             pkg.vulnerability_scan_results_url,
@@ -1128,7 +1135,7 @@ function canonicalizeSearchPackage(pkg) {
 }
 
 function isValidFetchedPage(result, requestedPage, requestedPageSize) {
-    return Boolean(
+    if (!(
         result
         && isPackageSearchArray(result.data)
         && result.data.length <= requestedPageSize
@@ -1136,12 +1143,50 @@ function isValidFetchedPage(result, requestedPage, requestedPageSize) {
         && result.pagination.page === requestedPage
         && Number.isSafeInteger(result.pagination.pageTotal)
         && result.pagination.pageTotal >= requestedPage
-        && Number.isSafeInteger(result.pagination.count)
-        && result.pagination.count >= result.data.length
         && Number.isSafeInteger(result.pagination.pageSize)
         && result.pagination.pageSize >= 1
         && result.pagination.pageSize <= 100
-    );
+        && result.pagination.pageSize <= requestedPageSize
+        && result.data.length <= result.pagination.pageSize
+    )) return false;
+    const countAuthoritative = result.pagination.countAuthoritative === true
+        || (
+            result.pagination.countAuthoritative === undefined
+            && Number.isSafeInteger(result.pagination.count)
+        );
+    if (countAuthoritative) {
+        if (!Number.isSafeInteger(result.pagination.count) || result.pagination.count < 0) return false;
+        const calculatedPages = Math.max(
+            1,
+            Math.ceil(result.pagination.count / result.pagination.pageSize)
+        );
+        const expectedItems = Math.min(
+            result.pagination.pageSize,
+            Math.max(
+                0,
+                result.pagination.count - ((requestedPage - 1) * result.pagination.pageSize)
+            )
+        );
+        return calculatedPages === result.pagination.pageTotal
+            && result.data.length === expectedItems;
+    }
+    return (result.pagination.count === null || result.pagination.count === undefined)
+        && (
+            requestedPage >= result.pagination.pageTotal
+            || result.data.length === result.pagination.pageSize
+        );
+}
+
+function samePaginationAnchor(previous, current) {
+    if (!previous || !current || current.page !== previous.page + 1) return false;
+    const previousCountAuthoritative = previous.countAuthoritative === true
+        || (previous.countAuthoritative === undefined && Number.isSafeInteger(previous.count));
+    const currentCountAuthoritative = current.countAuthoritative === true
+        || (current.countAuthoritative === undefined && Number.isSafeInteger(current.count));
+    return previous.pageTotal === current.pageTotal
+        && previous.pageSize === current.pageSize
+        && previousCountAuthoritative === currentCountAuthoritative
+        && previous.count === current.count;
 }
 
 function hasExactPackageScope(packages, descriptor) {
@@ -1152,15 +1197,20 @@ function hasExactPackageScope(packages, descriptor) {
 }
 
 function packageKey(pkg) {
-    return JSON.stringify([pkg.namespace, pkg.repository, pkg.slug_perm]);
+    return packageCollectionIdentity(pkg);
 }
 
 function packageKeyFromNode(node) {
-    return JSON.stringify([node.namespace, node.repository, node.slug_perm_raw]);
+    return packageCollectionIdentity({
+        namespace: node.namespace,
+        repository: node.repository,
+        slug_perm: node.slug_perm_raw,
+    });
 }
 
 function buildUniqueNodes(packages, context, seen, connectionManager) {
     const nodes = [];
+    let duplicateCount = 0;
     for (const pkg of packages) {
         const canonicalPackage = canonicalizeSearchPackage(pkg);
         if (!canonicalPackage) {
@@ -1168,12 +1218,13 @@ function buildUniqueNodes(packages, context, seen, connectionManager) {
         }
         const key = packageKey(canonicalPackage);
         if (seen.has(key)) {
+            duplicateCount += 1;
             continue;
         }
         seen.add(key);
         nodes.push(freezeSearchNode(new SearchResultNode(canonicalPackage, context, { connectionManager })));
     }
-    return { nodes };
+    return { nodes, duplicateCount };
 }
 
 function freezeSearchNode(node) {
@@ -1206,10 +1257,13 @@ function freezeDescriptor(descriptor) {
 }
 
 function freezePagination(pagination) {
+    const countAuthoritative = pagination.countAuthoritative === true
+        || (pagination.countAuthoritative === undefined && Number.isSafeInteger(pagination.count));
     return Object.freeze({
         page: pagination.page,
         pageTotal: pagination.pageTotal,
-        count: pagination.count,
+        count: countAuthoritative ? pagination.count : null,
+        countAuthoritative,
         pageSize: pagination.pageSize,
     });
 }
@@ -1229,7 +1283,9 @@ function freezeCommitted(value) {
         resultKeys: Object.freeze([...value.resultKeys]),
         pagination: value.pagination ? freezePagination(value.pagination) : null,
         pageable: Boolean(value.pageable),
-        totalCount: Number.isFinite(value.totalCount) ? value.totalCount : value.results.length,
+        totalCount: Number.isSafeInteger(value.totalCount) && value.totalCount >= 0
+            ? value.totalCount
+            : null,
         diagnostics: Object.freeze({
             failedRepositoryCount: diagnostics.failedRepositoryCount || 0,
             failureDetails,
@@ -1240,7 +1296,35 @@ function freezeCommitted(value) {
             droppedResultCount: diagnostics.droppedResultCount || 0,
             partial: Boolean(diagnostics.partial),
             capReached: Boolean(diagnostics.capReached),
+            requestCount: diagnostics.requestCount || 0,
+            pageCount: diagnostics.pageCount || 0,
+            rateLimited: Boolean(diagnostics.rateLimited),
+            requestLimitReached: Boolean(diagnostics.requestLimitReached),
+            pageLimitReached: Boolean(diagnostics.pageLimitReached),
         }),
+    });
+}
+
+function commitPageAttempt(operation, { terminal = false } = {}) {
+    const committed = operation.committed;
+    const requestCount = Math.max(
+        committed.diagnostics.requestCount,
+        operation.attemptRequestCount
+    );
+    const requestLimitReached = requestCount >= MAX_SINGLE_SEARCH_REQUESTS;
+    const pageLimitReached = committed.diagnostics.pageCount >= MAX_SINGLE_SEARCH_PAGES;
+    const hardLimitReached = requestLimitReached || pageLimitReached;
+    return freezeCommitted({
+        ...committed,
+        pageable: committed.pageable && !terminal && !hardLimitReached,
+        diagnostics: {
+            ...committed.diagnostics,
+            requestCount,
+            capReached: committed.diagnostics.capReached || hardLimitReached,
+            partial: committed.diagnostics.partial || terminal || hardLimitReached,
+            requestLimitReached,
+            pageLimitReached,
+        },
     });
 }
 
@@ -1302,49 +1386,454 @@ function progressOptions(title = "Searching packages...") {
     };
 }
 
-async function mapWithConcurrency(items, concurrency, worker, shouldContinue) {
-    const results = new Array(items.length);
-    let nextIndex = 0;
-    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
-        while (shouldContinue()) {
-            const index = nextIndex;
-            nextIndex += 1;
-            if (index >= items.length) {
-                return;
-            }
-            results[index] = await worker(items[index], index);
-            if (!shouldContinue()) {
-                return;
-            }
+function createRepositorySearchRun(descriptor) {
+    const repositories = descriptor.repositories.map((repository, index) => ({
+        repository,
+        index,
+        anchor: null,
+        complete: false,
+        failed: false,
+        pagesFetched: 0,
+        itemCount: 0,
+        uniqueCount: 0,
+    }));
+    return {
+        descriptor,
+        repositories,
+        queue: repositories.map(repository => ({ repositoryIndex: repository.index, page: 1 })),
+        nextQueueIndex: 0,
+        requestCount: 0,
+        successfulPageCount: 0,
+        records: [],
+        identities: new Map(),
+        failureRepositories: new Set(),
+        failureDetails: [],
+        firstFailureKind: null,
+        cancelled: false,
+        stale: false,
+        circuitOpen: false,
+        rateLimited: false,
+        requestLimitReached: false,
+        pageLimitReached: false,
+        resultLimitReached: false,
+        internalFailure: false,
+    };
+}
+
+async function runRepositorySearchWorkers(options) {
+    const workers = Array.from(
+        { length: MULTI_REPO_CONCURRENCY },
+        () => runRepositorySearchWorker(options)
+    );
+    const outcomes = await Promise.allSettled(workers);
+    if (outcomes.some(outcome => outcome.status === "rejected")) {
+        options.run.internalFailure = true;
+        options.run.circuitOpen = true;
+        if (!options.run.firstFailureKind) options.run.firstFailureKind = "unexpected";
+    }
+}
+
+async function runRepositorySearchWorker(options) {
+    const workerState = { repository: null };
+    try {
+        await runRepositorySearchWorkerLoop(options, workerState);
+    } catch {
+        options.run.circuitOpen = true;
+        if (workerState.repository) {
+            recordRepositoryFailure(
+                options.run,
+                workerState.repository,
+                "unexpected",
+                "The repository result could not be processed safely."
+            );
+        } else {
+            options.run.internalFailure = true;
+            if (!options.run.firstFailureKind) options.run.firstFailureKind = "unexpected";
         }
-    });
-    await Promise.all(workers);
-    return results;
+    }
 }
 
-function failedRepositoryResult(repository, error) {
-    return Object.freeze({ repository, error, stale: false });
+async function runRepositorySearchWorkerLoop(options, workerState) {
+    const { run, operation, pageSize, paginatedFetch, token, isCurrent } = options;
+    while (true) {
+        workerState.repository = null;
+        const task = reserveRepositoryTask(run, token, isCurrent);
+        if (!task) return;
+        const repositoryState = run.repositories[task.repositoryIndex];
+        workerState.repository = repositoryState;
+        let endpoint;
+        try {
+            endpoint = apiEndpoint([
+                "packages",
+                run.descriptor.workspace,
+                repositoryState.repository,
+            ]);
+        } catch {
+            recordRepositoryFailure(
+                run,
+                repositoryState,
+                "invalid_request",
+                "The repository identifier was invalid."
+            );
+            continue;
+        }
+
+        let result;
+        try {
+            result = await paginatedFetch.fetchPage(
+                endpoint,
+                task.page,
+                pageSize,
+                run.descriptor.query,
+                {
+                    cancellationToken: token,
+                    retry: "never",
+                    signal: operation.controller.signal,
+                    validate: isPackageSearchArray,
+                }
+            );
+        } catch {
+            if (!isCurrent()) {
+                run.stale = true;
+                return;
+            }
+            if (token?.isCancellationRequested) {
+                run.cancelled = true;
+                return;
+            }
+            recordRepositoryFailure(
+                run,
+                repositoryState,
+                "unexpected",
+                "The repository request failed unexpectedly."
+            );
+            continue;
+        }
+
+        if (!isCurrent()) {
+            run.stale = true;
+            return;
+        }
+        if (token?.isCancellationRequested) {
+            run.cancelled = true;
+            return;
+        }
+        if (result?.error) {
+            if (result.error.kind === "cancelled") {
+                run.cancelled = true;
+                return;
+            }
+            recordRepositoryFailure(
+                run,
+                repositoryState,
+                result.error.kind || "search_failed",
+                formatApiError(result.error)
+            );
+            if (result.error.kind === "rate_limited" || result.error.status === 429) {
+                run.rateLimited = true;
+                run.circuitOpen = true;
+            }
+            continue;
+        }
+
+        const validation = validateRepositoryPage(result, task, repositoryState, pageSize);
+        if (!validation.ok) {
+            recordRepositoryFailure(
+                run,
+                repositoryState,
+                "invalid_response",
+                validation.message
+            );
+            continue;
+        }
+        if (!hasExactPackageScope(result.data, {
+            kind: "repository",
+            workspace: run.descriptor.workspace,
+            repository: repositoryState.repository,
+        })) {
+            recordRepositoryFailure(
+                run,
+                repositoryState,
+                "invalid_response",
+                "Cloudsmith returned packages outside the requested repository."
+            );
+            continue;
+        }
+
+        let duplicateKind = null;
+        const pageIdentities = new Map();
+        const pageRecords = [];
+        for (let itemIndex = 0; itemIndex < result.data.length; itemIndex += 1) {
+            const canonicalPackage = canonicalizeSearchPackage(result.data[itemIndex]);
+            if (!canonicalPackage) {
+                duplicateKind = "malformed";
+                break;
+            }
+            const key = packageKey(canonicalPackage);
+            const signature = packageIdentitySignature(canonicalPackage);
+            const existing = run.identities.get(key);
+            const pageSignature = pageIdentities.get(key);
+            if (existing || pageSignature) {
+                duplicateKind = (existing ? existing.signature : pageSignature) === signature
+                    ? "duplicate"
+                    : "collision";
+                break;
+            }
+            pageIdentities.set(key, signature);
+            pageRecords.push({
+                repositoryIndex: repositoryState.index,
+                page: task.page,
+                itemIndex,
+                package: canonicalPackage,
+                key,
+                signature,
+            });
+        }
+
+        if (duplicateKind) {
+            const messages = {
+                collision: "Cloudsmith returned conflicting records for one package identity.",
+                duplicate: "Cloudsmith repeated a package identity across result pages.",
+                malformed: "Cloudsmith returned an invalid package record.",
+            };
+            recordRepositoryFailure(
+                run,
+                repositoryState,
+                duplicateKind === "duplicate" ? "pagination_no_progress" : "invalid_response",
+                messages[duplicateKind]
+            );
+            continue;
+        }
+
+        run.successfulPageCount += 1;
+        repositoryState.pagesFetched = task.page;
+        repositoryState.itemCount += result.data.length;
+        repositoryState.uniqueCount += pageRecords.length;
+        if (!repositoryState.anchor) repositoryState.anchor = validation.anchor;
+        for (const record of pageRecords) {
+            run.identities.set(record.key, {
+                signature: record.signature,
+                repositoryIndex: repositoryState.index,
+            });
+            run.records.push({
+                repositoryIndex: record.repositoryIndex,
+                page: record.page,
+                itemIndex: record.itemIndex,
+                package: record.package,
+            });
+        }
+
+        if (run.identities.size >= MAX_RESULTS) {
+            run.resultLimitReached = true;
+        }
+
+        if (task.page >= validation.anchor.pageTotal) {
+            if (
+                validation.anchor.countAuthoritative
+                && repositoryState.itemCount !== validation.anchor.count
+            ) {
+                recordRepositoryFailure(
+                    run,
+                    repositoryState,
+                    "invalid_response",
+                    "Cloudsmith pagination did not match its authoritative result count."
+                );
+                continue;
+            }
+            repositoryState.complete = true;
+            continue;
+        }
+
+        if (task.page >= MAX_MULTI_REPO_PAGES) {
+            run.pageLimitReached = true;
+            continue;
+        }
+        if (!run.circuitOpen && !run.resultLimitReached) {
+            run.queue.push({ repositoryIndex: repositoryState.index, page: task.page + 1 });
+        }
+    }
 }
 
-function staleRepositoryResult(repository) {
-    return Object.freeze({ repository, error: null, stale: true });
+function reserveRepositoryTask(run, token, isCurrent) {
+    if (!isCurrent()) {
+        run.stale = true;
+        return null;
+    }
+    if (token?.isCancellationRequested) {
+        run.cancelled = true;
+        return null;
+    }
+    if (run.circuitOpen || run.resultLimitReached) return null;
+    if (run.requestCount >= MAX_MULTI_REPO_REQUESTS) {
+        if (run.nextQueueIndex < run.queue.length) run.requestLimitReached = true;
+        return null;
+    }
+    if (run.nextQueueIndex >= run.queue.length) return null;
+
+    const task = run.queue[run.nextQueueIndex];
+    run.nextQueueIndex += 1;
+    run.requestCount += 1;
+    return task;
 }
 
-function localSearchError(kind, message) {
-    return Object.freeze({
-        kind,
-        status: null,
-        retryable: false,
-        message,
-        requestId: null,
-        retryAfterMs: null,
-        outcomeUnknown: false,
-        diagnostic: Object.freeze({}),
-    });
+function validateRepositoryPage(result, task, repositoryState, requestedPageSize) {
+    if (!result || !Array.isArray(result.data) || !result.pagination) {
+        return { ok: false, message: "Cloudsmith returned an invalid result page." };
+    }
+    const pagination = result.pagination;
+    const countAuthoritative = pagination.countAuthoritative === true
+        || (pagination.countAuthoritative === undefined && Number.isSafeInteger(pagination.count));
+    if (
+        pagination.page !== task.page
+        || !Number.isSafeInteger(pagination.pageTotal)
+        || pagination.pageTotal < task.page
+        || !Number.isSafeInteger(pagination.pageSize)
+        || pagination.pageSize < 1
+        || pagination.pageSize > requestedPageSize
+        || result.data.length > pagination.pageSize
+        || (countAuthoritative && (!Number.isSafeInteger(pagination.count) || pagination.count < 0))
+        || (!countAuthoritative && pagination.count !== null && pagination.count !== undefined)
+    ) {
+        return { ok: false, message: "Cloudsmith returned invalid pagination metadata." };
+    }
+
+    const anchor = {
+        pageTotal: pagination.pageTotal,
+        pageSize: pagination.pageSize,
+        count: countAuthoritative ? pagination.count : null,
+        countAuthoritative,
+    };
+    if (repositoryState.anchor && (
+        repositoryState.anchor.pageTotal !== anchor.pageTotal
+        || repositoryState.anchor.pageSize !== anchor.pageSize
+        || repositoryState.anchor.count !== anchor.count
+        || repositoryState.anchor.countAuthoritative !== anchor.countAuthoritative
+    )) {
+        return { ok: false, message: "Cloudsmith changed pagination metadata between pages." };
+    }
+    if (task.page !== repositoryState.pagesFetched + 1) {
+        return { ok: false, message: "Cloudsmith repeated or skipped a repository result page." };
+    }
+    if (countAuthoritative) {
+        const calculatedPages = Math.max(1, Math.ceil(anchor.count / anchor.pageSize));
+        if (calculatedPages !== anchor.pageTotal) {
+            return { ok: false, message: "Cloudsmith returned contradictory pagination metadata." };
+        }
+        const expectedItems = task.page < anchor.pageTotal
+            ? anchor.pageSize
+            : anchor.count - ((task.page - 1) * anchor.pageSize);
+        if (expectedItems < 0 || expectedItems > anchor.pageSize || result.data.length !== expectedItems) {
+            return { ok: false, message: "Cloudsmith returned a page with contradictory cardinality." };
+        }
+    } else if (task.page < anchor.pageTotal && result.data.length !== anchor.pageSize) {
+        return { ok: false, message: "Cloudsmith returned a short page before the final page." };
+    }
+    return { ok: true, anchor };
+}
+
+function packageIdentitySignature(pkg) {
+    return JSON.stringify([
+        pkg.namespace,
+        pkg.repository,
+        pkg.slug_perm,
+        pkg.name,
+        pkg.format,
+        pkg.version,
+    ]);
+}
+
+function recordRepositoryFailure(run, repositoryState, kind, message) {
+    repositoryState.failed = true;
+    repositoryState.complete = false;
+    if (!run.failureRepositories.has(repositoryState.index)) {
+        run.failureRepositories.add(repositoryState.index);
+        if (run.failureDetails.length < MAX_FAILURE_DETAILS) {
+            run.failureDetails.push({ repository: repositoryState.repository, message });
+        }
+    }
+    if (!run.firstFailureKind) run.firstFailureKind = kind;
+}
+
+function finalizeRepositorySearchRun(run) {
+    run.records.sort((left, right) => (
+        left.repositoryIndex - right.repositoryIndex
+        || left.page - right.page
+        || left.itemIndex - right.itemIndex
+    ));
+    const packages = run.records.slice(0, MAX_RESULTS).map(record => record.package);
+    const droppedResultCount = Math.max(0, run.records.length - packages.length);
+    const unsearched = run.repositories.filter(repository => (
+        !repository.failed && repository.pagesFetched === 0
+    ));
+    const truncated = run.repositories.filter(repository => (
+        !repository.failed && !repository.complete && repository.pagesFetched > 0
+    ));
+    const truncationDetails = truncated.slice(0, MAX_FAILURE_DETAILS).map(repository => ({
+        repository: repository.repository,
+        loadedCount: repository.uniqueCount,
+        totalCount: repository.anchor?.countAuthoritative
+            ? repository.anchor.count
+            : null,
+        page: repository.pagesFetched,
+        pageTotal: repository.anchor?.pageTotal || repository.pagesFetched,
+    }));
+    const totalCount = boundedCountSum(run.repositories.map(repository => (
+        repository.anchor?.countAuthoritative ? repository.anchor.count : repository.uniqueCount
+    )));
+    const truncatedResultCount = boundedCountSum(truncated.map(repository => (
+        repository.anchor?.countAuthoritative
+            ? Math.max(0, repository.anchor.count - repository.uniqueCount)
+            : 0
+    )));
+    const resultLimitReached = droppedResultCount > 0 || (
+        run.resultLimitReached
+        && run.repositories.some(repository => !repository.complete && !repository.failed)
+    );
+    const complete = run.failureRepositories.size === 0
+        && !run.internalFailure
+        && unsearched.length === 0
+        && truncated.length === 0
+        && !run.requestLimitReached
+        && !run.pageLimitReached
+        && !resultLimitReached;
+    return {
+        packages,
+        droppedResultCount,
+        complete,
+        successfulPageCount: run.successfulPageCount,
+        failedRepositoryCount: run.failureRepositories.size,
+        failureDetails: run.failureDetails,
+        firstFailureKind: run.firstFailureKind,
+        unsearchedRepositoryCount: unsearched.length,
+        truncatedRepositoryCount: truncated.length,
+        truncationDetails,
+        truncatedResultCount,
+        totalCount,
+        requestCount: run.requestCount,
+        pageCount: run.successfulPageCount,
+        rateLimited: run.rateLimited,
+        requestLimitReached: run.requestLimitReached,
+        pageLimitReached: run.pageLimitReached,
+        resultLimitReached,
+    };
 }
 
 function safeErrorMessage() {
     return "The operation failed unexpectedly. Retry the search.";
+}
+
+function isRetryablePageFailure(error) {
+    return Boolean(
+        error
+        && typeof error === "object"
+        && (
+            error.retryable === true
+            || error.kind === "rate_limited"
+            || error.kind === "network_error"
+            || error.kind === "timeout"
+            || error.kind === "server_error"
+        )
+    );
 }
 
 function boundedCountSum(counts) {
@@ -1370,15 +1859,24 @@ function summaryNode(committed) {
     }
     const count = committed.totalCount;
     const loadedCount = committed.results.length;
-    const countDescription = descriptor.kind === "repositories" && committed.diagnostics.partial
-        ? count > loadedCount
-            ? `${loadedCount.toLocaleString()} of ${count.toLocaleString()} matching packages loaded (partial)`
-            : `${loadedCount.toLocaleString()} package${loadedCount !== 1 ? "s" : ""} loaded (partial)`
-        : `${count.toLocaleString()} package${count !== 1 ? "s" : ""}`;
+    let countDescription;
+    if (committed.diagnostics.partial) {
+        countDescription = count !== null && count > loadedCount
+            ? `${loadedCount.toLocaleString()} of ${count.toLocaleString()} known matching packages loaded (incomplete)`
+            : `${loadedCount.toLocaleString()} package${loadedCount !== 1 ? "s" : ""} loaded (incomplete)`;
+    } else if (count !== null && committed.pageable) {
+        countDescription = `${loadedCount.toLocaleString()} of ${count.toLocaleString()} matching packages loaded`;
+    } else if (count !== null) {
+        countDescription = `${count.toLocaleString()} package${count !== 1 ? "s" : ""}`;
+    } else if (committed.pageable) {
+        countDescription = `${loadedCount.toLocaleString()} package${loadedCount !== 1 ? "s" : ""} loaded (more available)`;
+    } else {
+        countDescription = `${loadedCount.toLocaleString()} package${loadedCount !== 1 ? "s" : ""} loaded`;
+    }
     return new InfoNode(
         `Results for: ${descriptor.query}`,
         `${countDescription} in ${scopeLabel}`,
-        `Query: ${descriptor.query}\n${tooltipScope}${committed.diagnostics.partial ? "\nPartial results" : ""}`,
+        `Query: ${descriptor.query}\n${tooltipScope}${committed.diagnostics.partial ? "\nIncomplete results" : ""}`,
         "search",
         "searchSummary"
     );
@@ -1411,26 +1909,36 @@ function diagnosticNodes(committed) {
     if (diagnostics.unsearchedRepositoryCount > 0) {
         nodes.push(new InfoNode(
             `${diagnostics.unsearchedRepositoryCount} repositories were not searched`,
-            `The search stopped before scheduling them to stay within the ${MAX_RESULTS.toLocaleString()}-item work budget.`,
+            "The search stopped before their next request could be scheduled.",
             "Refine the query or select fewer repositories to search every selected repository.",
             "info"
         ));
     }
     if (diagnostics.truncatedRepositoryCount > 0) {
         const details = diagnostics.truncationDetails
-            .map(detail => (
-                `${detail.repository}: loaded ${detail.loadedCount.toLocaleString()} of `
-                + `${detail.totalCount.toLocaleString()} matches `
-                + `(page ${detail.page} of ${detail.pageTotal})`
-            ))
+            .map(detail => {
+                const count = Number.isSafeInteger(detail.totalCount)
+                    ? ` of ${detail.totalCount.toLocaleString()}`
+                    : "";
+                return `${detail.repository}: loaded ${detail.loadedCount.toLocaleString()}${count} matches `
+                    + `(page ${detail.page} of ${detail.pageTotal})`;
+            })
             .join("\n");
         const omitted = diagnostics.truncatedRepositoryCount - diagnostics.truncationDetails.length;
         const suffix = omitted > 0 ? `\n…and ${omitted} more.` : "";
         nodes.push(new InfoNode(
-            `${diagnostics.truncatedRepositoryCount} repositories have additional matching pages`,
+            `${diagnostics.truncatedRepositoryCount} repositories were not fully searched`,
             `${details}${suffix}`,
-            "Multi-repository search loads only the first page from each repository. Refine the query to avoid omitted matches.",
+            "The search stopped at a page, request, result, or rate-limit boundary. Refine the query to avoid omitted matches.",
             "info"
+        ));
+    }
+    if (diagnostics.rateLimited) {
+        nodes.push(new InfoNode(
+            "Search stopped after rate limiting",
+            "No further repository requests were scheduled after Cloudsmith returned HTTP 429.",
+            "Successful repository pages were preserved, but the result is incomplete.",
+            "warning"
         ));
     }
     if (diagnostics.droppedResultCount > 0) {
@@ -1438,6 +1946,16 @@ function diagnosticNodes(committed) {
             `${diagnostics.droppedResultCount} results were omitted`,
             `Only the first ${MAX_RESULTS.toLocaleString()} results are retained.`,
             "Refine the search query to see omitted results.",
+            "info"
+        ));
+    } else if (
+        (diagnostics.pageLimitReached || diagnostics.requestLimitReached)
+        && diagnostics.truncatedRepositoryCount === 0
+    ) {
+        nodes.push(new InfoNode(
+            "Search loading limit reached",
+            `${committed.results.length.toLocaleString()} results were retained; more results may exist.`,
+            "Refine the search query before loading more pages.",
             "info"
         ));
     } else if (diagnostics.capReached && diagnostics.truncatedRepositoryCount === 0) {

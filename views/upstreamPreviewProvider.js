@@ -2,6 +2,14 @@
 // Shows a "what if I pull this?" dry run for packages that don't exist locally.
 
 const vscode = require("vscode");
+const {
+  formatUpstreamError,
+  formatUpstreamOrigin,
+  formatUpstreamText,
+} = require("../util/upstreamPresentation");
+
+const MAX_RENDERED_UPSTREAMS = 100;
+const MAX_PREVIEW_UPSTREAMS = 500;
 
 class UpstreamPreviewProvider {
   constructor(context) {
@@ -14,13 +22,14 @@ class UpstreamPreviewProvider {
    * @param {Object} result - Output from UpstreamChecker.previewResolution()
    */
   show(result) {
+    if (!result || typeof result !== "object") return;
     if (this._panel) {
       this._panel.dispose();
     }
 
     this._panel = vscode.window.createWebviewPanel(
       "cloudsmithUpstreamPreview",
-      `Upstream preview: ${result.name}`,
+      `Upstream preview: ${formatUpstreamText(result.name, "Unknown")}`,
       vscode.ViewColumn.One,
       { enableScripts: false, localResourceRoots: [] }
     );
@@ -33,35 +42,78 @@ class UpstreamPreviewProvider {
   }
 
   _getHtmlContent(result) {
-    const localStatus = result.local.error
-      ? `<span class="status-error">Could not load local package data: ${this._escapeHtml(result.local.error)}</span>`
-      : result.local.data
-        ? `<span class="status-found">Found in ${this._escapeHtml(result.repo)} (${this._escapeHtml(result.local.data.status_str || "Unknown")})</span>`
-        : `<span class="status-missing">Not found in ${this._escapeHtml(result.repo)}</span>`;
+    const local = result.local && typeof result.local === "object" ? result.local : {};
+    const upstreamState = result.upstreams && typeof result.upstreams === "object"
+      ? result.upstreams
+      : {};
+    const upstreamData = upstreamState.data && typeof upstreamState.data === "object"
+      ? upstreamState.data
+      : {};
+    const rawConfigs = Array.isArray(upstreamData.configs) ? upstreamData.configs : [];
+    const boundedConfigs = rawConfigs.slice(0, MAX_PREVIEW_UPSTREAMS);
+    const configs = boundedConfigs.filter(isPreviewUpstreamConfig);
+    const metadataConsistent = rawConfigs.length <= MAX_PREVIEW_UPSTREAMS
+      && configs.length === rawConfigs.length
+      && upstreamData.total === configs.length
+      && upstreamData.active === configs.filter(config => config.is_active !== false).length;
+    const displayedConfigs = configs
+      .slice(0, MAX_RENDERED_UPSTREAMS);
+    const loadedTotal = configs.length;
+    const activeTotal = configs.filter(config => config.is_active !== false).length;
+    const localError = local.errorMessage == null
+      ? null
+      : formatUpstreamError(local.errorMessage, "local");
+    const upstreamError = upstreamState.errorMessage == null
+      ? null
+      : formatUpstreamError(upstreamState.errorMessage, "upstream");
+    const upstreamComplete = upstreamState.complete === true
+      && metadataConsistent
+      && upstreamError === null;
+    const localStatus = localError
+      ? `<span class="status-error">Could not verify local package data: ${this._escapeHtml(localError)}</span>`
+      : local.data
+        ? `<span class="status-found">Found in ${this._escapeHtml(formatUpstreamText(result.repo))} (${this._escapeHtml(formatUpstreamText(local.data.status_str, "Unknown"))})</span>`
+        : local.complete === true
+          ? `<span class="status-missing">Not found in ${this._escapeHtml(formatUpstreamText(result.repo))}</span>`
+          : '<span class="status-error">Local package status is incomplete.</span>';
 
     let upstreamHtml = "";
-    if (result.upstreams.error) {
-      upstreamHtml = `<p class="error-banner">Could not load upstream data: ${this._escapeHtml(result.upstreams.error)}</p>`;
-    } else if (result.upstreams.data.configs.length === 0) {
-      upstreamHtml = '<p class="muted">No upstreams configured for this format.</p>';
+    if (upstreamError) {
+      upstreamHtml = `<p class="error-banner">Could not load upstream data: ${this._escapeHtml(upstreamError)}</p>`;
+    } else if (configs.length === 0) {
+      upstreamHtml = upstreamComplete
+        ? '<p class="muted">No upstreams configured for this format.</p>'
+        : '<p class="error-banner">Upstream inspection is incomplete. Additional upstreams may exist.</p>';
     } else {
-      upstreamHtml = '<table class="data-table"><thead><tr><th>Name</th><th>URL</th><th>Status</th></tr></thead><tbody>';
-      for (const u of result.upstreams.data.configs) {
+      if (!upstreamComplete) {
+        upstreamHtml += '<p class="error-banner">Upstream inspection is incomplete. The loaded configurations are shown below.</p>';
+      }
+      upstreamHtml += '<table class="data-table"><thead><tr><th>Name</th><th>Origin</th><th>Status</th></tr></thead><tbody>';
+      for (const u of displayedConfigs) {
         const active = u.is_active !== false;
         const statusClass = active ? "status-active" : "status-inactive";
         const statusLabel = active ? "Active" : "Inactive";
         upstreamHtml += `<tr>
-          <td>${this._escapeHtml(u.name || "Unnamed")}</td>
-          <td class="mono">${this._escapeHtml(u.upstream_url || "")}</td>
+          <td>${this._escapeHtml(formatUpstreamText(u.name, "Unnamed"))}</td>
+          <td class="mono">${this._escapeHtml(formatUpstreamOrigin(u.upstream_url))}</td>
           <td class="${statusClass}">${statusLabel}</td>
         </tr>`;
       }
       upstreamHtml += "</tbody></table>";
+      if (configs.length > displayedConfigs.length) {
+        upstreamHtml += `<p class="muted">Showing ${displayedConfigs.length} of ${configs.length} loaded upstreams.</p>`;
+      }
     }
 
-    const resolutionSummary = result.canResolveViaUpstream
-      ? `<div class="resolution-yes">This package can likely resolve through ${result.upstreams.data.active} active upstream${result.upstreams.data.active === 1 ? "" : "s"}.</div>`
-      : '<div class="resolution-no">No active upstreams for this format. Upload the package directly.</div>';
+    const resolutionSummary = activeTotal > 0
+      ? `<div class="resolution-yes">This package can likely resolve through ${activeTotal} active upstream${activeTotal === 1 ? "" : "s"}.</div>`
+      : upstreamComplete && !upstreamError
+        ? '<div class="resolution-no">No active upstreams for this format. Upload the package directly.</div>'
+        : '<div class="resolution-no">Upstream resolution could not be determined because inspection is incomplete.</div>';
+
+    const upstreamHeading = upstreamComplete
+      ? `Upstreams (${activeTotal} active of ${loadedTotal})`
+      : `Loaded upstreams (${activeTotal} active of ${loadedTotal} loaded)`;
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -93,15 +145,15 @@ class UpstreamPreviewProvider {
 <body>
   <h2>Upstream resolution preview</h2>
   <dl class="header-info">
-    <dt>Package</dt><dd>${this._escapeHtml(result.name)}</dd>
-    <dt>Format</dt><dd>${this._escapeHtml(result.format)}</dd>
-    <dt>Target repository</dt><dd>${this._escapeHtml(result.workspace)}/${this._escapeHtml(result.repo)}</dd>
+    <dt>Package</dt><dd>${this._escapeHtml(formatUpstreamText(result.name, "Unknown"))}</dd>
+    <dt>Format</dt><dd>${this._escapeHtml(formatUpstreamText(result.format, "Unknown"))}</dd>
+    <dt>Target repository</dt><dd>${this._escapeHtml(formatUpstreamText(result.workspace, "Unknown"))}/${this._escapeHtml(formatUpstreamText(result.repo, "Unknown"))}</dd>
     <dt>Local status</dt><dd>${localStatus}</dd>
   </dl>
 
   ${resolutionSummary}
 
-  <h3>Upstreams (${result.upstreams.data.active} active of ${result.upstreams.data.total})</h3>
+  <h3>${upstreamHeading}</h3>
   ${upstreamHtml}
 </body>
 </html>`;
@@ -122,6 +174,20 @@ class UpstreamPreviewProvider {
       this._panel = null;
     }
   }
+
+  resetForAccountChange() {
+    this.dispose();
+  }
+}
+
+function isPreviewUpstreamConfig(value) {
+  return Boolean(value)
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && typeof value.name === "string"
+    && value.name.length > 0
+    && (value.is_active === undefined || typeof value.is_active === "boolean")
+    && (value.upstream_url === undefined || typeof value.upstream_url === "string");
 }
 
 module.exports = { UpstreamPreviewProvider };

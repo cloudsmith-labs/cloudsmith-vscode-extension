@@ -1,6 +1,11 @@
 // Copyright 2026 Cloudsmith Ltd.
 
 const { getAllUpstreamData } = require("./upstreamChecker");
+const { SUPPORTED_UPSTREAM_FORMATS } = require("./upstreamFormats");
+const {
+  formatUpstreamText,
+  getTerraformUpstreamUrl,
+} = require("./upstreamPresentation");
 
 const REPOSITORY_OPTIONAL_FIELDS = [
   { apiField: "repository_type_str", terraformField: "repository_type", defaultValue: "Private" },
@@ -72,7 +77,10 @@ function sanitizeIdentifier(value, options = {}) {
 }
 
 function escapeHclString(value) {
-  return JSON.stringify(String(value));
+  const literal = String(value)
+    .split("${").join("$${")
+    .split("%{").join("%%{");
+  return JSON.stringify(literal);
 }
 
 function isPlainObject(value) {
@@ -194,20 +202,30 @@ function buildVariableBlock(name, description) {
 }
 
 async function fetchRepositoryUpstreams(context, workspace, repoSlug, options = {}) {
-  const upstreamData = await getAllUpstreamData(context, workspace, repoSlug, options);
+  const upstreamData = await getAllUpstreamData(context, workspace, repoSlug, {
+    ...options,
+    bypassCache: true,
+  });
   if (upstreamData === null) {
     return null;
   }
 
   const upstreams = Array.isArray(upstreamData.upstreams) ? upstreamData.upstreams : [];
   const failedFormats = Array.isArray(upstreamData.failedFormats) ? upstreamData.failedFormats : [];
+  const uninspectedFormats = Array.isArray(upstreamData.uninspectedFormats)
+    ? upstreamData.uninspectedFormats
+    : [];
+  const unavailableFormats = [...new Set([...failedFormats, ...uninspectedFormats])];
   const hasUsableUpstreams = upstreams.length > 0;
 
-  if (failedFormats.length > 0 && !hasUsableUpstreams) {
+  if (unavailableFormats.length > 0 && !hasUsableUpstreams) {
     return {
       data: upstreams,
-      error: `Could not load upstream data for: ${failedFormats.join(", ")}`,
+      error: `Could not load upstream data for: ${unavailableFormats.join(", ")}`,
       failedFormats,
+      uninspectedFormats,
+      complete: false,
+      partial: false,
     };
   }
 
@@ -217,6 +235,9 @@ async function fetchRepositoryUpstreams(context, workspace, repoSlug, options = 
     active: upstreamData.active,
     total: upstreamData.total,
     failedFormats,
+    uninspectedFormats,
+    complete: upstreamData.complete === true,
+    partial: upstreamData.complete !== true && hasUsableUpstreams,
   };
 }
 
@@ -264,6 +285,7 @@ function buildUpstreamBlocks(upstreams, repoSlug, repoResourceLabel) {
   const variableBlocks = [];
   const seenVariables = new Set();
   const blocks = [];
+  let omittedUnsafeUrlCount = 0;
 
   for (const upstream of upstreams) {
     const name = getStringValue(upstream && upstream.name);
@@ -272,7 +294,13 @@ function buildUpstreamBlocks(upstreams, repoSlug, repoResourceLabel) {
       upstream && (upstream._format != null ? upstream._format : upstream.format)
     );
 
-    if (!name || !upstreamUrlRaw || !upstreamType) {
+    if (!name || !upstreamType) {
+      continue;
+    }
+
+    const upstreamUrl = upstreamUrlRaw ? getTerraformUpstreamUrl(upstreamUrlRaw) : null;
+    if (!upstreamUrl) {
+      omittedUnsafeUrlCount += 1;
       continue;
     }
 
@@ -281,7 +309,6 @@ function buildUpstreamBlocks(upstreams, repoSlug, repoResourceLabel) {
       fallback: `${repoSlugIdentifier}_upstream`,
     });
     const resourceLabel = uniqueLabel(resourceBaseLabel, usedLabels, upstreamType);
-    const upstreamUrl = upstreamUrlRaw.replace(/\/+$/g, "");
     const authMode = getStringValue(upstream.auth_mode);
     const authUsername = getStringValue(upstream.auth_username);
     const comments = [];
@@ -377,7 +404,7 @@ function buildUpstreamBlocks(upstreams, repoSlug, repoResourceLabel) {
     blocks.push(blockLines.join("\n"));
   }
 
-  return { blocks, variableBlocks };
+  return { blocks, variableBlocks, omittedUnsafeUrlCount };
 }
 
 function buildRetentionBlock(retention, repoResourceLabel) {
@@ -413,14 +440,22 @@ function generateTerraformConfig(options) {
     retention = null,
     exportedAt = new Date().toISOString(),
     upstreamLoadFailed = false,
+    upstreamLoadPartial = false,
+    upstreamFailedFormats = [],
   } = options || {};
 
   const repoSlug = getStringValue(getRepoField(repo, "slug")) || "repository";
   const repoResourceLabel = sanitizeIdentifier(repoSlug, { lowercase: true, fallback: "repository" });
+  const repositoryDisplayName = formatUpstreamText(
+    getStringValue(getRepoField(repo, "name")) || repoSlug,
+    "repository"
+  );
+  const workspaceDisplayName = formatUpstreamText(workspace, "workspace");
+  const exportedAtDisplay = formatUpstreamText(exportedAt, "unknown time");
   const sections = [
     [
-      `# Terraform configuration for repository "${getStringValue(getRepoField(repo, "name")) || repoSlug}" in workspace "${workspace}"`,
-      `# Exported at ${exportedAt}`,
+      `# Terraform configuration for repository "${repositoryDisplayName}" in workspace "${workspaceDisplayName}"`,
+      `# Exported at ${exportedAtDisplay}`,
     ].join("\n"),
     formatBlock('data "cloudsmith_namespace" "this" {', [
       { key: "slug", value: workspace },
@@ -431,8 +466,27 @@ function generateTerraformConfig(options) {
   if (upstreamLoadFailed) {
     sections.push("# Could not load upstream data. Add upstream resources manually.");
   } else if (Array.isArray(upstreams) && upstreams.length > 0) {
-    const { blocks, variableBlocks } = buildUpstreamBlocks(upstreams, repoSlug, repoResourceLabel);
+    if (upstreamLoadPartial) {
+      const unavailable = Array.isArray(upstreamFailedFormats)
+        ? [...new Set(upstreamFailedFormats.filter(value => (
+          typeof value === "string" && SUPPORTED_UPSTREAM_FORMATS.includes(value)
+        )))]
+        : [];
+      sections.push(
+        `# Upstream data is incomplete${unavailable.length > 0 ? ` for: ${unavailable.join(", ")}` : ""}. Loaded upstream resources are included; additional resources may need to be added manually.`
+      );
+    }
+    const { blocks, variableBlocks, omittedUnsafeUrlCount } = buildUpstreamBlocks(
+      upstreams,
+      repoSlug,
+      repoResourceLabel
+    );
     sections.push(...blocks);
+    if (omittedUnsafeUrlCount > 0) {
+      sections.push(
+        `# ${omittedUnsafeUrlCount} upstream resource${omittedUnsafeUrlCount === 1 ? " was" : "s were"} omitted because the configured URL could not be exported safely. Add ${omittedUnsafeUrlCount === 1 ? "it" : "them"} manually.`
+      );
+    }
 
     const retentionBlock = buildRetentionBlock(retention, repoResourceLabel);
     if (retentionBlock) {

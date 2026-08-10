@@ -15,7 +15,7 @@ const {
   MAX_DIAGNOSTIC_OCCURRENCES,
   createDiagnosticCandidate,
 } = require("../util/diagnosticsPublisher");
-const { PaginatedFetch } = require("../util/paginatedFetch");
+const { fetchWorkspaceRepositories } = require("../util/workspaceRepositoryFetcher");
 const { SearchQueryBuilder } = require("../util/searchQueryBuilder");
 const { LicenseClassifier } = require("../util/licenseClassifier");
 const {
@@ -28,6 +28,10 @@ const {
 const {
   enrichVulnerabilities,
 } = require("../util/dependencyVulnEnricher");
+const {
+  getPackagePolicyFlags,
+  getPackageVulnerabilityState,
+} = require("../util/packageVulnerabilities");
 const { enrichLicenses } = require("../util/dependencyLicenseEnricher");
 const { getFoundDependencyKey } = require("../util/foundDependencyKey");
 const { enrichPolicies } = require("../util/dependencyPolicyEnricher");
@@ -45,13 +49,16 @@ const DependencySourceGroupNode = require("../models/dependencySourceGroupNode")
 const DependencySummaryNode = require("../models/dependencySummaryNode");
 const InfoNode = require("../models/infoNode");
 const { getConnectionManager } = require("../util/connectionManager");
+const { packageCollectionIdentity } = require("../util/collectionIdentity");
 
 const DEFAULT_MAX_DEPENDENCIES_TO_SCAN = 10000;
 const LOOKUP_PAGE_SIZE = 100;
 const LOOKUP_MAX_PAGES = 100;
 const LOOKUP_CONCURRENCY = 8;
 const LOOKUP_MAX_REQUESTS_PER_RESOLUTION = 2000;
-const WORKSPACE_REPOSITORY_PAGE_SIZE = 500;
+const LOOKUP_MAX_PACKAGE_NAME_LENGTH = 2048;
+const LOOKUP_MAX_PACKAGE_FORMAT_LENGTH = 100;
+const LOOKUP_MAX_PACKAGE_VERSION_LENGTH = 2048;
 const COVERAGE_MATCH_BATCH_SIZE = 50;
 const ENRICHMENT_PROGRESS_DEBOUNCE_MS = 500;
 
@@ -1060,14 +1067,23 @@ class DependencyHealthProvider {
           return;
         }
 
-        const result = await lookupExactDependency({
-          api,
-          cloudsmithWorkspace,
-          cloudsmithRepo,
-          dependency,
-          token,
-          requestBudget,
-        });
+        let result;
+        try {
+          result = await lookupExactDependency({
+            api,
+            cloudsmithWorkspace,
+            cloudsmithRepo,
+            dependency,
+            token,
+            requestBudget,
+          });
+        } catch {
+          result = createCoverageLookupResult(
+            CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED,
+            null,
+            "The Cloudsmith lookup failed unexpectedly without proving package absence."
+          );
+        }
         statusCounts.set(result.status, (statusCounts.get(result.status) || 0) + 1);
         pendingMatches.push({ dependency, result });
       });
@@ -1108,10 +1124,10 @@ class DependencyHealthProvider {
         continue;
       }
 
-      const message = result.reason && result.reason.message
-        ? result.reason.message
-        : String(result.reason || "An enrichment step failed.");
-      this._warnings.push(message);
+      appendUniqueWarning(
+        this._warnings,
+        boundedFailureMessage(result.reason, "An enrichment step failed.")
+      );
     }
   }
 
@@ -1194,11 +1210,18 @@ class DependencyHealthProvider {
   }
 
   async _runUpstreamGapAnalysis(uncoveredDependencies, workspace, repo, progress, token) {
-    const repositories = repo
-      ? [repo]
+    const repositoryCollection = repo
+      ? { items: [repo], complete: true, incomplete: false, partial: false }
       : await (this._services.fetchRepositories
         ? this._services.fetchRepositories(workspace, token)
         : this._fetchWorkspaceRepositories(workspace, token));
+    const normalizedRepositories = normalizeRepositoryCollection(repositoryCollection);
+    if (!normalizedRepositories.complete) {
+      appendUniqueWarning(
+        this._warnings,
+        "Repository enumeration for upstream analysis was incomplete. Positive proxy matches are retained, but missing proxy coverage is shown as unknown."
+      );
+    }
 
     const handler = this._createDebouncedEnrichmentHandler((patchMap) => {
       this._fullTrees = applyUncoveredOverlayPatch(this._fullTrees, patchMap, (dependency, gap) => ({
@@ -1218,9 +1241,14 @@ class DependencyHealthProvider {
         ...dependency,
         cloudsmithStatus: "NOT_FOUND",
       }));
-      await this._services.analyzeUpstreamGaps(legacyCompatibleDependencies, workspace, repositories, {
+      await this._services.analyzeUpstreamGaps(
+        legacyCompatibleDependencies,
+        workspace,
+        normalizedRepositories.items,
+        {
         context: this.context,
         cancellationToken: token,
+        repositoriesComplete: normalizedRepositories.complete,
         onProgress: (patchMap, meta = {}) => {
           if (meta.total > 0) {
             progress.report({
@@ -1229,54 +1257,27 @@ class DependencyHealthProvider {
           }
           handler.onProgress(patchMap);
         },
-      });
+        }
+      );
     } finally {
       handler.flush();
     }
   }
 
   async _fetchWorkspaceRepositories(workspace, token) {
-    const api = new CloudsmithAPI(this.context);
-    const paginatedFetch = new PaginatedFetch(api);
-    let endpoint;
-    try {
-      endpoint = apiEndpoint(["repos", workspace], { query: { sort: "name" } });
-    } catch {
-      this._warnings.push("Could not load repositories for upstream analysis. The workspace identifier was invalid.");
-      return [];
-    }
-    const repositories = [];
-    let page = 1;
-
-    while (!token || !token.isCancellationRequested) {
-      const result = await paginatedFetch.fetchPage(
-        endpoint,
-        page,
-        WORKSPACE_REPOSITORY_PAGE_SIZE,
-        null,
-        { cancellationToken: token, retry: "never", validate: isRepositoryPageArray }
-      );
-      if (result.error) {
-        this._warnings.push(`Could not load repositories for upstream analysis. ${result.error.message}`);
-        break;
-      }
-
-      for (const repository of Array.isArray(result.data) ? result.data : []) {
-        if (repository && repository.slug) {
-          repositories.push(repository.slug);
-        }
-      }
-
-      const pageTotal = result.pagination && result.pagination.pageTotal
-        ? result.pagination.pageTotal
-        : 1;
-      if (page >= pageTotal) {
-        break;
-      }
-      page += 1;
-    }
-
-    return [...new Set(repositories)];
+    const result = await fetchWorkspaceRepositories(this.context, workspace, {
+      connectionManager: this._connectionManager,
+      cloudsmithAPI: this._services.createCloudsmithAPI(),
+      cancellationToken: token,
+      retry: "never",
+      withProgress: async (_options, task) => task({ report() {} }),
+    });
+    const items = Array.isArray(result?.items) ? result.items : [];
+    return {
+      ...result,
+      items: [...new Set(items.map(repository => repository?.slug).filter(Boolean))],
+      complete: result?.complete === true,
+    };
   }
 
   async _publishDiagnostics(cancellationToken) {
@@ -1487,30 +1488,38 @@ class DependencyHealthProvider {
     }
 
     this._dependencyOperationRunning = true;
-    let cancellationSource = null;
+    const cancellationSource = new vscode.CancellationTokenSource();
+    this._activeDependencyCancellation = cancellationSource;
+    let prepared = null;
 
     try {
       await this._updateContexts();
-      const prepared = await this._services.upstreamPullService.prepareSingle({
-        workspace: this.lastWorkspace,
-        repositoryHint: this.lastRepo,
-        dependency,
-      });
-      if (!prepared || !this._isAccountCurrent(accountEpoch)) {
-        return;
-      }
-
-      cancellationSource = new vscode.CancellationTokenSource();
-      this._activeDependencyCancellation = cancellationSource;
       const result = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `Pulling ${formatSingleDependencyLabel(prepared.dependency)} through ${prepared.repository.slug}...`,
+          title: `Preparing upstream pull for ${formatSingleDependencyLabel(dependency)}...`,
           cancellable: true,
         },
         async (progress, token) => {
           const subscription = token.onCancellationRequested(() => cancellationSource.cancel());
           try {
+            progress.report({ message: "Inspecting repository upstreams..." });
+            prepared = await this._services.upstreamPullService.prepareSingle({
+              workspace: this.lastWorkspace,
+              repositoryHint: this.lastRepo,
+              dependency,
+              cancellationToken: cancellationSource.token,
+            });
+            if (
+              !prepared
+              || cancellationSource.token.isCancellationRequested
+              || !this._isAccountCurrent(accountEpoch)
+            ) {
+              return cancellationSource.token.isCancellationRequested
+                ? { canceled: true }
+                : null;
+            }
+
             progress.report({ message: "Triggering upstream pull..." });
             const execution = await this._services.upstreamPullService.execute(prepared, {
               progress,
@@ -1574,11 +1583,9 @@ class DependencyHealthProvider {
         vscode.window.showInformationMessage(notification.message);
       }
     } finally {
-      if (cancellationSource) {
-        cancellationSource.dispose();
-        if (this._activeDependencyCancellation === cancellationSource) {
-          this._activeDependencyCancellation = null;
-        }
+      cancellationSource.dispose();
+      if (this._activeDependencyCancellation === cancellationSource) {
+        this._activeDependencyCancellation = null;
       }
       this._dependencyOperationRunning = false;
       await this._updateContexts();
@@ -1680,11 +1687,19 @@ class DependencyHealthProvider {
           ? "Enriching pulled dependency..."
           : "Enriching newly covered dependencies...",
       });
-      await Promise.all([
+      const enrichmentResults = await Promise.allSettled([
         this._runVulnerabilityEnrichment(newlyFoundDependencies, cloudsmithWorkspace, progress, token),
         this._runLicenseEnrichment(newlyFoundDependencies, token),
         this._runPolicyEnrichment(newlyFoundDependencies, token),
       ]);
+      for (const result of enrichmentResults) {
+        if (result.status === "rejected") {
+          appendUniqueWarning(
+            this._warnings,
+            boundedFailureMessage(result.reason, "A dependency refresh enrichment step failed.")
+          );
+        }
+      }
     }
 
     if (options.refreshRemainingUpstream) {
@@ -1868,16 +1883,18 @@ class DependencyHealthProvider {
   }
 }
 
-function isRepositoryPageArray(value) {
-  return Array.isArray(value) && value.every(repository => (
-    repository
-    && typeof repository === "object"
-    && !Array.isArray(repository)
-    && typeof repository.slug === "string"
-    && repository.slug.length > 0
-    && typeof repository.name === "string"
-    && repository.name.length > 0
-  ));
+function normalizeRepositoryCollection(value) {
+  const collection = value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : { items: [], complete: false };
+  const rawItems = Array.isArray(collection.items) ? collection.items : [];
+  const items = [...new Set(rawItems.map(repository => (
+    typeof repository === "string" ? repository.trim() : repository?.slug
+  )).filter(Boolean))];
+  return {
+    items,
+    complete: collection.complete === true && collection.stale !== true,
+  };
 }
 
 function createScanOperation(status, id, values = {}) {
@@ -1898,6 +1915,16 @@ function appendUniqueWarning(warnings, warning) {
     return;
   }
   warnings.push(warning);
+}
+
+function boundedFailureMessage(error, fallback) {
+  const raw = error && typeof error.message === "string"
+    ? error.message
+    : typeof error === "string"
+      ? error
+      : fallback;
+  const normalized = String(raw || fallback).replace(/[\r\n\t]+/g, " ").trim();
+  return normalized.length <= 512 ? normalized : `${normalized.slice(0, 511)}…`;
 }
 
 function getConcreteDependencyVersion(dependency) {
@@ -2016,6 +2043,8 @@ async function lookupExactDependency({
       .version(concreteVersion)
       .build();
     let page = 1;
+    let paginationAnchor = null;
+    const seenPackageIdentities = new Set();
 
     while (true) {
       if (token && token.isCancellationRequested) {
@@ -2062,7 +2091,11 @@ async function lookupExactDependency({
       }
       const response = await api.get(requestEndpoint, {
         responseType: "array",
-        validate: isPackageCandidateArray,
+        validate: value => isPackageCandidateArray(
+          value,
+          cloudsmithWorkspace,
+          cloudsmithRepo
+        ),
         retry: "never",
         cancellationToken: token,
       });
@@ -2089,6 +2122,29 @@ async function lookupExactDependency({
           pagesFetched
         );
       }
+      if (!isPackageCandidateArray(response.data, cloudsmithWorkspace, cloudsmithRepo)) {
+        return createCoverageLookupResult(
+          pagesFetched > 0
+            ? CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
+            : CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED,
+          null,
+          "Cloudsmith returned package records outside the requested lookup scope.",
+          pagesFetched
+        );
+      }
+      const pageIdentities = response.data.map(packageCandidateIdentity);
+      if (
+        new Set(pageIdentities).size !== pageIdentities.length
+        || pageIdentities.some(identity => seenPackageIdentities.has(identity))
+      ) {
+        return createCoverageLookupResult(
+          CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE,
+          null,
+          "Cloudsmith repeated package records before the lookup completed.",
+          pagesFetched
+        );
+      }
+      for (const identity of pageIdentities) seenPackageIdentities.add(identity);
       pagesFetched += 1;
       const match = matchCoverageCandidates(response.data, dependency, concreteVersion);
       if (match) {
@@ -2100,12 +2156,15 @@ async function lookupExactDependency({
         );
       }
 
-      const pagination = getLookupPaginationDirective(
+      const paginationState = getLookupPaginationState(
         normalizeLookupHeaders(response.headers),
         page,
         response.data.length,
-        LOOKUP_PAGE_SIZE
+        LOOKUP_PAGE_SIZE,
+        paginationAnchor
       );
+      const pagination = paginationState.directive;
+      paginationAnchor = paginationState.anchor;
       if (pagination === "incomplete") {
         return createCoverageLookupResult(
           CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE,
@@ -2213,43 +2272,75 @@ function getCaseAwareCloudsmithPackageLookupKeys(candidate, ecosystemOrFormat) {
   return getCloudsmithPackageLookupKeys(candidate, format);
 }
 
-function getLookupPaginationDirective(headers, requestedPage, itemCount, requestedPageSize) {
+function getLookupPaginationState(
+  headers,
+  requestedPage,
+  itemCount,
+  requestedPageSize,
+  anchor = null
+) {
   const metadata = headers && typeof headers === "object" ? headers : {};
   const currentPage = parseOptionalNonNegativeInteger(metadata.page);
   if (currentPage.present && (!currentPage.valid || currentPage.value !== requestedPage)) {
-    return "incomplete";
+    return { directive: "incomplete", anchor };
   }
 
   const pageTotal = parseOptionalNonNegativeInteger(metadata.pageTotal);
   const count = parseOptionalNonNegativeInteger(metadata.count);
   const responsePageSize = parseOptionalNonNegativeInteger(metadata.pageSize);
   if (count.present && (!count.valid || count.value < itemCount)) {
-    return "incomplete";
+    return { directive: "incomplete", anchor };
   }
   if (responsePageSize.present && (!responsePageSize.valid || responsePageSize.value < 1)) {
-    return "incomplete";
+    return { directive: "incomplete", anchor };
   }
   const effectivePageSize = responsePageSize.present
     ? responsePageSize.value
     : requestedPageSize;
   if (itemCount > effectivePageSize) {
-    return "incomplete";
+    return { directive: "incomplete", anchor };
   }
+  const nextAnchor = {
+    pageTotal: pageTotal.present && pageTotal.valid ? pageTotal.value : null,
+    pageTotalAuthoritative: pageTotal.present,
+    count: count.present && count.valid ? count.value : null,
+    countAuthoritative: count.present,
+    pageSize: effectivePageSize,
+    pageSizeAuthoritative: responsePageSize.present,
+  };
+  if (
+    (pageTotal.present && !pageTotal.valid)
+    || (count.present && !count.valid)
+    || (
+      anchor
+      && (
+        anchor.pageTotal !== nextAnchor.pageTotal
+        || anchor.pageTotalAuthoritative !== nextAnchor.pageTotalAuthoritative
+        || anchor.count !== nextAnchor.count
+        || anchor.countAuthoritative !== nextAnchor.countAuthoritative
+        || anchor.pageSize !== nextAnchor.pageSize
+        || anchor.pageSizeAuthoritative !== nextAnchor.pageSizeAuthoritative
+      )
+    )
+  ) {
+    return { directive: "incomplete", anchor };
+  }
+  const stableAnchor = anchor || nextAnchor;
   if (count.present) {
     const expectedItemCount = Math.min(
       effectivePageSize,
       Math.max(0, count.value - ((requestedPage - 1) * effectivePageSize))
     );
     if (itemCount !== expectedItemCount) {
-      return "incomplete";
+      return { directive: "incomplete", anchor: stableAnchor };
     }
   }
 
   if (pageTotal.present) {
     if (!pageTotal.valid || pageTotal.value < requestedPage) {
       return pageTotal.valid && pageTotal.value === 0 && itemCount === 0
-        ? "exhausted"
-        : "incomplete";
+        ? { directive: "exhausted", anchor: stableAnchor }
+        : { directive: "incomplete", anchor: stableAnchor };
     }
     if (count.present) {
       const calculatedTotal = count.value === 0
@@ -2260,33 +2351,55 @@ function getLookupPaginationDirective(headers, requestedPage, itemCount, request
         || (count.value === 0 && pageTotal.value > 1)
         || (count.value > 0 && calculatedTotal !== pageTotal.value)
       ) {
-        return "incomplete";
+        return { directive: "incomplete", anchor: stableAnchor };
       }
     }
-    return requestedPage >= pageTotal.value ? "exhausted" : "next";
+    if (requestedPage < pageTotal.value && itemCount !== effectivePageSize) {
+      return { directive: "incomplete", anchor: stableAnchor };
+    }
+    return {
+      directive: requestedPage >= pageTotal.value ? "exhausted" : "next",
+      anchor: stableAnchor,
+    };
   }
 
   if (count.present) {
     const calculatedTotal = Math.ceil(count.value / effectivePageSize);
     if (calculatedTotal < requestedPage) {
       return count.value === 0 && itemCount === 0 && requestedPage === 1
-        ? "exhausted"
-        : "incomplete";
+        ? { directive: "exhausted", anchor: stableAnchor }
+        : { directive: "incomplete", anchor: stableAnchor };
     }
-    return requestedPage >= calculatedTotal ? "exhausted" : "next";
+    return {
+      directive: requestedPage >= calculatedTotal ? "exhausted" : "next",
+      anchor: stableAnchor,
+    };
   }
 
-  return "incomplete";
+  return { directive: "incomplete", anchor: stableAnchor };
+}
+
+function getLookupPaginationDirective(headers, requestedPage, itemCount, requestedPageSize) {
+  return getLookupPaginationState(
+    headers,
+    requestedPage,
+    itemCount,
+    requestedPageSize
+  ).directive;
 }
 
 function parseOptionalNonNegativeInteger(value) {
   if (value == null || value === "") {
     return { present: false, valid: false, value: null };
   }
-  const normalized = typeof value === "number" ? value : Number(String(value).trim());
+  const normalized = typeof value === "number"
+    ? value
+    : typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)
+      ? Number(value)
+      : NaN;
   return {
     present: true,
-    valid: Number.isInteger(normalized) && normalized >= 0,
+    valid: Number.isSafeInteger(normalized) && normalized >= 0,
     value: normalized,
   };
 }
@@ -2300,15 +2413,36 @@ function normalizeLookupHeaders(headers) {
   };
 }
 
-function isPackageCandidateArray(value) {
-  return Array.isArray(value) && value.every(candidate => (
-    candidate
-    && typeof candidate === "object"
-    && !Array.isArray(candidate)
-    && nonEmptyString(candidate.name)
-    && nonEmptyString(candidate.format)
-    && nonEmptyString(candidate.version)
-  ));
+function isPackageCandidateArray(value, expectedWorkspace, expectedRepository) {
+  return Array.isArray(value)
+    && value.length <= LOOKUP_PAGE_SIZE
+    && value.every(candidate => (
+      candidate
+      && typeof candidate === "object"
+      && !Array.isArray(candidate)
+      && boundedExactLookupString(candidate.name, LOOKUP_MAX_PACKAGE_NAME_LENGTH)
+      && boundedExactLookupString(candidate.format, LOOKUP_MAX_PACKAGE_FORMAT_LENGTH)
+      && boundedExactLookupString(candidate.version, LOOKUP_MAX_PACKAGE_VERSION_LENGTH)
+      && candidate.namespace === expectedWorkspace
+      && (!expectedRepository || candidate.repository === expectedRepository)
+      && Boolean(getPackagePolicyFlags(candidate))
+      && Boolean(packageCandidateIdentity(candidate))
+    ));
+}
+
+function packageCandidateIdentity(candidate) {
+  try {
+    return packageCollectionIdentity(candidate);
+  } catch {
+    return null;
+  }
+}
+
+function boundedExactLookupString(value, maxLength) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= maxLength
+    && value.trim() === value;
 }
 
 function isAbsentCoverageStatus(status) {
@@ -2751,7 +2885,7 @@ function dependencySeveritySortGroup(dependency) {
     return 0;
   }
 
-  if (vulnerabilities && vulnerabilities.count > 0) {
+  if (hasDetectedVulnerabilities(vulnerabilities)) {
     if (vulnerabilities.maxSeverity === "Critical") {
       return 1;
     }
@@ -2847,7 +2981,7 @@ function matchesFilter(dependency, filterMode) {
 
   switch (filterMode) {
     case FILTER_MODES.VULNERABLE:
-      return Boolean(vulnerabilities && vulnerabilities.count > 0);
+      return hasDetectedVulnerabilities(vulnerabilities);
     case FILTER_MODES.UNCOVERED:
       return isAbsentCoverageStatus(dependency.cloudsmithStatus);
     case FILTER_MODES.RESTRICTIVE_LICENSE:
@@ -2904,12 +3038,17 @@ function buildDependencySummary(fullTrees, displayTrees, options = {}) {
   )).length;
   const vulnerable = summaryDependencies.filter((dependency) => {
     const vulnerabilities = getDependencyVulnerabilityData(dependency);
-    return dependency.cloudsmithStatus === "FOUND" && vulnerabilities && vulnerabilities.count > 0;
+    return dependency.cloudsmithStatus === "FOUND" && hasDetectedVulnerabilities(vulnerabilities);
   }).length;
   const severityCounts = {};
   for (const dependency of summaryDependencies) {
     const vulnerabilities = getDependencyVulnerabilityData(dependency);
-    if (dependency.cloudsmithStatus === "FOUND" && vulnerabilities && vulnerabilities.count > 0 && vulnerabilities.maxSeverity) {
+    if (
+      dependency.cloudsmithStatus === "FOUND"
+      && hasDetectedVulnerabilities(vulnerabilities)
+      && vulnerabilities.maxSeverity
+      && vulnerabilities.maxSeverity !== "Unknown"
+    ) {
       severityCounts[vulnerabilities.maxSeverity] = (severityCounts[vulnerabilities.maxSeverity] || 0) + 1;
     }
   }
@@ -3024,7 +3163,7 @@ async function runPromisePool(items, concurrency, worker) {
     })());
   }
 
-  await Promise.all(workers);
+  await Promise.allSettled(workers);
 }
 
 function mergePatchMaps(patchMaps) {
@@ -3159,7 +3298,7 @@ function buildComplianceReportData(projectName, dependencies, options = {}) {
     .filter((dependency) => dependency.cloudsmithStatus === "FOUND")
     .map((dependency) => {
       const vulnerabilities = getDependencyVulnerabilityData(dependency);
-      if (!vulnerabilities || vulnerabilities.count <= 0) {
+      if (!vulnerabilities || (!hasDetectedVulnerabilities(vulnerabilities) && !vulnerabilities.unknown)) {
         return null;
       }
 
@@ -3172,15 +3311,19 @@ function buildComplianceReportData(projectName, dependencies, options = {}) {
         version: dependency.version || "",
         isDirect: Boolean(dependency.isDirect),
         maxSeverity: vulnerabilities.maxSeverity || null,
-        cveCount: vulnerabilities.count || 0,
+        cveCount: vulnerabilities.countKnown === true ? vulnerabilities.count : null,
+        vulnerabilityStatus: hasDetectedVulnerabilities(vulnerabilities) ? "Detected" : "Unknown",
         hasFixAvailable: Boolean(fixEntry || vulnerabilities.hasFixAvailable),
       };
     })
     .filter(Boolean)
     .sort(compareComplianceVulnerabilityRows);
 
+  const detectedVulnerableDeps = vulnerableDeps.filter((dependency) => (
+    dependency.vulnerabilityStatus === "Detected"
+  ));
   const severityCounts = {};
-  for (const dependency of vulnerableDeps) {
+  for (const dependency of detectedVulnerableDeps) {
     const severity = dependency.maxSeverity || "Unknown";
     severityCounts[severity] = (severityCounts[severity] || 0) + 1;
   }
@@ -3269,7 +3412,8 @@ function buildComplianceReportData(projectName, dependencies, options = {}) {
       lookupFailed,
       lookupIncomplete,
       coveragePct: total === 0 ? 0 : Math.round((found / total) * 100),
-      vulnCount: vulnerableDeps.length,
+      vulnCount: detectedVulnerableDeps.length,
+      vulnUnknownCount: vulnerableDeps.length - detectedVulnerableDeps.length,
       criticalCount: severityCounts.Critical || 0,
       highCount: severityCounts.High || 0,
       mediumCount: severityCounts.Medium || 0,
@@ -3525,7 +3669,10 @@ function defaultUpstreamDetail(status) {
 
 function buildDependencyHealthReport(projectName, dependencies, summary, generatedDate) {
   const vulnerableDependencies = dependencies
-    .filter((dependency) => dependency.vulnerabilities && dependency.vulnerabilities.count > 0)
+    .filter((dependency) => {
+      const vulnerabilities = getDependencyVulnerabilityData(dependency);
+      return hasDetectedVulnerabilities(vulnerabilities) || vulnerabilities?.unknown === true;
+    })
     .sort((left, right) => compareDependencies(left, right, SORT_MODES.SEVERITY, false));
   const uncoveredDependencies = dependencies
     .filter((dependency) => isAbsentCoverageStatus(dependency.cloudsmithStatus))
@@ -3551,24 +3698,33 @@ function buildDependencyHealthReport(projectName, dependencies, summary, generat
     const severityParts = ["Critical", "High", "Medium", "Low"]
       .filter((severity) => summary.severityCounts[severity] > 0)
       .map((severity) => `${summary.severityCounts[severity]} ${severity}`);
-    lines.push(`- ${summary.vulnerable} with known vulnerabilities (${severityParts.join(", ")})`);
+    lines.push(
+      `- ${summary.vulnerable} with detected vulnerabilities${severityParts.length > 0 ? ` (${severityParts.join(", ")})` : ""}`
+    );
   }
 
   lines.push("");
-  lines.push("## Vulnerable Dependencies");
+  lines.push("## Dependency Vulnerability Status");
   if (vulnerableDependencies.length === 0) {
     lines.push("None");
   } else {
     lines.push("| Package | Version | Type | Severity | CVEs | Fix Available |");
     lines.push("|---------|---------|------|----------|------|---------------|");
     for (const dependency of vulnerableDependencies) {
-      const fixEntry = (dependency.vulnerabilities.entries || []).find((entry) => entry.fixVersion);
+      const vulnerabilities = getDependencyVulnerabilityData(dependency);
+      const fixEntry = (vulnerabilities.entries || []).find((entry) => entry.fixVersion);
       const fixCell = fixEntry
         ? `Yes (${fixEntry.fixVersion})`
-        : dependency.vulnerabilities.hasFixAvailable
+        : vulnerabilities.hasFixAvailable
           ? "Yes"
           : "No";
-      lines.push(`| ${dependency.name} | ${dependency.version || "—"} | ${dependency.isDirect ? "Direct" : "Transitive"} | ${dependency.vulnerabilities.maxSeverity || "Unknown"} | ${(dependency.vulnerabilities.cveIds || []).join(", ") || "—"} | ${fixCell} |`);
+      const status = vulnerabilities.unknown && !hasDetectedVulnerabilities(vulnerabilities)
+        ? "Unknown"
+        : "Detected";
+      const cves = vulnerabilities.countKnown === true
+        ? (vulnerabilities.cveIds || []).join(", ") || String(vulnerabilities.count)
+        : status;
+      lines.push(`| ${dependency.name} | ${dependency.version || "—"} | ${dependency.isDirect ? "Direct" : "Transitive"} | ${vulnerabilities.maxSeverity || "Unknown"} | ${cves} | ${fixCell} |`);
     }
   }
 
@@ -3627,19 +3783,25 @@ function getDependencyVulnerabilityData(dependency) {
     return null;
   }
 
-  const count = Number(
-    cloudsmithPackage.vulnerability_scan_results_count
-    || cloudsmithPackage.num_vulnerabilities
-    || 0
-  );
-  if (!Number.isFinite(count) || count <= 0) {
+  const state = getPackageVulnerabilityState(cloudsmithPackage);
+  if (state.count === 0 && !state.detected && !state.unknown) {
     return null;
   }
 
   return {
-    count,
+    count: state.count !== null ? state.count : (state.candidateCount || 0),
+    countKnown: state.count !== null,
+    detected: state.detected,
+    unknown: state.unknown,
     maxSeverity: cloudsmithPackage.max_severity || null,
   };
+}
+
+function hasDetectedVulnerabilities(vulnerabilities) {
+  return Boolean(vulnerabilities && (
+    vulnerabilities.detected === true
+    || (vulnerabilities.countKnown !== false && vulnerabilities.count > 0)
+  ));
 }
 
 function getDependencyPolicyData(dependency) {

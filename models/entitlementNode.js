@@ -2,21 +2,39 @@
 // Shows entitlement token info under a repository for debugging access issues.
 
 const vscode = require("vscode");
+const InfoNode = require("./infoNode");
 
 /**
- * Summary header node: "Entitlements: {active} active of {total}"
+ * Summary header node with an authoritative total only for complete collections.
  */
 class EntitlementSummaryNode {
-  constructor(entitlements, context) {
+  constructor(entitlements, context, options = {}) {
     this.context = context;
     this.entitlements = entitlements || [];
     this.activeCount = this.entitlements.filter(e => e.is_active !== false).length;
+    this.complete = options.complete === true;
+    this.totalCount = Number.isSafeInteger(options.totalCount) && options.totalCount >= 0
+      ? options.totalCount
+      : null;
+    this.failureCount = Number.isSafeInteger(options.failureCount) && options.failureCount >= 0
+      ? options.failureCount
+      : 0;
+    this.termination = typeof options.termination === "string" ? options.termination : null;
   }
 
   getTreeItem() {
+    const loadedCount = this.entitlements.length;
+    const label = this.complete
+      ? `Entitlement tokens: ${this.activeCount} active of ${loadedCount}`
+      : `Entitlement tokens: ${this.activeCount} active among ${loadedCount} loaded (partial)`;
+    const tooltip = this.complete
+      ? `${loadedCount} entitlement token${loadedCount === 1 ? "" : "s"} configured`
+      : this.totalCount !== null
+        ? `${loadedCount} of ${this.totalCount} entitlement tokens loaded; the collection is incomplete`
+        : `${loadedCount} entitlement tokens loaded; the configured total could not be verified`;
     return {
-      label: `Entitlement tokens: ${this.activeCount} active of ${this.entitlements.length}`,
-      tooltip: `${this.entitlements.length} entitlement token${this.entitlements.length === 1 ? "" : "s"} configured`,
+      label,
+      tooltip,
       collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
       contextValue: "entitlementSummary",
       iconPath: new vscode.ThemeIcon("key"),
@@ -24,7 +42,18 @@ class EntitlementSummaryNode {
   }
 
   getChildren() {
-    return this.entitlements.map(e => new EntitlementNode(e, this.context));
+    const children = this.entitlements.map(e => new EntitlementNode(e, this.context));
+    if (!this.complete) {
+      children.unshift(new InfoNode(
+        "Entitlement list is incomplete",
+        this.failureCount > 0
+          ? `${this.failureCount} page request${this.failureCount === 1 ? "" : "s"} failed`
+          : "A safe collection limit was reached",
+        "Loaded entitlement tokens remain available, but the configured total is not being claimed.",
+        "warning"
+      ));
+    }
+    return children;
   }
 }
 

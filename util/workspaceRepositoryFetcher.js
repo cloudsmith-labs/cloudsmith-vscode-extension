@@ -1,8 +1,15 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("./cloudsmithAPI");
 const { apiEndpoint } = require("./apiEndpoint");
 const { formatApiError } = require("./errorFormatter");
-const { PaginatedFetch } = require("./paginatedFetch");
+const {
+  PaginatedFetch,
+  collectionFailureResult,
+  replaceCollectionItems,
+} = require("./paginatedFetch");
+const { repositoryCollectionIdentity } = require("./collectionIdentity");
 const {
   captureAccount,
   isAccountCurrent,
@@ -11,30 +18,26 @@ const {
 
 const WORKSPACE_REPOSITORY_PAGE_SIZE = 500;
 const MAX_WORKSPACE_REPOSITORY_PAGES = 20;
-const UNEXPECTED_RESPONSE_FORMAT_ERROR = "Unexpected repository response format";
+const MAX_WORKSPACE_REPOSITORIES = 10000;
 const STALE_ACCOUNT_ERROR = Object.freeze({
   kind: "stale_account",
   message: "The active Cloudsmith account changed while repositories were loading.",
 });
 
 function staleResult() {
-  return {
-    repositories: [],
-    error: STALE_ACCOUNT_ERROR,
-    warning: null,
-    partial: false,
+  return Object.freeze({
+    ...collectionFailureResult(STALE_ACCOUNT_ERROR, { termination: "stale_account" }),
     stale: true,
-  };
+  });
 }
 
 function sortRepositories(repositories) {
   return [...repositories].sort((left, right) => {
     const leftName = typeof left.name === "string" ? left.name : "";
     const rightName = typeof right.name === "string" ? right.name : "";
-
-    return leftName.localeCompare(rightName, undefined, {
-      sensitivity: "base",
-    });
+    const byName = leftName.localeCompare(rightName, undefined, { sensitivity: "base" });
+    if (byName !== 0) return byName;
+    return left.slug.localeCompare(right.slug);
   });
 }
 
@@ -50,143 +53,51 @@ async function fetchWorkspaceRepositories(context, workspace, options = {}) {
   const connectionManager = resolveConnectionManager(context, suppliedManager);
   const account = suppliedAccount || captureAccount(connectionManager);
   if (!account || !isAccountCurrent(connectionManager, account)) return staleResult();
-  const cloudsmithAPI = suppliedApi || new CloudsmithAPI(context);
-  const paginatedFetch = suppliedPagination || new PaginatedFetch(cloudsmithAPI);
+
   let endpoint;
   try {
     endpoint = apiEndpoint(["repos", workspace], { query: { sort: "name" } });
   } catch {
-    return {
-      repositories: [],
-      error: Object.freeze({ kind: "invalid_request", message: "The workspace identifier is invalid." }),
-      warning: null,
-      partial: false,
+    return Object.freeze({
+      ...collectionFailureResult(
+        Object.freeze({ kind: "invalid_request", message: "The workspace identifier is invalid." }),
+        { termination: "invalid_request" }
+      ),
       stale: false,
-    };
+    });
   }
 
+  const cloudsmithAPI = suppliedApi || new CloudsmithAPI(context);
+  const paginatedFetch = suppliedPagination || new PaginatedFetch(cloudsmithAPI);
   return withProgress(
     {
       location: vscode.ProgressLocation.Window,
       title: `Loading repositories for ${workspace}...`,
+      cancellable: true,
     },
-    async progress => {
+    async (_progress, progressToken) => {
       if (!isAccountCurrent(connectionManager, account)) return staleResult();
-      const repositories = [];
-      let page = 1;
-      let knownPageTotal = null;
-
-      while (true) {
-        if (!isAccountCurrent(connectionManager, account)) return staleResult();
-        progress.report({
-          message: knownPageTotal ? `Page ${page} of ${knownPageTotal}` : `Page ${page}`,
-        });
-
-        const result = await paginatedFetch.fetchPage(
-          endpoint,
-          page,
-          WORKSPACE_REPOSITORY_PAGE_SIZE,
-          null,
-          { ...requestOptions, validate: isRepositoryArray }
+      const result = await paginatedFetch.fetchCollection(endpoint, {
+        ...requestOptions,
+        pageSize: WORKSPACE_REPOSITORY_PAGE_SIZE,
+        maxPages: MAX_WORKSPACE_REPOSITORY_PAGES,
+        maxRequests: MAX_WORKSPACE_REPOSITORY_PAGES,
+        maxItems: MAX_WORKSPACE_REPOSITORIES,
+        canonicalIdentity: repository => repositoryCollectionIdentity(workspace, repository),
+        descriptor: `workspace-repositories:${account.activationId}:${account.accountEpoch}:${workspace}`,
+        validate: isRepositoryArray,
+        cancellationToken: requestOptions.cancellationToken || progressToken,
+      });
+      if (!isAccountCurrent(connectionManager, account)) return staleResult();
+      if (result.partial && result.failures.length > 0) {
+        console.warn(
+          `[WorkspaceRepositories] Repository enumeration is incomplete: ${formatApiError(result.failures[0].error)}`
         );
-        if (!isAccountCurrent(connectionManager, account)) return staleResult();
-
-        if (result.error) {
-          if (page === 1) {
-            return {
-              repositories: [],
-              error: result.error,
-              warning: null,
-              partial: false,
-              stale: false,
-            };
-          }
-
-          console.warn(
-            `[WorkspaceRepositories] Failed to load an additional repository page: ${formatApiError(result.error)}`
-          );
-
-          return {
-            repositories: sortRepositories(repositories),
-            error: null,
-            warning: result.error,
-            partial: true,
-            stale: false,
-          };
-        }
-
-        if (!Array.isArray(result.data)) {
-          if (page === 1) {
-            return {
-              repositories: [],
-              error: UNEXPECTED_RESPONSE_FORMAT_ERROR,
-              warning: null,
-              partial: false,
-              stale: false,
-            };
-          }
-
-          console.warn(
-            `[WorkspaceRepositories] Failed to load additional repositories for ${workspace} on page ${page}: ${UNEXPECTED_RESPONSE_FORMAT_ERROR}`
-          );
-
-          return {
-            repositories: sortRepositories(repositories),
-            error: null,
-            warning: UNEXPECTED_RESPONSE_FORMAT_ERROR,
-            partial: true,
-            stale: false,
-          };
-        }
-
-        const pageData = result.data;
-        const currentPage = result.pagination?.page || page;
-        const pageTotal = result.pagination?.pageTotal || currentPage;
-        const actualPageSize = result.pagination?.pageSize || WORKSPACE_REPOSITORY_PAGE_SIZE;
-
-        knownPageTotal = pageTotal;
-        repositories.push(...pageData);
-
-        if (currentPage >= pageTotal) {
-          break;
-        }
-
-        if (pageData.length < actualPageSize) {
-          return {
-            repositories: sortRepositories(repositories),
-            error: null,
-            warning: Object.freeze({
-              kind: "pagination_incomplete",
-              message: "Repository pagination ended before the authoritative final page.",
-            }),
-            partial: true,
-            stale: false,
-          };
-        }
-
-        if (page >= MAX_WORKSPACE_REPOSITORY_PAGES) {
-          return {
-            repositories: sortRepositories(repositories),
-            error: null,
-            warning: Object.freeze({
-              kind: "pagination_limit",
-              message: "Repository enumeration exceeded the safe page limit.",
-            }),
-            partial: true,
-            stale: false,
-          };
-        }
-
-        page += 1;
       }
-
-      return {
-        repositories: sortRepositories(repositories),
-        error: null,
-        warning: null,
-        partial: false,
+      return Object.freeze({
+        ...replaceCollectionItems(result, sortRepositories(result.items)),
         stale: false,
-      };
+      });
     }
   );
 }
@@ -198,15 +109,18 @@ function isRepositoryArray(value) {
     && !Array.isArray(repository)
     && typeof repository.slug === "string"
     && repository.slug.length > 0
+    && repository.slug.length <= 512
+    && repository.slug.trim() === repository.slug
     && typeof repository.name === "string"
     && repository.name.length > 0
+    && repository.name.length <= 512
   ));
 }
 
 module.exports = {
-  UNEXPECTED_RESPONSE_FORMAT_ERROR,
-  STALE_ACCOUNT_ERROR,
+  MAX_WORKSPACE_REPOSITORIES,
   MAX_WORKSPACE_REPOSITORY_PAGES,
+  STALE_ACCOUNT_ERROR,
   WORKSPACE_REPOSITORY_PAGE_SIZE,
   fetchWorkspaceRepositories,
 };

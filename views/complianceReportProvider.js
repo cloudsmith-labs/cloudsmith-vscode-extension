@@ -66,8 +66,24 @@ class ComplianceReportProvider {
       sections.push(renderUncoveredSection(reportData.uncoveredDeps || []));
     }
 
+    const incompleteCount = [
+      summary.unresolved,
+      summary.lookupFailed,
+      summary.lookupIncomplete,
+      summary.rateLimited,
+      summary.checking,
+    ].reduce((total, value) => (
+      Number.isSafeInteger(value) && value > 0 ? total + value : total
+    ), 0);
     const emptyState = sections.length === 0
-      ? `
+      ? incompleteCount > 0
+        ? `
+        <div class="card empty-card">
+          <h2>Compliance status incomplete</h2>
+          <p>${escapeHtml(String(incompleteCount))} dependency lookups were unresolved, failed, incomplete, rate limited, or still in progress. No clean compliance conclusion can be made.</p>
+        </div>
+      `
+        : `
         <div class="card empty-card">
           <h2>No compliance issues detected</h2>
           <p>All scanned dependencies were covered by Cloudsmith and no report sections were triggered for this scan.</p>
@@ -434,19 +450,23 @@ function renderEcosystemSection(ecosystemBreakdown) {
 function renderVulnerabilitySection(vulnerableDeps) {
   const rows = vulnerableDeps.map((dependency) => {
     const severityClass = severityClassName(dependency.maxSeverity);
+    const vulnerabilityEvidence = Number.isSafeInteger(dependency.cveCount)
+      && dependency.cveCount >= 0
+      ? String(dependency.cveCount)
+      : boundedVulnerabilityStatus(dependency.vulnerabilityStatus);
     return `
       <tr>
         <td>${escapeHtml(dependency.name)}</td>
         <td>${escapeHtml(displayValue(dependency.version))}</td>
         <td>${escapeHtml(dependency.isDirect ? "Direct" : "Transitive")}</td>
         <td><span class="badge ${severityClass}">${escapeHtml(dependency.maxSeverity || "Unknown")}</span></td>
-        <td>${escapeHtml(String(dependency.cveCount || 0))}</td>
+        <td>${escapeHtml(vulnerabilityEvidence)}</td>
         <td>${escapeHtml(dependency.hasFixAvailable ? "Yes" : "No")}</td>
       </tr>
     `;
   }).join("");
 
-  return renderSection("Vulnerable Dependencies", `
+  return renderSection("Vulnerability Findings", `
     <table>
       <thead>
         <tr>
@@ -454,13 +474,17 @@ function renderVulnerabilitySection(vulnerableDeps) {
           <th>Version</th>
           <th>Type</th>
           <th>Severity</th>
-          <th>CVE Count</th>
+          <th>CVE Count / Status</th>
           <th>Fix Available</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
     </table>
   `);
+}
+
+function boundedVulnerabilityStatus(value) {
+  return value === "Detected" ? "Detected" : "Unknown";
 }
 
 function renderLicenseSection(restrictiveLicenseDeps) {
@@ -515,7 +539,14 @@ function renderPolicySection(policyViolationDeps) {
 
 function renderUncoveredSection(uncoveredDeps) {
   const reachable = uncoveredDeps.filter((dependency) => dependency.upstreamStatus === "reachable");
-  const notReachable = uncoveredDeps.filter((dependency) => dependency.upstreamStatus !== "reachable");
+  const notReachable = uncoveredDeps.filter((dependency) => (
+    dependency.upstreamStatus === "no_proxy" || dependency.upstreamStatus === "unreachable"
+  ));
+  const unknown = uncoveredDeps.filter((dependency) => (
+    dependency.upstreamStatus !== "reachable"
+    && dependency.upstreamStatus !== "no_proxy"
+    && dependency.upstreamStatus !== "unreachable"
+  ));
   const groups = [];
 
   if (reachable.length > 0) {
@@ -574,6 +605,34 @@ function renderUncoveredSection(uncoveredDeps) {
     `);
   }
 
+  if (unknown.length > 0) {
+    groups.push(`
+      <div class="section-group">
+        <h3>Reachability unknown</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Package</th>
+              <th>Version</th>
+              <th>Ecosystem</th>
+              <th>Detail</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${unknown.map((dependency) => `
+              <tr>
+                <td>${escapeHtml(dependency.name)}</td>
+                <td>${escapeHtml(displayValue(dependency.version))}</td>
+                <td>${escapeHtml(displayValue(dependency.ecosystem))}</td>
+                <td>${escapeHtml(displayValue(dependency.upstreamDetail))}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+    `);
+  }
+
   return renderSection("Uncovered Dependencies", groups.join(""));
 }
 
@@ -602,6 +661,9 @@ function formatSeverityBreakdown(summary) {
   }
   if (summary.lowCount) {
     parts.push(`${summary.lowCount} Low`);
+  }
+  if (summary.vulnUnknownCount) {
+    parts.push(`${summary.vulnUnknownCount} Unknown`);
   }
   return parts.length > 0 ? parts.join(", ") : "No known vulnerabilities";
 }

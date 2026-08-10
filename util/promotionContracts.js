@@ -1,6 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const { encodeApiPathSegment } = require("./apiEndpoint");
+const { getPackagePolicyFlags } = require("./packageVulnerabilities");
 
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
 const DISPLAY_CONTROL_PATTERN = /[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/;
@@ -314,6 +315,7 @@ function isPackageLocationArray(value) {
       scalarString(record.name, MAX_PACKAGE_NAME_LENGTH, "malformed_package_location");
       scalarString(record.version, MAX_PACKAGE_VERSION_LENGTH, "malformed_package_location");
       scalarString(record.format, MAX_PACKAGE_FORMAT_LENGTH, "malformed_package_location");
+      if (!getPackagePolicyFlags(record)) return false;
       const packageIdentifier = pathIdentity(
         record.slug_perm,
         MAX_PACKAGE_IDENTIFIER_LENGTH,

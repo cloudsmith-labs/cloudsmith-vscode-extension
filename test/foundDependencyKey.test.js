@@ -2,19 +2,19 @@ const assert = require("assert");
 const { getFoundDependencyKey } = require("../util/foundDependencyKey");
 
 suite("foundDependencyKey", () => {
-  test("builds a lowercase trimmed key for valid found dependencies", () => {
+  test("uses the exact shared scoped package identity", () => {
     const key = getFoundDependencyKey({
       cloudsmithPackage: {
-        namespace: " Workspace-A ",
-        repository: " Production-NPM ",
+        namespace: "Workspace-A",
+        repository: "Production-NPM",
         slug_perm: "Pkg-1",
       },
     });
 
-    assert.strictEqual(key, "workspace-a:production-npm:pkg-1");
+    assert.strictEqual(key, JSON.stringify(["Workspace-A", "Production-NPM", "Pkg-1"]));
   });
 
-  test("uses slug fallbacks in priority order", () => {
+  test("requires slug_perm and rejects legacy identity fallbacks", () => {
     assert.strictEqual(getFoundDependencyKey({
       cloudsmithPackage: {
         namespace: "workspace-a",
@@ -24,7 +24,7 @@ suite("foundDependencyKey", () => {
         slug: "slug-value",
         identifier: "identifier-value",
       },
-    }), "workspace-a:repo-a:slug-perm");
+    }), JSON.stringify(["workspace-a", "repo-a", "slug-perm"]));
 
     assert.strictEqual(getFoundDependencyKey({
       cloudsmithPackage: {
@@ -34,7 +34,7 @@ suite("foundDependencyKey", () => {
         slug: "slug-value",
         identifier: "identifier-value",
       },
-    }), "workspace-a:repo-a:slug-perm-camel");
+    }), null);
 
     assert.strictEqual(getFoundDependencyKey({
       cloudsmithPackage: {
@@ -43,7 +43,7 @@ suite("foundDependencyKey", () => {
         slug: "slug-value",
         identifier: "identifier-value",
       },
-    }), "workspace-a:repo-a:slug-value");
+    }), null);
 
     assert.strictEqual(getFoundDependencyKey({
       cloudsmithPackage: {
@@ -51,7 +51,7 @@ suite("foundDependencyKey", () => {
         repository: "repo-a",
         identifier: "identifier-value",
       },
-    }), "workspace-a:repo-a:identifier-value");
+    }), null);
   });
 
   test("returns null for null or undefined dependency inputs", () => {
@@ -90,15 +90,22 @@ suite("foundDependencyKey", () => {
     }), null);
   });
 
-  test("keeps the key format workspace repo slug with lowercase trimmed values", () => {
-    const key = getFoundDependencyKey({
+  test("does not merge case-distinct permanent package identities", () => {
+    const upper = getFoundDependencyKey({
       cloudsmithPackage: {
-        namespace: " Workspace-A ",
-        repository: " Repo-A ",
-        slugPerm: " slug-value ",
+        namespace: "Workspace-A",
+        repository: "Repo-A",
+        slug_perm: "Package-A",
+      },
+    });
+    const lower = getFoundDependencyKey({
+      cloudsmithPackage: {
+        namespace: "workspace-a",
+        repository: "repo-a",
+        slug_perm: "package-a",
       },
     });
 
-    assert.strictEqual(key, "workspace-a:repo-a:slug-value");
+    assert.notStrictEqual(upper, lower);
   });
 });

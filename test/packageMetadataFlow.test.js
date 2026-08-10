@@ -329,6 +329,26 @@ suite("Package Metadata Flow Test Suite", () => {
     assert.strictEqual(quarantinedNode.getTreeItem().description, "4.18.2 — Quarantined");
   });
 
+  test("dependency vulnerability indicators never turn conflicting positive evidence into clean state", () => {
+    const cloudsmithPackage = {
+      ...pkg,
+      vulnerability_scan_results_count: 0,
+      has_vulnerabilities: true,
+      max_severity: undefined,
+    };
+    const node = new DependencyHealthNode({
+      name: "artifact",
+      version: "4.18.2",
+      format: "raw",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage,
+    }, cloudsmithPackage, {});
+
+    assert.match(node.getTreeItem().description, /Vulnerabilities detected/);
+    assert.doesNotMatch(node.getTreeItem().description, /undefined/);
+    assert.strictEqual(node.num_vulnerabilities, -1);
+  });
+
   test("dependency health tooltips show no-license text only in the tooltip", () => {
     const node = new DependencyHealthNode({
       name: "artifact",

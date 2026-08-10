@@ -4,8 +4,13 @@ const vscode = require("vscode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiEndpoint } = require("../util/apiEndpoint");
 const { CredentialManager } = require("../util/credentialManager");
-const { PaginatedFetch } = require("../util/paginatedFetch");
+const {
+  PaginatedFetch,
+  collectionFailureResult,
+  replaceCollectionItems,
+} = require("../util/paginatedFetch");
 const { fetchWorkspaceRepositories } = require("../util/workspaceRepositoryFetcher");
+const { packageCollectionIdentity } = require("../util/collectionIdentity");
 const { buildExactPackageQuery, packageMatchesExactIdentity } = require("../util/packageQuery");
 const { captureAccount, isAccountCurrent, resolveConnectionManager } = require("../util/accountOperation");
 const {
@@ -69,7 +74,84 @@ class PromotionProvider {
     return config.get("promotionTags");
   }
 
-  async getPromotionStatus(workspace, name, version, format) {
+  async getPackageLocations(workspace, name, version, format, options = {}) {
+    const account = options.account || captureAccount(this._connectionManager);
+    if (!account || !isAccountCurrent(this._connectionManager, account)) {
+      return packageLocationFailure("stale_account", "The active Cloudsmith account is unavailable.");
+    }
+    let apiKey;
+    try {
+      apiKey = Object.prototype.hasOwnProperty.call(options, "apiKey")
+        ? options.apiKey
+        : await this._credentialManager.getApiKey();
+    } catch {
+      return packageLocationFailure(
+        "authentication_unavailable",
+        "Cloudsmith authentication is unavailable."
+      );
+    }
+    if (!apiKey || !isAccountCurrent(this._connectionManager, account)) {
+      return packageLocationFailure(
+        "authentication_unavailable",
+        "Cloudsmith authentication is unavailable."
+      );
+    }
+    let endpoint;
+    let identity;
+    try {
+      identity = normalizePackageQueryIdentity(workspace, name, version, format);
+      endpoint = apiEndpoint(["packages", identity.workspace]);
+    } catch {
+      const error = Object.freeze({
+        kind: "invalid_request",
+        message: "The exact package location identity was invalid.",
+      });
+      return Object.freeze({
+        ...collectionFailureResult(error, { termination: "invalid_request" }),
+        error,
+      });
+    }
+
+    // Reuse an injected/shared adapter. If lifecycle code replaces the API, avoid retaining
+    // the adapter bound to the superseded transport.
+    const paginatedFetch = this._paginatedFetch.api === undefined
+      || this._paginatedFetch.api === this.api
+      ? this._paginatedFetch
+      : new PaginatedFetch(this.api);
+    const collection = await paginatedFetch.fetchCollection(endpoint, {
+      pageSize: EXACT_PACKAGE_PAGE_SIZE,
+      maxPages: MAX_EXACT_PACKAGE_PAGES,
+      maxRequests: MAX_EXACT_PACKAGE_PAGES,
+      maxItems: MAX_EXACT_PACKAGE_ITEMS,
+      query: buildExactPackageQuery(identity.name, identity.version, identity.format),
+      canonicalIdentity: packageCollectionIdentity,
+      descriptor: `exact-package-locations:${identity.workspace}:${identity.format}`,
+      responseType: "array",
+      validate: isPackageLocationArray,
+      retry: "never",
+      apiKey,
+      signal: options.signal,
+      cancellationToken: options.cancellationToken,
+    });
+    if (!isAccountCurrent(this._connectionManager, account)) {
+      return packageLocationFailure(
+        "stale_account",
+        "The active Cloudsmith account changed while package locations were loading."
+      );
+    }
+    const exactCollection = replaceCollectionItems(
+      collection,
+      collection.items.filter(candidate => packageMatchesExactIdentity(candidate, identity))
+    );
+    const error = exactCollection.items.length === 0
+      && exactCollection.failureCount > 0
+      && exactCollection.pageCount === 0
+      ? exactCollection.failures[0].error
+      : null;
+    return Object.freeze({ ...exactCollection, error });
+  }
+
+  async getPromotionStatus(workspace, name, version, format, options = {}) {
     let pipeline;
     try {
       pipeline = normalizePipeline(this.getPipeline());
@@ -78,38 +160,42 @@ class PromotionProvider {
     }
     if (pipeline.length === 0) return { items: [], error: null };
 
-    let endpoint;
-    let identity;
-    try {
-      identity = normalizePackageQueryIdentity(workspace, name, version, format);
-      const query = buildExactPackageQuery(identity.name, identity.version, identity.format);
-      endpoint = apiEndpoint(["packages", identity.workspace], { query: { query, page_size: 100 } });
-    } catch (error) {
-      return { items: [], error };
-    }
-    const results = await this.api.get(endpoint, {
-      responseType: "array",
-      validate: isPackageLocationArray,
-      retry: "never",
-    });
-    if (!results.ok) return { items: [], error: results.error };
+    const collection = await this.getPackageLocations(
+      workspace,
+      name,
+      version,
+      format,
+      options
+    );
+    if (collection.error) return collection;
 
     const repoMap = new Map();
-    for (const pkg of results.data.filter(candidate => (
-      packageMatchesExactIdentity(candidate, identity)
-    ))) {
-      repoMap.set(pkg.repository, pkg);
+    for (const pkg of collection.items) {
+      const matches = repoMap.get(pkg.repository) || [];
+      matches.push(pkg);
+      repoMap.set(pkg.repository, matches);
     }
     return {
+      ...collection,
       items: pipeline.map(repo => {
-        const pkg = repoMap.get(repo) || null;
+        const matches = repoMap.get(repo) || [];
+        const pkg = matches.length === 1 ? matches[0] : null;
+        const ambiguous = matches.length > 1;
+        const absentProven = collection.complete && matches.length === 0;
         return {
           repo,
-          found: Boolean(pkg),
-          status: pkg ? (pkg.status_str || "Unknown") : "Not present",
+          found: pkg ? true : (absentProven ? false : null),
+          status: pkg
+            ? (pkg.status_str || "Unknown")
+            : ambiguous
+              ? "Unknown — multiple exact package locations were returned"
+              : absentProven
+                ? "Not present"
+                : "Unknown — package location search is incomplete",
           quarantined: pkg ? pkg.status_str === "Quarantined" : false,
           policyViolated: pkg ? pkg.policy_violated === true : false,
           pkg,
+          ambiguous,
         };
       }),
       error: null,
@@ -839,7 +925,7 @@ class PromotionProvider {
     }
   }
 
-  async _findTargetPackages(source, target, apiKey, cancellationToken, account, options) {
+  async _findTargetPackages(source, target, apiKey, cancellationToken, account, options = {}) {
     let endpoint;
     let query;
     try {
@@ -849,41 +935,38 @@ class PromotionProvider {
       return { ok: false, complete: false, packages: [], errorCode: "invalid_package_query" };
     }
     const packages = [];
-    let itemCount = 0;
-    for (let page = 1; page <= MAX_EXACT_PACKAGE_PAGES; page += 1) {
-      if (!this._isAccountCurrent(account)) {
-        return { ok: false, complete: false, packages: [], errorCode: "account_changed" };
-      }
-      let result;
+    const knownIdentities = new Set();
+    let resume = null;
+    while (true) {
+      let collection;
       try {
-        result = await this._paginatedFetch.fetchPage(
-          endpoint,
-          page,
-          EXACT_PACKAGE_PAGE_SIZE,
+        collection = await this._paginatedFetch.fetchCollection(endpoint, {
+          pageSize: EXACT_PACKAGE_PAGE_SIZE,
+          maxPages: MAX_EXACT_PACKAGE_PAGES,
+          maxRequests: MAX_EXACT_PACKAGE_PAGES,
+          maxItems: MAX_EXACT_PACKAGE_ITEMS,
+          pageBatchLimit: 1,
           query,
-          {
-            apiKey,
-            validate: isPackageLocationArray,
-            retry: "never",
-            cancellationToken,
-          }
-        );
+          descriptor: `promotion-target:${target.workspace}:${target.repository}:${source.format}`,
+          canonicalIdentity: packageCollectionIdentity,
+          validate: value => isPackageLocationArray(value) && value.every(candidate => (
+            candidate.namespace === target.workspace
+            && candidate.repository === target.repository
+          )),
+          retry: "never",
+          apiKey,
+          cancellationToken,
+          resume,
+          ...(resume ? { knownIdentities } : {}),
+        });
       } catch {
         return { ok: false, complete: false, packages: [], errorCode: "target_state_unverified" };
       }
-      if (result.error) {
-        return {
-          ok: false,
-          complete: false,
-          packages: [],
-          errorCode: readErrorCode(result.error, "target_state"),
-        };
+      if (!this._isAccountCurrent(account)) {
+        return { ok: false, complete: false, packages: [], errorCode: "account_changed" };
       }
-      itemCount += result.data.length;
-      if (itemCount > MAX_EXACT_PACKAGE_ITEMS) {
-        return { ok: false, complete: false, packages: [], errorCode: "target_state_unknown" };
-      }
-      for (const candidate of result.data) {
+      for (const candidate of collection.items) {
+        knownIdentities.add(packageCollectionIdentity(candidate));
         if (!packageMatchesExactIdentity(candidate, source)) continue;
         try {
           packages.push(normalizeTargetPackage(candidate, source, target));
@@ -895,21 +978,29 @@ class PromotionProvider {
             errorCode: errorCode(error, "malformed_target_package"),
           };
         }
-        if (options.stopOnPresence) {
-          return { ok: true, complete: true, packages: Object.freeze(packages) };
-        }
-        if (packages.length > 1) {
-          return { ok: true, complete: true, packages: Object.freeze(packages) };
-        }
       }
-      if (page >= result.pagination.pageTotal) {
+      if ((options.stopOnPresence && packages.length > 0) || packages.length > 1) {
         return { ok: true, complete: true, packages: Object.freeze(packages) };
       }
-      if (result.pagination.pageTotal > MAX_EXACT_PACKAGE_PAGES) {
+      if (collection.complete) {
+        return { ok: true, complete: true, packages: Object.freeze(packages) };
+      }
+      if (collection.termination !== "page_batch" || !collection.continuation) {
+        const failure = collection.failures[0]?.error;
+        return {
+          ok: false,
+          complete: false,
+          packages: [],
+          errorCode: failure
+            ? readErrorCode(failure, "target_state")
+            : "target_state_unknown",
+        };
+      }
+      resume = collection.continuation;
+      if (knownIdentities.size !== resume.cumulative.itemCount) {
         return { ok: false, complete: false, packages: [], errorCode: "target_state_unknown" };
       }
     }
-    return { ok: false, complete: false, packages: [], errorCode: "target_state_unknown" };
   }
 
   async _loadPresenceHints(source, apiKey, account) {
@@ -921,28 +1012,31 @@ class PromotionProvider {
     } catch {
       return null;
     }
-    const repositories = new Set();
-    for (let page = 1; page <= MAX_EXACT_PACKAGE_PAGES; page += 1) {
-      if (!this._isAccountCurrent(account)) return null;
-      let result;
-      try {
-        result = await this._paginatedFetch.fetchPage(
-          endpoint,
-          page,
-          EXACT_PACKAGE_PAGE_SIZE,
-          query,
-          { apiKey, validate: isPackageLocationArray, retry: "never" }
-        );
-      } catch {
-        return null;
-      }
-      if (result.error || result.pagination.pageTotal > MAX_EXACT_PACKAGE_PAGES) return null;
-      for (const pkg of result.data) {
-        if (packageMatchesExactIdentity(pkg, source)) repositories.add(pkg.repository);
-      }
-      if (page >= result.pagination.pageTotal) return repositories;
+    let collection;
+    try {
+      collection = await this._paginatedFetch.fetchCollection(endpoint, {
+        pageSize: EXACT_PACKAGE_PAGE_SIZE,
+        maxPages: MAX_EXACT_PACKAGE_PAGES,
+        maxRequests: MAX_EXACT_PACKAGE_PAGES,
+        maxItems: MAX_EXACT_PACKAGE_ITEMS,
+        query,
+        descriptor: `promotion-presence-hints:${source.workspace}:${source.format}`,
+        canonicalIdentity: packageCollectionIdentity,
+        validate: value => isPackageLocationArray(value) && value.every(candidate => (
+          candidate.namespace === source.workspace
+        )),
+        retry: "never",
+        apiKey,
+      });
+    } catch {
+      return null;
     }
-    return null;
+    if (!this._isAccountCurrent(account) || !collection.complete) return null;
+    const repositories = new Set();
+    for (const pkg of collection.items) {
+      if (packageMatchesExactIdentity(pkg, source)) repositories.add(pkg.repository);
+    }
+    return repositories;
   }
 
   async _loadTargetCandidates(source, pipeline, account, apiKey) {
@@ -961,12 +1055,12 @@ class PromotionProvider {
       return { ok: false, errorCode: "repository_list_incomplete" };
     }
     if (result.stale) return { ok: false, errorCode: "account_changed" };
-    if (result.error || result.warning || result.partial) {
+    if (result.complete !== true || result.failureCount > 0 || !Array.isArray(result.items)) {
       return { ok: false, errorCode: "repository_list_incomplete" };
     }
     const repositories = new Map();
     try {
-      for (const record of result.repositories) {
+      for (const record of result.items) {
         const target = normalizeTargetRepository(record, source.workspace, record.slug);
         if (repositories.has(target.repository)) {
           return { ok: false, errorCode: "repository_list_incomplete" };
@@ -1310,6 +1404,14 @@ function failureOutcome(code, options = {}) {
     overall: "failed",
     errorCode: code,
     remoteState: "unchanged",
+  });
+}
+
+function packageLocationFailure(kind, message) {
+  const error = Object.freeze({ kind, message });
+  return Object.freeze({
+    ...collectionFailureResult(error, { termination: kind }),
+    error,
   });
 }
 

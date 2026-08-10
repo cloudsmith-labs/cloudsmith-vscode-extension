@@ -93,6 +93,102 @@ suite("TerraformExporter Test Suite", () => {
     assert.ok(output.includes('upstream_url  = "https://pypi.org"'));
   });
 
+  test("omits unsafe upstream URLs without exposing secrets or dropping safe siblings", () => {
+    const unsafeUrls = [
+      "https://user:pass@example.com/private",
+      "https://example.com/private?token=query-secret",
+      "https://example.com/private#fragment-secret",
+      "https://example.com/private?",
+      "https://example.com/private#",
+      "https://example.com/private\\normalized-secret",
+      "https:example.com/missing-authority",
+      "https:///example.com/extra-authority-slash",
+      "https:////example.com/many-authority-slashes",
+      "https://example.com/%2e%2e/dot-secret",
+      "file:///tmp/path-secret",
+      "not-a-url-secret",
+    ];
+    const output = generateTerraformConfig({
+      repo: { name: "Proxy Repo", slug: "proxy-repo" },
+      workspace,
+      upstreams: [
+        {
+          name: "Safe mirror",
+          format: "python",
+          upstream_url: "https://safe.example:8443/simple/%3Fencoded",
+        },
+        ...unsafeUrls.map((upstream_url, index) => ({
+          name: `Unsafe ${index}`,
+          format: "npm",
+          upstream_url,
+        })),
+        { name: "Missing URL", format: "ruby" },
+      ],
+      exportedAt,
+    });
+
+    assert.ok(output.includes('upstream_url  = "https://safe.example:8443/simple/%3Fencoded"'));
+    assert.ok(output.includes("13 upstream resources were omitted"));
+    assert.ok(!output.includes("Missing URL"));
+    for (const secret of [
+      "user:pass",
+      "private?",
+      "fragment-secret",
+      "normalized-secret",
+      "missing-authority",
+      "extra-authority-slash",
+      "many-authority-slashes",
+      "dot-secret",
+      "path-secret",
+      "not-a-url-secret",
+    ]) {
+      assert.ok(!output.includes(secret), secret);
+    }
+  });
+
+  test("escapes Terraform template introducers in URLs and other string fields", () => {
+    const output = generateTerraformConfig({
+      repo: {
+        name: "Template Repo",
+        slug: "template-repo",
+        description: 'description %{ if file("/private") }',
+      },
+      workspace,
+      upstreams: [{
+        name: "Template mirror",
+        format: "python",
+        upstream_url: 'https://example.com/${file("/etc/passwd")}',
+      }],
+      exportedAt,
+    });
+
+    assert.ok(output.includes('$${file(\\"/etc/passwd\\")}'));
+    assert.ok(output.includes('description %%{ if file(\\"/private\\") }'));
+    assert.ok(!output.includes('https://example.com/${file'));
+    assert.ok(!output.includes('description %{ if'));
+  });
+
+  test("keeps dynamic Terraform header values on one bounded comment line", () => {
+    const output = generateTerraformConfig({
+      repo: {
+        name: 'safe\nresource "evil" "x" {}\u202e',
+        slug: "safe-repo",
+      },
+      workspace: "acme\nmodule evil {}",
+      exportedAt: "now\u2028resource evil {}",
+    });
+
+    assert.ok(output.includes(
+      '# Terraform configuration for repository "safe resource "evil" "x" {}" in workspace "acme module evil {}"'
+    ));
+    assert.ok(output.includes("# Exported at now resource evil {}"));
+    assert.ok(!output.includes('\nresource "evil"'));
+    assert.ok(!output.includes("\nmodule evil"));
+    const header = output.split("\n").slice(0, 2).join("\n");
+    assert.ok(!header.includes("\u202e"));
+    assert.ok(!header.includes("\u2028"));
+  });
+
   test("upstream auth exports variable placeholders instead of secrets", () => {
     const output = generateTerraformConfig({
       repo: {
@@ -235,5 +331,23 @@ suite("TerraformExporter Test Suite", () => {
 
     assert.ok(output.includes("# Could not load upstream data. Add upstream resources manually."));
     assert.ok(!output.includes("cloudsmith_repository_upstream"));
+  });
+
+  test("partial upstream export keeps verified resources and marks the file incomplete", () => {
+    const output = generateTerraformConfig({
+      repo: { name: "Partial Repo", slug: "partial-repo" },
+      workspace,
+      upstreams: [{
+        name: "npm",
+        format: "npm",
+        upstream_url: "https://registry.npmjs.org/",
+      }],
+      upstreamLoadPartial: true,
+      upstreamFailedFormats: ["python"],
+      exportedAt,
+    });
+
+    assert.match(output, /Upstream data is incomplete for: python/);
+    assert.ok(output.includes('resource "cloudsmith_repository_upstream"'));
   });
 });

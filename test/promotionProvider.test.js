@@ -1,5 +1,6 @@
 const assert = require("assert");
 const { PromotionProvider } = require("../views/promotionProvider");
+const { PaginatedFetch } = require("../util/paginatedFetch");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
 suite("Safe package promotion workflow", () => {
@@ -251,13 +252,15 @@ suite("Safe package promotion workflow", () => {
       },
     };
     const repositoryResult = options.repositoryResult || {
-      repositories: [
+      items: [
         { name: "Source", slug: "source", namespace: "workspace" },
         { name: "Target", slug: "target", namespace: "workspace" },
       ],
-      error: null,
-      warning: null,
+      complete: true,
+      incomplete: false,
       partial: false,
+      failureCount: 0,
+      failures: [],
       stale: false,
     };
     const provider = new PromotionProvider({}, {
@@ -409,7 +412,12 @@ suite("Safe package promotion workflow", () => {
   test("missing target, permission failure, partial repository enumeration, and malformed pagination fail closed", async () => {
     const cases = [
       { targetRepositoryFailure: true },
-      { repositoryResult: { repositories: [], error: null, warning: {}, partial: true, stale: false } },
+      {
+        repositoryResult: {
+          items: [], complete: false, incomplete: true, partial: false,
+          failureCount: 1, failures: [{ page: 2, error: { kind: "network_error" } }], stale: false,
+        },
+      },
       { malformedPaginationAt: 1 },
       { targetPageTotalAt: 1 },
     ];
@@ -827,15 +835,155 @@ suite("Safe package promotion workflow", () => {
     filtered.provider.api = {
       async get(_endpoint, requestOptions) {
         const data = [
-          filtered.sourceRecord({ format: "python" }),
+          filtered.sourceRecord({ format: "python", slug_perm: "python-package-id" }),
           filtered.sourceRecord({ status_str: "Completed" }),
         ];
         assert.strictEqual(requestOptions.validate(data), true);
-        return apiSuccess(data);
+        return page(data);
       },
     };
     const status = await filtered.provider.getPromotionStatus("workspace", "artifact", "1.0.0", "npm");
     assert.strictEqual(status.items[0].found, true);
     assert.strictEqual(status.items[0].status, "Completed");
+  });
+
+  test("promotion status discovers later-page locations and keeps positives on partial failure", async () => {
+    const later = createHarness({ pipeline: ["target"] });
+    const firstPage = Array.from({ length: 100 }, (_, index) => later.sourceRecord({
+      repository: "source",
+      slug_perm: `python-package-${index}`,
+      format: "python",
+    }));
+    later.provider.api = {
+      async get(endpoint) {
+        const pageNumber = Number(new URL(endpoint, "https://example.invalid").searchParams.get("page"));
+        return pageNumber === 1
+          ? page(firstPage, { page: 1, pageTotal: 2, count: 101 })
+          : page([later.targetRecord()], { page: 2, pageTotal: 2, count: 101 });
+      },
+    };
+    const laterStatus = await later.provider.getPromotionStatus(
+      "workspace", "artifact", "1.0.0", "npm"
+    );
+    assert.strictEqual(laterStatus.complete, true);
+    assert.strictEqual(laterStatus.items[0].found, true);
+
+    const partial = createHarness({ pipeline: ["target", "uninspected"] });
+    partial.provider.api = {
+      async get(endpoint) {
+        const pageNumber = Number(new URL(endpoint, "https://example.invalid").searchParams.get("page"));
+        if (pageNumber === 2) return apiFailure("rate_limited", { status: 429 });
+        return page([
+          partial.targetRecord(),
+          ...Array.from({ length: 99 }, (_, index) => partial.sourceRecord({
+            slug_perm: `other-${index}`,
+            format: "python",
+          })),
+        ], { page: 1, pageTotal: 2, count: 101 });
+      },
+    };
+    const partialStatus = await partial.provider.getPromotionStatus(
+      "workspace", "artifact", "1.0.0", "npm"
+    );
+    assert.strictEqual(partialStatus.partial, true);
+    assert.strictEqual(partialStatus.items[0].found, true);
+    assert.strictEqual(partialStatus.items[1].found, null);
+    assert.match(partialStatus.items[1].status, /incomplete/);
+  });
+
+  test("promotion target absence fails closed when pagination metadata drifts", async () => {
+    const harness = createHarness();
+    const pages = [];
+    const api = {
+      async get(endpoint) {
+        const pageNumber = Number(new URL(endpoint, "https://example.invalid").searchParams.get("page"));
+        pages.push(pageNumber);
+        const records = Array.from({ length: 100 }, (_value, index) => harness.targetRecord({
+          name: `other-${pageNumber}-${index}`,
+          format: "python",
+          slug_perm: `other-${pageNumber}-${index}`,
+        }));
+        return page(records, {
+          page: pageNumber,
+          pageTotal: pageNumber === 1 ? 2 : 3,
+          count: pageNumber === 1 ? 200 : 300,
+        });
+      },
+    };
+    harness.provider.api = api;
+    harness.provider._paginatedFetch = new PaginatedFetch(api);
+
+    const result = await harness.provider._findTargetPackages(
+      {
+        workspace: "workspace",
+        repository: "source",
+        packageIdentifier: "source-package-id",
+        name: "artifact",
+        version: "1.0.0",
+        format: "npm",
+      },
+      { workspace: "workspace", repository: "target" },
+      "credential-sentinel",
+      null,
+      harness.manager.getState(),
+      { stopOnPresence: false }
+    );
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.complete, false);
+    assert.strictEqual(result.errorCode, "target_state_malformed");
+    assert.deepStrictEqual(pages, [1, 2]);
+  });
+
+  test("promotion status treats multiple exact locations in one repository as ambiguous", async () => {
+    const harness = createHarness({ pipeline: ["target"] });
+    harness.provider.api = {
+      async get() {
+        return page([
+          harness.targetRecord(),
+          harness.targetRecord({ slug_perm: "duplicate-location" }),
+        ]);
+      },
+    };
+
+    const status = await harness.provider.getPromotionStatus(
+      "workspace", "artifact", "1.0.0", "npm"
+    );
+    assert.strictEqual(status.complete, true);
+    assert.strictEqual(status.items[0].found, null);
+    assert.strictEqual(status.items[0].ambiguous, true);
+    assert.match(status.items[0].status, /multiple exact package locations/);
+  });
+
+  test("bounded exact package locations remain available when no pipeline is configured", async () => {
+    const harness = createHarness({ pipeline: [] });
+    harness.provider.api = {
+      async get() {
+        return page([harness.targetRecord()]);
+      },
+    };
+
+    const locations = await harness.provider.getPackageLocations(
+      "workspace", "artifact", "1.0.0", "npm"
+    );
+    assert.strictEqual(locations.complete, true);
+    assert.deepStrictEqual(locations.items.map(item => item.repository), ["target"]);
+  });
+
+  test("exact package locations discard an old-account completion", async () => {
+    const harness = createHarness({ pipeline: [] });
+    harness.provider.api = {
+      async get() {
+        harness.manager.changeAccount();
+        return page([harness.targetRecord()]);
+      },
+    };
+
+    const locations = await harness.provider.getPackageLocations(
+      "workspace", "artifact", "1.0.0", "npm"
+    );
+    assert.strictEqual(locations.complete, false);
+    assert.deepStrictEqual(locations.items, []);
+    assert.strictEqual(locations.error.kind, "stale_account");
   });
 });

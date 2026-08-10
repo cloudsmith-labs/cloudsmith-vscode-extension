@@ -3,6 +3,7 @@ const vscode = require("vscode");
 const { LicenseClassifier } = require("../util/licenseClassifier");
 const { getFormatIconPath } = require("../util/formatIcons");
 const { canonicalFormat } = require("../util/packageNameNormalizer");
+const { getPackageVulnerabilityState } = require("../util/packageVulnerabilities");
 
 class DependencyHealthNode {
   constructor(dep, cloudsmithMatchOrContext, maybeContext, maybeOptions) {
@@ -83,7 +84,10 @@ class DependencyHealthNode {
       this.tags_raw = this.cloudsmithMatch.tags || {};
       this.cdn_url = this.cloudsmithMatch.cdn_url || null;
       this.filename = this.cloudsmithMatch.filename || null;
-      this.num_vulnerabilities = this.cloudsmithMatch.num_vulnerabilities || 0;
+      const vulnerabilityState = getPackageVulnerabilityState(this.cloudsmithMatch);
+      this.num_vulnerabilities = vulnerabilityState.count !== null
+        ? vulnerabilityState.count
+        : vulnerabilityState.detected ? -1 : null;
       this.max_severity = this.cloudsmithMatch.max_severity || null;
       this.status_reason = this.cloudsmithMatch.status_reason || null;
     }
@@ -140,6 +144,7 @@ class DependencyHealthNode {
 
     if (
       this._hasVulnerabilities()
+      || this._hasVulnerabilityUncertainty()
       || this._hasPolicyViolation()
       || this._hasRestrictiveLicense()
       || this._hasWeakCopyleftLicense()
@@ -151,17 +156,25 @@ class DependencyHealthNode {
   }
 
   _hasVulnerabilities() {
-    return Boolean(this._getVulnerabilityData() && this._getVulnerabilityData().count > 0);
+    const vulnerabilities = this._getVulnerabilityData();
+    return Boolean(vulnerabilities && (
+      vulnerabilities.detected === true
+      || (vulnerabilities.countKnown !== false && vulnerabilities.count > 0)
+    ));
+  }
+
+  _hasVulnerabilityUncertainty() {
+    return this._getVulnerabilityData()?.unknown === true;
   }
 
   _hasCriticalVulnerability() {
     const vulnerabilities = this._getVulnerabilityData();
-    return Boolean(vulnerabilities && vulnerabilities.count > 0 && vulnerabilities.maxSeverity === "Critical");
+    return Boolean(this._hasVulnerabilities() && vulnerabilities.maxSeverity === "Critical");
   }
 
   _hasHighVulnerability() {
     const vulnerabilities = this._getVulnerabilityData();
-    return Boolean(vulnerabilities && vulnerabilities.count > 0 && vulnerabilities.maxSeverity === "High");
+    return Boolean(this._hasVulnerabilities() && vulnerabilities.maxSeverity === "High");
   }
 
   _hasMediumOrLowVulnerability() {
@@ -265,7 +278,12 @@ class DependencyHealthNode {
       return new vscode.ThemeIcon("warning", new vscode.ThemeColor("charts.orange"));
     }
 
-    if (this._hasMediumOrLowVulnerability() || this._hasWeakCopyleftLicense() || this._hasPolicyViolation()) {
+    if (
+      this._hasMediumOrLowVulnerability()
+      || this._hasVulnerabilityUncertainty()
+      || this._hasWeakCopyleftLicense()
+      || this._hasPolicyViolation()
+    ) {
       return new vscode.ThemeIcon("warning", new vscode.ThemeColor("charts.yellow"));
     }
 
@@ -278,9 +296,13 @@ class DependencyHealthNode {
 
   _buildVulnerabilityDescription() {
     const vulnerabilities = this._getVulnerabilityData();
-    if (!vulnerabilities || vulnerabilities.count === 0) {
+    if (!vulnerabilities) {
       return null;
     }
+    if (vulnerabilities.unknown && !this._hasVulnerabilities()) {
+      return "Vulnerability status unknown";
+    }
+    if (!this._hasVulnerabilities()) return null;
 
     if (
       vulnerabilities.detailsLoaded
@@ -292,9 +314,16 @@ class DependencyHealthNode {
       return `Vulnerabilities found (${maxCount} ${vulnerabilities.maxSeverity})`;
     }
 
-    const summary = vulnerabilities.maxSeverity
-      ? `${vulnerabilities.count} ${vulnerabilities.maxSeverity}`
-      : String(vulnerabilities.count);
+    if (vulnerabilities.countKnown === false) {
+      const severity = vulnerabilities.maxSeverity && vulnerabilities.maxSeverity !== "Unknown"
+        ? ` (${vulnerabilities.maxSeverity})`
+        : "";
+      return `Vulnerabilities detected${severity}`;
+    }
+    const countLabel = String(vulnerabilities.count);
+    const summary = vulnerabilities.maxSeverity && vulnerabilities.maxSeverity !== "Unknown"
+      ? `${countLabel} ${vulnerabilities.maxSeverity}`
+      : countLabel;
     return `Vulnerabilities found (${summary})`;
   }
 
@@ -386,16 +415,19 @@ class DependencyHealthNode {
 
       const vulnerabilities = this._getVulnerabilityData();
       if (vulnerabilities) {
-        if (vulnerabilities && vulnerabilities.count > 0) {
+        if (this._hasVulnerabilities()) {
           const severitySummary = Object.entries(vulnerabilities.severityCounts || {})
             .map(([severity, count]) => `${count} ${severity}`)
             .join(", ");
           const suffix = severitySummary
             ? ` (${severitySummary})`
-            : vulnerabilities.maxSeverity
+            : vulnerabilities.maxSeverity && vulnerabilities.maxSeverity !== "Unknown"
               ? ` (${vulnerabilities.maxSeverity})`
               : "";
-          lines.push(`Vulnerabilities: ${vulnerabilities.count}${suffix}`);
+          const countLabel = vulnerabilities.countKnown === false
+            ? "Detected"
+            : String(vulnerabilities.count);
+          lines.push(`Vulnerabilities: ${countLabel}${suffix}`);
 
           if (Array.isArray(vulnerabilities.entries)) {
             for (const entry of vulnerabilities.entries) {
@@ -403,6 +435,8 @@ class DependencyHealthNode {
               lines.push(`  ${entry.cveId} (${entry.severity}) — ${fixText}`);
             }
           }
+        } else if (vulnerabilities.unknown) {
+          lines.push("Vulnerabilities: Unknown");
         } else {
           lines.push("Vulnerabilities: none known");
         }
@@ -462,13 +496,13 @@ class DependencyHealthNode {
     }
 
     const vulnerabilities = this._getVulnerabilityData();
-    if (vulnerabilities && vulnerabilities.count > 0) {
+    if (vulnerabilities && this._hasVulnerabilities()) {
       const VulnerabilitySummaryNode = require("./vulnerabilitySummaryNode");
       children.push(new VulnerabilitySummaryNode({
         namespace: this.cloudsmithMatch.namespace,
         repository: this.cloudsmithMatch.repository,
         slug_perm: this.cloudsmithMatch.slug_perm,
-        num_vulnerabilities: vulnerabilities.count,
+        num_vulnerabilities: vulnerabilities.countKnown === false ? -1 : vulnerabilities.count,
         max_severity: vulnerabilities.maxSeverity,
       }, this.context, { connectionManager: this.options.connectionManager }));
     }
@@ -500,12 +534,8 @@ class DependencyHealthNode {
       return null;
     }
 
-    const count = Number(
-      this.cloudsmithMatch.vulnerability_scan_results_count
-      || this.cloudsmithMatch.num_vulnerabilities
-      || 0
-    );
-    if (!Number.isFinite(count) || count <= 0) {
+    const state = getPackageVulnerabilityState(this.cloudsmithMatch);
+    if (state.count === 0 && !state.detected && !state.unknown) {
       return {
         count: 0,
         maxSeverity: null,
@@ -517,10 +547,14 @@ class DependencyHealthNode {
       };
     }
 
+    const count = state.count !== null ? state.count : (state.candidateCount || 0);
     const maxSeverity = this.cloudsmithMatch.max_severity || null;
     const severityCounts = maxSeverity ? { [maxSeverity]: 1 } : {};
     return {
       count,
+      countKnown: state.count !== null,
+      detected: state.detected,
+      unknown: state.unknown,
       maxSeverity,
       cveIds: [],
       hasFixAvailable: false,

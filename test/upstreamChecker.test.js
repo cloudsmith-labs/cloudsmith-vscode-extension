@@ -122,7 +122,7 @@ suite("UpstreamChecker repository upstream cache", () => {
       successfulFormats: 1,
       groupedUpstreams: {
         python: [
-          { name: "PyPI" },
+          { name: "PyPI", _format: "python", format: "python" },
         ],
       },
       ...overrides,
@@ -149,7 +149,8 @@ suite("UpstreamChecker repository upstream cache", () => {
           name: "PyPI",
           upstream_url: "https://user:path-secret@example.com/path-secret?token=query-secret",
           api_key: "never-persist",
-          mode: { nested_secret: "nested-secret" },
+          mode: "proxy_only",
+          opaque_metadata: { nested_secret: "nested-secret" },
         },
         { name: "Internal mirror", upstream_url: "https://mirror.example/python" },
         { name: "Legacy", upstream_url: "https://legacy.example/python" },
@@ -193,6 +194,25 @@ suite("UpstreamChecker repository upstream cache", () => {
     assert.strictEqual(secondState.groupedUpstreams.get("python")[0].name, "Internal mirror");
   });
 
+  test("repository workflow inspection requests only the relevant formats", async () => {
+    formatResponses = {
+      npm: [{ name: "npmjs", upstream_url: "https://registry.npmjs.org/" }],
+      python: [{ name: "PyPI", upstream_url: "https://pypi.org/" }],
+    };
+    const checker = createChecker({});
+
+    const state = await checker.getRepositoryUpstreamStateForFormats(
+      "workspace-a",
+      "repo-a",
+      ["npm"]
+    );
+
+    assert.strictEqual(requestCount, 1);
+    assert.strictEqual(state.complete, true);
+    assert.deepStrictEqual([...state.groupedUpstreams.keys()], ["npm"]);
+    assert.deepStrictEqual(state.upstreams.map(upstream => upstream.name), ["npmjs"]);
+  });
+
   test("does not cache partial upstream data when any format fails", async () => {
     formatResponses = {
       python: [
@@ -226,6 +246,23 @@ suite("UpstreamChecker repository upstream cache", () => {
     assert.strictEqual(state.active, 0);
     assert.strictEqual(state.total, 0);
     assert.ok(state.failedFormats.includes("python"));
+    assert.strictEqual(store.size, 0);
+  });
+
+  test("rejects malformed active fields instead of treating them as active upstreams", async () => {
+    formatResponses = { python: [{ name: "PyPI", is_active: "false" }] };
+
+    const checker = createChecker(context);
+    const state = await checker.getRepositoryUpstreamStateForFormats(
+      "workspace-a",
+      "repo-a",
+      ["python"]
+    );
+
+    assert.strictEqual(state.complete, false);
+    assert.strictEqual(state.active, 0);
+    assert.strictEqual(state.total, 0);
+    assert.deepStrictEqual(state.failedFormats, ["python"]);
     assert.strictEqual(store.size, 0);
   });
 
@@ -278,15 +315,25 @@ suite("UpstreamChecker repository upstream cache", () => {
   test("accepts a valid cached repository upstream state", () => {
     const checker = createChecker(context);
     const cacheKey = checker._getRepositoryUpstreamCacheKey("workspace-a", "repo-a");
-    store.set(cacheKey, createCachedEntry({ successfulFormats: 7 }));
+    store.set(cacheKey, createCachedEntry({ successfulFormats: SUPPORTED_UPSTREAM_FORMATS.length }));
 
     const cachedState = checker._getCachedRepositoryUpstreamState("workspace-a", "repo-a");
 
     assert.ok(cachedState);
-    assert.strictEqual(cachedState.successfulFormats, 7);
+    assert.strictEqual(cachedState.successfulFormats, SUPPORTED_UPSTREAM_FORMATS.length);
     assert.strictEqual(cachedState.total, 1);
     assert.strictEqual(cachedState.active, 1);
     assert.strictEqual(cachedState.groupedUpstreams.get("python").length, 1);
+  });
+
+  test("evicts repository cache entries that do not prove every supported format was inspected", async () => {
+    const checker = createChecker(context);
+    const cacheKey = checker._getRepositoryUpstreamCacheKey("workspace-a", "repo-a");
+    store.set(cacheKey, createCachedEntry({ successfulFormats: SUPPORTED_UPSTREAM_FORMATS.length - 1 }));
+
+    assert.strictEqual(checker._getCachedRepositoryUpstreamState("workspace-a", "repo-a"), null);
+    await Promise.resolve();
+    assert.strictEqual(store.has(cacheKey), false);
   });
 
   test("returns computed upstream state when repository cache persistence fails", async () => {
@@ -469,7 +516,8 @@ suite("UpstreamChecker shared helper and format handling", () => {
         {
           name: "PyPI",
           upstream_url: "https://user:url-secret@example.com/url-secret?token=url-secret",
-          mode: { token: "nested-secret" },
+          mode: "proxy_only",
+          opaque_metadata: { token: "nested-secret" },
         },
         { name: "Internal mirror", upstream_url: "https://mirror.example/python" },
         { name: "Legacy", upstream_url: "https://legacy.example/python" },
@@ -653,6 +701,93 @@ suite("UpstreamChecker shared helper and format handling", () => {
     assert.strictEqual(updates[0].value, undefined);
   });
 
+  test("evicts flat cache entries whose completion count does not match the requested formats", async () => {
+    const { context, store, updates } = createContext();
+    const { checker, getRequestCount } = createResponseAwareChecker(context, {});
+    const cacheKey = getUpstreamCacheKey("workspace-a", "repo-a", ["python", "npm"]);
+    store.set(cacheKey, createCachedEntry({ successfulFormats: 1 }));
+
+    const result = await checker.getUpstreamDataForFormats(
+      "workspace-a",
+      "repo-a",
+      ["python", "npm"]
+    );
+
+    assert.strictEqual(getRequestCount(), 2);
+    assert.strictEqual(result.complete, true);
+    assert.strictEqual(updates[0].key, cacheKey);
+    assert.strictEqual(updates[0].value, undefined);
+  });
+
+  test("bypassCache refetches runtime upstream details instead of serving a summary-only warm cache", async () => {
+    const { context, store } = createContext();
+    const { checker, getRequestCount } = createResponseAwareChecker(context, {
+      python: [{ name: "PyPI", upstream_url: "https://pypi.org/simple/" }],
+    });
+    const cacheKey = getUpstreamCacheKey("workspace-a", "repo-a", ["python"]);
+    store.set(cacheKey, createCachedEntry());
+
+    const result = await checker.getUpstreamDataForFormats(
+      "workspace-a",
+      "repo-a",
+      ["python"],
+      { bypassCache: true }
+    );
+
+    assert.strictEqual(getRequestCount(), 1);
+    assert.strictEqual(result.upstreams[0].upstream_url, "https://pypi.org/simple/");
+  });
+
+  test("evicts cached upstream summaries with duplicate, conflicting, or stale derived metadata", async () => {
+    const { context, store, updates } = createContext();
+    const { checker } = createResponseAwareChecker(context, {});
+    const cacheKey = getUpstreamCacheKey("workspace-a", "repo-a", ["python"]);
+    for (const poisoned of [
+      createCachedEntry({
+        upstreams: [
+          { name: "PyPI", _format: "python", format: "python", is_active: true },
+          { name: "PyPI", _format: "python", format: "python", is_active: true },
+        ],
+        active: 2,
+        total: 2,
+      }),
+      createCachedEntry({
+        upstreams: [{ name: "PyPI", _format: "python", format: "npm", is_active: true }],
+      }),
+      createCachedEntry({ active: 0 }),
+    ]) {
+      store.set(cacheKey, poisoned);
+      await checker.getUpstreamDataForFormats("workspace-a", "repo-a", ["python"]);
+      assert.strictEqual(updates[updates.length - 2].value, undefined);
+    }
+  });
+
+  test("rejects duplicate and format-conflicting upstream records", async () => {
+    const { checker } = createResponseAwareChecker(createContext().context, {
+      python: [
+        { name: "PyPI", format: "python" },
+        { name: "PyPI", format: "python" },
+      ],
+      npm: [{ name: "npmjs", format: "python" }],
+    });
+
+    const duplicate = await checker.getUpstreamDataForFormats(
+      "workspace-a",
+      "repo-a",
+      ["python"]
+    );
+    const conflicting = await checker.getUpstreamDataForFormats(
+      "workspace-a",
+      "repo-b",
+      ["npm"]
+    );
+
+    assert.deepStrictEqual(duplicate.upstreams, []);
+    assert.deepStrictEqual(duplicate.failedFormats, ["python"]);
+    assert.strictEqual(duplicate.complete, false);
+    assert.deepStrictEqual(conflicting.failedFormats, ["npm"]);
+  });
+
   test("evicts a flat cache envelope containing nested secret-bearing fields", async () => {
     const { context, store, updates } = createContext();
     const { checker } = createResponseAwareChecker(context, {});
@@ -786,6 +921,93 @@ suite("UpstreamChecker shared helper and format handling", () => {
 });
 
 suite("UpstreamChecker preview resolution", () => {
+  setup(() => resetAccount());
+
+  test("local package lookup discovers later pages with strict bounded pagination", async () => {
+    const calls = [];
+    const firstPage = Array.from({ length: 100 }, (_value, index) => ({
+      name: `other-${index}`,
+      format: "python",
+      namespace: "acme",
+      repository: "example-repo",
+      slug_perm: `other-${index}`,
+    }));
+    const checker = createChecker({}, {
+      cloudsmithAPI: {
+        async get(endpoint) {
+          const pageNumber = Number(new URL(`https://example.test/${endpoint}`).searchParams.get("page"));
+          calls.push(pageNumber);
+          const data = pageNumber === 1 ? firstPage : [{
+            name: "flask",
+            format: "python",
+            namespace: "acme",
+            repository: "example-repo",
+            slug_perm: "flask-1",
+          }];
+          return apiSuccess(data, {
+            headers: {
+              "x-pagination-page": String(pageNumber),
+              "x-pagination-pagetotal": "2",
+              "x-pagination-count": "101",
+              "x-pagination-pagesize": "100",
+            },
+          });
+        },
+      },
+    });
+
+    const result = await checker.existsLocally(
+      "acme",
+      "example-repo",
+      "flask",
+      "python"
+    );
+
+    assert.strictEqual(result.data.slug_perm, "flask-1");
+    assert.strictEqual(result.complete, true);
+    assert.deepStrictEqual(calls, [1, 2]);
+  });
+
+  test("local package lookup short-circuits after a validated positive page", async () => {
+    const calls = [];
+    const firstPage = Array.from({ length: 100 }, (_value, index) => ({
+      name: index === 0 ? "flask" : `other-${index}`,
+      format: "python",
+      namespace: "acme",
+      repository: "example-repo",
+      slug_perm: `package-${index}`,
+    }));
+    const checker = createChecker({}, {
+      cloudsmithAPI: {
+        async get(endpoint) {
+          const pageNumber = Number(new URL(`https://example.test/${endpoint}`).searchParams.get("page"));
+          calls.push(pageNumber);
+          if (pageNumber === 2) return apiFailure("rate_limited", { status: 429 });
+          return apiSuccess(firstPage, {
+            headers: {
+              "x-pagination-page": "1",
+              "x-pagination-pagetotal": "2",
+              "x-pagination-count": "200",
+              "x-pagination-pagesize": "100",
+            },
+          });
+        },
+      },
+    });
+
+    const result = await checker.existsLocally(
+      "acme",
+      "example-repo",
+      "flask",
+      "python"
+    );
+
+    assert.strictEqual(result.data.slug_perm, "package-0");
+    assert.strictEqual(result.complete, false);
+    assert.strictEqual(result.error, null);
+    assert.deepStrictEqual(calls, [1]);
+  });
+
   test("previewResolution does not trigger policy fetches and still returns upstream data", async () => {
     const checker = createChecker({});
     let policyFetchCount = 0;
@@ -793,6 +1015,7 @@ suite("UpstreamChecker preview resolution", () => {
     checker.existsLocally = async () => ({
       data: null,
       error: null,
+      complete: true,
     });
     checker.getUpstreamsForFormat = async () => ({
       data: [
@@ -822,5 +1045,41 @@ suite("UpstreamChecker preview resolution", () => {
     assert.strictEqual(result.upstreams.data.total, 2);
     assert.strictEqual(result.upstreams.data.active, 1);
     assert.strictEqual(result.upstreams.data.configs[0].name, "PyPI");
+  });
+
+  test("previewResolution settles sibling failures and exposes only normalized error strings", async () => {
+    const checker = createChecker({});
+    checker.existsLocally = async () => {
+      throw new Error("https://user:pass@example.com/private?token=secret\nprivate stack");
+    };
+    checker.getUpstreamsForFormat = async () => ({
+      data: [{ name: "PyPI", upstream_url: "https://pypi.org/simple/", is_active: true }],
+      error: null,
+      complete: true,
+    });
+
+    const result = await checker.previewResolution("acme", "repo", "flask", "python");
+
+    assert.strictEqual(result.local.errorMessage, "The local package collection could not be verified.");
+    assert.strictEqual(typeof result.local.errorMessage, "string");
+    assert.strictEqual(result.upstreams.data.total, 1);
+    assert.strictEqual(result.canResolveViaUpstream, true);
+    assert.ok(!JSON.stringify(result).includes("user:pass"));
+    assert.ok(!JSON.stringify(result).includes("token=secret"));
+  });
+
+  test("previewResolution normalizes structured upstream failures", async () => {
+    const checker = createChecker({});
+    checker.existsLocally = async () => ({ data: null, error: null, complete: true });
+    checker.getUpstreamsForFormat = async () => ({
+      data: [],
+      error: { message: "Upstream request failed", status: 500, body: "private body" },
+      complete: false,
+    });
+
+    const result = await checker.previewResolution("acme", "repo", "flask", "python");
+    assert.strictEqual(result.upstreams.errorMessage, "Upstream request failed");
+    assert.strictEqual("error" in result.upstreams, false);
+    assert.ok(!JSON.stringify(result).includes("private body"));
   });
 });

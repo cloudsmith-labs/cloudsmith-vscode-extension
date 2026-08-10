@@ -7,6 +7,7 @@ const {
   SCAN_STATES,
   buildComplianceReportData,
   getConcreteDependencyVersion,
+  getLookupPaginationDirective,
   lookupExactDependency,
   matchCoverageCandidates,
 } = require("../views/dependencyHealthProvider");
@@ -216,6 +217,7 @@ suite("DependencyHealthProvider Test Suite", () => {
           return response;
         }
         if (response && typeof response === "object" && Array.isArray(response.data)) {
+          addDefaultTestPackageIdentities(response.data);
           return apiSuccess(response.data, { headers: normalizeTestLookupHeaders(response.headers) });
         }
         return apiSuccess(response);
@@ -233,6 +235,7 @@ suite("DependencyHealthProvider Test Suite", () => {
   }
 
   function lookupPage(data, page = 1, pageTotal = 1, count = data.length, pageSize = 100) {
+    addDefaultTestPackageIdentities(data);
     return {
       data,
       headers: {
@@ -242,6 +245,20 @@ suite("DependencyHealthProvider Test Suite", () => {
         pageSize: String(pageSize),
       },
     };
+  }
+
+  function addDefaultTestPackageIdentities(data) {
+    for (const candidate of data) {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+      if (candidate.namespace === undefined) candidate.namespace = "workspace";
+      if (candidate.repository === undefined) candidate.repository = "repo";
+      if (candidate.slug_perm === undefined) {
+        const groupId = candidate.identifiers && candidate.identifiers.group_id
+          ? `${candidate.identifiers.group_id}:`
+          : "";
+        candidate.slug_perm = `${candidate.format || "package"}:${groupId}${candidate.name}:${candidate.version}`;
+      }
+    }
   }
 
   async function runFixtureThroughLookupAndNode(ecosystem, fixtureName, dependencyName, candidate) {
@@ -275,7 +292,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       cloudsmithPackage: lookup.package,
       cloudsmithLookupDetail: lookup.detail,
     }, {});
-    assert.strictEqual(node.state, "available");
+    assert.strictEqual(node.state, "violated");
     assert.strictEqual(node.version.value, candidate.version);
     return { adapterResult, dependency, lookup, node };
   }
@@ -1380,6 +1397,53 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(maxInFlight, 8);
   });
 
+  test("exact lookup workers settle delayed siblings before publishing a thrown request failure", async () => {
+    const gate = deferred();
+    const dependencies = Array.from(
+      { length: 5 },
+      (_value, index) => createDependency(`package-${index}`, "1.0.0")
+    );
+    let calls = 0;
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCloudsmithAPI: () => ({
+        async get() {
+          calls += 1;
+          if (calls === 1) throw new Error("unexpected transport throw");
+          await gate.promise;
+          return apiSuccess([], {
+            headers: normalizeTestLookupHeaders(lookupPage([], 1, 1, 0).headers),
+          });
+        },
+      }),
+    });
+    let flushed = null;
+    provider._flushCoverageMatchBatch = async (matches, completed) => {
+      flushed = matches;
+      return completed + matches.length;
+    };
+
+    let settled = false;
+    const pending = provider._resolveCoverageWithExactQueries(
+      "workspace",
+      "repo",
+      "npm",
+      dependencies,
+      0,
+      dependencies.length,
+      { report() {} },
+      { isCancellationRequested: false }
+    ).then(value => { settled = true; return value; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(settled, false);
+    gate.resolve();
+    assert.strictEqual(await pending, dependencies.length);
+    assert.strictEqual(flushed.length, dependencies.length);
+    assert.strictEqual(
+      flushed.filter(entry => entry.result.status === CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED).length,
+      1
+    );
+  });
+
   test("scan-wide lookup budget counts pages across formats and marks remaining work incomplete", async () => {
     const npmDependency = createDependency("first-package", "1.0.0", "npm");
     const pythonDependency = createDependency("second-package", "2.0.0", "python");
@@ -1509,7 +1573,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     });
     const partialApi = createLookupApi((_endpoint, callCount) => (
       callCount === 1
-        ? lookupPage([{ name: "other", version: "1.0.0" }], 1, 2, 2, 1)
+        ? lookupPage([{ name: "other", version: "1.0.0", format: "npm" }], 1, 2, 2, 1)
         : apiFailure("server_error", { status: 503 })
     ));
     const incomplete = await lookupExactDependency({
@@ -1561,6 +1625,162 @@ suite("DependencyHealthProvider Test Suite", () => {
     });
 
     assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+  });
+
+  test("exact lookup rejects pagination anchor drift across otherwise valid pages", async () => {
+    for (const secondPageHeaders of [
+      { page: "2", pageTotal: "3", count: "3", pageSize: "1" },
+      { page: "2", pageTotal: "2", pageSize: "1" },
+      { page: "2", pageTotal: "1", count: "2", pageSize: "2" },
+    ]) {
+      const api = createLookupApi((endpoint) => {
+        const page = Number(new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("page"));
+        return page === 1
+          ? lookupPage([{ name: "other-a", version: "1.0.0", format: "npm" }], 1, 2, 2, 1)
+          : {
+            data: [{ name: "other-b", version: "1.0.0", format: "npm" }],
+            headers: secondPageHeaders,
+          };
+      });
+      const result = await lookupExactDependency({
+        api,
+        cloudsmithWorkspace: "workspace",
+        cloudsmithRepo: "repo",
+        dependency: createDependency("left-pad", "1.0.0"),
+        token: { isCancellationRequested: false },
+      });
+      assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+      assert.strictEqual(api.calls.length, 2);
+    }
+  });
+
+  test("exact lookup stops when a later page repeats an earlier package identity", async () => {
+    const repeated = {
+      name: "other",
+      version: "1.0.0",
+      format: "npm",
+      namespace: "workspace",
+      repository: "repo",
+      slug_perm: "repeated-package",
+    };
+    const api = createLookupApi((endpoint) => {
+      const page = Number(new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("page"));
+      return lookupPage([{ ...repeated }], page, 2, 2, 1);
+    });
+
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+    assert.strictEqual(result.pagesFetched, 1);
+    assert.strictEqual(api.calls.length, 2);
+  });
+
+  test("page-total-only nonfinal pages must be full before lookup can continue", async () => {
+    for (const data of [
+      [],
+      [{ name: "other", version: "1.0.0", format: "npm" }],
+    ]) {
+      const api = createLookupApi(() => ({
+        data,
+        headers: { page: "1", pageTotal: "2", pageSize: "100" },
+      }));
+      const result = await lookupExactDependency({
+        api,
+        cloudsmithWorkspace: "workspace",
+        cloudsmithRepo: "repo",
+        dependency: createDependency("left-pad", "1.0.0"),
+        token: { isCancellationRequested: false },
+      });
+
+      assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+      assert.strictEqual(api.calls.length, 1);
+    }
+  });
+
+  test("out-of-scope or identity-less matching packages cannot become found", async () => {
+    for (const candidate of [
+      {
+        name: "left-pad",
+        version: "1.0.0",
+        format: "npm",
+        namespace: "other-workspace",
+        repository: "repo",
+        slug_perm: "left-pad",
+      },
+      {
+        name: "left-pad",
+        version: 100,
+        format: "npm",
+        namespace: "workspace",
+        repository: "repo",
+        slug_perm: "left-pad-numeric-version",
+      },
+      {
+        name: "left-pad",
+        version: "1.0.0",
+        format: "npm",
+        namespace: "workspace",
+        repository: "other-repo",
+        slug_perm: "left-pad",
+      },
+      {
+        name: "left-pad",
+        version: "1.0.0",
+        format: "npm",
+        namespace: "workspace",
+        repository: "repo",
+        slug_perm: null,
+      },
+    ]) {
+      const result = await lookupExactDependency({
+        api: createLookupApi(() => lookupPage([candidate])),
+        cloudsmithWorkspace: "workspace",
+        cloudsmithRepo: "repo",
+        dependency: createDependency("left-pad", "1.0.0"),
+        token: { isCancellationRequested: false },
+      });
+      assert.notStrictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
+      assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED);
+    }
+  });
+
+  test("malformed package policy booleans cannot become exact lookup evidence", async () => {
+    const candidate = {
+      name: "left-pad",
+      version: "1.0.0",
+      format: "npm",
+      namespace: "workspace",
+      repository: "repo",
+      slug_perm: "left-pad",
+      policy_violated: "false",
+    };
+    const result = await lookupExactDependency({
+      api: createLookupApi(() => lookupPage([candidate])),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("left-pad", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED);
+    assert.strictEqual(result.package, null);
+  });
+
+  test("pagination metadata accepts only strict safe decimal integers", () => {
+    for (const malformed of ["1e0", "+1", " 1 ", "01", "0x1"]) {
+      assert.strictEqual(getLookupPaginationDirective({
+        page: malformed,
+        pageTotal: "1",
+        count: "0",
+        pageSize: "100",
+      }, 1, 0, 100), "incomplete");
+    }
   });
 
   test("contradictory page totals and counts cannot prove package absence", async () => {
@@ -1928,7 +2148,7 @@ suite("DependencyHealthProvider Test Suite", () => {
   test("pagination terminates at the safety limit and remains incomplete", async () => {
     const api = createLookupApi((endpoint) => {
       const page = Number(new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("page"));
-      return lookupPage([{ name: "other", version: "1.0.0" }], page, 101, 101, 1);
+      return lookupPage([{ name: `other-${page}`, version: "1.0.0", format: "npm" }], page, 101, 101, 1);
     });
 
     const result = await lookupExactDependency({
@@ -2100,10 +2320,10 @@ suite("DependencyHealthProvider Test Suite", () => {
     const provider = new DependencyHealthProvider(createContext(), null, {
       enrichLicenses: async (_dependencies, options = {}) => {
         options.onProgress(new Map([
-          ["workspace:repo:left-pad/1.0.0", { spdx: "MIT" }],
+          [JSON.stringify(["workspace", "repo", "left-pad/1.0.0"]), { spdx: "MIT" }],
         ]));
         options.onProgress(new Map([
-          ["workspace:repo:left-pad/1.0.0", { spdx: "Apache-2.0" }],
+          [JSON.stringify(["workspace", "repo", "left-pad/1.0.0"]), { spdx: "Apache-2.0" }],
         ]));
       },
     });
@@ -2139,6 +2359,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     const originalShowErrorMessage = vscode.window.showErrorMessage;
     const notifications = [];
     let refreshArgs = null;
+    let preparationToken = null;
 
     vscode.window.withProgress = async (_options, task) => task(
       { report() {} },
@@ -2158,7 +2379,8 @@ suite("DependencyHealthProvider Test Suite", () => {
     try {
       const provider = new DependencyHealthProvider(createContext(), null, {
         upstreamPullService: {
-          async prepareSingle({ dependency }) {
+          async prepareSingle({ dependency, cancellationToken }) {
+            preparationToken = cancellationToken;
             return {
               workspace: "workspace-a",
               repository: { slug: "repo-b" },
@@ -2166,7 +2388,8 @@ suite("DependencyHealthProvider Test Suite", () => {
               plan: { skippedDependencies: [] },
             };
           },
-          async execute() {
+          async execute(_prepared, options) {
+            assert.strictEqual(options.token, preparationToken);
             return {
               canceled: false,
               pullResult: {
@@ -2218,12 +2441,66 @@ suite("DependencyHealthProvider Test Suite", () => {
           ecosystem: "python",
         },
       });
+      assert.ok(preparationToken);
       assert.deepStrictEqual(notifications, ["requests@2.31.0 cached in repo-b"]);
     } finally {
       vscode.window.withProgress = originalWithProgress;
       vscode.window.showInformationMessage = originalShowInformationMessage;
       vscode.window.showErrorMessage = originalShowErrorMessage;
     }
+  });
+
+  test("coverage refresh waits for every enrichment sibling after one rejects", async () => {
+    const dependency = createDependency("left-pad", "1.0.0");
+    dependency.cloudsmithStatus = "ABSENT";
+    const provider = new DependencyHealthProvider(createContext());
+    provider._fullTrees = [{ ecosystem: "npm", sourceFile: "package.json", dependencies: [dependency] }];
+    provider._displayTrees = cloneTrees(provider._fullTrees);
+    provider._runCoverageResolution = async () => {
+      dependency.cloudsmithStatus = "FOUND";
+      dependency.cloudsmithPackage = {
+        namespace: "workspace",
+        repository: "repo",
+        slug_perm: "left-pad-1",
+        name: "left-pad",
+        version: "1.0.0",
+        format: "npm",
+      };
+    };
+    const gate = deferred();
+    let siblingCompletions = 0;
+    provider._runVulnerabilityEnrichment = async () => {
+      throw new Error("vulnerability enrichment failed");
+    };
+    provider._runLicenseEnrichment = async () => {
+      await gate.promise;
+      siblingCompletions += 1;
+    };
+    provider._runPolicyEnrichment = async () => {
+      await gate.promise;
+      siblingCompletions += 1;
+    };
+    provider._publishDiagnostics = async () => {
+      assert.strictEqual(siblingCompletions, 2);
+    };
+    provider._rebuildSummary = () => {};
+    provider._storeReportData = async () => {};
+    provider.refresh = () => {};
+
+    let settled = false;
+    const pending = provider._refreshCoverageForDependencies(
+      "workspace",
+      "repo",
+      [dependency],
+      { report() {} },
+      { isCancellationRequested: false }
+    ).then(value => { settled = true; return value; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(settled, false);
+    gate.resolve();
+    await pending;
+    assert.strictEqual(siblingCompletions, 2);
+    assert.ok(provider._warnings.some(warning => /vulnerability enrichment failed/.test(warning)));
   });
 
   test("pullSingleDependency reserves the operation before asynchronous preparation", async () => {

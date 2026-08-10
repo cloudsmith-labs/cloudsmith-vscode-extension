@@ -11,6 +11,27 @@ function createResponse(status, body, headers = {}) {
   return new Response(body, { status, headers });
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise(resolvePromise => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
+function cancellationToken() {
+  const listeners = new Set();
+  return {
+    isCancellationRequested: false,
+    cancel() {
+      this.isCancellationRequested = true;
+      for (const listener of listeners) listener();
+    },
+    onCancellationRequested(listener) {
+      listeners.add(listener);
+      return { dispose() { listeners.delete(listener); } };
+    },
+  };
+}
+
 suite("UpstreamPullService", () => {
   test("builds canonical registry trigger URLs for supported formats", () => {
     const mavenPlan = buildRegistryTriggerPlan("workspace", "repo", {
@@ -106,13 +127,17 @@ suite("UpstreamPullService", () => {
   test("prepare builds a mixed-ecosystem confirmation with skipped formats", async () => {
     const warnings = [];
     const service = new UpstreamPullService({}, {
-      fetchRepositories: async () => [{ slug: "repo", name: "Repo" }],
+      fetchRepositories: async () => ({
+        items: [{ slug: "repo", name: "Repo" }],
+        complete: true,
+      }),
       upstreamChecker: {
         async getRepositoryUpstreamState() {
           return {
             groupedUpstreams: new Map([
               ["maven", [{ name: "Maven Central", is_active: true }]],
             ]),
+            complete: true,
           };
         },
       },
@@ -158,13 +183,17 @@ suite("UpstreamPullService", () => {
 
   test("prepare preserves exact versions that differ only by prerelease identifier case", async () => {
     const service = new UpstreamPullService({}, {
-      fetchRepositories: async () => [{ slug: "repo", name: "Repo" }],
+      fetchRepositories: async () => ({
+        items: [{ slug: "repo", name: "Repo" }],
+        complete: true,
+      }),
       upstreamChecker: {
         async getRepositoryUpstreamState() {
           return {
             groupedUpstreams: new Map([
               ["npm", [{ name: "npm", is_active: true }]],
             ]),
+            complete: true,
           };
         },
       },
@@ -549,20 +578,200 @@ suite("UpstreamPullService", () => {
     ]);
   });
 
+  test("contains throwing status observers and drains every launched pull before returning", async () => {
+    const gate = deferred();
+    const threeStarted = deferred();
+    let calls = 0;
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+      showWarningMessage: async () => {},
+    });
+    service._pullDependency = async (_workspace, _repo, dependency) => {
+      calls += 1;
+      if (calls === 3) threeStarted.resolve();
+      if (dependency.name === "package-0") {
+        throw new Error("worker failed");
+      }
+      await gate.promise;
+      return {
+        dependency,
+        status: "cached",
+        errorMessage: null,
+        requestUrl: "https://npm.cloudsmith.io/workspace/repo/package",
+        networkError: false,
+      };
+    };
+
+    const dependencies = Array.from({ length: 8 }, (_, index) => ({
+      name: `package-${index}`,
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "NOT_FOUND",
+    }));
+    let returned = false;
+    const pending = service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: { pullableDependencies: dependencies, skippedDependencies: [] },
+    }, {
+      onStatus() { throw new Error("observer failed"); },
+      progress: { report() { throw new Error("progress observer failed"); } },
+    }).then((value) => {
+      returned = true;
+      return value;
+    });
+
+    await threeStarted.promise;
+    assert.strictEqual(returned, false);
+    gate.resolve();
+    const result = await pending;
+
+    assert.strictEqual(calls, dependencies.length);
+    assert.strictEqual(result.pullResult.details.length, dependencies.length);
+    assert.strictEqual(result.pullResult.cached, dependencies.length - 1);
+    assert.strictEqual(result.pullResult.errors, 1);
+  });
+
+  test("never exposes registry request URLs through status or terminal details", async () => {
+    const statuses = [];
+    const dependency = {
+      name: "private-package",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "NOT_FOUND",
+    };
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+      showWarningMessage: async () => {},
+    });
+    service._pullDependency = async () => ({
+      dependency,
+      status: "cached",
+      errorMessage: null,
+      requestUrl: "https://user:pass@npm.cloudsmith.io/private/repo/package?token=secret#fragment",
+      networkError: false,
+    });
+
+    const result = await service.execute({
+      workspace: "private-workspace",
+      repository: { slug: "private-repo" },
+      plan: { pullableDependencies: [dependency], skippedDependencies: [] },
+    }, {
+      onStatus(detail) { statuses.push(detail); },
+    });
+
+    assert.ok(statuses.length >= 2);
+    assert.ok(statuses.every(detail => !("requestUrl" in detail)));
+    assert.ok(result.pullResult.details.every(detail => !("requestUrl" in detail)));
+    assert.ok(!JSON.stringify(statuses).includes("token=secret"));
+    assert.ok(!JSON.stringify(result.pullResult).includes("private-workspace"));
+  });
+
+  test("does not dispatch after the prepared account changes while loading credentials", async () => {
+    let accountState = {
+      activationId: "account-a",
+      accountEpoch: 1,
+      sessionConnected: true,
+    };
+    const apiKey = deferred();
+    let pulls = 0;
+    const service = new UpstreamPullService({}, {
+      connectionManager: { getState() { return { ...accountState }; } },
+      credentialManager: { async getApiKey() { return apiKey.promise; } },
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+      showWarningMessage: async () => {},
+    });
+    service._pullDependency = async () => {
+      pulls += 1;
+      throw new Error("must not dispatch");
+    };
+
+    const pending = service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      account: { activationId: "account-a", accountEpoch: 1 },
+      plan: {
+        pullableDependencies: [{
+          name: "package-a",
+          version: "1.0.0",
+          format: "npm",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    });
+    accountState = { ...accountState, activationId: "account-b", accountEpoch: 2 };
+    apiKey.resolve("api-key");
+
+    assert.deepStrictEqual(await pending, { canceled: true, stale: true });
+    assert.strictEqual(pulls, 0);
+  });
+
+  test("does not issue an artifact request after the prepared account changes", async () => {
+    let accountState = {
+      activationId: "account-a",
+      accountEpoch: 1,
+      sessionConnected: true,
+    };
+    const calls = [];
+    const service = new UpstreamPullService({}, {
+      connectionManager: { getState() { return { ...accountState }; } },
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      fetchImpl: async (url) => {
+        calls.push(url);
+        accountState = { ...accountState, activationId: "account-b", accountEpoch: 2 };
+        return createResponse(
+          200,
+          '<a href="../../packages/requests-2.31.0-py3-none-any.whl">requests</a>'
+        );
+      },
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+      showWarningMessage: async () => {},
+    });
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      account: { activationId: "account-a", accountEpoch: 1 },
+      plan: {
+        pullableDependencies: [{
+          name: "requests",
+          version: "2.31.0",
+          format: "python",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    });
+
+    assert.deepStrictEqual(result, { canceled: true, stale: true });
+    assert.strictEqual(calls.length, 1);
+  });
+
   test("prepareSingle only offers repositories with a matching upstream", async () => {
     const quickPickCalls = [];
     let warningCalls = 0;
     const service = new UpstreamPullService({}, {
-      fetchRepositories: async () => [
-        { slug: "repo-a", name: "Repo A" },
-        { slug: "repo-b", name: "Repo B" },
-      ],
+      fetchRepositories: async () => ({
+        items: [
+          { slug: "repo-a", name: "Repo A" },
+          { slug: "repo-b", name: "Repo B" },
+        ],
+        complete: true,
+      }),
       upstreamChecker: {
         async getRepositoryUpstreamState(_workspace, repo) {
           return {
             groupedUpstreams: new Map([
               ["python", repo === "repo-b" ? [{ name: "PyPI", is_active: true }] : []],
             ]),
+            complete: true,
           };
         },
       },
@@ -596,6 +805,128 @@ suite("UpstreamPullService", () => {
     assert.strictEqual(quickPickCalls[0][0].label, "repo-b");
     assert.match(quickPickCalls[0][0].detail, /Python upstream \(PyPI\)/);
     assert.strictEqual(warningCalls, 0);
+  });
+
+  test("preparation reports a fixed repository error without exposing thrown detail", async () => {
+    const errors = [];
+    const service = new UpstreamPullService({}, {
+      fetchRepositories: async () => {
+        throw new Error("secret-token-and-internal-host");
+      },
+      showErrorMessage: async (message) => { errors.push(message); },
+      showInformationMessage: async () => {},
+      showWarningMessage: async () => {},
+    });
+
+    const prepared = await service.prepareSingle({
+      workspace: "workspace",
+      dependency: {
+        name: "requests",
+        version: "2.31.0",
+        format: "python",
+        cloudsmithStatus: "NOT_FOUND",
+      },
+    });
+
+    assert.strictEqual(prepared, null);
+    assert.deepStrictEqual(errors, ["Could not fetch workspace repositories."]);
+    assert.doesNotMatch(errors[0], /secret|internal-host/i);
+  });
+
+  test("prepareSingle cancellation stops repository inspection from scheduling more work", async () => {
+    const token = cancellationToken();
+    const gate = deferred();
+    let inspectionCalls = 0;
+    let quickPickCalls = 0;
+    const service = new UpstreamPullService({}, {
+      fetchRepositories: async (_workspace, operation) => {
+        assert.strictEqual(operation.cancellationToken, token);
+        return {
+          items: Array.from({ length: 1000 }, (_value, index) => ({ slug: `repo-${index}` })),
+          complete: true,
+        };
+      },
+      upstreamChecker: {
+        async getRepositoryUpstreamStateForFormats(_workspace, _repo, _formats, options) {
+          inspectionCalls += 1;
+          assert.strictEqual(options.cancellationToken, token);
+          await gate.promise;
+          return {
+            groupedUpstreams: new Map(),
+            complete: false,
+            failedFormats: [],
+            uninspectedFormats: ["python"],
+          };
+        },
+      },
+      showQuickPick: async () => { quickPickCalls += 1; return null; },
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+      showWarningMessage: async () => {},
+    });
+
+    const pending = service.prepareSingle({
+      workspace: "workspace",
+      dependency: {
+        name: "requests",
+        version: "2.31.0",
+        format: "python",
+        cloudsmithStatus: "NOT_FOUND",
+      },
+      cancellationToken: token,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(inspectionCalls, 4);
+    token.cancel();
+    gate.resolve();
+
+    assert.strictEqual(await pending, null);
+    assert.strictEqual(inspectionCalls, 4);
+    assert.strictEqual(quickPickCalls, 0);
+  });
+
+  test("prepareSingle discards repository results completed by a superseded account", async () => {
+    let state = {
+      activationId: "account-a",
+      accountEpoch: 1,
+      sessionConnected: true,
+    };
+    const repositories = deferred();
+    let inspectionCalls = 0;
+    const service = new UpstreamPullService({}, {
+      connectionManager: { getState() { return { ...state }; } },
+      fetchRepositories: async (_workspace, operation) => {
+        assert.deepStrictEqual(operation.account, {
+          activationId: "account-a",
+          accountEpoch: 1,
+        });
+        return repositories.promise;
+      },
+      upstreamChecker: {
+        async getRepositoryUpstreamStateForFormats() {
+          inspectionCalls += 1;
+          return { groupedUpstreams: new Map(), complete: true };
+        },
+      },
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+      showWarningMessage: async () => {},
+    });
+
+    const pending = service.prepareSingle({
+      workspace: "workspace",
+      dependency: {
+        name: "requests",
+        version: "2.31.0",
+        format: "python",
+        cloudsmithStatus: "NOT_FOUND",
+      },
+    });
+    state = { ...state, activationId: "account-b", accountEpoch: 2 };
+    repositories.resolve({ items: [{ slug: "repo" }], complete: true });
+
+    assert.strictEqual(await pending, null);
+    assert.strictEqual(inspectionCalls, 0);
   });
 
   test("does not offer uncertain dependencies for upstream pull", async () => {
