@@ -31,6 +31,10 @@ suite("search intent command boundary", () => {
       filterState: { clear: clear("filter") },
       recentPackages: { clear: clear("recent") },
       clearVulnerabilityCache: clear("vulnerability"),
+      vulnerabilityProvider: { resetForAccountChange: clear("vulnerability-panel") },
+      quarantineExplainProvider: { resetForAccountChange: clear("quarantine-panel") },
+      upstreamPreviewProvider: { resetForAccountChange: clear("upstream-preview-panel") },
+      upstreamDetailProvider: { resetForAccountChange: clear("upstream-detail-panel") },
       dependencyHealthProvider: {
         async resetForAccountChange() {
           order.push("dependency");
@@ -47,22 +51,30 @@ suite("search intent command boundary", () => {
       },
     });
 
-    assert.deepStrictEqual(order.slice(0, 5), [
+    assert.deepStrictEqual(order.slice(0, 9), [
       "workspace",
       "search",
       "filter",
       "recent",
       "vulnerability",
+      "vulnerability-panel",
+      "quarantine-panel",
+      "upstream-preview-panel",
+      "upstream-detail-panel",
     ]);
     assert.deepStrictEqual([...cleared].sort(), [
       "filter",
+      "quarantine-panel",
       "recent",
       "search",
       "upstream",
+      "upstream-detail-panel",
+      "upstream-preview-panel",
       "vulnerability",
+      "vulnerability-panel",
       "workspace",
     ]);
-    assert.deepStrictEqual(order.slice(5), ["dependency", "projection:false", "upstream"]);
+    assert.deepStrictEqual(order.slice(9), ["dependency", "projection:false", "upstream"]);
     assert.deepStrictEqual(outcome.asyncResults.map(result => result.status), [
       "rejected",
       "rejected",

@@ -14,6 +14,7 @@ class UpstreamPreviewProvider {
    * @param {Object} result - Output from UpstreamChecker.previewResolution()
    */
   show(result) {
+    if (!result || typeof result !== "object") return;
     if (this._panel) {
       this._panel.dispose();
     }
@@ -33,19 +34,27 @@ class UpstreamPreviewProvider {
   }
 
   _getHtmlContent(result) {
+    const upstreamComplete = result.upstreams.complete === true;
     const localStatus = result.local.error
-      ? `<span class="status-error">Could not load local package data: ${this._escapeHtml(result.local.error)}</span>`
+      ? `<span class="status-error">Could not verify local package data: ${this._escapeHtml(this._errorMessage(result.local.error))}</span>`
       : result.local.data
         ? `<span class="status-found">Found in ${this._escapeHtml(result.repo)} (${this._escapeHtml(result.local.data.status_str || "Unknown")})</span>`
-        : `<span class="status-missing">Not found in ${this._escapeHtml(result.repo)}</span>`;
+        : result.local.complete === true
+          ? `<span class="status-missing">Not found in ${this._escapeHtml(result.repo)}</span>`
+          : '<span class="status-error">Local package status is incomplete.</span>';
 
     let upstreamHtml = "";
     if (result.upstreams.error) {
       upstreamHtml = `<p class="error-banner">Could not load upstream data: ${this._escapeHtml(result.upstreams.error)}</p>`;
     } else if (result.upstreams.data.configs.length === 0) {
-      upstreamHtml = '<p class="muted">No upstreams configured for this format.</p>';
+      upstreamHtml = upstreamComplete
+        ? '<p class="muted">No upstreams configured for this format.</p>'
+        : '<p class="error-banner">Upstream inspection is incomplete. Additional upstreams may exist.</p>';
     } else {
-      upstreamHtml = '<table class="data-table"><thead><tr><th>Name</th><th>URL</th><th>Status</th></tr></thead><tbody>';
+      if (!upstreamComplete) {
+        upstreamHtml += '<p class="error-banner">Upstream inspection is incomplete. The loaded configurations are shown below.</p>';
+      }
+      upstreamHtml += '<table class="data-table"><thead><tr><th>Name</th><th>URL</th><th>Status</th></tr></thead><tbody>';
       for (const u of result.upstreams.data.configs) {
         const active = u.is_active !== false;
         const statusClass = active ? "status-active" : "status-inactive";
@@ -61,7 +70,13 @@ class UpstreamPreviewProvider {
 
     const resolutionSummary = result.canResolveViaUpstream
       ? `<div class="resolution-yes">This package can likely resolve through ${result.upstreams.data.active} active upstream${result.upstreams.data.active === 1 ? "" : "s"}.</div>`
-      : '<div class="resolution-no">No active upstreams for this format. Upload the package directly.</div>';
+      : upstreamComplete && !result.upstreams.error
+        ? '<div class="resolution-no">No active upstreams for this format. Upload the package directly.</div>'
+        : '<div class="resolution-no">Upstream resolution could not be determined because inspection is incomplete.</div>';
+
+    const upstreamHeading = upstreamComplete
+      ? `Upstreams (${result.upstreams.data.active} active of ${result.upstreams.data.total})`
+      : `Loaded upstreams (${result.upstreams.data.active} active of ${result.upstreams.data.total} loaded)`;
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -101,7 +116,7 @@ class UpstreamPreviewProvider {
 
   ${resolutionSummary}
 
-  <h3>Upstreams (${result.upstreams.data.active} active of ${result.upstreams.data.total})</h3>
+  <h3>${upstreamHeading}</h3>
   ${upstreamHtml}
 </body>
 </html>`;
@@ -116,11 +131,21 @@ class UpstreamPreviewProvider {
       .replace(/"/g, "&quot;");
   }
 
+  _errorMessage(error) {
+    return error && typeof error === "object" && typeof error.message === "string"
+      ? error.message
+      : String(error || "The local package collection could not be verified.");
+  }
+
   dispose() {
     if (this._panel) {
       this._panel.dispose();
       this._panel = null;
     }
+  }
+
+  resetForAccountChange() {
+    this.dispose();
   }
 }
 

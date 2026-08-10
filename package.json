@@ -132,6 +132,11 @@
         "category": "Cloudsmith"
       },
       {
+        "command": "cloudsmith-vsc.loadMoreRepositoryPackages",
+        "title": "Load more repository packages",
+        "category": "Cloudsmith"
+      },
+      {
         "command": "cloudsmith-vsc.searchInWorkspace",
         "title": "Search packages in this workspace",
         "category": "Cloudsmith"
@@ -395,6 +400,12 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "cloudsmith-vsc.loadMoreRepositoryPackages",
+          "when": "false"
+        }
+      ],
       "view/item/context": [
         {
           "command": "cloudsmith-vsc.inspectPackage",
@@ -763,7 +774,7 @@
           "default": 30,
           "maximum": 30,
           "minimum": 1,
-          "description": "Maximum number of packages to return per repository. Limit: 30."
+          "description": "Packages loaded per page in the repository tree. Use Load More to continue, up to the 600-package safety bound per expansion."
         },
         "cloudsmith-vsc.groupByPackageGroups": {
           "type": "boolean",

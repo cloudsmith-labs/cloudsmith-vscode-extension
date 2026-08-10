@@ -190,8 +190,8 @@ suite("tree visualization", () => {
     const summary = buildDependencySummary([tree], [tree], {});
     const report = buildDependencyHealthReport("fixture-app", tree.dependencies, summary, "2026-04-05");
 
-    assert.match(report, /## Vulnerable Dependencies/);
-    assert.match(report, /\| shared-lib \| 1.0.0 \| Transitive \| High \| CVE-2024-1234 \| Yes \(1.0.1\) \|/);
+    assert.match(report, /## Dependency Vulnerability Status/);
+    assert.match(report, /\| shared-lib \| 1.0.0 \| Transitive \| High \| Detected \| Yes \(1.0.1\) \|/);
     assert.match(report, /## Uncovered Dependencies/);
     assert.match(report, /\| missing-lib \| 0.1.0 \| npm \| Reachable \| npm proxy on production \|/);
   });

@@ -13,6 +13,7 @@ suite("UpstreamPreviewProvider Test Suite", () => {
       local: {
         data: null,
         error: null,
+        complete: true,
       },
       upstreams: {
         data: {
@@ -32,6 +33,7 @@ suite("UpstreamPreviewProvider Test Suite", () => {
           ],
         },
         error: null,
+        complete: true,
       },
       canResolveViaUpstream: true,
     });
@@ -57,6 +59,7 @@ suite("UpstreamPreviewProvider Test Suite", () => {
       local: {
         data: null,
         error: null,
+        complete: false,
       },
       upstreams: {
         data: {
@@ -65,11 +68,28 @@ suite("UpstreamPreviewProvider Test Suite", () => {
           configs: [],
         },
         error: "Upstream availability could not be determined.",
+        complete: false,
       },
       canResolveViaUpstream: false,
     });
 
     assert.ok(html.includes("Could not load upstream data"));
+    assert.ok(html.includes("Local package status is incomplete"));
+    assert.ok(!html.includes("Not found in example-repo"));
     assert.ok(!html.includes("Active policies"));
+    assert.ok(!html.includes("No active upstreams"));
+    assert.ok(!html.includes("Upload the package directly"));
+  });
+
+  test("account reset disposes the panel and null preview results are ignored", () => {
+    const provider = new UpstreamPreviewProvider({});
+    let disposed = 0;
+    provider._panel = { dispose() { disposed += 1; } };
+
+    provider.resetForAccountChange();
+    provider.show(null);
+
+    assert.strictEqual(disposed, 1);
+    assert.strictEqual(provider._panel, null);
   });
 });

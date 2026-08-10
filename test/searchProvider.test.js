@@ -33,6 +33,27 @@ suite("SearchProvider atomic search state", () => {
     assert(Object.isFrozen(provider.state.committed.diagnostics));
   });
 
+  test("preserves an unknown total for page-total-only single-scope search", async () => {
+    const { provider } = createProvider({
+      pageSize: 2,
+      fetchPage: async () => page([pkg("one"), pkg("two")], {
+        pageSize: 2,
+        pageTotal: 2,
+        count: null,
+        countAuthoritative: false,
+      }),
+    });
+
+    await provider.search("workspace-a", "name:artifact");
+
+    assert.strictEqual(provider.state.committed.totalCount, null);
+    const items = (await provider.getChildren()).map(node => node.getTreeItem());
+    assert.match(items[0].description, /2 packages loaded \(more available\)/);
+    const loadMore = items.find(item => item.label.startsWith("Load more results"));
+    assert.strictEqual(loadMore.label, "Load more results (2 loaded; page 1 of 2)");
+    assert(!JSON.stringify(items).includes("null total"));
+  });
+
   test("freezes the node snapshot without freezing its injected connection manager", async () => {
     const connectionManager = createConnectionManager();
     connectionManager.callerOwned = { mutable: true };
@@ -64,7 +85,7 @@ suite("SearchProvider atomic search state", () => {
       slug: { nested: "caller-owned" },
       uploaded_at: { nested: "caller-owned" },
       status_reason: { nested: "caller-owned" },
-      policy_violated: { nested: true },
+      policy_violated: true,
       max_severity: { nested: "Critical" },
       vulnerability_scan_results_url: { nested: "https://example.invalid" },
       cdn_url: { nested: "https://example.invalid" },
@@ -86,7 +107,7 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(committedNode.slug.value, null);
     assert.strictEqual(committedNode.uploaded_at.value, null);
     assert.strictEqual(committedNode.status_reason, null);
-    assert.strictEqual(committedNode.policy_violated, false);
+    assert.strictEqual(committedNode.policy_violated, true);
     assert.strictEqual(committedNode.max_severity, null);
     assert.strictEqual(committedNode.vulnerability_scan_results_url, null);
     assert.strictEqual(committedNode.cdn_url, null);
@@ -101,6 +122,28 @@ suite("SearchProvider atomic search state", () => {
     responsePackage.status_str.nested.value = "mutated";
     assert.deepStrictEqual(committedNode.tags_raw.info, ["upstream"]);
     assert.strictEqual(committedNode.status_str.value, null);
+  });
+
+  test("uses the shared vulnerability indicator contract for retained packages", async () => {
+    const packages = [
+      pkg("no-evidence"),
+      pkg("known-clean", { num_vulnerabilities: "0" }),
+      pkg("detected", { has_vulnerabilities: true }),
+      pkg("conflicting", {
+        num_vulnerabilities: 0,
+        vulnerability_scan_results_count: 2,
+      }),
+    ];
+    const { provider } = createProvider({
+      fetchPage: async () => page(packages),
+    });
+
+    await provider.search("workspace-a", "artifact");
+
+    assert.deepStrictEqual(
+      provider.searchResults.map(node => node.num_vulnerabilities),
+      [null, 0, -1, -1]
+    );
   });
 
   test("beginSearch synchronously supersedes the prior intent before either executes", async () => {
@@ -343,6 +386,17 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.state.failure.kind, "invalid_response");
   });
 
+  test("rejects malformed present package policy booleans", async () => {
+    const { provider } = createProvider({
+      fetchPage: async () => page([pkg("artifact", { deny_policy_violated: "true" })]),
+    });
+
+    await provider.search("workspace-a", "name:artifact");
+
+    assert.strictEqual(provider.state.committed, null);
+    assert.strictEqual(provider.state.failure.kind, "invalid_response");
+  });
+
   test("invalid repository counts fail currently and perform no fetch", async () => {
     let fetchCount = 0;
     const { provider, messages } = createProvider({
@@ -355,13 +409,13 @@ suite("SearchProvider atomic search state", () => {
     await provider.searchRepos("workspace-a", [], "name:artifact");
     await provider.searchRepos(
       "workspace-a",
-      Array.from({ length: 101 }, (_, index) => `repo-${index}`),
+      Array.from({ length: 1001 }, (_, index) => `repo-${index}`),
       "name:artifact"
     );
 
     assert.strictEqual(fetchCount, 0);
     assert.strictEqual(provider.state.failure.kind, "invalid_request");
-    assert.match(messages.error.at(-1), /between 1 and 100/);
+    assert.match(messages.error.at(-1), /between 1 and 1,000/);
   });
 
   test("rejects over-limit descriptor and package identity strings", async () => {
@@ -390,7 +444,7 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(responseProvider.state.failure.kind, "invalid_response");
   });
 
-  test("multi-repository work uses four workers and reserves the 5000-item budget", async () => {
+  test("100 repositories are searched completely with exactly four bounded workers", async () => {
     let calls = 0;
     let active = 0;
     let maxActive = 0;
@@ -409,64 +463,189 @@ suite("SearchProvider atomic search state", () => {
 
     await provider.searchRepos("workspace-a", repositories, "name:artifact");
 
-    assert.strictEqual(calls, 50);
+    assert.strictEqual(calls, 100);
     assert.strictEqual(maxActive, 4);
     assert.strictEqual(provider.state.committed.descriptor.repositories.length, 100);
     assert(Object.isFrozen(provider.state.committed.descriptor.repositories));
-    assert.strictEqual(provider.state.committed.diagnostics.unsearchedRepositoryCount, 50);
+    assert.strictEqual(provider.state.committed.diagnostics.unsearchedRepositoryCount, 0);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, false);
+    assert.strictEqual(provider.state.committed.diagnostics.requestCount, 100);
     assert.strictEqual(provider.state.committed.pageable, false);
   });
 
-  test("reports first-page multi-repository truncation without offering paging", async () => {
-    const firstPage = Array.from({ length: 20 }, (_, index) => pkg(`artifact-${index}`));
+  test("1,000 repositories remain structurally bounded and complete", async function () {
+    this.timeout(10000);
+    let calls = 0;
+    let active = 0;
+    let maxActive = 0;
+    const repositories = Array.from({ length: 1000 }, (_, index) => `repo-${index}`);
     const { provider } = createProvider({
-      pageSize: 20,
-      fetchPage: async () => page(firstPage, {
-        pageSize: 20,
-        pageTotal: 50,
-        count: 1000,
-      }),
+      pageSize: 100,
+      fetchPage: async () => {
+        calls += 1;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await nextTurn();
+        active -= 1;
+        return page([], { pageSize: 100 });
+      },
+    });
+
+    await provider.searchRepos("workspace-a", repositories, "name:no-match");
+
+    assert.strictEqual(calls, 1000);
+    assert.strictEqual(maxActive, 4);
+    assert.strictEqual(provider.state.committed.diagnostics.requestCount, 1000);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, false);
+    assert.strictEqual(provider.state.committed.diagnostics.unsearchedRepositoryCount, 0);
+  });
+
+  test("FIFO reservations search every first page before any second page", async () => {
+    const calls = [];
+    const repositories = Array.from({ length: 100 }, (_, index) => `repo-${index}`);
+    const { provider } = createProvider({
+      pageSize: 1,
+      fetchPage: async (endpoint, requestedPage) => {
+        const repository = repositoryFromEndpoint(endpoint);
+        calls.push({ repository, page: requestedPage });
+        await nextTurn();
+        return page([pkg(`${repository}-${requestedPage}`, { repository })], {
+          requestedPage,
+          pageSize: 1,
+          pageTotal: 2,
+          count: 2,
+        });
+      },
+    });
+
+    await provider.searchRepos("workspace-a", repositories, "name:artifact");
+
+    assert.strictEqual(calls.length, 200);
+    assert(calls.slice(0, 100).every(call => call.page === 1));
+    assert(calls.slice(100).every(call => call.page === 2));
+    assert.strictEqual(new Set(calls.slice(0, 100).map(call => call.repository)).size, 100);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, false);
+  });
+
+  test("the global logical request ceiling stops at 2,000 without request amplification", async function () {
+    this.timeout(10000);
+    let calls = 0;
+    const repositories = Array.from({ length: 101 }, (_, index) => `repo-${index}`);
+    const { provider } = createProvider({
+      pageSize: 1,
+      fetchPage: async (endpoint, requestedPage) => {
+        calls += 1;
+        const repository = repositoryFromEndpoint(endpoint);
+        return page([pkg(`${repository}-${requestedPage}`, { repository })], {
+          requestedPage,
+          pageSize: 1,
+          pageTotal: 20,
+          count: 20,
+        });
+      },
+    });
+
+    await provider.searchRepos("workspace-a", repositories, "name:artifact");
+
+    assert.strictEqual(calls, 2000);
+    assert.strictEqual(provider.state.committed.diagnostics.requestCount, 2000);
+    assert.strictEqual(provider.state.committed.diagnostics.requestLimitReached, true);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, true);
+    assert(provider.state.committed.diagnostics.truncatedRepositoryCount > 0);
+  });
+
+  test("the per-repository page ceiling stops before page 21", async () => {
+    const calls = [];
+    const { provider } = createProvider({
+      pageSize: 1,
+      fetchPage: async (endpoint, requestedPage) => {
+        calls.push(requestedPage);
+        return page([pkg(`artifact-${requestedPage}`, {
+          repository: repositoryFromEndpoint(endpoint),
+        })], {
+          requestedPage,
+          pageSize: 1,
+          pageTotal: 21,
+          count: 21,
+        });
+      },
+    });
+
+    await provider.searchRepos("workspace-a", ["repo-a"], "name:artifact");
+
+    assert.deepStrictEqual(calls, Array.from({ length: 20 }, (_, index) => index + 1));
+    assert.strictEqual(provider.state.committed.diagnostics.pageLimitReached, true);
+    assert.strictEqual(provider.state.committed.diagnostics.truncatedRepositoryCount, 1);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, true);
+  });
+
+  test("discovers later-page results and completes anchored repository pagination", async () => {
+    const { provider } = createProvider({
+      pageSize: 2,
+      fetchPage: async (_endpoint, requestedPage) => requestedPage === 1
+        ? page([pkg("artifact-1"), pkg("artifact-2")], {
+          pageSize: 2,
+          pageTotal: 2,
+          count: 3,
+        })
+        : page([pkg("artifact-3")], {
+          requestedPage: 2,
+          pageSize: 2,
+          pageTotal: 2,
+          count: 3,
+        }),
     });
 
     await provider.searchRepos("workspace-a", ["repo-a"], "name:artifact");
 
     const committed = provider.state.committed;
-    assert.strictEqual(committed.results.length, 20);
-    assert.strictEqual(committed.totalCount, 1000);
+    assert.deepStrictEqual(committed.results.map(node => node.name), [
+      "artifact-1", "artifact-2", "artifact-3",
+    ]);
+    assert.strictEqual(committed.totalCount, 3);
     assert.strictEqual(committed.pageable, false);
-    assert.strictEqual(committed.diagnostics.truncatedRepositoryCount, 1);
-    assert.strictEqual(committed.diagnostics.truncatedResultCount, 980);
-    assert.strictEqual(committed.diagnostics.partial, true);
-    assert.strictEqual(committed.diagnostics.capReached, true);
-    assert.strictEqual(committed.diagnostics.truncationDetails.length, 1);
-    assert(Object.isFrozen(committed.diagnostics.truncationDetails));
-    assert(Object.isFrozen(committed.diagnostics.truncationDetails[0]));
+    assert.strictEqual(committed.diagnostics.truncatedRepositoryCount, 0);
+    assert.strictEqual(committed.diagnostics.partial, false);
+    assert.strictEqual(committed.diagnostics.requestCount, 2);
+    assert.strictEqual(committed.diagnostics.pageCount, 2);
 
     const items = (await provider.getChildren()).map(node => node.getTreeItem());
-    assert.match(items[0].description, /20 of 1,000 matching packages loaded \(partial\)/);
-    assert(items.some(item => /additional matching pages/.test(item.label)));
+    assert.match(items[0].description, /3 packages/);
     assert.strictEqual(items.some(item => item.contextValue === "loadMore"), false);
   });
 
   test("multi-repository cancellation stops scheduling and preserves prior state", async () => {
     const token = { isCancellationRequested: false };
     let calls = 0;
+    let active = 0;
+    const requests = [];
     const { provider, messages } = createProvider({
       cancellationToken: token,
       fetchPage: async () => {
         calls += 1;
-        token.isCancellationRequested = true;
-        return failedPage("cancelled");
+        active += 1;
+        const request = deferred();
+        requests.push(request);
+        const result = await request.promise;
+        active -= 1;
+        return result;
       },
     });
 
-    await provider.searchRepos(
+    const search = provider.searchRepos(
       "workspace-a",
       Array.from({ length: 20 }, (_, index) => `repo-${index}`),
       "name:artifact"
     );
+    await nextTurn();
+    assert.strictEqual(calls, 4);
+    assert.strictEqual(active, 4);
+    token.isCancellationRequested = true;
+    for (const request of requests) request.resolve(failedPage("cancelled"));
+    await search;
 
-    assert(calls <= 4);
+    assert.strictEqual(calls, 4);
+    assert.strictEqual(active, 0);
     assert.strictEqual(provider.state.committed, null);
     assert.strictEqual(provider.state.failure, null);
     assert.deepStrictEqual(messages.error, []);
@@ -495,6 +674,126 @@ suite("SearchProvider atomic search state", () => {
     assert.match(messages.warning[0], /and 5 more/);
   });
 
+  test("99 successful repositories survive one repository failure", async () => {
+    const repositories = Array.from({ length: 100 }, (_, index) => `repo-${index}`);
+    const { provider, messages } = createProvider({
+      fetchPage: async endpoint => {
+        const repository = repositoryFromEndpoint(endpoint);
+        if (repository === "repo-99") return failedPage("forbidden");
+        return page([pkg(`artifact-${repository}`, { repository })]);
+      },
+    });
+
+    await provider.searchRepos("workspace-a", repositories, "name:artifact");
+
+    assert.strictEqual(provider.searchResults.length, 99);
+    assert.strictEqual(provider.state.committed.diagnostics.failedRepositoryCount, 1);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, true);
+    assert.strictEqual(messages.warning.length, 1);
+    assert.strictEqual(messages.information.length, 0);
+  });
+
+  test("HTTP 429 opens the circuit, settles active workers, and schedules no queued work", async () => {
+    let calls = 0;
+    let active = 0;
+    const repositories = Array.from({ length: 100 }, (_, index) => `repo-${index}`);
+    const { provider } = createProvider({
+      fetchPage: async endpoint => {
+        calls += 1;
+        active += 1;
+        const repository = repositoryFromEndpoint(endpoint);
+        await nextTurn();
+        active -= 1;
+        if (repository === "repo-0") return failedPage("rate_limited");
+        return page([pkg(`artifact-${repository}`, { repository })]);
+      },
+    });
+
+    await provider.searchRepos("workspace-a", repositories, "name:artifact");
+
+    assert.strictEqual(active, 0);
+    assert.strictEqual(calls, 4);
+    assert.strictEqual(provider.state.committed.diagnostics.rateLimited, true);
+    assert.strictEqual(provider.state.committed.diagnostics.failedRepositoryCount, 1);
+    assert(provider.state.committed.diagnostics.unsearchedRepositoryCount >= 96);
+    assert(provider.searchResults.length > 0);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, true);
+  });
+
+  test("a thrown repository request releases its worker and does not starve later work", async () => {
+    let calls = 0;
+    let active = 0;
+    let maxActive = 0;
+    const repositories = Array.from({ length: 100 }, (_, index) => `repo-${index}`);
+    const { provider } = createProvider({
+      fetchPage: async endpoint => {
+        calls += 1;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        const repository = repositoryFromEndpoint(endpoint);
+        await nextTurn();
+        active -= 1;
+        if (repository === "repo-0") throw new Error("secret transport detail");
+        return page([pkg(`artifact-${repository}`, { repository })]);
+      },
+    });
+
+    await provider.searchRepos("workspace-a", repositories, "name:artifact");
+
+    assert.strictEqual(calls, 100);
+    assert.strictEqual(active, 0);
+    assert.strictEqual(maxActive, 4);
+    assert.strictEqual(provider.searchResults.length, 99);
+    assert.strictEqual(provider.state.committed.diagnostics.failedRepositoryCount, 1);
+  });
+
+  test("an unexpected page-processing exception settles every worker and preserves successes", async () => {
+    let calls = 0;
+    let active = 0;
+    const repositories = Array.from({ length: 100 }, (_, index) => `repo-${index}`);
+    const { provider } = createProvider({
+      fetchPage: async endpoint => {
+        calls += 1;
+        active += 1;
+        const repository = repositoryFromEndpoint(endpoint);
+        await nextTurn();
+        active -= 1;
+        if (repository === "repo-0") {
+          return {
+            data: [],
+            get pagination() { throw new Error("untrusted accessor"); },
+            error: null,
+          };
+        }
+        return page([pkg(`artifact-${repository}`, { repository })]);
+      },
+    });
+
+    await provider.searchRepos("workspace-a", repositories, "name:artifact");
+
+    assert.strictEqual(calls, 4);
+    assert.strictEqual(active, 0);
+    assert.strictEqual(provider.searchResults.length, 3);
+    assert.strictEqual(provider.state.committed.diagnostics.failedRepositoryCount, 1);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, true);
+  });
+
+  test("an incomplete empty multi-repository result is never announced as no packages", async () => {
+    const { provider, messages } = createProvider({
+      fetchPage: async endpoint => repositoryFromEndpoint(endpoint) === "repo-a"
+        ? page([])
+        : failedPage("forbidden"),
+    });
+
+    await provider.searchRepos("workspace-a", ["repo-a", "repo-b"], "name:missing");
+
+    assert.strictEqual(provider.searchResults.length, 0);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, true);
+    assert.strictEqual(messages.information.length, 0);
+    const summary = (await provider.getChildren())[0].getTreeItem();
+    assert.match(summary.description, /incomplete/);
+  });
+
   test("all repository failures preserve the prior committed session", async () => {
     let fail = false;
     const { provider } = createProvider({
@@ -510,7 +809,7 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.state.failure.descriptor.kind, "repositories");
   });
 
-  test("deduplicates by namespace, repository, and canonical slug_perm", async () => {
+  test("fails a single-scope page closed when it repeats a canonical package identity", async () => {
     const duplicate = pkg("artifact");
     const { provider } = createProvider({
       fetchPage: async () => page([duplicate, { ...duplicate }]),
@@ -518,7 +817,209 @@ suite("SearchProvider atomic search state", () => {
 
     await provider.search("workspace-a", "name:artifact");
 
-    assert.strictEqual(provider.searchResults.length, 1);
+    assert.strictEqual(provider.searchResults.length, 0);
+    assert.strictEqual(provider.state.committed, null);
+    assert.strictEqual(provider.state.failure.kind, "invalid_response");
+  });
+
+  test("a repeated identity is terminal and incomplete for that repository", async () => {
+    const repeated = pkg("artifact");
+    let calls = 0;
+    const { provider } = createProvider({
+      pageSize: 2,
+      fetchPage: async (_endpoint, requestedPage) => {
+        calls += 1;
+        if (requestedPage === 1) {
+          return page([repeated, pkg("second")], {
+            pageSize: 2,
+            pageTotal: 2,
+            count: 4,
+          });
+        }
+        return page([{ ...repeated }, pkg("fourth")], {
+          requestedPage: 2,
+          pageSize: 2,
+          pageTotal: 2,
+          count: 4,
+        });
+      },
+    });
+
+    await provider.searchRepos("workspace-a", ["repo-a"], "name:artifact");
+
+    assert.strictEqual(calls, 2);
+    assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["artifact", "second"]);
+    assert.strictEqual(provider.state.committed.diagnostics.failedRepositoryCount, 1);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, true);
+  });
+
+  test("a conflicting canonical identity fails closed without publishing both records", async () => {
+    const sharedIdentity = "immutable-id";
+    const { provider } = createProvider({
+      fetchPage: async () => page([
+        pkg("artifact-a", { slug_perm: sharedIdentity }),
+        pkg("artifact-b", { slug_perm: sharedIdentity }),
+      ], { pageSize: 2, count: 2 }),
+    });
+
+    await provider.searchRepos("workspace-a", ["repo-a"], "name:artifact");
+
+    assert.deepStrictEqual(provider.searchResults.map(node => node.name), []);
+    assert.strictEqual(provider.state.committed, null);
+    assert.strictEqual(provider.state.failure.kind, "invalid_response");
+    assert.match(provider.state.failure.message, /conflicting records/);
+  });
+
+  test("cross-page pagination metadata changes preserve prior pages as incomplete", async () => {
+    const { provider } = createProvider({
+      pageSize: 1,
+      fetchPage: async (_endpoint, requestedPage) => requestedPage === 1
+        ? page([pkg("first")], { pageSize: 1, pageTotal: 2, count: 2 })
+        : page([pkg("second")], {
+          requestedPage: 2,
+          pageSize: 1,
+          pageTotal: 3,
+          count: 3,
+        }),
+    });
+
+    await provider.searchRepos("workspace-a", ["repo-a"], "name:artifact");
+
+    assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["first"]);
+    assert.strictEqual(provider.state.committed.diagnostics.failedRepositoryCount, 1);
+    assert.match(provider.state.committed.diagnostics.failureDetails[0].message, /changed pagination metadata/);
+  });
+
+  test("a short authoritative non-final page terminates without requesting another page", async () => {
+    let calls = 0;
+    const { provider } = createProvider({
+      pageSize: 2,
+      fetchPage: async () => {
+        calls += 1;
+        return page([pkg("only-one")], { pageSize: 2, pageTotal: 2, count: 3 });
+      },
+    });
+
+    await provider.searchRepos("workspace-a", ["repo-a"], "name:artifact");
+
+    assert.strictEqual(calls, 1);
+    assert.strictEqual(provider.state.committed, null);
+    assert.strictEqual(provider.state.failure.kind, "invalid_response");
+  });
+
+  test("page-total-only metadata permits a full non-final page and bounded final page", async () => {
+    const calls = [];
+    const { provider } = createProvider({
+      pageSize: 2,
+      fetchPage: async (_endpoint, requestedPage) => {
+        calls.push(requestedPage);
+        return requestedPage === 1
+          ? page([pkg("first"), pkg("second")], {
+            pageSize: 2,
+            pageTotal: 2,
+            count: null,
+            countAuthoritative: false,
+          })
+          : page([pkg("third")], {
+            requestedPage: 2,
+            pageSize: 2,
+            pageTotal: 2,
+            count: null,
+            countAuthoritative: false,
+          });
+      },
+    });
+
+    await provider.searchRepos("workspace-a", ["repo-a"], "name:artifact");
+
+    assert.deepStrictEqual(calls, [1, 2]);
+    assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["first", "second", "third"]);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, false);
+  });
+
+  test("multi-repository result retention is capped with only bounded in-flight overflow", async () => {
+    let calls = 0;
+    let active = 0;
+    let maxActive = 0;
+    const repositories = Array.from({ length: 60 }, (_, index) => `repo-${index}`);
+    const { provider } = createProvider({
+      pageSize: 100,
+      fetchPage: async endpoint => {
+        calls += 1;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        const repository = repositoryFromEndpoint(endpoint);
+        await nextTurn();
+        active -= 1;
+        return page(Array.from({ length: 100 }, (_, index) => (
+          pkg(`${repository}-${index}`, { repository })
+        )), { pageSize: 100, count: 100 });
+      },
+    });
+
+    await provider.searchRepos("workspace-a", repositories, "name:artifact");
+
+    assert.strictEqual(provider.searchResults.length, 5000);
+    assert.strictEqual(maxActive, 4);
+    assert(calls >= 50 && calls <= 53);
+    assert(calls * 100 <= 5300);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, true);
+    assert.strictEqual(provider.state.committed.diagnostics.capReached, true);
+    assert(provider.state.committed.diagnostics.droppedResultCount <= 300);
+  });
+
+  test("exactly 5,000 complete results do not imply omitted work", async () => {
+    const repositories = Array.from({ length: 50 }, (_, index) => `repo-${index}`);
+    const { provider } = createProvider({
+      pageSize: 100,
+      fetchPage: async endpoint => {
+        const repository = repositoryFromEndpoint(endpoint);
+        return page(Array.from({ length: 100 }, (_, index) => (
+          pkg(`${repository}-${index}`, { repository })
+        )), { pageSize: 100, count: 100 });
+      },
+    });
+
+    await provider.searchRepos("workspace-a", repositories, "name:artifact");
+
+    assert.strictEqual(provider.searchResults.length, 5000);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, false);
+    assert.strictEqual(provider.state.committed.diagnostics.capReached, false);
+    const labels = (await provider.getChildren()).map(node => node.getTreeItem().label);
+    assert.strictEqual(labels.includes("Showing the first 5,000 results"), false);
+  });
+
+  test("a stale multi-repository run settles without publishing over the current search", async () => {
+    const slow = deferred();
+    let activeSlow = 0;
+    const { provider, messages } = createProvider({
+      fetchPage: async (endpoint, _requestedPage, _pageSize, query) => {
+        const repository = repositoryFromEndpoint(endpoint);
+        if (query === "slow") {
+          activeSlow += 1;
+          const result = await slow.promise;
+          activeSlow -= 1;
+          return result;
+        }
+        return page([pkg("current", { repository })]);
+      },
+    });
+
+    const staleSearch = provider.searchRepos(
+      "workspace-a",
+      ["repo-a", "repo-b"],
+      "slow"
+    );
+    await nextTurn();
+    assert.strictEqual(activeSlow, 2);
+    await provider.searchRepos("workspace-a", ["repo-current"], "current");
+    slow.resolve(page([pkg("stale")]));
+    await staleSearch;
+
+    assert.strictEqual(activeSlow, 0);
+    assert.strictEqual(provider.currentQuery, "current");
+    assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["current"]);
+    assert.deepStrictEqual(messages.error, []);
   });
 
   test("duplicate next-page commands return the same promise and fetch once", async () => {
@@ -599,7 +1100,7 @@ suite("SearchProvider atomic search state", () => {
     assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["new"]);
   });
 
-  test("stops page accumulation at 5000 and replaces Load More with truthful guidance", async function () {
+  test("stops single-scope pagination at the cumulative page limit", async function () {
     this.timeout(5000);
     let calls = 0;
     const { provider } = createProvider({
@@ -619,18 +1120,70 @@ suite("SearchProvider atomic search state", () => {
     });
     await provider.search("workspace-a", "name:artifact");
 
-    for (let pageNumber = 2; pageNumber <= 50; pageNumber += 1) {
+    for (let pageNumber = 2; pageNumber <= 20; pageNumber += 1) {
       await provider.loadNextPage();
     }
 
-    assert.strictEqual(calls, 50);
-    assert.strictEqual(provider.searchResults.length, 5000);
-    assert.strictEqual(provider.currentPage, 50);
+    assert.strictEqual(calls, 20);
+    assert.strictEqual(provider.searchResults.length, 2000);
+    assert.strictEqual(provider.currentPage, 20);
     assert.strictEqual(provider.state.committed.pageable, false);
     assert.strictEqual(provider.state.committed.diagnostics.capReached, true);
+    assert.strictEqual(provider.state.committed.diagnostics.pageLimitReached, true);
     const labels = (await provider.getChildren()).map(node => node.getTreeItem().label);
-    assert(labels.includes("Showing the first 5,000 results"));
+    assert(labels.includes("Search loading limit reached"));
     assert(!labels.some(label => label.startsWith("Load more results")));
+  });
+
+  test("invalid continuation metadata is terminal and cannot amplify requests", async () => {
+    let calls = 0;
+    const { provider } = createProvider({
+      pageSize: 2,
+      fetchPage: async (_endpoint, requestedPage) => {
+        calls += 1;
+        if (requestedPage === 1) {
+          return page([pkg("one"), pkg("two")], { pageSize: 2, pageTotal: 2, count: 3 });
+        }
+        return page([pkg("three")], {
+          requestedPage: 2,
+          pageSize: 2,
+          pageTotal: 3,
+          count: 5,
+        });
+      },
+    });
+    await provider.search("workspace-a", "name:artifact");
+
+    await provider.loadNextPage();
+    await provider.loadNextPage();
+
+    assert.strictEqual(calls, 2);
+    assert.strictEqual(provider.state.committed.pageable, false);
+    assert.strictEqual(provider.state.committed.diagnostics.partial, true);
+    assert.strictEqual(provider.state.failure.kind, "invalid_response");
+  });
+
+  test("transient continuation retries consume a cumulative request budget", async () => {
+    let calls = 0;
+    const { provider } = createProvider({
+      pageSize: 2,
+      fetchPage: async (_endpoint, requestedPage) => {
+        calls += 1;
+        return requestedPage === 1
+          ? page([pkg("one"), pkg("two")], { pageSize: 2, pageTotal: 2, count: 3 })
+          : failedPage("rate_limited", 2, 2);
+      },
+    });
+    await provider.search("workspace-a", "name:artifact");
+
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await provider.loadNextPage();
+    }
+
+    assert.strictEqual(calls, 24);
+    assert.strictEqual(provider.state.committed.diagnostics.requestCount, 24);
+    assert.strictEqual(provider.state.committed.diagnostics.requestLimitReached, true);
+    assert.strictEqual(provider.state.committed.pageable, false);
   });
 
   test("clear invalidates a pending root and publishes no later result", async () => {
@@ -733,12 +1286,15 @@ function pkg(name, overrides = {}) {
 function page(data, options = {}) {
   const requestedPage = options.requestedPage || 1;
   const pageTotal = options.pageTotal || requestedPage;
+  const hasCount = Object.prototype.hasOwnProperty.call(options, "count");
+  const hasCountAuthority = Object.prototype.hasOwnProperty.call(options, "countAuthoritative");
   return {
     data,
     pagination: {
       page: requestedPage,
       pageTotal,
-      count: options.count ?? data.length,
+      count: hasCount ? options.count : data.length,
+      ...(hasCountAuthority ? { countAuthoritative: options.countAuthoritative } : {}),
       pageSize: options.pageSize || 50,
     },
     error: null,

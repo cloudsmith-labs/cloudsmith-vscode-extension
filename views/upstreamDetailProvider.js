@@ -35,6 +35,15 @@ class UpstreamDetailProvider {
       const fetchState = await this._fetchGroupedUpstreams(workspace, repoSlug, abortController.signal);
 
       if (!fetchState) {
+        if (this._canRender(panel, requestId) && !abortController.signal.aborted) {
+          panel.webview.html = this._getHtmlContent(workspace, repoSlug, repoName, {
+            groupedUpstreams: new Map(),
+            failedFormats: SUPPORTED_UPSTREAM_FORMATS,
+            uninspectedFormats: [],
+            successfulFormats: 0,
+            complete: false,
+          });
+        }
         return;
       }
 
@@ -79,7 +88,10 @@ class UpstreamDetailProvider {
   }
 
   async _fetchGroupedUpstreams(workspace, repoSlug, signal) {
-    const upstreamData = await getAllUpstreamData(this.context, workspace, repoSlug, { signal });
+    const upstreamData = await getAllUpstreamData(this.context, workspace, repoSlug, {
+      signal,
+      bypassCache: true,
+    });
     if (upstreamData === null || signal.aborted) {
       return null;
     }
@@ -113,10 +125,14 @@ class UpstreamDetailProvider {
     return {
       groupedUpstreams: grouped,
       failedFormats: Array.isArray(upstreamData.failedFormats) ? upstreamData.failedFormats : [],
+      uninspectedFormats: Array.isArray(upstreamData.uninspectedFormats)
+        ? upstreamData.uninspectedFormats
+        : [],
       successfulFormats: typeof upstreamData.successfulFormats === "number"
         ? upstreamData.successfulFormats
         : 0,
-      };
+      complete: upstreamData.complete === true,
+    };
   }
   _abortInFlightRequest() {
     if (this._abortController) {
@@ -172,10 +188,16 @@ class UpstreamDetailProvider {
   }
 
   _getHtmlContent(workspace, repoSlug, repoName, fetchState) {
-    const { groupedUpstreams, failedFormats, successfulFormats } = fetchState;
+    const {
+      groupedUpstreams,
+      failedFormats = [],
+      uninspectedFormats = [],
+      successfulFormats,
+    } = fetchState;
     const formatSections = [];
     const hasLoadedUpstreams = groupedUpstreams.size > 0;
-    const hasFailures = failedFormats.length > 0;
+    const unavailableFormats = [...new Set([...failedFormats, ...uninspectedFormats])];
+    const hasFailures = unavailableFormats.length > 0 || fetchState.complete === false;
 
     for (const format of SUPPORTED_UPSTREAM_FORMATS) {
       const upstreams = groupedUpstreams.get(format);
@@ -192,8 +214,16 @@ class UpstreamDetailProvider {
 </section>`);
     }
 
+    const partialWarning = hasLoadedUpstreams && hasFailures
+      ? `<div class="error-state">
+  <span class="error-state-title">Some upstream data could not be loaded.</span>
+  Loaded upstreams are shown, but configuration for ${this._escape(
+    unavailableFormats.length > 0 ? unavailableFormats.join(", ") : "one or more formats"
+  )} is incomplete.
+</div>`
+      : "";
     const contentHtml = hasLoadedUpstreams
-      ? formatSections.join("\n")
+      ? `${partialWarning}${formatSections.join("\n")}`
       : this._getEmptyOrErrorState(hasFailures, successfulFormats);
 
     return `<!DOCTYPE html>
@@ -541,6 +571,11 @@ class UpstreamDetailProvider {
       this._panel.dispose();
       this._panel = null;
     }
+  }
+
+
+  resetForAccountChange() {
+    this.dispose();
   }
 }
 

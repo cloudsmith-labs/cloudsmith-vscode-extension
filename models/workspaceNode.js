@@ -23,6 +23,14 @@ class WorkspaceNode {
       || (() => new CloudsmithAPI(this.context));
     this._fetchWorkspaceRepositories = options.fetchWorkspaceRepositories
       || workspaceRepositoryFetcher.fetchWorkspaceRepositories;
+    this._signal = options.signal || null;
+    this._createRepositoryNode = options.createRepositoryNode
+      || ((repo, workspace) => new repositoryNode(
+        repo,
+        workspace,
+        this.context,
+        { connectionManager: this._connectionManager, createCloudsmithAPI: this._createCloudsmithAPI }
+      ));
     this.name = item.name;
     this.slug = item.slug;
     this.workspace = item.slug;
@@ -47,32 +55,32 @@ class WorkspaceNode {
     const account = captureAccount(this._connectionManager);
     if (!account) return [];
     const workspace = this.workspace;
-    const result = await this._fetchWorkspaceRepositories(this.context, workspace, {
-      account,
-      connectionManager: this._connectionManager,
-    });
+    let result;
+    try {
+      result = await this._fetchWorkspaceRepositories(this.context, workspace, {
+        account,
+        connectionManager: this._connectionManager,
+        signal: this._signal,
+      });
+    } catch {
+      return isAccountCurrent(this._connectionManager, account)
+        ? [repositoryCollectionWarning(workspace, null)]
+        : [];
+    }
+    if (!result || !Array.isArray(result.items)) {
+      return [repositoryCollectionWarning(workspace, result)];
+    }
     if (!isAccountCurrent(this._connectionManager, account) || result.stale) return [];
 
-    if (result.error) {
-      return [new InfoNode(
-        "Failed to load repositories",
-        "Check your connection and try refreshing",
-        `Failed to load repositories for ${workspace}: ${formatApiError(result.error)}`,
-        "warning"
-      )];
-    }
-
-    const repositories = result.repositories;
+    const repositories = result.items;
     const RepositoryNodes = [];
 
     for (const repo of repositories) {
-      const repositoryNodeInst = new repositoryNode(
-        repo,
-        this.slug,
-        this.context,
-        { connectionManager: this._connectionManager, createCloudsmithAPI: this._createCloudsmithAPI }
-      );
+      const repositoryNodeInst = this._createRepositoryNode(repo, this.slug);
       RepositoryNodes.push(repositoryNodeInst);
+    }
+    if (result.complete !== true) {
+      RepositoryNodes.push(repositoryCollectionWarning(workspace, result));
     }
     return RepositoryNodes;
   }
@@ -87,6 +95,7 @@ class WorkspaceNode {
       const result = await cloudsmithAPI.get(apiEndpoint(["quota", this.workspace]), {
         responseType: "object",
         retry: "safe-read",
+        signal: this._signal,
       });
 
       if (result.ok && result.data.usage && typeof result.data.usage === "object") {
@@ -106,6 +115,20 @@ class WorkspaceNode {
 
     return children;
   }
+}
+
+function repositoryCollectionWarning(workspace, result) {
+  const loaded = Array.isArray(result?.items) ? result.items.length : 0;
+  const error = result?.failures?.[0]?.error;
+  const detail = error
+    ? formatApiError(error)
+    : "A safe collection limit was reached before completeness was proven.";
+  return new InfoNode(
+    loaded > 0 ? "Repository list is incomplete" : "Failed to load repositories",
+    loaded > 0 ? `${loaded.toLocaleString()} repositories loaded` : "Check your connection and try refreshing",
+    `Repositories for ${workspace} are incomplete: ${detail}`,
+    "warning"
+  );
 }
 
 module.exports = WorkspaceNode;

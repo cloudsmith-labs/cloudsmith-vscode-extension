@@ -2,6 +2,7 @@
 const { CloudsmithAPI } = require("./cloudsmithAPI");
 const { apiEndpoint } = require("./apiEndpoint");
 const { getFoundDependencyKey } = require("./foundDependencyKey");
+const { getPackageVulnerabilityState } = require("./packageVulnerabilities");
 const {
   captureAccount,
   isAccountCurrent,
@@ -10,7 +11,11 @@ const {
 
 const VULNERABILITY_CACHE_TTL_MS = 10 * 60 * 1000;
 const VULNERABILITY_CACHE_MAX_SIZE = 5000;
-const VULNERABILITY_CONCURRENCY = 10;
+const VULNERABILITY_CONCURRENCY = 4;
+const MAX_VULNERABILITY_DETAIL_REQUESTS = 1000;
+const MAX_VULNERABILITY_DETAIL_ENTRIES = 5000;
+const MAX_VULNERABILITY_IDENTIFIER_LENGTH = 512;
+const MAX_VULNERABILITY_DISPLAY_LENGTH = 4096;
 const vulnerabilityCache = new Map();
 
 function severityRank(severity) {
@@ -40,18 +45,34 @@ function canonicalSeverity(severity) {
     case "low":
       return "Low";
     default:
-      return severity ? String(severity).trim() : null;
+      return "Unknown";
   }
 }
 
 function getIndicatorCount(packageModel) {
-  const rawCount = packageModel && (
-    packageModel.vulnerability_scan_results_count
-    || packageModel.num_vulnerabilities
-    || packageModel.vulnerabilityCount
-  );
-  const count = Number(rawCount);
-  return Number.isFinite(count) && count > 0 ? count : 0;
+  const state = getPackageVulnerabilityState(packageModel);
+  if (state.count !== null) {
+    return {
+      count: state.count,
+      authoritative: true,
+      detected: state.count > 0,
+      unknown: false,
+    };
+  }
+  if (state.detected) {
+    return {
+      count: state.candidateCount && state.candidateCount > 0 ? state.candidateCount : 0,
+      authoritative: false,
+      detected: true,
+      unknown: state.unknown,
+    };
+  }
+  return {
+    count: 0,
+    authoritative: !state.unknown,
+    detected: false,
+    unknown: state.unknown,
+  };
 }
 
 function buildEmptySummary(packageModel) {
@@ -60,7 +81,7 @@ function buildEmptySummary(packageModel) {
     maxSeverity: canonicalSeverity(packageModel && packageModel.max_severity),
     cveIds: [],
     hasFixAvailable: false,
-    severityCounts: {},
+    severityCounts: Object.create(null),
     entries: [],
     detailsLoaded: false,
     policyViolated: Boolean(packageModel && packageModel.vulnerability_policy_violated),
@@ -68,14 +89,21 @@ function buildEmptySummary(packageModel) {
 }
 
 function buildIndicatorSummary(packageModel) {
-  const count = getIndicatorCount(packageModel);
-  if (count === 0) {
-    return buildEmptySummary(packageModel);
+  const indicator = getIndicatorCount(packageModel);
+  const { count } = indicator;
+  if (count === 0 && !indicator.detected && !indicator.unknown) {
+    return {
+      ...buildEmptySummary(packageModel),
+      countAuthoritative: indicator.authoritative,
+      countKnown: indicator.authoritative,
+      detected: false,
+      unknown: false,
+    };
   }
 
   const maxSeverity = canonicalSeverity(packageModel && packageModel.max_severity);
-  const severityCounts = {};
-  if (maxSeverity) {
+  const severityCounts = Object.create(null);
+  if (indicator.detected && maxSeverity && maxSeverity !== "Unknown") {
     severityCounts[maxSeverity] = 1;
   }
 
@@ -87,6 +115,10 @@ function buildIndicatorSummary(packageModel) {
     severityCounts,
     entries: [],
     detailsLoaded: false,
+    countAuthoritative: indicator.authoritative,
+    countKnown: indicator.authoritative,
+    detected: indicator.detected,
+    unknown: indicator.unknown,
     policyViolated: Boolean(packageModel && packageModel.vulnerability_policy_violated),
   };
 }
@@ -146,7 +178,7 @@ function extractFixVersion(entry) {
   }
 
   for (const candidate of candidates) {
-    const value = String(candidate || "").trim();
+    const value = boundedDisplayString(candidate, MAX_VULNERABILITY_IDENTIFIER_LENGTH);
     if (value) {
       return value;
     }
@@ -164,36 +196,61 @@ function normalizeEntry(entry) {
     )
   ) || "Unknown";
 
-  const cveId = String(
+  const cveId = boundedDisplayString(
     (entry && (
       entry.vulnerability_id
       || entry.identifier
       || entry.id
       || entry.name
-    )) || "Unknown"
-  ).trim();
+    )) || "Unknown",
+    MAX_VULNERABILITY_IDENTIFIER_LENGTH
+  ) || "Unknown";
 
   const fixVersion = extractFixVersion(entry);
 
   return {
     cveId,
     severity,
-    description: String(entry && (entry.title || entry.description || "") || "").trim(),
+    description: boundedDisplayString(
+      entry && (entry.title || entry.description || ""),
+      MAX_VULNERABILITY_DISPLAY_LENGTH
+    ) || "",
     fixVersion,
     hasFixAvailable: Boolean(fixVersion),
   };
 }
 
+function vulnerabilityIdentity(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  const aliases = ["vulnerability_id", "identifier", "id", "name"]
+    .filter(key => Object.prototype.hasOwnProperty.call(entry, key))
+    .map(key => boundedDisplayString(entry[key], MAX_VULNERABILITY_IDENTIFIER_LENGTH))
+    .filter(Boolean);
+  if (aliases.length === 0) return null;
+  const identities = new Set(aliases.map(value => value.toLocaleLowerCase("en-US")));
+  return identities.size === 1 ? [...identities][0] : null;
+}
+
 function summarizeEntries(entries, fallbackSummary) {
-  const severityCounts = {};
+  const identities = entries.map(vulnerabilityIdentity);
+  if (
+    identities.some(identity => !identity)
+    || new Set(identities).size !== identities.length
+    || fallbackSummary.countAuthoritative !== true
+    || entries.length !== fallbackSummary.count
+  ) return fallbackSummary;
+
+  const severityCounts = Object.create(null);
   const cveIds = [];
+  const seenCveIds = new Set();
   const normalizedEntries = [];
   let maxSeverity = null;
   let hasFixAvailable = false;
 
   for (const entry of entries.map(normalizeEntry)) {
     normalizedEntries.push(entry);
-    if (!cveIds.includes(entry.cveId)) {
+    if (!seenCveIds.has(entry.cveId)) {
+      seenCveIds.add(entry.cveId);
       cveIds.push(entry.cveId);
     }
     severityCounts[entry.severity] = (severityCounts[entry.severity] || 0) + 1;
@@ -206,13 +263,17 @@ function summarizeEntries(entries, fallbackSummary) {
   }
 
   return {
-    count: normalizedEntries.length || fallbackSummary.count || 0,
+    count: fallbackSummary.count,
     maxSeverity: maxSeverity || fallbackSummary.maxSeverity || null,
     cveIds,
     hasFixAvailable,
     severityCounts,
     entries: normalizedEntries,
     detailsLoaded: true,
+    countAuthoritative: true,
+    countKnown: true,
+    detected: normalizedEntries.length > 0,
+    unknown: false,
     policyViolated: Boolean(fallbackSummary.policyViolated),
   };
 }
@@ -291,7 +352,7 @@ async function runPool(items, concurrency, worker) {
     })());
   }
 
-  await Promise.all(workers);
+  await Promise.allSettled(workers);
 }
 
 function pruneExpiredVulnerabilityCache(now = Date.now()) {
@@ -386,12 +447,17 @@ async function fetchVulnerabilitySummary(
   } catch {
     return null;
   }
-  const response = await api.getV2(endpoint, {
-    responseType: "json",
-    validate: isRecognizedVulnerabilityDetail,
-    retry: "never",
-    cancellationToken,
-  });
+  let response;
+  try {
+    response = await api.getV2(endpoint, {
+      responseType: "json",
+      validate: isRecognizedVulnerabilityDetail,
+      retry: "never",
+      cancellationToken,
+    });
+  } catch {
+    return null;
+  }
   if (
     !response.ok
     || isCancellationRequested(cancellationToken)
@@ -400,9 +466,13 @@ async function fetchVulnerabilitySummary(
     return null;
   }
 
-  const summary = summarizeEntries(extractVulnerabilityEntries(response.data), fallbackSummary);
+  const entries = extractVulnerabilityEntries(response.data);
+  if (!isVulnerabilityRecordArray(entries)) return null;
+  const summary = summarizeEntries(entries, fallbackSummary);
   if (!isAccountCurrent(connectionManager, account)) return null;
-  setCachedVulnerabilitySummary(packageKey, summary, account, now());
+  if (summary.detailsLoaded) {
+    setCachedVulnerabilitySummary(packageKey, summary, account, now());
+  }
   return summary;
 }
 
@@ -437,16 +507,22 @@ async function enrichVulnerabilities(dependencies, workspace, options = {}) {
   for (const group of groups) {
     const indicatorSummary = buildIndicatorSummary(group.packageModel);
     patchMap.set(group.key, indicatorSummary);
-    if (indicatorSummary.count > 0) {
-      detailTargets.push({
-        ...group,
-        fallbackSummary: indicatorSummary,
-      });
+    if (
+      indicatorSummary.count > 0
+      && indicatorSummary.count <= MAX_VULNERABILITY_DETAIL_ENTRIES
+      && indicatorSummary.countAuthoritative === true
+    ) {
+      if (detailTargets.length < MAX_VULNERABILITY_DETAIL_REQUESTS) {
+        detailTargets.push({
+          ...group,
+          fallbackSummary: indicatorSummary,
+        });
+      }
     }
   }
 
   if (onProgress && patchMap.size > 0 && isAccountCurrent(connectionManager, account)) {
-    onProgress(new Map(patchMap), {
+    publishProgress(onProgress, new Map(patchMap), {
       completed: 0,
       total: detailTargets.length,
       workspace,
@@ -482,7 +558,7 @@ async function enrichVulnerabilities(dependencies, workspace, options = {}) {
     completed += 1;
 
     if (onProgress && isAccountCurrent(connectionManager, account)) {
-      onProgress(summary ? new Map([[target.key, summary]]) : new Map(), {
+      publishProgress(onProgress, summary ? new Map([[target.key, summary]]) : new Map(), {
         completed,
         total: detailTargets.length,
         workspace,
@@ -495,6 +571,14 @@ async function enrichVulnerabilities(dependencies, workspace, options = {}) {
     return Array.isArray(dependencies) ? dependencies : [];
   }
   return applyVulnerabilityPatch(dependencies, patchMap);
+}
+
+function publishProgress(onProgress, patchMap, metadata) {
+  try {
+    onProgress(patchMap, metadata);
+  } catch {
+    // Progress callbacks are observers and cannot abort or outlive the bounded work pool.
+  }
 }
 
 function isRecognizedVulnerabilityDetail(value) {
@@ -513,24 +597,50 @@ function isRecognizedVulnerabilityDetail(value) {
   if (Object.prototype.hasOwnProperty.call(value, "items")) {
     return Array.isArray(value.items) && isVulnerabilityRecordArray(value.items);
   }
-  return Array.isArray(value.scans) && value.scans.every(scan => (
-    scan
-    && typeof scan === "object"
-    && !Array.isArray(scan)
-    && Array.isArray(scan.results)
-    && isVulnerabilityRecordArray(scan.results)
-  ));
+  if (!Array.isArray(value.scans) || value.scans.length > 100) return false;
+  let totalEntries = 0;
+  for (const scan of value.scans) {
+    if (
+      !scan
+      || typeof scan !== "object"
+      || Array.isArray(scan)
+      || !Array.isArray(scan.results)
+      || !isVulnerabilityRecordArray(scan.results)
+    ) return false;
+    totalEntries += scan.results.length;
+    if (totalEntries > MAX_VULNERABILITY_DETAIL_ENTRIES) return false;
+  }
+  return true;
 }
 
 function isVulnerabilityRecordArray(value) {
-  return Array.isArray(value) && value.every(entry => (
+  if (
+    !Array.isArray(value)
+    || value.length > MAX_VULNERABILITY_DETAIL_ENTRIES
+    || !value.every(entry => (
     Boolean(entry)
     && typeof entry === "object"
     && !Array.isArray(entry)
     && [entry.vulnerability_id, entry.identifier, entry.id, entry.name]
-      .some(identifier => typeof identifier === "string" && identifier.trim().length > 0)
-    && (entry.severity === undefined || entry.severity === null || typeof entry.severity === "string")
-  ));
+      .some(identifier => Boolean(boundedDisplayString(
+        identifier,
+        MAX_VULNERABILITY_IDENTIFIER_LENGTH
+      )))
+    && (
+      entry.severity === undefined
+      || entry.severity === null
+      || Boolean(boundedDisplayString(entry.severity, 100))
+    )
+  ))
+  ) return false;
+  const identities = value.map(vulnerabilityIdentity);
+  return identities.every(Boolean) && new Set(identities).size === identities.length;
+}
+
+function boundedDisplayString(value, maxLength) {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const normalized = String(value).trim();
+  return normalized.length > 0 && normalized.length <= maxLength ? normalized : null;
 }
 
 module.exports = {
@@ -541,5 +651,6 @@ module.exports = {
   getVulnerabilityCacheSize() {
     return vulnerabilityCache.size;
   },
+  MAX_VULNERABILITY_DETAIL_REQUESTS,
   VULNERABILITY_CACHE_MAX_SIZE,
 };

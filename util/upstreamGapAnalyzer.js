@@ -2,8 +2,9 @@
 const { canonicalFormat, normalizePackageName } = require("./packageNameNormalizer");
 const { normalizeUpstreamFormat } = require("./upstreamFormats");
 const { UpstreamChecker } = require("./upstreamChecker");
+const { UpstreamOperationScheduler } = require("./upstreamOperationScheduler");
 
-const UPSTREAM_REPO_CONCURRENCY = 5;
+const UPSTREAM_REPO_CONCURRENCY = 4;
 
 function getUncoveredDependencyKey(dependency) {
   const format = canonicalFormat(dependency && (dependency.format || dependency.ecosystem));
@@ -48,7 +49,7 @@ function buildReachableDetail(snapshot, upstream, format) {
   return `${buildProxyLabel(upstream, format)} on ${snapshot.repo}`;
 }
 
-function classifyDependency(dependency, snapshots) {
+function classifyDependency(dependency, snapshots, options = {}) {
   const key = getUncoveredDependencyKey(dependency);
   const format = canonicalFormat(dependency && (dependency.format || dependency.ecosystem));
   if (!key || !format) {
@@ -81,13 +82,32 @@ function classifyDependency(dependency, snapshots) {
     };
   }
 
+  const incompleteRepositoryState = snapshots.some(snapshot => (
+    (
+      snapshot.complete === false
+      && (!Array.isArray(snapshot.failedFormats) || snapshot.failedFormats.length === 0)
+      && (!Array.isArray(snapshot.uninspectedFormats) || snapshot.uninspectedFormats.length === 0)
+    )
+    || (Array.isArray(snapshot.failedFormats) && snapshot.failedFormats.includes(upstreamFormat))
+    || (
+      Array.isArray(snapshot.uninspectedFormats)
+      && snapshot.uninspectedFormats.includes(upstreamFormat)
+    )
+  ));
+  if (options.repositoriesComplete === false || incompleteRepositoryState) {
+    return {
+      upstreamStatus: "unknown",
+      upstreamDetail: `Upstream coverage for ${upstreamFormat} could not be inspected completely`,
+    };
+  }
+
   return {
     upstreamStatus: "no_proxy",
     upstreamDetail: `No upstream proxy configured for ${upstreamFormat}`,
   };
 }
 
-function buildGapPatch(uncoveredDependencies, snapshots) {
+function buildGapPatch(uncoveredDependencies, snapshots, options = {}) {
   const patchMap = new Map();
 
   for (const dependency of Array.isArray(uncoveredDependencies) ? uncoveredDependencies : []) {
@@ -100,7 +120,7 @@ function buildGapPatch(uncoveredDependencies, snapshots) {
       continue;
     }
 
-    patchMap.set(key, classifyDependency(dependency, snapshots));
+    patchMap.set(key, classifyDependency(dependency, snapshots, options));
   }
 
   return patchMap;
@@ -127,13 +147,20 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
   const cancellationToken = options.cancellationToken || null;
   const upstreamChecker = options.upstreamChecker || new UpstreamChecker(options.context);
   const repositoriesToInspect = Array.isArray(repositories)
-    ? repositories.map((repo) => String(repo || "").trim()).filter(Boolean)
+    ? [...new Set(repositories.map((repo) => String(repo || "").trim()).filter(Boolean))]
     : [];
+  const repositoriesComplete = options.repositoriesComplete !== false;
+  const scheduler = options.scheduler || new UpstreamOperationScheduler();
+  const formatsToInspect = [...new Set((Array.isArray(uncoveredDependencies)
+    ? uncoveredDependencies
+    : []).map(dependency => normalizeUpstreamFormat(canonicalFormat(
+      dependency && (dependency.format || dependency.ecosystem)
+    ))).filter(Boolean))];
 
-  if (repositoriesToInspect.length === 0) {
-    const emptyPatch = buildGapPatch(uncoveredDependencies, []);
+  if (repositoriesToInspect.length === 0 || formatsToInspect.length === 0) {
+    const emptyPatch = buildGapPatch(uncoveredDependencies, [], { repositoriesComplete });
     if (onProgress && emptyPatch.size > 0) {
-      onProgress(new Map(emptyPatch), {
+      publishProgress(onProgress, new Map(emptyPatch), {
         completed: 0,
         total: 0,
         workspace,
@@ -147,41 +174,60 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
   let completed = 0;
 
   await runPromisePool(repositoriesToInspect, UPSTREAM_REPO_CONCURRENCY, async (repo) => {
-    if (cancellationToken && cancellationToken.isCancellationRequested) {
-      return;
-    }
+    if (isCancelled(cancellationToken) || scheduler.stopped) return false;
 
-    const state = await upstreamChecker.getRepositoryUpstreamState(workspace, repo, {
-      cancellationToken,
-    });
+    let state;
+    try {
+      const requestOptions = { cancellationToken, scheduler };
+      state = typeof upstreamChecker.getRepositoryUpstreamStateForFormats === "function"
+        ? await upstreamChecker.getRepositoryUpstreamStateForFormats(
+          workspace,
+          repo,
+          formatsToInspect,
+          requestOptions
+        )
+        : await upstreamChecker.getRepositoryUpstreamState(workspace, repo, requestOptions);
+    } catch {
+      state = null;
+    }
     if (cancellationToken && cancellationToken.isCancellationRequested) {
-      return;
+      return false;
     }
     repoUpstreamStates.set(repo, {
       repo,
       groupedUpstreams: state && state.groupedUpstreams instanceof Map
         ? state.groupedUpstreams
         : new Map(),
+      complete: state?.complete === true,
+      failedFormats: Array.isArray(state?.failedFormats) ? state.failedFormats : [],
+      uninspectedFormats: Array.isArray(state?.uninspectedFormats)
+        ? state.uninspectedFormats
+        : [],
     });
 
     completed += 1;
     if (onProgress) {
-      onProgress(new Map(), {
+      publishProgress(onProgress, new Map(), {
         completed,
         total: repositoriesToInspect.length,
         workspace,
         stage: "upstream",
       });
     }
+    return true;
   });
 
   const snapshots = repositoriesToInspect
     .filter((repo) => repoUpstreamStates.has(repo))
     .map((repo) => repoUpstreamStates.get(repo));
 
-  const patchMap = buildGapPatch(uncoveredDependencies, snapshots);
+  const patchMap = buildGapPatch(uncoveredDependencies, snapshots, {
+    repositoriesComplete: repositoriesComplete
+      && snapshots.length === repositoriesToInspect.length
+      && !isCancelled(cancellationToken),
+  });
   if (onProgress && patchMap.size > 0) {
-    onProgress(new Map(patchMap), {
+    publishProgress(onProgress, new Map(patchMap), {
       completed,
       total: repositoriesToInspect.length,
       workspace,
@@ -189,6 +235,18 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
     });
   }
   return applyGapPatch(uncoveredDependencies, patchMap);
+}
+
+function isCancelled(cancellationToken) {
+  return Boolean(cancellationToken && cancellationToken.isCancellationRequested);
+}
+
+function publishProgress(onProgress, patchMap, metadata) {
+  try {
+    onProgress(patchMap, metadata);
+  } catch {
+    // Progress callbacks are observers and cannot abort or outlive the bounded work pool.
+  }
 }
 
 async function runPromisePool(items, concurrency, worker) {
@@ -204,12 +262,12 @@ async function runPromisePool(items, concurrency, worker) {
         if (item === undefined) {
           break;
         }
-        await worker(item);
+        if (await worker(item) === false) break;
       }
     })());
   }
 
-  await Promise.all(workers);
+  await Promise.allSettled(workers);
 }
 
 module.exports = {

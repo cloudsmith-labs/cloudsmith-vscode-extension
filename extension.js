@@ -30,13 +30,9 @@ const { UpstreamChecker } = require("./util/upstreamChecker");
 const { UpstreamPreviewProvider } = require("./views/upstreamPreviewProvider");
 const { UpstreamDetailProvider } = require("./views/upstreamDetailProvider");
 const { PromotionProvider } = require("./views/promotionProvider");
-const {
-  isPackageLocationArray,
-  normalizePackageQueryIdentity,
-} = require("./util/promotionContracts");
+const { normalizePackageQueryIdentity } = require("./util/promotionContracts");
 const { SearchQueryBuilder } = require("./util/searchQueryBuilder");
 const { formatApiError } = require("./util/errorFormatter");
-const { buildExactPackageQuery, packageMatchesExactIdentity } = require("./util/packageQuery");
 const { LicenseClassifier } = require("./util/licenseClassifier");
 const { fetchRepositoryUpstreams, generateTerraformConfig } = require("./util/terraformExporter");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("./util/upstreamFormats");
@@ -47,6 +43,10 @@ const { clearVulnerabilityCache } = require("./util/dependencyVulnEnricher");
 const { WorkspaceCache } = require("./util/workspaceCache");
 const { getWorkspaceContextProjector } = require("./util/workspaceContextProjector");
 const { captureAccount, isAccountCurrent } = require("./util/accountOperation");
+const { fetchWorkspaces, normalizedWorkspaceName } = require("./util/workspaceFetcher");
+const { fetchWorkspaceRepositories } = require("./util/workspaceRepositoryFetcher");
+const { PaginatedFetch, replaceCollectionItems } = require("./util/paginatedFetch");
+const { packageCollectionIdentity } = require("./util/collectionIdentity");
 
 let exportTerraformAbortController = null;
 
@@ -96,25 +96,6 @@ function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function isRecordArray(value) {
-  return Array.isArray(value) && value.every(isRecord);
-}
-
-function isWorkspaceArray(value) {
-  return isRecordArray(value) && value.every(workspace => (
-    typeof workspace.slug === "string" && workspace.slug.length > 0
-  ));
-}
-
-function isRepositoryArray(value) {
-  return isRecordArray(value) && value.every(repo => (
-    typeof repo.slug === "string"
-    && repo.slug.length > 0
-    && typeof repo.name === "string"
-    && repo.name.length > 0
-  ));
-}
-
 function getNestedInstallField(item, fieldName) {
   if (!item || typeof item !== "object") {
     return null;
@@ -126,6 +107,20 @@ function getNestedInstallField(item, fieldName) {
     return item.cloudsmithMatch[fieldName];
   }
   return null;
+}
+
+function isInspectedPackageArray(value, workspace, repository, name) {
+  return Array.isArray(value) && value.every(pkg => (
+    pkg
+    && typeof pkg === "object"
+    && !Array.isArray(pkg)
+    && pkg.namespace === workspace
+    && pkg.repository === repository
+    && pkg.name === name
+    && typeof pkg.slug_perm === "string"
+    && pkg.slug_perm.length > 0
+    && pkg.slug_perm.length <= 512
+  ));
 }
 
 function isQuarantinedPackage(item) {
@@ -344,6 +339,10 @@ async function resetAccountScopedState(context, options = {}) {
     () => (options.filterState || filterState).clear(),
     () => (options.recentPackages || recentPackages).clear(),
     () => (options.clearVulnerabilityCache || clearVulnerabilityCache)(),
+    () => options.vulnerabilityProvider?.resetForAccountChange?.(),
+    () => options.quarantineExplainProvider?.resetForAccountChange?.(),
+    () => options.upstreamPreviewProvider?.resetForAccountChange?.(),
+    () => options.upstreamDetailProvider?.resetForAccountChange?.(),
   ];
   const syncFailures = [];
   for (const invalidate of synchronousInvalidators) {
@@ -402,38 +401,77 @@ async function getWorkspaces(context, options = {}) {
     const cloudsmithAPI = options.createCloudsmithAPI
       ? options.createCloudsmithAPI()
       : new CloudsmithAPI(context);
-    const result = await cloudsmithAPI.get("namespaces/?sort=slug", {
-        responseType: "array",
-        validate: isWorkspaceArray,
+    const workspaceFetcher = options.fetchWorkspaces || fetchWorkspaces;
+    const result = await workspaceFetcher(context, {
+        account,
+        cloudsmithAPI,
+        connectionManager,
         retry: "safe-read",
     });
     if (!isAccountCurrent(connectionManager, account)) {
         await workspaceContextProjector.project(true, { operation: projection });
         return null;
     }
-    if (!result.ok) {
-        await workspaceContextProjector.project(false, { operation: projection });
-        if (!isAccountCurrent(connectionManager, account)) return null;
-        vscode.window.showErrorMessage(`Failed to load workspaces: ${formatApiError(result.error)}`);
-        return null;
-    }
-    if (result.data.length === 0) {
-        await workspaceContextProjector.project(false, { operation: projection });
-        if (!isAccountCurrent(connectionManager, account)) return null;
-        return [];
-    }
-    const workspaces = result.data.map(workspace => ({
+    const workspaces = result.items.map(workspace => ({
         ...workspace,
-        name: typeof workspace.name === "string" && workspace.name.length > 0
-            ? workspace.name
-            : workspace.slug,
+        name: normalizedWorkspaceName(workspace),
     }));
-    await workspaceContextProjector.project(workspaces.length > 1, { operation: projection });
+    const normalizedResult = replaceCollectionItems(result, workspaces);
+    await workspaceContextProjector.project(
+      !normalizedResult.complete || workspaces.length > 1,
+      { operation: projection }
+    );
     if (!isAccountCurrent(connectionManager, account)) {
         await workspaceContextProjector.project(true, { operation: projection });
         return null;
     }
-    return workspaces;
+    if (!normalizedResult.complete) {
+      const detail = firstCollectionFailureMessage(normalizedResult);
+      if (workspaces.length === 0) {
+        vscode.window.showErrorMessage(`Failed to load workspaces completely.${detail}`);
+      } else {
+        vscode.window.showWarningMessage(
+          `Workspace choices are incomplete; later workspaces may be unavailable.${detail}`
+        );
+      }
+    }
+    return normalizedResult;
+}
+
+async function getWorkspaceRepositories(context, workspace, options = {}) {
+  const connectionManager = options.connectionManager || getConnectionManager(context);
+  const result = await fetchWorkspaceRepositories(context, workspace, {
+    connectionManager,
+    retry: "safe-read",
+    ...options,
+  });
+  if (!result.complete) {
+    const detail = firstCollectionFailureMessage(result);
+    if (result.items.length === 0) {
+      vscode.window.showErrorMessage(`Could not load repositories completely.${detail}`);
+    } else {
+      vscode.window.showWarningMessage(
+        `Repository choices are incomplete; later repositories may be unavailable.${detail}`
+      );
+    }
+  }
+  return result;
+}
+
+function firstCollectionFailureMessage(result) {
+  const error = result && result.failures && result.failures[0] && result.failures[0].error;
+  return error ? ` ${formatApiError(error)}` : "";
+}
+
+function collectionQuickPickItems(result, mapper, incompleteLabel) {
+  const items = result.items.map(mapper);
+  if (!result.complete) {
+    items.unshift({
+      label: incompleteLabel,
+      kind: vscode.QuickPickItemKind.Separator,
+    });
+  }
+  return items;
 }
 
 async function getPreferredTextDocumentLanguage() {
@@ -546,20 +584,23 @@ async function resolveDependencyScanTarget(context, options = {}) {
     };
   }
 
-  const workspaces = await getWorkspaces(context);
-  if (!workspaces) {
+  const workspaceResult = await getWorkspaces(context);
+  if (!workspaceResult) {
     return null;
   }
-  if (workspaces.length === 0) {
-    vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
+  if (workspaceResult.items.length === 0) {
+    if (workspaceResult.complete) {
+      vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
+    }
     return null;
   }
 
   const selectedWorkspace = await vscode.window.showQuickPick(
-    workspaces.map((workspace) => ({
-      label: workspace.name,
-      description: workspace.slug,
-    })),
+    collectionQuickPickItems(
+      workspaceResult,
+      workspace => ({ label: workspace.name, description: workspace.slug }),
+      "Workspace list incomplete"
+    ),
     {
       placeHolder: "Select a Cloudsmith workspace for the scan",
     }
@@ -594,28 +635,14 @@ async function resolveDependencyScanTarget(context, options = {}) {
   }
 
   if (!selectedScope._all) {
-    const cloudsmithAPI = new CloudsmithAPI(context);
-    let endpoint;
-    try {
-      endpoint = apiEndpoint(["repos", scanWorkspace], { query: { sort: "name" } });
-    } catch {
-      return null;
-    }
-    const repos = await cloudsmithAPI.get(endpoint, {
-      responseType: "array",
-      validate: isRepositoryArray,
-      retry: "safe-read",
-    });
-    if (!repos.ok) {
-      vscode.window.showErrorMessage(`Could not load repositories. ${formatApiError(repos.error)}`);
-      return null;
-    }
-    if (repos.ok && repos.data.length > 0) {
+    const repositories = await getWorkspaceRepositories(context, scanWorkspace);
+    if (repositories.items.length > 0) {
       const selectedRepo = await vscode.window.showQuickPick(
-        repos.data.map((repository) => ({
-          label: repository.name,
-          description: repository.slug,
-        })),
+        collectionQuickPickItems(
+          repositories,
+          repository => ({ label: repository.name, description: repository.slug }),
+          "Repository list incomplete"
+        ),
         {
           placeHolder: "Select a repository",
         }
@@ -624,8 +651,10 @@ async function resolveDependencyScanTarget(context, options = {}) {
       if (selectedRepo) {
         scanRepo = selectedRepo.description;
       }
-    } else {
+    } else if (repositories.complete) {
       vscode.window.showInformationMessage("No repositories were found in this workspace.");
+      return null;
+    } else {
       return null;
     }
   }
@@ -789,6 +818,8 @@ async function activate(context) {
   const connectionManager = new ConnectionManager(context);
   const connectionBinding = bindConnectionManager(context, connectionManager);
   context.subscriptions.push(connectionBinding, connectionManager);
+  const inspectOutputChannel = vscode.window.createOutputChannel("Cloudsmith");
+  context.subscriptions.push(inspectOutputChannel);
 
   // Persisted upstream summaries are account-bound. Purge them before the
   // initial SecretStorage read so an indeterminate startup cannot retain data
@@ -816,7 +847,7 @@ async function activate(context) {
     treeView.title = "Workspaces";
     treeView.description = "";
     vscode.window.showWarningMessage(
-      `Could not access workspace "${slug}". Showing all workspaces.`
+      `Could not verify the repository list for workspace "${slug}". Showing all workspaces.`
     );
   });
 
@@ -868,6 +899,10 @@ async function activate(context) {
 
   let projectedAccountEpoch = connectionManager.getState().accountEpoch;
   let promotionProvider = null;
+  let vulnerabilityProvider = null;
+  let quarantineExplainProvider = null;
+  let upstreamPreviewProvider = null;
+  let upstreamDetailProvider = null;
   const handleConnectionStateChange = async (state) => {
     if (state.accountEpoch !== projectedAccountEpoch) {
       projectedAccountEpoch = state.accountEpoch;
@@ -877,6 +912,10 @@ async function activate(context) {
         searchProvider,
         dependencyHealthProvider,
         workspaceContextProjector,
+        vulnerabilityProvider,
+        quarantineExplainProvider,
+        upstreamPreviewProvider,
+        upstreamDetailProvider,
       });
     }
 
@@ -892,7 +931,7 @@ async function activate(context) {
   context.subscriptions.push(connectionSubscription);
 
   // Create vulnerability WebView provider
-  const vulnerabilityProvider = new VulnerabilityProvider(context);
+  vulnerabilityProvider = new VulnerabilityProvider(context, { connectionManager });
   context.subscriptions.push({ dispose: () => vulnerabilityProvider.dispose() });
 
   // Create compliance report WebView provider
@@ -900,15 +939,15 @@ async function activate(context) {
   context.subscriptions.push({ dispose: () => complianceReportProvider.dispose() });
 
   // Create quarantine explanation WebView provider
-  const quarantineExplainProvider = new QuarantineExplainProvider(context);
+  quarantineExplainProvider = new QuarantineExplainProvider(context, { connectionManager });
   context.subscriptions.push({ dispose: () => quarantineExplainProvider.dispose() });
 
   // Create upstream preview WebView provider
-  const upstreamPreviewProvider = new UpstreamPreviewProvider(context);
+  upstreamPreviewProvider = new UpstreamPreviewProvider(context);
   context.subscriptions.push({ dispose: () => upstreamPreviewProvider.dispose() });
 
   // Create upstream detail WebView provider
-  const upstreamDetailProvider = new UpstreamDetailProvider(context);
+  upstreamDetailProvider = new UpstreamDetailProvider(context);
   context.subscriptions.push({ dispose: () => upstreamDetailProvider.dispose() });
 
   const credentialManager = new CredentialManager(context, { connectionManager });
@@ -955,8 +994,8 @@ async function activate(context) {
     // If connected and no default workspace, offer to set the single workspace as default.
     if (options.offerDefault !== false && !getDefaultWorkspace()) {
       const workspaces = await getWorkspaces(context);
-      if (Array.isArray(workspaces) && workspaces.length === 1) {
-        const ws = workspaces[0];
+      if (workspaces && workspaces.complete && workspaces.items.length === 1) {
+        const ws = workspaces.items[0];
         const choice = await vscode.window.showInformationMessage(
           `One workspace available: ${ws.name}. Set as default?`,
           "Set as default", "Dismiss"
@@ -1044,15 +1083,20 @@ async function activate(context) {
       if (!workspaces) {
         return;
       }
-      if (workspaces.length === 0) {
-        vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
+      if (workspaces.items.length === 0) {
+        if (workspaces.complete) {
+          vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
+        }
         return;
       }
 
       const items = [
         { label: "$(close) Clear default workspace", description: "Show all workspaces", _clear: true },
       ];
-      for (const ws of workspaces) {
+      if (!workspaces.complete) {
+        items.push({ label: "Workspace list incomplete", kind: vscode.QuickPickItemKind.Separator });
+      }
+      for (const ws of workspaces.items) {
         items.push({ label: ws.name, description: ws.slug });
       }
 
@@ -1154,11 +1198,9 @@ async function activate(context) {
             });
             await vscode.window.showTextDocument(doc, { preview: true });
           } else {
-            const outputChannel =
-              vscode.window.createOutputChannel("Cloudsmith");
-            outputChannel.clear();
-            outputChannel.show(true);
-            outputChannel.append(jsonContent);
+            inspectOutputChannel.clear();
+            inspectOutputChannel.show(true);
+            inspectOutputChannel.append(jsonContent);
           }
 
           vscode.window.showInformationMessage(
@@ -1185,23 +1227,39 @@ async function activate(context) {
 
         if (name) {
           let endpoint;
+          let query;
           try {
-            const query = new SearchQueryBuilder().name(name).build();
-            endpoint = apiEndpoint(["packages", workspace, repo], { query: { query } });
+            query = new SearchQueryBuilder().name(name).build();
+            endpoint = apiEndpoint(["packages", workspace, repo], { query: { sort: "-version" } });
           } catch {
             vscode.window.showErrorMessage("Could not inspect the package group because its identity was invalid.");
             return;
           }
-          const result = await cloudsmithAPI.get(endpoint, {
-            responseType: "array",
-            validate: isRecordArray,
+          const result = await new PaginatedFetch(cloudsmithAPI).fetchCollection(endpoint, {
+            pageSize: 100,
+            maxPages: 20,
+            maxRequests: 20,
+            maxItems: 2000,
+            query,
+            descriptor: `inspect-package-group:${workspace}:${repo}:${name}`,
+            canonicalIdentity: packageCollectionIdentity,
+            validate: value => isInspectedPackageArray(value, workspace, repo, name),
             retry: "safe-read",
           });
-          if (!result.ok) {
-            vscode.window.showErrorMessage(formatApiError(result.error));
+          if (!result.complete && result.items.length === 0) {
+            vscode.window.showErrorMessage(
+              firstCollectionFailureMessage(result) || "Could not inspect the package group completely."
+            );
             return;
           }
-          const jsonContent = JSON.stringify(result.data, null, 2);
+          const jsonContent = JSON.stringify({
+            items: result.items,
+            complete: result.complete,
+            loadedCount: result.items.length,
+            totalCount: result.pagination?.countAuthoritative ? result.pagination.count : null,
+            termination: result.termination,
+            failureCount: result.failureCount,
+          }, null, 2);
 
           const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
           const inspectOutput = await config.get("inspectOutput");
@@ -1213,16 +1271,18 @@ async function activate(context) {
             });
             await vscode.window.showTextDocument(doc, { preview: true });
           } else {
-            const outputChannel =
-              vscode.window.createOutputChannel("Cloudsmith");
-            outputChannel.clear();
-            outputChannel.show(true);
-            outputChannel.append(jsonContent);
+            inspectOutputChannel.clear();
+            inspectOutputChannel.show(true);
+            inspectOutputChannel.append(jsonContent);
           }
 
-          vscode.window.showInformationMessage(
-            `Inspecting package group ${name}.`
-          );
+          if (result.complete) {
+            vscode.window.showInformationMessage(`Inspecting package group ${name}.`);
+          } else {
+            vscode.window.showWarningMessage(
+              `Inspecting an incomplete package-group result (${result.items.length} packages loaded).`
+            );
+          }
         } else {
           vscode.window.showWarningMessage("Run this command from a package context menu.");
         }
@@ -1296,15 +1356,18 @@ async function activate(context) {
         if (!workspaces) {
           return;
         }
-        if (workspaces.length === 0) {
-          vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
+        if (workspaces.items.length === 0) {
+          if (workspaces.complete) {
+            vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
+          }
           return;
         }
 
-        const items = [];
-        for (const ws of workspaces) {
-          items.push({ label: ws.name, description: ws.slug });
-        }
+        const items = collectionQuickPickItems(
+          workspaces,
+          ws => ({ label: ws.name, description: ws.slug }),
+          "Workspace list incomplete"
+        );
 
         const selected = await vscode.window.showQuickPick(items, {
           placeHolder: "Select a workspace",
@@ -1374,6 +1437,12 @@ async function activate(context) {
       await searchProvider.loadNextPage();
     }),
 
+    vscode.commands.registerCommand("cloudsmith-vsc.loadMoreRepositoryPackages", async (item) => {
+      if (item && typeof item.loadMorePackages === "function") {
+        await item.loadMorePackages();
+      }
+    }),
+
     // Register search in workspace (from workspace context menu or view title)
     vscode.commands.registerCommand("cloudsmith-vsc.searchInWorkspace", async (item) => {
       let workspace;
@@ -1417,16 +1486,19 @@ async function activate(context) {
         if (!workspaces) {
           return;
         }
-        if (workspaces.length === 0) {
-          vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
+        if (workspaces.items.length === 0) {
+          if (workspaces.complete) {
+            vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
+          }
           return;
         }
 
         // Step 1: Select workspace
-        const wsItems = [];
-        for (const ws of workspaces) {
-          wsItems.push({ label: ws.name, description: ws.slug });
-        }
+        const wsItems = collectionQuickPickItems(
+          workspaces,
+          ws => ({ label: ws.name, description: ws.slug }),
+          "Workspace list incomplete"
+        );
 
         const selectedWs = await vscode.window.showQuickPick(wsItems, {
           placeHolder: "Step 1: Select a workspace",
@@ -1482,28 +1554,18 @@ async function activate(context) {
 
       let selectedRepos = null;
       if (selectedScope.label === "Select specific repositories") {
-        const cloudsmithAPI = new CloudsmithAPI(context);
-        let endpoint;
-        try {
-          endpoint = apiEndpoint(["repos", workspaceSlug], { query: { sort: "name" } });
-        } catch {
-          vscode.window.showErrorMessage("The selected workspace identifier was invalid.");
+        const repositories = await getWorkspaceRepositories(context, workspaceSlug);
+        if (repositories.items.length === 0) {
+          if (repositories.complete) {
+            vscode.window.showErrorMessage("No repositories found in this workspace.");
+          }
           return;
         }
-        const repos = await cloudsmithAPI.get(endpoint, {
-          responseType: "array",
-          validate: isRepositoryArray,
-          retry: "safe-read",
-        });
-        if (!repos.ok) {
-          vscode.window.showErrorMessage(`Could not load repositories. ${formatApiError(repos.error)}`);
-          return;
-        }
-        if (repos.data.length === 0) {
-          vscode.window.showErrorMessage("No repositories found in this workspace.");
-          return;
-        }
-        const repoItems = repos.data.map(r => ({ label: r.name, description: r.slug }));
+        const repoItems = collectionQuickPickItems(
+          repositories,
+          repository => ({ label: repository.name, description: repository.slug }),
+          "Repository list incomplete"
+        );
         const picked = await vscode.window.showQuickPick(repoItems, {
           placeHolder: "Select repositories to search",
           canPickMany: true,
@@ -1706,7 +1768,15 @@ async function activate(context) {
       }
 
       if (result.versions.length === 0) {
-        vscode.window.showInformationMessage(`No safe versions found for "${name}" in ${crossRepo ? "the workspace" : repo}.`);
+        if (result.absenceProven) {
+          vscode.window.showInformationMessage(
+            `No safe versions found for "${name}" in ${crossRepo ? "the workspace" : repo}.`
+          );
+        } else {
+          vscode.window.showWarningMessage(
+            `Safe-version results were incomplete; no absence claim can be made for "${name}".`
+          );
+        }
         return;
       }
 
@@ -1729,9 +1799,19 @@ async function activate(context) {
         };
       });
 
+      if (!result.complete) {
+        const countDetail = result.totalCount === null
+          ? `${result.versions.length} loaded`
+          : `showing newest ${result.versions.length} of ${result.totalCount}`;
+        quickPickItems.unshift({
+          label: `Safe-version preview incomplete (${countDetail})`,
+          kind: vscode.QuickPickItemKind.Separator,
+        });
+      }
+
       const title = crossRepo
-        ? `Safe versions of "${name}" (${format}) in the workspace`
-        : `Safe versions of "${name}" (${format}) in ${repo}`;
+        ? `Newest safe versions of "${name}" (${format}) in the workspace`
+        : `Newest safe versions of "${name}" (${format}) in ${repo}`;
 
       const selected = await vscode.window.showQuickPick(quickPickItems, {
         placeHolder: title,
@@ -2095,12 +2175,18 @@ async function activate(context) {
         if (!workspaces) {
           return;
         }
-        if (workspaces.length === 0) {
-          vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
+        if (workspaces.items.length === 0) {
+          if (workspaces.complete) {
+            vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
+          }
           return;
         }
 
-        const wsItems = workspaces.map(ws => ({ label: ws.name, description: ws.slug }));
+        const wsItems = collectionQuickPickItems(
+          workspaces,
+          ws => ({ label: ws.name, description: ws.slug }),
+          "Workspace list incomplete"
+        );
         const selectedWs = await vscode.window.showQuickPick(wsItems, {
           placeHolder: "Select a workspace to search",
         });
@@ -2322,16 +2408,26 @@ async function activate(context) {
               return;
             }
 
-            const upstreamLoadFailed = Boolean(upstreamResult && upstreamResult.error);
+            const upstreamLoadFailed = Boolean(
+              upstreamResult
+              && upstreamResult.error
+              && (!Array.isArray(upstreamResult.data) || upstreamResult.data.length === 0)
+            );
+            const upstreamUnavailableFormats = [...new Set([
+              ...(upstreamResult.failedFormats || []),
+              ...(upstreamResult.uninspectedFormats || []),
+            ])];
             const retentionRules = retentionResult.ok ? retentionResult.data : null;
 
             const hclContent = generateTerraformConfig({
               repo: repoResult.data,
               workspace,
-              upstreams: upstreamLoadFailed ? [] : upstreamResult.data,
+              upstreams: Array.isArray(upstreamResult.data) ? upstreamResult.data : [],
               retention: retentionRules,
               exportedAt: new Date().toISOString(),
               upstreamLoadFailed,
+              upstreamLoadPartial: upstreamResult.complete !== true,
+              upstreamFailedFormats: upstreamUnavailableFormats,
             });
 
             const doc = await vscode.workspace.openTextDocument({
@@ -2395,12 +2491,18 @@ async function activate(context) {
         if (!workspaces) {
           return;
         }
-        if (workspaces.length === 0) {
-          vscode.window.showErrorMessage("No workspaces found.");
+        if (workspaces.items.length === 0) {
+          if (workspaces.complete) {
+            vscode.window.showErrorMessage("No workspaces found.");
+          }
           return;
         }
         const wsPick = await vscode.window.showQuickPick(
-          workspaces.map(ws => ({ label: ws.name, description: ws.slug })),
+          collectionQuickPickItems(
+            workspaces,
+            ws => ({ label: ws.name, description: ws.slug }),
+            "Workspace list incomplete"
+          ),
           { placeHolder: "Select a workspace" }
         );
         if (!wsPick) return;
@@ -2408,29 +2510,17 @@ async function activate(context) {
       }
 
       // Select repo
-      const cloudsmithAPI = new CloudsmithAPI(context);
-      let reposEndpoint;
-      try {
-        reposEndpoint = apiEndpoint(["repos", wsSlug], { query: { sort: "name" } });
-      } catch {
-        vscode.window.showErrorMessage("The workspace identifier was invalid.");
-        return;
-      }
-      const repos = await cloudsmithAPI.get(reposEndpoint, {
-        responseType: "array",
-        validate: isRepositoryArray,
-        retry: "safe-read",
-      });
-      if (!repos.ok) {
-        vscode.window.showErrorMessage(`Could not load repositories. ${formatApiError(repos.error)}`);
-        return;
-      }
-      if (repos.data.length === 0) {
-        vscode.window.showErrorMessage("No repositories found.");
+      const repositories = await getWorkspaceRepositories(context, wsSlug);
+      if (repositories.items.length === 0) {
+        if (repositories.complete) vscode.window.showErrorMessage("No repositories found.");
         return;
       }
       const repoPick = await vscode.window.showQuickPick(
-        repos.data.map(r => ({ label: r.name, description: r.slug })),
+        collectionQuickPickItems(
+          repositories,
+          repository => ({ label: repository.name, description: repository.slug }),
+          "Repository list incomplete"
+        ),
         { placeHolder: "Select target repository" }
       );
       if (!repoPick) return;
@@ -2441,7 +2531,9 @@ async function activate(context) {
         { location: vscode.ProgressLocation.Notification, title: "Checking upstream resolution..." },
         () => checker.previewResolution(wsSlug, targetRepo, pkgName, pkgFormat)
       );
-      upstreamPreviewProvider.show(result);
+      if (result) {
+        upstreamPreviewProvider.show(result);
+      }
     }),
 
     // Phase 10: Show promotion status
@@ -2490,50 +2582,41 @@ async function activate(context) {
         }
 
         const lines = status.map(s => {
-          const icon = !s.found ? "\u2014" : (s.quarantined ? "\u274C" : (s.policyViolated ? "\u26A0\uFE0F" : "\u2705"));
+          const icon = s.found === null
+            ? "?"
+            : !s.found
+              ? "\u2014"
+              : (s.quarantined ? "\u274C" : (s.policyViolated ? "\u26A0\uFE0F" : "\u2705"));
           return `${icon} ${s.repo}: ${s.status}`;
         });
+        const completeness = statusResult.complete ? "" : " (package-location search incomplete)";
         vscode.window.showInformationMessage(
-          `Pipeline for ${promotionIdentity.name} ${promotionIdentity.version}: ${lines.join(" \u2192 ")}`
+          `Pipeline for ${promotionIdentity.name} ${promotionIdentity.version}: ${lines.join(" \u2192 ")}${completeness}`
         );
       } else {
-        // No pipeline: search workspace-wide for this package name+version
-        const cloudsmithAPI = new CloudsmithAPI(context);
-        let endpoint;
-        try {
-          endpoint = apiEndpoint(["packages", promotionIdentity.workspace], {
-            query: {
-              query: buildExactPackageQuery(
-                promotionIdentity.name,
-                promotionIdentity.version,
-                promotionIdentity.format
-              ),
-              page_size: 100,
-            },
-          });
-        } catch {
-          vscode.window.showErrorMessage("The package search parameters were invalid.");
-          return;
-        }
-        const results = await cloudsmithAPI.get(endpoint, {
-          responseType: "array",
-          validate: isPackageLocationArray,
-          retry: "never",
-        });
-
-        if (!results.ok) {
+        const results = await promotionProvider.getPackageLocations(
+          promotionIdentity.workspace,
+          promotionIdentity.name,
+          promotionIdentity.version,
+          promotionIdentity.format
+        );
+        if (results.items.length === 0 && results.failureCount > 0 && results.pageCount === 0) {
           vscode.window.showErrorMessage(
-            `Could not load package locations. ${formatApiError(results.error)}`
+            `Could not load package locations.${firstCollectionFailureMessage(results)}`
           );
           return;
         }
-        const exactPackages = results.data.filter(pkg => (
-          packageMatchesExactIdentity(pkg, promotionIdentity)
-        ));
+        const exactPackages = results.items;
         if (exactPackages.length === 0) {
-          vscode.window.showInformationMessage(
-            `${promotionIdentity.name} ${promotionIdentity.version} was not found in any other repository.`
-          );
+          if (results.complete) {
+            vscode.window.showInformationMessage(
+              `${promotionIdentity.name} ${promotionIdentity.version} was not found in any other repository.`
+            );
+          } else {
+            vscode.window.showWarningMessage(
+              `Package locations are incomplete; ${promotionIdentity.name} ${promotionIdentity.version} may exist in another repository.`
+            );
+          }
           return;
         }
 
@@ -2541,8 +2624,9 @@ async function activate(context) {
           const icon = pkg.status_str === "Quarantined" ? "\u274C" : (pkg.policy_violated ? "\u26A0\uFE0F" : "\u2705");
           return `${icon} ${pkg.repository}: ${pkg.status_str || "Unknown"}`;
         });
+        const completeness = results.complete ? "" : " (additional locations may be unavailable)";
         vscode.window.showInformationMessage(
-          `${promotionIdentity.name} ${promotionIdentity.version} found in: ${lines.join(", ")}`
+          `${promotionIdentity.name} ${promotionIdentity.version} found in: ${lines.join(", ")}${completeness}`
         );
       }
     }),

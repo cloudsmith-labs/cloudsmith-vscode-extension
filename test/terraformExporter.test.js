@@ -236,4 +236,22 @@ suite("TerraformExporter Test Suite", () => {
     assert.ok(output.includes("# Could not load upstream data. Add upstream resources manually."));
     assert.ok(!output.includes("cloudsmith_repository_upstream"));
   });
+
+  test("partial upstream export keeps verified resources and marks the file incomplete", () => {
+    const output = generateTerraformConfig({
+      repo: { name: "Partial Repo", slug: "partial-repo" },
+      workspace,
+      upstreams: [{
+        name: "npm",
+        format: "npm",
+        upstream_url: "https://registry.npmjs.org/",
+      }],
+      upstreamLoadPartial: true,
+      upstreamFailedFormats: ["python"],
+      exportedAt,
+    });
+
+    assert.match(output, /Upstream data is incomplete for: python/);
+    assert.ok(output.includes('resource "cloudsmith_repository_upstream"'));
+  });
 });

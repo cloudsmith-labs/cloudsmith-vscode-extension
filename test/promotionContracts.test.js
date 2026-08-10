@@ -134,6 +134,7 @@ suite("Promotion contracts", () => {
       locationRecord({ slug_perm: "package%5cid" }),
       locationRecord({ slug_perm: "package%255cid" }),
       locationRecord({ slug_perm_raw: "other-package-id" }),
+      locationRecord({ policy_violated: "false" }),
       locationRecord({ namespace: undefined }),
       locationRecord({ repository: undefined }),
       locationRecord({ slug_perm: undefined }),

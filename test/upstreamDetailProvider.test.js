@@ -7,7 +7,7 @@ suite("UpstreamDetailProvider Test Suite", () => {
     assert.strictEqual(SUPPORTED_FORMATS, SUPPORTED_UPSTREAM_FORMATS);
   });
 
-  test("does not show the partial warning banner when upstreams are available", () => {
+  test("shows successful upstreams together with a truthful partial warning", () => {
     const provider = new UpstreamDetailProvider({});
     const groupedUpstreams = new Map([
       [
@@ -29,7 +29,8 @@ suite("UpstreamDetailProvider Test Suite", () => {
     });
 
     assert.ok(html.includes("PyPI"));
-    assert.ok(!html.includes("Some upstream data could not be loaded."));
+    assert.ok(html.includes("Some upstream data could not be loaded."));
+    assert.ok(html.includes("alpine"));
     assert.ok(!html.includes("Could not load upstreams."));
   });
 
@@ -44,5 +45,39 @@ suite("UpstreamDetailProvider Test Suite", () => {
 
     assert.ok(html.includes("Could not load upstreams."));
     assert.ok(html.includes("The upstream configuration could not be loaded for this repository."));
+  });
+
+  test("account reset aborts in-flight work and disposes the panel", () => {
+    const provider = new UpstreamDetailProvider({});
+    let aborted = 0;
+    let disposed = 0;
+    provider._abortController = { abort() { aborted += 1; } };
+    provider._panel = { dispose() { disposed += 1; } };
+
+    provider.resetForAccountChange();
+
+    assert.strictEqual(aborted, 1);
+    assert.strictEqual(disposed, 1);
+    assert.strictEqual(provider._abortController, null);
+    assert.strictEqual(provider._panel, null);
+  });
+
+  test("a null fetch result replaces loading state with a bounded failure state", async () => {
+    const provider = new UpstreamDetailProvider({});
+    const panel = {
+      title: "",
+      webview: { html: "" },
+      reveal() {},
+    };
+    provider._getOrCreatePanel = () => {
+      provider._panel = panel;
+      return panel;
+    };
+    provider._fetchGroupedUpstreams = async () => null;
+
+    await provider.show("acme", "example-repo", "Example Repo");
+
+    assert.ok(panel.webview.html.includes("Could not load upstreams."));
+    assert.ok(!panel.webview.html.includes("Loading upstreams..."));
   });
 });
