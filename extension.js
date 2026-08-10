@@ -876,9 +876,11 @@ async function activate(context) {
   });
 
   let projectedAccountEpoch = connectionManager.getState().accountEpoch;
+  let promotionProvider = null;
   const handleConnectionStateChange = async (state) => {
     if (state.accountEpoch !== projectedAccountEpoch) {
       projectedAccountEpoch = state.accountEpoch;
+      promotionProvider?.resetForAccountChange();
       await resetAccountScopedState(context, {
         workspaceCache,
         searchProvider,
@@ -918,10 +920,11 @@ async function activate(context) {
   const upstreamDetailProvider = new UpstreamDetailProvider(context);
   context.subscriptions.push({ dispose: () => upstreamDetailProvider.dispose() });
 
-  // Create promotion provider
-  const promotionProvider = new PromotionProvider(context);
-
   const credentialManager = new CredentialManager(context, { connectionManager });
+  // Create promotion provider
+  promotionProvider = new PromotionProvider(context, { connectionManager, credentialManager });
+  context.subscriptions.push({ dispose: () => promotionProvider.dispose() });
+
   const ssoManager = new SSOAuthManager(context, { connectionManager });
 
   async function handleAuthenticationResult(result, options = {}) {
@@ -2540,174 +2543,9 @@ async function activate(context) {
         item = await pickRecentPackage();
         if (!item) return;
       }
-      recentPackages.add(item);
-
-      const info = extractPackageInfo(item);
-      if (
-        !info.workspace
-        || !info.repo
-        || !info.slugPerm
-        || !info.name
-        || !info.version
-        || !info.format
-      ) {
-        vscode.window.showWarningMessage("Could not determine package details.");
-        return;
-      }
-
-      // Check is_copyable upfront to avoid a wasted API round-trip
-      if (item.is_copyable === false) {
-        vscode.window.showWarningMessage(
-          "This package cannot be promoted. Write access to the target repository may be required."
-        );
-        return;
-      }
-
-      const pipeline = promotionProvider.getPipeline();
-      const cloudsmithAPI = new CloudsmithAPI(context);
-      let targetItems = [];
-
-      if (pipeline.length > 0) {
-        // Pipeline mode: suggest next eligible repo(s)
-        const currentIdx = pipeline.indexOf(info.repo);
-        const eligibleTargets = currentIdx >= 0
-          ? pipeline.slice(currentIdx + 1)
-          : pipeline.filter(r => r !== info.repo);
-
-        if (eligibleTargets.length === 0) {
-          vscode.window.showInformationMessage("Package is already in the last pipeline stage.");
-          return;
-        }
-
-        targetItems = eligibleTargets.map(r => ({ label: r, description: r, _slug: r }));
-      } else {
-        // No pipeline: show all workspace repos except the source
-        let reposEndpoint;
-        try {
-          reposEndpoint = apiEndpoint(["repos", info.workspace], { query: { sort: "name" } });
-        } catch {
-          vscode.window.showErrorMessage("The workspace identifier was invalid.");
-          return;
-        }
-        const repos = await cloudsmithAPI.get(reposEndpoint, {
-          responseType: "array",
-          validate: isRepositoryArray,
-          retry: "safe-read",
-        });
-        if (!repos.ok) {
-          vscode.window.showErrorMessage(
-            `Could not fetch workspace repositories. ${formatApiError(repos.error)}`
-          );
-          return;
-        }
-        if (repos.data.length === 0) {
-          vscode.window.showErrorMessage("No target repositories were found.");
-          return;
-        }
-
-        targetItems = repos.data
-          .filter(r => r.slug !== info.repo)
-          .map(r => ({ label: r.name, description: r.slug, _slug: r.slug }));
-      }
-
-      // Check for recent promotion history and prepend
-      const historyKey = "cloudsmith-promotionHistory";
-      const history = context.globalState.get(historyKey) || {};
-      const recentTargets = (history[info.repo] || []).slice(0, 5);
-
-      // Check where this package already exists (workspace-wide search)
-      const existingRepoMap = new Map();
-      if (info.name && info.version) {
-        let existingEndpoint;
-        try {
-          existingEndpoint = apiEndpoint(["packages", info.workspace], {
-            query: {
-              query: buildExactPackageQuery(info.name, info.version, info.format),
-              page_size: 100,
-            },
-          });
-        } catch {
-          vscode.window.showErrorMessage("The package search parameters were invalid.");
-          return;
-        }
-        const existingResults = await cloudsmithAPI.get(existingEndpoint, {
-          responseType: "array",
-          validate: isPackageLocationArray,
-          retry: "never",
-        });
-        if (!existingResults.ok) {
-          vscode.window.showErrorMessage(
-            `Could not check existing package locations. ${formatApiError(existingResults.error)}`
-          );
-          return;
-        }
-        for (const pkg of existingResults.data.filter(pkg => packageMatchesExactIdentity(pkg, info))) {
-            existingRepoMap.set(pkg.repository, pkg.status_str || "Unknown");
-        }
-      }
-
-      // Annotate target items with existence status
-      for (const ti of targetItems) {
-        const existingStatus = existingRepoMap.get(ti._slug);
-        if (existingStatus) {
-          ti.description = `${ti._slug} — already exists (${existingStatus})`;
-        } else {
-          ti.description = `${ti._slug} — not present`;
-        }
-      }
-
-      // Build final QuickPick items with recent history at the top
-      const finalItems = [];
-      if (recentTargets.length > 0) {
-        finalItems.push({ label: "Recent", kind: vscode.QuickPickItemKind.Separator });
-        for (const recentSlug of recentTargets) {
-          const matching = targetItems.find(t => t._slug === recentSlug);
-          if (matching) {
-            finalItems.push({
-              label: `$(history) ${matching.label}`,
-              description: matching.description,
-              _slug: matching._slug,
-            });
-          }
-        }
-        finalItems.push({ label: "All repositories", kind: vscode.QuickPickItemKind.Separator });
-      }
-      for (const ti of targetItems) {
-        // Skip duplicates already in recent section
-        if (!recentTargets.includes(ti._slug)) {
-          finalItems.push(ti);
-        }
-      }
-
-      const targetPick = await vscode.window.showQuickPick(finalItems, {
-        placeHolder: `Select a target repository for ${info.name} ${info.version}`,
+      await promotionProvider.runPromotionWorkflow(item, {
+        refresh: () => cloudsmithProvider.refresh(),
       });
-      if (!targetPick || !targetPick._slug) return;
-
-      const result = await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: `Promoting package to ${targetPick._slug}...` },
-        () => promotionProvider.promote(info.workspace, info.repo, info.slugPerm, targetPick._slug)
-      );
-
-      if (result && result.success) {
-        // Store in promotion history
-        const updatedHistory = context.globalState.get(historyKey) || {};
-        const repoHistory = updatedHistory[info.repo] || [];
-        // Add to front, dedupe, cap at 5
-        const updated = [targetPick._slug, ...repoHistory.filter(r => r !== targetPick._slug)].slice(0, 5);
-        updatedHistory[info.repo] = updated;
-        await context.globalState.update(historyKey, updatedHistory);
-
-        vscode.window.showInformationMessage(
-          `Package "${info.name}" promoted from ${info.repo} to ${targetPick._slug}.`
-        );
-        cloudsmithProvider.refresh();
-      } else {
-        const reason = (result && result.error) ? formatApiError(result.error) : "Unknown error";
-        vscode.window.showErrorMessage(
-          `Could not promote ${info.name} to ${targetPick._slug}. ${reason}`
-        );
-      }
     }),
 
     // Phase 12: Copy entitlement token

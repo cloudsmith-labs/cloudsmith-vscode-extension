@@ -426,4 +426,20 @@ suite("Package Metadata Flow Test Suite", () => {
       }
     }
   });
+
+  test("package, search, and dependency models preserve only literal copyability booleans", () => {
+    for (const [value, expected] of [[true, true], [false, false], ["false", null], [undefined, null]]) {
+      const packageNode = new PackageNode({ ...pkg, is_copyable: value }, {});
+      const searchNode = new SearchResultNode({ ...pkg, is_copyable: value }, {});
+      const dependencyNode = new DependencyHealthNode({
+        name: pkg.name,
+        version: pkg.version,
+        format: pkg.format,
+        cloudsmithPackage: { ...pkg, is_copyable: value },
+      }, null, {});
+      assert.strictEqual(packageNode.is_copyable, expected);
+      assert.strictEqual(searchNode.is_copyable, expected);
+      assert.strictEqual(dependencyNode.is_copyable, expected);
+    }
+  });
 });

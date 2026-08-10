@@ -10,6 +10,7 @@ const {
 } = require("./accountOperation");
 
 const WORKSPACE_REPOSITORY_PAGE_SIZE = 500;
+const MAX_WORKSPACE_REPOSITORY_PAGES = 20;
 const UNEXPECTED_RESPONSE_FORMAT_ERROR = "Unexpected repository response format";
 const STALE_ACCOUNT_ERROR = Object.freeze({
   kind: "stale_account",
@@ -146,8 +147,34 @@ async function fetchWorkspaceRepositories(context, workspace, options = {}) {
         knownPageTotal = pageTotal;
         repositories.push(...pageData);
 
-        if (pageData.length < actualPageSize || currentPage >= pageTotal) {
+        if (currentPage >= pageTotal) {
           break;
+        }
+
+        if (pageData.length < actualPageSize) {
+          return {
+            repositories: sortRepositories(repositories),
+            error: null,
+            warning: Object.freeze({
+              kind: "pagination_incomplete",
+              message: "Repository pagination ended before the authoritative final page.",
+            }),
+            partial: true,
+            stale: false,
+          };
+        }
+
+        if (page >= MAX_WORKSPACE_REPOSITORY_PAGES) {
+          return {
+            repositories: sortRepositories(repositories),
+            error: null,
+            warning: Object.freeze({
+              kind: "pagination_limit",
+              message: "Repository enumeration exceeded the safe page limit.",
+            }),
+            partial: true,
+            stale: false,
+          };
         }
 
         page += 1;
@@ -179,6 +206,7 @@ function isRepositoryArray(value) {
 module.exports = {
   UNEXPECTED_RESPONSE_FORMAT_ERROR,
   STALE_ACCOUNT_ERROR,
+  MAX_WORKSPACE_REPOSITORY_PAGES,
   WORKSPACE_REPOSITORY_PAGE_SIZE,
   fetchWorkspaceRepositories,
 };

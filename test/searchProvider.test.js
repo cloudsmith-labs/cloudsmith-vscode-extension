@@ -56,6 +56,7 @@ suite("SearchProvider atomic search state", () => {
 
   test("canonicalizes every retained field without freezing the API response", async () => {
     const responsePackage = pkg("artifact", {
+      is_copyable: true,
       tags: { info: ["upstream"], nested: { source: "api" } },
       license: "MIT",
       licenseInfo: { metadata: { label: "caller-owned", nested: { secret: true } } },
@@ -89,6 +90,7 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(committedNode.max_severity, null);
     assert.strictEqual(committedNode.vulnerability_scan_results_url, null);
     assert.strictEqual(committedNode.cdn_url, null);
+    assert.strictEqual(committedNode.is_copyable, true);
     assert.strictEqual(Object.isFrozen(responsePackage), false);
     assert.strictEqual(Object.isFrozen(responsePackage.tags), false);
     assert.strictEqual(Object.isFrozen(responsePackage.tags.info), false);

@@ -202,6 +202,25 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
     );
   });
 
+  test("returns partial state when a short page contradicts authoritative later pages", async () => {
+    let calls = 0;
+    PaginatedFetch.prototype.fetchPage = async () => {
+      calls += 1;
+      return {
+        data: [{ name: "repo-a", slug: "repo-a" }],
+        pagination: { page: 1, pageTotal: 2, count: 2, pageSize: 2 },
+      };
+    };
+
+    const result = await fetchRepositories();
+
+    assert.strictEqual(calls, 1);
+    assert.strictEqual(result.error, null);
+    assert.strictEqual(result.partial, true);
+    assert.strictEqual(result.warning.kind, "pagination_incomplete");
+    assert.deepStrictEqual(result.repositories, [{ name: "repo-a", slug: "repo-a" }]);
+  });
+
   test("returns an error when the first page fails", async () => {
     const failure = apiFailure("server_error", {
       status: 500,
@@ -335,5 +354,23 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
     assert.strictEqual(result.stale, true);
     assert.deepStrictEqual(result.repositories, []);
     assert.strictEqual(result.error.kind, "stale_account");
+  });
+
+  test("returns partial state instead of looping beyond the repository page ceiling", async () => {
+    let calls = 0;
+    PaginatedFetch.prototype.fetchPage = async (_endpoint, page) => {
+      calls += 1;
+      return {
+        data: [{ name: `repo-${page}`, slug: `repo-${page}` }],
+        pagination: { page, pageTotal: 21, count: 21, pageSize: 1 },
+      };
+    };
+
+    const result = await fetchRepositories();
+
+    assert.strictEqual(calls, workspaceRepositoryFetcher.MAX_WORKSPACE_REPOSITORY_PAGES);
+    assert.strictEqual(result.partial, true);
+    assert.strictEqual(result.repositories.length, workspaceRepositoryFetcher.MAX_WORKSPACE_REPOSITORY_PAGES);
+    assert.strictEqual(result.warning.kind, "pagination_limit");
   });
 });

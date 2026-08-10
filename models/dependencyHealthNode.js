@@ -71,6 +71,11 @@ class DependencyHealthNode {
       this.repository = this.cloudsmithMatch.repository;
       this.slug_perm = { id: "Slug", value: this.cloudsmithMatch.slug_perm };
       this.slug_perm_raw = this.cloudsmithMatch.slug_perm;
+      this.is_copyable = this.cloudsmithMatch.is_copyable === true
+        ? true
+        : this.cloudsmithMatch.is_copyable === false
+          ? false
+          : null;
       this.version = { id: "Version", value: this.cloudsmithMatch.version };
       this.status_str = { id: "Status", value: this.cloudsmithMatch.status_str };
       this.checksum_sha256 = this.cloudsmithMatch.checksum_sha256 || null;
