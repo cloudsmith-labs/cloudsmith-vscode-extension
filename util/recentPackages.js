@@ -61,10 +61,12 @@ function add(pkg) {
   if (!pkg || !pkg.name) {
     return;
   }
-  const workspace = pkg.cloudsmithWorkspace || pkg.namespace || "";
+  const workspace = canonicalAlias([pkg.cloudsmithWorkspace, pkg.namespace]);
+  const repository = canonicalAlias([pkg.cloudsmithRepo, pkg.repository]);
+  const packageIdentifier = canonicalAlias([pkg.slug_perm, pkg.slug_perm_raw]);
   const version = unwrapValue(pkg.version) || pkg.declaredVersion || "";
   // Deduplicate by workspace + name + version + repository
-  const key = `${workspace}:${pkg.name}:${version}:${pkg.repository || ""}`;
+  const key = `${workspace || ""}:${pkg.name}:${version}:${repository || ""}`;
   const idx = _recent.findIndex(p =>
     `${p.cloudsmithWorkspace || p.namespace || ""}:${p.name}:${p.version || ""}:${p.repository || ""}` === key
   );
@@ -76,11 +78,16 @@ function add(pkg) {
     name: pkg.name,
     format: pkg.format,
     version: version || null,
-    namespace: pkg.namespace,
-    repository: pkg.repository,
-    slug_perm: unwrapValue(pkg.slug_perm),
-    slug_perm_raw: pkg.slug_perm_raw || unwrapValue(pkg.slug_perm) || null,
+    namespace: workspace,
+    repository,
+    slug_perm: packageIdentifier,
+    slug_perm_raw: packageIdentifier,
     slug: unwrapValue(pkg.slug) || null,
+    is_copyable: pkg.is_copyable === true
+      ? true
+      : pkg.is_copyable === false
+        ? false
+        : null,
     num_vulnerabilities: pkg.num_vulnerabilities || 0,
     max_severity: pkg.max_severity || null,
     checksum_sha256: getNestedField(pkg, "checksum_sha256") || null,
@@ -91,12 +98,34 @@ function add(pkg) {
     cdn_url: getNestedField(pkg, "cdn_url") || null,
     filename: getNestedField(pkg, "filename") || null,
     status_str: unwrapValue(pkg.status_str) || pkg.status_str_raw || getNestedField(pkg, "status_str") || null,
-    cloudsmithWorkspace: pkg.cloudsmithWorkspace || pkg.namespace || null,
-    cloudsmithRepo: pkg.cloudsmithRepo || pkg.repository || null,
+    cloudsmithWorkspace: workspace,
+    cloudsmithRepo: repository,
   });
   if (_recent.length > MAX_RECENT) {
     _recent.length = MAX_RECENT;
   }
+}
+
+function canonicalAlias(values) {
+  const supplied = values.filter(value => value !== undefined && value !== null);
+  const present = supplied.map(value => {
+    let current = value;
+    for (let depth = 0; depth < 2; depth += 1) {
+      if (
+        !current
+        || typeof current !== "object"
+        || Array.isArray(current)
+        || !Object.prototype.hasOwnProperty.call(current, "value")
+      ) {
+        break;
+      }
+      current = current.value;
+    }
+    return typeof current === "string" && current.length > 0 ? current : null;
+  });
+  if (present.some(value => value === null)) return null;
+  if (present.length === 0 || present.some(value => value !== present[0])) return null;
+  return present[0];
 }
 
 /**

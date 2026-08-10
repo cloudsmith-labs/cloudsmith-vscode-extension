@@ -36,13 +36,17 @@ class PaginatedFetch {
             };
         }
 
-        const result = await this.api.get(url, {
+        const requestOptions = {
             responseType: "array",
             validate: typeof options.validate === "function" ? options.validate : isRecordArray,
             retry: options.retry || "never",
             signal: options.signal,
             cancellationToken: options.cancellationToken,
-        });
+        };
+        if (Object.prototype.hasOwnProperty.call(options, "apiKey")) {
+            requestOptions.apiKey = options.apiKey;
+        }
+        const result = await this.api.get(url, requestOptions);
 
         if (!result.ok) {
             return {

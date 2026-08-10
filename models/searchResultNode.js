@@ -17,6 +17,11 @@ class SearchResultNode {
         this.format = pkg.format;
         this.repository = pkg.repository;
         this.namespace = pkg.namespace;
+        this.is_copyable = pkg.is_copyable === true
+            ? true
+            : pkg.is_copyable === false
+                ? false
+                : null;
         this.status_str = { id: "Status", value: pkg.status_str };
         this.slug = { id: "Slug", value: pkg.slug };
         this.slug_perm = { id: "Slug", value: pkg.slug_perm };

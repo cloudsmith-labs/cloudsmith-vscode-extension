@@ -1089,6 +1089,11 @@ function canonicalizeSearchPackage(pkg) {
         repository,
         namespace,
         slug_perm: slugPerm,
+        is_copyable: pkg.is_copyable === true
+            ? true
+            : pkg.is_copyable === false
+                ? false
+                : null,
         status_str: optionalString(pkg.status_str),
         slug: optionalString(pkg.slug, MAX_PACKAGE_IDENTITY_LENGTH),
         downloads,

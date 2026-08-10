@@ -19,6 +19,11 @@ class PackageNode {
     this.uploaded_at = { id: "Uploaded at", value: pkg.uploaded_at };
     this.repository = pkg.repository;
     this.namespace = pkg.namespace;
+    this.is_copyable = pkg.is_copyable === true
+      ? true
+      : pkg.is_copyable === false
+        ? false
+        : null;
     this.status_reason = pkg.status_reason || null;
     this.checksum_sha256 = pkg.checksum_sha256 || null;
     this.version_digest = pkg.version_digest || null;
