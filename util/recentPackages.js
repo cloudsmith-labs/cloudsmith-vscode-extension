@@ -53,35 +53,101 @@ function getRawTags(pkg) {
   return null;
 }
 
+function canonicalVersionScalar(value) {
+  if (value === undefined || value === null) {
+    return { state: "absent", value: "" };
+  }
+  let current = value;
+  for (let depth = 0; depth < 2; depth += 1) {
+    if (
+      !current
+      || typeof current !== "object"
+      || Array.isArray(current)
+      || !Object.prototype.hasOwnProperty.call(current, "value")
+    ) {
+      break;
+    }
+    current = current.value;
+  }
+  if (typeof current === "string") {
+    return { state: "valid", value: current };
+  }
+  if (typeof current === "number" && Number.isFinite(current)) {
+    return { state: "valid", value: String(current) };
+  }
+  return { state: "invalid", value: "" };
+}
+
+function canonicalRecentVersion(pkg) {
+  const version = canonicalVersionScalar(pkg.version);
+  if (version.state === "invalid" || (version.state === "valid" && version.value.length > 0)) {
+    return version;
+  }
+  const declaredVersion = canonicalVersionScalar(pkg.declaredVersion);
+  return declaredVersion.state === "absent"
+    ? { state: "valid", value: "" }
+    : declaredVersion;
+}
+
+function normalizeRecentPackage(pkg) {
+  const version = canonicalRecentVersion(pkg);
+  return {
+    name: pkg.name,
+    workspace: canonicalAlias([pkg.cloudsmithWorkspace, pkg.namespace]),
+    repository: canonicalAlias([pkg.cloudsmithRepo, pkg.repository]),
+    packageIdentifier: canonicalAlias([pkg.slug_perm, pkg.slug_perm_raw]),
+    version: version.value,
+    versionValid: version.state === "valid",
+  };
+}
+
+function recentPackageIdentity(normalized) {
+  if (
+    typeof normalized.name !== "string"
+    || normalized.name.length === 0
+    || typeof normalized.workspace !== "string"
+    || typeof normalized.repository !== "string"
+    || !normalized.versionValid
+  ) {
+    return null;
+  }
+  return JSON.stringify([
+    normalized.workspace,
+    normalized.name,
+    normalized.version,
+    normalized.repository,
+  ]);
+}
+
 /**
  * Add a package to the recent list.
- * @param {Object} pkg  Must have at least { name, format, namespace, repository }.
+ * Workspace and repository may use their current or compatibility aliases. Only
+ * records with a canonical workspace/repository/name/version tuple are deduplicated.
+ * @param {Object} pkg Must have a non-empty name and a supported version shape.
  */
 function add(pkg) {
-  if (!pkg || !pkg.name) {
+  if (!pkg || typeof pkg.name !== "string" || pkg.name.length === 0) {
     return;
   }
-  const workspace = canonicalAlias([pkg.cloudsmithWorkspace, pkg.namespace]);
-  const repository = canonicalAlias([pkg.cloudsmithRepo, pkg.repository]);
-  const packageIdentifier = canonicalAlias([pkg.slug_perm, pkg.slug_perm_raw]);
-  const version = unwrapValue(pkg.version) || pkg.declaredVersion || "";
-  // Deduplicate by workspace + name + version + repository
-  const key = `${workspace || ""}:${pkg.name}:${version}:${repository || ""}`;
-  const idx = _recent.findIndex(p =>
-    `${p.cloudsmithWorkspace || p.namespace || ""}:${p.name}:${p.version || ""}:${p.repository || ""}` === key
-  );
-  if (idx >= 0) {
-    _recent.splice(idx, 1);
+  const normalized = normalizeRecentPackage(pkg);
+  if (!normalized.versionValid) return;
+  const key = recentPackageIdentity(normalized);
+  if (key !== null) {
+    for (let index = _recent.length - 1; index >= 0; index -= 1) {
+      if (recentPackageIdentity(normalizeRecentPackage(_recent[index])) === key) {
+        _recent.splice(index, 1);
+      }
+    }
   }
   const rawTags = getRawTags(pkg);
   _recent.unshift({
-    name: pkg.name,
+    name: normalized.name,
     format: pkg.format,
-    version: version || null,
-    namespace: workspace,
-    repository,
-    slug_perm: packageIdentifier,
-    slug_perm_raw: packageIdentifier,
+    version: normalized.version || null,
+    namespace: normalized.workspace,
+    repository: normalized.repository,
+    slug_perm: normalized.packageIdentifier,
+    slug_perm_raw: normalized.packageIdentifier,
     slug: unwrapValue(pkg.slug) || null,
     is_copyable: pkg.is_copyable === true
       ? true
@@ -98,8 +164,8 @@ function add(pkg) {
     cdn_url: getNestedField(pkg, "cdn_url") || null,
     filename: getNestedField(pkg, "filename") || null,
     status_str: unwrapValue(pkg.status_str) || pkg.status_str_raw || getNestedField(pkg, "status_str") || null,
-    cloudsmithWorkspace: workspace,
-    cloudsmithRepo: repository,
+    cloudsmithWorkspace: normalized.workspace,
+    cloudsmithRepo: normalized.repository,
   });
   if (_recent.length > MAX_RECENT) {
     _recent.length = MAX_RECENT;

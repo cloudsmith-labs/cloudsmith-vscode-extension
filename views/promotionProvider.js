@@ -15,8 +15,10 @@ const {
   createStage,
   createTagPlan,
   deepFreeze,
+  isPackageLocationArray,
   missingTags,
   normalizeFreshSource,
+  normalizePackageQueryIdentity,
   normalizePipeline,
   normalizeTargetPackage,
   normalizeTargetRepository,
@@ -75,27 +77,26 @@ class PromotionProvider {
       return { items: [], error };
     }
     if (pipeline.length === 0) return { items: [], error: null };
-    if (!name || !version || !format) {
-      return { items: [], error: new Error("Package identity is incomplete.") };
-    }
 
     let endpoint;
+    let identity;
     try {
-      const query = buildExactPackageQuery(name, version, format);
-      endpoint = apiEndpoint(["packages", workspace], { query: { query, page_size: 100 } });
+      identity = normalizePackageQueryIdentity(workspace, name, version, format);
+      const query = buildExactPackageQuery(identity.name, identity.version, identity.format);
+      endpoint = apiEndpoint(["packages", identity.workspace], { query: { query, page_size: 100 } });
     } catch (error) {
       return { items: [], error };
     }
     const results = await this.api.get(endpoint, {
       responseType: "array",
-      validate: isPromotionStatusArray,
+      validate: isPackageLocationArray,
       retry: "never",
     });
     if (!results.ok) return { items: [], error: results.error };
 
     const repoMap = new Map();
     for (const pkg of results.data.filter(candidate => (
-      packageMatchesExactIdentity(candidate, { name, version, format })
+      packageMatchesExactIdentity(candidate, identity)
     ))) {
       repoMap.set(pkg.repository, pkg);
     }
@@ -862,7 +863,7 @@ class PromotionProvider {
           query,
           {
             apiKey,
-            validate: isRecordArray,
+            validate: isPackageLocationArray,
             retry: "never",
             cancellationToken,
           }
@@ -1400,6 +1401,7 @@ function failureMessage(code) {
     target_access_denied: "The target repository could not be verified. Check repository access and try again.",
     target_missing: "The target repository is unavailable. Check repository access and try again.",
     target_package_exists: "This package already exists in the selected target repository. No changes were made.",
+    target_state_malformed: "Cloudsmith returned malformed target package data. No changes were made.",
     target_state_unknown: "Target package state could not be verified. No changes were made.",
     unexpected_error: "Promotion stopped because of an unexpected error. No further changes were attempted.",
   };
@@ -1408,24 +1410,6 @@ function failureMessage(code) {
 
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function isRecordArray(value) {
-  return Array.isArray(value) && value.every(isRecord);
-}
-
-function isPackageLocationArray(value) {
-  return Array.isArray(value) && value.every(pkg => (
-    isRecord(pkg)
-    && typeof pkg.name === "string"
-    && (typeof pkg.version === "string" || typeof pkg.version === "number")
-    && typeof pkg.format === "string"
-    && typeof pkg.repository === "string"
-  ));
-}
-
-function isPromotionStatusArray(value) {
-  return isPackageLocationArray(value);
 }
 
 module.exports = {

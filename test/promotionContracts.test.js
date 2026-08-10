@@ -5,7 +5,9 @@ const {
   createSourceLocator,
   createStage,
   createTagPlan,
+  isPackageLocationArray,
   normalizeFreshSource,
+  normalizePackageQueryIdentity,
   normalizePipeline,
   normalizeTargetPackage,
   preflightFingerprint,
@@ -29,6 +31,18 @@ suite("Promotion contracts", () => {
       is_copyable: true,
       checksum_sha256: "checksum-a",
       tags: { info: [] },
+      ...overrides,
+    };
+  }
+
+  function locationRecord(overrides = {}) {
+    return {
+      namespace: "workspace",
+      repository: "source",
+      slug_perm: "package-id",
+      name: "artifact",
+      version: "1.0.0",
+      format: "npm",
       ...overrides,
     };
   }
@@ -85,6 +99,87 @@ suite("Promotion contracts", () => {
     }
   });
 
+  test("package-location arrays require complete canonical string identities", () => {
+    assert.strictEqual(isPackageLocationArray([locationRecord()]), true);
+    assert.strictEqual(
+      isPackageLocationArray([locationRecord({ slug_perm_raw: "package-id" })]),
+      true
+    );
+
+    const malformed = [
+      locationRecord({ name: "" }),
+      locationRecord({ name: "   " }),
+      locationRecord({ name: "artifact\u0000" }),
+      locationRecord({ version: "" }),
+      locationRecord({ version: "   " }),
+      locationRecord({ version: 1 }),
+      locationRecord({ version: Number.NaN }),
+      locationRecord({ version: Number.POSITIVE_INFINITY }),
+      locationRecord({ version: Number.NEGATIVE_INFINITY }),
+      locationRecord({ format: "" }),
+      locationRecord({ format: "   " }),
+      locationRecord({ format: "np\u202em" }),
+      locationRecord({ namespace: "" }),
+      locationRecord({ namespace: "   " }),
+      locationRecord({ namespace: "../workspace" }),
+      locationRecord({ namespace: "workspace%2fother" }),
+      locationRecord({ namespace: "workspace%252fother" }),
+      locationRecord({ repository: "" }),
+      locationRecord({ repository: "   " }),
+      locationRecord({ repository: "../source" }),
+      locationRecord({ repository: "source/other" }),
+      locationRecord({ slug_perm: "" }),
+      locationRecord({ slug_perm: "   " }),
+      locationRecord({ slug_perm: "../package-id" }),
+      locationRecord({ slug_perm: "package%5cid" }),
+      locationRecord({ slug_perm: "package%255cid" }),
+      locationRecord({ slug_perm_raw: "other-package-id" }),
+      locationRecord({ namespace: undefined }),
+      locationRecord({ repository: undefined }),
+      locationRecord({ slug_perm: undefined }),
+    ];
+    for (const record of malformed) {
+      assert.doesNotThrow(() => isPackageLocationArray([record]));
+      assert.strictEqual(isPackageLocationArray([record]), false);
+    }
+    assert.strictEqual(
+      isPackageLocationArray([locationRecord(), locationRecord({ repository: " " })]),
+      false
+    );
+    assert.strictEqual(isPackageLocationArray({}), false);
+  });
+
+  test("promotion query identity is normalized once and rejects ambiguous inputs", () => {
+    const identity = normalizePackageQueryIdentity("workspace", "artifact", "1.0.0", "npm");
+    assert.deepStrictEqual(identity, {
+      workspace: "workspace",
+      name: "artifact",
+      version: "1.0.0",
+      format: "npm",
+    });
+    assert(Object.isFrozen(identity));
+
+    const invalid = [
+      ["", "artifact", "1.0.0", "npm"],
+      ["   ", "artifact", "1.0.0", "npm"],
+      ["../workspace", "artifact", "1.0.0", "npm"],
+      ["workspace%252fother", "artifact", "1.0.0", "npm"],
+      ["workspace", "", "1.0.0", "npm"],
+      ["workspace", "   ", "1.0.0", "npm"],
+      ["workspace", "artifact", "", "npm"],
+      ["workspace", "artifact", "   ", "npm"],
+      ["workspace", "artifact", 1, "npm"],
+      ["workspace", "artifact", Number.NaN, "npm"],
+      ["workspace", "artifact", Number.POSITIVE_INFINITY, "npm"],
+      ["workspace", "artifact", Number.NEGATIVE_INFINITY, "npm"],
+      ["workspace", "artifact", "1.0.0", ""],
+      ["workspace", "artifact", "1.0.0", "   "],
+    ];
+    for (const args of invalid) {
+      assert.throws(() => normalizePackageQueryIdentity(...args), PromotionContractError);
+    }
+  });
+
   test("fresh source is the only authority for identity and strict copyability", () => {
     const source = normalizeFreshSource(sourceRecord(), locator);
     assert.strictEqual(source.copyable, true);
@@ -104,11 +199,25 @@ suite("Promotion contracts", () => {
   test("rejects fresh identity mismatch, malformed versions, and missing immutable evidence", () => {
     for (const record of [
       sourceRecord({ slug_perm: "different" }),
+      sourceRecord({ slug_perm: "" }),
+      sourceRecord({ slug_perm: "   " }),
       sourceRecord({ namespace: "other" }),
+      sourceRecord({ namespace: "" }),
+      sourceRecord({ namespace: "   " }),
       sourceRecord({ repository: "other" }),
+      sourceRecord({ repository: "" }),
+      sourceRecord({ repository: "   " }),
+      sourceRecord({ name: "" }),
+      sourceRecord({ name: "   " }),
+      sourceRecord({ version: "" }),
+      sourceRecord({ version: "   " }),
+      sourceRecord({ version: 1 }),
       sourceRecord({ version: Number.NaN }),
       sourceRecord({ version: Number.POSITIVE_INFINITY }),
+      sourceRecord({ version: Number.NEGATIVE_INFINITY }),
       sourceRecord({ version: {} }),
+      sourceRecord({ format: "" }),
+      sourceRecord({ format: "   " }),
       sourceRecord({ checksum_sha256: null, version_digest: null }),
     ]) {
       assert.throws(() => normalizeFreshSource(record, locator), PromotionContractError);
@@ -147,6 +256,30 @@ suite("Promotion contracts", () => {
       }, sourceWithBoth, target),
       PromotionContractError
     );
+
+    for (const record of [
+      { ...packageRecord, namespace: "" },
+      { ...packageRecord, namespace: "   " },
+      { ...packageRecord, repository: "" },
+      { ...packageRecord, repository: "   " },
+      { ...packageRecord, slug_perm: "" },
+      { ...packageRecord, slug_perm: "   " },
+      { ...packageRecord, name: "" },
+      { ...packageRecord, name: "   " },
+      { ...packageRecord, version: "" },
+      { ...packageRecord, version: "   " },
+      { ...packageRecord, version: 1 },
+      { ...packageRecord, version: Number.NaN },
+      { ...packageRecord, version: Number.POSITIVE_INFINITY },
+      { ...packageRecord, version: Number.NEGATIVE_INFINITY },
+      { ...packageRecord, format: "" },
+      { ...packageRecord, format: "   " },
+    ]) {
+      assert.throws(
+        () => normalizeTargetPackage(record, source, target),
+        PromotionContractError
+      );
+    }
   });
 
   test("pipeline and expanded tag plans are bounded, unique, and frozen", () => {

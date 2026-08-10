@@ -71,12 +71,8 @@ function unwrapLegacyValue(value) {
   return current;
 }
 
-function scalarString(value, maximumLength, code, options = {}) {
-  let normalized = value;
-  if (options.allowFiniteNumber && typeof normalized === "number") {
-    if (!Number.isFinite(normalized)) throw new PromotionContractError(code);
-    normalized = String(normalized);
-  }
+function scalarString(value, maximumLength, code) {
+  const normalized = value;
   if (
     typeof normalized !== "string"
     || normalized.length === 0
@@ -211,8 +207,7 @@ function normalizeFreshSource(record, locator) {
     version: scalarString(
       record.version,
       MAX_PACKAGE_VERSION_LENGTH,
-      "malformed_source_package",
-      { allowFiniteNumber: true }
+      "malformed_source_package"
     ),
     format: scalarString(record.format, MAX_PACKAGE_FORMAT_LENGTH, "malformed_source_package"),
     copyable: record.is_copyable,
@@ -257,8 +252,7 @@ function normalizeTargetPackage(record, source, target) {
   const version = scalarString(
     record.version,
     MAX_PACKAGE_VERSION_LENGTH,
-    "malformed_target_package",
-    { allowFiniteNumber: true }
+    "malformed_target_package"
   );
   const format = scalarString(record.format, MAX_PACKAGE_FORMAT_LENGTH, "malformed_target_package");
   const fingerprint = immutableFingerprint(record);
@@ -299,6 +293,47 @@ function normalizePipeline(value) {
     throw new PromotionContractError("malformed_pipeline");
   }
   return Object.freeze(pipeline);
+}
+
+function normalizePackageQueryIdentity(workspace, name, version, format) {
+  return deepFreeze({
+    workspace: pathIdentity(workspace, MAX_WORKSPACE_LENGTH, "malformed_package_query"),
+    name: scalarString(name, MAX_PACKAGE_NAME_LENGTH, "malformed_package_query"),
+    version: scalarString(version, MAX_PACKAGE_VERSION_LENGTH, "malformed_package_query"),
+    format: scalarString(format, MAX_PACKAGE_FORMAT_LENGTH, "malformed_package_query"),
+  });
+}
+
+function isPackageLocationArray(value) {
+  if (!Array.isArray(value)) return false;
+  try {
+    return value.every(record => {
+      if (!isRecord(record)) return false;
+      pathIdentity(record.namespace, MAX_WORKSPACE_LENGTH, "malformed_package_location");
+      pathIdentity(record.repository, MAX_REPOSITORY_LENGTH, "malformed_package_location");
+      scalarString(record.name, MAX_PACKAGE_NAME_LENGTH, "malformed_package_location");
+      scalarString(record.version, MAX_PACKAGE_VERSION_LENGTH, "malformed_package_location");
+      scalarString(record.format, MAX_PACKAGE_FORMAT_LENGTH, "malformed_package_location");
+      const packageIdentifier = pathIdentity(
+        record.slug_perm,
+        MAX_PACKAGE_IDENTIFIER_LENGTH,
+        "malformed_package_location"
+      );
+      if (
+        record.slug_perm_raw != null
+        && pathIdentity(
+          record.slug_perm_raw,
+          MAX_PACKAGE_IDENTIFIER_LENGTH,
+          "malformed_package_location"
+        ) !== packageIdentifier
+      ) {
+        return false;
+      }
+      return true;
+    });
+  } catch {
+    return false;
+  }
 }
 
 function normalizeTagTemplates(value) {
@@ -574,8 +609,10 @@ module.exports = {
   createTagPlan,
   deepFreeze,
   fingerprintsMatch,
+  isPackageLocationArray,
   missingTags,
   normalizeFreshSource,
+  normalizePackageQueryIdentity,
   normalizePipeline,
   normalizeTargetPackage,
   normalizeTargetRepository,
