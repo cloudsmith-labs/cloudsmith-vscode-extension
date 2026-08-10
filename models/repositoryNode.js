@@ -12,10 +12,19 @@ const UpstreamIndicatorNode = require("./upstreamIndicatorNode");
 const { activeFilters } = require("../util/filterState");
 const InfoNode = require("./infoNode");
 const { EntitlementSummaryNode } = require("./entitlementNode");
+const {
+  captureAccount,
+  isAccountCurrent,
+  resolveConnectionManager,
+} = require("../util/accountOperation");
 
 class RepositoryNode {
-  constructor(repo, workspace, context) {
+  constructor(repo, workspace, context, options = {}) {
     this.context = context;
+    this._connectionManager = resolveConnectionManager(context, options.connectionManager);
+    this._createCloudsmithAPI = options.createCloudsmithAPI
+      || (() => new CloudsmithAPI(this.context));
+    this._upstreamChecker = options.upstreamChecker || upstreamChecker;
     this.slug = repo.slug;
     this.slug_perm = repo.slug_perm;
     this.name = repo.name;
@@ -105,7 +114,9 @@ class RepositoryNode {
   }
 
   async getPackages() {
-    const cloudsmithAPI = new CloudsmithAPI(this.context);
+    const account = captureAccount(this._connectionManager);
+    if (!account) return [];
+    const cloudsmithAPI = this._createCloudsmithAPI();
     let packages = '';
     
 
@@ -116,6 +127,7 @@ class RepositoryNode {
     const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
     const maxPackages = await config.get("showMaxPackages"); // get legacy app setting from configuration settings
     const groupByPackageGroup = await config.get("groupByPackageGroups");
+    if (!isAccountCurrent(this._connectionManager, account)) return [];
 
     const activeFilter = this._getActiveFilter();
     const filterQuery = activeFilter ? (activeFilter.query || activeFilter) : null;
@@ -154,9 +166,11 @@ class RepositoryNode {
         }
       }
     } catch {
+      if (!isAccountCurrent(this._connectionManager, account)) return [];
       apiFailed = true;
       packages = [];
     }
+    if (!isAccountCurrent(this._connectionManager, account)) return [];
     this._lastApiFailed = apiFailed;
 
     const PackageNodes = [];
@@ -164,7 +178,9 @@ class RepositoryNode {
       for (const pkg of packages) {
         if (!groupByPackageGroup) {
           const packageNode = require("./packageNode");
-          let packageNodeInst = new packageNode(pkg, this.context);
+          let packageNodeInst = new packageNode(pkg, this.context, {
+            connectionManager: this._connectionManager,
+          });
           PackageNodes.push(packageNodeInst);
         } else {
           const packageGroupsNode = require("./packageGroupsNode");
@@ -186,27 +202,43 @@ class RepositoryNode {
    * @returns {Array} Array of upstream config objects (may be empty).
    */
   async getUpstreams(packageNodes = []) {
+    const account = captureAccount(this._connectionManager);
+    if (!account) return [];
     const inferredFormats = this._inferUpstreamFormats(packageNodes);
     if (inferredFormats.length === 0) {
-      return this._getUpstreamList(
-        await upstreamChecker.getAllUpstreamData(this.context, this.workspace, this.slug)
+      const result = await this._upstreamChecker.getAllUpstreamData(
+        this.context,
+        this.workspace,
+        this.slug,
+        { account, connectionManager: this._connectionManager }
       );
+      return isAccountCurrent(this._connectionManager, account)
+        ? this._getUpstreamList(result)
+        : [];
     }
 
-    const hintedResult = await upstreamChecker.getUpstreamDataForFormats(
+    const hintedResult = await this._upstreamChecker.getUpstreamDataForFormats(
       this.context,
       this.workspace,
       this.slug,
-      inferredFormats
+      inferredFormats,
+      { account, connectionManager: this._connectionManager }
     );
+    if (!isAccountCurrent(this._connectionManager, account)) return [];
 
     if (this._hasCompleteUpstreamCoverage(inferredFormats)) {
       return this._getUpstreamList(hintedResult);
     }
 
-    return this._getUpstreamList(
-      await upstreamChecker.getAllUpstreamData(this.context, this.workspace, this.slug)
+    const result = await this._upstreamChecker.getAllUpstreamData(
+      this.context,
+      this.workspace,
+      this.slug,
+      { account, connectionManager: this._connectionManager }
     );
+    return isAccountCurrent(this._connectionManager, account)
+      ? this._getUpstreamList(result)
+      : [];
   }
 
   _getUpstreamList(result) {
@@ -252,7 +284,9 @@ class RepositoryNode {
    * @returns {Array} Array of entitlement objects.
    */
   async getEntitlements() {
-    const cloudsmithAPI = new CloudsmithAPI(this.context);
+    const account = captureAccount(this._connectionManager);
+    if (!account) return [];
+    const cloudsmithAPI = this._createCloudsmithAPI();
     let endpoint;
     try {
       endpoint = apiEndpoint(["entitlements", this.workspace, this.slug], {
@@ -266,6 +300,7 @@ class RepositoryNode {
       validate: isEntitlementArray,
       retry: "safe-read",
     });
+    if (!isAccountCurrent(this._connectionManager, account)) return [];
     if (!result.ok) {
       throw result.error;
     }
@@ -273,7 +308,10 @@ class RepositoryNode {
   }
 
   async getChildren() {
+    const account = captureAccount(this._connectionManager);
+    if (!account) return [];
     const packages = await this.getPackages();
+    if (!isAccountCurrent(this._connectionManager, account)) return [];
     const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
     const showEntitlements = config.get("showEntitlements");
 
@@ -282,6 +320,7 @@ class RepositoryNode {
     // Fetch upstreams lazily (only when repo is expanded)
     if (packages.length > 0) {
       const upstreams = await this.getUpstreams(packages);
+      if (!isAccountCurrent(this._connectionManager, account)) return [];
       if (upstreams.length > 0) {
         children.push(new UpstreamIndicatorNode(
           upstreams,
@@ -314,10 +353,12 @@ class RepositoryNode {
     if (showEntitlements) {
       try {
         const entitlements = await this.getEntitlements();
+        if (!isAccountCurrent(this._connectionManager, account)) return [];
         if (entitlements.length > 0) {
           children.push(new EntitlementSummaryNode(entitlements, this.context));
         }
       } catch (e) {
+        if (!isAccountCurrent(this._connectionManager, account)) return [];
         children.push(new InfoNode(
           "Entitlements: failed to load",
           "",
@@ -364,7 +405,7 @@ class RepositoryNode {
       children.push(node);
     }
 
-    return children;
+    return isAccountCurrent(this._connectionManager, account) ? children : [];
   }
 }
 

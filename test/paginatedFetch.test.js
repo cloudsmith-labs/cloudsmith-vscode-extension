@@ -70,6 +70,26 @@ suite("PaginatedFetch typed API boundary", () => {
     }
   });
 
+  test("rejects a response whose authoritative page differs from the request", async () => {
+    const paginated = new PaginatedFetch({
+      async get() {
+        return apiSuccess([{ name: "artifact" }], {
+          headers: {
+            "x-pagination-page": "1",
+            "x-pagination-pagetotal": "2",
+            "x-pagination-count": "3",
+            "x-pagination-pagesize": "2",
+          },
+        });
+      },
+    });
+
+    const result = await paginated.fetchPage("packages/workspace/", 2, 2);
+
+    assert.strictEqual(result.error.kind, "invalid_response");
+    assert.deepStrictEqual(result.data, []);
+  });
+
   test("forwards a domain validator so blank records cannot cross pagination", async () => {
     let capturedValidator;
     const paginated = new PaginatedFetch({

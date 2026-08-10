@@ -1,438 +1,416 @@
-// SSO authentication manager — pragmatic credential setup for SSO-enabled
-// Cloudsmith workspaces.
-//
-// Three approaches, in order of reliability:
-//
-// A. CLI config import (importFromCLI) — PRIMARY
-//    Reads an existing API key from the Cloudsmith CLI's config file
-//    (~/.cloudsmith/config.ini). This is the most reliable path for SSO users.
-//
-// B. Terminal-based SSO (loginViaTerminal)
-//    Opens a VS Code integrated terminal and runs `cloudsmith auth -o {workspace}`
-//    so the user can complete the interactive SAML + 2FA flow. After the terminal
-//    closes, offers to import the resulting credentials.
-//
-// C. Browser-based SAML redirect (loginViaBrowser) — EXPERIMENTAL
-//    Starts a local HTTP server on port 12400, opens the SAML endpoint in the
-//    browser, and waits for the redirect. Gated behind the
-//    cloudsmith-vsc.experimentalSSOBrowser setting. Uses a one-time callback path
-//    to reject unrelated localhost traffic and avoids logging callback payloads.
-
 const crypto = require("crypto");
-const vscode = require("vscode");
-const http = require("http");
-const url = require("url");
 const fs = require("fs");
-const path = require("path");
+const http = require("http");
 const os = require("os");
+const path = require("path");
+const url = require("url");
+const vscode = require("vscode");
 
-// The CLI always uses port 12400 for the SAML redirect.
 const SAML_CALLBACK_PORT = 12400;
 const CALLBACK_SUCCESS_PATH = "/authenticated";
-
-// Known query parameter names that might contain the auth token.
 const TOKEN_PARAM_NAMES = ["api_key", "token", "access_token", "key"];
 const WORKSPACE_SLUG_PATTERN = /^[A-Za-z0-9._-]+$/;
+const MAX_WORKSPACE_SLUG_LENGTH = 128;
+const MAX_CLI_CONFIG_BYTES = 64 * 1024;
+
+function configTooLargeError() {
+  const error = new Error("Cloudsmith CLI configuration exceeds the supported size.");
+  error.code = "CONFIG_TOO_LARGE";
+  return error;
+}
+
+async function readBoundedTextFile(filePath) {
+  const handle = await fs.promises.open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(MAX_CLI_CONFIG_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+    }
+    if (total > MAX_CLI_CONFIG_BYTES) throw configTooLargeError();
+    return buffer.subarray(0, total).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+function readBoundedTextFileSync(filePath) {
+  const descriptor = fs.openSync(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(MAX_CLI_CONFIG_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const bytesRead = fs.readSync(descriptor, buffer, total, buffer.length - total, total);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+    }
+    if (total > MAX_CLI_CONFIG_BYTES) throw configTooLargeError();
+    return buffer.subarray(0, total).toString("utf8");
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function failedResult(kind, message) {
+  return Object.freeze({
+    ok: false,
+    status: "failed",
+    committed: false,
+    error: Object.freeze({ kind, message }),
+  });
+}
+
+function unavailableResult() {
+  return failedResult(
+    "unavailable",
+    "Authentication is not ready. Reload the extension and try again."
+  );
+}
 
 class SSOAuthManager {
-  constructor(context) {
+  constructor(context, options = {}) {
     this.context = context;
+    this._connectionManager = options.connectionManager || null;
+    this._readFile = options.readFile
+      ? async filePath => {
+        const content = await options.readFile(filePath, "utf8");
+        if (Buffer.byteLength(content, "utf8") > MAX_CLI_CONFIG_BYTES) throw configTooLargeError();
+        return content;
+      }
+      : readBoundedTextFile;
+    this._readFileSync = options.readFileSync
+      ? filePath => {
+        const content = options.readFileSync(filePath, "utf8");
+        if (Buffer.byteLength(content, "utf8") > MAX_CLI_CONFIG_BYTES) throw configTooLargeError();
+        return content;
+      }
+      : readBoundedTextFileSync;
+    this._accessSync = options.accessSync || fs.accessSync;
+    this._findConfigPath = options.findCLIConfigPath || null;
+    this._setTimeout = options.setTimeout || setTimeout;
+    this._clearTimeout = options.clearTimeout || clearTimeout;
+    this._createServer = options.createServer || http.createServer;
+    this._randomBytes = options.randomBytes || crypto.randomBytes;
+    this._openExternal = options.openExternal || vscode.env.openExternal;
   }
 
-  // --------------------------------------------------------------------------
-  // Approach A: Import credentials from Cloudsmith CLI config (primary)
-  // --------------------------------------------------------------------------
+  async importFromCLI(operation = null) {
+    const manager = this._getConnectionManager();
+    if (!manager) return unavailableResult();
+    const token = operation || manager.beginCredentialOperation();
+    if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
 
-  /**
-   * Import an API key from the Cloudsmith CLI's config file.
-   *
-   * The CLI stores credentials in an INI-style config file after
-   * `cloudsmith auth` or `cloudsmith auth -o {workspace}` completes.
-   *
-   * @returns {Promise<boolean>} True if import succeeded, false otherwise.
-   */
-  async importFromCLI() {
     const configPath = this._findCLIConfigPath();
-
     if (!configPath) {
+      await manager.cancelCredentialOperation(token);
       vscode.window.showErrorMessage(
         'Could not find Cloudsmith CLI configuration. Run "cloudsmith auth" in a terminal first.'
       );
-      return false;
+      return failedResult("config_missing", "Cloudsmith CLI configuration was not found.");
     }
 
     let content;
     try {
-      content = await fs.promises.readFile(configPath, "utf8");
-    } catch (e) {
-      console.debug("Could not read Cloudsmith CLI config:", configPath, e);
-      vscode.window.showErrorMessage(
-        "Could not read Cloudsmith CLI config. Check file permissions."
+      content = await this._readFile(configPath);
+    } catch (error) {
+      await manager.cancelCredentialOperation(token);
+      const tooLarge = error && error.code === "CONFIG_TOO_LARGE";
+      const publicMessage = tooLarge
+        ? "Cloudsmith CLI config is too large to import."
+        : "Could not read Cloudsmith CLI config. Check file permissions.";
+      vscode.window.showErrorMessage(publicMessage);
+      return failedResult(
+        tooLarge ? "config_too_large" : "config_read_failed",
+        publicMessage
       );
-      return false;
     }
+    if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
 
     const apiKey = this._parseAPIKeyFromConfig(content);
-
     if (!apiKey) {
+      await manager.cancelCredentialOperation(token);
       vscode.window.showErrorMessage(
-        "No API key found in Cloudsmith CLI config. " +
-        "Run 'cloudsmith auth -o {workspace}' to authenticate first."
+        "No API key found in Cloudsmith CLI config. Run 'cloudsmith auth -o {workspace}' first."
       );
-      return false;
+      return failedResult("credential_missing", "No API key was found in the CLI configuration.");
     }
 
-    await this.context.secrets.store("cloudsmith-vsc.authToken", apiKey);
-    vscode.window.showInformationMessage(
-      "Credentials imported from Cloudsmith CLI config. Connected."
-    );
-    return true;
+    return manager.replaceCredential(apiKey, token);
   }
 
-  /**
-   * Silently check whether CLI credentials exist (for auto-detect on activation).
-   * Returns true if a config file with an API key was found, false otherwise.
-   * Does NOT import or store anything — call importFromCLI() to do that.
-   */
   hasCLICredentials() {
     const configPath = this._findCLIConfigPath();
-    if (!configPath) {
-      return false;
-    }
+    if (!configPath) return false;
     try {
-      const content = fs.readFileSync(configPath, "utf8");
-      return !!this._parseAPIKeyFromConfig(content);
-    } catch (e) { // eslint-disable-line no-unused-vars
+      const content = this._readFileSync(configPath, "utf8");
+      return Boolean(this._parseAPIKeyFromConfig(content));
+    } catch {
       return false;
     }
   }
 
-  /**
-   * Locate the Cloudsmith CLI config file.
-   * Checks platform-specific paths and returns the first one that exists,
-   * or null if none are found.
-   */
   _findCLIConfigPath() {
+    if (this._findConfigPath) return this._findConfigPath();
     const home = os.homedir();
-    const candidates = [];
-
-    // The CLI's primary config location
-    candidates.push(path.join(home, ".cloudsmith", "config.ini"));
-
-    // XDG-style (Linux)
-    const xdgConfig = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
-    candidates.push(path.join(xdgConfig, "cloudsmith", "config.ini"));
-
-    // macOS Application Support
+    const candidates = [
+      path.join(home, ".cloudsmith", "config.ini"),
+      path.join(process.env.XDG_CONFIG_HOME || path.join(home, ".config"), "cloudsmith", "config.ini"),
+    ];
     if (process.platform === "darwin") {
-      candidates.push(
-        path.join(home, "Library", "Application Support", "cloudsmith", "config.ini")
-      );
+      candidates.push(path.join(home, "Library", "Application Support", "cloudsmith", "config.ini"));
     }
-
-    // Windows AppData
     if (process.platform === "win32" && process.env.APPDATA) {
-      candidates.push(
-        path.join(process.env.APPDATA, "cloudsmith", "config.ini")
-      );
+      candidates.push(path.join(process.env.APPDATA, "cloudsmith", "config.ini"));
     }
-
     for (const candidate of candidates) {
       try {
-        fs.accessSync(candidate, fs.constants.R_OK);
+        this._accessSync(candidate, fs.constants.R_OK);
         return candidate;
-      } catch (e) { // eslint-disable-line no-unused-vars
-        // File doesn't exist or isn't readable, try next
+      } catch {
+        // Try the next platform-specific location.
       }
     }
     return null;
   }
 
-  /**
-   * Parse the API key from a Cloudsmith CLI INI-style config string.
-   *
-   * Expected format:
-   *   [default]
-   *   api_key = cs_xxxxxxxxxxxxxxxxxxxx
-   *
-   * @param   {string} content  Raw config file content.
-   * @returns {string|null}     The API key, or null if not found.
-   */
   _parseAPIKeyFromConfig(content) {
-    const lines = content.split("\n");
-    for (const line of lines) {
-      const trimmed = line.trim();
-      // Match: api_key = value  or  api_key=value
-      const match = trimmed.match(/^api_key\s*=\s*(.+)$/);
+    if (typeof content !== "string") return null;
+    if (Buffer.byteLength(content, "utf8") > MAX_CLI_CONFIG_BYTES) return null;
+    for (const line of content.split("\n")) {
+      const match = line.trim().match(/^api_key\s*=\s*(.+)$/);
       if (match) {
         const key = match[1].trim();
-        if (key) {
-          return key;
-        }
+        if (key) return key;
       }
     }
     return null;
   }
 
-  // --------------------------------------------------------------------------
-  // Approach B: Terminal-based SSO (opens integrated terminal)
-  // --------------------------------------------------------------------------
-
-  /**
-   * Open a VS Code integrated terminal and run `cloudsmith auth -o {workspace}`
-   * so the user can complete the interactive SAML + 2FA flow. After the terminal
-   * is visible, show an info message offering to import credentials once done.
-   *
-   * @param {string} workspaceSlug  The Cloudsmith workspace/org slug.
-   * @returns {Promise<boolean>} True if credentials were imported after the
-   *          terminal flow, false otherwise.
-   */
-  async loginViaTerminal(workspaceSlug) {
+  async loginViaTerminal(workspaceSlug, operation = null) {
+    const manager = this._getConnectionManager();
+    if (!manager) return unavailableResult();
+    const token = operation || manager.beginCredentialOperation();
     if (!this._isValidWorkspaceSlug(workspaceSlug)) {
+      await manager.cancelCredentialOperation(token);
       vscode.window.showErrorMessage("Enter a valid Cloudsmith workspace slug.");
-      return false;
+      return failedResult("invalid_workspace", "The Cloudsmith workspace slug is invalid.");
     }
 
-    // Create and show an integrated terminal
     const terminal = vscode.window.createTerminal("Cloudsmith SSO");
-    terminal.show();
-    terminal.sendText(`cloudsmith auth -o ${workspaceSlug}`);
-
-    // Listen for the terminal closing so we can auto-prompt import
-    const closePromise = new Promise((resolve) => {
-      let done = false;
-      const disposable = vscode.window.onDidCloseTerminal((closed) => {
-        if (!done && closed === terminal) {
+    let closeDisposable = null;
+    let timeout = null;
+    let abortListener = null;
+    try {
+      terminal.show();
+      terminal.sendText(`cloudsmith auth -o ${workspaceSlug}`);
+      await new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
           done = true;
-          disposable.dispose();
           resolve();
-        }
+        };
+        closeDisposable = vscode.window.onDidCloseTerminal((closed) => {
+          if (closed === terminal) finish();
+        });
+        timeout = this._setTimeout(finish, 10000);
+        abortListener = finish;
+        token.signal.addEventListener("abort", abortListener, { once: true });
+        if (token.signal.aborted) finish();
       });
 
-      // Also offer import after a delay in case the user doesn't close the terminal
-      setTimeout(() => {
-        if (!done) {
-          done = true;
-          disposable.dispose();
-          resolve();
-        }
-      }, 10000);
-    });
-
-    await closePromise;
-
-    // Offer to import credentials
-    const choice = await vscode.window.showInformationMessage(
-      "Import credentials from the Cloudsmith CLI config?",
-      "Import", "Not now"
-    );
-
-    if (choice === "Import") {
-      return this.importFromCLI();
+      if (!manager.isOperationCurrent(token)) {
+        return failedResult("stale", "Authentication was superseded.");
+      }
+      const choice = await vscode.window.showInformationMessage(
+        "Import credentials from the Cloudsmith CLI config?",
+        "Import",
+        "Not now"
+      );
+      if (!manager.isOperationCurrent(token)) {
+        return failedResult("stale", "Authentication was superseded.");
+      }
+      if (choice === "Import") return this.importFromCLI(token);
+      return manager.cancelCredentialOperation(token);
+    } catch {
+      if (manager.isOperationCurrent(token)) await manager.cancelCredentialOperation(token);
+      return failedResult(
+        "terminal_failed",
+        "Could not start Cloudsmith CLI authentication."
+      );
+    } finally {
+      if (timeout !== null) this._clearTimeout(timeout);
+      if (closeDisposable && typeof closeDisposable.dispose === "function") closeDisposable.dispose();
+      if (abortListener) token.signal.removeEventListener("abort", abortListener);
     }
-    return false;
   }
 
-  // --------------------------------------------------------------------------
-  // Approach C: Experimental browser-based SAML redirect
-  // --------------------------------------------------------------------------
-
-  /**
-   * Attempt SSO login via the SAML endpoint with a localhost:12400 redirect.
-   *
-   * EXPERIMENTAL — gated behind cloudsmith-vsc.experimentalSSOBrowser setting.
-   *
-   * The Cloudsmith CLI uses this exact flow on port 12400. The SAML endpoint
-   * may require prior authentication (JWT), which creates a chicken-and-egg
-   * problem for first-time setup. This flow uses a one-time callback path and
-   * stores the resulting token without logging callback contents.
-   *
-   * @param {string} workspaceSlug  The Cloudsmith workspace/org slug.
-   * @returns {Promise<boolean>} True if login succeeded, false otherwise.
-   */
-  async loginViaBrowser(workspaceSlug) {
+  async loginViaBrowser(workspaceSlug, operation = null) {
+    const manager = this._getConnectionManager();
+    if (!manager) return unavailableResult();
+    const token = operation || manager.beginCredentialOperation();
     if (!this._isValidWorkspaceSlug(workspaceSlug)) {
+      await manager.cancelCredentialOperation(token);
       vscode.window.showErrorMessage("Enter a valid Cloudsmith workspace slug.");
-      return false;
+      return failedResult("invalid_workspace", "The Cloudsmith workspace slug is invalid.");
     }
 
-    const callbackId = crypto.randomBytes(16).toString("hex");
+    const callbackId = this._randomBytes(16).toString("hex");
     const callbackPath = `/callback/${callbackId}`;
-
-    // Start a local HTTP server on the CLI's fixed port (12400)
-    let serverResult;
+    let server = null;
     try {
-      serverResult = await this._startCallbackServer(callbackPath);
-    } catch (err) {
-      vscode.window.showErrorMessage(
-        `Could not start the SSO callback server on port ${SAML_CALLBACK_PORT}. ` +
-        `Free the port and try again. (${err.message})`
-      );
-      return false;
-    }
+      const serverResult = await this._startCallbackServer(callbackPath);
+      server = serverResult.server;
+      if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
 
-    const { server } = serverResult;
-    const redirectUrl = `http://127.0.0.1:${SAML_CALLBACK_PORT}${callbackPath}`;
-    const authUrl =
-      `https://api.cloudsmith.io/orgs/${encodeURIComponent(workspaceSlug)}/saml/` +
-      `?redirect_url=${encodeURIComponent(redirectUrl)}`;
+      const redirectUrl = `http://127.0.0.1:${SAML_CALLBACK_PORT}${callbackPath}`;
+      const authUrl =
+        `https://api.cloudsmith.io/orgs/${encodeURIComponent(workspaceSlug)}/saml/` +
+        `?redirect_url=${encodeURIComponent(redirectUrl)}`;
+      const tokenPromise = this._waitForCallbackToken(server, token.signal);
+      await this._openExternal(vscode.Uri.parse(authUrl));
+      if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
+      vscode.window.showInformationMessage("Browser sign-in started. Waiting for authentication...");
 
-    // Create a promise that resolves when the callback arrives or times out
-    const tokenPromise = new Promise((resolve) => {
-      server._resolveToken = resolve;
+      const candidate = await tokenPromise;
+      if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
+      if (candidate) return manager.replaceCredential(candidate, token);
 
-      const timeout = setTimeout(() => {
-        resolve(null);
-      }, 5 * 60 * 1000);
-
-      server._timeout = timeout;
-    });
-
-    // Open the browser for SSO authentication
-    await vscode.env.openExternal(vscode.Uri.parse(authUrl));
-    vscode.window.showInformationMessage(
-      "Browser sign-in started. Waiting for authentication..."
-    );
-
-    // Wait for the callback
-    const token = await tokenPromise;
-
-    // Clean up
-    this._shutdownServer(server);
-
-    if (!token) {
-      // Offer CLI import as fallback
       const choice = await vscode.window.showWarningMessage(
         "Browser-based SSO did not complete. Select a fallback method.",
-        "Open Terminal", "Import from CLI", "Dismiss"
+        "Open Terminal",
+        "Import from CLI",
+        "Dismiss"
       );
-      if (choice === "Open Terminal") {
-        return this.loginViaTerminal(workspaceSlug);
-      }
-      if (choice === "Import from CLI") {
-        return this.importFromCLI();
-      }
-      return false;
+      if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
+      if (choice === "Open Terminal") return this.loginViaTerminal(workspaceSlug, token);
+      if (choice === "Import from CLI") return this.importFromCLI(token);
+      return manager.cancelCredentialOperation(token);
+    } catch {
+      if (manager.isOperationCurrent(token)) await manager.cancelCredentialOperation(token);
+      const message = "Browser authentication could not start or complete.";
+      vscode.window.showErrorMessage(
+        `Could not complete browser SSO on port ${SAML_CALLBACK_PORT}. ${message}`
+      );
+      return failedResult("browser_failed", message);
+    } finally {
+      if (server) this._shutdownServer(server);
     }
-
-    await this.context.secrets.store("cloudsmith-vsc.authToken", token);
-    vscode.window.showInformationMessage("SSO authentication complete. Credentials saved.");
-    return true;
   }
 
-  /**
-   * Start a local HTTP server on port 12400 (the CLI's fixed port).
-   * Rejects if the port is unavailable.
-   */
+  _waitForCallbackToken(server, signal) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (candidate) => {
+        if (settled) return;
+        settled = true;
+        if (server._timeout !== null) this._clearTimeout(server._timeout);
+        server._timeout = null;
+        signal.removeEventListener("abort", onAbort);
+        server._resolveToken = null;
+        resolve(candidate);
+      };
+      const onAbort = () => finish(null);
+      server._resolveToken = finish;
+      server._timeout = this._setTimeout(() => finish(null), 5 * 60 * 1000);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    });
+  }
+
   _startCallbackServer(expectedPath) {
     return new Promise((resolve, reject) => {
-      const server = http.createServer((req, res) => {
-        this._handleCallbackRequest(req, res, server);
-      });
+      const server = this._createServer((req, res) => this._handleCallbackRequest(req, res, server));
       server._expectedPath = expectedPath;
-
+      server._timeout = null;
+      const onError = (error) => {
+        const message = error.code === "EADDRINUSE"
+          ? `Port ${SAML_CALLBACK_PORT} is already in use`
+          : "Failed to start the callback server";
+        reject(new Error(message));
+      };
+      server.once("error", onError);
       server.listen(SAML_CALLBACK_PORT, "127.0.0.1", () => {
+        server.removeListener("error", onError);
+        server.on("error", () => {
+          if (server._resolveToken) server._resolveToken(null);
+          this._shutdownServer(server);
+        });
         resolve({ server, port: SAML_CALLBACK_PORT });
-      });
-
-      server.on("error", (err) => {
-        if (err.code === "EADDRINUSE") {
-          reject(new Error(`Port ${SAML_CALLBACK_PORT} is already in use`));
-        } else {
-          reject(new Error(`Failed to start callback server: ${err.message}`));
-        }
       });
     });
   }
 
-  /**
-   * Handle an incoming HTTP request on the callback server.
-   * Accept only the one-time callback path and avoid logging token-bearing data.
-   */
   _handleCallbackRequest(req, res, server) {
     const parsed = url.parse(req.url, true);
     const params = parsed.query || {};
     const pathName = parsed.pathname || "/";
-
     if (req.method !== "GET") {
       res.writeHead(405, { "Content-Type": "text/plain" });
       res.end("Method Not Allowed");
       return;
     }
-
-    if (pathName === CALLBACK_SUCCESS_PATH) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(this._buildCallbackHtml(true));
-      return;
-    }
-
     if (pathName !== server._expectedPath) {
       res.writeHead(404, { "Content-Type": "text/plain" });
       res.end("Not Found");
       return;
     }
 
-    // Look for the token in known parameter names
     let token = null;
     for (const name of TOKEN_PARAM_NAMES) {
-      if (params[name]) {
+      if (typeof params[name] === "string" && params[name]) {
         token = params[name];
         break;
       }
     }
-
-    // Resolve the token promise
-    if (server._resolveToken) {
-      server._resolveToken(token);
-      server._resolveToken = null;
-    }
-
+    if (server._resolveToken) server._resolveToken(token);
     if (token) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(this._buildCallbackHtml(true, CALLBACK_SUCCESS_PATH));
       return;
     }
-
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(this._buildCallbackHtml(false));
   }
 
-  /**
-   * Shut down the callback server and clear the timeout.
-   */
   _shutdownServer(server) {
-    if (server._timeout) {
-      clearTimeout(server._timeout);
+    if (server._timeout !== null) {
+      this._clearTimeout(server._timeout);
       server._timeout = null;
     }
+    server._resolveToken = null;
     try {
       server.close();
-    } catch (e) { // eslint-disable-line no-unused-vars
-      // Server may already be closed
+    } catch {
+      // The server may already be closed.
     }
   }
 
   _isValidWorkspaceSlug(workspaceSlug) {
-    return typeof workspaceSlug === "string" &&
-      workspaceSlug.length > 0 &&
-      WORKSPACE_SLUG_PATTERN.test(workspaceSlug);
+    return typeof workspaceSlug === "string"
+      && workspaceSlug.length > 0
+      && workspaceSlug.length <= MAX_WORKSPACE_SLUG_LENGTH
+      && WORKSPACE_SLUG_PATTERN.test(workspaceSlug);
   }
 
   _buildCallbackHtml(success, replacePath) {
-    const heading = success ? "\u2705 Authentication complete" : "\u274C Authentication incomplete";
+    const heading = success ? "\u2705 Credentials received" : "\u274C Credentials not received";
     const message = success
-      ? "Close this tab and return to VS Code."
-      : "No credentials were found in the redirect. Try the terminal-based SSO flow or import from the CLI.";
-
+      ? "Return to VS Code while the credentials are validated and saved."
+      : "No credentials were found in the redirect. Try the terminal flow or CLI import.";
     const script = replacePath
       ? `<script>if (window.history && window.history.replaceState) { window.history.replaceState(null, "", "${replacePath}"); }</script>`
       : "";
-
     return "<html><body style=\"font-family:sans-serif;text-align:center;padding:40px\">" +
-      `<h2>${heading}</h2>` +
-      `<p>${message}</p>` +
-      script +
-      "</body></html>";
+      `<h2>${heading}</h2><p>${message}</p>${script}</body></html>`;
+  }
+
+  _getConnectionManager() {
+    if (this._connectionManager) return this._connectionManager;
+    const { getConnectionManager } = require("./connectionManager");
+    return getConnectionManager(this.context);
   }
 }
 

@@ -11,6 +11,7 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
   let progressOptions;
   let progressReports;
   let warnCalls;
+  let manager;
 
   setup(() => {
     originalConsole = global.console;
@@ -19,6 +20,15 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
     progressOptions = null;
     progressReports = [];
     warnCalls = [];
+    let state = {
+      activationId: "activation-a",
+      accountEpoch: 1,
+      sessionConnected: true,
+    };
+    manager = {
+      getState() { return { ...state }; },
+      setState(next) { state = { ...state, ...next }; },
+    };
 
     global.console = new Proxy(originalConsole, {
       get(target, property) {
@@ -64,6 +74,13 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
     return repositories;
   }
 
+  function fetchRepositories(options = {}) {
+    return workspaceRepositoryFetcher.fetchWorkspaceRepositories({}, "workspace-a", {
+      connectionManager: manager,
+      ...options,
+    });
+  }
+
   test("stubs console.warn during test setup", () => {
     console.warn("warning-path");
 
@@ -90,10 +107,7 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
       };
     };
 
-    const result = await workspaceRepositoryFetcher.fetchWorkspaceRepositories(
-      {},
-      "workspace-a"
-    );
+    const result = await fetchRepositories();
 
     assert.strictEqual(progressOptions.title, "Loading repositories for workspace-a...");
     assert.deepStrictEqual(
@@ -136,10 +150,7 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
       };
     };
 
-    const result = await workspaceRepositoryFetcher.fetchWorkspaceRepositories(
-      {},
-      "workspace-a"
-    );
+    const result = await fetchRepositories();
 
     assert.deepStrictEqual(
       calls,
@@ -180,10 +191,7 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
       };
     };
 
-    const result = await workspaceRepositoryFetcher.fetchWorkspaceRepositories(
-      {},
-      "workspace-a"
-    );
+    const result = await fetchRepositories();
 
     assert.deepStrictEqual(calls, [1, 2]);
     assert.strictEqual(result.error, null);
@@ -205,10 +213,7 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
       error: failure,
     });
 
-    const result = await workspaceRepositoryFetcher.fetchWorkspaceRepositories(
-      {},
-      "workspace-a"
-    );
+    const result = await fetchRepositories();
 
     assert.strictEqual(result.error, failure);
     assert.strictEqual(result.partial, false);
@@ -236,10 +241,7 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
       };
     };
 
-    const result = await workspaceRepositoryFetcher.fetchWorkspaceRepositories(
-      {},
-      "workspace-a"
-    );
+    const result = await fetchRepositories();
 
     assert.strictEqual(result.error, null);
     assert.strictEqual(result.partial, true);
@@ -260,10 +262,7 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
       pagination: { page: 1, pageTotal: 1, count: 0, pageSize: 500 },
     });
 
-    const result = await workspaceRepositoryFetcher.fetchWorkspaceRepositories(
-      {},
-      "workspace-a"
-    );
+    const result = await fetchRepositories();
 
     assert.strictEqual(
       result.error,
@@ -293,10 +292,7 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
       };
     };
 
-    const result = await workspaceRepositoryFetcher.fetchWorkspaceRepositories(
-      {},
-      "workspace-a"
-    );
+    const result = await fetchRepositories();
 
     assert.strictEqual(result.error, null);
     assert.strictEqual(
@@ -313,5 +309,31 @@ suite("WorkspaceRepositoryFetcher Test Suite", () => {
         "[WorkspaceRepositories] Failed to load additional repositories for workspace-a on page 2: Unexpected repository response format",
       ],
     ]);
+  });
+
+  test("discards all partial repositories when the account changes between pages", async () => {
+    let releaseSecondPage;
+    const secondPage = new Promise(resolve => { releaseSecondPage = resolve; });
+    PaginatedFetch.prototype.fetchPage = async (_endpoint, page) => {
+      if (page === 1) {
+        return {
+          data: [{ name: "old-repo", slug: "old-repo" }],
+          pagination: { page: 1, pageTotal: 2, count: 2, pageSize: 1 },
+        };
+      }
+      return secondPage;
+    };
+    const pending = fetchRepositories();
+    await new Promise(resolve => setImmediate(resolve));
+    manager.setState({ accountEpoch: 2 });
+    releaseSecondPage({
+      data: [{ name: "also-old", slug: "also-old" }],
+      pagination: { page: 2, pageTotal: 2, count: 2, pageSize: 1 },
+    });
+
+    const result = await pending;
+    assert.strictEqual(result.stale, true);
+    assert.deepStrictEqual(result.repositories, []);
+    assert.strictEqual(result.error.kind, "stale_account");
   });
 });

@@ -2,6 +2,10 @@ const assert = require("assert");
 const vscode = require("vscode");
 const UpstreamIndicatorNode = require("../models/upstreamIndicatorNode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const {
+  bindConnectionManager,
+  unbindConnectionManager,
+} = require("../util/connectionManager");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
@@ -14,6 +18,8 @@ suite("RepositoryNode Test Suite", () => {
   let originalGetAllUpstreamData;
   let originalGetUpstreamDataForFormats;
   let originalApiGet;
+  let managerBinding;
+  let accountState;
   const terraformExporterPath = require.resolve("../util/terraformExporter");
 
   const context = {
@@ -23,6 +29,13 @@ suite("RepositoryNode Test Suite", () => {
       },
       async update() {},
     },
+  };
+  const connectionManager = {
+    activationId: "activation-a",
+    getState() {
+      return { ...accountState };
+    },
+    setState(next) { accountState = { ...accountState, ...next }; },
   };
 
   setup(() => {
@@ -35,6 +48,13 @@ suite("RepositoryNode Test Suite", () => {
     originalGetAllUpstreamData = upstreamChecker.getAllUpstreamData;
     originalGetUpstreamDataForFormats = upstreamChecker.getUpstreamDataForFormats;
     originalApiGet = CloudsmithAPI.prototype.get;
+    accountState = {
+      activationId: connectionManager.activationId,
+      accountEpoch: 1,
+      sessionConnected: true,
+      status: "connected",
+    };
+    managerBinding = bindConnectionManager(context, connectionManager);
 
     vscode.workspace.getConfiguration = () => ({
       get(key) {
@@ -51,6 +71,8 @@ suite("RepositoryNode Test Suite", () => {
     upstreamChecker.getAllUpstreamData = originalGetAllUpstreamData;
     upstreamChecker.getUpstreamDataForFormats = originalGetUpstreamDataForFormats;
     CloudsmithAPI.prototype.get = originalApiGet;
+    managerBinding.dispose();
+    unbindConnectionManager(context, connectionManager);
     delete require.cache[terraformExporterPath];
     delete require.cache[repositoryNodePath];
     delete require.cache[upstreamCheckerPath];
@@ -95,7 +117,8 @@ suite("RepositoryNode Test Suite", () => {
     const repositoryNode = new RepositoryNode(
       { slug: "example-repo", slug_perm: "example-repo", name: "Example Repo" },
       "acme",
-      context
+      context,
+      { connectionManager }
     );
 
     repositoryNode.getPackages = async () => [
@@ -138,7 +161,8 @@ suite("RepositoryNode Test Suite", () => {
     const repositoryNode = new RepositoryNode(
       { slug: "grouped-repo", slug_perm: "grouped-repo", name: "Grouped Repo" },
       "acme",
-      context
+      context,
+      { connectionManager }
     );
 
     const upstreams = await repositoryNode.getUpstreams([{ name: "package-group-without-format" }]);
@@ -167,7 +191,8 @@ suite("RepositoryNode Test Suite", () => {
     const repositoryNode = new RepositoryNode(
       { slug: "complete-repo", slug_perm: "complete-repo", name: "Complete Repo" },
       "acme",
-      context
+      context,
+      { connectionManager }
     );
 
     const upstreams = await repositoryNode.getUpstreams([{ formats: SUPPORTED_UPSTREAM_FORMATS }]);
@@ -182,7 +207,8 @@ suite("RepositoryNode Test Suite", () => {
     const repositoryNode = new RepositoryNode(
       { slug: "indicator-repo", slug_perm: "indicator-repo", name: "Indicator Repo" },
       "acme",
-      context
+      context,
+      { connectionManager }
     );
 
     repositoryNode.getPackages = async () => [{ format: "python" }];
@@ -230,7 +256,8 @@ suite("RepositoryNode Test Suite", () => {
     const repositoryNode = new RepositoryNode(
       { slug: "packages", slug_perm: "packages", name: "Packages" },
       "acme",
-      context
+      context,
+      { connectionManager }
     );
 
     const packages = await repositoryNode.getPackages();
@@ -259,7 +286,8 @@ suite("RepositoryNode Test Suite", () => {
     const repositoryNode = new RepositoryNode(
       { slug: "packages", slug_perm: "packages", name: "Packages" },
       "acme",
-      context
+      context,
+      { connectionManager }
     );
 
     const packages = await repositoryNode.getPackages();
@@ -291,7 +319,8 @@ suite("RepositoryNode Test Suite", () => {
     const repositoryNode = new RepositoryNode(
       { slug: "packages", slug_perm: "packages", name: "Packages" },
       "acme",
-      context
+      context,
+      { connectionManager }
     );
 
     assert.deepStrictEqual(await repositoryNode.getPackages(), []);
@@ -299,5 +328,33 @@ suite("RepositoryNode Test Suite", () => {
       () => repositoryNode.getEntitlements(),
       error => error && error.kind === "invalid_response"
     );
+  });
+
+  test("does not publish packages completed after an account change", async () => {
+    let release;
+    const response = new Promise(resolve => { release = resolve; });
+    const repositoryNode = new RepositoryNode(
+      { slug: "packages", slug_perm: "packages", name: "Packages" },
+      "acme",
+      context,
+      {
+        connectionManager,
+        createCloudsmithAPI: () => ({ get: async () => response }),
+      }
+    );
+    const pending = repositoryNode.getPackages();
+    await new Promise(resolve => setImmediate(resolve));
+    connectionManager.setState({ accountEpoch: 2 });
+    release(apiSuccess([{
+      namespace: "acme",
+      repository: "packages",
+      name: "old-package",
+      format: "npm",
+      slug: "old-package",
+      slug_perm: "old-package",
+      version: "1.0.0",
+    }]));
+
+    assert.deepStrictEqual(await pending, []);
   });
 });

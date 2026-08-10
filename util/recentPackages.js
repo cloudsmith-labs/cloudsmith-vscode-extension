@@ -107,4 +107,8 @@ function getAll() {
   return _recent.slice();
 }
 
-module.exports = { add, getAll };
+function clear() {
+  _recent.length = 0;
+}
+
+module.exports = { add, clear, getAll };

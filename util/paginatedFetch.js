@@ -153,6 +153,7 @@ function parsePagination(headers, requestedPage, requestedPageSize, itemCount) {
     if (
         !Number.isInteger(effectivePage)
         || effectivePage < 1
+        || effectivePage !== requestedPage
         || !Number.isInteger(effectivePageSize)
         || effectivePageSize < 1
         || itemCount > effectivePageSize

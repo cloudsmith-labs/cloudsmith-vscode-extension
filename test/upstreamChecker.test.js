@@ -2,9 +2,14 @@ const assert = require("assert");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { CredentialManager } = require("../util/credentialManager");
 const {
+  cacheErrorMessage,
+  getActiveUpstreamCacheOperationCount,
+  getUpstreamCacheKey,
   isBenignUpstreamFormatError,
+  MAX_RUNTIME_UPSTREAMS_PER_FORMAT,
   SUPPORTED_UPSTREAM_FORMATS,
   UpstreamChecker,
+  UPSTREAM_CACHE_SCHEMA_VERSION,
 } = require("../util/upstreamChecker");
 const {
   SUPPORTED_UPSTREAM_FORMATS: SHARED_SUPPORTED_UPSTREAM_FORMATS,
@@ -21,6 +26,30 @@ function toApiResult(response) {
   return apiSuccess(response === undefined ? [] : response);
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise(resolvePromise => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
+let accountState;
+const connectionManager = {
+  getState() { return { ...accountState }; },
+  setState(next) { accountState = { ...accountState, ...next }; },
+};
+
+function resetAccount() {
+  accountState = {
+    activationId: "activation-a",
+    accountEpoch: 1,
+    sessionConnected: true,
+  };
+}
+
+function createChecker(context, options = {}) {
+  return new UpstreamChecker(context, { connectionManager, ...options });
+}
+
 suite("UpstreamChecker repository upstream cache", () => {
   let originalGet;
   let originalGetApiKey;
@@ -30,6 +59,7 @@ suite("UpstreamChecker repository upstream cache", () => {
   let context;
 
   setup(() => {
+    resetAccount();
     originalGet = CloudsmithAPI.prototype.get;
     originalGetApiKey = CredentialManager.prototype.getApiKey;
     formatResponses = {};
@@ -85,11 +115,14 @@ suite("UpstreamChecker repository upstream cache", () => {
 
   function createCachedEntry(overrides = {}) {
     return {
+      version: UPSTREAM_CACHE_SCHEMA_VERSION,
+      activationId: "activation-a",
+      accountEpoch: 1,
       timestamp: Date.now(),
       successfulFormats: 1,
       groupedUpstreams: {
         python: [
-          { name: "PyPI", upstream_url: "https://pypi.org/simple/" },
+          { name: "PyPI" },
         ],
       },
       ...overrides,
@@ -97,7 +130,7 @@ suite("UpstreamChecker repository upstream cache", () => {
   }
 
   async function assertInvalidCachedEntry(entry) {
-    const checker = new UpstreamChecker(context);
+    const checker = createChecker(context);
     const cacheKey = checker._getRepositoryUpstreamCacheKey("workspace-a", "repo-a");
     store.set(cacheKey, entry);
 
@@ -112,7 +145,12 @@ suite("UpstreamChecker repository upstream cache", () => {
   test("aggregates repository upstreams across formats and reuses the shared cache", async () => {
     formatResponses = {
       python: [
-        { name: "PyPI", upstream_url: "https://pypi.org/simple/" },
+        {
+          name: "PyPI",
+          upstream_url: "https://user:path-secret@example.com/path-secret?token=query-secret",
+          api_key: "never-persist",
+          mode: { nested_secret: "nested-secret" },
+        },
         { name: "Internal mirror", upstream_url: "https://mirror.example/python" },
         { name: "Legacy", upstream_url: "https://legacy.example/python" },
       ],
@@ -126,7 +164,7 @@ suite("UpstreamChecker repository upstream cache", () => {
       conda: apiFailure("not_found", { status: 404 }),
     };
 
-    const checker = new UpstreamChecker(context);
+    const checker = createChecker(context);
     const firstState = await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
 
     assert.strictEqual(requestCount, SUPPORTED_UPSTREAM_FORMATS.length);
@@ -138,6 +176,14 @@ suite("UpstreamChecker repository upstream cache", () => {
     assert.strictEqual(firstState.groupedUpstreams.get("docker").length, 1);
     assert.strictEqual(firstState.groupedUpstreams.get("docker")[0].format, "docker");
     assert.strictEqual(store.size, 1);
+    const persisted = [...store.values()][0];
+    assert.strictEqual(persisted.version, UPSTREAM_CACHE_SCHEMA_VERSION);
+    assert.strictEqual(persisted.activationId, "activation-a");
+    assert.strictEqual(persisted.accountEpoch, 1);
+    assert.strictEqual(JSON.stringify(persisted).includes("never-persist"), false);
+    assert.strictEqual(JSON.stringify(persisted).includes("path-secret"), false);
+    assert.strictEqual(JSON.stringify(persisted).includes("query-secret"), false);
+    assert.strictEqual(JSON.stringify(persisted).includes("nested-secret"), false);
 
     const secondState = await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
 
@@ -157,7 +203,7 @@ suite("UpstreamChecker repository upstream cache", () => {
       },
     };
 
-    const checker = new UpstreamChecker(context);
+    const checker = createChecker(context);
     const firstState = await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
 
     assert.ok(firstState.failedFormats.includes("npm"));
@@ -174,7 +220,7 @@ suite("UpstreamChecker repository upstream cache", () => {
   test("rejects blank upstream records instead of reporting false active reachability", async () => {
     formatResponses = { python: [{}] };
 
-    const checker = new UpstreamChecker(context);
+    const checker = createChecker(context);
     const state = await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
 
     assert.strictEqual(state.active, 0);
@@ -211,8 +257,16 @@ suite("UpstreamChecker repository upstream cache", () => {
     await assertInvalidCachedEntry(createCachedEntry({ groupedUpstreams: { python: [{}] } }));
   });
 
+  test("rejects poisoned nested values in a persisted repository envelope", async () => {
+    await assertInvalidCachedEntry(createCachedEntry({
+      groupedUpstreams: {
+        python: [{ name: "PyPI", mode: { token: "nested-secret" } }],
+      },
+    }));
+  });
+
   test("treats expired cached repository upstream state as invalid", () => {
-    const checker = new UpstreamChecker(context);
+    const checker = createChecker(context);
     const cacheKey = checker._getRepositoryUpstreamCacheKey("workspace-a", "repo-a");
     store.set(cacheKey, createCachedEntry({ timestamp: Date.now() - (11 * 60 * 1000) }));
 
@@ -222,7 +276,7 @@ suite("UpstreamChecker repository upstream cache", () => {
   });
 
   test("accepts a valid cached repository upstream state", () => {
-    const checker = new UpstreamChecker(context);
+    const checker = createChecker(context);
     const cacheKey = checker._getRepositoryUpstreamCacheKey("workspace-a", "repo-a");
     store.set(cacheKey, createCachedEntry({ successfulFormats: 7 }));
 
@@ -253,7 +307,7 @@ suite("UpstreamChecker repository upstream cache", () => {
     };
 
     try {
-      const checker = new UpstreamChecker(context);
+      const checker = createChecker(context);
       checker._logRepositoryUpstreamCacheError = (...args) => logCalls.push(args);
       const state = await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
 
@@ -275,6 +329,9 @@ suite("UpstreamChecker repository upstream cache", () => {
 });
 
 suite("UpstreamChecker shared helper and format handling", () => {
+  setup(() => {
+    resetAccount();
+  });
   function createContext() {
     const store = new Map();
     const updates = [];
@@ -303,13 +360,15 @@ suite("UpstreamChecker shared helper and format handling", () => {
 
   function createCachedEntry(overrides = {}) {
     return {
+      version: UPSTREAM_CACHE_SCHEMA_VERSION,
+      activationId: "activation-a",
+      accountEpoch: 1,
       timestamp: Date.now(),
       upstreams: [
         {
           name: "PyPI",
           _format: "python",
           format: "python",
-          upstream_url: "https://pypi.org/simple/",
           is_active: true,
         },
       ],
@@ -323,7 +382,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
 
   function createResponseAwareChecker(context, formatResponses) {
     let requestCount = 0;
-    const checker = new UpstreamChecker(context);
+    const checker = createChecker(context);
 
     checker.api.get = async (endpoint) => {
       requestCount += 1;
@@ -407,7 +466,11 @@ suite("UpstreamChecker shared helper and format handling", () => {
     const { context, updates } = createContext();
     const { checker, getRequestCount } = createResponseAwareChecker(context, {
       python: [
-        { name: "PyPI", upstream_url: "https://pypi.org/simple/" },
+        {
+          name: "PyPI",
+          upstream_url: "https://user:url-secret@example.com/url-secret?token=url-secret",
+          mode: { token: "nested-secret" },
+        },
         { name: "Internal mirror", upstream_url: "https://mirror.example/python" },
         { name: "Legacy", upstream_url: "https://legacy.example/python" },
       ],
@@ -436,7 +499,15 @@ suite("UpstreamChecker shared helper and format handling", () => {
       "docker"
     );
     assert.strictEqual(updates.length, 1);
-    assert.strictEqual(updates[0].key, "cloudsmith-upstreams:all:workspace-a:repo-a");
+    assert.strictEqual(
+      updates[0].key,
+      getUpstreamCacheKey("workspace-a", "repo-a")
+    );
+    assert.strictEqual(updates[0].value.version, UPSTREAM_CACHE_SCHEMA_VERSION);
+    assert.strictEqual(updates[0].value.activationId, "activation-a");
+    assert.strictEqual(updates[0].value.accountEpoch, 1);
+    assert.strictEqual(JSON.stringify(updates[0].value).includes("url-secret"), false);
+    assert.strictEqual(JSON.stringify(updates[0].value).includes("nested-secret"), false);
 
     const secondState = await checker.getAllUpstreamData("workspace-a", "repo-a");
 
@@ -473,10 +544,89 @@ suite("UpstreamChecker shared helper and format handling", () => {
     assert.strictEqual(updates.length, 0);
   });
 
+  test("uses collision-free encoded cache tuple keys", () => {
+    assert.notStrictEqual(
+      getUpstreamCacheKey("workspace:a", "repo"),
+      getUpstreamCacheKey("workspace", "a:repo")
+    );
+    assert.notStrictEqual(
+      getUpstreamCacheKey("workspace", "repo", ["python", "npm"]),
+      getUpstreamCacheKey("workspace", "repo", ["python"])
+    );
+  });
+
+  test("retires per-key operation authority after terminal settlement", async () => {
+    const { context } = createContext();
+    const response = deferred();
+    const checker = createChecker(context, {
+      cloudsmithAPI: { async get() { return response.promise; } },
+    });
+
+    const pending = checker.getUpstreamDataForFormats(
+      "workspace-a",
+      "repo-a",
+      ["python"]
+    );
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(getActiveUpstreamCacheOperationCount(context.globalState), 1);
+    response.resolve(apiSuccess([]));
+    await pending;
+
+    assert.strictEqual(getActiveUpstreamCacheOperationCount(context.globalState), 0);
+  });
+
+  test("rejects over-count and over-limit runtime upstream responses before use", async () => {
+    const { context, updates } = createContext();
+    const checker = createChecker(context, {
+      cloudsmithAPI: {
+        async get(_endpoint, options) {
+          const payload = Array.from(
+            { length: MAX_RUNTIME_UPSTREAMS_PER_FORMAT + 1 },
+            (_, index) => ({ name: `upstream-${index}` })
+          );
+          assert.strictEqual(options.validate(payload), false);
+          return apiSuccess(payload);
+        },
+      },
+    });
+
+    const countResult = await checker.getUpstreamDataForFormats(
+      "workspace-a",
+      "repo-a",
+      ["python"]
+    );
+    assert.deepStrictEqual(countResult.failedFormats, ["python"]);
+    assert.strictEqual(countResult.total, 0);
+    assert.strictEqual(updates.length, 0);
+
+    checker.api.get = async (_endpoint, options) => {
+      const payload = [{ name: "x".repeat(501) }];
+      assert.strictEqual(options.validate(payload), false);
+      return apiSuccess(payload);
+    };
+    const fieldResult = await checker.getUpstreamDataForFormats(
+      "workspace-a",
+      "repo-b",
+      ["python"]
+    );
+    assert.deepStrictEqual(fieldResult.failedFormats, ["python"]);
+    assert.strictEqual(fieldResult.total, 0);
+    assert.strictEqual(updates.length, 0);
+  });
+
+  test("cache failure logs never include exception text or account identifiers", async () => {
+    const secret = "secret-from-quota-exception";
+    const warning = cacheErrorMessage("persist");
+    assert.strictEqual(warning, "[UpstreamChecker] Failed to persist upstream cache.");
+    assert.strictEqual(warning.includes(secret), false);
+    assert.strictEqual(warning.includes("workspace-sensitive"), false);
+    assert(warning.length < 100);
+  });
+
   test("evicts cached upstream data with an invalid timestamp before refetching", async () => {
     const { context, store, updates } = createContext();
     const { checker, getRequestCount } = createResponseAwareChecker(context, {});
-    const cacheKey = "cloudsmith-upstreams:all:workspace-a:repo-a";
+    const cacheKey = getUpstreamCacheKey("workspace-a", "repo-a");
 
     store.set(cacheKey, createCachedEntry({ timestamp: "123" }));
 
@@ -491,7 +641,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
   test("evicts cached upstream data with an invalid upstream list before refetching", async () => {
     const { context, store, updates } = createContext();
     const { checker, getRequestCount } = createResponseAwareChecker(context, {});
-    const cacheKey = "cloudsmith-upstreams:all:workspace-a:repo-a";
+    const cacheKey = getUpstreamCacheKey("workspace-a", "repo-a");
 
     store.set(cacheKey, createCachedEntry({ upstreams: {} }));
 
@@ -499,6 +649,40 @@ suite("UpstreamChecker shared helper and format handling", () => {
 
     assert.strictEqual(getRequestCount(), SUPPORTED_UPSTREAM_FORMATS.length);
     assert.strictEqual(state.total, 0);
+    assert.strictEqual(updates[0].key, cacheKey);
+    assert.strictEqual(updates[0].value, undefined);
+  });
+
+  test("evicts a flat cache envelope containing nested secret-bearing fields", async () => {
+    const { context, store, updates } = createContext();
+    const { checker } = createResponseAwareChecker(context, {});
+    const cacheKey = getUpstreamCacheKey("workspace-a", "repo-a");
+    store.set(cacheKey, createCachedEntry({
+      upstreams: [{
+        name: "PyPI",
+        _format: "python",
+        format: "python",
+        mode: { token: "nested-secret" },
+        is_active: true,
+      }],
+    }));
+
+    await checker.getAllUpstreamData("workspace-a", "repo-a");
+
+    assert.strictEqual(updates[0].key, cacheKey);
+    assert.strictEqual(updates[0].value, undefined);
+  });
+
+  test("evicts persisted strings beyond the strict field bound", async () => {
+    const { context, store, updates } = createContext();
+    const { checker } = createResponseAwareChecker(context, {});
+    const cacheKey = getUpstreamCacheKey("workspace-a", "repo-a");
+    store.set(cacheKey, createCachedEntry({
+      upstreams: [{ name: "x".repeat(501), _format: "python", format: "python" }],
+    }));
+
+    await checker.getAllUpstreamData("workspace-a", "repo-a");
+
     assert.strictEqual(updates[0].key, cacheKey);
     assert.strictEqual(updates[0].value, undefined);
   });
@@ -539,7 +723,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
   });
 
   test("returns upstream data without an error when partial failures still yield upstreams", async () => {
-    const checker = new UpstreamChecker({});
+    const checker = createChecker({});
     checker.getAllUpstreamData = async () => ({
       upstreams: [{ name: "PyPI", _format: "python", upstream_url: "https://pypi.org/" }],
       active: 1,
@@ -556,7 +740,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
   });
 
   test("returns an error when formats fail and no upstream data is available", async () => {
-    const checker = new UpstreamChecker({});
+    const checker = createChecker({});
     checker.getAllUpstreamData = async () => ({
       upstreams: [],
       active: 0,
@@ -573,7 +757,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
 
   test("does not cache non-benign empty upstream results", async () => {
     const { context, updates } = createContext();
-    const checker = new UpstreamChecker(context);
+    const checker = createChecker(context);
 
     checker.api.get = async () => apiFailure("unauthorized", { status: 401 });
 
@@ -583,11 +767,27 @@ suite("UpstreamChecker shared helper and format handling", () => {
     assert.strictEqual(result.upstreams.length, 0);
     assert.strictEqual(updates.length, 0);
   });
+
+  test("does not publish or persist an upstream response after account supersession", async () => {
+    const { context, updates } = createContext();
+    let release;
+    const response = new Promise(resolve => { release = resolve; });
+    const checker = createChecker(context, {
+      cloudsmithAPI: { async get() { return response; } },
+    });
+    const pending = checker.getUpstreamDataForFormats("acme", "repo", ["python"]);
+    await new Promise(resolve => setImmediate(resolve));
+    connectionManager.setState({ accountEpoch: 2 });
+    release(apiSuccess([{ name: "Old PyPI", upstream_url: "https://old.example" }]));
+
+    assert.strictEqual(await pending, null);
+    assert.strictEqual(updates.length, 0);
+  });
 });
 
 suite("UpstreamChecker preview resolution", () => {
   test("previewResolution does not trigger policy fetches and still returns upstream data", async () => {
-    const checker = new UpstreamChecker({});
+    const checker = createChecker({});
     let policyFetchCount = 0;
 
     checker.existsLocally = async () => ({

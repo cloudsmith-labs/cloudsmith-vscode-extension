@@ -8,8 +8,9 @@ const { LicenseClassifier } = require("../util/licenseClassifier");
 const { getPackageVulnerabilityCount } = require("../util/packageVulnerabilities");
 
 class SearchResultNode {
-    constructor(pkg, context) {
+    constructor(pkg, context, options = {}) {
         this.context = context;
+        this._connectionManager = options.connectionManager || null;
 
         // Store fields matching PackageNode's shape so existing commands work
         this.name = pkg.name;
@@ -54,14 +55,14 @@ class SearchResultNode {
         this.security_scan_status = pkg.security_scan_status || null;
 
         // License fields from API response (may be absent in list endpoint)
-        this.licenseInfo = LicenseClassifier.inspect(pkg);
+        this.licenseInfo = cloneCanonicalValue(LicenseClassifier.inspect(pkg));
         this.spdx_license = this.licenseInfo.spdxLicense;
         this.raw_license = this.licenseInfo.rawLicense;
         this.license = this.licenseInfo.displayValue;
         this.license_url = this.licenseInfo.licenseUrl;
 
         // Raw tags for upstream origin detection
-        this.tags_raw = pkg.tags || {};
+        this.tags_raw = cloneCanonicalValue(pkg.tags) || {};
 
         // Determine upstream origin from tags
         this.upstreamSource = this._detectUpstreamSource();
@@ -71,15 +72,15 @@ class SearchResultNode {
         };
 
         // Tags handling (same pattern as PackageNode)
-        if (pkg.tags && pkg.tags.info) {
-            if (pkg.tags.version) {
-                this.tags = { id: "Tags", value: String([pkg.tags.info, pkg.tags.version]) };
+        if (this.tags_raw.info) {
+            if (this.tags_raw.version) {
+                this.tags = { id: "Tags", value: String([this.tags_raw.info, this.tags_raw.version]) };
             } else {
-                this.tags = { id: "Tags", value: pkg.tags.info };
+                this.tags = { id: "Tags", value: this.tags_raw.info };
             }
         } else {
-            if (pkg.tags && pkg.tags.version) {
-                this.tags = { id: "Tags", value: pkg.tags.version };
+            if (this.tags_raw.version) {
+                this.tags = { id: "Tags", value: this.tags_raw.version };
             } else {
                 this.tags = { id: "Tags", value: "" };
             }
@@ -210,7 +211,7 @@ class SearchResultNode {
                 slug_perm: this.slug_perm_raw,
                 num_vulnerabilities: this.num_vulnerabilities,
                 max_severity: this.max_severity,
-            }, this.context));
+            }, this.context, { connectionManager: this._connectionManager }));
         }
 
         // 5. Quarantine Reason (if quarantined)
@@ -254,6 +255,30 @@ class SearchResultNode {
 
         return children;
     }
+}
+
+function cloneCanonicalValue(value, depth = 0) {
+    if (
+        value === null
+        || typeof value === "string"
+        || typeof value === "number"
+        || typeof value === "boolean"
+    ) {
+        return value;
+    }
+    if (depth >= 10) return null;
+    if (Array.isArray(value)) {
+        return value.map(item => cloneCanonicalValue(item, depth + 1));
+    }
+    if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+        const clone = {};
+        for (const [key, nested] of Object.entries(value)) {
+            const cloned = cloneCanonicalValue(nested, depth + 1);
+            if (cloned !== undefined) clone[key] = cloned;
+        }
+        return clone;
+    }
+    return undefined;
 }
 
 module.exports = SearchResultNode;

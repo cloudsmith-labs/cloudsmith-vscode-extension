@@ -465,7 +465,7 @@ class DependencyHealthNode {
         slug_perm: this.cloudsmithMatch.slug_perm,
         num_vulnerabilities: vulnerabilities.count,
         max_severity: vulnerabilities.maxSeverity,
-      }, this.context));
+      }, this.context, { connectionManager: this.options.connectionManager }));
     }
 
     const policy = this._getPolicyData();

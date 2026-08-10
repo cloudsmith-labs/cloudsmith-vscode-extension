@@ -4,7 +4,12 @@ const { helpProvider } = require("./views/helpProvider");
 const { SearchProvider } = require("./views/searchProvider");
 const { CloudsmithAPI } = require("./util/cloudsmithAPI");
 const { apiEndpoint } = require("./util/apiEndpoint");
-const { CredentialManager } = require("./util/credentialManager");
+const { CredentialManager, runCLIAutoDetect } = require("./util/credentialManager");
+const {
+  ConnectionManager,
+  bindConnectionManager,
+  getConnectionManager,
+} = require("./util/connectionManager");
 const { RecentSearches } = require("./util/recentSearches");
 const { RemediationHelper } = require("./util/remediationHelper");
 const {
@@ -33,6 +38,11 @@ const { fetchRepositoryUpstreams, generateTerraformConfig } = require("./util/te
 const { SUPPORTED_UPSTREAM_FORMATS } = require("./util/upstreamFormats");
 const { buildPackageGroupUrl, buildPackageUrl } = require("./util/webAppUrls");
 const recentPackages = require("./util/recentPackages");
+const filterState = require("./util/filterState");
+const { clearVulnerabilityCache } = require("./util/dependencyVulnEnricher");
+const { WorkspaceCache } = require("./util/workspaceCache");
+const { getWorkspaceContextProjector } = require("./util/workspaceContextProjector");
+const { captureAccount, isAccountCurrent } = require("./util/accountOperation");
 
 let exportTerraformAbortController = null;
 
@@ -308,11 +318,6 @@ const FILTER_PRESETS = [
 const FORMAT_OPTIONS = SUPPORTED_UPSTREAM_FORMATS;
 
 /**
- * Helper: get workspaces from cache or fetch fresh.
- */
-const WORKSPACE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
-
-/**
  * Helper: read the defaultWorkspace setting.
  * Returns the slug string if set, or empty string if not.
  */
@@ -321,16 +326,66 @@ function getDefaultWorkspace() {
   return config.get("defaultWorkspace") || "";
 }
 
-async function setConnectedContext(isConnected) {
-  await vscode.commands.executeCommand("setContext", "cloudsmith.connected", Boolean(isConnected));
+async function setHasMultipleWorkspacesContext(context, hasMultipleWorkspaces, options = {}) {
+  const projector = options.workspaceContextProjector
+    || getWorkspaceContextProjector(context);
+  return projector.project(hasMultipleWorkspaces, options);
 }
 
-async function setHasMultipleWorkspacesContext(hasMultipleWorkspaces) {
-  await vscode.commands.executeCommand(
-    "setContext",
-    "cloudsmith.hasMultipleWorkspaces",
-    Boolean(hasMultipleWorkspaces)
+async function evictPersistedUpstreamCaches(context) {
+  const accountCacheKeys = typeof context?.globalState?.keys === "function"
+    ? context.globalState.keys().filter(key => key.startsWith("cloudsmith-upstreams:"))
+    : [];
+  const evictions = await Promise.allSettled(
+    accountCacheKeys.map(key => context.globalState.update(key, undefined))
   );
+  const complete = evictions.every(result => result.status === "fulfilled");
+  if (!complete) {
+    console.warn("[Cloudsmith] Some stale account cache entries could not be evicted.");
+  }
+  return complete;
+}
+
+async function resetAccountScopedState(context, options = {}) {
+  const synchronousInvalidators = [
+    () => options.workspaceCache?.clear?.(),
+    () => options.searchProvider?.clear?.(),
+    () => (options.filterState || filterState).clear(),
+    () => (options.recentPackages || recentPackages).clear(),
+    () => (options.clearVulnerabilityCache || clearVulnerabilityCache)(),
+  ];
+  const syncFailures = [];
+  for (const invalidate of synchronousInvalidators) {
+    try {
+      invalidate();
+    } catch (error) {
+      syncFailures.push(error);
+    }
+  }
+
+  // Start each fallible authority projection independently. A rejected tree or
+  // context update must not retain another cache from the previous account.
+  const asynchronousInvalidators = [
+    () => options.dependencyHealthProvider?.resetForAccountChange?.(),
+    () => (options.projectHasMultipleWorkspaces
+      ? options.projectHasMultipleWorkspaces(false)
+      : setHasMultipleWorkspacesContext(context, false, {
+        workspaceContextProjector: options.workspaceContextProjector,
+      })),
+    () => (options.evictPersistedUpstreamCaches || evictPersistedUpstreamCaches)(context),
+  ];
+  const pending = asynchronousInvalidators.map(invalidate => {
+    try {
+      return Promise.resolve(invalidate());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  });
+  const asyncResults = await Promise.allSettled(pending);
+  return Object.freeze({
+    syncFailures: Object.freeze([...syncFailures]),
+    asyncResults: Object.freeze(asyncResults),
+  });
 }
 
 async function updateDefaultWorkspaceContext() {
@@ -341,28 +396,39 @@ async function updateDefaultWorkspaceContext() {
   );
 }
 
-async function getWorkspaces(context) {
-    const cache = context.globalState.get('CloudsmithCache');
-    if (cache && cache.name === 'Workspaces' && cache.workspaces) {
-        // Check TTL — treat as stale if older than 30 minutes
-        if (cache.lastSync && (Date.now() - cache.lastSync) < WORKSPACE_CACHE_TTL_MS) {
-            await setHasMultipleWorkspacesContext(cache.workspaces.length > 1);
-            return cache.workspaces;
-        }
+async function getWorkspaces(context, options = {}) {
+    const connectionManager = options.connectionManager || getConnectionManager(context);
+    const workspaceContextProjector = options.workspaceContextProjector
+      || getWorkspaceContextProjector(context);
+    const account = captureAccount(connectionManager);
+    if (!account) {
+        await setHasMultipleWorkspacesContext(context, false, { workspaceContextProjector });
+        return null;
     }
-    const cloudsmithAPI = new CloudsmithAPI(context);
+    const projection = workspaceContextProjector.begin({
+      isCurrent: () => isAccountCurrent(connectionManager, account),
+    });
+    const cloudsmithAPI = options.createCloudsmithAPI
+      ? options.createCloudsmithAPI()
+      : new CloudsmithAPI(context);
     const result = await cloudsmithAPI.get("namespaces/?sort=slug", {
         responseType: "array",
         validate: isWorkspaceArray,
         retry: "safe-read",
     });
+    if (!isAccountCurrent(connectionManager, account)) {
+        await workspaceContextProjector.project(true, { operation: projection });
+        return null;
+    }
     if (!result.ok) {
-        await setHasMultipleWorkspacesContext(false);
+        await workspaceContextProjector.project(false, { operation: projection });
+        if (!isAccountCurrent(connectionManager, account)) return null;
         vscode.window.showErrorMessage(`Failed to load workspaces: ${formatApiError(result.error)}`);
         return null;
     }
     if (result.data.length === 0) {
-        await setHasMultipleWorkspacesContext(false);
+        await workspaceContextProjector.project(false, { operation: projection });
+        if (!isAccountCurrent(connectionManager, account)) return null;
         return [];
     }
     const workspaces = result.data.map(workspace => ({
@@ -371,7 +437,11 @@ async function getWorkspaces(context) {
             ? workspace.name
             : workspace.slug,
     }));
-    await setHasMultipleWorkspacesContext(workspaces.length > 1);
+    await workspaceContextProjector.project(workspaces.length > 1, { operation: projection });
+    if (!isAccountCurrent(connectionManager, account)) {
+        await workspaceContextProjector.project(true, { operation: projection });
+        return null;
+    }
     return workspaces;
 }
 
@@ -403,6 +473,70 @@ function buildPresetQuery(preset, customQuery) {
     return maybeString;
   }
   return builder.build();
+}
+
+function searchDescriptorFromRecent(entry) {
+  const scope = entry && entry.scope;
+  if (!scope || typeof scope !== "object" || Array.isArray(scope)) return null;
+  const scopeKeys = Object.keys(scope).sort().join(",");
+  if (
+    scope.kind === "repository"
+    && scopeKeys === "kind,repository"
+    && typeof scope.repository === "string"
+  ) {
+    return {
+      kind: "repository",
+      workspace: entry.workspace,
+      repository: scope.repository,
+      query: entry.query,
+      page: 1,
+    };
+  }
+  if (
+    scope.kind === "repositories"
+    && scopeKeys === "kind,repositories"
+    && Array.isArray(scope.repositories)
+  ) {
+    return {
+      kind: "repositories",
+      workspace: entry.workspace,
+      repositories: scope.repositories,
+      query: entry.query,
+      page: 1,
+    };
+  }
+  return scope.kind === "workspace" && scopeKeys === "kind"
+    ? {
+      kind: "workspace",
+      workspace: entry.workspace,
+      query: entry.query,
+      page: 1,
+    }
+    : null;
+}
+
+async function executeSearchIntent(searchProvider, descriptor, options = {}) {
+  const operation = searchProvider.beginSearch(descriptor);
+  const execution = searchProvider.executeSearch(operation);
+  if (options.recentSearches && options.record) {
+    const ownedDescriptor = operation.descriptor;
+    let scope = { kind: "workspace" };
+    if (ownedDescriptor.kind === "repository") {
+      scope = { kind: "repository", repository: ownedDescriptor.repository };
+    } else if (ownedDescriptor.kind === "repositories") {
+      scope = { kind: "repositories", repositories: ownedDescriptor.repositories };
+    }
+    // History persistence is deliberately detached: it must never delay or
+    // supersede execution of the synchronously owned search operation.
+    Promise.resolve().then(() => options.recentSearches.add({
+      workspace: ownedDescriptor.workspace,
+      query: ownedDescriptor.query,
+      scope,
+    })).catch(() => {
+      console.warn("[Cloudsmith] Could not save the recent search.");
+    });
+  }
+  return execution;
 }
 
 async function resolveDependencyScanTarget(context, options = {}) {
@@ -661,15 +795,27 @@ async function showDependencySortFilterPicker(provider) {
  * @param {vscode.ExtensionContext} context
  */
 async function activate(context) {
+  const connectionManager = new ConnectionManager(context);
+  const connectionBinding = bindConnectionManager(context, connectionManager);
+  context.subscriptions.push(connectionBinding, connectionManager);
 
-  await context.secrets.store("cloudsmith-vsc.isConnected", "false");
-  await setConnectedContext(false);
-  await setHasMultipleWorkspacesContext(false);
+  // Persisted upstream summaries are account-bound. Purge them before the
+  // initial SecretStorage read so an indeterminate startup cannot retain data
+  // from a prior activation or account.
+  await evictPersistedUpstreamCaches(context);
+  const workspaceContextProjector = getWorkspaceContextProjector(context);
+  context.subscriptions.push(workspaceContextProjector);
+  await setHasMultipleWorkspacesContext(context, false, { workspaceContextProjector });
   await updateDefaultWorkspaceContext();
 
-
   // Define main view provider which populates with data
-  const cloudsmithProvider = new CloudsmithProvider(context);
+  const workspaceCache = new WorkspaceCache(connectionManager);
+  const cloudsmithProvider = new CloudsmithProvider(context, {
+    connectionManager,
+    workspaceCache,
+    workspaceContextProjector,
+  });
+  context.subscriptions.push({ dispose: () => cloudsmithProvider.dispose() });
   const treeView = vscode.window.createTreeView("cloudsmithView", {
     treeDataProvider: cloudsmithProvider,
     showCollapseAll: true,
@@ -708,7 +854,7 @@ async function activate(context) {
   vscode.window.registerTreeDataProvider("helpView", provider);
 
   // Set Package Search view.
-  const searchProvider = new SearchProvider(context);
+  const searchProvider = new SearchProvider(context, { connectionManager });
   vscode.window.createTreeView("cloudsmithSearchView", {
     treeDataProvider: searchProvider,
     showCollapseAll: true,
@@ -717,31 +863,40 @@ async function activate(context) {
   // Set Dependency Health view with diagnostics publisher.
   const diagnosticsPublisher = new DiagnosticsPublisher();
   context.subscriptions.push(diagnosticsPublisher);
-  const dependencyHealthProvider = new DependencyHealthProvider(context, diagnosticsPublisher);
+  const dependencyHealthProvider = new DependencyHealthProvider(context, diagnosticsPublisher, {
+    connectionManager,
+  });
+  context.subscriptions.push(
+    { dispose: () => searchProvider.dispose() },
+    { dispose: () => dependencyHealthProvider.dispose() }
+  );
   vscode.window.createTreeView("cloudsmithDependencyHealthView", {
     treeDataProvider: dependencyHealthProvider,
     showCollapseAll: false,
   });
 
-  context.subscriptions.push(
-    context.secrets.onDidChange(async (e) => {
-      if (e.key !== "cloudsmith-vsc.authToken") {
-        return;
-      }
+  let projectedAccountEpoch = connectionManager.getState().accountEpoch;
+  const handleConnectionStateChange = async (state) => {
+    if (state.accountEpoch !== projectedAccountEpoch) {
+      projectedAccountEpoch = state.accountEpoch;
+      await resetAccountScopedState(context, {
+        workspaceCache,
+        searchProvider,
+        dependencyHealthProvider,
+        workspaceContextProjector,
+      });
+    }
 
-      const apiKey = await context.secrets.get("cloudsmith-vsc.authToken");
-      if (apiKey) {
-        return;
-      }
-
-      await context.secrets.store("cloudsmith-vsc.isConnected", "false");
-      await setConnectedContext(false);
-      await setHasMultipleWorkspacesContext(false);
-      cloudsmithProvider.refresh({ suppressMissingCredentialsWarning: true });
-      searchProvider.refresh();
-      dependencyHealthProvider.refresh();
-    })
-  );
+    cloudsmithProvider.refresh({ suppressMissingCredentialsWarning: !state.credentialPresent });
+    searchProvider.refresh();
+    dependencyHealthProvider.refresh();
+  };
+  const connectionSubscription = connectionManager.onDidChange(state => {
+    void handleConnectionStateChange(state).catch(error => {
+      console.warn("[Cloudsmith] Could not refresh all account-scoped state:", error);
+    });
+  });
+  context.subscriptions.push(connectionSubscription);
 
   // Create vulnerability WebView provider
   const vulnerabilityProvider = new VulnerabilityProvider(context);
@@ -766,40 +921,45 @@ async function activate(context) {
   // Create promotion provider
   const promotionProvider = new PromotionProvider(context);
 
-  const initializeConnectionContext = async () => {
-    const credentialManager = new CredentialManager(context);
-    const apiKey = await credentialManager.getApiKey();
-    if (!apiKey) {
-      return;
+  const credentialManager = new CredentialManager(context, { connectionManager });
+  const ssoManager = new SSOAuthManager(context, { connectionManager });
+
+  async function handleAuthenticationResult(result, options = {}) {
+    if (!result || result.status === "stale" || result.status === "cancelled") {
+      return result;
     }
 
-    try {
-      const { ConnectionManager } = require("./util/connectionManager");
-      const connectionManager = new ConnectionManager(context);
-      await connectionManager.checkConnectivity(apiKey);
-    } catch {
-      await context.secrets.store("cloudsmith-vsc.isConnected", "false");
-      await setConnectedContext(false);
+    const state = connectionManager.getState();
+    if (result.partial && result.committed) {
+      const outcome = state.credentialPresent === false
+        ? "Credentials were cleared"
+        : "Credentials were saved and validated";
+      const detail = result.error && result.error.message
+        ? ` ${result.error.message}`
+        : "";
+      vscode.window.showWarningMessage(
+        `${outcome}, but the connection indicator could not be updated.${detail}`
+      );
+      return result;
     }
-  };
+    if (!result.ok || !state.sessionConnected) {
+      if (result.committed && state.credentialPresent === false) {
+        vscode.window.showInformationMessage("Credentials cleared.");
+      } else if (options.reportFailure !== false && result.error && result.error.message) {
+        if (state.sessionConnected) {
+          vscode.window.showWarningMessage(result.error.message);
+        } else {
+          vscode.window.showErrorMessage(result.error.message);
+        }
+      }
+      return result;
+    }
 
-  void initializeConnectionContext();
-
-
-  // Shared post-authentication handler: connect, refresh all views, and prompt
-  // to set default workspace if only one workspace is available.
-  async function postAuthSuccess() {
-    const { ConnectionManager } = require("./util/connectionManager");
-    const connectionManager = new ConnectionManager(context);
-    const status = await connectionManager.connect();
-
-    // Refresh all three sidebar views
-    cloudsmithProvider.refresh();
-    searchProvider.refresh();
-    dependencyHealthProvider.refresh();
-
-    // If connected and no default workspace, offer to set the single workspace as default
-    if (status === "true" && !getDefaultWorkspace()) {
+    if (options.showSuccess !== false) {
+      vscode.window.showInformationMessage("Connected to Cloudsmith.");
+    }
+    // If connected and no default workspace, offer to set the single workspace as default.
+    if (options.offerDefault !== false && !getDefaultWorkspace()) {
       const workspaces = await getWorkspaces(context);
       if (Array.isArray(workspaces) && workspaces.length === 1) {
         const ws = workspaces[0];
@@ -817,42 +977,42 @@ async function activate(context) {
         }
       }
     }
-
-    return status;
+    return result;
   }
+
+  const initializationResult = await connectionManager.initialize();
+  await handleAuthenticationResult(initializationResult, {
+    showSuccess: false,
+    offerDefault: false,
+    reportFailure: false,
+  });
 
   // Auto-detect Cloudsmith CLI credentials on activation.
   // If no API key is stored but CLI credentials exist, offer to import them.
-  setTimeout(async () => {
-    const existingKey = await context.secrets.get("cloudsmith-vsc.authToken");
-    if (!existingKey) {
-      const ssoManager = new SSOAuthManager(context);
-      if (ssoManager.hasCLICredentials()) {
-        const choice = await vscode.window.showInformationMessage(
-          "Cloudsmith CLI credentials detected. Import them?",
-          "Import", "Dismiss"
-        );
-        if (choice === "Import") {
-          const success = await ssoManager.importFromCLI();
-          if (success) {
-            await postAuthSuccess();
-          }
-        }
-      }
-    }
+  const cliAutoDetectTimer = setTimeout(() => {
+    void runCLIAutoDetect({
+      connectionManager,
+      secrets: context.secrets,
+      ssoManager,
+      showInformationMessage: (...args) => vscode.window.showInformationMessage(...args),
+      handleAuthenticationResult,
+    }).catch(() => {
+      console.warn("[Cloudsmith] CLI credential auto-detection failed.");
+    });
   }, 3000);
+  context.subscriptions.push({ dispose: () => clearTimeout(cliAutoDetectTimer) });
 
   // register general commands. Will move this over to command Manager in future release.
   context.subscriptions.push(
     // Register command to clear credentials
-    vscode.commands.registerCommand("cloudsmith-vsc.clearCredentials", () => {
-      
-      const credentialManager = new CredentialManager(context);
-      credentialManager.clearCredentials();
+    vscode.commands.registerCommand("cloudsmith-vsc.clearCredentials", async () => {
+      const result = await credentialManager.clearCredentials();
+      await handleAuthenticationResult(result, { offerDefault: false });
     }),
 
     // Register command to set credentials — QuickPick with four auth methods
     vscode.commands.registerCommand("cloudsmith-vsc.configureCredentials", async () => {
+      const operation = connectionManager.beginCredentialOperation();
       const authOptions = [
         { label: "$(key) Enter API key", description: "Paste a personal API key", _method: "apikey" },
         { label: "$(server) Enter service account API key", description: "Paste a service account API key", _method: "apikey" },
@@ -864,25 +1024,24 @@ async function activate(context) {
         placeHolder: "Select an authentication method",
       });
       if (!selected) {
+        await connectionManager.cancelCredentialOperation(operation);
         return;
       }
 
       if (selected._method === "sso-terminal") {
-        await vscode.commands.executeCommand("cloudsmith-vsc.ssoLogin");
+        await vscode.commands.executeCommand("cloudsmith-vsc.ssoLogin", operation);
       } else if (selected._method === "import") {
-        await vscode.commands.executeCommand("cloudsmith-vsc.importCLICredentials");
+        await vscode.commands.executeCommand("cloudsmith-vsc.importCLICredentials", operation);
       } else {
-        const credentialManager = new CredentialManager(context);
-        const stored = await credentialManager.storeApiKey();
-        if (stored) {
-          await postAuthSuccess();
-        }
+        const result = await credentialManager.storeApiKey(operation);
+        await handleAuthenticationResult(result);
       }
     }),
 
     // Register command to connect to Cloudsmith
     vscode.commands.registerCommand("cloudsmith-vsc.connectCloudsmith", async () => {
-      await postAuthSuccess();
+      const result = await connectionManager.initialize();
+      await handleAuthenticationResult(result);
     }),
 
     // Register set default workspace command
@@ -1163,7 +1322,7 @@ async function activate(context) {
         recentSearches = new RecentSearches(context, workspaceSlug);
       }
 
-      const recent = recentSearches.getAll();
+      const recent = await recentSearches.getAll();
       if (recent.length > 0) {
         const items = [
           { label: "Recent searches", kind: vscode.QuickPickItemKind.Separator },
@@ -1185,7 +1344,10 @@ async function activate(context) {
           return;
         }
         if (selected._recent) {
-          await searchProvider.search(selected._recent.workspace, selected._recent.query);
+          await executeSearchIntent(
+            searchProvider,
+            searchDescriptorFromRecent(selected._recent)
+          );
           return;
         }
       }
@@ -1200,8 +1362,12 @@ async function activate(context) {
       }
 
       const builtQuery = buildRawSearchQuery(query);
-      recentSearches.add({ workspace: workspaceSlug, query: builtQuery, scope: 'workspace' });
-      await searchProvider.search(workspaceSlug, builtQuery);
+      await executeSearchIntent(searchProvider, {
+        kind: "workspace",
+        workspace: workspaceSlug,
+        query: builtQuery,
+        page: 1,
+      }, { recentSearches, record: true });
     }),
 
     // Register clear search command
@@ -1238,8 +1404,12 @@ async function activate(context) {
 
       const recentSearches = new RecentSearches(context, workspace);
       const builtQuery = buildRawSearchQuery(query);
-      recentSearches.add({ workspace: workspace, query: builtQuery, scope: 'workspace' });
-      await searchProvider.search(workspace, builtQuery);
+      await executeSearchIntent(searchProvider, {
+        kind: "workspace",
+        workspace,
+        query: builtQuery,
+        page: 1,
+      }, { recentSearches, record: true });
     }),
 
     // Register guided search command
@@ -1274,7 +1444,7 @@ async function activate(context) {
         recentSearches = new RecentSearches(context, workspaceSlug);
       }
 
-      const recent = recentSearches.getAll();
+      const recent = await recentSearches.getAll();
       if (recent.length > 0) {
         const recentItems = [
           { label: "Recent searches", kind: vscode.QuickPickItemKind.Separator },
@@ -1296,7 +1466,10 @@ async function activate(context) {
           return;
         }
         if (selectedRecent._recent) {
-          await searchProvider.search(selectedRecent._recent.workspace, selectedRecent._recent.query);
+          await executeSearchIntent(
+            searchProvider,
+            searchDescriptorFromRecent(selectedRecent._recent)
+          );
           return;
         }
       }
@@ -1403,19 +1576,13 @@ async function activate(context) {
       }
       const finalQuery = finalBuilder.build() || '*';
 
-      // Save to recent searches
-      recentSearches.add({
+      await executeSearchIntent(searchProvider, {
+        kind: selectedRepos ? "repositories" : "workspace",
         workspace: workspaceSlug,
         query: finalQuery,
-        scope: selectedRepos ? 'repository' : 'workspace',
-      });
-
-      // Execute search
-      if (selectedRepos) {
-        await searchProvider.searchRepos(workspaceSlug, selectedRepos, finalQuery);
-      } else {
-        await searchProvider.search(workspaceSlug, finalQuery);
-      }
+        page: 1,
+        ...(selectedRepos ? { repositories: selectedRepos } : {}),
+      }, { recentSearches, record: true });
     }),
 
     // Register filter packages command (right-click repo in main tree)
@@ -1961,8 +2128,12 @@ async function activate(context) {
 
       const query = selectedLicense.query || LicenseClassifier.buildLicenseQuery(selectedLicense.label);
       const recentSearches = new RecentSearches(context, workspaceSlug);
-      recentSearches.add({ workspace: workspaceSlug, query: query, scope: "workspace" });
-      await searchProvider.search(workspaceSlug, query);
+      await executeSearchIntent(searchProvider, {
+        kind: "workspace",
+        workspace: workspaceSlug,
+        query,
+        page: 1,
+      }, { recentSearches, record: true });
     }),
 
     // Register open license URL command
@@ -1992,39 +2163,38 @@ async function activate(context) {
 
     // Register SSO login command — uses terminal flow by default,
     // experimental browser flow if the setting is enabled
-    vscode.commands.registerCommand("cloudsmith-vsc.ssoLogin", async () => {
+    vscode.commands.registerCommand("cloudsmith-vsc.ssoLogin", async (suppliedOperation = null) => {
+      const operation = suppliedOperation || connectionManager.beginCredentialOperation();
+      if (!connectionManager.isOperationCurrent(operation)) {
+        return;
+      }
       const workspaceSlug = await vscode.window.showInputBox({
         placeHolder: "my-org",
         prompt: "Enter the Cloudsmith workspace slug for SSO",
         ignoreFocusOut: true,
       });
       if (!workspaceSlug) {
+        await connectionManager.cancelCredentialOperation(operation);
         return;
       }
 
-      const ssoManager = new SSOAuthManager(context);
       const ssoConfig = vscode.workspace.getConfiguration("cloudsmith-vsc");
       const useExperimental = ssoConfig.get("experimentalSSOBrowser");
 
-      let success;
+      let result;
       if (useExperimental) {
-        success = await ssoManager.loginViaBrowser(workspaceSlug.trim());
+        result = await ssoManager.loginViaBrowser(workspaceSlug.trim(), operation);
       } else {
-        success = await ssoManager.loginViaTerminal(workspaceSlug.trim());
+        result = await ssoManager.loginViaTerminal(workspaceSlug.trim(), operation);
       }
-
-      if (success) {
-        await postAuthSuccess();
-      }
+      await handleAuthenticationResult(result);
     }),
 
     // Register import CLI credentials command
-    vscode.commands.registerCommand("cloudsmith-vsc.importCLICredentials", async () => {
-      const ssoManager = new SSOAuthManager(context);
-      const success = await ssoManager.importFromCLI();
-      if (success) {
-        await postAuthSuccess();
-      }
+    vscode.commands.registerCommand("cloudsmith-vsc.importCLICredentials", async (suppliedOperation = null) => {
+      const operation = suppliedOperation || connectionManager.beginCredentialOperation();
+      const result = await ssoManager.importFromCLI(operation);
+      await handleAuthenticationResult(result);
     }),
 
     // Register show install command (opens in new document)
@@ -2568,6 +2738,11 @@ function deactivate() {}
 module.exports = {
   activate,
   deactivate,
+  evictPersistedUpstreamCaches,
+  executeSearchIntent,
   FORMAT_OPTIONS,
+  getWorkspaces,
+  resetAccountScopedState,
   runDependencyScan,
+  searchDescriptorFromRecent,
 };
