@@ -4,19 +4,38 @@
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiEndpoint } = require("../util/apiEndpoint");
-const { ConnectionManager } = require("../util/connectionManager");
+const {
+  captureAccount,
+  isAccountCurrent,
+  resolveConnectionManager,
+} = require("../util/accountOperation");
+const { WorkspaceCache } = require("../util/workspaceCache");
 const InfoNode = require("../models/infoNode");
 const { WorkspaceInfoNode } = require("../models/workspaceInfoNode");
+const WorkspaceNode = require("../models/workspaceNode");
+const RepositoryNode = require("../models/repositoryNode");
 const workspaceRepositoryFetcher = require("../util/workspaceRepositoryFetcher");
+const { getWorkspaceContextProjector } = require("../util/workspaceContextProjector");
 
 class CloudsmithProvider {
-  constructor(context) {
+  constructor(context, options = {}) {
     this.context = context;
+    this._connectionManager = resolveConnectionManager(context, options.connectionManager);
+    this._workspaceCache = options.workspaceCache
+      || new WorkspaceCache(this._connectionManager, options.workspaceCacheOptions);
+    this._createCloudsmithAPI = options.createCloudsmithAPI
+      || (() => new CloudsmithAPI(this.context));
+    this._fetchWorkspaceRepositories = options.fetchWorkspaceRepositories
+      || workspaceRepositoryFetcher.fetchWorkspaceRepositories;
+    this._workspaceContextProjector = options.workspaceContextProjector
+      || getWorkspaceContextProjector(context);
     this._onDidChangeTreeData = new vscode.EventEmitter();
     this.onDidChangeTreeData = this._onDidChangeTreeData.event;
     this._defaultWorkspaceFallbackHandler = null;
     this._treeView = null;
     this._suppressMissingCredentialsWarningOnce = false;
+    this._operationId = 0;
+    this._loadingOperationId = null;
   }
 
   getTreeItem(element) {
@@ -41,13 +60,87 @@ class CloudsmithProvider {
     if (options.suppressMissingCredentialsWarning) {
       this._suppressMissingCredentialsWarningOnce = true;
     }
+    this._operationId += 1;
+    void this._projectMultipleWorkspaces(false).catch(() => {});
     this._onDidChangeTreeData.fire();
   }
 
-  _consumeConnectionOptions() {
-    const promptOnMissingCredentials = !this._suppressMissingCredentialsWarningOnce;
+  dispose() {
+    this._operationId += 1;
+    this._workspaceCache.clear();
+    this._onDidChangeTreeData.dispose();
+  }
+
+  _consumeMissingCredentialsWarningSuppression() {
+    const suppressed = this._suppressMissingCredentialsWarningOnce;
     this._suppressMissingCredentialsWarningOnce = false;
-    return { promptOnMissingCredentials };
+    return suppressed;
+  }
+
+  _beginOperation() {
+    const account = captureAccount(this._connectionManager);
+    if (!account) return null;
+    const operation = {
+      id: ++this._operationId,
+      account,
+    };
+    operation.projection = this._workspaceContextProjector.begin({
+      isCurrent: () => this._isOperationCurrent(operation),
+    });
+    return Object.freeze(operation);
+  }
+
+  _isOperationCurrent(operation) {
+    return Boolean(
+      operation
+      && operation.id === this._operationId
+      && isAccountCurrent(this._connectionManager, operation.account)
+    );
+  }
+
+  _signedOutNode() {
+    return new InfoNode(
+      "Connect to Cloudsmith",
+      "Use the key icon above to set up a personal or service account API key, CLI import, or SSO.",
+      "Set up Cloudsmith authentication to get started.",
+      "plug",
+      undefined,
+      { command: "cloudsmith-vsc.configureCredentials", title: "Set up authentication" }
+    );
+  }
+
+  _loadFailureNode(kind = "workspaces") {
+    return new InfoNode(
+      `Could not load ${kind}`,
+      "Check the connection and credentials",
+      "The Cloudsmith API returned an error. Refresh or configure credentials.",
+      "warning"
+    );
+  }
+
+  _startLoading(operation) {
+    this._loadingOperationId = operation.id;
+    if (this._treeView) this._treeView.message = "Loading...";
+  }
+
+  _finishLoading(operation) {
+    if (this._loadingOperationId !== operation.id) return;
+    this._loadingOperationId = null;
+    if (this._treeView) this._treeView.message = undefined;
+  }
+
+  _projectMultipleWorkspaces(hasMultiple, operation = null) {
+    return this._workspaceContextProjector.project(hasMultiple, {
+      operation: operation?.projection,
+    });
+  }
+
+  _createWorkspaceNodes(workspaces) {
+    return workspaces.map(workspace => new WorkspaceNode(workspace, this.context, {
+      connectionManager: this._connectionManager,
+      createCloudsmithAPI: this._createCloudsmithAPI,
+      fetchWorkspaceRepositories: this._fetchWorkspaceRepositories,
+    }));
   }
 
   setDefaultWorkspaceFallbackHandler(handler) {
@@ -59,85 +152,69 @@ class CloudsmithProvider {
   }
 
   async getWorkspaces() {
-    const context = this.context;
-    const cloudsmithAPI = new CloudsmithAPI(context);
-    const connectionManager = new ConnectionManager(context);
-    let workspaces = "";
-
-    if (this._treeView) {
-      this._treeView.message = "Loading...";
+    this._consumeMissingCredentialsWarningSuppression();
+    const operation = this._beginOperation();
+    if (!operation) {
+      if (this._treeView) this._treeView.message = undefined;
+      await this._projectMultipleWorkspaces(false);
+      return [this._signedOutNode()];
     }
 
-    const connStatus = await connectionManager.connect(this._consumeConnectionOptions());
-
-    if (connStatus === "false" || connStatus === "error") {
-      await vscode.commands.executeCommand("setContext", "cloudsmith.hasMultipleWorkspaces", false);
-      if (this._treeView) {
-        this._treeView.message = undefined;
+    this._startLoading(operation);
+    try {
+      const cached = this._workspaceCache.get();
+      if (cached) {
+        if (!this._isOperationCurrent(operation)) return [];
+        await this._projectMultipleWorkspaces(cached.length > 1, operation);
+        if (!this._isOperationCurrent(operation)) return [];
+        return this._createWorkspaceNodes(cached);
       }
-      return [new InfoNode(
-        "Connect to Cloudsmith",
-        "Use the key icon above to set up a personal or service account API key, CLI import, or SSO.",
-        "Set up Cloudsmith authentication to get started.",
-        "plug",
-        undefined,
-        { command: "cloudsmith-vsc.configureCredentials", title: "Set up authentication" }
-      )];
-    }
 
-    const result = await cloudsmithAPI.get("namespaces/?sort=slug", {
-      responseType: "array",
-      validate: value => value.every(workspace => (
-        workspace
-        && typeof workspace === "object"
-        && !Array.isArray(workspace)
-        && typeof workspace.slug === "string"
-        && workspace.slug.length > 0
-      )),
-      retry: "safe-read",
-    });
-    workspaces = result.ok
-      ? result.data.map(workspace => ({
-        ...workspace,
-        name: typeof workspace.name === "string" && workspace.name.length > 0
-          ? workspace.name
-          : workspace.slug,
-      }))
-      : null;
-
-    if (this._treeView) {
-      this._treeView.message = undefined;
-    }
-
-    const WorkspaceNodes = [];
-    if (!workspaces) {
-      await vscode.commands.executeCommand("setContext", "cloudsmith.hasMultipleWorkspaces", false);
-      return [new InfoNode(
-        "Could not load workspaces",
-        "Check the connection and credentials",
-        "The Cloudsmith API returned an error. Refresh or configure credentials.",
-        "warning"
-      )];
-    }
-    await vscode.commands.executeCommand(
-      "setContext",
-      "cloudsmith.hasMultipleWorkspaces",
-      workspaces.length > 1
-    );
-    if (workspaces.length > 0) {
-      for (const workspace of workspaces) {
-        const workspaceNode = require("../models/workspaceNode");
-        const workspaceNodeInst = new workspaceNode(workspace, context);
-        WorkspaceNodes.push(workspaceNodeInst);
-      }
-      context.globalState.update('CloudsmithCache', {
-        name: 'Workspaces',
-        lastSync: Date.now(),
-        workspaces: workspaces
+      const result = await this._createCloudsmithAPI().get("namespaces/?sort=slug", {
+        responseType: "array",
+        validate: value => Array.isArray(value) && value.every(workspace => (
+          workspace
+          && typeof workspace === "object"
+          && !Array.isArray(workspace)
+          && typeof workspace.slug === "string"
+          && workspace.slug.length > 0
+        )),
+        retry: "safe-read",
       });
-    }
+      if (!this._isOperationCurrent(operation)) return [];
 
-    return WorkspaceNodes;
+      const workspaces = result.ok
+        ? result.data.map(workspace => ({
+          slug: workspace.slug,
+          name: typeof workspace.name === "string" && workspace.name.length > 0
+            ? workspace.name
+            : workspace.slug,
+        }))
+        : null;
+
+      if (!workspaces) {
+        await this._projectMultipleWorkspaces(false, operation);
+        if (!this._isOperationCurrent(operation)) return [];
+        return [this._loadFailureNode("workspaces")];
+      }
+      await this._projectMultipleWorkspaces(workspaces.length > 1, operation);
+      if (!this._isOperationCurrent(operation)) return [];
+      this._workspaceCache.set(workspaces, operation.account);
+
+      return this._createWorkspaceNodes(workspaces);
+    } catch {
+      if (!this._isOperationCurrent(operation)) return [];
+      try {
+        await this._projectMultipleWorkspaces(false, operation);
+      } catch {
+        // Loading cleanup and the fixed failure node remain authoritative.
+      }
+      return this._isOperationCurrent(operation)
+        ? [this._loadFailureNode("workspaces")]
+        : [];
+    } finally {
+      this._finishLoading(operation);
+    }
   }
 
   /**
@@ -148,85 +225,66 @@ class CloudsmithProvider {
    * @returns {Array} Array of RepositoryNode instances, or empty on error.
    */
   async getRepositories(workspaceSlug) {
-    const context = this.context;
-    const cloudsmithAPI = new CloudsmithAPI(context);
-    const connectionManager = new ConnectionManager(context);
-
-    if (this._treeView) {
-      this._treeView.message = "Loading...";
+    this._consumeMissingCredentialsWarningSuppression();
+    const operation = this._beginOperation();
+    if (!operation) {
+      if (this._treeView) this._treeView.message = undefined;
+      return [this._signedOutNode()];
     }
 
-    const connStatus = await connectionManager.connect(this._consumeConnectionOptions());
-    if (connStatus === "false" || connStatus === "error") {
-      if (this._treeView) {
-        this._treeView.message = undefined;
-      }
-      return [new InfoNode(
-        "Connect to Cloudsmith",
-        "Use the key icon above to set up a personal or service account API key, CLI import, or SSO.",
-        "Set up Cloudsmith authentication to get started.",
-        "plug",
-        undefined,
-        { command: "cloudsmith-vsc.configureCredentials", title: "Set up authentication" }
-      )];
-    }
-
-    const result = await workspaceRepositoryFetcher.fetchWorkspaceRepositories(
-      context,
-      workspaceSlug
-    );
-
-    if (this._treeView) {
-      this._treeView.message = undefined;
-    }
-
-    if (result.error) {
-      if (this._defaultWorkspaceFallbackHandler) {
-        this._defaultWorkspaceFallbackHandler(workspaceSlug);
-      } else {
-        vscode.window.showWarningMessage(
-          `Could not access workspace "${workspaceSlug}". Showing all workspaces.`
-        );
-      }
-      // Fall back to full workspace tree
-      return this.getWorkspaces();
-    }
-
-    const repos = result.repositories;
-
-    const RepositoryNode = require("../models/repositoryNode");
-    let quotaData = null;
-
+    this._startLoading(operation);
     try {
-      const quotaResult = await cloudsmithAPI.get(apiEndpoint(["quota", workspaceSlug]), {
-        responseType: "object",
-        retry: "safe-read",
+      const result = await this._fetchWorkspaceRepositories(this.context, workspaceSlug, {
+        account: operation.account,
+        connectionManager: this._connectionManager,
       });
-      if (quotaResult.ok && quotaResult.data.usage && typeof quotaResult.data.usage === "object") {
-        quotaData = quotaResult.data;
+      if (!this._isOperationCurrent(operation) || result.stale) return [];
+
+      if (result.error) {
+        if (this._defaultWorkspaceFallbackHandler) {
+          this._defaultWorkspaceFallbackHandler(workspaceSlug);
+        } else {
+          vscode.window.showWarningMessage(
+            `Could not access workspace "${workspaceSlug}". Showing all workspaces.`
+          );
+        }
+        // Fall back to full workspace tree
+        return this.getWorkspaces();
       }
+
+      const repos = result.repositories;
+      let quotaData = null;
+      try {
+        const quotaResult = await this._createCloudsmithAPI().get(apiEndpoint(["quota", workspaceSlug]), {
+          responseType: "object",
+          retry: "safe-read",
+        });
+        if (quotaResult.ok && quotaResult.data.usage && typeof quotaResult.data.usage === "object") {
+          quotaData = quotaResult.data;
+        }
+      } catch {
+        // Quota access is optional for the workspace summary row.
+      }
+      if (!this._isOperationCurrent(operation)) return [];
+
+      const RepositoryNodes = [
+        new WorkspaceInfoNode(workspaceSlug, quotaData),
+      ];
+      for (const repo of repos) {
+        // Pass workspaceSlug as the workspace parameter so downstream calls work
+        RepositoryNodes.push(new RepositoryNode(repo, workspaceSlug, this.context, {
+          connectionManager: this._connectionManager,
+          createCloudsmithAPI: this._createCloudsmithAPI,
+        }));
+      }
+      return RepositoryNodes;
     } catch {
-      // Quota access is optional for the workspace summary row.
+      return this._isOperationCurrent(operation)
+        ? [this._loadFailureNode("repositories")]
+        : [];
+    } finally {
+      this._finishLoading(operation);
     }
-
-    const RepositoryNodes = [
-      new WorkspaceInfoNode(workspaceSlug, quotaData),
-    ];
-
-    for (const repo of repos) {
-      // Pass workspaceSlug as the workspace parameter so downstream calls work
-      const repoNode = new RepositoryNode(repo, workspaceSlug, context);
-      RepositoryNodes.push(repoNode);
-    }
-
-    // Also update the workspace cache so search commands can find it
-    context.globalState.update('CloudsmithCache', {
-      name: 'Workspaces',
-      lastSync: Date.now(),
-      workspaces: [{ name: workspaceSlug, slug: workspaceSlug }]
-    });
-
-    return RepositoryNodes;
   }
 }
 

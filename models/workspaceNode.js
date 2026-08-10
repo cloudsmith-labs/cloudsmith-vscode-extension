@@ -9,10 +9,20 @@ const InfoNode = require("./infoNode");
 const repositoryNode = require("./repositoryNode");
 const { WorkspaceInfoNode } = require("./workspaceInfoNode");
 const workspaceRepositoryFetcher = require("../util/workspaceRepositoryFetcher");
+const {
+  captureAccount,
+  isAccountCurrent,
+  resolveConnectionManager,
+} = require("../util/accountOperation");
 
 class WorkspaceNode {
-  constructor(item, context) {
+  constructor(item, context, options = {}) {
     this.context = context;
+    this._connectionManager = resolveConnectionManager(context, options.connectionManager);
+    this._createCloudsmithAPI = options.createCloudsmithAPI
+      || (() => new CloudsmithAPI(this.context));
+    this._fetchWorkspaceRepositories = options.fetchWorkspaceRepositories
+      || workspaceRepositoryFetcher.fetchWorkspaceRepositories;
     this.name = item.name;
     this.slug = item.slug;
     this.workspace = item.slug;
@@ -34,12 +44,14 @@ class WorkspaceNode {
   }
 
   async getRepositories() {
-    const context = this.context;
+    const account = captureAccount(this._connectionManager);
+    if (!account) return [];
     const workspace = this.workspace;
-    const result = await workspaceRepositoryFetcher.fetchWorkspaceRepositories(
-      context,
-      workspace
-    );
+    const result = await this._fetchWorkspaceRepositories(this.context, workspace, {
+      account,
+      connectionManager: this._connectionManager,
+    });
+    if (!isAccountCurrent(this._connectionManager, account) || result.stale) return [];
 
     if (result.error) {
       return [new InfoNode(
@@ -57,24 +69,21 @@ class WorkspaceNode {
       const repositoryNodeInst = new repositoryNode(
         repo,
         this.slug,
-        this.context
+        this.context,
+        { connectionManager: this._connectionManager, createCloudsmithAPI: this._createCloudsmithAPI }
       );
       RepositoryNodes.push(repositoryNodeInst);
     }
-
-    context.globalState.update("CloudsmithCache", {
-      name: "Repositories",
-      lastSync: Date.now(),
-      workspaces: repositories,
-    });
     return RepositoryNodes;
   }
 
   async getChildren() {
+    const account = captureAccount(this._connectionManager);
+    if (!account) return [];
     let quotaData = null;
 
     try {
-      const cloudsmithAPI = new CloudsmithAPI(this.context);
+      const cloudsmithAPI = this._createCloudsmithAPI();
       const result = await cloudsmithAPI.get(apiEndpoint(["quota", this.workspace]), {
         responseType: "object",
         retry: "safe-read",
@@ -86,11 +95,13 @@ class WorkspaceNode {
     } catch {
       // Quota access is optional for this node.
     }
+    if (!isAccountCurrent(this._connectionManager, account)) return [];
 
     const children = [];
     children.push(new WorkspaceInfoNode(this.name || this.workspace, quotaData));
 
     const repos = await this.getRepositories();
+    if (!isAccountCurrent(this._connectionManager, account)) return [];
     children.push(...repos);
 
     return children;

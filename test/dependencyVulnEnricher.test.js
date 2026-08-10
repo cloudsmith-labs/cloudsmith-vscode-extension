@@ -1,13 +1,26 @@
 const assert = require("assert");
 const {
   clearVulnerabilityCache,
-  enrichVulnerabilities,
+  enrichVulnerabilities: enrichVulnerabilitiesImpl,
   getVulnerabilityCacheSize,
 } = require("../util/dependencyVulnEnricher");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 
 suite("dependencyVulnEnricher", () => {
+  let accountState;
+  const connectionManager = {
+    getState() { return { ...accountState }; },
+    setState(next) { accountState = { ...accountState, ...next }; },
+  };
+
+  function enrichVulnerabilities(dependencies, workspace, options = {}) {
+    return enrichVulnerabilitiesImpl(dependencies, workspace, {
+      connectionManager,
+      ...options,
+    });
+  }
+
   function createFoundDependency(slug, count = 1) {
     return {
       name: `pkg-${slug}`,
@@ -28,6 +41,11 @@ suite("dependencyVulnEnricher", () => {
 
   setup(() => {
     clearVulnerabilityCache();
+    accountState = {
+      activationId: "activation-a",
+      accountEpoch: 1,
+      sessionConnected: true,
+    };
   });
 
   test("hydrates vulnerability summaries from the detail endpoint", async () => {
@@ -178,6 +196,18 @@ suite("dependencyVulnEnricher", () => {
 
       assert.strictEqual(getVulnerabilityCacheSize(), 5000);
 
+      await enrichVulnerabilities([createFoundDependency("pkg-over-cap")], "workspace-a", {
+        cloudsmithAPI: {
+          async getV2() {
+            return apiSuccess({
+              results: [{ vulnerability_id: "CVE-2024-9999", severity: "Low" }],
+            });
+          },
+        },
+      });
+
+      assert.strictEqual(getVulnerabilityCacheSize(), 5000);
+
       now += 20 * 60 * 1000;
 
       await enrichVulnerabilities([createFoundDependency("pkg-fresh")], "workspace-a", {
@@ -236,6 +266,25 @@ suite("dependencyVulnEnricher", () => {
     assert.strictEqual(fetchSignal.aborted, true);
     assert.strictEqual(disposedListeners, 1);
     assert.strictEqual(enriched[0].vulnerabilities.detailsLoaded, false);
+    assert.strictEqual(getVulnerabilityCacheSize(), 0);
+  });
+
+  test("does not cache or publish vulnerability details completed by an old account", async () => {
+    let release;
+    const response = new Promise(resolve => { release = resolve; });
+    const dependencies = [createFoundDependency("pkg-old")];
+    const pending = enrichVulnerabilities(dependencies, "workspace-a", {
+      cloudsmithAPI: { async getV2() { return response; } },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    connectionManager.setState({ accountEpoch: 2 });
+    release(apiSuccess({
+      results: [{ vulnerability_id: "CVE-OLD", severity: "Critical" }],
+    }));
+
+    const result = await pending;
+    assert.strictEqual(result, dependencies);
+    assert.strictEqual(result[0].vulnerabilities, undefined);
     assert.strictEqual(getVulnerabilityCacheSize(), 0);
   });
 });

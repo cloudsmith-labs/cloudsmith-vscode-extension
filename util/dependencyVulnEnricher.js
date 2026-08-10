@@ -2,6 +2,11 @@
 const { CloudsmithAPI } = require("./cloudsmithAPI");
 const { apiEndpoint } = require("./apiEndpoint");
 const { getFoundDependencyKey } = require("./foundDependencyKey");
+const {
+  captureAccount,
+  isAccountCurrent,
+  resolveConnectionManager,
+} = require("./accountOperation");
 
 const VULNERABILITY_CACHE_TTL_MS = 10 * 60 * 1000;
 const VULNERABILITY_CACHE_MAX_SIZE = 5000;
@@ -297,13 +302,20 @@ function pruneExpiredVulnerabilityCache(now = Date.now()) {
   }
 }
 
-function getCachedVulnerabilitySummary(packageKey) {
+function getCachedVulnerabilitySummary(packageKey, account, now) {
   const cached = vulnerabilityCache.get(packageKey);
   if (!cached) {
     return null;
   }
 
-  if (cached.expiresAt > Date.now()) {
+  if (
+    cached.expiresAt > now
+    && cached.activationId === account.activationId
+    && cached.accountEpoch === account.accountEpoch
+  ) {
+    // Reinsert cache hits so the hard-cap eviction policy is deterministic LRU.
+    vulnerabilityCache.delete(packageKey);
+    vulnerabilityCache.set(packageKey, cached);
     return cached.value;
   }
 
@@ -311,24 +323,41 @@ function getCachedVulnerabilitySummary(packageKey) {
   return null;
 }
 
-function setCachedVulnerabilitySummary(packageKey, value) {
+function setCachedVulnerabilitySummary(packageKey, value, account, now) {
+  vulnerabilityCache.delete(packageKey);
   if (vulnerabilityCache.size >= VULNERABILITY_CACHE_MAX_SIZE) {
-    pruneExpiredVulnerabilityCache();
+    pruneExpiredVulnerabilityCache(now);
+  }
+  while (vulnerabilityCache.size >= VULNERABILITY_CACHE_MAX_SIZE) {
+    const oldestKey = vulnerabilityCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    vulnerabilityCache.delete(oldestKey);
   }
 
   vulnerabilityCache.set(packageKey, {
-    expiresAt: Date.now() + VULNERABILITY_CACHE_TTL_MS,
+    activationId: account.activationId,
+    accountEpoch: account.accountEpoch,
+    expiresAt: now + VULNERABILITY_CACHE_TTL_MS,
     value,
   });
 }
 
-async function fetchVulnerabilitySummary(api, packageModel, fallbackSummary, cancellationToken) {
+async function fetchVulnerabilitySummary(
+  api,
+  packageModel,
+  fallbackSummary,
+  cancellationToken,
+  connectionManager,
+  account,
+  now
+) {
   const packageKey = getFoundDependencyKey({ cloudsmithPackage: packageModel });
   if (!packageKey) {
     return fallbackSummary;
   }
 
-  const cachedValue = getCachedVulnerabilitySummary(packageKey);
+  if (!isAccountCurrent(connectionManager, account)) return null;
+  const cachedValue = getCachedVulnerabilitySummary(packageKey, account, now());
   if (cachedValue) {
     return cachedValue;
   }
@@ -363,12 +392,17 @@ async function fetchVulnerabilitySummary(api, packageModel, fallbackSummary, can
     retry: "never",
     cancellationToken,
   });
-  if (!response.ok || isCancellationRequested(cancellationToken)) {
+  if (
+    !response.ok
+    || isCancellationRequested(cancellationToken)
+    || !isAccountCurrent(connectionManager, account)
+  ) {
     return null;
   }
 
   const summary = summarizeEntries(extractVulnerabilityEntries(response.data), fallbackSummary);
-  setCachedVulnerabilitySummary(packageKey, summary);
+  if (!isAccountCurrent(connectionManager, account)) return null;
+  setCachedVulnerabilitySummary(packageKey, summary, account, now());
   return summary;
 }
 
@@ -389,7 +423,13 @@ function applyVulnerabilityPatch(dependencies, patchMap) {
 async function enrichVulnerabilities(dependencies, workspace, options = {}) {
   const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
   const cancellationToken = options.cancellationToken || null;
+  const connectionManager = resolveConnectionManager(options.context, options.connectionManager);
+  const account = options.account || captureAccount(connectionManager);
+  if (!account || !isAccountCurrent(connectionManager, account)) {
+    return Array.isArray(dependencies) ? dependencies : [];
+  }
   const api = options.cloudsmithAPI || new CloudsmithAPI(options.context);
+  const now = options.now || Date.now;
   const groups = collectPackageGroups(dependencies);
   const patchMap = new Map();
   const detailTargets = [];
@@ -405,7 +445,7 @@ async function enrichVulnerabilities(dependencies, workspace, options = {}) {
     }
   }
 
-  if (onProgress && patchMap.size > 0) {
+  if (onProgress && patchMap.size > 0 && isAccountCurrent(connectionManager, account)) {
     onProgress(new Map(patchMap), {
       completed: 0,
       total: detailTargets.length,
@@ -415,8 +455,10 @@ async function enrichVulnerabilities(dependencies, workspace, options = {}) {
   }
 
   let completed = 0;
+  let stale = false;
   await runPool(detailTargets, VULNERABILITY_CONCURRENCY, async (target) => {
-    if (isCancellationRequested(cancellationToken)) {
+    if (isCancellationRequested(cancellationToken) || !isAccountCurrent(connectionManager, account)) {
+      stale = stale || !isAccountCurrent(connectionManager, account);
       return;
     }
 
@@ -424,15 +466,22 @@ async function enrichVulnerabilities(dependencies, workspace, options = {}) {
       api,
       target.packageModel,
       target.fallbackSummary,
-      cancellationToken
+      cancellationToken,
+      connectionManager,
+      account,
+      now
     );
 
+    if (!isAccountCurrent(connectionManager, account)) {
+      stale = true;
+      return;
+    }
     if (summary) {
       patchMap.set(target.key, summary);
     }
     completed += 1;
 
-    if (onProgress) {
+    if (onProgress && isAccountCurrent(connectionManager, account)) {
       onProgress(summary ? new Map([[target.key, summary]]) : new Map(), {
         completed,
         total: detailTargets.length,
@@ -442,6 +491,9 @@ async function enrichVulnerabilities(dependencies, workspace, options = {}) {
     }
   });
 
+  if (stale || !isAccountCurrent(connectionManager, account)) {
+    return Array.isArray(dependencies) ? dependencies : [];
+  }
   return applyVulnerabilityPatch(dependencies, patchMap);
 }
 
@@ -489,4 +541,5 @@ module.exports = {
   getVulnerabilityCacheSize() {
     return vulnerabilityCache.size;
   },
+  VULNERABILITY_CACHE_MAX_SIZE,
 };

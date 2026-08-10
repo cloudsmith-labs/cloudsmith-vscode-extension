@@ -22,6 +22,7 @@ const {
   createDependencySource,
 } = require("../util/dependencyRecord");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
+const { bindConnectionManager } = require("../util/connectionManager");
 
 suite("DependencyHealthProvider Test Suite", () => {
   let originalWithProgress;
@@ -30,15 +31,9 @@ suite("DependencyHealthProvider Test Suite", () => {
   let originalShowErrorMessage;
 
   function createContext(isConnected = "true") {
-    return {
+    const context = {
       secrets: {
         onDidChange() {},
-        async get(key) {
-          if (key === "cloudsmith-vsc.isConnected") {
-            return isConnected;
-          }
-          return null;
-        },
       },
       workspaceState: {
         get() {
@@ -47,6 +42,20 @@ suite("DependencyHealthProvider Test Suite", () => {
         async update() {},
       },
     };
+    const connected = isConnected === "true";
+    const connectionManager = {
+      activationId: "dependency-health-tests",
+      getState() {
+        return Object.freeze({
+          activationId: this.activationId,
+          accountEpoch: 1,
+          sessionConnected: connected,
+          status: connected ? "connected" : "absent",
+        });
+      },
+    };
+    bindConnectionManager(context, connectionManager);
+    return context;
   }
 
   function createDependency(name, version, format = "npm") {
@@ -141,6 +150,9 @@ suite("DependencyHealthProvider Test Suite", () => {
       replace(snapshot) {
         this.current = snapshot;
         this.replacements.push(snapshot);
+      },
+      clear() {
+        this.current = [];
       },
     };
   }
@@ -371,6 +383,38 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(nodes[0].getTreeItem().label, "Dependency scan canceled");
   });
 
+  test("account epoch change cancels in-flight work and prevents old-account publication", async () => {
+    let accountEpoch = 1;
+    const connectionManager = {
+      getState() {
+        return Object.freeze({
+          activationId: "dependency-account-race",
+          accountEpoch,
+          sessionConnected: true,
+          status: "connected",
+        });
+      },
+    };
+    const diagnostics = createDiagnosticsPublisher();
+    const provider = new DependencyHealthProvider(createContext(), diagnostics, {
+      connectionManager,
+    });
+    const scanStarted = deferred();
+    const scanGate = deferred();
+    installScanSteps(provider, [{ name: "old-account-result", started: scanStarted, gate: scanGate }]);
+
+    const scanPromise = provider.scan("workspace-a", "repo-a", "/project-a");
+    await scanStarted.promise;
+    accountEpoch = 2;
+    await provider.resetForAccountChange();
+    scanGate.resolve();
+
+    assert.strictEqual((await scanPromise).status, "superseded");
+    assert.strictEqual(provider.hasSuccessfulScan(), false);
+    assert.deepStrictEqual(provider.dependencies, []);
+    assert.deepStrictEqual(diagnostics.current, []);
+  });
+
   test("successful rescan leaves prior results visible while running and replaces them on commit", async () => {
     const diagnostics = createDiagnosticsPublisher();
     const provider = new DependencyHealthProvider(createContext(), diagnostics);
@@ -555,11 +599,17 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.deepStrictEqual(provider._warnings, ["previous successful warning"]);
     assert.match(scanWorker._warnings[0], /capped at 10000 direct occurrences/);
 
+    provider._scanOperation = {
+      ...provider._scanOperation,
+      id: 1,
+      accountEpoch: 1,
+      status: SCAN_STATES.RUNNING,
+    };
     provider._commitSuccessfulScan(scanWorker, {
       workspace: "workspace-a",
       repository: "repo-a",
       projectFolder: "/project",
-    }, 1);
+    }, 1, 1);
     assert.match(provider._warnings[0], /capped at 10000 direct occurrences/);
   });
 

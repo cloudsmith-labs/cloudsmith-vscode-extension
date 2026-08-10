@@ -1,63 +1,178 @@
-// This class handles credential storage and retrieval. 
-
 const vscode = require("vscode");
 
-class CredentialManager {
-  constructor(context) {
-    this.context = context;
+const AUTH_TOKEN_KEY = "cloudsmith-vsc.authToken";
+
+function unavailableResult() {
+  return Object.freeze({
+    ok: false,
+    status: "unavailable",
+    committed: false,
+    error: Object.freeze({
+      kind: "unavailable",
+      message: "Authentication is not ready. Reload the extension and try again.",
+    }),
+  });
+}
+
+async function runCLIAutoDetect(options) {
+  const {
+    connectionManager,
+    secrets,
+    ssoManager,
+    showInformationMessage,
+    handleAuthenticationResult,
+  } = options;
+  const stableState = connectionManager.getState();
+  if (
+    stableState.status !== "absent"
+    || stableState.credentialPresent !== false
+    || stableState.sessionConnected
+  ) {
+    return Object.freeze({ ok: false, status: "not_applicable" });
   }
 
-  // Show input box to enter credential key and store as a secret
-  async storeApiKey() {
-    const context = this.context;
-    const apiKey = await vscode.window.showInputBox({
-      prompt: "Enter a Cloudsmith API key",
-      password: true,
-      ignoreFocusOut: true,
+  const operation = connectionManager.beginCredentialOperation();
+  let currentKey;
+  try {
+    currentKey = await secrets.get(AUTH_TOKEN_KEY);
+  } catch {
+    if (connectionManager.isOperationCurrent(operation)) {
+      await connectionManager.cancelCredentialOperation(operation);
+    }
+    return Object.freeze({
+      ok: false,
+      status: "failed",
+      committed: false,
+      error: Object.freeze({
+        kind: "credential_read_failed",
+        message: "Could not check stored Cloudsmith credentials. Try again.",
+      }),
     });
-
-    if (apiKey) {
-      await context.secrets.store("cloudsmith-vsc.authToken", apiKey);
-      vscode.window.showInformationMessage("Credentials saved.");
-      return true;
+  }
+  if (!connectionManager.isOperationCurrent(operation)) {
+    return Object.freeze({ ok: false, status: "stale" });
+  }
+  if (currentKey) {
+    return connectionManager.initialize();
+  }
+  if (ssoManager.hasCLICredentials()) {
+    const choice = await showInformationMessage(
+      "Cloudsmith CLI credentials detected. Import them?",
+      "Import",
+      "Dismiss"
+    );
+    if (!connectionManager.isOperationCurrent(operation)) {
+      return Object.freeze({ ok: false, status: "stale" });
     }
-    return false;
+    if (choice === "Import") {
+      const result = await ssoManager.importFromCLI(operation);
+      await handleAuthenticationResult(result);
+      return result;
+    }
+  }
+  return connectionManager.cancelCredentialOperation(operation);
+}
+
+class CredentialManager {
+  constructor(context, options = {}) {
+    this.context = context;
+    this._connectionManager = options.connectionManager || null;
+    this._showInputBox = options.showInputBox || vscode.window.showInputBox;
+    this._showWarningMessage = options.showWarningMessage || vscode.window.showWarningMessage;
   }
 
-  // Fetch credential from secret store
   async getApiKey() {
-    const context = this.context;
-    const apiKey = await context.secrets.get("cloudsmith-vsc.authToken");
-
-    if (!apiKey) {
-      return null;
-    }
-
-    return apiKey;
+    const apiKey = await this.context.secrets.get(AUTH_TOKEN_KEY);
+    return typeof apiKey === "string" && apiKey ? apiKey : null;
   }
 
-  // Clear secret
-  async clearCredentials() {
-    const context = this.context;
-    const apiKey = await context.secrets.get("cloudsmith-vsc.authToken");
+  async storeApiKey(operation = null) {
+    const manager = this._getConnectionManager();
+    if (!manager) return unavailableResult();
 
-    if (apiKey) {
-      vscode.window
-        .showWarningMessage(
-          "Delete the stored API key?",
-          { modal: true },
-          "Delete"
-        )
-        .then(async (selection) => {
-          if (selection === "Delete") {
-            await context.secrets.delete("cloudsmith-vsc.authToken");
-            vscode.window.showInformationMessage("Credentials cleared.");
-          }
-        });
-    } else {
-      vscode.window.showWarningMessage("No credentials found.");
+    const token = operation || manager.beginCredentialOperation();
+    if (!manager.isOperationCurrent(token)) {
+      return Object.freeze({ ok: false, status: "stale", committed: false, state: manager.getState() });
     }
+    let apiKey;
+    try {
+      apiKey = await this._showInputBox({
+        prompt: "Enter a Cloudsmith API key",
+        password: true,
+        ignoreFocusOut: true,
+      });
+    } catch {
+      await manager.cancelCredentialOperation(token);
+      return Object.freeze({
+        ok: false,
+        status: "failed",
+        committed: false,
+        error: Object.freeze({
+          kind: "input_failed",
+          message: "Could not read the API key. Try again.",
+        }),
+      });
+    }
+
+    if (typeof apiKey !== "string") {
+      return manager.cancelCredentialOperation(token);
+    }
+    return manager.replaceCredential(apiKey, token);
+  }
+
+  async saveApiKey(apiKey, operation = null) {
+    const manager = this._getConnectionManager();
+    if (!manager) return unavailableResult();
+    return manager.replaceCredential(apiKey, operation || manager.beginCredentialOperation());
+  }
+
+  async clearCredentials(operation = null) {
+    const manager = this._getConnectionManager();
+    if (!manager) return unavailableResult();
+
+    const token = operation || manager.beginCredentialOperation();
+    if (!manager.isOperationCurrent(token)) {
+      return Object.freeze({ ok: false, status: "stale", committed: false, state: manager.getState() });
+    }
+    const state = manager.getState();
+    if (state.credentialPresent === false) {
+      await manager.cancelCredentialOperation(token);
+      await this._showWarningMessage("No credentials found.");
+      return Object.freeze({ ok: false, status: "absent", committed: false, state: manager.getState() });
+    }
+
+    let selection;
+    try {
+      selection = await this._showWarningMessage(
+        "Delete the stored API key?",
+        { modal: true },
+        "Delete"
+      );
+    } catch {
+      await manager.cancelCredentialOperation(token);
+      return Object.freeze({
+        ok: false,
+        status: "failed",
+        committed: false,
+        error: Object.freeze({
+          kind: "confirmation_failed",
+          message: "Could not confirm credential deletion. Try again.",
+        }),
+      });
+    }
+
+    if (selection !== "Delete") {
+      return manager.cancelCredentialOperation(token);
+    }
+    return manager.disconnect(token);
+  }
+
+  _getConnectionManager() {
+    if (this._connectionManager) return this._connectionManager;
+    // Lazy loading avoids a circular dependency while preserving fail-closed lookup.
+    const { getConnectionManager } = require("./connectionManager");
+    return getConnectionManager(this.context);
   }
 }
 
-module.exports = { CredentialManager };
+module.exports = { AUTH_TOKEN_KEY, CredentialManager, runCLIAutoDetect };

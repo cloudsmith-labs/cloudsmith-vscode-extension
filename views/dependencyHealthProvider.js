@@ -44,6 +44,7 @@ const DependencyHealthNode = require("../models/dependencyHealthNode");
 const DependencySourceGroupNode = require("../models/dependencySourceGroupNode");
 const DependencySummaryNode = require("../models/dependencySummaryNode");
 const InfoNode = require("../models/infoNode");
+const { getConnectionManager } = require("../util/connectionManager");
 
 const DEFAULT_MAX_DEPENDENCIES_TO_SCAN = 10000;
 const LOOKUP_PAGE_SIZE = 100;
@@ -92,6 +93,7 @@ class DependencyHealthProvider {
   constructor(context, diagnosticsPublisher, options = {}) {
     this.context = context;
     this._diagnosticsPublisher = diagnosticsPublisher || null;
+    this._connectionManager = options.connectionManager || getConnectionManager(context);
     this._services = {
       enrichVulnerabilities: options.enrichVulnerabilities || enrichVulnerabilities,
       enrichLicenses: options.enrichLicenses || enrichLicenses,
@@ -128,19 +130,29 @@ class DependencyHealthProvider {
     this._lastScanTimestamp = null;
     this._nextScanOperationId = 0;
     this._activeScanCancellation = null;
+    this._activeDependencyCancellation = null;
     this._dependencyOperationRunning = false;
     this._scanOperation = createScanOperation(SCAN_STATES.IDLE, 0);
     this._hasSuccessfulScan = false;
 
-    if (this.context && this.context.secrets && typeof this.context.secrets.onDidChange === "function") {
-      this.context.secrets.onDidChange((event) => {
-        if (event.key === "cloudsmith-vsc.isConnected") {
-          this.refresh();
-        }
-      });
-    }
-
     this._updateContexts();
+  }
+
+  _captureAccountEpoch() {
+    const state = this._connectionManager && this._connectionManager.getState();
+    return state && state.sessionConnected && Number.isInteger(state.accountEpoch)
+      ? state.accountEpoch
+      : null;
+  }
+
+  _isAccountCurrent(accountEpoch) {
+    const state = this._connectionManager && this._connectionManager.getState();
+    return Boolean(
+      Number.isInteger(accountEpoch)
+      && state
+      && state.sessionConnected
+      && state.accountEpoch === accountEpoch
+    );
   }
 
   _getInitialViewMode() {
@@ -179,8 +191,10 @@ class DependencyHealthProvider {
   }
 
   getScanState() {
+    const operation = { ...this._scanOperation };
+    delete operation.accountEpoch;
     return {
-      ...this._scanOperation,
+      ...operation,
       hasSuccessfulScan: this._hasSuccessfulScan,
       successfulScope: this.getLastSuccessfulScope(),
     };
@@ -196,6 +210,35 @@ class DependencyHealthProvider {
       repository: this.lastRepo,
       projectFolder: this._projectFolderPath,
     };
+  }
+
+  async resetForAccountChange() {
+    this._nextScanOperationId += 1;
+    if (this._activeScanCancellation) {
+      this._activeScanCancellation.cancel();
+    }
+    if (this._activeDependencyCancellation) {
+      this._activeDependencyCancellation.cancel();
+    }
+    this.dependencies = [];
+    this.lastWorkspace = null;
+    this.lastRepo = null;
+    this._warnings = [];
+    this._lastManifests = [];
+    this._projectFolderPath = null;
+    this._noManifestsFolder = null;
+    this._fullTrees = [];
+    this._displayTrees = [];
+    this._summary = emptySummary();
+    this._reportData = null;
+    this._lastScanTimestamp = null;
+    this._hasSuccessfulScan = false;
+    this._scanOperation = createScanOperation(SCAN_STATES.IDLE, this._nextScanOperationId);
+    if (this._diagnosticsPublisher) {
+      this._diagnosticsPublisher.clear();
+    }
+    await this._updateContexts();
+    this.refresh();
   }
 
   async setViewMode(mode) {
@@ -366,6 +409,12 @@ class DependencyHealthProvider {
       return { status: "blocked" };
     }
 
+    const accountEpoch = this._captureAccountEpoch();
+    if (accountEpoch === null) {
+      vscode.window.showWarningMessage("Connect to Cloudsmith before scanning dependencies.");
+      return { status: "blocked" };
+    }
+
     const operationId = ++this._nextScanOperationId;
     const previousCancellation = this._activeScanCancellation;
     if (previousCancellation) {
@@ -374,6 +423,7 @@ class DependencyHealthProvider {
 
     this._scanOperation = createScanOperation(SCAN_STATES.SELECTING, operationId, {
       startedAt: Date.now(),
+      accountEpoch,
       scope: {
         workspace: cloudsmithWorkspace,
         repository: cloudsmithRepo || null,
@@ -386,7 +436,7 @@ class DependencyHealthProvider {
     let folderPath = projectFolder || this.getProjectFolder();
     if (!folderPath) {
       folderPath = await this.promptForFolder();
-      if (!this._isCurrentScan(operationId)) {
+      if (!this._isCurrentScan(operationId, accountEpoch)) {
         return { status: "superseded" };
       }
       if (!folderPath) {
@@ -402,6 +452,7 @@ class DependencyHealthProvider {
     };
     this._scanOperation = createScanOperation(SCAN_STATES.RUNNING, operationId, {
       startedAt: this._scanOperation.startedAt,
+      accountEpoch,
       scope,
     });
     await this._updateContexts();
@@ -434,7 +485,7 @@ class DependencyHealthProvider {
         }
       );
 
-      if (!this._isCurrentScan(operationId)) {
+      if (!this._isCurrentScan(operationId, accountEpoch)) {
         return { status: "superseded" };
       }
 
@@ -448,7 +499,7 @@ class DependencyHealthProvider {
         scanWorker,
         cancellationSource.token
       );
-      if (!this._isCurrentScan(operationId)) {
+      if (!this._isCurrentScan(operationId, accountEpoch)) {
         return { status: "superseded" };
       }
 
@@ -461,12 +512,12 @@ class DependencyHealthProvider {
       if (this._diagnosticsPublisher) {
         this._diagnosticsPublisher.replace(preparedDiagnostics.entries);
       }
-      this._commitSuccessfulScan(scanWorker, scope, operationId);
+      this._commitSuccessfulScan(scanWorker, scope, operationId, accountEpoch);
       await this._updateContexts();
       this.refresh();
       return { status: SCAN_STATES.SUCCEEDED };
     } catch (error) {
-      if (!this._isCurrentScan(operationId)) {
+      if (!this._isCurrentScan(operationId, accountEpoch)) {
         return { status: "superseded" };
       }
 
@@ -482,6 +533,7 @@ class DependencyHealthProvider {
         : `Dependency scan failed. ${reason}`;
       this._scanOperation = createScanOperation(SCAN_STATES.FAILED, operationId, {
         startedAt: this._scanOperation.startedAt,
+        accountEpoch,
         completedAt: Date.now(),
         failureMessage: message,
         scope,
@@ -502,8 +554,8 @@ class DependencyHealthProvider {
     }
   }
 
-  _isCurrentScan(operationId) {
-    return this._scanOperation.id === operationId;
+  _isCurrentScan(operationId, accountEpoch = this._scanOperation.accountEpoch) {
+    return this._scanOperation.id === operationId && this._isAccountCurrent(accountEpoch);
   }
 
   _createScanWorker(scope) {
@@ -537,6 +589,7 @@ class DependencyHealthProvider {
     const currentOperation = this._scanOperation;
     this._scanOperation = createScanOperation(SCAN_STATES.CANCELLED, operationId, {
       startedAt: currentOperation.startedAt,
+      accountEpoch: currentOperation.accountEpoch,
       completedAt: Date.now(),
       scope: currentOperation.scope,
       message: this._hasSuccessfulScan
@@ -547,7 +600,10 @@ class DependencyHealthProvider {
     this.refresh();
   }
 
-  _commitSuccessfulScan(scanWorker, scope, operationId) {
+  _commitSuccessfulScan(scanWorker, scope, operationId, accountEpoch) {
+    if (!this._isCurrentScan(operationId, accountEpoch)) {
+      return;
+    }
     this.lastWorkspace = scope.workspace;
     this.lastRepo = scope.repository;
     this._warnings = scanWorker._warnings;
@@ -562,6 +618,7 @@ class DependencyHealthProvider {
     this._hasSuccessfulScan = true;
     this._scanOperation = createScanOperation(SCAN_STATES.SUCCEEDED, operationId, {
       startedAt: this._scanOperation.startedAt,
+      accountEpoch,
       completedAt: Date.now(),
       scope,
     });
@@ -585,7 +642,9 @@ class DependencyHealthProvider {
           break outer;
         }
         examinedDirectDependencies += 1;
-        const healthNode = new DependencyHealthNode(dependency, null, this.context);
+        const healthNode = new DependencyHealthNode(dependency, null, this.context, {
+          connectionManager: this._connectionManager,
+        });
         if (!["quarantined", "violated", "not_found"].includes(healthNode.state)) {
           continue;
         }
@@ -1252,7 +1311,7 @@ class DependencyHealthProvider {
         dependency,
         null,
         this.context,
-        { childMode: "details" }
+        { childMode: "details", connectionManager: this._connectionManager }
       ));
   }
 
@@ -1274,6 +1333,7 @@ class DependencyHealthProvider {
       null,
       this.context,
       {
+        connectionManager: this._connectionManager,
         childMode: "tree",
         treeChildren: wrapper.children,
         duplicateReference: wrapper.duplicate,
@@ -1305,6 +1365,11 @@ class DependencyHealthProvider {
       return;
     }
 
+    const accountEpoch = this._captureAccountEpoch();
+    if (accountEpoch === null) {
+      return;
+    }
+
     if (!this.lastWorkspace) {
       vscode.window.showInformationMessage("Run a dependency scan before pulling dependencies.");
       return;
@@ -1317,6 +1382,7 @@ class DependencyHealthProvider {
     }
 
     const cancellationSource = new vscode.CancellationTokenSource();
+    this._activeDependencyCancellation = cancellationSource;
     this._dependencyOperationRunning = true;
     await this._updateContexts();
 
@@ -1341,6 +1407,10 @@ class DependencyHealthProvider {
 
             if (!execution || execution.canceled) {
               return execution || { canceled: true };
+            }
+
+            if (!this._isAccountCurrent(accountEpoch)) {
+              return { canceled: true };
             }
 
             this.lastRepo = execution.repository.slug;
@@ -1369,6 +1439,10 @@ class DependencyHealthProvider {
         return;
       }
 
+      if (!this._isAccountCurrent(accountEpoch)) {
+        return;
+      }
+
       if (result.canceled) {
         vscode.window.showInformationMessage("Dependency pull canceled.");
         return;
@@ -1381,6 +1455,9 @@ class DependencyHealthProvider {
       }
     } finally {
       cancellationSource.dispose();
+      if (this._activeDependencyCancellation === cancellationSource) {
+        this._activeDependencyCancellation = null;
+      }
       this._dependencyOperationRunning = false;
       await this._updateContexts();
       this.refresh();
@@ -1390,6 +1467,11 @@ class DependencyHealthProvider {
   async pullSingleDependency(item) {
     if (this.isScanRunning() || this._dependencyOperationRunning) {
       vscode.window.showWarningMessage("Wait for the current dependency operation to finish.");
+      return;
+    }
+
+    const accountEpoch = this._captureAccountEpoch();
+    if (accountEpoch === null) {
       return;
     }
 
@@ -1414,11 +1496,12 @@ class DependencyHealthProvider {
         repositoryHint: this.lastRepo,
         dependency,
       });
-      if (!prepared) {
+      if (!prepared || !this._isAccountCurrent(accountEpoch)) {
         return;
       }
 
       cancellationSource = new vscode.CancellationTokenSource();
+      this._activeDependencyCancellation = cancellationSource;
       const result = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -1436,6 +1519,10 @@ class DependencyHealthProvider {
 
             if (!execution || execution.canceled) {
               return execution || { canceled: true };
+            }
+
+            if (!this._isAccountCurrent(accountEpoch)) {
+              return { canceled: true };
             }
 
             this.lastRepo = prepared.repository.slug;
@@ -1467,6 +1554,10 @@ class DependencyHealthProvider {
         return;
       }
 
+      if (!this._isAccountCurrent(accountEpoch)) {
+        return;
+      }
+
       if (result.canceled) {
         vscode.window.showInformationMessage("Dependency pull canceled.");
         return;
@@ -1485,6 +1576,9 @@ class DependencyHealthProvider {
     } finally {
       if (cancellationSource) {
         cancellationSource.dispose();
+        if (this._activeDependencyCancellation === cancellationSource) {
+          this._activeDependencyCancellation = null;
+        }
       }
       this._dependencyOperationRunning = false;
       await this._updateContexts();
@@ -1675,10 +1769,8 @@ class DependencyHealthProvider {
     }
 
     if (!this._hasSuccessfulScan && this._scanOperation.status === SCAN_STATES.IDLE) {
-      const isConnected = this.context && this.context.secrets
-        ? await this.context.secrets.get("cloudsmith-vsc.isConnected")
-        : "false";
-      if (isConnected !== "true") {
+      const state = this._connectionManager && this._connectionManager.getState();
+      if (!state || !state.sessionConnected) {
         return [
           new InfoNode(
             "Connect to Cloudsmith",
@@ -1754,6 +1846,20 @@ class DependencyHealthProvider {
     this._onDidChangeTreeData.fire();
   }
 
+  dispose() {
+    if (this._activeScanCancellation) {
+      this._activeScanCancellation.cancel();
+      this._activeScanCancellation.dispose();
+      this._activeScanCancellation = null;
+    }
+    if (this._activeDependencyCancellation) {
+      this._activeDependencyCancellation.cancel();
+      this._activeDependencyCancellation.dispose();
+      this._activeDependencyCancellation = null;
+    }
+    this._onDidChangeTreeData.dispose();
+  }
+
   _rebuildSummary() {
     this._summary = buildDependencySummary(this._fullTrees, this._displayTrees, {
       filterMode: this._filterMode,
@@ -1778,6 +1884,7 @@ function createScanOperation(status, id, values = {}) {
   return {
     status,
     id,
+    accountEpoch: Number.isInteger(values.accountEpoch) ? values.accountEpoch : null,
     startedAt: values.startedAt || null,
     completedAt: values.completedAt || null,
     scope: values.scope || null,

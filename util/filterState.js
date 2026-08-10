@@ -4,4 +4,8 @@
 
 const activeFilters = new Map();
 
-module.exports = { activeFilters };
+function clear() {
+  activeFilters.clear();
+}
+
+module.exports = { activeFilters, clear };

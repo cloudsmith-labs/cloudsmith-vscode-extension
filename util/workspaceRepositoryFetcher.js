@@ -3,9 +3,28 @@ const { CloudsmithAPI } = require("./cloudsmithAPI");
 const { apiEndpoint } = require("./apiEndpoint");
 const { formatApiError } = require("./errorFormatter");
 const { PaginatedFetch } = require("./paginatedFetch");
+const {
+  captureAccount,
+  isAccountCurrent,
+  resolveConnectionManager,
+} = require("./accountOperation");
 
 const WORKSPACE_REPOSITORY_PAGE_SIZE = 500;
 const UNEXPECTED_RESPONSE_FORMAT_ERROR = "Unexpected repository response format";
+const STALE_ACCOUNT_ERROR = Object.freeze({
+  kind: "stale_account",
+  message: "The active Cloudsmith account changed while repositories were loading.",
+});
+
+function staleResult() {
+  return {
+    repositories: [],
+    error: STALE_ACCOUNT_ERROR,
+    warning: null,
+    partial: false,
+    stale: true,
+  };
+}
 
 function sortRepositories(repositories) {
   return [...repositories].sort((left, right) => {
@@ -19,8 +38,19 @@ function sortRepositories(repositories) {
 }
 
 async function fetchWorkspaceRepositories(context, workspace, options = {}) {
-  const cloudsmithAPI = new CloudsmithAPI(context);
-  const paginatedFetch = new PaginatedFetch(cloudsmithAPI);
+  const {
+    account: suppliedAccount,
+    cloudsmithAPI: suppliedApi,
+    connectionManager: suppliedManager,
+    paginatedFetch: suppliedPagination,
+    withProgress = vscode.window.withProgress.bind(vscode.window),
+    ...requestOptions
+  } = options;
+  const connectionManager = resolveConnectionManager(context, suppliedManager);
+  const account = suppliedAccount || captureAccount(connectionManager);
+  if (!account || !isAccountCurrent(connectionManager, account)) return staleResult();
+  const cloudsmithAPI = suppliedApi || new CloudsmithAPI(context);
+  const paginatedFetch = suppliedPagination || new PaginatedFetch(cloudsmithAPI);
   let endpoint;
   try {
     endpoint = apiEndpoint(["repos", workspace], { query: { sort: "name" } });
@@ -30,20 +60,23 @@ async function fetchWorkspaceRepositories(context, workspace, options = {}) {
       error: Object.freeze({ kind: "invalid_request", message: "The workspace identifier is invalid." }),
       warning: null,
       partial: false,
+      stale: false,
     };
   }
 
-  return vscode.window.withProgress(
+  return withProgress(
     {
       location: vscode.ProgressLocation.Window,
       title: `Loading repositories for ${workspace}...`,
     },
     async progress => {
+      if (!isAccountCurrent(connectionManager, account)) return staleResult();
       const repositories = [];
       let page = 1;
       let knownPageTotal = null;
 
       while (true) {
+        if (!isAccountCurrent(connectionManager, account)) return staleResult();
         progress.report({
           message: knownPageTotal ? `Page ${page} of ${knownPageTotal}` : `Page ${page}`,
         });
@@ -53,8 +86,9 @@ async function fetchWorkspaceRepositories(context, workspace, options = {}) {
           page,
           WORKSPACE_REPOSITORY_PAGE_SIZE,
           null,
-          { ...options, validate: isRepositoryArray }
+          { ...requestOptions, validate: isRepositoryArray }
         );
+        if (!isAccountCurrent(connectionManager, account)) return staleResult();
 
         if (result.error) {
           if (page === 1) {
@@ -63,6 +97,7 @@ async function fetchWorkspaceRepositories(context, workspace, options = {}) {
               error: result.error,
               warning: null,
               partial: false,
+              stale: false,
             };
           }
 
@@ -75,6 +110,7 @@ async function fetchWorkspaceRepositories(context, workspace, options = {}) {
             error: null,
             warning: result.error,
             partial: true,
+            stale: false,
           };
         }
 
@@ -85,6 +121,7 @@ async function fetchWorkspaceRepositories(context, workspace, options = {}) {
               error: UNEXPECTED_RESPONSE_FORMAT_ERROR,
               warning: null,
               partial: false,
+              stale: false,
             };
           }
 
@@ -97,6 +134,7 @@ async function fetchWorkspaceRepositories(context, workspace, options = {}) {
             error: null,
             warning: UNEXPECTED_RESPONSE_FORMAT_ERROR,
             partial: true,
+            stale: false,
           };
         }
 
@@ -120,6 +158,7 @@ async function fetchWorkspaceRepositories(context, workspace, options = {}) {
         error: null,
         warning: null,
         partial: false,
+        stale: false,
       };
     }
   );
@@ -139,6 +178,7 @@ function isRepositoryArray(value) {
 
 module.exports = {
   UNEXPECTED_RESPONSE_FORMAT_ERROR,
+  STALE_ACCOUNT_ERROR,
   WORKSPACE_REPOSITORY_PAGE_SIZE,
   fetchWorkspaceRepositories,
 };

@@ -549,25 +549,6 @@ class CloudsmithAPI {
         return cancelledFailure();
       }
 
-      const credentialResult = await this._awaitAbortable(
-        Promise.resolve().then(() => this._credentialManager.getApiKey()),
-        controller.signal
-      );
-      if (credentialResult.aborted) {
-        return cancelledFailure();
-      }
-      if (!credentialResult.ok) {
-        return failure({ kind: "invalid_request" });
-      }
-      storedKey = credentialResult.value;
-      if (typeof storedKey === "string" && storedKey) {
-        keys.add(storedKey);
-      }
-      if (abortKind !== null || this._now() >= deadline) {
-        if (abortKind === null) abort("timeout");
-        return cancelledFailure();
-      }
-
       const hasCandidateKey = Object.prototype.hasOwnProperty.call(options, "apiKey");
       if (hasCandidateKey) {
         if (typeof options.apiKey === "string" && options.apiKey) {
@@ -575,6 +556,24 @@ class CloudsmithAPI {
           keys.add(selectedKey);
         }
       } else {
+        const credentialResult = await this._awaitAbortable(
+          Promise.resolve().then(() => this._credentialManager.getApiKey()),
+          controller.signal
+        );
+        if (credentialResult.aborted) {
+          return cancelledFailure();
+        }
+        if (!credentialResult.ok) {
+          return failure({ kind: "invalid_request" });
+        }
+        storedKey = credentialResult.value;
+        if (typeof storedKey === "string" && storedKey) {
+          keys.add(storedKey);
+        }
+        if (abortKind !== null || this._now() >= deadline) {
+          if (abortKind === null) abort("timeout");
+          return cancelledFailure();
+        }
         selectedKey = storedKey;
       }
       if (

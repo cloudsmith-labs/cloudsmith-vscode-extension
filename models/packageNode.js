@@ -6,8 +6,9 @@ const { getFormatIconPath } = require("../util/formatIcons");
 const { getPackageVulnerabilityCount } = require("../util/packageVulnerabilities");
 
 class PackageNode {
-  constructor(pkg, context) {
+  constructor(pkg, context, options = {}) {
     this.context = context;
+    this._connectionManager = options.connectionManager || null;
     this.slug = { id: "Slug", value: pkg.slug };
     this.slug_perm = { id: "Slug", value: pkg.slug_perm };
     this.name = pkg.name;
@@ -213,7 +214,7 @@ class PackageNode {
         slug_perm: this.slug_perm_raw,
         num_vulnerabilities: this.num_vulnerabilities,
         max_severity: this.max_severity,
-      }, this.context));
+      }, this.context, { connectionManager: this._connectionManager }));
     }
 
     // 5. Quarantine Reason (if quarantined)
