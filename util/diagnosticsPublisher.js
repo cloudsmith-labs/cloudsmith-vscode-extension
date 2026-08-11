@@ -155,7 +155,9 @@ function createDiagnosticCandidate(dependency, values = {}) {
 
 class DiagnosticsPublisher {
   constructor(options = {}) {
-    this.collection = vscode.languages.createDiagnosticCollection("cloudsmith");
+    const createDiagnosticCollection = options.createDiagnosticCollection
+      || vscode.languages.createDiagnosticCollection.bind(vscode.languages);
+    this.collection = createDiagnosticCollection("cloudsmith");
     this._readSource = typeof options.readSource === "function"
       ? options.readSource
       : readUtf8;

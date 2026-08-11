@@ -10,6 +10,7 @@ const {
 } = require("../util/connectionManager");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
+const { FakeSecretStorage } = require("./helpers/fakeSecretStorage");
 
 function deferred() {
   let resolve;
@@ -25,55 +26,11 @@ async function nextTurn() {
   await new Promise(resolve => setImmediate(resolve));
 }
 
-class FakeSecrets {
-  constructor(value = null) {
-    this.value = value;
-    this.listeners = new Set();
-    this.deletedKeys = [];
-    this.storeHook = null;
-    this.deleteHook = null;
-    this.getHook = null;
-  }
-
-  onDidChange(listener) {
-    this.listeners.add(listener);
-    return { dispose: () => this.listeners.delete(listener) };
-  }
-
-  async get(key) {
-    if (this.getHook) return this.getHook(key, this);
-    return key === AUTH_TOKEN_KEY ? this.value : null;
-  }
-
-  async store(key, value) {
-    if (this.storeHook) return this.storeHook(key, value, this);
-    if (key === AUTH_TOKEN_KEY) {
-      this.value = value;
-      this.emit(key);
-    }
-  }
-
-  async delete(key) {
-    this.deletedKeys.push(key);
-    if (this.deleteHook) return this.deleteHook(key, this);
-    if (key === AUTH_TOKEN_KEY) {
-      this.value = null;
-      this.emit(key);
-    }
-  }
-
-  externalSet(value) {
-    this.value = value;
-    this.emit(AUTH_TOKEN_KEY);
-  }
-
-  emit(key) {
-    for (const listener of [...this.listeners]) listener({ key });
-  }
-}
-
 function createHarness(initialCredential, validate) {
-  const secrets = new FakeSecrets(initialCredential);
+  const secrets = new FakeSecretStorage(
+    initialCredential === null ? {} : { [AUTH_TOKEN_KEY]: initialCredential },
+    { primaryKey: AUTH_TOKEN_KEY }
+  );
   const projections = [];
   const context = { secrets };
   const manager = new ConnectionManager(context, {
@@ -963,7 +920,7 @@ suite("ConnectionManager Test Suite", () => {
 
   test("context projection retries and reports partial success without changing authority", async () => {
     let attempts = 0;
-    const secrets = new FakeSecrets(null);
+    const secrets = new FakeSecretStorage({}, { primaryKey: AUTH_TOKEN_KEY });
     const manager = new ConnectionManager({ secrets }, {
       activationId: "projection-test",
       createCloudsmithAPI: () => ({ get: async () => apiSuccess({ authenticated: true }) }),
@@ -985,7 +942,12 @@ suite("ConnectionManager Test Suite", () => {
 
   test("an explicit API candidate bypasses stored credential lookup", async () => {
     let credentialReads = 0;
-    const api = new CloudsmithAPI({ secrets: new FakeSecrets("stored-key") }, {
+    const api = new CloudsmithAPI({
+      secrets: new FakeSecretStorage(
+        { [AUTH_TOKEN_KEY]: "stored-key" },
+        { primaryKey: AUTH_TOKEN_KEY }
+      ),
+    }, {
       credentialManager: {
         async getApiKey() {
           credentialReads += 1;

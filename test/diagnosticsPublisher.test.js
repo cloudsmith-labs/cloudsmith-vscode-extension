@@ -3,7 +3,6 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { pathToFileURL } = require("url");
-const vscode = require("vscode");
 const {
   DiagnosticsPublisher,
   createDiagnosticCandidate,
@@ -26,27 +25,30 @@ const {
 const { canonicalFormat } = require("../util/packageNameNormalizer");
 
 suite("DiagnosticsPublisher Test Suite", () => {
-  let originalCreateDiagnosticCollection;
   let collection;
+  let collectionNames;
+  let createDiagnosticCollection;
 
   setup(() => {
-    originalCreateDiagnosticCollection = vscode.languages.createDiagnosticCollection;
+    collectionNames = [];
     collection = {
       setCalls: [],
       clearCalls: 0,
+      disposeCalls: 0,
       set(entries) {
         this.setCalls.push(entries);
       },
       clear() {
         this.clearCalls += 1;
       },
-      dispose() {},
+      dispose() {
+        this.disposeCalls += 1;
+      },
     };
-    vscode.languages.createDiagnosticCollection = () => collection;
-  });
-
-  teardown(() => {
-    vscode.languages.createDiagnosticCollection = originalCreateDiagnosticCollection;
+    createDiagnosticCollection = name => {
+      collectionNames.push(name);
+      return collection;
+    };
   });
 
   function source(filePath, type = path.basename(filePath), range = null) {
@@ -100,6 +102,7 @@ suite("DiagnosticsPublisher Test Suite", () => {
     const reads = [];
     const publisher = new DiagnosticsPublisher({
       ...options,
+      createDiagnosticCollection: options.createDiagnosticCollection || createDiagnosticCollection,
       async readSource(filePath, workspaceFolder) {
         reads.push({ filePath, workspaceFolder });
         if (!files.has(filePath)) {
@@ -148,7 +151,7 @@ suite("DiagnosticsPublisher Test Suite", () => {
     };
     const healthNode = new DependencyHealthNode(healthOccurrence, {});
     assert.strictEqual(healthNode.state, "not_found");
-    const publisher = new DiagnosticsPublisher();
+    const publisher = new DiagnosticsPublisher({ createDiagnosticCollection });
     const prepared = await publisher.prepare({
       workspaceFolder,
       candidates: [createDiagnosticCandidate(healthOccurrence, {
@@ -159,6 +162,17 @@ suite("DiagnosticsPublisher Test Suite", () => {
     });
     return { occurrence, prepared };
   }
+
+  test("uses the injected diagnostic collection factory and owns collection cleanup", () => {
+    const publisher = new DiagnosticsPublisher({ createDiagnosticCollection });
+
+    publisher.clear();
+    publisher.dispose();
+
+    assert.deepStrictEqual(collectionNames, ["cloudsmith"]);
+    assert.strictEqual(collection.clearCalls, 1);
+    assert.strictEqual(collection.disposeCalls, 1);
+  });
 
   test("derives dependency source contract fields from one normalized ecosystem", () => {
     const cases = [
@@ -1013,7 +1027,7 @@ suite("DiagnosticsPublisher Test Suite", () => {
       "utf8"
     );
     try {
-      const publisher = new DiagnosticsPublisher();
+      const publisher = new DiagnosticsPublisher({ createDiagnosticCollection });
       await assert.rejects(
       () => publisher.prepare({
           workspaceFolder,

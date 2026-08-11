@@ -1,54 +1,36 @@
-// Shared setup for integration tests that run against the live Cloudsmith API.
-//
-// Usage:
-//   CLOUDSMITH_TEST_API_KEY=your_key_here npm test
-//
-// When CLOUDSMITH_TEST_API_KEY is not set, all integration tests are skipped.
+// Shared setup for optional tests against explicitly controlled Cloudsmith fixtures.
+// Required opt-in and fixture coordinates are validated by scripts/run-vscode-tests.js.
 
-const { CloudsmithAPI } = require('../../util/cloudsmithAPI');
+const { CloudsmithAPI } = require("../../util/cloudsmithAPI");
+const { LIVE_REQUIRED_ENV } = require("../testInventories");
 
-// Test constants — known workspace and package for assertions
-const apiKey = process.env.CLOUDSMITH_TEST_API_KEY || null;
-const workspace = 'dl-technology-consulting';
-const testRepo = 'flask-primary-web-app';
-const testPackageSlug = '1yqk96alztTfimXJ'; // spotipy 2.25.0
+if (process.env.CLOUDSMITH_LIVE_TESTS !== "1") {
+  throw new Error("Live tests require explicit CLOUDSMITH_LIVE_TESTS=1 opt-in");
+}
+for (const name of LIVE_REQUIRED_ENV) {
+  const value = process.env[name];
+  if (typeof value !== "string" || value.length === 0 || value !== value.trim()
+    || value.length > 4096 || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error(`Live test environment value is missing or invalid: ${name}`);
+  }
+}
 
-// Minimal mock context — just enough for CloudsmithAPI constructor.
-// The apiKey parameter on each call bypasses CredentialManager entirely.
-const mockContext = {
-  secrets: { get: async () => null, store: async () => {} },
-  globalState: { get: () => undefined, update: () => {} },
-};
+const liveFixture = Object.freeze({
+  apiKey: process.env.CLOUDSMITH_TEST_API_KEY,
+  packageName: process.env.CLOUDSMITH_TEST_PACKAGE_NAME,
+  quarantinedPackageName: process.env.CLOUDSMITH_TEST_QUARANTINED_PACKAGE_NAME,
+  repository: process.env.CLOUDSMITH_TEST_REPOSITORY,
+  vulnerablePackageSlug: process.env.CLOUDSMITH_TEST_VULNERABLE_PACKAGE_SLUG,
+  workspace: process.env.CLOUDSMITH_TEST_WORKSPACE,
+});
 
-/**
- * Create a CloudsmithAPI instance suitable for integration tests.
- */
+const mockContext = Object.freeze({
+  secrets: Object.freeze({ get: async () => null, store: async () => {} }),
+  globalState: Object.freeze({ get: () => undefined, update: async () => {} }),
+});
+
 function createAPI() {
   return new CloudsmithAPI(mockContext);
 }
 
-/**
- * Call at the top of an integration test suite to skip when no API key is set.
- * Must be called inside suite() with a regular function (not arrow) for `this` binding.
- *
- * Example:
- *   suite('Integration: Search', function () {
- *     setup(function () { skipIfNoKey.call(this); });
- *     ...
- *   });
- */
-function skipIfNoKey() {
-  if (!apiKey) {
-    this.skip();
-  }
-}
-
-module.exports = {
-  apiKey,
-  workspace,
-  testRepo,
-  testPackageSlug,
-  mockContext,
-  createAPI,
-  skipIfNoKey,
-};
+module.exports = { createAPI, liveFixture, mockContext };

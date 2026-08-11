@@ -8,6 +8,7 @@ const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiEndpoint } = require("../util/apiEndpoint");
 const { formatApiError } = require("../util/errorFormatter");
 const { buildPackageUrl } = require("../util/webAppUrls");
+const { parseWebviewMessage } = require("../util/webviewMessage");
 const {
   captureAccount,
   isAccountCurrent,
@@ -26,6 +27,17 @@ class QuarantineExplainProvider {
     this._operation = null;
     this._connectionManager = resolveConnectionManager(context, options.connectionManager);
     this._cloudsmithAPI = options.cloudsmithAPI || null;
+    this._createWebviewPanel = options.createWebviewPanel || ((...args) => (
+      vscode.window.createWebviewPanel(...args)
+    ));
+    this._executeCommand = options.executeCommand || ((...args) => vscode.commands.executeCommand(...args));
+    this._writeClipboard = options.writeClipboard || (value => vscode.env.clipboard.writeText(value));
+    this._openExternal = options.openExternal || (value => vscode.env.openExternal(vscode.Uri.parse(value)));
+    this._notifications = options.notifications || {
+      information: message => vscode.window.showInformationMessage(message),
+      warning: message => vscode.window.showWarningMessage(message),
+    };
+    this._createNonce = options.createNonce || (() => crypto.randomBytes(16).toString("hex"));
   }
 
   /**
@@ -34,7 +46,7 @@ class QuarantineExplainProvider {
    */
   async show(item) {
     if (!item) {
-      vscode.window.showWarningMessage("No package selected.");
+      this._notifications.warning("No package selected.");
       return;
     }
 
@@ -62,7 +74,7 @@ class QuarantineExplainProvider {
     const packageUrl = buildPackageUrl(workspace, repo, format, name, version, slugPerm);
 
     if (!workspace || !slugPerm) {
-      vscode.window.showWarningMessage("Could not determine package details for quarantine explanation.");
+      this._notifications.warning("Could not determine package details for quarantine explanation.");
       return;
     }
 
@@ -70,28 +82,29 @@ class QuarantineExplainProvider {
     if (!account || !isAccountCurrent(this._connectionManager, account)) return;
 
     // Create or reveal the WebView panel
-    if (this._panel) {
-      this._panel.dispose();
-    }
+    if (this._operation) this._disposeOperation(this._operation, true);
 
-    const panel = vscode.window.createWebviewPanel(
+    const panel = this._createWebviewPanel(
       "cloudsmithQuarantineExplain",
       `Quarantine: ${name || ""} ${version || ""}`,
       vscode.ViewColumn.One,
-      { enableScripts: true }
+      { enableScripts: true, localResourceRoots: [] }
     );
     this._panel = panel;
     const requestController = new AbortController();
-    const operation = { account, controller: requestController, panel };
+    const operation = {
+      account,
+      controller: requestController,
+      panel,
+      messageSubscription: null,
+      disposeSubscription: null,
+      disposed: false,
+    };
     this._operation = operation;
     const nonce = this._getNonce();
 
-    panel.onDidDispose(() => {
-      requestController.abort();
-      if (this._panel === panel) {
-        this._panel = null;
-      }
-      if (this._operation === operation) this._operation = null;
+    operation.disposeSubscription = panel.onDidDispose(() => {
+      this._disposeOperation(operation, false);
     });
 
     // Show loading state
@@ -118,22 +131,43 @@ class QuarantineExplainProvider {
     );
 
     // Handle messages from the WebView
-    panel.webview.onDidReceiveMessage(async (message) => {
-      if (!this._isOperationCurrent(operation)) return;
-      if (message.command === "findSafeVersion") {
-        await vscode.commands.executeCommand("cloudsmith-vsc.findSafeVersion", item);
-      } else if (message.command === "showVulnerabilities") {
-        await vscode.commands.executeCommand("cloudsmith-vsc.showVulnerabilities", item);
-      } else if (message.command === "openInCloudsmith" && packageUrl) {
-        await vscode.env.openExternal(vscode.Uri.parse(packageUrl));
-      } else if (message.command === "copyReport") {
-        const report = this._buildPlainTextReport(name, version, statusReason, policyTrace);
-        await vscode.env.clipboard.writeText(report);
+    operation.messageSubscription = panel.webview.onDidReceiveMessage(message => (
+      this._handleMessage(
+        operation,
+        message,
+        item,
+        name,
+        version,
+        statusReason,
+        packageUrl,
+        policyTrace
+      ).catch(() => {
         if (this._isOperationCurrent(operation)) {
-          vscode.window.showInformationMessage("Quarantine report copied.");
+          return this._notifications.warning("Could not complete the quarantine panel action.");
         }
+        return undefined;
+      })
+    ));
+  }
+
+  async _handleMessage(operation, message, item, name, version, statusReason, packageUrl, policyTrace) {
+    if (!this._isOperationCurrent(operation)) return;
+    const parsed = parseWebviewMessage(message, QUARANTINE_MESSAGE_CONTRACTS);
+    if (!parsed || !this._isOperationCurrent(operation)) return;
+
+    if (parsed.command === "findSafeVersion") {
+      await this._executeCommand("cloudsmith-vsc.findSafeVersion", item);
+    } else if (parsed.command === "showVulnerabilities") {
+      await this._executeCommand("cloudsmith-vsc.showVulnerabilities", item);
+    } else if (parsed.command === "openInCloudsmith" && packageUrl) {
+      await this._openExternal(packageUrl);
+    } else if (parsed.command === "copyReport") {
+      const report = this._buildPlainTextReport(name, version, statusReason, policyTrace);
+      await this._writeClipboard(report);
+      if (this._isOperationCurrent(operation)) {
+        await this._notifications.information("Quarantine report copied.");
       }
-    });
+    }
   }
 
   /**
@@ -429,7 +463,7 @@ class QuarantineExplainProvider {
   }
 
   _getNonce() {
-    return crypto.randomBytes(16).toString("hex");
+    return this._createNonce();
   }
 
   _isOperationCurrent(operation) {
@@ -444,8 +478,10 @@ class QuarantineExplainProvider {
 
   resetForAccountChange() {
     const operation = this._operation;
-    this._operation = null;
-    if (operation) operation.controller.abort();
+    if (operation) {
+      this._disposeOperation(operation, true);
+      return;
+    }
     const panel = this._panel;
     this._panel = null;
     if (panel) panel.dispose();
@@ -454,7 +490,27 @@ class QuarantineExplainProvider {
   dispose() {
     this.resetForAccountChange();
   }
+
+  _disposeOperation(operation, disposePanel) {
+    if (!operation || operation.disposed) return;
+    operation.disposed = true;
+    operation.controller.abort();
+    operation.messageSubscription?.dispose();
+    operation.messageSubscription = null;
+    operation.disposeSubscription?.dispose();
+    operation.disposeSubscription = null;
+    if (this._operation === operation) this._operation = null;
+    if (this._panel === operation.panel) this._panel = null;
+    if (disposePanel) operation.panel.dispose();
+  }
 }
+
+const QUARANTINE_MESSAGE_CONTRACTS = Object.freeze({
+  findSafeVersion: Object.freeze([]),
+  showVulnerabilities: Object.freeze([]),
+  openInCloudsmith: Object.freeze([]),
+  copyReport: Object.freeze([]),
+});
 
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);

@@ -118,6 +118,16 @@ class DependencyHealthProvider {
     this._reportDateFactory = typeof options.reportDateFactory === "function"
       ? options.reportDateFactory
       : () => new Date();
+    this._scheduler = normalizeScheduler(options.scheduler);
+    this._createCancellationSource = typeof options.createCancellationSource === "function"
+      ? options.createCancellationSource
+      : () => new vscode.CancellationTokenSource();
+    this._userInteraction = normalizeUserInteraction(options.userInteraction);
+    this._workspace = options.workspace || vscode.workspace;
+    this._executeCommand = options.executeCommand
+      || vscode.commands.executeCommand.bind(vscode.commands);
+    this._debouncedEnrichmentHandlers = new Set();
+    this._disposed = false;
     this._onDidChangeTreeData = new vscode.EventEmitter();
     this.onDidChangeTreeData = this._onDidChangeTreeData.event;
     this.dependencies = [];
@@ -155,7 +165,8 @@ class DependencyHealthProvider {
   _isAccountCurrent(accountEpoch) {
     const state = this._connectionManager && this._connectionManager.getState();
     return Boolean(
-      Number.isInteger(accountEpoch)
+      !this._disposed
+      && Number.isInteger(accountEpoch)
       && state
       && state.sessionConnected
       && state.accountEpoch === accountEpoch
@@ -163,7 +174,7 @@ class DependencyHealthProvider {
   }
 
   _getInitialViewMode() {
-    const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
+    const config = this._workspace.getConfiguration("cloudsmith-vsc");
     const configuredDefault = String(config.get("dependencyTreeDefaultView") || "flat");
     const storedView = this.context && this.context.workspaceState
       ? this.context.workspaceState.get("cloudsmith-vsc.dependencyTreeView")
@@ -173,19 +184,36 @@ class DependencyHealthProvider {
   }
 
   async _updateContexts() {
+    const executeWhileActive = async (...args) => {
+      if (this._disposed) return false;
+      await this._executeCommand(...args);
+      return !this._disposed;
+    };
     const scanRunning = this.isScanRunning();
-    await vscode.commands.executeCommand("setContext", "cloudsmith.depView", this._viewMode);
-    await vscode.commands.executeCommand("setContext", "cloudsmith.depViewMode", this._viewMode);
-    await vscode.commands.executeCommand("setContext", "cloudsmith.depFilterActive", Boolean(this._filterMode));
-    await vscode.commands.executeCommand("setContext", "cloudsmith.depScanComplete", this._hasSuccessfulScan);
-    await vscode.commands.executeCommand("setContext", "cloudsmith.depScanSucceeded", this._hasSuccessfulScan);
-    await vscode.commands.executeCommand("setContext", "cloudsmith.depScanRunning", scanRunning);
-    await vscode.commands.executeCommand(
+    if (!await executeWhileActive("setContext", "cloudsmith.depView", this._viewMode)) return;
+    if (!await executeWhileActive("setContext", "cloudsmith.depViewMode", this._viewMode)) return;
+    if (!await executeWhileActive(
+      "setContext",
+      "cloudsmith.depFilterActive",
+      Boolean(this._filterMode)
+    )) return;
+    if (!await executeWhileActive(
+      "setContext",
+      "cloudsmith.depScanComplete",
+      this._hasSuccessfulScan
+    )) return;
+    if (!await executeWhileActive(
+      "setContext",
+      "cloudsmith.depScanSucceeded",
+      this._hasSuccessfulScan
+    )) return;
+    if (!await executeWhileActive("setContext", "cloudsmith.depScanRunning", scanRunning)) return;
+    if (!await executeWhileActive(
       "setContext",
       "cloudsmith.depOperationRunning",
       scanRunning || this._dependencyOperationRunning
-    );
-    await vscode.commands.executeCommand("setContext", "cloudsmith.depRepoSelected", Boolean(this.lastRepo));
+    )) return;
+    await executeWhileActive("setContext", "cloudsmith.depRepoSelected", Boolean(this.lastRepo));
   }
 
   hasSuccessfulScan() {
@@ -253,10 +281,10 @@ class DependencyHealthProvider {
       return;
     }
 
-    this._viewMode = mode;
     if (this.context && this.context.workspaceState && typeof this.context.workspaceState.update === "function") {
       await this.context.workspaceState.update("cloudsmith-vsc.dependencyTreeView", mode);
     }
+    this._viewMode = mode;
     await this._updateContexts();
     this._rebuildSummary();
     this.refresh();
@@ -320,12 +348,12 @@ class DependencyHealthProvider {
     if (this._projectFolderPath) {
       return this._projectFolderPath;
     }
-    const folders = vscode.workspace.workspaceFolders;
+    const folders = this._workspace.workspaceFolders;
     return folders && folders[0] ? folders[0].uri.fsPath : null;
   }
 
   async promptForFolder() {
-    const choice = await vscode.window.showQuickPick(
+    const choice = await this._userInteraction.showQuickPick(
       [
         {
           label: "$(folder-opened) Select a folder to scan",
@@ -346,11 +374,11 @@ class DependencyHealthProvider {
     }
 
     if (choice._action === "open") {
-      await vscode.commands.executeCommand("vscode.openFolder");
+      await this._executeCommand("vscode.openFolder");
       return null;
     }
 
-    const selected = await vscode.window.showOpenDialog({
+    const selected = await this._userInteraction.showOpenDialog({
       canSelectFolders: true,
       canSelectFiles: false,
       canSelectMany: false,
@@ -366,7 +394,7 @@ class DependencyHealthProvider {
 
   async selectProjectFolder() {
     const foldersByPath = new Map();
-    for (const folder of vscode.workspace.workspaceFolders || []) {
+    for (const folder of this._workspace.workspaceFolders || []) {
       foldersByPath.set(folder.uri.fsPath, {
         label: folder.name || path.basename(folder.uri.fsPath),
         description: folder.uri.fsPath,
@@ -382,7 +410,7 @@ class DependencyHealthProvider {
       });
     }
 
-    const selected = await vscode.window.showQuickPick(
+    const selected = await this._userInteraction.showQuickPick(
       [
         ...foldersByPath.values(),
         {
@@ -401,7 +429,7 @@ class DependencyHealthProvider {
       return selected.folderPath;
     }
 
-    const pickedFolders = await vscode.window.showOpenDialog({
+    const pickedFolders = await this._userInteraction.showOpenDialog({
       canSelectFolders: true,
       canSelectFiles: false,
       canSelectMany: false,
@@ -411,14 +439,15 @@ class DependencyHealthProvider {
   }
 
   async scan(cloudsmithWorkspace, cloudsmithRepo, projectFolder) {
+    if (this._disposed) return { status: "blocked" };
     if (this._dependencyOperationRunning) {
-      vscode.window.showWarningMessage("Wait for the current dependency operation to finish.");
+      this._userInteraction.showWarningMessage("Wait for the current dependency operation to finish.");
       return { status: "blocked" };
     }
 
     const accountEpoch = this._captureAccountEpoch();
     if (accountEpoch === null) {
-      vscode.window.showWarningMessage("Connect to Cloudsmith before scanning dependencies.");
+      this._userInteraction.showWarningMessage("Connect to Cloudsmith before scanning dependencies.");
       return { status: "blocked" };
     }
 
@@ -429,7 +458,7 @@ class DependencyHealthProvider {
     }
 
     this._scanOperation = createScanOperation(SCAN_STATES.SELECTING, operationId, {
-      startedAt: Date.now(),
+      startedAt: this._scheduler.now(),
       accountEpoch,
       scope: {
         workspace: cloudsmithWorkspace,
@@ -465,12 +494,12 @@ class DependencyHealthProvider {
     await this._updateContexts();
     this.refresh();
 
-    const cancellationSource = new vscode.CancellationTokenSource();
+    const cancellationSource = this._createCancellationSource();
     this._activeScanCancellation = cancellationSource;
     const scanWorker = this._createScanWorker(scope);
 
     try {
-      const result = await vscode.window.withProgress(
+      const result = await this._userInteraction.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: "Scanning dependencies",
@@ -498,7 +527,7 @@ class DependencyHealthProvider {
 
       if ((result && result.canceled) || cancellationSource.token.isCancellationRequested) {
         await this._finishCancelledScan(operationId);
-        vscode.window.showInformationMessage("Dependency scan canceled.");
+        this._userInteraction.showInformationMessage("Dependency scan canceled.");
         return { status: SCAN_STATES.CANCELLED };
       }
 
@@ -512,7 +541,7 @@ class DependencyHealthProvider {
 
       if (cancellationSource.token.isCancellationRequested) {
         await this._finishCancelledScan(operationId);
-        vscode.window.showInformationMessage("Dependency scan canceled.");
+        this._userInteraction.showInformationMessage("Dependency scan canceled.");
         return { status: SCAN_STATES.CANCELLED };
       }
 
@@ -530,7 +559,7 @@ class DependencyHealthProvider {
 
       if (cancellationSource.token.isCancellationRequested) {
         await this._finishCancelledScan(operationId);
-        vscode.window.showInformationMessage("Dependency scan canceled.");
+        this._userInteraction.showInformationMessage("Dependency scan canceled.");
         return { status: SCAN_STATES.CANCELLED };
       }
 
@@ -541,16 +570,16 @@ class DependencyHealthProvider {
       this._scanOperation = createScanOperation(SCAN_STATES.FAILED, operationId, {
         startedAt: this._scanOperation.startedAt,
         accountEpoch,
-        completedAt: Date.now(),
+        completedAt: this._scheduler.now(),
         failureMessage: message,
         scope,
       });
       await this._updateContexts();
       this.refresh();
       if (this._hasSuccessfulScan) {
-        vscode.window.showWarningMessage(message);
+        this._userInteraction.showWarningMessage(message);
       } else {
-        vscode.window.showErrorMessage(message);
+        this._userInteraction.showErrorMessage(message);
       }
       return { status: SCAN_STATES.FAILED, error };
     } finally {
@@ -562,7 +591,9 @@ class DependencyHealthProvider {
   }
 
   _isCurrentScan(operationId, accountEpoch = this._scanOperation.accountEpoch) {
-    return this._scanOperation.id === operationId && this._isAccountCurrent(accountEpoch);
+    return !this._disposed
+      && this._scanOperation.id === operationId
+      && this._isAccountCurrent(accountEpoch);
   }
 
   _createScanWorker(scope) {
@@ -597,7 +628,7 @@ class DependencyHealthProvider {
     this._scanOperation = createScanOperation(SCAN_STATES.CANCELLED, operationId, {
       startedAt: currentOperation.startedAt,
       accountEpoch: currentOperation.accountEpoch,
-      completedAt: Date.now(),
+      completedAt: this._scheduler.now(),
       scope: currentOperation.scope,
       message: this._hasSuccessfulScan
         ? "Dependency refresh canceled. Previous scan results are shown."
@@ -626,7 +657,7 @@ class DependencyHealthProvider {
     this._scanOperation = createScanOperation(SCAN_STATES.SUCCEEDED, operationId, {
       startedAt: this._scanOperation.startedAt,
       accountEpoch,
-      completedAt: Date.now(),
+      completedAt: this._scheduler.now(),
       scope,
     });
   }
@@ -681,7 +712,7 @@ class DependencyHealthProvider {
   }
 
   _getMaxDependenciesToScan() {
-    const configuredValue = Number(vscode.workspace.getConfiguration("cloudsmith-vsc").get("maxDependenciesToScan"));
+    const configuredValue = Number(this._workspace.getConfiguration("cloudsmith-vsc").get("maxDependenciesToScan"));
     if (!Number.isFinite(configuredValue) || configuredValue < 1) {
       return DEFAULT_MAX_DEPENDENCIES_TO_SCAN;
     }
@@ -700,7 +731,7 @@ class DependencyHealthProvider {
       return { canceled: true };
     }
 
-    const resolveTransitives = vscode.workspace.getConfiguration("cloudsmith-vsc").get("resolveTransitiveDependencies") !== false;
+    const resolveTransitives = this._workspace.getConfiguration("cloudsmith-vsc").get("resolveTransitiveDependencies") !== false;
     const trees = [];
     const coveredManifestPaths = new Set();
 
@@ -970,7 +1001,7 @@ class DependencyHealthProvider {
       increment: totalDependencies > 0 ? (batchSize * 100) / totalDependencies : 100,
     });
     this.refresh();
-    await yieldToEventLoop();
+    await this._scheduler.yield();
 
     return completed;
   }
@@ -999,14 +1030,15 @@ class DependencyHealthProvider {
   _createDebouncedEnrichmentHandler(patchApplier) {
     let pendingPatchMaps = [];
     let flushTimeout = null;
+    let disposed = false;
 
     const flush = () => {
       if (flushTimeout) {
-        clearTimeout(flushTimeout);
+        this._scheduler.clearTimeout(flushTimeout);
         flushTimeout = null;
       }
 
-      if (pendingPatchMaps.length === 0) {
+      if (disposed || pendingPatchMaps.length === 0) {
         return;
       }
 
@@ -1018,22 +1050,34 @@ class DependencyHealthProvider {
       this.refresh();
     };
 
-    return {
+    const handler = {
       onProgress: (patchMap) => {
-        if (!(patchMap instanceof Map) || patchMap.size === 0) {
+        if (disposed || !(patchMap instanceof Map) || patchMap.size === 0) {
           return;
         }
 
         pendingPatchMaps.push(patchMap);
         if (!flushTimeout) {
-          flushTimeout = setTimeout(() => {
+          flushTimeout = this._scheduler.setTimeout(() => {
             flushTimeout = null;
             flush();
           }, ENRICHMENT_PROGRESS_DEBOUNCE_MS);
         }
       },
       flush,
+      dispose: () => {
+        if (disposed) return;
+        disposed = true;
+        pendingPatchMaps = [];
+        if (flushTimeout) {
+          this._scheduler.clearTimeout(flushTimeout);
+          flushTimeout = null;
+        }
+        this._debouncedEnrichmentHandlers.delete(handler);
+      },
     };
+    this._debouncedEnrichmentHandlers.add(handler);
+    return handler;
   }
 
   async _resolveCoverageWithExactQueries(
@@ -1158,6 +1202,7 @@ class DependencyHealthProvider {
       });
     } finally {
       handler.flush();
+      handler.dispose();
     }
   }
 
@@ -1182,6 +1227,7 @@ class DependencyHealthProvider {
       });
     } finally {
       handler.flush();
+      handler.dispose();
     }
   }
 
@@ -1206,6 +1252,7 @@ class DependencyHealthProvider {
       });
     } finally {
       handler.flush();
+      handler.dispose();
     }
   }
 
@@ -1261,6 +1308,7 @@ class DependencyHealthProvider {
       );
     } finally {
       handler.flush();
+      handler.dispose();
     }
   }
 
@@ -1361,8 +1409,9 @@ class DependencyHealthProvider {
   }
 
   async pullDependencies() {
+    if (this._disposed) return;
     if (this.isScanRunning() || this._dependencyOperationRunning) {
-      vscode.window.showWarningMessage("Wait for the current dependency operation to finish.");
+      this._userInteraction.showWarningMessage("Wait for the current dependency operation to finish.");
       return;
     }
 
@@ -1372,23 +1421,23 @@ class DependencyHealthProvider {
     }
 
     if (!this.lastWorkspace) {
-      vscode.window.showInformationMessage("Run a dependency scan before pulling dependencies.");
+      this._userInteraction.showInformationMessage("Run a dependency scan before pulling dependencies.");
       return;
     }
 
     const dependencies = this._fullTrees.flatMap((tree) => tree.dependencies);
     if (dependencies.length === 0) {
-      vscode.window.showInformationMessage("Run a dependency scan before pulling dependencies.");
+      this._userInteraction.showInformationMessage("Run a dependency scan before pulling dependencies.");
       return;
     }
 
-    const cancellationSource = new vscode.CancellationTokenSource();
+    const cancellationSource = this._createCancellationSource();
     this._activeDependencyCancellation = cancellationSource;
     this._dependencyOperationRunning = true;
     await this._updateContexts();
 
     try {
-      const result = await vscode.window.withProgress(
+      const result = await this._userInteraction.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: "Pulling dependencies",
@@ -1445,12 +1494,12 @@ class DependencyHealthProvider {
       }
 
       if (result.canceled) {
-        vscode.window.showInformationMessage("Dependency pull canceled.");
+        this._userInteraction.showInformationMessage("Dependency pull canceled.");
         return;
       }
 
       if (result.pullResult) {
-        vscode.window.showInformationMessage(
+        this._userInteraction.showInformationMessage(
           buildPullSummaryMessage(result.pullResult, result.plan.skippedDependencies.length)
         );
       }
@@ -1466,8 +1515,9 @@ class DependencyHealthProvider {
   }
 
   async pullSingleDependency(item) {
+    if (this._disposed) return;
     if (this.isScanRunning() || this._dependencyOperationRunning) {
-      vscode.window.showWarningMessage("Wait for the current dependency operation to finish.");
+      this._userInteraction.showWarningMessage("Wait for the current dependency operation to finish.");
       return;
     }
 
@@ -1477,24 +1527,24 @@ class DependencyHealthProvider {
     }
 
     if (!this.lastWorkspace) {
-      vscode.window.showInformationMessage("Run a dependency scan before pulling dependencies.");
+      this._userInteraction.showInformationMessage("Run a dependency scan before pulling dependencies.");
       return;
     }
 
     const dependency = createSingleDependencyPullTarget(item);
     if (!dependency) {
-      vscode.window.showWarningMessage("Could not determine the dependency details.");
+      this._userInteraction.showWarningMessage("Could not determine the dependency details.");
       return;
     }
 
     this._dependencyOperationRunning = true;
-    const cancellationSource = new vscode.CancellationTokenSource();
+    const cancellationSource = this._createCancellationSource();
     this._activeDependencyCancellation = cancellationSource;
     let prepared = null;
 
     try {
       await this._updateContexts();
-      const result = await vscode.window.withProgress(
+      const result = await this._userInteraction.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: `Preparing upstream pull for ${formatSingleDependencyLabel(dependency)}...`,
@@ -1568,7 +1618,7 @@ class DependencyHealthProvider {
       }
 
       if (result.canceled) {
-        vscode.window.showInformationMessage("Dependency pull canceled.");
+        this._userInteraction.showInformationMessage("Dependency pull canceled.");
         return;
       }
 
@@ -1578,9 +1628,9 @@ class DependencyHealthProvider {
         getSingleDependencyPullDetail(result.pullResult)
       );
       if (notification.level === "error") {
-        vscode.window.showErrorMessage(notification.message);
+        this._userInteraction.showErrorMessage(notification.message);
       } else {
-        vscode.window.showInformationMessage(notification.message);
+        this._userInteraction.showInformationMessage(notification.message);
       }
     } finally {
       cancellationSource.dispose();
@@ -1858,10 +1908,25 @@ class DependencyHealthProvider {
   }
 
   refresh() {
+    if (this._disposed) return;
     this._onDidChangeTreeData.fire();
   }
 
   dispose() {
+    if (this._disposed) return;
+    this._disposed = true;
+    const disposedOperationId = ++this._nextScanOperationId;
+    this._scanOperation = createScanOperation(SCAN_STATES.CANCELLED, disposedOperationId, {
+      startedAt: this._scanOperation.startedAt,
+      accountEpoch: this._scanOperation.accountEpoch,
+      completedAt: this._scheduler.now(),
+      scope: this._scanOperation.scope,
+      message: "Dependency provider disposed.",
+    });
+    this._dependencyOperationRunning = false;
+    for (const handler of [...this._debouncedEnrichmentHandlers]) {
+      handler.dispose();
+    }
     if (this._activeScanCancellation) {
       this._activeScanCancellation.cancel();
       this._activeScanCancellation.dispose();
@@ -3191,6 +3256,63 @@ function yieldToEventLoop() {
 
     setTimeout(resolve, 0);
   });
+}
+
+function normalizeScheduler(scheduler) {
+  if (scheduler === undefined) {
+    return Object.freeze({
+      now: Date.now,
+      setTimeout,
+      clearTimeout,
+      yield: yieldToEventLoop,
+    });
+  }
+  if (!scheduler || typeof scheduler !== "object" || Array.isArray(scheduler)) {
+    throw new TypeError("Dependency scheduler must be an object.");
+  }
+  for (const method of ["now", "setTimeout", "clearTimeout", "yield"]) {
+    if (typeof scheduler[method] !== "function") {
+      throw new TypeError(`Dependency scheduler is missing ${method}().`);
+    }
+  }
+  return Object.freeze({
+    now: scheduler.now.bind(scheduler),
+    setTimeout: scheduler.setTimeout.bind(scheduler),
+    clearTimeout: scheduler.clearTimeout.bind(scheduler),
+    yield: scheduler.yield.bind(scheduler),
+  });
+}
+
+function normalizeUserInteraction(userInteraction) {
+  if (userInteraction === undefined) {
+    return Object.freeze({
+      withProgress: vscode.window.withProgress.bind(vscode.window),
+      showQuickPick: vscode.window.showQuickPick.bind(vscode.window),
+      showOpenDialog: vscode.window.showOpenDialog.bind(vscode.window),
+      showInformationMessage: vscode.window.showInformationMessage.bind(vscode.window),
+      showWarningMessage: vscode.window.showWarningMessage.bind(vscode.window),
+      showErrorMessage: vscode.window.showErrorMessage.bind(vscode.window),
+    });
+  }
+  if (!userInteraction || typeof userInteraction !== "object" || Array.isArray(userInteraction)) {
+    throw new TypeError("Dependency user interaction must be an object.");
+  }
+  const methods = [
+    "withProgress",
+    "showQuickPick",
+    "showOpenDialog",
+    "showInformationMessage",
+    "showWarningMessage",
+    "showErrorMessage",
+  ];
+  const normalized = {};
+  for (const method of methods) {
+    if (typeof userInteraction[method] !== "function") {
+      throw new TypeError(`Dependency user interaction is missing ${method}().`);
+    }
+    normalized[method] = userInteraction[method].bind(userInteraction);
+  }
+  return Object.freeze(normalized);
 }
 
 function createSingleDependencyPullTarget(item) {

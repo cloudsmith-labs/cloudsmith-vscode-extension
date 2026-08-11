@@ -24,6 +24,11 @@ const {
 } = require("../util/dependencyRecord");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { bindConnectionManager } = require("../util/connectionManager");
+const {
+  createCancellationSource,
+  createManualClock,
+} = require("./helpers/asyncControl");
+const { FakeMemento } = require("./helpers/fakeMemento");
 
 suite("DependencyHealthProvider Test Suite", () => {
   let originalWithProgress;
@@ -155,6 +160,21 @@ suite("DependencyHealthProvider Test Suite", () => {
       clear() {
         this.current = [];
       },
+    };
+  }
+
+  function createUserInteraction(overrides = {}) {
+    return {
+      withProgress: async (_options, task) => task(
+        { report() {} },
+        createCancellationSource().token
+      ),
+      showQuickPick: async () => undefined,
+      showOpenDialog: async () => undefined,
+      showInformationMessage: async () => undefined,
+      showWarningMessage: async () => undefined,
+      showErrorMessage: async () => undefined,
+      ...overrides,
     };
   }
 
@@ -346,6 +366,164 @@ suite("DependencyHealthProvider Test Suite", () => {
 
     assert.strictEqual(result, "first-scan");
     assert.strictEqual(fallbackCalls, 1);
+  });
+
+  test("workspace-state write failure does not publish an unpersisted view mode", async () => {
+    const context = createContext();
+    context.workspaceState = new FakeMemento();
+    context.workspaceState.failNextUpdate();
+    const contextCommands = [];
+    const provider = new DependencyHealthProvider(context, null, {
+      workspace: {
+        workspaceFolders: [],
+        getConfiguration() {
+          return { get: () => "flat" };
+        },
+      },
+      executeCommand: async (...args) => {
+        contextCommands.push(args);
+      },
+    });
+    await waitForTurn();
+    contextCommands.length = 0;
+
+    await assert.rejects(provider.setViewMode("tree"), /Injected Memento update failure/);
+
+    assert.strictEqual(provider.getViewMode(), "flat");
+    assert.deepStrictEqual(contextCommands, []);
+    provider.dispose();
+  });
+
+  test("progress cancellation reaches the scan worker and releases every listener/source", async () => {
+    const clock = createManualClock(1000);
+    const progressSource = createCancellationSource();
+    const workerSource = createCancellationSource();
+    const started = deferred();
+    const gate = deferred();
+    let workerToken = null;
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      scheduler: {
+        now: clock.now,
+        setTimeout: clock.setTimeout,
+        clearTimeout: clock.clearTimeout,
+        yield: async () => {},
+      },
+      createCancellationSource: () => workerSource,
+      userInteraction: createUserInteraction({
+        withProgress: async (_options, task) => task({ report() {} }, progressSource.token),
+      }),
+    });
+    provider._performScan = async (_workspace, _repo, _folder, _progress, token) => {
+      workerToken = token;
+      started.resolve();
+      await gate.promise;
+      return { canceled: token.isCancellationRequested };
+    };
+
+    const scanPromise = provider.scan("workspace-a", "repo-a", "/project-a");
+    await started.promise;
+    assert.strictEqual(progressSource.listenerCount(), 1);
+    await clock.advanceBy(25);
+    progressSource.cancel();
+    gate.resolve();
+
+    const result = await scanPromise;
+    assert.strictEqual(result.status, SCAN_STATES.CANCELLED);
+    assert.strictEqual(workerToken, workerSource.token);
+    assert.strictEqual(workerToken.isCancellationRequested, true);
+    assert.strictEqual(progressSource.listenerCount(), 0);
+    assert.strictEqual(workerSource.listenerCount(), 0);
+    assert.strictEqual(workerSource.cancel(), false, "disposed sources cannot restart cancellation");
+    assert.strictEqual(provider.getScanState().startedAt, 1000);
+    assert.strictEqual(provider.getScanState().completedAt, 1025);
+    provider.dispose();
+  });
+
+  test("disposing the provider clears debounced work and blocks late patch publication", async () => {
+    const clock = createManualClock(5000);
+    const applied = [];
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      scheduler: {
+        now: clock.now,
+        setTimeout: clock.setTimeout,
+        clearTimeout: clock.clearTimeout,
+        yield: async () => {},
+      },
+    });
+    const handler = provider._createDebouncedEnrichmentHandler((patch) => applied.push(patch));
+    handler.onProgress(new Map([["dependency", { state: "found" }]]));
+    assert.strictEqual(clock.pendingCount(), 1);
+
+    provider.dispose();
+    assert.strictEqual(clock.pendingCount(), 0);
+    await clock.advanceBy(1000);
+
+    assert.deepStrictEqual(applied, []);
+    handler.onProgress(new Map([["late", { state: "found" }]]));
+    assert.strictEqual(clock.pendingCount(), 0);
+  });
+
+  test("disposing the provider invalidates a gated scan and blocks every late publication", async () => {
+    const clock = createManualClock(7000);
+    const started = deferred();
+    const gate = deferred();
+    const commands = [];
+    const notifications = [];
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      scheduler: {
+        now: clock.now,
+        setTimeout: clock.setTimeout,
+        clearTimeout: clock.clearTimeout,
+        yield: async () => {},
+      },
+      executeCommand: async (...args) => commands.push(args),
+      userInteraction: createUserInteraction({
+        showInformationMessage: async message => { notifications.push(message); },
+      }),
+    });
+    provider._performScan = async () => {
+      started.resolve();
+      await gate.promise;
+      return { canceled: false };
+    };
+
+    const pending = provider.scan("workspace-a", "repo-a", "/project-a");
+    await started.promise;
+    commands.length = 0;
+    provider.dispose();
+    const disposedState = provider.getScanState();
+    gate.resolve();
+    const result = await pending;
+
+    assert.strictEqual(result.status, "superseded");
+    assert.deepStrictEqual(provider.getScanState(), disposedState);
+    assert.deepStrictEqual(commands, []);
+    assert.deepStrictEqual(notifications, []);
+    assert.strictEqual(disposedState.status, SCAN_STATES.CANCELLED);
+    assert.strictEqual(disposedState.completedAt, 7000);
+  });
+
+  test("disposal during context projection prevents every later context write", async () => {
+    const firstCommandStarted = deferred();
+    const firstCommandGate = deferred();
+    const commands = [];
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      executeCommand: async (...args) => {
+        commands.push(args);
+        if (commands.length === 1) {
+          firstCommandStarted.resolve();
+          await firstCommandGate.promise;
+        }
+      },
+    });
+
+    await firstCommandStarted.promise;
+    provider.dispose();
+    firstCommandGate.resolve();
+    await waitForTurn();
+    await waitForTurn();
+
+    assert.deepStrictEqual(commands, [["setContext", "cloudsmith.depView", "flat"]]);
   });
 
   test("first successful scan atomically commits results, scope, report data, and diagnostics", async () => {
