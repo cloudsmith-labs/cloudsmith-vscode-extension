@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "exceptions": [
+    {
+      "advisoryId": "GHSA-73rr-hh4g-fpgx",
+      "package": "diff",
+      "severity": "low",
+      "owner": "release-engineering",
+      "reviewedOn": "2026-08-11",
+      "expiresOn": "2026-09-10",
+      "rationale": "Development-only Mocha diff rendering; untrusted patches are not processed by the shipped extension.",
+      "rejectedFix": {
+        "name": "@vscode/test-cli",
+        "version": "0.0.11",
+        "isSemVerMajor": true,
+        "reason": "npm proposes a breaking test-runner downgrade whose Mocha range still resolves the affected dependency graph."
+      }
+    },
+    {
+      "advisoryId": "GHSA-5c6j-r48x-rmvq",
+      "package": "serialize-javascript",
+      "severity": "high",
+      "owner": "release-engineering",
+      "reviewedOn": "2026-08-11",
+      "expiresOn": "2026-09-10",
+      "rationale": "Development-only Mocha reporter serialization; no attacker-controlled values reach this package in CI or the shipped extension.",
+      "rejectedFix": {
+        "name": "@vscode/test-cli",
+        "version": "0.0.11",
+        "isSemVerMajor": true,
+        "reason": "npm proposes a breaking test-runner downgrade whose Mocha range still resolves the affected dependency graph."
+      }
+    },
+    {
+      "advisoryId": "GHSA-qj8w-gfj5-8c6v",
+      "package": "serialize-javascript",
+      "severity": "moderate",
+      "owner": "release-engineering",
+      "reviewedOn": "2026-08-11",
+      "expiresOn": "2026-09-10",
+      "rationale": "Development-only Mocha reporter serialization; no attacker-controlled array-like values reach this package in CI or the shipped extension.",
+      "rejectedFix": {
+        "name": "@vscode/test-cli",
+        "version": "0.0.11",
+        "isSemVerMajor": true,
+        "reason": "npm proposes a breaking test-runner downgrade whose Mocha range still resolves the affected dependency graph."
+      }
+    }
+  ]
+}

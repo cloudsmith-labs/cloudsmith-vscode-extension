@@ -184,6 +184,7 @@ async function readUtf8(targetPath, workspaceFolder) {
     throw createReadFileSystemError(error);
   }
 
+  let result;
   let readError = null;
   try {
     const stats = await validateOpenedWorkspaceFile(
@@ -204,22 +205,21 @@ async function readUtf8(targetPath, workspaceFolder) {
       );
     }
 
-    return await readFileHandleUtf8(fileHandle);
+    result = await readFileHandleUtf8(fileHandle);
   } catch (error) {
-    readError = error;
-    if (isDependencyFileError(error)) {
-      throw error;
-    }
-    throw createReadFileSystemError(error);
-  } finally {
-    try {
-      await fileHandle.close();
-    } catch (error) {
-      if (!readError) {
-        throw createReadFileSystemError(error);
-      }
-    }
+    readError = isDependencyFileError(error) ? error : createReadFileSystemError(error);
   }
+
+  try {
+    await fileHandle.close();
+  } catch (error) {
+    readError ||= createReadFileSystemError(error);
+  }
+
+  if (readError) {
+    throw readError;
+  }
+  return result;
 }
 
 async function validateOpenedWorkspaceFile(fileHandle, safePath, workspaceRoot) {
