@@ -12,10 +12,10 @@ const cli = path.join(
 );
 const zeroProbe = process.argv.includes("--zero-probe");
 const labelIndex = process.argv.indexOf("--label");
-const label = labelIndex === -1 ? "core" : process.argv[labelIndex + 1];
+const label = labelIndex === -1 ? (process.env.VSCODE_TEST_LABEL || "core") : process.argv[labelIndex + 1];
 
-if (!label || !["core", "live"].includes(label)) {
-  throw new Error("The VS Code test label must be either core or live");
+if (!label || !["core", "smoke", "live"].includes(label)) {
+  throw new Error("The VS Code test label must be core, smoke, or live");
 }
 if (label === "live" && !process.env.CLOUDSMITH_TEST_API_KEY) {
   throw new Error("CLOUDSMITH_TEST_API_KEY is required for the optional live test suite");
@@ -26,7 +26,7 @@ const cliArguments = [
   label,
   "--fail-zero",
   "--forbid-only",
-  ...(label === "core" ? ["--forbid-pending"] : []),
+  ...(label !== "live" ? ["--forbid-pending"] : []),
   ...(zeroProbe ? ["--grep", "__m9_zero_test_probe_no_match__"] : []),
 ];
 

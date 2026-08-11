@@ -55,7 +55,7 @@ jobs:
         run: npm run audit:dev
 
   extension-tests:
-    name: Extension tests (${{ matrix.os }}, VS Code ${{ matrix.vscode }})
+    name: Extension tests (${{ matrix.os }}, VS Code ${{ matrix.vscode }}, ${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -64,14 +64,19 @@ jobs:
         include:
           - os: ubuntu-24.04
             vscode: 1.99.0
+            label: core
           - os: ubuntu-24.04
             vscode: 1.132.0
+            label: core
           - os: windows-2025
             vscode: 1.132.0
+            label: smoke
           - os: macos-15
             vscode: 1.132.0
+            label: smoke
     env:
       VSCODE_TEST_VERSION: ${{ matrix.vscode }}
+      VSCODE_TEST_LABEL: ${{ matrix.label }}
     steps:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -88,7 +93,7 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Log test runtime
-        run: node -e "console.log({node:process.version,platform:process.platform,arch:process.arch,vscode:process.env.VSCODE_TEST_VERSION})"
+        run: node -e "console.log({node:process.version,platform:process.platform,arch:process.arch,vscode:process.env.VSCODE_TEST_VERSION,label:process.env.VSCODE_TEST_LABEL})"
 
       - name: Run deterministic extension suite
         run: npm test

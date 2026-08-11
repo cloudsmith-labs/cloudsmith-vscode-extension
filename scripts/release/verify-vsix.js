@@ -239,6 +239,39 @@ function normalizeReadme(buffer, manifest) {
   return Buffer.from(buffer.toString("utf8").replaceAll(`${base}/raw/HEAD/`, ""), "utf8");
 }
 
+function readStableWorktreeFile(filePath, sourcePath) {
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  const descriptor = fs.openSync(filePath, flags);
+  try {
+    const before = fs.fstatSync(descriptor, { bigint: true });
+    if (!before.isFile() || before.size > BigInt(limits.entryBytes)) {
+      throw new Error(`Packaged worktree source is not a bounded regular file: ${sourcePath}`);
+    }
+    const expectedSize = Number(before.size);
+    const allocation = Buffer.alloc(expectedSize + 1);
+    let offset = 0;
+    while (offset < allocation.length) {
+      const bytesRead = fs.readSync(descriptor, allocation, offset, allocation.length - offset, offset);
+      if (!bytesRead) {
+        break;
+      }
+      offset += bytesRead;
+    }
+    if (offset !== expectedSize) {
+      throw new Error(`Packaged worktree source changed size while being read: ${sourcePath}`);
+    }
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    for (const field of ["dev", "ino", "size", "mtimeNs", "ctimeNs"]) {
+      if (before[field] !== after[field]) {
+        throw new Error(`Packaged worktree source changed while being read: ${sourcePath}`);
+      }
+    }
+    return Buffer.from(allocation.subarray(0, expectedSize));
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 function assertSourceBytes(archivePath, bytes, source, manifest, sourceSha) {
   let comparable = bytes;
   if (archivePath === "extension/readme.md") {
@@ -251,11 +284,7 @@ function assertSourceBytes(archivePath, bytes, source, manifest, sourceSha) {
     return;
   }
   const sourcePath = path.join(root, source.sourcePath);
-  const stats = fs.lstatSync(sourcePath);
-  if (!stats.isFile() || stats.isSymbolicLink()) {
-    throw new Error(`Packaged worktree source is not a regular file: ${source.sourcePath}`);
-  }
-  if (!comparable.equals(fs.readFileSync(sourcePath))) {
+  if (!comparable.equals(readStableWorktreeFile(sourcePath, source.sourcePath))) {
     throw new Error(`VSIX bytes do not match the worktree for ${source.sourcePath}`);
   }
 }
