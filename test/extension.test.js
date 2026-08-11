@@ -1,10 +1,27 @@
 const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
-const { FORMAT_OPTIONS, runDependencyScan } = require("../extension");
+const { ActivationOwner, FORMAT_OPTIONS, runDependencyScan } = require("../extension");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
 
 suite("Extension Test Suite", () => {
+  test("activation owner reports async cleanup failure without retaining its error", async () => {
+    const reports = [];
+    const owner = new ActivationOwner(() => reports.push("cleanup failed"));
+    owner.add({
+      async dispose() {
+        throw new Error("secret cleanup infrastructure detail");
+      },
+    });
+
+    owner.dispose();
+    await owner.settle();
+    await owner.settle();
+
+    assert.deepStrictEqual(reports, ["cleanup failed"]);
+    assert.strictEqual(JSON.stringify(reports).includes("secret cleanup infrastructure detail"), false);
+  });
+
   test("uses the shared upstream format list for format picks", () => {
     assert.strictEqual(FORMAT_OPTIONS, SUPPORTED_UPSTREAM_FORMATS);
     assert.ok(FORMAT_OPTIONS.includes("conan"));
@@ -85,13 +102,5 @@ suite("Extension Test Suite", () => {
       group: "navigation@1.5",
       when: "view == cloudsmithDependencyHealthView && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning",
     });
-  });
-
-  test("historical rescan command IDs remain registered as primary-scan aliases", () => {
-    const source = fs.readFileSync(path.join(__dirname, "..", "extension.js"), "utf8");
-
-    assert.match(source, /registerCommand\("cloudsmith-vsc\.scanDependenciesComplete"/);
-    assert.match(source, /registerCommand\("cloudsmith-vsc\.rescanDependencies"/);
-    assert.match(source, /executeCommand\("cloudsmith-vsc\.scanDependencies"\)/);
   });
 });

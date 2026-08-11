@@ -2,6 +2,9 @@
 import { defineConfig } from "@vscode/test-cli";
 import os from "os";
 import path from "path";
+import testInventories from "./test/testInventories.js";
+
+const { LIVE_TESTS, VSCODE_CORE_TESTS, VSCODE_SMOKE_TESTS } = testInventories;
 
 const version = process.env.VSCODE_TEST_VERSION || "1.132.0";
 if (!/^\d+\.\d+\.\d+$/.test(version)) {
@@ -25,13 +28,7 @@ export default defineConfig([
     ...common,
     label: "core",
     launchArgs: userDataLaunchArgs("core"),
-    files: [
-      "test/*.test.js",
-      "test/lockfileParsers/*.test.js",
-      "test/integration/manifestParser.test.js",
-      "test/integration/licenseClassifier.test.js",
-      "test/integration/installCommand.test.js",
-    ],
+    files: VSCODE_CORE_TESTS,
     mocha: {
       failZero: true,
       forbidOnly: true,
@@ -43,10 +40,7 @@ export default defineConfig([
     ...common,
     label: "smoke",
     launchArgs: userDataLaunchArgs("smoke"),
-    files: [
-      "test/activation.test.js",
-      "test/releaseGate.test.js",
-    ],
+    files: VSCODE_SMOKE_TESTS,
     mocha: {
       failZero: true,
       forbidOnly: true,
@@ -58,13 +52,11 @@ export default defineConfig([
     ...common,
     label: "live",
     launchArgs: userDataLaunchArgs("live"),
-    files: [
-      "test/integration/search.test.js",
-      "test/integration/vulnerabilities.test.js",
-    ],
+    files: LIVE_TESTS,
     mocha: {
       failZero: true,
       forbidOnly: true,
+      forbidPending: true,
       timeout: 20000,
     },
   },

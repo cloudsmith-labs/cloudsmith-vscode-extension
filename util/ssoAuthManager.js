@@ -94,6 +94,16 @@ class SSOAuthManager {
     this._createServer = options.createServer || http.createServer;
     this._randomBytes = options.randomBytes || crypto.randomBytes;
     this._openExternal = options.openExternal || vscode.env.openExternal;
+    this._showErrorMessage = options.showErrorMessage
+      || vscode.window.showErrorMessage.bind(vscode.window);
+    this._showInformationMessage = options.showInformationMessage
+      || vscode.window.showInformationMessage.bind(vscode.window);
+    this._showWarningMessage = options.showWarningMessage
+      || vscode.window.showWarningMessage.bind(vscode.window);
+    this._createTerminal = options.createTerminal
+      || vscode.window.createTerminal.bind(vscode.window);
+    this._onDidCloseTerminal = options.onDidCloseTerminal
+      || vscode.window.onDidCloseTerminal.bind(vscode.window);
   }
 
   async importFromCLI(operation = null) {
@@ -105,7 +115,7 @@ class SSOAuthManager {
     const configPath = this._findCLIConfigPath();
     if (!configPath) {
       await manager.cancelCredentialOperation(token);
-      vscode.window.showErrorMessage(
+      this._showErrorMessage(
         'Could not find Cloudsmith CLI configuration. Run "cloudsmith auth" in a terminal first.'
       );
       return failedResult("config_missing", "Cloudsmith CLI configuration was not found.");
@@ -120,7 +130,7 @@ class SSOAuthManager {
       const publicMessage = tooLarge
         ? "Cloudsmith CLI config is too large to import."
         : "Could not read Cloudsmith CLI config. Check file permissions.";
-      vscode.window.showErrorMessage(publicMessage);
+      this._showErrorMessage(publicMessage);
       return failedResult(
         tooLarge ? "config_too_large" : "config_read_failed",
         publicMessage
@@ -131,7 +141,7 @@ class SSOAuthManager {
     const apiKey = this._parseAPIKeyFromConfig(content);
     if (!apiKey) {
       await manager.cancelCredentialOperation(token);
-      vscode.window.showErrorMessage(
+      this._showErrorMessage(
         "No API key found in Cloudsmith CLI config. Run 'cloudsmith auth -o {workspace}' first."
       );
       return failedResult("credential_missing", "No API key was found in the CLI configuration.");
@@ -194,15 +204,16 @@ class SSOAuthManager {
     const token = operation || manager.beginCredentialOperation();
     if (!this._isValidWorkspaceSlug(workspaceSlug)) {
       await manager.cancelCredentialOperation(token);
-      vscode.window.showErrorMessage("Enter a valid Cloudsmith workspace slug.");
+      this._showErrorMessage("Enter a valid Cloudsmith workspace slug.");
       return failedResult("invalid_workspace", "The Cloudsmith workspace slug is invalid.");
     }
 
-    const terminal = vscode.window.createTerminal("Cloudsmith SSO");
+    let terminal = null;
     let closeDisposable = null;
     let timeout = null;
     let abortListener = null;
     try {
+      terminal = this._createTerminal("Cloudsmith SSO");
       terminal.show();
       terminal.sendText(`cloudsmith auth -o ${workspaceSlug}`);
       await new Promise((resolve) => {
@@ -212,7 +223,7 @@ class SSOAuthManager {
           done = true;
           resolve();
         };
-        closeDisposable = vscode.window.onDidCloseTerminal((closed) => {
+        closeDisposable = this._onDidCloseTerminal((closed) => {
           if (closed === terminal) finish();
         });
         timeout = this._setTimeout(finish, 10000);
@@ -224,7 +235,7 @@ class SSOAuthManager {
       if (!manager.isOperationCurrent(token)) {
         return failedResult("stale", "Authentication was superseded.");
       }
-      const choice = await vscode.window.showInformationMessage(
+      const choice = await this._showInformationMessage(
         "Import credentials from the Cloudsmith CLI config?",
         "Import",
         "Not now"
@@ -253,7 +264,7 @@ class SSOAuthManager {
     const token = operation || manager.beginCredentialOperation();
     if (!this._isValidWorkspaceSlug(workspaceSlug)) {
       await manager.cancelCredentialOperation(token);
-      vscode.window.showErrorMessage("Enter a valid Cloudsmith workspace slug.");
+      this._showErrorMessage("Enter a valid Cloudsmith workspace slug.");
       return failedResult("invalid_workspace", "The Cloudsmith workspace slug is invalid.");
     }
 
@@ -272,13 +283,13 @@ class SSOAuthManager {
       const tokenPromise = this._waitForCallbackToken(server, token.signal);
       await this._openExternal(vscode.Uri.parse(authUrl));
       if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
-      vscode.window.showInformationMessage("Browser sign-in started. Waiting for authentication...");
+      this._showInformationMessage("Browser sign-in started. Waiting for authentication...");
 
       const candidate = await tokenPromise;
       if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
       if (candidate) return manager.replaceCredential(candidate, token);
 
-      const choice = await vscode.window.showWarningMessage(
+      const choice = await this._showWarningMessage(
         "Browser-based SSO did not complete. Select a fallback method.",
         "Open Terminal",
         "Import from CLI",
@@ -291,7 +302,7 @@ class SSOAuthManager {
     } catch {
       if (manager.isOperationCurrent(token)) await manager.cancelCredentialOperation(token);
       const message = "Browser authentication could not start or complete.";
-      vscode.window.showErrorMessage(
+      this._showErrorMessage(
         `Could not complete browser SSO on port ${SAML_CALLBACK_PORT}. ${message}`
       );
       return failedResult("browser_failed", message);
@@ -376,7 +387,9 @@ class SSOAuthManager {
   }
 
   _shutdownServer(server) {
-    if (server._timeout !== null) {
+    if (typeof server._resolveToken === "function") {
+      server._resolveToken(null);
+    } else if (server._timeout !== null) {
       this._clearTimeout(server._timeout);
       server._timeout = null;
     }

@@ -21,5 +21,42 @@ suite("Extension activation smoke", () => {
     const registeredCommands = new Set(await vscode.commands.getCommands(true));
     const missingCommands = contributedCommands.filter((command) => !registeredCommands.has(command));
     assert.deepStrictEqual(missingCommands, [], "Every contributed command must be registered after activation");
+    for (const compatibilityCommand of [
+      "cloudsmith-vsc.scanDependenciesComplete",
+      "cloudsmith-vsc.rescanDependencies",
+    ]) {
+      assert.ok(
+        registeredCommands.has(compatibilityCommand),
+        `Expected compatibility command ${compatibilityCommand} to be registered`
+      );
+    }
+
+    const viewIds = (extension.packageJSON.contributes?.views?.cloudsmithSideBar || [])
+      .map((entry) => entry.id);
+    assert.deepStrictEqual(
+      viewIds,
+      ["cloudsmithView", "cloudsmithSearchView", "cloudsmithDependencyHealthView", "helpView"]
+    );
+    for (const viewId of viewIds) {
+      assert.ok(
+        registeredCommands.has(`${viewId}.focus`),
+        `Expected VS Code to initialize the ${viewId} view contribution`
+      );
+    }
+  });
+
+  test("deactivation disposes registered commands and is idempotent", async () => {
+    const extension = vscode.extensions.getExtension("Cloudsmith.cloudsmith-vsc");
+    assert.ok(extension?.isActive, "The extension must be active before deactivation is exercised");
+    assert.ok((await vscode.commands.getCommands(true)).includes("cloudsmith-vsc.refreshView"));
+
+    const { deactivate } = require("../extension");
+    await deactivate();
+    await deactivate();
+
+    assert.ok(
+      !(await vscode.commands.getCommands(true)).includes("cloudsmith-vsc.refreshView"),
+      "Deactivation must dispose command registrations owned by activation"
+    );
   });
 });

@@ -2,6 +2,7 @@ const assert = require("assert");
 const { PaginatedFetch } = require("../util/paginatedFetch");
 const { fetchWorkspaces } = require("../util/workspaceFetcher");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
+const { ScriptedCloudsmithAPI } = require("./helpers/scriptedCloudsmithAPI");
 
 suite("WorkspaceFetcher", () => {
   test("discovers and stably sorts 1,000 workspaces across pages", async () => {
@@ -28,10 +29,11 @@ suite("WorkspaceFetcher", () => {
   });
 
   test("retains a successful page and reports a later rate limit as incomplete", async () => {
-    const api = {
-      async get(endpoint) {
-        if (requestedPage(endpoint) === 2) return apiFailure("rate_limited", { status: 429 });
-        return pageResult(
+    const api = new ScriptedCloudsmithAPI([
+      {
+        method: "GET",
+        endpoint: endpoint => requestedPage(endpoint) === 1,
+        result: pageResult(
           Array.from({ length: 500 }, (_, index) => ({
             slug: `workspace-${index}`,
             name: `Workspace ${index}`,
@@ -40,9 +42,14 @@ suite("WorkspaceFetcher", () => {
           2,
           501,
           500
-        );
+        ),
       },
-    };
+      {
+        method: "GET",
+        endpoint: endpoint => requestedPage(endpoint) === 2,
+        result: apiFailure("rate_limited", { status: 429 }),
+      },
+    ]);
 
     const result = await fetchWorkspaces({}, fetchOptions(api));
 
@@ -51,6 +58,7 @@ suite("WorkspaceFetcher", () => {
     assert.strictEqual(result.items.length, 500);
     assert.strictEqual(result.failureCount, 1);
     assert.strictEqual(result.failures[0].error.kind, "rate_limited");
+    api.assertExhausted();
   });
 
   test("duplicate workspace slugs fail closed and are not published twice", async () => {

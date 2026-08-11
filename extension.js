@@ -49,6 +49,60 @@ const { PaginatedFetch, replaceCollectionItems } = require("./util/paginatedFetc
 const { packageCollectionIdentity } = require("./util/collectionIdentity");
 
 let exportTerraformAbortController = null;
+let activeActivationOwner = null;
+
+class ActivationOwner {
+  constructor(reportFailure = () => {
+    console.warn("[Cloudsmith] An activation resource could not be disposed cleanly.");
+  }) {
+    this._resources = [];
+    this._pending = [];
+    this._disposed = false;
+    this._reportFailure = reportFailure;
+  }
+
+  add(...resources) {
+    for (const resource of resources) {
+      if (!resource || typeof resource.dispose !== "function") {
+        throw new TypeError("Activation resources must be disposable.");
+      }
+      if (this._disposed) {
+        this._disposeResource(resource);
+      } else {
+        this._resources.push(resource);
+      }
+    }
+  }
+
+  dispose() {
+    if (this._disposed) return;
+    this._disposed = true;
+    for (const resource of this._resources.splice(0).reverse()) {
+      this._disposeResource(resource);
+    }
+  }
+
+  async settle() {
+    const pending = this._pending.splice(0);
+    if (pending.length > 0) {
+      const results = await Promise.allSettled(pending);
+      if (results.some(result => result.status === "rejected")) {
+        this._reportFailure();
+      }
+    }
+  }
+
+  _disposeResource(resource) {
+    try {
+      const result = resource.dispose();
+      if (result && typeof result.then === "function") {
+        this._pending.push(Promise.resolve(result));
+      }
+    } catch {
+      this._reportFailure();
+    }
+  }
+}
 
 /**
  * Helper: unwrap a property that may be stored as:
@@ -815,18 +869,42 @@ async function showDependencySortFilterPicker(provider) {
  * @param {vscode.ExtensionContext} context
  */
 async function activate(context) {
+  await deactivate();
+  const owner = new ActivationOwner();
+  activeActivationOwner = owner;
+  context.subscriptions.push(owner);
+  const own = (...resources) => owner.add(...resources);
+  try {
+    return await activateOwned(context, own);
+  } catch (error) {
+    owner.dispose();
+    await owner.settle();
+    if (activeActivationOwner === owner) activeActivationOwner = null;
+    throw error;
+  }
+}
+
+async function activateOwned(context, own) {
   const connectionManager = new ConnectionManager(context);
   const connectionBinding = bindConnectionManager(context, connectionManager);
-  context.subscriptions.push(connectionBinding, connectionManager);
+  own(connectionBinding, connectionManager);
   const inspectOutputChannel = vscode.window.createOutputChannel("Cloudsmith");
-  context.subscriptions.push(inspectOutputChannel);
+  own(inspectOutputChannel);
+  own({
+    dispose() {
+      if (exportTerraformAbortController) {
+        exportTerraformAbortController.abort();
+        exportTerraformAbortController = null;
+      }
+    },
+  });
 
   // Persisted upstream summaries are account-bound. Purge them before the
   // initial SecretStorage read so an indeterminate startup cannot retain data
   // from a prior activation or account.
   await evictPersistedUpstreamCaches(context);
   const workspaceContextProjector = getWorkspaceContextProjector(context);
-  context.subscriptions.push(workspaceContextProjector);
+  own(workspaceContextProjector);
   await setHasMultipleWorkspacesContext(context, false, { workspaceContextProjector });
   await updateDefaultWorkspaceContext();
 
@@ -837,11 +915,12 @@ async function activate(context) {
     workspaceCache,
     workspaceContextProjector,
   });
-  context.subscriptions.push({ dispose: () => cloudsmithProvider.dispose() });
+  own({ dispose: () => cloudsmithProvider.dispose() });
   const treeView = vscode.window.createTreeView("cloudsmithView", {
     treeDataProvider: cloudsmithProvider,
     showCollapseAll: true,
   });
+  own(treeView);
   cloudsmithProvider.setTreeView(treeView);
   cloudsmithProvider.setDefaultWorkspaceFallbackHandler((slug) => {
     treeView.title = "Workspaces";
@@ -859,7 +938,7 @@ async function activate(context) {
   }
 
   // Listen for configuration changes to refresh tree when defaultWorkspace changes
-  context.subscriptions.push(
+  own(
     vscode.workspace.onDidChangeConfiguration(async e => {
       if (e.affectsConfiguration("cloudsmith-vsc.defaultWorkspace")) {
         await updateDefaultWorkspaceContext();
@@ -873,29 +952,31 @@ async function activate(context) {
 
   // Set Help & Feedback view.
   const provider = new helpProvider();
-  vscode.window.registerTreeDataProvider("helpView", provider);
+  own(vscode.window.registerTreeDataProvider("helpView", provider));
 
   // Set Package Search view.
   const searchProvider = new SearchProvider(context, { connectionManager });
-  vscode.window.createTreeView("cloudsmithSearchView", {
+  const searchTreeView = vscode.window.createTreeView("cloudsmithSearchView", {
     treeDataProvider: searchProvider,
     showCollapseAll: true,
   });
+  own(searchTreeView);
 
   // Set Dependency Health view with diagnostics publisher.
   const diagnosticsPublisher = new DiagnosticsPublisher();
-  context.subscriptions.push(diagnosticsPublisher);
+  own(diagnosticsPublisher);
   const dependencyHealthProvider = new DependencyHealthProvider(context, diagnosticsPublisher, {
     connectionManager,
   });
-  context.subscriptions.push(
+  own(
     { dispose: () => searchProvider.dispose() },
     { dispose: () => dependencyHealthProvider.dispose() }
   );
-  vscode.window.createTreeView("cloudsmithDependencyHealthView", {
+  const dependencyTreeView = vscode.window.createTreeView("cloudsmithDependencyHealthView", {
     treeDataProvider: dependencyHealthProvider,
     showCollapseAll: false,
   });
+  own(dependencyTreeView);
 
   let projectedAccountEpoch = connectionManager.getState().accountEpoch;
   let promotionProvider = null;
@@ -928,32 +1009,32 @@ async function activate(context) {
       console.warn("[Cloudsmith] Could not refresh all account-scoped state.");
     });
   });
-  context.subscriptions.push(connectionSubscription);
+  own(connectionSubscription);
 
   // Create vulnerability WebView provider
   vulnerabilityProvider = new VulnerabilityProvider(context, { connectionManager });
-  context.subscriptions.push({ dispose: () => vulnerabilityProvider.dispose() });
+  own({ dispose: () => vulnerabilityProvider.dispose() });
 
   // Create compliance report WebView provider
   const complianceReportProvider = new ComplianceReportProvider(context);
-  context.subscriptions.push({ dispose: () => complianceReportProvider.dispose() });
+  own({ dispose: () => complianceReportProvider.dispose() });
 
   // Create quarantine explanation WebView provider
   quarantineExplainProvider = new QuarantineExplainProvider(context, { connectionManager });
-  context.subscriptions.push({ dispose: () => quarantineExplainProvider.dispose() });
+  own({ dispose: () => quarantineExplainProvider.dispose() });
 
   // Create upstream preview WebView provider
   upstreamPreviewProvider = new UpstreamPreviewProvider(context);
-  context.subscriptions.push({ dispose: () => upstreamPreviewProvider.dispose() });
+  own({ dispose: () => upstreamPreviewProvider.dispose() });
 
   // Create upstream detail WebView provider
   upstreamDetailProvider = new UpstreamDetailProvider(context);
-  context.subscriptions.push({ dispose: () => upstreamDetailProvider.dispose() });
+  own({ dispose: () => upstreamDetailProvider.dispose() });
 
   const credentialManager = new CredentialManager(context, { connectionManager });
   // Create promotion provider
   promotionProvider = new PromotionProvider(context, { connectionManager, credentialManager });
-  context.subscriptions.push({ dispose: () => promotionProvider.dispose() });
+  own({ dispose: () => promotionProvider.dispose() });
 
   const ssoManager = new SSOAuthManager(context, { connectionManager });
 
@@ -1033,10 +1114,10 @@ async function activate(context) {
       console.warn("[Cloudsmith] CLI credential auto-detection failed.");
     });
   }, 3000);
-  context.subscriptions.push({ dispose: () => clearTimeout(cliAutoDetectTimer) });
+  own({ dispose: () => clearTimeout(cliAutoDetectTimer) });
 
   // register general commands. Will move this over to command Manager in future release.
-  context.subscriptions.push(
+  own(
     // Register command to clear credentials
     vscode.commands.registerCommand("cloudsmith-vsc.clearCredentials", async () => {
       const result = await credentialManager.clearCredentials();
@@ -2664,9 +2745,21 @@ async function activate(context) {
 }
 
 // This method is called when your extension is deactivated
-function deactivate() {}
+async function deactivate() {
+  const owner = activeActivationOwner;
+  activeActivationOwner = null;
+  if (owner) {
+    owner.dispose();
+    await owner.settle();
+  }
+  if (exportTerraformAbortController) {
+    exportTerraformAbortController.abort();
+    exportTerraformAbortController = null;
+  }
+}
 
 module.exports = {
+  ActivationOwner,
   activate,
   deactivate,
   evictPersistedUpstreamCaches,

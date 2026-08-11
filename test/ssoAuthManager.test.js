@@ -1,6 +1,5 @@
 const assert = require("assert");
 const { EventEmitter } = require("events");
-const vscode = require("vscode");
 const { SSOAuthManager } = require("../util/ssoAuthManager");
 
 function deferred() {
@@ -13,9 +12,31 @@ function createConnectionHarness() {
   const calls = [];
   let current = null;
   let nextId = 0;
+  const createController = () => {
+    let aborted = false;
+    const listeners = new Set();
+    const signal = {
+      get aborted() { return aborted; },
+      addEventListener(event, listener) {
+        if (event === "abort") listeners.add(listener);
+      },
+      removeEventListener(event, listener) {
+        if (event === "abort") listeners.delete(listener);
+      },
+    };
+    return {
+      signal,
+      abort() {
+        if (aborted) return;
+        aborted = true;
+        for (const listener of [...listeners]) listener();
+      },
+      get listenerCount() { return listeners.size; },
+    };
+  };
   const manager = {
     beginCredentialOperation() {
-      const controller = new AbortController();
+      const controller = createController();
       current = Object.freeze({ id: ++nextId, controller, signal: controller.signal });
       calls.push(["begin", current.id]);
       return current;
@@ -33,40 +54,83 @@ function createConnectionHarness() {
       return Object.freeze({ ok: true, status: "connected", committed: true });
     },
   };
-  return { calls, manager };
+  return {
+    calls,
+    manager,
+    cancelCurrent() {
+      if (current) current.controller.abort();
+    },
+    get abortListenerCount() {
+      return current ? current.controller.listenerCount : 0;
+    },
+  };
+}
+
+function createManualTimers() {
+  let nextId = 0;
+  const pending = new Map();
+  const cleared = [];
+  return {
+    setTimeout(callback, delay) {
+      const handle = ++nextId;
+      pending.set(handle, { callback, delay });
+      return handle;
+    },
+    clearTimeout(handle) {
+      if (pending.delete(handle)) cleared.push(handle);
+    },
+    fire(handle) {
+      const timer = pending.get(handle);
+      assert.ok(timer, `expected timer ${handle} to be pending`);
+      pending.delete(handle);
+      timer.callback();
+    },
+    firstHandle() {
+      return pending.keys().next().value;
+    },
+    get pendingCount() { return pending.size; },
+    get clearedHandles() { return cleared.slice(); },
+  };
+}
+
+function createTerminalEvents() {
+  const listeners = new Set();
+  let disposals = 0;
+  return {
+    onDidCloseTerminal(listener) {
+      listeners.add(listener);
+      return {
+        dispose() {
+          if (listeners.delete(listener)) disposals += 1;
+        },
+      };
+    },
+    close(terminal) {
+      for (const listener of [...listeners]) listener(terminal);
+    },
+    get listenerCount() { return listeners.size; },
+    get disposalCount() { return disposals; },
+  };
+}
+
+function createManager(connectionManager, options = {}) {
+  return new SSOAuthManager({}, {
+    connectionManager,
+    showErrorMessage: async () => undefined,
+    showInformationMessage: async () => undefined,
+    showWarningMessage: async () => undefined,
+    createTerminal: () => ({ show() {}, sendText() {} }),
+    onDidCloseTerminal: () => ({ dispose() {} }),
+    ...options,
+  });
 }
 
 suite("SSOAuthManager Test Suite", () => {
-  let originalShowErrorMessage;
-  let originalShowInformationMessage;
-  let originalShowWarningMessage;
-  let originalCreateTerminal;
-  let originalOnDidCloseTerminal;
-
-  setup(() => {
-    originalShowErrorMessage = vscode.window.showErrorMessage;
-    originalShowInformationMessage = vscode.window.showInformationMessage;
-    originalShowWarningMessage = vscode.window.showWarningMessage;
-    originalCreateTerminal = vscode.window.createTerminal;
-    originalOnDidCloseTerminal = vscode.window.onDidCloseTerminal;
-    vscode.window.showErrorMessage = async () => undefined;
-    vscode.window.showInformationMessage = async () => undefined;
-    vscode.window.showWarningMessage = async () => undefined;
-  });
-
-  teardown(() => {
-    vscode.window.showErrorMessage = originalShowErrorMessage;
-    vscode.window.showInformationMessage = originalShowInformationMessage;
-    vscode.window.showWarningMessage = originalShowWarningMessage;
-    vscode.window.createTerminal = originalCreateTerminal;
-    vscode.window.onDidCloseTerminal = originalOnDidCloseTerminal;
-  });
 
   test("CLI import owns an operation before reading and validates before commit", async () => {
     const read = deferred();
     const { calls, manager: connectionManager } = createConnectionHarness();
-    const sso = new SSOAuthManager({}, {
-      connectionManager,
+    const sso = createManager(connectionManager, {
       findCLIConfigPath: () => "/tmp/cloudsmith-config.ini",
       readFile: () => {
         calls.push(["read"]);
@@ -87,9 +151,8 @@ suite("SSOAuthManager Test Suite", () => {
   test("CLI import rejects oversized config before parsing or replacing credentials", async () => {
     const { calls, manager: connectionManager } = createConnectionHarness();
     const messages = [];
-    vscode.window.showErrorMessage = async message => { messages.push(message); };
-    const sso = new SSOAuthManager({}, {
-      connectionManager,
+    const sso = createManager(connectionManager, {
+      showErrorMessage: async message => { messages.push(message); },
       findCLIConfigPath: () => "/tmp/cloudsmith-config.ini",
       readFile: async () => `api_key=${"x".repeat(70 * 1024)}`,
     });
@@ -106,9 +169,8 @@ suite("SSOAuthManager Test Suite", () => {
     const leaked = "candidate-secret-in-filesystem-error";
     const { manager: connectionManager } = createConnectionHarness();
     const messages = [];
-    vscode.window.showErrorMessage = async message => { messages.push(message); };
-    const sso = new SSOAuthManager({}, {
-      connectionManager,
+    const sso = createManager(connectionManager, {
+      showErrorMessage: async message => { messages.push(message); },
       findCLIConfigPath: () => "/tmp/cloudsmith-config.ini",
       readFile: async () => { throw new Error(`failed while reading ${leaked}`); },
     });
@@ -124,8 +186,7 @@ suite("SSOAuthManager Test Suite", () => {
     const { calls, manager: connectionManager } = createConnectionHarness();
     const operation = connectionManager.beginCredentialOperation();
     calls.length = 0;
-    const sso = new SSOAuthManager({}, {
-      connectionManager,
+    const sso = createManager(connectionManager, {
       findCLIConfigPath: () => "/tmp/cloudsmith-config.ini",
       readFile: async () => "api_key=imported-key",
     });
@@ -137,32 +198,82 @@ suite("SSOAuthManager Test Suite", () => {
   });
 
   test("terminal timeout and close listener are cleaned before cancellation returns", async () => {
-    const { manager: connectionManager } = createConnectionHarness();
-    const cleared = [];
-    let disposed = 0;
+    const connection = createConnectionHarness();
+    const timers = createManualTimers();
+    const terminalEvents = createTerminalEvents();
     const terminal = { show() {}, sendText() {} };
-    vscode.window.createTerminal = () => terminal;
-    vscode.window.onDidCloseTerminal = () => ({ dispose: () => { disposed += 1; } });
-    vscode.window.showInformationMessage = async () => "Not now";
-    const sso = new SSOAuthManager({}, {
-      connectionManager,
-      setTimeout: (callback) => {
-        queueMicrotask(callback);
-        return 41;
-      },
-      clearTimeout: id => cleared.push(id),
+    const sso = createManager(connection.manager, {
+      createTerminal: () => terminal,
+      onDidCloseTerminal: listener => terminalEvents.onDidCloseTerminal(listener),
+      showInformationMessage: async () => "Not now",
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
     });
 
-    const result = await sso.loginViaTerminal("workspace-a");
+    const pending = sso.loginViaTerminal("workspace-a");
+    const handle = timers.firstHandle();
+    assert.strictEqual(terminalEvents.listenerCount, 1);
+    assert.strictEqual(connection.abortListenerCount, 1);
+    timers.fire(handle);
+    const result = await pending;
 
     assert.strictEqual(result.status, "cancelled");
-    assert.deepStrictEqual(cleared, [41]);
-    assert.strictEqual(disposed, 1);
+    assert.strictEqual(timers.pendingCount, 0);
+    assert.strictEqual(terminalEvents.listenerCount, 0);
+    assert.strictEqual(terminalEvents.disposalCount, 1);
+    assert.strictEqual(connection.abortListenerCount, 0);
+  });
+
+  test("terminal close wins without waiting for the timeout and releases every listener", async () => {
+    const connection = createConnectionHarness();
+    const timers = createManualTimers();
+    const terminalEvents = createTerminalEvents();
+    const terminal = { show() {}, sendText() {} };
+    const sso = createManager(connection.manager, {
+      createTerminal: () => terminal,
+      onDidCloseTerminal: listener => terminalEvents.onDidCloseTerminal(listener),
+      showInformationMessage: async () => "Not now",
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+    });
+
+    const pending = sso.loginViaTerminal("workspace-a");
+    const timeoutHandle = timers.firstHandle();
+    terminalEvents.close(terminal);
+    const result = await pending;
+
+    assert.strictEqual(result.status, "cancelled");
+    assert.deepStrictEqual(timers.clearedHandles, [timeoutHandle]);
+    assert.strictEqual(timers.pendingCount, 0);
+    assert.strictEqual(terminalEvents.listenerCount, 0);
+    assert.strictEqual(connection.abortListenerCount, 0);
+  });
+
+  test("credential operation cancellation ends the terminal wait and cleans resources", async () => {
+    const connection = createConnectionHarness();
+    const timers = createManualTimers();
+    const terminalEvents = createTerminalEvents();
+    const sso = createManager(connection.manager, {
+      onDidCloseTerminal: listener => terminalEvents.onDidCloseTerminal(listener),
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+    });
+
+    const pending = sso.loginViaTerminal("workspace-a");
+    const timeoutHandle = timers.firstHandle();
+    connection.cancelCurrent();
+    const result = await pending;
+
+    assert.strictEqual(result.error.kind, "stale");
+    assert.deepStrictEqual(timers.clearedHandles, [timeoutHandle]);
+    assert.strictEqual(timers.pendingCount, 0);
+    assert.strictEqual(terminalEvents.listenerCount, 0);
+    assert.strictEqual(connection.abortListenerCount, 0);
   });
 
   test("workspace slugs at the maximum length are accepted", () => {
     const { manager: connectionManager } = createConnectionHarness();
-    const sso = new SSOAuthManager({}, { connectionManager });
+    const sso = createManager(connectionManager);
 
     assert.strictEqual(sso._isValidWorkspaceSlug("w".repeat(128)), true);
   });
@@ -172,12 +283,11 @@ suite("SSOAuthManager Test Suite", () => {
     let terminalsCreated = 0;
     let serversCreated = 0;
     let browserOpens = 0;
-    vscode.window.createTerminal = () => {
-      terminalsCreated += 1;
-      throw new Error("must not create a terminal");
-    };
-    const sso = new SSOAuthManager({}, {
-      connectionManager,
+    const sso = createManager(connectionManager, {
+      createTerminal: () => {
+        terminalsCreated += 1;
+        throw new Error("must not create a terminal");
+      },
       createServer: () => {
         serversCreated += 1;
         throw new Error("must not create a callback server");
@@ -198,10 +308,10 @@ suite("SSOAuthManager Test Suite", () => {
   });
 
   test("browser success routes the callback candidate through the shared manager and closes the server", async () => {
-    const { calls, manager: connectionManager } = createConnectionHarness();
+    const connection = createConnectionHarness();
+    const timers = createManualTimers();
     let requestHandler = null;
     let server = null;
-    const cleared = [];
     const createServer = handler => {
       requestHandler = handler;
       server = Object.assign(new EventEmitter(), {
@@ -211,12 +321,11 @@ suite("SSOAuthManager Test Suite", () => {
       });
       return server;
     };
-    const sso = new SSOAuthManager({}, {
-      connectionManager,
+    const sso = createManager(connection.manager, {
       createServer,
       randomBytes: () => Buffer.from("00112233445566778899aabbccddeeff", "hex"),
-      setTimeout: () => 73,
-      clearTimeout: id => cleared.push(id),
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
       openExternal: async () => {
         const response = { writeHead() {}, end() {} };
         requestHandler({ method: "GET", url: `${server._expectedPath}?token=browser-key` }, response);
@@ -226,13 +335,14 @@ suite("SSOAuthManager Test Suite", () => {
     const result = await sso.loginViaBrowser("workspace-a");
 
     assert.strictEqual(result.ok, true);
-    assert.ok(calls.some(call => call[0] === "replace" && call[1] === "browser-key"));
+    assert.ok(connection.calls.some(call => call[0] === "replace" && call[1] === "browser-key"));
     assert.strictEqual(server.closed, true);
-    assert.deepStrictEqual(cleared, [73]);
+    assert.strictEqual(server._resolveToken, null);
+    assert.strictEqual(timers.pendingCount, 0);
+    assert.strictEqual(connection.abortListenerCount, 0);
   });
 
   test("browser-open failure still closes the callback server", async () => {
-    const { manager: connectionManager } = createConnectionHarness();
     let server = null;
     const createServer = () => {
       server = Object.assign(new EventEmitter(), {
@@ -242,23 +352,27 @@ suite("SSOAuthManager Test Suite", () => {
       });
       return server;
     };
-    const sso = new SSOAuthManager({}, {
-      connectionManager,
+    const connection = createConnectionHarness();
+    const timers = createManualTimers();
+    const sso = createManager(connection.manager, {
       createServer,
       openExternal: async () => { throw new Error("browser unavailable"); },
-      setTimeout: () => 19,
-      clearTimeout: () => {},
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
     });
 
     const result = await sso.loginViaBrowser("workspace-a");
 
     assert.strictEqual(result.ok, false);
     assert.strictEqual(server.closed, true);
+    assert.strictEqual(server._resolveToken, null);
+    assert.strictEqual(timers.pendingCount, 0);
+    assert.strictEqual(connection.abortListenerCount, 0);
   });
 
   test("duplicate callback parameters are rejected as ambiguous", () => {
     const { manager: connectionManager } = createConnectionHarness();
-    const sso = new SSOAuthManager({}, { connectionManager });
+    const sso = createManager(connectionManager);
     let resolved = "not-called";
     const server = {
       _expectedPath: "/callback/id",
@@ -277,7 +391,7 @@ suite("SSOAuthManager Test Suite", () => {
 
   test("callback HTML reports receipt without claiming authentication succeeded", () => {
     const { manager: connectionManager } = createConnectionHarness();
-    const sso = new SSOAuthManager({}, { connectionManager });
+    const sso = createManager(connectionManager);
 
     const html = sso._buildCallbackHtml(true, "/authenticated");
 
