@@ -23,6 +23,7 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/upstreamOperationScheduler.test.js",
   "test/upstreamPresentation.test.js",
   "test/webAppUrls.test.js",
+  "test/webviewMessage.test.js",
   "test/workspaceCache.test.js",
   "test/lockfileParsers/cargoParser.test.js",
   "test/lockfileParsers/dockerParser.test.js",
