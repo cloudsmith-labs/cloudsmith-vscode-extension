@@ -15,6 +15,25 @@
     "url": "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension"
   },
   "icon": "media/logo.png",
+  "files": [
+    "extension.js",
+    "models/**/*.js",
+    "util/**/*.js",
+    "views/**/*.js",
+    "media/icon.svg",
+    "media/logo.png",
+    "media/repo.png",
+    "media/workspace_dark.svg",
+    "media/workspace_light.svg",
+    "media/readme/*.gif",
+    "media/readme/*.jpg",
+    "media/readme/*.png",
+    "media/vscode_icons/file_type_*.svg",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "CONTRIBUTORS.md"
+  ],
   "engines": {
     "vscode": "^1.99.0"
   },
@@ -899,19 +918,30 @@
   },
   "scripts": {
     "build": "node scripts/verify-build.js",
-    "lint": "eslint .",
+    "syntax": "node scripts/check-syntax.js",
+    "lint": "eslint . --max-warnings 0",
+    "check": "npm run lint && npm run syntax && npm run build && npm run verify:version",
+    "verify:version": "node scripts/release/verify-version.js",
+    "audit:runtime": "node scripts/release/verify-dependency-audit.js runtime",
+    "audit:dev": "node scripts/release/verify-dependency-audit.js development",
     "pretest": "npm run lint",
-    "test": "vscode-test",
+    "test": "node scripts/run-vscode-tests.js",
+    "test:zero-guard": "node scripts/run-vscode-tests.js --zero-probe",
+    "test:live": "node scripts/run-vscode-tests.js --label live",
+    "package": "node scripts/release/package-vsix.js",
+    "package:verify": "node scripts/release/verify-vsix.js --require-sidecars",
+    "package:list": "node scripts/release/verify-vsix.js --require-sidecars --list",
     "vscode:prepublish": "npm run build"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
     "@types/vscode": "^1.99.0",
-    "@vscode/test-cli": "^0.0.10",
-    "@vscode/test-electron": "^2.5.2",
+    "@vscode/test-cli": "0.0.15",
+    "@vscode/test-electron": "3.1.0",
     "@vscode/vsce": "^3.9.2",
-    "eslint": "^9.25.1"
+    "eslint": "^9.25.1",
+    "yauzl": "3.4.0"
   },
   "dependencies": {},
   "keywords": [

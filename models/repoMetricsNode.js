@@ -33,7 +33,7 @@ class RepoMetricsNode {
       }
 
       description = parts.join(" | ") || "No usage data available";
-    } catch (_) {
+    } catch {
       description = "Could not load metrics";
     }
 
