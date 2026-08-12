@@ -520,20 +520,6 @@ class UpstreamDetailProvider {
       color: var(--vscode-testing-iconPassed);
       font-weight: 600;
     }
-    .trust-callout {
-      margin-top: 10px;
-      padding: 10px 12px;
-      border: 1px solid var(--vscode-inputValidation-infoBorder);
-      border-radius: 6px;
-      background: var(--vscode-inputValidation-infoBackground);
-      line-height: 1.4;
-    }
-    .trust-callout-title {
-      display: block;
-      margin-bottom: 2px;
-      font-weight: 600;
-      color: var(--vscode-foreground);
-    }
     .empty-state {
       margin: 8px 0 0 0;
       color: var(--vscode-descriptionForeground);
@@ -592,8 +578,6 @@ class UpstreamDetailProvider {
       this._renderDetail("Created", this._formatCreatedAt(upstream.created_at), ""),
     ].filter(Boolean).join("\n");
 
-    const trustCallout = this._renderTrustCallout(upstream);
-
     return `<article class="upstream-card">
   <div class="card-header">
     <div class="card-title">${this._escape(formatUpstreamText(upstream.name, "Unnamed"))}</div>
@@ -602,7 +586,6 @@ class UpstreamDetailProvider {
   <div class="details-grid">
     ${details}
   </div>
-  ${trustCallout}
 </article>`;
   }
 
@@ -621,24 +604,6 @@ class UpstreamDetailProvider {
     if (upstream.trust_level === "Untrusted") {
       return `<div class="detail-label">Trust level</div><div class="detail-value trust-value-untrusted">${this._escape(upstream.trust_level)}</div>`;
     }
-    return "";
-  }
-
-  _renderTrustCallout(upstream) {
-    if (upstream.trust_level === "Trusted") {
-      return `<div class="trust-callout">
-  <span class="trust-callout-title">Trusted upstream:</span>
-  ${this._escape("This source can serve any package, including versions of packages that exist in a private repository. Packages from this upstream are not blocked by dependency confusion protections.")}
-</div>`;
-    }
-
-    if (upstream.trust_level === "Untrusted") {
-      return `<div class="trust-callout">
-  <span class="trust-callout-title">Untrusted upstream (recommended):</span>
-  ${this._escape("If a package name exists in a private repository or another trusted source, this upstream is blocked from serving versions of that package. This protects against namesquatting and dependency confusion attacks.")}
-</div>`;
-    }
-
     return "";
   }
 

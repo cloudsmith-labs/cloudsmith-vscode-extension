@@ -117,6 +117,32 @@ suite("UpstreamDetailProvider Test Suite", () => {
     assert.ok(html.length < 20_000);
   });
 
+  test("shows trust level without explanatory trust callouts", () => {
+    const provider = new UpstreamDetailProvider({});
+    const html = provider._getHtmlContent("acme", "repo", "Repo", {
+      groupedUpstreams: new Map([
+        ["python", [
+          { name: "Trusted source", trust_level: "Trusted" },
+          { name: "Untrusted source", trust_level: "Untrusted" },
+        ]],
+      ]),
+      failedFormats: [],
+      uninspectedFormats: [],
+      successfulFormats: 20,
+      configuredTotal: 2,
+      complete: true,
+      state: "complete",
+    });
+
+    assert.ok(html.includes("Trust level"));
+    assert.ok(html.includes("Trusted"));
+    assert.ok(html.includes("Untrusted"));
+    assert.ok(!html.includes("Trusted upstream:"));
+    assert.ok(!html.includes("Untrusted upstream (recommended):"));
+    assert.ok(!html.includes("dependency confusion"));
+    assert.ok(!html.includes("namesquatting"));
+  });
+
   test("caps rendered cards before joining HTML", () => {
     const provider = new UpstreamDetailProvider({});
     const groupedUpstreams = new Map([
