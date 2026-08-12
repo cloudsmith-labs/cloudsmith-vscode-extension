@@ -233,7 +233,8 @@ suite("UpstreamDetailProvider Test Suite", () => {
     assert.ok(html.includes("PyPI &lt;script&gt;"));
     assert.ok(html.includes("npm"));
     assert.ok(html.includes("timed out"));
-    assert.ok(html.includes("Not applicable to this API: terraform"));
+    assert.ok(!html.includes("Not applicable"));
+    assert.ok(!html.includes("terraform"));
     assert.ok(html.includes(">Retry<"));
     assert.ok(/script-src 'nonce-[^']+'/.test(html));
     assert.ok(!html.includes("[object Object]"));

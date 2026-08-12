@@ -23,9 +23,6 @@ class UpstreamIndicatorNode {
             ? options.uninspectedFormats.filter(format => typeof format === "string")
             : [];
         this.failures = Array.isArray(options.failures) ? options.failures : [];
-        this.unsupportedFormats = Array.isArray(options.unsupportedFormats)
-            ? options.unsupportedFormats.filter(format => typeof format === "string")
-            : [];
         this.complete = options.complete === true
             && this.failedFormats.length === 0
             && this.uninspectedFormats.length === 0;
@@ -59,10 +56,6 @@ class UpstreamIndicatorNode {
                 ? safeFailureLines.join("\n")
                 : unavailableFormats.join(", ")}`
             : partial ? "\nThe configured total could not be verified." : "";
-        const unsupportedDetail = this.unsupportedFormats.length > 0
-            ? `\nNot applicable to the upstream API: ${this.unsupportedFormats.join(", ")}`
-            : "";
-
         const displayedUpstreams = this.upstreams.slice(0, MAX_TOOLTIP_UPSTREAMS);
         const loadedUpstreamDetail = displayedUpstreams.map((upstream) => (
             `${formatUpstreamText(upstream.name, "Unnamed")} (${formatUpstreamText(
@@ -80,7 +73,7 @@ class UpstreamIndicatorNode {
 
         return {
             label,
-            tooltip: `${loadedUpstreamDetail}${omittedDetail}${failureDetail}${unsupportedDetail}`,
+            tooltip: `${loadedUpstreamDetail}${omittedDetail}${failureDetail}`,
             collapsibleState: vscode.TreeItemCollapsibleState.None,
             contextValue: "upstreamIndicator",
             iconPath: new vscode.ThemeIcon('cloud'),

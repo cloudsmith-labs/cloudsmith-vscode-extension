@@ -321,7 +321,6 @@ class UpstreamDetailProvider {
       uninspectedFormats = [],
       successfulFormats,
       failures = [],
-      unsupportedFormats = [],
     } = fetchState;
     const formatSections = [];
     const hasLoadedUpstreams = groupedUpstreams.size > 0;
@@ -365,9 +364,6 @@ class UpstreamDetailProvider {
   )}
 </div>`
       : "";
-    const unsupportedNotice = unsupportedFormats.length > 0
-      ? `<p class="subtle">Not applicable to this API: ${this._escape(unsupportedFormats.join(", "))}.</p>`
-      : "";
     const refreshNotice = options.refreshing
       ? `<p class="subtle">Refreshing upstreams… Existing results remain visible.</p>`
       : options.refreshFailed
@@ -384,8 +380,8 @@ class UpstreamDetailProvider {
       ? `<p class="subtle">Showing ${renderedCount} of ${loadedCount} loaded upstreams.</p>`
       : "";
     const contentHtml = hasLoadedUpstreams
-      ? `${refreshNotice}${partialWarning}${unsupportedNotice}${displayLimitNotice}${formatSections.join("\n")}${retryButton}`
-      : `${refreshNotice}${this._getEmptyOrErrorState(hasFailures, successfulFormats, failures)}${unsupportedNotice}${retryButton}`;
+      ? `${refreshNotice}${partialWarning}${displayLimitNotice}${formatSections.join("\n")}${retryButton}`
+      : `${refreshNotice}${this._getEmptyOrErrorState(hasFailures, successfulFormats, failures)}${retryButton}`;
     const nonce = crypto.randomBytes(16).toString("base64");
     const script = retryButton ? `<script nonce="${nonce}">
   const vscode = acquireVsCodeApi();

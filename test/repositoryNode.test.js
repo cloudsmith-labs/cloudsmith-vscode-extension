@@ -1315,12 +1315,18 @@ suite("RepositoryNode Test Suite", () => {
       }],
       {},
       context,
-      { complete: false, failedFormats: ["npm"] }
+      {
+        complete: false,
+        failedFormats: ["npm"],
+        unsupportedFormats: ["terraform"],
+      }
     );
     const item = indicator.getTreeItem();
     assert.strictEqual(item.label, "Upstreams: 1 active among 1 loaded (partial)");
     assert.ok(item.tooltip.includes("Could not inspect:"));
     assert.ok(item.tooltip.includes("npm"));
+    assert.ok(!item.tooltip.includes("Not applicable"));
+    assert.ok(!item.tooltip.includes("terraform"));
     assert.ok(item.tooltip.includes("PyPI (https://pypi.org)"));
     assert.ok(!item.tooltip.includes("user:pass"));
     assert.ok(!item.tooltip.includes("/simple/"));
