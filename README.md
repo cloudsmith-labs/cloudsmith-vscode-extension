@@ -179,7 +179,7 @@ The extension exposes several settings under `cloudsmith-vsc.*`:
 | `cloudsmith-vsc.resolveTransitiveDependencies` | Parse lockfiles to resolve transitive dependencies. When disabled, only direct manifest dependencies are shown. Default: `true`. |
 | `cloudsmith-vsc.dependencyTreeDefaultView` | Default view mode for the Dependency Health panel: `direct`, `flat`, or `tree`. Default: `flat`. |
 | `cloudsmith-vsc.maxDependenciesToScan` | Maximum number of dependencies to display. Pull operations always process all dependencies regardless of this limit. Default: `10000`. |
-| `cloudsmith-vsc.searchPageSize` | Number of results per page when searching packages (10–100). Default: `50`. |
+| `cloudsmith-vsc.searchPageSize` | Results per repository for Advanced Search across selected repositories (10–100). Workspace and single-repository searches request at most 10 per page. Default: `50`. |
 | `cloudsmith-vsc.recentSearches` | Number of recent searches to remember (0–50). Default: `10`. |
 
 ### Commands

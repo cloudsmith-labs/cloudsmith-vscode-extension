@@ -12,7 +12,7 @@ class LoadMoreNode {
 
     getTreeItem() {
         const progress = Number.isSafeInteger(this.totalCount) && this.totalCount >= 0
-            ? `page ${this.currentPage} of ${this.totalPages}, ${this.totalCount} total`
+            ? `${Number.isSafeInteger(this.loadedCount) ? this.loadedCount : 0} of ${this.totalCount} loaded; page ${this.currentPage} of ${this.totalPages}`
             : `${Number.isSafeInteger(this.loadedCount) ? this.loadedCount : 0} loaded; page ${this.currentPage} of ${this.totalPages}`;
         return {
             label: `Load more results (${progress})`,
