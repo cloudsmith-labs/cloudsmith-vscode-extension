@@ -205,6 +205,7 @@ async function fetchRepositoryUpstreams(context, workspace, repoSlug, options = 
   const upstreamData = await getAllUpstreamData(context, workspace, repoSlug, {
     ...options,
     bypassCache: true,
+    projection: "privileged",
   });
   if (upstreamData === null) {
     return null;

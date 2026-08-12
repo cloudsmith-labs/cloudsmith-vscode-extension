@@ -6,6 +6,8 @@ const {
 const {
   UpstreamPullService,
 } = require("../util/upstreamPullService");
+const { UpstreamChecker } = require("../util/upstreamChecker");
+const { apiSuccess } = require("./apiResultHelpers");
 
 function createResponse(status, body, headers = {}) {
   return new Response(body, { status, headers });
@@ -29,6 +31,34 @@ function cancellationToken() {
       listeners.add(listener);
       return { dispose() { listeners.delete(listener); } };
     },
+  };
+}
+
+function safeUpstream(format, name, overrides = {}) {
+  return {
+    name,
+    format,
+    _format: format,
+    origin: `https://${format}.example`,
+    ...overrides,
+  };
+}
+
+function completeRepositoryState(entriesByFormat) {
+  const groupedUpstreams = new Map(Object.entries(entriesByFormat));
+  const formats = [...groupedUpstreams.keys()];
+  return {
+    groupedUpstreams,
+    complete: true,
+    failedFormats: [],
+    uninspectedFormats: [],
+    unsupportedFormats: [],
+    outcomes: formats.map(format => ({
+      format,
+      apiFormat: format,
+      state: "success",
+      authoritative: true,
+    })),
   };
 }
 
@@ -133,12 +163,10 @@ suite("UpstreamPullService", () => {
       }),
       upstreamChecker: {
         async getRepositoryUpstreamState() {
-          return {
-            groupedUpstreams: new Map([
-              ["maven", [{ name: "Maven Central", is_active: true }]],
-            ]),
-            complete: true,
-          };
+          return completeRepositoryState({
+            maven: [safeUpstream("maven", "Maven Central", { is_active: true })],
+            python: [],
+          });
         },
       },
       showQuickPick: async (items) => items[0],
@@ -189,12 +217,9 @@ suite("UpstreamPullService", () => {
       }),
       upstreamChecker: {
         async getRepositoryUpstreamState() {
-          return {
-            groupedUpstreams: new Map([
-              ["npm", [{ name: "npm", is_active: true }]],
-            ]),
-            complete: true,
-          };
+          return completeRepositoryState({
+            npm: [safeUpstream("npm", "npm", { is_active: true })],
+          });
         },
       },
       showQuickPick: async (items) => items[0],
@@ -767,12 +792,11 @@ suite("UpstreamPullService", () => {
       }),
       upstreamChecker: {
         async getRepositoryUpstreamState(_workspace, repo) {
-          return {
-            groupedUpstreams: new Map([
-              ["python", repo === "repo-b" ? [{ name: "PyPI", is_active: true }] : []],
-            ]),
-            complete: true,
-          };
+          return completeRepositoryState({
+            python: repo === "repo-b"
+              ? [safeUpstream("python", "PyPI", { is_active: true })]
+              : [],
+          });
         },
       },
       showQuickPick: async (items) => {
@@ -856,6 +880,13 @@ suite("UpstreamPullService", () => {
             complete: false,
             failedFormats: [],
             uninspectedFormats: ["python"],
+            unsupportedFormats: [],
+            outcomes: [{
+              format: "python",
+              apiFormat: "python",
+              state: "cancelled",
+              authoritative: false,
+            }],
           };
         },
       },
@@ -952,5 +983,303 @@ suite("UpstreamPullService", () => {
 
     assert.strictEqual(warnings.length, 4);
     assert.ok(warnings.every((message) => /absence was not conclusively established/.test(message)));
+  });
+
+  test("uses real canonical outcomes for mixed inspectable and non-inspectable pull preparation", async () => {
+    const requests = [];
+    const warnings = [];
+    let repositoryFetches = 0;
+    const account = {
+      getState() {
+        return { activationId: "account-a", accountEpoch: 1, sessionConnected: true };
+      },
+    };
+    const checker = new UpstreamChecker({}, {
+      connectionManager: account,
+      cloudsmithAPI: {
+        async get(endpoint) {
+          requests.push(endpoint);
+          return apiSuccess([{
+            name: "npmjs",
+            slug_perm: "npmjs",
+            upstream_url: "https://registry.npmjs.org/",
+            is_active: true,
+          }]);
+        },
+      },
+    });
+    const service = new UpstreamPullService({}, {
+      connectionManager: account,
+      upstreamChecker: checker,
+      fetchRepositories: async () => {
+        repositoryFetches += 1;
+        return { items: [{ slug: "repo", name: "Repo" }], complete: true };
+      },
+      showQuickPick: async items => items[0],
+      showWarningMessage: async (message, _options, action) => {
+        warnings.push(message);
+        return action;
+      },
+      showInformationMessage: async () => {},
+      showErrorMessage: async () => {},
+    });
+
+    const prepared = await service.prepare({
+      workspace: "workspace",
+      dependencies: [
+        { name: "package-a", version: "1.0.0", format: "NPM", cloudsmithStatus: "ABSENT" },
+        { name: "archive", version: "1.0.0", format: "raw", cloudsmithStatus: "ABSENT" },
+      ],
+    });
+
+    assert.ok(prepared);
+    assert.strictEqual(repositoryFetches, 1);
+    assert.strictEqual(requests.length, 1);
+    assert.match(requests[0], /upstream\/npm\//);
+    assert.doesNotMatch(requests[0], /upstream\/raw\//);
+    assert.strictEqual(prepared.repositorySearchComplete, true);
+    assert.deepStrictEqual(prepared.plan.pullableDependencies.map(item => item.format), ["NPM"]);
+    assert.strictEqual(prepared.plan.skippedDependencies.length, 1);
+    assert.strictEqual(prepared.plan.skippedDependencies[0].reason, "no_pull_support");
+    assert.ok(warnings.every(message => !/inspection was incomplete/i.test(message)));
+    assert.match(warnings[0], /1 Raw will be skipped/);
+  });
+
+  test("short-circuits zero executable formats before repository enumeration", async () => {
+    for (const format of ["raw", "terraform", "alpine"]) {
+      let repositoryFetches = 0;
+      const messages = [];
+      const service = new UpstreamPullService({}, {
+        fetchRepositories: async () => {
+          repositoryFetches += 1;
+          return { items: [{ slug: "repo" }], complete: true };
+        },
+        showInformationMessage: async message => messages.push(message),
+        showWarningMessage: async () => {},
+        showErrorMessage: async () => {},
+      });
+      const prepared = await service.prepare({
+        workspace: "workspace",
+        dependencies: [{
+          name: "package-a", version: "1.0.0", format, cloudsmithStatus: "ABSENT",
+        }],
+      });
+      assert.strictEqual(prepared, null, format);
+      assert.strictEqual(repositoryFetches, 0, format);
+      assert.match(messages[0], /Pull-through caching is not available/i, format);
+      assert.doesNotMatch(messages[0], /incomplete/i, format);
+    }
+  });
+
+  test("prepareSingle reports a recognized non-inspectable format as unavailable", async () => {
+    let repositoryFetches = 0;
+    const messages = [];
+    const service = new UpstreamPullService({}, {
+      fetchRepositories: async () => {
+        repositoryFetches += 1;
+        return { items: [{ slug: "repo" }], complete: true };
+      },
+      showInformationMessage: async message => messages.push(message),
+      showWarningMessage: async () => {},
+      showErrorMessage: async () => {},
+    });
+    const prepared = await service.prepareSingle({
+      workspace: "workspace",
+      dependency: {
+        name: "archive", version: "1.0.0", format: "raw", cloudsmithStatus: "ABSENT",
+      },
+    });
+    assert.strictEqual(prepared, null);
+    assert.strictEqual(repositoryFetches, 0);
+    assert.match(messages[0], /not available for Raw dependencies/i);
+    assert.doesNotMatch(messages[0], /incomplete|failed/i);
+  });
+
+  test("proves pull inspection completeness from canonical authoritative outcomes", async () => {
+    const cases = [
+      {
+        name: "inspectable success",
+        formats: [" NPM "],
+        state: completeRepositoryState({ npm: [] }),
+        expected: true,
+      },
+      {
+        name: "inspectable failure",
+        formats: ["npm"],
+        state: {
+          groupedUpstreams: new Map(), complete: false,
+          failedFormats: ["npm"], uninspectedFormats: [], unsupportedFormats: [],
+          outcomes: [{ format: "npm", apiFormat: "npm", state: "failed", authoritative: false }],
+        },
+        expected: false,
+      },
+      {
+        name: "mixed inspectable and neutral",
+        formats: ["NPM", "raw"],
+        state: {
+          ...completeRepositoryState({ npm: [] }),
+          complete: true,
+          unsupportedFormats: ["raw"],
+          outcomes: [
+            { format: "npm", apiFormat: "npm", state: "success", authoritative: true },
+            { format: "raw", apiFormat: null, state: "unsupported", authoritative: true },
+          ],
+        },
+        expected: true,
+      },
+      {
+        name: "neutral only",
+        formats: ["raw", "terraform"],
+        state: {
+          groupedUpstreams: new Map(), complete: false,
+          failedFormats: [], uninspectedFormats: [], unsupportedFormats: ["raw", "terraform"],
+          outcomes: [
+            { format: "raw", apiFormat: null, state: "unsupported", authoritative: true },
+            { format: "terraform", apiFormat: null, state: "unsupported", authoritative: true },
+          ],
+        },
+        expected: true,
+      },
+      {
+        name: "unknown",
+        formats: ["unknown"],
+        state: completeRepositoryState({ npm: [] }),
+        expected: false,
+      },
+      {
+        name: "empty",
+        formats: [],
+        state: completeRepositoryState({ npm: [] }),
+        expected: false,
+      },
+      {
+        name: "missing outcome",
+        formats: ["npm"],
+        state: {
+          groupedUpstreams: new Map(), complete: true,
+          failedFormats: [], uninspectedFormats: [], unsupportedFormats: [], outcomes: [],
+        },
+        expected: false,
+      },
+      {
+        name: "duplicate outcome",
+        formats: ["npm"],
+        state: {
+          groupedUpstreams: new Map(), complete: true,
+          failedFormats: [], uninspectedFormats: [], unsupportedFormats: [],
+          outcomes: [
+            { format: "npm", apiFormat: "npm", state: "success", authoritative: true },
+            { format: "npm", apiFormat: "npm", state: "success", authoritative: true },
+          ],
+        },
+        expected: false,
+      },
+      {
+        name: "inspectable mislabeled unsupported",
+        formats: ["npm"],
+        state: {
+          groupedUpstreams: new Map(), complete: false,
+          failedFormats: [], uninspectedFormats: [], unsupportedFormats: ["npm"], outcomes: [],
+        },
+        expected: false,
+      },
+      {
+        name: "success contradicts failed list",
+        formats: ["npm"],
+        state: {
+          ...completeRepositoryState({ npm: [] }),
+          failedFormats: ["npm"],
+        },
+        expected: false,
+      },
+      {
+        name: "requested subset succeeds while another inspected format explains incompleteness",
+        formats: ["npm"],
+        state: {
+          groupedUpstreams: new Map(), complete: false, incomplete: true,
+          failedFormats: ["python"], uninspectedFormats: [], unsupportedFormats: [],
+          outcomes: [
+            { format: "npm", apiFormat: "npm", state: "success", authoritative: true },
+            { format: "python", apiFormat: "python", state: "failed", authoritative: false },
+          ],
+        },
+        expected: true,
+      },
+      {
+        name: "authoritative outcome contradicts incomplete aggregate",
+        formats: ["npm"],
+        state: {
+          ...completeRepositoryState({ npm: [] }),
+          complete: false,
+        },
+        expected: false,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const service = new UpstreamPullService({}, {
+        upstreamChecker: {
+          async getRepositoryUpstreamStateForFormats() { return testCase.state; },
+        },
+      });
+      const result = await service._findMatchingRepositories(
+        "workspace", [{ slug: "repo" }], testCase.formats,
+        service._createPreparationOperation(null, null)
+      );
+      assert.strictEqual(result.complete, testCase.expected, testCase.name);
+    }
+  });
+
+  test("requires canonical requested grouped data while retaining safe positive matches", async () => {
+    const valid = safeUpstream("npm", "npmjs", { is_active: true });
+    const missingOrigin = { ...valid };
+    delete missingOrigin.origin;
+    const cases = [
+      ["missing origin", [valid, missingOrigin], 1],
+      ["privileged field", [valid, { ...valid, upstream_url: "https://secret.example/path" }], 1],
+      ["wrong format", [valid, safeUpstream("python", "PyPI")], 1],
+      ["malformed record", [valid, {}], 1],
+      ["non-array format entry", { ...valid }, 0],
+    ];
+
+    for (const [name, groupedValue, expectedMatches] of cases) {
+      const state = completeRepositoryState({ npm: [] });
+      state.groupedUpstreams.set("npm", groupedValue);
+      const service = new UpstreamPullService({}, {
+        upstreamChecker: {
+          async getRepositoryUpstreamStateForFormats() { return state; },
+        },
+      });
+      const result = await service._findMatchingRepositories(
+        "workspace", [{ slug: "repo" }], ["npm"],
+        service._createPreparationOperation(null, null)
+      );
+      assert.strictEqual(result.complete, false, name);
+      assert.strictEqual(result.matches.length, expectedMatches, name);
+      if (expectedMatches > 0) {
+        assert.deepStrictEqual(result.matches[0].activeUpstreamsByFormat.get("npm"), [valid], name);
+      }
+    }
+  });
+
+  test("treats absent and empty requested grouped entries as valid verified absence", async () => {
+    for (const [name, groupedUpstreams] of [
+      ["absent", new Map()],
+      ["empty", new Map([["npm", []]])],
+    ]) {
+      const state = completeRepositoryState({ npm: [] });
+      state.groupedUpstreams = groupedUpstreams;
+      const service = new UpstreamPullService({}, {
+        upstreamChecker: {
+          async getRepositoryUpstreamStateForFormats() { return state; },
+        },
+      });
+      const result = await service._findMatchingRepositories(
+        "workspace", [{ slug: "repo" }], ["npm"],
+        service._createPreparationOperation(null, null)
+      );
+      assert.strictEqual(result.complete, true, name);
+      assert.deepStrictEqual(result.matches, [], name);
+    }
   });
 });

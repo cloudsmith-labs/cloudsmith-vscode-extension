@@ -322,6 +322,80 @@ suite("RepositoryNode Test Suite", () => {
     assert.strictEqual(children[0].getTreeItem().label, "Upstreams: 1 active of 1 configured");
   });
 
+  test("loads upstreams through the exact RepositoryNode production aggregation path", async () => {
+    let upstreamRequests = 0;
+    CloudsmithAPI.prototype.get = async (endpoint) => {
+      if (!endpoint.includes("/upstream/")) {
+        throw new Error("Unexpected non-upstream transport request");
+      }
+      upstreamRequests += 1;
+      if (endpoint.includes("/upstream/python/")) {
+        return apiSuccess([{
+          name: "PyPI",
+          slug_perm: "pypi",
+          upstream_url: "https://pypi.org/simple",
+          auth_username: null,
+          index_package_count: null,
+          is_active: true,
+        }]);
+      }
+      return apiSuccess([]);
+    };
+    const repositoryNode = new RepositoryNode(
+      { slug: "production-repo", slug_perm: "production-repo", name: "Production Repo" },
+      "acme",
+      context,
+      { connectionManager }
+    );
+    repositoryNode.getPackages = async () => [{ format: "python" }];
+    repositoryNode._packageState = { ...repositoryNode._packageState, pageCount: 1 };
+
+    const children = await repositoryNode.getChildren();
+
+    assert.strictEqual(upstreamRequests, 20);
+    assert.ok(children[0] instanceof UpstreamIndicatorNode);
+    assert.strictEqual(children[0].complete, true);
+    assert.strictEqual(children[0].upstreams.length, 1);
+    assert.strictEqual(children[0].upstreams[0].slug_perm, "pypi");
+    assert.strictEqual(children[0].upstreams[0].origin, "https://pypi.org");
+  });
+
+  test("retains production-path upstream data when another format fails", async () => {
+    CloudsmithAPI.prototype.get = async (endpoint) => {
+      if (endpoint.includes("/upstream/python/")) {
+        return apiSuccess([{
+          name: "PyPI",
+          slug_perm: "pypi",
+          upstream_url: "https://pypi.org/simple",
+          is_active: true,
+        }]);
+      }
+      if (endpoint.includes("/upstream/npm/")) {
+        return apiFailure("permission", { status: 403 });
+      }
+      return apiSuccess([]);
+    };
+    const repositoryNode = new RepositoryNode(
+      { slug: "partial-repo", slug_perm: "partial-repo", name: "Partial Repo" },
+      "acme",
+      context,
+      { connectionManager }
+    );
+    repositoryNode.getPackages = async () => [{ format: "python" }];
+    repositoryNode._packageState = { ...repositoryNode._packageState, pageCount: 1 };
+
+    const children = await repositoryNode.getChildren();
+    const indicator = children.find(child => child instanceof UpstreamIndicatorNode);
+
+    assert.ok(indicator);
+    assert.strictEqual(indicator.complete, false);
+    assert.strictEqual(indicator.upstreams.length, 1);
+    assert.strictEqual(indicator.failures[0].format, "npm");
+    assert.strictEqual(indicator.failures[0].category, "permission");
+    assert.ok(indicator.getTreeItem().label.includes("partial"));
+    assert.ok(!indicator.getTreeItem().label.includes("configured"));
+  });
+
   test("repository packages do not expose vulnerability nodes for clean npm and Python scans", async () => {
     const packageBase = {
       namespace: "acme",
@@ -1236,16 +1310,24 @@ suite("RepositoryNode Test Suite", () => {
     const indicator = new UpstreamIndicatorNode(
       [{
         name: "PyPI",
+        origin: "https://pypi.org",
         upstream_url: "https://user:pass@pypi.org/simple/?token=secret#fragment",
         is_active: true,
       }],
       {},
       context,
-      { complete: false, failedFormats: ["npm"] }
+      {
+        complete: false,
+        failedFormats: ["npm"],
+        unsupportedFormats: ["terraform"],
+      }
     );
     const item = indicator.getTreeItem();
     assert.strictEqual(item.label, "Upstreams: 1 active among 1 loaded (partial)");
-    assert.ok(item.tooltip.includes("Could not load formats: npm"));
+    assert.ok(item.tooltip.includes("Could not inspect:"));
+    assert.ok(item.tooltip.includes("npm"));
+    assert.ok(!item.tooltip.includes("Not applicable"));
+    assert.ok(!item.tooltip.includes("terraform"));
     assert.ok(item.tooltip.includes("PyPI (https://pypi.org)"));
     assert.ok(!item.tooltip.includes("user:pass"));
     assert.ok(!item.tooltip.includes("/simple/"));

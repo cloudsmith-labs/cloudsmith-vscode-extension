@@ -1,6 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const { canonicalFormat, normalizePackageName } = require("./packageNameNormalizer");
-const { normalizeUpstreamFormat } = require("./upstreamFormats");
+const { getUpstreamFormatDescriptor, normalizeUpstreamFormat } = require("./upstreamFormats");
 const { UpstreamChecker } = require("./upstreamChecker");
 const { UpstreamOperationScheduler } = require("./upstreamOperationScheduler");
 
@@ -60,7 +60,7 @@ function classifyDependency(dependency, snapshots, options = {}) {
   }
 
   const upstreamFormat = normalizeUpstreamFormat(format);
-  if (!upstreamFormat) {
+  if (!upstreamFormat || !getUpstreamFormatDescriptor(upstreamFormat)?.inspectable) {
     return {
       upstreamStatus: "unreachable",
       upstreamDetail: "Not available through Cloudsmith",
@@ -155,7 +155,7 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
     ? uncoveredDependencies
     : []).map(dependency => normalizeUpstreamFormat(canonicalFormat(
       dependency && (dependency.format || dependency.ecosystem)
-    ))).filter(Boolean))];
+    ))).filter(format => getUpstreamFormatDescriptor(format)?.inspectable))];
 
   if (repositoriesToInspect.length === 0 || formatsToInspect.length === 0) {
     const emptyPatch = buildGapPatch(uncoveredDependencies, [], { repositoriesComplete });
@@ -202,6 +202,9 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
       failedFormats: Array.isArray(state?.failedFormats) ? state.failedFormats : [],
       uninspectedFormats: Array.isArray(state?.uninspectedFormats)
         ? state.uninspectedFormats
+        : [],
+      unsupportedFormats: Array.isArray(state?.unsupportedFormats)
+        ? state.unsupportedFormats
         : [],
     });
 

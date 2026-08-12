@@ -1,9 +1,17 @@
 function apiSuccess(data, options = {}) {
+  const defaultHeaders = Array.isArray(data) && data.length > 0
+    ? {
+        "x-pagination-page": "1",
+        "x-pagination-pagetotal": "1",
+        "x-pagination-count": String(data.length),
+        "x-pagination-pagesize": "100",
+      }
+    : {};
   return {
     ok: true,
     data,
     status: options.status || 200,
-    headers: options.headers || {},
+    headers: options.headers || defaultHeaders,
     requestId: options.requestId || "test-request-id",
     serverRequestId: null,
     attempts: options.attempts || 1,

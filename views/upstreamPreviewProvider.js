@@ -1,7 +1,10 @@
 // Upstream resolution preview WebView panel.
 // Shows a "what if I pull this?" dry run for packages that don't exist locally.
 
+const { types: { isProxy } } = require("util");
 const vscode = require("vscode");
+const { sanitizeSafeInventoryUpstream } = require("../util/upstreamChecker");
+const { getUpstreamFormatDescriptor } = require("../util/upstreamFormats");
 const {
   formatUpstreamError,
   formatUpstreamOrigin,
@@ -42,39 +45,62 @@ class UpstreamPreviewProvider {
   }
 
   _getHtmlContent(result) {
-    const local = result.local && typeof result.local === "object" ? result.local : {};
-    const upstreamState = result.upstreams && typeof result.upstreams === "object"
-      ? result.upstreams
+    const formatDescriptor = getUpstreamFormatDescriptor(ownDataValue(result, "format"));
+    const canonicalFormat = formatDescriptor?.inspectable ? formatDescriptor.format : null;
+    const localValue = ownDataValue(result, "local");
+    const local = localValue && typeof localValue === "object" ? localValue : {};
+    const upstreamValue = ownDataValue(result, "upstreams");
+    const upstreamState = upstreamValue && typeof upstreamValue === "object"
+      ? upstreamValue
       : {};
-    const upstreamData = upstreamState.data && typeof upstreamState.data === "object"
-      ? upstreamState.data
+    const upstreamDataValue = ownDataValue(upstreamState, "data");
+    const upstreamData = upstreamDataValue && typeof upstreamDataValue === "object"
+      ? upstreamDataValue
       : {};
-    const rawConfigs = Array.isArray(upstreamData.configs) ? upstreamData.configs : [];
-    const boundedConfigs = rawConfigs.slice(0, MAX_PREVIEW_UPSTREAMS);
-    const configs = boundedConfigs.filter(isPreviewUpstreamConfig);
-    const metadataConsistent = rawConfigs.length <= MAX_PREVIEW_UPSTREAMS
+    const rawConfigState = snapshotOwnDataArray(
+      ownDataValue(upstreamData, "configs"),
+      MAX_PREVIEW_UPSTREAMS
+    );
+    const rawConfigs = rawConfigState.values;
+    const sanitizedConfigs = canonicalFormat
+      ? rawConfigs.map(config => sanitizeSafeInventoryUpstream(config, canonicalFormat))
+      : [];
+    const configs = sanitizedConfigs.filter(Boolean);
+    const metadataConsistent = canonicalFormat !== null
+      && rawConfigState.valid
       && configs.length === rawConfigs.length
-      && upstreamData.total === configs.length
-      && upstreamData.active === configs.filter(config => config.is_active !== false).length;
+      && ownDataValue(upstreamData, "total") === configs.length
+      && ownDataValue(upstreamData, "active")
+        === configs.filter(config => config.is_active !== false).length;
     const displayedConfigs = configs
       .slice(0, MAX_RENDERED_UPSTREAMS);
     const loadedTotal = configs.length;
     const activeTotal = configs.filter(config => config.is_active !== false).length;
-    const localError = local.errorMessage == null
+    const localErrorValue = ownDataValue(local, "errorMessage");
+    const localData = ownDataValue(local, "data");
+    const localComplete = ownDataValue(local, "complete");
+    const upstreamErrorValue = ownDataValue(upstreamState, "errorMessage");
+    const upstreamCompleteValue = ownDataValue(upstreamState, "complete");
+    const repository = ownDataValue(result, "repo");
+    const localError = localErrorValue == null
       ? null
-      : formatUpstreamError(local.errorMessage, "local");
-    const upstreamError = upstreamState.errorMessage == null
+      : formatUpstreamError(localErrorValue, "local");
+    const upstreamError = upstreamErrorValue == null
       ? null
-      : formatUpstreamError(upstreamState.errorMessage, "upstream");
-    const upstreamComplete = upstreamState.complete === true
+      : formatUpstreamError(upstreamErrorValue, "upstream");
+    const upstreamComplete = upstreamCompleteValue === true
       && metadataConsistent
       && upstreamError === null;
     const localStatus = localError
       ? `<span class="status-error">Could not verify local package data: ${this._escapeHtml(localError)}</span>`
-      : local.data
-        ? `<span class="status-found">Found in ${this._escapeHtml(formatUpstreamText(result.repo))} (${this._escapeHtml(formatUpstreamText(local.data.status_str, "Unknown"))})</span>`
-        : local.complete === true
-          ? `<span class="status-missing">Not found in ${this._escapeHtml(formatUpstreamText(result.repo))}</span>`
+      : localData
+        ? `<span class="status-found">Found in ${this._escapeHtml(formatUpstreamText(
+          repository
+        ))} (${this._escapeHtml(formatUpstreamText(
+          ownDataValue(localData, "status_str"), "Unknown"
+        ))})</span>`
+        : localComplete === true
+          ? `<span class="status-missing">Not found in ${this._escapeHtml(formatUpstreamText(repository))}</span>`
           : '<span class="status-error">Local package status is incomplete.</span>';
 
     let upstreamHtml = "";
@@ -95,7 +121,7 @@ class UpstreamPreviewProvider {
         const statusLabel = active ? "Active" : "Inactive";
         upstreamHtml += `<tr>
           <td>${this._escapeHtml(formatUpstreamText(u.name, "Unnamed"))}</td>
-          <td class="mono">${this._escapeHtml(formatUpstreamOrigin(u.upstream_url))}</td>
+          <td class="mono">${this._escapeHtml(formatUpstreamOrigin(u.origin))}</td>
           <td class="${statusClass}">${statusLabel}</td>
         </tr>`;
       }
@@ -145,9 +171,11 @@ class UpstreamPreviewProvider {
 <body>
   <h2>Upstream resolution preview</h2>
   <dl class="header-info">
-    <dt>Package</dt><dd>${this._escapeHtml(formatUpstreamText(result.name, "Unknown"))}</dd>
-    <dt>Format</dt><dd>${this._escapeHtml(formatUpstreamText(result.format, "Unknown"))}</dd>
-    <dt>Target repository</dt><dd>${this._escapeHtml(formatUpstreamText(result.workspace, "Unknown"))}/${this._escapeHtml(formatUpstreamText(result.repo, "Unknown"))}</dd>
+    <dt>Package</dt><dd>${this._escapeHtml(formatUpstreamText(ownDataValue(result, "name"), "Unknown"))}</dd>
+    <dt>Format</dt><dd>${this._escapeHtml(formatUpstreamText(canonicalFormat, "Unknown"))}</dd>
+    <dt>Target repository</dt><dd>${this._escapeHtml(formatUpstreamText(
+      ownDataValue(result, "workspace"), "Unknown"
+    ))}/${this._escapeHtml(formatUpstreamText(ownDataValue(result, "repo"), "Unknown"))}</dd>
     <dt>Local status</dt><dd>${localStatus}</dd>
   </dl>
 
@@ -180,14 +208,46 @@ class UpstreamPreviewProvider {
   }
 }
 
-function isPreviewUpstreamConfig(value) {
-  return Boolean(value)
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && typeof value.name === "string"
-    && value.name.length > 0
-    && (value.is_active === undefined || typeof value.is_active === "boolean")
-    && (value.upstream_url === undefined || typeof value.upstream_url === "string");
+function ownDataValue(value, property) {
+  if (!value || typeof value !== "object" || isProxy(value)) return null;
+  try {
+    if (Array.isArray(value)) return null;
+    const descriptor = Object.getOwnPropertyDescriptor(value, property);
+    return descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value")
+      ? descriptor.value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function snapshotOwnDataArray(value, maximum) {
+  if (isProxy(value)) return { valid: false, values: [] };
+  let descriptors;
+  try {
+    if (!Array.isArray(value)) return { valid: false, values: [] };
+    if (Object.getPrototypeOf(value) !== Array.prototype) return { valid: false, values: [] };
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    return { valid: false, values: [] };
+  }
+  const lengthDescriptor = descriptors.length;
+  const length = lengthDescriptor?.value;
+  if (!Number.isSafeInteger(length) || length < 0 || length > maximum) {
+    return { valid: false, values: [] };
+  }
+  if (Reflect.ownKeys(descriptors).some(key => (
+    typeof key !== "string" || (key !== "length" && !/^(0|[1-9]\d*)$/u.test(key))
+  ))) return { valid: false, values: [] };
+  const values = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+      return { valid: false, values: [] };
+    }
+    values.push(descriptor.value);
+  }
+  return { valid: true, values };
 }
 
 module.exports = { UpstreamPreviewProvider };
