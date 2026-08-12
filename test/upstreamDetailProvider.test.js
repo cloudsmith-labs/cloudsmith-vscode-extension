@@ -1,27 +1,44 @@
 const assert = require("assert");
 const vscode = require("vscode");
 const { UpstreamDetailProvider, SUPPORTED_FORMATS } = require("../views/upstreamDetailProvider");
-const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
+const { UpstreamChecker } = require("../util/upstreamChecker");
+const {
+  getUpstreamFormatDescriptor,
+  SUPPORTED_UPSTREAM_FORMATS,
+} = require("../util/upstreamFormats");
 const { formatUpstreamFailureCategory } = require("../util/upstreamPresentation");
+const { apiSuccess } = require("./apiResultHelpers");
 
 suite("UpstreamDetailProvider Test Suite", () => {
+  const NON_INSPECTABLE_FORMATS = SUPPORTED_UPSTREAM_FORMATS.filter(format => (
+    !getUpstreamFormatDescriptor(format)?.inspectable
+  ));
+
   function aggregate(overrides = {}) {
+    const requestedFormats = Array.isArray(overrides.requestedFormats)
+      ? overrides.requestedFormats
+      : SUPPORTED_UPSTREAM_FORMATS;
+    const aggregateOverrides = { ...overrides };
+    delete aggregateOverrides.requestedFormats;
     const result = {
       upstreams: [],
       failedFormats: [],
       uninspectedFormats: [],
-      unsupportedFormats: [],
+      unsupportedFormats: requestedFormats.filter(format => (
+        !getUpstreamFormatDescriptor(format)?.inspectable
+      )),
       failures: [],
       successfulFormats: 20,
       configuredTotal: 0,
       complete: true,
       state: "empty",
-      ...overrides,
+      ...aggregateOverrides,
     };
     result.upstreams = result.upstreams.map(upstream => ({
       ...upstream,
       format: upstream.format || upstream._format,
       _format: upstream._format || upstream.format,
+      origin: Object.prototype.hasOwnProperty.call(upstream, "origin") ? upstream.origin : "",
     }));
     result.failures = result.failures.map((failure) => {
       const category = failure.category || (/permission/i.test(failure.message || "")
@@ -29,11 +46,55 @@ suite("UpstreamDetailProvider Test Suite", () => {
         : /time/i.test(failure.message || "") ? "timeout" : "unknown");
       return {
         ...failure,
+        apiFormat: failure.apiFormat || failure.format,
         category,
+        state: failure.state || (result.failedFormats.includes(failure.format)
+          ? "failed"
+          : "uninspected"),
         message: formatUpstreamFailureCategory(category),
+        httpStatus: failure.httpStatus ?? null,
         retryable: failure.retryable === true,
+        retryAfterMs: failure.retryAfterMs ?? null,
+        requestId: failure.requestId ?? null,
+        serverRequestId: failure.serverRequestId ?? null,
       };
     });
+    if (!Object.prototype.hasOwnProperty.call(aggregateOverrides, "outcomes")) {
+      const failed = new Set(result.failedFormats);
+      const uninspected = new Set(result.uninspectedFormats);
+      const unsupported = new Set(result.unsupportedFormats);
+      result.outcomes = requestedFormats.map((format) => {
+        const descriptor = getUpstreamFormatDescriptor(format);
+        const entries = result.upstreams.filter(upstream => upstream.format === descriptor?.format);
+        let state = "success";
+        if (!descriptor?.inspectable || unsupported.has(descriptor.format)) state = "unsupported";
+        else if (failed.has(descriptor.format)) state = "failed";
+        else if (uninspected.has(descriptor.format)) state = "uninspected";
+        const aggregateFailure = result.failures.find(failure => failure.format === descriptor?.format);
+        const failure = ["failed", "uninspected"].includes(state)
+          ? {
+              category: aggregateFailure?.category || "unknown",
+              message: aggregateFailure?.message || formatUpstreamFailureCategory("unknown"),
+              httpStatus: aggregateFailure?.httpStatus ?? null,
+              retryable: aggregateFailure?.retryable === true,
+              retryAfterMs: aggregateFailure?.retryAfterMs ?? null,
+              requestId: aggregateFailure?.requestId ?? null,
+              serverRequestId: aggregateFailure?.serverRequestId ?? null,
+            }
+          : null;
+        return {
+          format: descriptor?.format,
+          apiFormat: descriptor?.apiFormat ?? null,
+          state,
+          status: state === "success" ? "loaded" : state,
+          entries,
+          upstreams: entries,
+          authoritative: ["success", "unsupported"].includes(state),
+          failure,
+          pageCount: state === "success" ? 1 : 0,
+        };
+      });
+    }
     return result;
   }
 
@@ -55,6 +116,7 @@ suite("UpstreamDetailProvider Test Suite", () => {
         [
           {
             name: "PyPI",
+            origin: "https://pypi.org",
             upstream_url: "https://user:pass@pypi.org/simple/?token=secret#fragment",
             is_active: true,
           },
@@ -276,6 +338,8 @@ suite("UpstreamDetailProvider Test Suite", () => {
     assert.ok(panel.webview.html.includes("Existing results remain visible"));
     replacement.resolve(aggregate({
       upstreams: [{ name: "New", format: "npm", origin: "https://new.example" }],
+      requestedFormats: ["npm"],
+      successfulFormats: 1,
       configuredTotal: 1,
       state: "complete",
     }));
@@ -303,6 +367,7 @@ suite("UpstreamDetailProvider Test Suite", () => {
         }
         return aggregate({
           upstreams: [{ name: "npmjs", format: "npm", _format: "npm", origin: "https://registry.npmjs.org" }],
+          requestedFormats: options.formats,
           successfulFormats: 1,
           configuredTotal: 1,
           complete: true,
@@ -340,6 +405,7 @@ suite("UpstreamDetailProvider Test Suite", () => {
         });
         return aggregate({
           upstreams: [{ name: "Partial page", format: "python", origin: "https://partial.example" }],
+          requestedFormats: ["python"],
           uninspectedFormats: ["python"],
           failures: [{ format: "python", category: "invalid_response", retryable: false }],
           successfulFormats: 0,
@@ -367,6 +433,7 @@ suite("UpstreamDetailProvider Test Suite", () => {
       loadUpstreams: async () => {
         calls += 1;
         return aggregate({
+          requestedFormats: calls === 1 ? SUPPORTED_UPSTREAM_FORMATS : ["npm"],
           failedFormats: ["npm"],
           failures: [{ format: "npm", category: "timeout", retryable: true }],
           successfulFormats: calls === 1 ? 19 : 0,
@@ -408,6 +475,7 @@ suite("UpstreamDetailProvider Test Suite", () => {
           });
         }
         return aggregate({
+          requestedFormats: ["npm"],
           failedFormats: ["npm"],
           failures: [{ format: "npm", message: "Permission denied." }],
           successfulFormats: 0,
@@ -501,6 +569,22 @@ suite("UpstreamDetailProvider Test Suite", () => {
       }],
       configuredTotal: 1,
       state: "complete",
+    }), aggregate({
+      upstreams: [{
+        name: "Privileged", format: "python", origin: "", upstream_url: "https://example.com",
+      }],
+      configuredTotal: 1,
+      state: "complete",
+    }), aggregate({
+      upstreams: [{ name: "Bad priority", format: "python", origin: "", priority: -1 }],
+      configuredTotal: 1,
+      state: "complete",
+    }), aggregate({
+      upstreams: [{
+        name: "Bad indexing", format: "python", origin: "", index_package_count: "0",
+      }],
+      configuredTotal: 1,
+      state: "complete",
     }), {
       ...aggregate({
         failedFormats: ["npm"],
@@ -531,6 +615,226 @@ suite("UpstreamDetailProvider Test Suite", () => {
       assert.ok(!panel.webview.html.includes("[object Object]"));
       assert.ok(!panel.webview.html.includes("user:secret"));
       assert.ok(!panel.webview.html.includes("token=secret"));
+    }
+  });
+
+  test("accepts only canonical or explicitly redacted origins at the aggregate boundary", async () => {
+    const cases = [
+      ["https://example.com", true],
+      ["", true],
+      [undefined, false],
+      [" ", false],
+      ["https://user:pass@example.com", false],
+      ["https://example.com?token=secret", false],
+      ["https://example.com#fragment", false],
+      ["https://example.com/path", false],
+      ["not a URL", false],
+      ["Origin unavailable", false],
+    ];
+    for (const [origin, accepted] of cases) {
+      const provider = new UpstreamDetailProvider({}, {
+        loadUpstreams: async () => aggregate({
+          upstreams: [{ name: "Mirror", format: "python", origin }],
+          unsupportedFormats: NON_INSPECTABLE_FORMATS,
+          successfulFormats: 20,
+          configuredTotal: 1,
+          complete: true,
+          state: "complete",
+        }),
+      });
+      const panel = { title: "", webview: { html: "" }, reveal() {} };
+      provider._getOrCreatePanel = () => {
+        provider._panel = panel;
+        return panel;
+      };
+      await provider.show("acme", "repo", "Repo");
+      assert.strictEqual(panel.webview.html.includes("Mirror"), accepted, String(origin));
+      if (origin === "") {
+        assert.ok(panel.webview.html.includes("Origin unavailable"));
+        assert.ok(!panel.webview.html.includes("()"));
+      }
+      assert.ok(!panel.webview.html.includes("user:pass"));
+      assert.ok(!panel.webview.html.includes("token=secret"));
+      assert.ok(!panel.webview.html.includes("#fragment"));
+    }
+  });
+
+  test("binds aggregate completeness to the exact requested format scope", async () => {
+    const oneFormat = aggregate({
+      requestedFormats: ["python"],
+      upstreams: [{ name: "Scoped", format: "python", origin: "" }],
+      successfulFormats: 1,
+      configuredTotal: 1,
+      complete: true,
+      state: "complete",
+    });
+    const provider = new UpstreamDetailProvider({}, { loadUpstreams: async () => oneFormat });
+    const full = await provider._fetchGroupedUpstreams(
+      "acme", "repo", new AbortController().signal
+    );
+    assert.strictEqual(full.state, "failed");
+
+    const targeted = await provider._fetchGroupedUpstreams(
+      "acme", "repo", new AbortController().signal, { formats: ["python"] }
+    );
+    assert.strictEqual(targeted.state, "complete");
+    assert.strictEqual(targeted.groupedUpstreams.get("python")[0].name, "Scoped");
+  });
+
+  test("snapshots validated failure diagnostics and rejects proxy failures", async () => {
+    const source = aggregate({
+      requestedFormats: ["npm"],
+      failedFormats: ["npm"],
+      failures: [{ format: "npm", category: "timeout", retryable: true }],
+      successfulFormats: 0,
+      configuredTotal: null,
+      complete: false,
+      state: "failed",
+    });
+    const provider = new UpstreamDetailProvider({}, { loadUpstreams: async () => source });
+    const settled = await provider._fetchGroupedUpstreams(
+      "acme", "repo", new AbortController().signal, { formats: ["npm"] }
+    );
+    source.failures[0].format = "https://user:secret@example.com/?token=secret";
+    source.failedFormats[0] = "https://user:secret@example.com/?token=secret";
+    assert.deepStrictEqual(settled.failedFormats, ["npm"]);
+    assert.strictEqual(settled.failures[0].format, "npm");
+    assert.ok(Object.isFrozen(settled.failures));
+    assert.ok(Object.isFrozen(settled.failures[0]));
+    const html = provider._getHtmlContent("acme", "repo", "Repo", settled);
+    assert.ok(!html.includes("user:secret"));
+    assert.ok(!html.includes("token=secret"));
+
+    let reads = 0;
+    const hostile = aggregate({
+      requestedFormats: ["npm"],
+      failedFormats: ["npm"],
+      failures: [{ format: "npm", category: "timeout", retryable: true }],
+      successfulFormats: 0,
+      configuredTotal: null,
+      complete: false,
+      state: "failed",
+    });
+    hostile.failures[0] = new Proxy(hostile.failures[0], {
+      get(target, property, receiver) {
+        reads += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const hostileProvider = new UpstreamDetailProvider({}, {
+      loadUpstreams: async () => hostile,
+    });
+    const rejected = await hostileProvider._fetchGroupedUpstreams(
+      "acme", "repo", new AbortController().signal, { formats: ["npm"] }
+    );
+    assert.strictEqual(rejected.state, "failed");
+    assert.strictEqual(reads, 0);
+
+    let rootReads = 0;
+    const hostileRoot = aggregate({
+      requestedFormats: ["npm"],
+      failedFormats: ["npm"],
+      failures: [{ format: "npm", category: "timeout", retryable: true }],
+      successfulFormats: 0,
+      configuredTotal: null,
+      complete: false,
+      state: "failed",
+    });
+    Object.defineProperty(hostileRoot, "failures", {
+      enumerable: true,
+      get() {
+        rootReads += 1;
+        return [{ format: "https://user:secret@example.com/?token=secret" }];
+      },
+    });
+    const rootProvider = new UpstreamDetailProvider({}, {
+      loadUpstreams: async () => hostileRoot,
+    });
+    const rootRejected = await rootProvider._fetchGroupedUpstreams(
+      "acme", "repo", new AbortController().signal, { formats: ["npm"] }
+    );
+    assert.strictEqual(rootRejected.state, "failed");
+    assert.strictEqual(rootReads, 0);
+
+    let outcomeReads = 0;
+    const hostileOutcome = aggregate({
+      requestedFormats: ["npm"],
+      failedFormats: ["npm"],
+      failures: [{ format: "npm", category: "timeout", retryable: true }],
+      successfulFormats: 0,
+      configuredTotal: null,
+      complete: false,
+      state: "failed",
+    });
+    hostileOutcome.outcomes[0] = new Proxy(hostileOutcome.outcomes[0], {
+      get(target, property, receiver) {
+        outcomeReads += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const outcomeProvider = new UpstreamDetailProvider({}, {
+      loadUpstreams: async () => hostileOutcome,
+    });
+    const outcomeRejected = await outcomeProvider._fetchGroupedUpstreams(
+      "acme", "repo", new AbortController().signal, { formats: ["npm"] }
+    );
+    assert.strictEqual(outcomeRejected.state, "failed");
+    assert.strictEqual(outcomeReads, 0);
+  });
+
+  test("renders a real producer aggregate with a redacted origin without losing the card", async () => {
+    const endpoints = [];
+    const connectionManager = {
+      getState() {
+        return { activationId: "account-a", accountEpoch: 1, sessionConnected: true };
+      },
+    };
+    const checker = new UpstreamChecker({}, {
+      connectionManager,
+      cloudsmithAPI: {
+        async get(endpoint) {
+          endpoints.push(endpoint);
+          return endpoint.includes("upstream/python/")
+            ? apiSuccess([{
+                name: "Private PyPI",
+                slug_perm: "private-pypi",
+                upstream_url: "https://user:password@example.com/private?token=secret#signed",
+                is_active: true,
+                verify_ssl: false,
+                priority: "10",
+                trust_level: "Trusted",
+                index_status: "Up-to-date",
+                index_package_count: 0,
+                distro_versions: ["3.12"],
+              }])
+            : apiSuccess([]);
+        },
+      },
+    });
+    const provider = new UpstreamDetailProvider({}, {
+      loadUpstreams: (workspace, repo, options) => (
+        checker.getAllUpstreamData(workspace, repo, options)
+      ),
+    });
+    const panel = { title: "", webview: { html: "" }, reveal() {} };
+    provider._getOrCreatePanel = () => {
+      provider._panel = panel;
+      return panel;
+    };
+
+    await provider.show("acme", "repo", "Repo");
+
+    assert.strictEqual(endpoints.length, 20);
+    assert.ok(endpoints.every(endpoint => !/upstream\/(raw|terraform|conan|cocoapods|luarocks|vagrant)\//.test(endpoint)));
+    assert.ok(panel.webview.html.includes("Private PyPI"));
+    assert.ok(panel.webview.html.includes("Origin unavailable"));
+    assert.ok(panel.webview.html.includes(">Trusted<"));
+    assert.ok(panel.webview.html.includes("Disabled"));
+    assert.ok(panel.webview.html.includes(">10<"));
+    assert.ok(panel.webview.html.includes("0 packages"));
+    assert.ok(!panel.webview.html.includes("Could not load upstreams"));
+    for (const secret of ["user:password", "/private", "token=secret", "#signed"]) {
+      assert.ok(!panel.webview.html.includes(secret), secret);
     }
   });
 

@@ -2,7 +2,13 @@
 
 const vscode = require("vscode");
 const crypto = require("crypto");
-const { getAllUpstreamData, getUpstreamDataForFormats } = require("../util/upstreamChecker");
+const { types: { isProxy } } = require("util");
+const {
+  getAllUpstreamData,
+  getUpstreamDataForFormats,
+  isSafeInventoryUpstream,
+  sanitizeSafeInventoryUpstream,
+} = require("../util/upstreamChecker");
 const {
   getUpstreamFormatDescriptor,
   INSPECTABLE_UPSTREAM_FORMATS,
@@ -17,10 +23,20 @@ const {
 const SUPPORTED_FORMATS = SUPPORTED_UPSTREAM_FORMATS;
 const MAX_RENDERED_UPSTREAMS = 200;
 const MAX_DISTRIBUTION_VERSIONS = 20;
+const MAX_VALIDATED_UPSTREAMS = 5000;
+const MAX_VALIDATED_UPSTREAMS_PER_FORMAT = 500;
 const FAILURE_CATEGORIES = new Set([
   "authentication", "cancelled", "invalid_response", "network", "not_found",
   "permission", "rate_limit", "request_limit", "request_rejected", "server",
   "timeout", "uninspected", "unknown",
+]);
+const FAILURE_KEYS = new Set([
+  "apiFormat", "category", "format", "httpStatus", "message", "requestId",
+  "retryable", "retryAfterMs", "serverRequestId", "state",
+]);
+const OUTCOME_FAILURE_KEYS = new Set([
+  "category", "httpStatus", "message", "requestId", "retryable", "retryAfterMs",
+  "serverRequestId",
 ]);
 
 class UpstreamDetailProvider {
@@ -204,6 +220,9 @@ class UpstreamDetailProvider {
   }
 
   async _fetchGroupedUpstreams(workspace, repoSlug, signal, options = {}) {
+    const requestedFormats = Array.isArray(options.formats)
+      ? options.formats
+      : SUPPORTED_UPSTREAM_FORMATS;
     const upstreamData = await this._loadUpstreams(workspace, repoSlug, {
       signal,
       bypassCache: options.bypassCache === true,
@@ -212,11 +231,14 @@ class UpstreamDetailProvider {
     if (upstreamData === null || signal.aborted) {
       return null;
     }
-    if (!isValidAggregate(upstreamData)) return failedFetchState();
+    const aggregate = snapshotAggregateContract(upstreamData);
+    if (!aggregate || !isValidAggregate(aggregate, requestedFormats)) return failedFetchState();
 
     const grouped = new Map();
 
-    for (const upstream of upstreamData.upstreams) {
+    for (const candidate of aggregate.upstreams) {
+      const upstream = sanitizeSafeInventoryUpstream(candidate);
+      if (!upstream) return failedFetchState();
       const format = typeof upstream._format === "string"
         ? upstream._format
         : (typeof upstream.format === "string" ? upstream.format : "");
@@ -240,23 +262,37 @@ class UpstreamDetailProvider {
       });
     }
 
+    const failedFormats = aggregate.failedFormats;
+    const uninspectedFormats = aggregate.uninspectedFormats;
+    const unsupportedFormats = aggregate.unsupportedFormats;
+    const failures = Object.freeze(aggregate.failures.map(failure => Object.freeze({
+      format: failure.format,
+      apiFormat: failure.apiFormat,
+      state: failure.state,
+      category: failure.category,
+      message: failure.message,
+      httpStatus: failure.httpStatus,
+      retryable: failure.retryable,
+      retryAfterMs: failure.retryAfterMs,
+      requestId: failure.requestId,
+      serverRequestId: failure.serverRequestId,
+    })));
+    for (const [format, upstreams] of grouped) {
+      grouped.set(format, Object.freeze(upstreams.slice()));
+    }
     return {
       groupedUpstreams: grouped,
-      failedFormats: Array.isArray(upstreamData.failedFormats) ? upstreamData.failedFormats : [],
-      uninspectedFormats: Array.isArray(upstreamData.uninspectedFormats)
-        ? upstreamData.uninspectedFormats
-        : [],
-      successfulFormats: typeof upstreamData.successfulFormats === "number"
-        ? upstreamData.successfulFormats
+      failedFormats,
+      uninspectedFormats,
+      successfulFormats: typeof aggregate.successfulFormats === "number"
+        ? aggregate.successfulFormats
         : 0,
-      complete: upstreamData.complete === true,
-      state: upstreamData.state,
-      failures: Array.isArray(upstreamData.failures) ? upstreamData.failures : [],
-      unsupportedFormats: Array.isArray(upstreamData.unsupportedFormats)
-        ? upstreamData.unsupportedFormats
-        : [],
-      configuredTotal: Number.isSafeInteger(upstreamData.configuredTotal)
-        ? upstreamData.configuredTotal
+      complete: aggregate.complete === true,
+      state: aggregate.state,
+      failures,
+      unsupportedFormats,
+      configuredTotal: Number.isSafeInteger(aggregate.configuredTotal)
+        ? aggregate.configuredTotal
         : null,
       retainedFormats: [],
     };
@@ -565,9 +601,7 @@ class UpstreamDetailProvider {
     const details = [
       this._renderDetail(
         "Origin",
-        formatUpstreamOrigin(
-          typeof upstream.origin === "string" && upstream.origin ? upstream.origin : upstream.upstream_url
-        ),
+        formatUpstreamOrigin(upstream.origin),
         "mono"
       ),
       this._renderDetail("Mode", typeof upstream.mode === "string" ? upstream.mode : "", ""),
@@ -828,8 +862,112 @@ function mergeRetryState(previous, replacement, retriedFormats) {
   };
 }
 
-function isValidAggregate(value) {
-  if (!value || typeof value !== "object" || !Array.isArray(value.upstreams)) return false;
+function snapshotAggregateContract(value) {
+  const root = snapshotOwnDataRecord(value);
+  if (!root) return null;
+  const upstreams = snapshotOwnDataArray(root.upstreams, MAX_VALIDATED_UPSTREAMS);
+  const failedFormats = snapshotOwnDataArray(root.failedFormats, SUPPORTED_UPSTREAM_FORMATS.length);
+  const uninspectedFormats = snapshotOwnDataArray(
+    root.uninspectedFormats, SUPPORTED_UPSTREAM_FORMATS.length
+  );
+  const unsupportedFormats = snapshotOwnDataArray(
+    root.unsupportedFormats, SUPPORTED_UPSTREAM_FORMATS.length
+  );
+  const rawFailures = snapshotOwnDataArray(root.failures, INSPECTABLE_UPSTREAM_FORMATS.length);
+  const rawOutcomes = snapshotOwnDataArray(root.outcomes, SUPPORTED_UPSTREAM_FORMATS.length);
+  if (!upstreams || !failedFormats || !uninspectedFormats || !unsupportedFormats
+    || !rawFailures || !rawOutcomes) return null;
+
+  const failures = [];
+  for (const value of rawFailures) {
+    const failure = snapshotOwnDataRecord(value);
+    if (!failure) return null;
+    failures.push(failure);
+  }
+  const outcomes = [];
+  for (const value of rawOutcomes) {
+    const outcome = snapshotOwnDataRecord(value);
+    if (!outcome) return null;
+    const entries = snapshotOwnDataArray(
+      outcome.entries, MAX_VALIDATED_UPSTREAMS_PER_FORMAT
+    );
+    const outcomeUpstreams = snapshotOwnDataArray(
+      outcome.upstreams, MAX_VALIDATED_UPSTREAMS_PER_FORMAT
+    );
+    if (!entries || !outcomeUpstreams) return null;
+    let failure = null;
+    if (outcome.failure !== null) {
+      failure = snapshotOwnDataRecord(outcome.failure);
+      if (!failure) return null;
+    }
+    outcomes.push(Object.freeze({
+      ...outcome,
+      entries,
+      upstreams: outcomeUpstreams,
+      failure,
+    }));
+  }
+  return Object.freeze({
+    ...root,
+    upstreams,
+    failedFormats,
+    uninspectedFormats,
+    unsupportedFormats,
+    failures: Object.freeze(failures),
+    outcomes: Object.freeze(outcomes),
+  });
+}
+
+function snapshotOwnDataRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || isProxy(value)) return null;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const copy = {};
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (typeof key !== "string") return null;
+      const descriptor = descriptors[key];
+      if (!descriptor || descriptor.enumerable !== true
+        || !Object.prototype.hasOwnProperty.call(descriptor, "value")) return null;
+      copy[key] = descriptor.value;
+    }
+    return Object.freeze(copy);
+  } catch {
+    return null;
+  }
+}
+
+function snapshotOwnDataArray(value, maximum = MAX_VALIDATED_UPSTREAMS) {
+  if (!Array.isArray(value) || isProxy(value)) return null;
+  try {
+    if (Object.getPrototypeOf(value) !== Array.prototype) return null;
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    const length = lengthDescriptor?.value;
+    if (!Number.isSafeInteger(length) || length < 0 || length > maximum) return null;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    if (keys.length !== length + 1) return null;
+    const copy = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (!descriptor || descriptor.enumerable !== true
+        || !Object.prototype.hasOwnProperty.call(descriptor, "value")) return null;
+      copy.push(descriptor.value);
+    }
+    if (!keys.every(key => key === "length"
+      || (typeof key === "string" && /^(0|[1-9]\d*)$/u.test(key)))) return null;
+    return Object.freeze(copy);
+  } catch {
+    return null;
+  }
+}
+
+function isValidAggregate(value, requestedFormats) {
+  if (!value || typeof value !== "object" || !isOwnDataArray(value.upstreams)) return false;
+  if (value.upstreams.length > MAX_VALIDATED_UPSTREAMS) return false;
+  const requestedDescriptors = getExactRequestedDescriptors(requestedFormats);
+  if (!requestedDescriptors) return false;
   if (typeof value.complete !== "boolean") return false;
   const validStates = new Set(["complete", "empty", "partial", "failed", "cancelled", "unsupported"]);
   if (!validStates.has(value.state)) return false;
@@ -838,17 +976,17 @@ function isValidAggregate(value) {
     value.uninspectedFormats,
     value.unsupportedFormats,
   ];
-  if (formatLists.some(list => !Array.isArray(list) || list.some(format => (
-    typeof format !== "string" || !getUpstreamFormatDescriptor(format)
+  if (formatLists.some(list => !isOwnDataArray(list) || list.some(format => (
+    typeof format !== "string"
+    || getUpstreamFormatDescriptor(format)?.format !== format
   )))) return false;
-  if (!Array.isArray(value.failures) || value.failures.some(failure => (
-    !failure || typeof failure !== "object"
-    || typeof failure.format !== "string"
-    || !getUpstreamFormatDescriptor(failure.format)
-    || typeof failure.category !== "string"
-    || !FAILURE_CATEGORIES.has(failure.category)
-    || typeof failure.retryable !== "boolean"
-    || failure.message !== formatUpstreamFailureCategory(failure.category)
+  if (value.failedFormats.some(format => !getUpstreamFormatDescriptor(format)?.inspectable)
+    || value.uninspectedFormats.some(format => !getUpstreamFormatDescriptor(format)?.inspectable)
+    || value.unsupportedFormats.some(format => getUpstreamFormatDescriptor(format)?.inspectable)) {
+    return false;
+  }
+  if (!isOwnDataArray(value.failures) || value.failures.some(failure => (
+    !isValidAggregateFailure(failure)
   ))) return false;
   if (!Number.isSafeInteger(value.successfulFormats)
     || value.successfulFormats < 0
@@ -880,23 +1018,206 @@ function isValidAggregate(value) {
   ]).size !== value.failedFormats.length
     + value.uninspectedFormats.length
     + value.unsupportedFormats.length) return false;
+  if (!isValidOutcomeScope(value, requestedDescriptors)) return false;
   const identities = new Set();
   return value.upstreams.every((upstream) => {
     if (!upstream || typeof upstream !== "object"
       || typeof upstream.name !== "string"
       || !upstream.name
       || upstream.name.length > 500) return false;
-    const format = typeof upstream._format === "string" ? upstream._format : upstream.format;
-    const descriptor = getUpstreamFormatDescriptor(format);
+    const format = upstream._format;
     const identity = `${format}\0${upstream.slug_perm || upstream.name}`;
     if (identities.has(identity)) return false;
     identities.add(identity);
-    return Boolean(
-      descriptor?.inspectable
-      && upstream._format === upstream.format
-      && (upstream.origin === undefined || formatUpstreamOrigin(upstream.origin) === upstream.origin)
-    );
+    return isSafeInventoryUpstream(upstream);
   });
+}
+
+function getExactRequestedDescriptors(formats) {
+  if (!Array.isArray(formats) || formats.length === 0) return null;
+  const descriptors = [];
+  const seen = new Set();
+  for (const format of formats) {
+    const descriptor = getUpstreamFormatDescriptor(format);
+    if (!descriptor || descriptor.format !== format || seen.has(descriptor.format)) return null;
+    seen.add(descriptor.format);
+    descriptors.push(descriptor);
+  }
+  return descriptors;
+}
+
+function isValidOutcomeScope(value, requestedDescriptors) {
+  if (!isOwnDataArray(value.outcomes)
+    || value.outcomes.length !== requestedDescriptors.length) {
+    return false;
+  }
+  const expected = new Map(requestedDescriptors.map(descriptor => [descriptor.format, descriptor]));
+  const seen = new Set();
+  const failed = [];
+  const uninspected = [];
+  const unsupported = [];
+  let successful = 0;
+  let cancelled = false;
+  const aggregateEntryKeys = [];
+
+  for (const outcome of value.outcomes) {
+    if (!outcome || typeof outcome !== "object" || Array.isArray(outcome)) return false;
+    const descriptor = expected.get(outcome.format);
+    if (!descriptor || seen.has(outcome.format) || outcome.apiFormat !== descriptor.apiFormat) {
+      return false;
+    }
+    seen.add(outcome.format);
+    if (!isOwnDataArray(outcome.entries) || !isOwnDataArray(outcome.upstreams)
+      || outcome.entries.length !== outcome.upstreams.length
+      || outcome.entries.length > MAX_VALIDATED_UPSTREAMS_PER_FORMAT
+      || !Number.isSafeInteger(outcome.pageCount) || outcome.pageCount < 0) return false;
+    const safeEntries = outcome.entries.every((entry, index) => (
+      isSafeInventoryUpstream(entry)
+      && entry.format === descriptor.format
+      && entry._format === descriptor.format
+      && sameInventoryEntry(entry, outcome.upstreams[index])
+    ));
+    if (!safeEntries) return false;
+    aggregateEntryKeys.push(...outcome.entries.map(inventoryEntryKey));
+
+    if (!descriptor.inspectable) {
+      if (outcome.state !== "unsupported" || outcome.authoritative !== true
+        || outcome.entries.length !== 0 || outcome.failure !== null) return false;
+      unsupported.push(outcome.format);
+      continue;
+    }
+    if (outcome.state === "success") {
+      if (outcome.authoritative !== true || outcome.failure !== null) return false;
+      successful += 1;
+      continue;
+    }
+    if (!["failed", "incomplete", "uninspected", "cancelled"].includes(outcome.state)
+      || outcome.authoritative !== false || !isValidOutcomeFailure(outcome.failure)) return false;
+    if (outcome.state === "failed") failed.push(outcome.format);
+    else uninspected.push(outcome.format);
+    if (outcome.state === "cancelled") cancelled = true;
+  }
+
+  if (seen.size !== expected.size
+    || !sameSet(failed, value.failedFormats)
+    || !sameSet(uninspected, value.uninspectedFormats)
+    || !sameSet(unsupported, value.unsupportedFormats)
+    || successful !== value.successfulFormats) return false;
+  const aggregateKeys = value.upstreams.map(inventoryEntryKey);
+  if (!sameMultiset(aggregateEntryKeys, aggregateKeys)) return false;
+  const aggregateComplete = requestedDescriptors.some(descriptor => descriptor.inspectable)
+    && requestedDescriptors.filter(descriptor => descriptor.inspectable)
+      .every(descriptor => !failed.includes(descriptor.format)
+        && !uninspected.includes(descriptor.format));
+  if (value.complete !== aggregateComplete) return false;
+  if (cancelled !== (value.state === "cancelled")) return false;
+
+  const failureByFormat = new Map();
+  for (const failure of value.failures) {
+    if (failureByFormat.has(failure.format)) return false;
+    failureByFormat.set(failure.format, failure);
+  }
+  const unavailable = [...failed, ...uninspected];
+  if (!sameSet([...failureByFormat.keys()], unavailable)) return false;
+  return value.outcomes.every((outcome) => {
+    if (!unavailable.includes(outcome.format)) return true;
+    const failure = failureByFormat.get(outcome.format);
+    return failure.apiFormat === outcome.apiFormat
+      && failure.state === outcome.state
+      && failure.category === outcome.failure.category
+      && failure.message === outcome.failure.message
+      && failure.retryable === outcome.failure.retryable
+      && failure.httpStatus === outcome.failure.httpStatus
+      && failure.retryAfterMs === outcome.failure.retryAfterMs
+      && failure.requestId === outcome.failure.requestId
+      && failure.serverRequestId === outcome.failure.serverRequestId;
+  });
+}
+
+function isValidOutcomeFailure(failure) {
+  return hasExactDataKeys(failure, OUTCOME_FAILURE_KEYS)
+    && typeof failure.category === "string"
+    && FAILURE_CATEGORIES.has(failure.category)
+    && failure.message === formatUpstreamFailureCategory(failure.category)
+    && typeof failure.retryable === "boolean"
+    && isValidFailureMetadata(failure);
+}
+
+function isValidAggregateFailure(failure) {
+  if (!hasExactDataKeys(failure, FAILURE_KEYS)) return false;
+  const descriptor = getUpstreamFormatDescriptor(failure.format);
+  return descriptor?.inspectable === true
+    && descriptor.format === failure.format
+    && failure.apiFormat === descriptor.apiFormat
+    && ["failed", "incomplete", "uninspected", "cancelled"].includes(failure.state)
+    && FAILURE_CATEGORIES.has(failure.category)
+    && failure.message === formatUpstreamFailureCategory(failure.category)
+    && typeof failure.retryable === "boolean"
+    && isValidFailureMetadata(failure);
+}
+
+function isValidFailureMetadata(failure) {
+  return (failure.httpStatus === null
+      || (Number.isSafeInteger(failure.httpStatus)
+        && failure.httpStatus >= 100 && failure.httpStatus <= 599))
+    && (failure.retryAfterMs === null
+      || (Number.isSafeInteger(failure.retryAfterMs)
+        && failure.retryAfterMs >= 0 && failure.retryAfterMs <= 86_400_000))
+    && isValidFailureId(failure.requestId)
+    && isValidFailureId(failure.serverRequestId);
+}
+
+function isValidFailureId(value) {
+  return value === null || (typeof value === "string" && value.length <= 128
+    && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(value));
+}
+
+function hasExactDataKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || isProxy(value)) return false;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== expectedKeys.size
+      || keys.some(key => typeof key !== "string" || !expectedKeys.has(key))) return false;
+    return keys.every((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value")
+        && descriptor.enumerable === true;
+    });
+  } catch {
+    return false;
+  }
+}
+
+function isOwnDataArray(value) {
+  return snapshotOwnDataArray(value) !== null;
+}
+
+function inventoryEntryKey(entry) {
+  return `${entry.format}\0${entry.slug_perm || entry.name}\0${JSON.stringify(entry)}`;
+}
+
+function sameInventoryEntry(left, right) {
+  return isSafeInventoryUpstream(right) && inventoryEntryKey(left) === inventoryEntryKey(right);
+}
+
+function sameSet(left, right) {
+  return left.length === right.length && new Set(left).size === left.length
+    && left.every(value => right.includes(value));
+}
+
+function sameMultiset(left, right) {
+  if (left.length !== right.length) return false;
+  const remaining = new Map();
+  for (const value of left) remaining.set(value, (remaining.get(value) || 0) + 1);
+  for (const value of right) {
+    const count = remaining.get(value) || 0;
+    if (count === 0) return false;
+    if (count === 1) remaining.delete(value);
+    else remaining.set(value, count - 1);
+  }
+  return remaining.size === 0;
 }
 
 module.exports = { UpstreamDetailProvider, SUPPORTED_FORMATS };

@@ -14,7 +14,7 @@ const {
   resolveAndValidateRegistryUrl,
 } = require("./registryEndpoints");
 const { canonicalFormat, normalizePackageName } = require("./packageNameNormalizer");
-const { UpstreamChecker } = require("./upstreamChecker");
+const { sanitizeSafeInventoryUpstream, UpstreamChecker } = require("./upstreamChecker");
 const { UpstreamOperationScheduler } = require("./upstreamOperationScheduler");
 const { getUpstreamFormatDescriptor, normalizeUpstreamFormat } = require("./upstreamFormats");
 const {
@@ -117,8 +117,9 @@ class UpstreamPullService {
         .map((dependency) => normalizeUpstreamFormat(formatForDependency(dependency)))
         .filter(Boolean)
     )];
+    const inspectionFormats = projectFormats.filter(isPullInspectionFormat);
 
-    if (projectFormats.length === 0) {
+    if (inspectionFormats.length === 0) {
       await this._showInformationMessage(
         "Pull-through caching is not available for the uncovered dependency formats in this project."
       );
@@ -140,15 +141,15 @@ class UpstreamPullService {
     const repositorySearch = await this._findMatchingRepositories(
       workspace,
       repositoryCollection.items,
-      projectFormats,
+      inspectionFormats,
       operation
     );
     if (!this._isPreparationCurrent(operation)) return null;
     if (repositorySearch.matches.length === 0) {
       const incomplete = !repositoryCollection.complete || !repositorySearch.complete;
       const message = incomplete
-        ? `Repository upstream inspection was incomplete for ${formatListLabel(projectFormats)}. No matching proxy was found in the repositories that could be inspected.`
-        : `No repositories have upstream proxies configured for the dependency formats in this project (${formatListLabel(projectFormats)}). Configure an upstream proxy in Cloudsmith to enable pull-through caching.`;
+        ? `Repository upstream inspection was incomplete for ${formatListLabel(inspectionFormats)}. No matching proxy was found in the repositories that could be inspected.`
+        : `No repositories have upstream proxies configured for the dependency formats in this project (${formatListLabel(inspectionFormats)}). Configure an upstream proxy in Cloudsmith to enable pull-through caching.`;
       await (incomplete ? this._showWarningMessage(message) : this._showInformationMessage(message));
       return null;
     }
@@ -238,7 +239,7 @@ class UpstreamPullService {
     }
 
     const dependencyFormat = normalizeUpstreamFormat(formatForDependency(normalizedDependency));
-    if (!dependencyFormat) {
+    if (!dependencyFormat || !isPullInspectionFormat(dependencyFormat)) {
       await this._showInformationMessage(
         `Pull-through caching is not available for ${formatDisplayName(normalizedDependency.format)} dependencies.`
       );
@@ -626,7 +627,8 @@ class UpstreamPullService {
             ? state.groupedUpstreams.get(format)
             : [];
           const activeUpstreams = Array.isArray(upstreams)
-            ? upstreams.filter((upstream) => upstream && upstream.is_active !== false)
+            ? upstreams.map(upstream => sanitizeSafeInventoryUpstream(upstream, format))
+              .filter(upstream => upstream && upstream.is_active !== false)
             : [];
           if (activeUpstreams.length > 0) {
             activeUpstreamsByFormat.set(format, activeUpstreams);
@@ -966,17 +968,106 @@ function normalizeRepositoryCollection(value) {
 
 function isRepositoryInspectionCompleteForFormats(state, formats) {
   if (!state || typeof state !== "object") return false;
-  const requested = Array.isArray(formats) ? formats : [];
-  if (requested.some(format => !getUpstreamFormatDescriptor(format)?.inspectable)) return false;
-  if (Array.isArray(state.unsupportedFormats)
-    && requested.some(format => state.unsupportedFormats.includes(format))) return false;
-  if (state.complete === true) return true;
-  const unavailable = [
-    ...(Array.isArray(state.failedFormats) ? state.failedFormats : []),
-    ...(Array.isArray(state.uninspectedFormats) ? state.uninspectedFormats : []),
+  if (!Array.isArray(formats) || formats.length === 0) return false;
+  const descriptors = [];
+  const seen = new Set();
+  for (const format of formats) {
+    const descriptor = getUpstreamFormatDescriptor(format);
+    if (!descriptor) return false;
+    if (!seen.has(descriptor.format)) descriptors.push(descriptor);
+    seen.add(descriptor.format);
+  }
+  if (!hasCanonicalCapabilityLists(state)) return false;
+  const inspectable = descriptors.filter(descriptor => descriptor.inspectable);
+  if (inspectable.length === 0) return true;
+  if (!Array.isArray(state.outcomes)) return false;
+  const outcomes = new Map();
+  for (const outcome of state.outcomes) {
+    if (!isCanonicalFormatOutcome(outcome) || outcomes.has(outcome.format)) return false;
+    outcomes.set(outcome.format, outcome);
+  }
+  const expectedFailed = new Set();
+  const expectedUninspected = new Set();
+  const expectedUnsupported = new Set();
+  for (const outcome of outcomes.values()) {
+    if (outcome.state === "failed") expectedFailed.add(outcome.format);
+    else if (["incomplete", "uninspected", "cancelled"].includes(outcome.state)) {
+      expectedUninspected.add(outcome.format);
+    } else if (outcome.state === "unsupported") expectedUnsupported.add(outcome.format);
+  }
+  if (!sameFormatSet(state.failedFormats, expectedFailed)
+    || !sameFormatSet(state.uninspectedFormats, expectedUninspected)
+    || !sameFormatSet(state.unsupportedFormats, expectedUnsupported)) return false;
+  const globalInspectable = [...outcomes.values()].filter(outcome => outcome.apiFormat !== null);
+  const aggregateComplete = globalInspectable.length > 0 && globalInspectable.every(outcome => (
+    outcome.state === "success" && outcome.authoritative === true
+  ));
+  if (typeof state.complete !== "boolean") return false;
+  if (state.complete === true && !aggregateComplete) return false;
+  if (state.complete === false && aggregateComplete) return false;
+  if (state.incomplete !== undefined && state.incomplete !== !state.complete) return false;
+  if (!hasValidRequestedGroupedUpstreams(state, inspectable)) return false;
+  return inspectable.every((descriptor) => {
+    const outcome = outcomes.get(descriptor.format);
+    return outcome?.apiFormat === descriptor.apiFormat
+      && outcome.state === "success"
+      && outcome.authoritative === true;
+  });
+}
+
+function hasValidRequestedGroupedUpstreams(state, descriptors) {
+  if (!(state.groupedUpstreams instanceof Map)) return false;
+  for (const descriptor of descriptors) {
+    if (!state.groupedUpstreams.has(descriptor.format)) continue;
+    const upstreams = state.groupedUpstreams.get(descriptor.format);
+    if (!Array.isArray(upstreams) || upstreams.some(upstream => (
+      !sanitizeSafeInventoryUpstream(upstream, descriptor.format)
+    ))) return false;
+  }
+  return true;
+}
+
+function sameFormatSet(values, expected) {
+  return values.length === expected.size && values.every(value => expected.has(value));
+}
+
+function isPullInspectionFormat(format) {
+  const descriptor = getUpstreamFormatDescriptor(format);
+  return Boolean(descriptor?.inspectable && !isPullUnsupportedFormat(descriptor.format));
+}
+
+function hasCanonicalCapabilityLists(state) {
+  const lists = [
+    [state.failedFormats, true],
+    [state.uninspectedFormats, true],
+    [state.unsupportedFormats, false],
   ];
-  if (unavailable.length === 0) return false;
-  return !requested.some(format => unavailable.includes(format));
+  const seen = new Set();
+  for (const [list, inspectable] of lists) {
+    if (!Array.isArray(list)) return false;
+    for (const format of list) {
+      const descriptor = getUpstreamFormatDescriptor(format);
+      if (!descriptor || descriptor.format !== format || descriptor.inspectable !== inspectable) {
+        return false;
+      }
+      if (seen.has(format)) return false;
+      seen.add(format);
+    }
+  }
+  return true;
+}
+
+function isCanonicalFormatOutcome(outcome) {
+  if (!outcome || typeof outcome !== "object") return false;
+  const descriptor = getUpstreamFormatDescriptor(outcome.format);
+  if (!descriptor || descriptor.format !== outcome.format) return false;
+  if (outcome.apiFormat !== descriptor.apiFormat) return false;
+  if (descriptor.inspectable) {
+    if (outcome.state === "success") return outcome.authoritative === true;
+    return ["failed", "incomplete", "uninspected", "cancelled"].includes(outcome.state)
+      && outcome.authoritative === false;
+  }
+  return outcome.state === "unsupported" && outcome.authoritative === true;
 }
 
 function buildRegistryRequestHeaders(headers) {

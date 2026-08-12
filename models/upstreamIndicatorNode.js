@@ -60,9 +60,7 @@ class UpstreamIndicatorNode {
         const loadedUpstreamDetail = displayedUpstreams.map((upstream) => (
             `${formatUpstreamText(upstream.name, "Unnamed")} (${formatUpstreamText(
                 formatUpstreamOrigin(
-                    typeof upstream.origin === "string" && upstream.origin
-                        ? upstream.origin
-                        : upstream.upstream_url
+                    upstream.origin
                 ),
                 "Origin unavailable"
             )})`

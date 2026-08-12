@@ -1310,6 +1310,7 @@ suite("RepositoryNode Test Suite", () => {
     const indicator = new UpstreamIndicatorNode(
       [{
         name: "PyPI",
+        origin: "https://pypi.org",
         upstream_url: "https://user:pass@pypi.org/simple/?token=secret#fragment",
         is_active: true,
       }],

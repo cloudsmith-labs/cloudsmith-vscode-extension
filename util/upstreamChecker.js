@@ -1,4 +1,5 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
+const { types: { isProxy } } = require("util");
 const { CloudsmithAPI } = require("./cloudsmithAPI");
 const { apiEndpoint } = require("./apiEndpoint");
 const { SearchQueryBuilder } = require("./searchQueryBuilder");
@@ -22,14 +23,14 @@ const {
   normalizeUpstreamFailure,
 } = require("./upstreamPresentation");
 
-const UPSTREAM_CACHE_SCHEMA_VERSION = 4;
+const UPSTREAM_CACHE_SCHEMA_VERSION = 5;
 const UPSTREAM_CACHE_TTL_MS = 10 * 60 * 1000;
 // Four active page requests is conservative enough for the API rate limit while
 // avoiding the latency-amplifying batch barriers used by the previous path.
 const UPSTREAM_REQUEST_CONCURRENCY = 4;
 // Compatibility export for callers that referenced the former batching name.
 const UPSTREAM_FETCH_BATCH_SIZE = UPSTREAM_REQUEST_CONCURRENCY;
-const UPSTREAM_CACHE_KEY_PREFIX = "cloudsmith-upstreams:v4";
+const UPSTREAM_CACHE_KEY_PREFIX = "cloudsmith-upstreams:v5";
 const MAX_PERSISTED_UPSTREAMS = 5000;
 const MAX_PERSISTED_UPSTREAMS_PER_FORMAT = 500;
 const MAX_PERSISTED_STRING_LENGTH = 2048;
@@ -177,6 +178,14 @@ function boundedString(value, maxLength = MAX_PERSISTED_STRING_LENGTH) {
 }
 
 function normalizePersistedField(key, value) {
+  if (key === "origin") {
+    if (value === "") return "";
+    const origin = boundedString(value, MAX_PERSISTED_STRING_LENGTH);
+    const formatted = origin ? formatUpstreamOrigin(origin) : null;
+    return formatted && formatted !== "Origin unavailable" && formatted === origin
+      ? origin
+      : null;
+  }
   if (persistedStringFieldLimits.has(key)) {
     return boundedString(value, persistedStringFieldLimits.get(key));
   }
@@ -192,21 +201,22 @@ function normalizePersistedField(key, value) {
     return Number.isSafeInteger(value) && value >= 0 ? value : null;
   }
   if (key === "distro_versions") {
-    if (
-      !Array.isArray(value)
-      || value.length > MAX_PERSISTED_DISTRO_VERSIONS
-      || !value.every(item => boundedString(item, MAX_PERSISTED_NAME_LENGTH))
-    ) return null;
-    return value.slice();
+    return snapshotStringArray(
+      value,
+      MAX_PERSISTED_DISTRO_VERSIONS,
+      MAX_PERSISTED_NAME_LENGTH
+    );
   }
   return null;
 }
 
 function serializeUpstream(upstream) {
+  const safeUpstream = sanitizeSafeInventoryUpstream(upstream);
+  if (!safeUpstream) return null;
   const serialized = {};
   for (const key of PERSISTED_UPSTREAM_KEYS) {
-    if (upstream[key] === undefined) continue;
-    const normalized = normalizePersistedField(key, upstream[key]);
+    if (safeUpstream[key] === undefined) continue;
+    const normalized = normalizePersistedField(key, safeUpstream[key]);
     if (normalized !== null) serialized[key] = normalized;
   }
   return serialized.name ? serialized : null;
@@ -219,33 +229,42 @@ function serializeUpstreamArray(upstreams, max = MAX_PERSISTED_UPSTREAMS) {
 }
 
 function canonicalizeRuntimeUpstream(value, options = {}) {
-  if (!isObjectRecord(value)) return null;
-  const name = boundedString(value.name, MAX_PERSISTED_NAME_LENGTH);
+  const source = snapshotOwnDataRecord(value);
+  if (!source) return null;
+  const name = boundedString(source.name, MAX_PERSISTED_NAME_LENGTH);
   if (!name) return null;
+  const expectedDescriptor = getUpstreamFormatDescriptor(options.expectedFormat);
+  if (expectedDescriptor) {
+    for (const key of ["_format", "format"]) {
+      if (source[key] == null) continue;
+      const sourceDescriptor = getUpstreamFormatDescriptor(source[key]);
+      if (sourceDescriptor?.format !== expectedDescriptor.format) return null;
+    }
+  }
   const canonical = { name };
   for (const key of PERSISTED_UPSTREAM_KEYS) {
-    if (["name", "origin", "_format", "format"].includes(key) || value[key] == null) continue;
-    const normalized = normalizePersistedField(key, value[key]);
+    if (["name", "origin", "_format", "format"].includes(key) || source[key] == null) continue;
+    const normalized = normalizePersistedField(key, source[key]);
     if (normalized !== null) {
       canonical[key] = normalized;
       continue;
     }
     return null;
   }
-  if (!isValidUpstreamUrl(value.upstream_url)) return null;
-  canonical.origin = safeInventoryOrigin(value.upstream_url);
+  if (!isValidUpstreamUrl(source.upstream_url)) return null;
+  canonical.origin = safeInventoryOrigin(source.upstream_url);
   // Privileged projection is explicit, ephemeral, and never persisted. The
   // default inventory projection contains no URL path, userinfo, query, hash,
   // authentication, or custom-header values.
   if (options.privileged === true) {
-    canonical.upstream_url = value.upstream_url;
+    canonical.upstream_url = source.upstream_url;
   }
   for (const key of [
     "auth_mode", "auth_username", "extra_header_1", "extra_value_1",
     "extra_header_2", "extra_value_2",
   ]) {
-    if (value[key] == null) continue;
-    const normalized = boundedString(value[key], MAX_PERSISTED_STRING_LENGTH);
+    if (source[key] == null) continue;
+    const normalized = boundedString(source[key], MAX_PERSISTED_STRING_LENGTH);
     if (normalized === null) return null;
     if (options.privileged === true) canonical[key] = normalized;
   }
@@ -279,17 +298,118 @@ function isValidUpstreamUrl(value) {
   }
 }
 
-function isPersistedUpstream(value) {
-  return isObjectRecord(value)
-    && Boolean(boundedString(value.name, MAX_PERSISTED_NAME_LENGTH))
-    && Object.keys(value).every(key => persistedUpstreamKeySet.has(key))
-    && Object.entries(value).every(([key, fieldValue]) => {
-      const normalized = normalizePersistedField(key, fieldValue);
-      if (normalized === null) return false;
-      return Array.isArray(normalized)
-        ? JSON.stringify(normalized) === JSON.stringify(fieldValue)
-        : normalized === fieldValue;
-    });
+/**
+ * Validates the exact secret-free record emitted by the default inventory
+ * projection. `origin` is mandatory: an empty string is the canonical
+ * withheld/unavailable sentinel, while a non-empty value must already be an
+ * origin-only HTTP(S) URL. Privileged and unknown fields are rejected.
+ */
+function sanitizeSafeInventoryUpstream(value, expectedFormat = null) {
+  const source = snapshotOwnDataRecord(value);
+  if (!source) return null;
+  const keys = Object.keys(source);
+  if (!keys.every(key => persistedUpstreamKeySet.has(key))) return null;
+  if (!["name", "_format", "format", "origin"].every(key => (
+    Object.prototype.hasOwnProperty.call(source, key)
+  ))) return null;
+  const descriptor = getUpstreamFormatDescriptor(source.format);
+  const expectedDescriptor = expectedFormat === null
+    ? null
+    : getUpstreamFormatDescriptor(expectedFormat);
+  if (
+    !descriptor?.inspectable
+    || source._format !== descriptor.format
+    || source.format !== descriptor.format
+    || (expectedFormat !== null && expectedDescriptor?.format !== descriptor.format)
+  ) return null;
+  const safe = {};
+  for (const [key, fieldValue] of Object.entries(source)) {
+    const normalized = normalizePersistedField(key, fieldValue);
+    if (normalized === null) return null;
+    if (Array.isArray(normalized)) {
+      const original = snapshotStringArray(
+        fieldValue,
+        MAX_PERSISTED_DISTRO_VERSIONS,
+        MAX_PERSISTED_NAME_LENGTH
+      );
+      if (!original || normalized.length !== original.length
+        || normalized.some((item, index) => item !== original[index])) return null;
+      safe[key] = Object.freeze(normalized.slice());
+    } else {
+      if (normalized !== fieldValue) return null;
+      safe[key] = normalized;
+    }
+  }
+  return Object.freeze(safe);
+}
+
+function isSafeInventoryUpstream(value, expectedFormat = null) {
+  return sanitizeSafeInventoryUpstream(value, expectedFormat) !== null;
+}
+
+function snapshotOwnDataRecord(value) {
+  if (!value || typeof value !== "object" || isProxy(value)) return null;
+  let prototype;
+  let descriptors;
+  try {
+    if (Array.isArray(value)) return null;
+    prototype = Object.getPrototypeOf(value);
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    return null;
+  }
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  const ownKeys = Reflect.ownKeys(descriptors);
+  if (ownKeys.some(key => typeof key !== "string")) return null;
+  const snapshot = Object.create(null);
+  for (const key of ownKeys) {
+    const descriptor = descriptors[key];
+    if (!descriptor || descriptor.enumerable !== true
+      || !Object.prototype.hasOwnProperty.call(descriptor, "value")) return null;
+    snapshot[key] = descriptor.value;
+  }
+  return snapshot;
+}
+
+function snapshotStringArray(value, maxItems, maxStringLength) {
+  const values = snapshotOwnDataArray(value, maxItems);
+  if (!values) return null;
+  const copy = [];
+  for (const valueItem of values) {
+    const item = boundedString(valueItem, maxStringLength);
+    if (!item) return null;
+    copy.push(item);
+  }
+  return copy;
+}
+
+function snapshotOwnDataArray(value, maxItems) {
+  if (isProxy(value)) return null;
+  let descriptors;
+  try {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return null;
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    return null;
+  }
+  const lengthDescriptor = descriptors.length;
+  if (!lengthDescriptor || !Object.prototype.hasOwnProperty.call(lengthDescriptor, "value")) {
+    return null;
+  }
+  const length = lengthDescriptor.value;
+  if (!Number.isSafeInteger(length) || length < 0 || length > maxItems) return null;
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some(key => (
+    typeof key !== "string" || (key !== "length" && !/^(0|[1-9]\d*)$/u.test(key))
+  ))) return null;
+  const copy = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || descriptor.enumerable !== true
+      || !Object.prototype.hasOwnProperty.call(descriptor, "value")) return null;
+    copy.push(descriptor.value);
+  }
+  return copy;
 }
 
 function isAccountEnvelope(value, account, expectedKeys) {
@@ -314,41 +434,46 @@ function getCachedFlatResponse(
   now
 ) {
   if (!globalState || typeof globalState.get !== "function") return null;
-  const cached = globalState.get(cacheKey);
-  if (cached === undefined) return null;
+  const cachedValue = globalState.get(cacheKey);
+  if (cachedValue === undefined) return null;
+  const cached = snapshotOwnDataRecord(cachedValue);
+  const cachedValues = cached
+    ? snapshotOwnDataArray(cached.upstreams, MAX_PERSISTED_UPSTREAMS)
+    : null;
+  const cachedUpstreams = cachedValues
+    ? cachedValues.map(upstream => sanitizeSafeInventoryUpstream(upstream))
+    : null;
   const inspectableFormats = getInspectableUpstreamFormats(requestedFormats);
-  const valid = isAccountEnvelope(cached, account, [
+  const valid = cachedUpstreams !== null
+    && cachedUpstreams.every(Boolean)
+    && isAccountEnvelope(cached, account, [
     "accountEpoch", "activationId", "active", "failedFormats", "successfulFormats",
     "timestamp", "total", "upstreams", "version",
   ])
     && isFresh(cached.timestamp, now)
-    && Array.isArray(cached.upstreams)
-    && cached.upstreams.length <= MAX_PERSISTED_UPSTREAMS
-    && cached.upstreams.every(isPersistedUpstream)
     && Number.isInteger(cached.active) && cached.active >= 0
-    && Number.isInteger(cached.total) && cached.total === cached.upstreams.length
-    && cached.active === cached.upstreams.filter(upstream => upstream.is_active !== false).length
+    && Number.isInteger(cached.total) && cached.total === cachedUpstreams.length
+    && cached.active === cachedUpstreams.filter(upstream => upstream.is_active !== false).length
     && Array.isArray(cached.failedFormats) && cached.failedFormats.length === 0
     && Number.isInteger(cached.successfulFormats)
     && cached.successfulFormats === inspectableFormats.length
-    && cached.upstreams.every((upstream) => {
+    && cachedUpstreams.every((upstream) => {
       const taggedFormats = [upstream._format, upstream.format]
         .filter(value => value !== undefined);
       return taggedFormats.length > 0
         && taggedFormats.every(value => value === taggedFormats[0])
         && inspectableFormats.includes(taggedFormats[0]);
     })
-    && new Set(cached.upstreams.map((upstream) => {
+    && new Set(cachedUpstreams.map((upstream) => {
       const format = upstream._format || upstream.format;
       const identity = upstream.slug_perm ? `slug:${upstream.slug_perm}` : `name:${upstream.name}`;
       return `${format}\0${identity}`;
     })).size
-      === cached.upstreams.length;
+      === cachedUpstreams.length;
   if (!valid) {
     evictCacheEntry(globalState, cacheKey, workspace, repo);
     return null;
   }
-  const cachedUpstreams = cached.upstreams.map(upstream => ({ ...upstream }));
   const outcomes = getUniqueRequestedDescriptors(requestedFormats).map((descriptor) => {
     if (!descriptor.inspectable) {
       return makeFormatOutcome(descriptor.format, null, "unsupported", [], true);
@@ -521,9 +646,12 @@ async function fetchFormatUpstreams(api, workspace, repo, format, options = {}) 
         );
       }
       const canonicalPage = raw.map(value => canonicalizeRuntimeUpstream(value, {
+        expectedFormat: descriptor.format,
         privileged: options.projection === "privileged",
       }));
-      if (canonicalPage.some(value => value === null)) {
+      if (canonicalPage.some((value, index) => (
+        value === null || !hasCompatibleRawFormatIdentity(raw[index], descriptor)
+      ))) {
         return makeFormatOutcome(
           descriptor.format, descriptor.apiFormat, "failed", retained, false,
           { kind: "invalid_response", status: result.status, requestId: result.requestId,
@@ -592,6 +720,13 @@ async function fetchFormatUpstreams(api, workspace, repo, format, options = {}) 
       descriptor.format, descriptor.apiFormat, state, retained, false, error, page
     );
   }
+}
+
+function hasCompatibleRawFormatIdentity(value, descriptor) {
+  return [value?._format, value?.format].every((format) => {
+    if (format == null) return true;
+    return getUpstreamFormatDescriptor(format)?.format === descriptor.format;
+  });
 }
 
 function upstreamIdentity(descriptor, upstream) {
@@ -981,8 +1116,8 @@ class UpstreamChecker {
   }
 
   async getRepositoryUpstreamStateForFormats(workspace, repo, formats, options = {}) {
+    const result = await this.getUpstreamDataForFormats(workspace, repo, formats, options);
     const requestedFormats = getSupportedUpstreamFormats(formats);
-    const result = await this.getUpstreamDataForFormats(workspace, repo, requestedFormats, options);
     if (result === null) {
       return this._buildRepositoryUpstreamState(
         new Map(),
@@ -1016,25 +1151,37 @@ class UpstreamChecker {
   }
 
   async previewResolution(workspace, repo, name, format, options = {}) {
+    const descriptor = getUpstreamFormatDescriptor(format);
+    if (!descriptor?.inspectable) {
+      throw new TypeError("Upstream preview format must be a recognized inspectable format");
+    }
+    const canonicalFormat = descriptor.format;
     const account = this._captureAccount(options);
     if (!account) return null;
     const sharedOptions = { ...options, account };
     const [localResult, upstreamResult] = await Promise.allSettled([
-      this.existsLocally(workspace, repo, name, format, sharedOptions),
-      this.getUpstreamsForFormat(workspace, repo, format, sharedOptions),
+      this.existsLocally(workspace, repo, name, canonicalFormat, sharedOptions),
+      this.getUpstreamsForFormat(workspace, repo, canonicalFormat, sharedOptions),
     ]);
     if (!isAccountCurrent(this.connectionManager, account)) return null;
     const localPkg = localResult.status === "fulfilled"
       ? localResult.value
       : { data: null, error: localResult.reason, complete: false };
     const upstreams = upstreamResult.status === "fulfilled"
+      && upstreamResult.value && typeof upstreamResult.value === "object"
       ? upstreamResult.value
       : { data: [], error: upstreamResult.reason, complete: false };
-    const configs = Array.isArray(upstreams.data) ? upstreams.data : [];
+    const rawConfigs = Array.isArray(upstreams.data) ? upstreams.data : [];
+    const sanitizedConfigs = rawConfigs.map(upstream => (
+      sanitizeSafeInventoryUpstream(upstream, canonicalFormat)
+    ));
+    const configsValid = sanitizedConfigs.every(Boolean);
+    const configs = sanitizedConfigs.filter(Boolean);
     const active = configs.filter(upstream => upstream.is_active !== false);
+    const upstreamError = upstreams.error || (configsValid ? null : { kind: "invalid_response" });
     return {
       name,
-      format,
+      format: canonicalFormat,
       workspace,
       repo,
       local: {
@@ -1044,8 +1191,8 @@ class UpstreamChecker {
       },
       upstreams: {
         data: { total: configs.length, active: active.length, configs },
-        errorMessage: upstreams.error ? formatUpstreamError(upstreams.error, "upstream") : null,
-        complete: upstreams.complete === true,
+        errorMessage: upstreamError ? formatUpstreamError(upstreamError, "upstream") : null,
+        complete: upstreams.complete === true && configsValid,
       },
       canResolveViaUpstream: active.length > 0,
     };
@@ -1069,32 +1216,44 @@ class UpstreamChecker {
     if (!account || !isAccountCurrent(this.connectionManager, account)) return null;
     const globalState = this.context && this.context.globalState;
     if (!globalState || typeof globalState.get !== "function") return null;
-    const cached = globalState.get(this._getRepositoryUpstreamCacheKey(workspace, repo));
-    if (cached === undefined) return null;
-    const formats = isObjectRecord(cached.groupedUpstreams)
-      ? Object.keys(cached.groupedUpstreams)
-      : [];
-    const valid = isAccountEnvelope(cached, account, [
+    const cachedValue = globalState.get(this._getRepositoryUpstreamCacheKey(workspace, repo));
+    if (cachedValue === undefined) return null;
+    const cached = snapshotOwnDataRecord(cachedValue);
+    const groupedValue = cached ? snapshotOwnDataRecord(cached.groupedUpstreams) : null;
+    const formats = groupedValue ? Object.keys(groupedValue) : [];
+    const safeGrouped = new Map();
+    let groupedValid = groupedValue !== null;
+    for (const format of formats) {
+      const values = snapshotOwnDataArray(
+        groupedValue[format],
+        MAX_PERSISTED_UPSTREAMS_PER_FORMAT
+      );
+      const safeValues = values?.map(upstream => (
+        sanitizeSafeInventoryUpstream(upstream, format)
+      ));
+      if (!safeValues || safeValues.some(value => value === null)) {
+        groupedValid = false;
+        break;
+      }
+      safeGrouped.set(format, safeValues);
+    }
+    const valid = groupedValid && isAccountEnvelope(cached, account, [
       "accountEpoch", "activationId", "groupedUpstreams", "successfulFormats",
       "timestamp", "version",
     ])
       && isFresh(cached.timestamp, this.now())
-      && isObjectRecord(cached.groupedUpstreams)
       && formats.every(format => SUPPORTED_UPSTREAM_FORMATS.includes(format))
       && formats.every(format => (
-        Array.isArray(cached.groupedUpstreams[format])
-        && cached.groupedUpstreams[format].length <= MAX_PERSISTED_UPSTREAMS_PER_FORMAT
-        && cached.groupedUpstreams[format].every(isPersistedUpstream)
-        && cached.groupedUpstreams[format].every(upstream => (
+        safeGrouped.get(format).every(upstream => (
           upstream._format === format && upstream.format === format
         ))
-        && new Set(cached.groupedUpstreams[format].map((upstream) => (
+        && new Set(safeGrouped.get(format).map((upstream) => (
           upstream.slug_perm ? `slug:${upstream.slug_perm}` : `name:${upstream.name}`
         ))).size
-          === cached.groupedUpstreams[format].length
+          === safeGrouped.get(format).length
       ))
       && formats.reduce((total, format) => (
-        total + cached.groupedUpstreams[format].length
+        total + safeGrouped.get(format).length
       ), 0) <= MAX_PERSISTED_UPSTREAMS
       && Number.isInteger(cached.successfulFormats)
       && cached.successfulFormats === SUPPORTED_UPSTREAM_FORMATS.length;
@@ -1103,7 +1262,7 @@ class UpstreamChecker {
       return null;
     }
     return this._buildRepositoryUpstreamState(
-      this._deserializeGroupedUpstreams(cached.groupedUpstreams),
+      safeGrouped,
       [],
       cached.successfulFormats,
       []
@@ -1205,7 +1364,10 @@ class UpstreamChecker {
     const grouped = new Map();
     for (const format of SUPPORTED_UPSTREAM_FORMATS) {
       if (Array.isArray(groupedUpstreams[format])) {
-        grouped.set(format, groupedUpstreams[format].map(upstream => ({ ...upstream })));
+        const upstreams = groupedUpstreams[format]
+          .map(upstream => sanitizeSafeInventoryUpstream(upstream, format))
+          .filter(Boolean);
+        grouped.set(format, upstreams);
       }
     }
     return grouped;
@@ -1271,6 +1433,8 @@ module.exports = {
   getActiveUpstreamsFromRepositoryState,
   getActiveUpstreamCacheOperationCount,
   isBenignUpstreamFormatError,
+  isSafeInventoryUpstream,
+  sanitizeSafeInventoryUpstream,
   getUpstreamCacheKey,
   MAX_PERSISTED_UPSTREAMS,
   MAX_RUNTIME_UPSTREAMS_PER_FORMAT,
