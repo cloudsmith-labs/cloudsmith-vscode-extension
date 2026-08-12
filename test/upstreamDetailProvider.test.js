@@ -117,26 +117,28 @@ suite("UpstreamDetailProvider Test Suite", () => {
     assert.ok(html.length < 20_000);
   });
 
-  test("shows trust level without explanatory trust callouts", () => {
+  test("shows supported trust values as status pills without explanatory copy", () => {
     const provider = new UpstreamDetailProvider({});
     const html = provider._getHtmlContent("acme", "repo", "Repo", {
       groupedUpstreams: new Map([
         ["python", [
           { name: "Trusted source", trust_level: "Trusted" },
           { name: "Untrusted source", trust_level: "Untrusted" },
+          { name: "Future source", trust_level: "Future value" },
         ]],
       ]),
       failedFormats: [],
       uninspectedFormats: [],
       successfulFormats: 20,
-      configuredTotal: 2,
+      configuredTotal: 3,
       complete: true,
       state: "complete",
     });
 
-    assert.ok(html.includes("Trust level"));
-    assert.ok(html.includes("Trusted"));
-    assert.ok(html.includes("Untrusted"));
+    assert.match(html, /status-badge status-badge-trusted">Trusted<\/span>/);
+    assert.match(html, /status-badge status-badge-untrusted">Untrusted<\/span>/);
+    assert.ok(!html.includes("Trust level"));
+    assert.ok(!html.includes("Future value"));
     assert.ok(!html.includes("Trusted upstream:"));
     assert.ok(!html.includes("Untrusted upstream (recommended):"));
     assert.ok(!html.includes("dependency confusion"));

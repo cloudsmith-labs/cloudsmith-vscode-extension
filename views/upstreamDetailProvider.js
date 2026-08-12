@@ -484,6 +484,13 @@ class UpstreamDetailProvider {
       line-height: 1.3;
       white-space: nowrap;
     }
+    .status-badges {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
     .status-badge-active {
       color: var(--vscode-testing-iconPassed);
     }
@@ -512,13 +519,11 @@ class UpstreamDetailProvider {
       font-family: var(--vscode-editor-font-family);
       font-size: 0.95em;
     }
-    .trust-value-trusted {
+    .status-badge-trusted {
       color: var(--vscode-textLink-foreground);
-      font-weight: 600;
     }
-    .trust-value-untrusted {
+    .status-badge-untrusted {
       color: var(--vscode-testing-iconPassed);
-      font-weight: 600;
     }
     .empty-state {
       margin: 8px 0 0 0;
@@ -572,7 +577,6 @@ class UpstreamDetailProvider {
       this._renderDetail("Mode", typeof upstream.mode === "string" ? upstream.mode : "", ""),
       this._renderDetail("Priority", this._getPriority(upstream), ""),
       this._renderDetail("SSL verification", this._getSslVerification(upstream), ""),
-      this._renderTrustDetail(upstream),
       this._renderDetail("Indexing", this._getIndexingDisplay(upstream), ""),
       this._renderDetail("Distribution", this._getDistribution(upstream), ""),
       this._renderDetail("Created", this._formatCreatedAt(upstream.created_at), ""),
@@ -581,7 +585,10 @@ class UpstreamDetailProvider {
     return `<article class="upstream-card">
   <div class="card-header">
     <div class="card-title">${this._escape(formatUpstreamText(upstream.name, "Unnamed"))}</div>
-    <span class="status-badge ${statusClass}">${this._escape(statusLabel)}</span>
+    <div class="status-badges">
+      <span class="status-badge ${statusClass}">${this._escape(statusLabel)}</span>
+      ${this._renderTrustBadge(upstream)}
+    </div>
   </div>
   <div class="details-grid">
     ${details}
@@ -597,12 +604,12 @@ class UpstreamDetailProvider {
     return `<div class="detail-label">${label}</div><div class="${className}">${this._escape(displayValue)}</div>`;
   }
 
-  _renderTrustDetail(upstream) {
+  _renderTrustBadge(upstream) {
     if (upstream.trust_level === "Trusted") {
-      return `<div class="detail-label">Trust level</div><div class="detail-value trust-value-trusted">${this._escape(upstream.trust_level)}</div>`;
+      return `<span class="status-badge status-badge-trusted">Trusted</span>`;
     }
     if (upstream.trust_level === "Untrusted") {
-      return `<div class="detail-label">Trust level</div><div class="detail-value trust-value-untrusted">${this._escape(upstream.trust_level)}</div>`;
+      return `<span class="status-badge status-badge-untrusted">Untrusted</span>`;
     }
     return "";
   }
