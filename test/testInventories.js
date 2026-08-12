@@ -20,6 +20,7 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/searchQueryBuilder.test.js",
   "test/testHelpers.test.js",
   "test/testInventories.test.js",
+  "test/upstreamFormats.test.js",
   "test/upstreamOperationScheduler.test.js",
   "test/upstreamPresentation.test.js",
   "test/webAppUrls.test.js",
@@ -82,6 +83,7 @@ const VSCODE_SMOKE_TESTS = Object.freeze([
 
 const LIVE_TESTS = Object.freeze([
   "test/integration/search.test.js",
+  "test/integration/upstreams.test.js",
   "test/integration/vulnerabilities.test.js",
 ]);
 

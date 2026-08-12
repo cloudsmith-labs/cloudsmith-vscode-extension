@@ -10,16 +10,26 @@ const {
   resolveConnectionManager,
 } = require("./accountOperation");
 const {
+  getInspectableUpstreamFormats,
   getSupportedUpstreamFormats,
+  getUpstreamFormatDescriptor,
   SUPPORTED_UPSTREAM_FORMATS,
 } = require("./upstreamFormats");
 const { UpstreamOperationScheduler } = require("./upstreamOperationScheduler");
-const { formatUpstreamError } = require("./upstreamPresentation");
+const {
+  formatUpstreamError,
+  formatUpstreamOrigin,
+  normalizeUpstreamFailure,
+} = require("./upstreamPresentation");
 
-const UPSTREAM_CACHE_SCHEMA_VERSION = 3;
+const UPSTREAM_CACHE_SCHEMA_VERSION = 4;
 const UPSTREAM_CACHE_TTL_MS = 10 * 60 * 1000;
-const UPSTREAM_FETCH_BATCH_SIZE = 5;
-const UPSTREAM_CACHE_KEY_PREFIX = "cloudsmith-upstreams:v3";
+// Four active page requests is conservative enough for the API rate limit while
+// avoiding the latency-amplifying batch barriers used by the previous path.
+const UPSTREAM_REQUEST_CONCURRENCY = 4;
+// Compatibility export for callers that referenced the former batching name.
+const UPSTREAM_FETCH_BATCH_SIZE = UPSTREAM_REQUEST_CONCURRENCY;
+const UPSTREAM_CACHE_KEY_PREFIX = "cloudsmith-upstreams:v4";
 const MAX_PERSISTED_UPSTREAMS = 5000;
 const MAX_PERSISTED_UPSTREAMS_PER_FORMAT = 500;
 const MAX_PERSISTED_STRING_LENGTH = 2048;
@@ -28,12 +38,16 @@ const MAX_PERSISTED_DISTRO_VERSIONS = 100;
 const MAX_RUNTIME_UPSTREAMS = 5000;
 const MAX_RUNTIME_UPSTREAMS_PER_FORMAT = 500;
 const MAX_RUNTIME_URL_LENGTH = 8192;
+const MAX_REPOSITORY_IDENTITY_LENGTH = 500;
 const LOCAL_PACKAGE_PAGE_SIZE = 100;
 const MAX_LOCAL_PACKAGE_PAGES = 20;
 const MAX_LOCAL_PACKAGES = LOCAL_PACKAGE_PAGE_SIZE * MAX_LOCAL_PACKAGE_PAGES;
-const BENIGN_UPSTREAM_FORMAT_STATUS_CODES = new Set([400, 404, 405, 422]);
+const UPSTREAM_PAGE_SIZE = 100;
+const MAX_UPSTREAM_PAGES_PER_FORMAT = 5;
+const UPSTREAM_OPERATION_TIMEOUT_MS = 45_000;
 const PERSISTED_UPSTREAM_KEYS = Object.freeze([
   "name",
+  "slug_perm",
   "is_active",
   "_format",
   "format",
@@ -47,10 +61,12 @@ const PERSISTED_UPSTREAM_KEYS = Object.freeze([
   "distribution",
   "distro_versions",
   "upstream_distribution",
+  "origin",
 ]);
 const persistedUpstreamKeySet = new Set(PERSISTED_UPSTREAM_KEYS);
 const persistedStringFieldLimits = new Map([
   ["name", MAX_PERSISTED_NAME_LENGTH],
+  ["slug_perm", MAX_PERSISTED_NAME_LENGTH],
   ["_format", MAX_PERSISTED_NAME_LENGTH],
   ["format", MAX_PERSISTED_NAME_LENGTH],
   ["mode", MAX_PERSISTED_NAME_LENGTH],
@@ -59,6 +75,7 @@ const persistedStringFieldLimits = new Map([
   ["index_status", MAX_PERSISTED_NAME_LENGTH],
   ["distribution", MAX_PERSISTED_STRING_LENGTH],
   ["upstream_distribution", MAX_PERSISTED_STRING_LENGTH],
+  ["origin", MAX_PERSISTED_STRING_LENGTH],
 ]);
 const cacheOperations = new WeakMap();
 const cacheWriteQueues = new WeakMap();
@@ -75,9 +92,10 @@ function hasExactKeys(value, expectedKeys) {
 }
 
 function getUpstreamCacheKey(workspace, repo, formats = SUPPORTED_UPSTREAM_FORMATS) {
-  const normalizedFormats = getSupportedUpstreamFormats(formats);
+  const normalizedFormats = getSupportedUpstreamFormats(formats).sort();
+  const canonicalAllFormats = [...SUPPORTED_UPSTREAM_FORMATS].sort();
   const isAllFormats = normalizedFormats.length === SUPPORTED_UPSTREAM_FORMATS.length
-    && normalizedFormats.every((format, index) => format === SUPPORTED_UPSTREAM_FORMATS[index]);
+    && normalizedFormats.every((format, index) => format === canonicalAllFormats[index]);
   const tuple = isAllFormats
     ? ["all", workspace, repo]
     : ["formats", workspace, repo, normalizedFormats];
@@ -165,7 +183,12 @@ function normalizePersistedField(key, value) {
   if (["is_active", "verify_ssl"].includes(key)) {
     return typeof value === "boolean" ? value : null;
   }
-  if (["index_package_count", "priority"].includes(key)) {
+  if (key === "priority") {
+    return Number.isSafeInteger(value) && value >= 0
+      ? value
+      : boundedString(value, MAX_PERSISTED_NAME_LENGTH);
+  }
+  if (key === "index_package_count") {
     return Number.isSafeInteger(value) && value >= 0 ? value : null;
   }
   if (key === "distro_versions") {
@@ -195,46 +218,70 @@ function serializeUpstreamArray(upstreams, max = MAX_PERSISTED_UPSTREAMS) {
   return serialized.every(Boolean) ? serialized : null;
 }
 
-function canonicalizeRuntimeUpstream(value) {
+function canonicalizeRuntimeUpstream(value, options = {}) {
   if (!isObjectRecord(value)) return null;
   const name = boundedString(value.name, MAX_PERSISTED_NAME_LENGTH);
   if (!name) return null;
   const canonical = { name };
   for (const key of PERSISTED_UPSTREAM_KEYS) {
-    if (key === "name" || value[key] === undefined) continue;
+    if (["name", "origin", "_format", "format"].includes(key) || value[key] == null) continue;
     const normalized = normalizePersistedField(key, value[key]);
     if (normalized !== null) {
       canonical[key] = normalized;
       continue;
     }
-    if (
-      key === "priority"
-      && typeof value.priority === "string"
-      && boundedString(value.priority, MAX_PERSISTED_NAME_LENGTH)
-    ) {
-      canonical.priority = value.priority;
-      continue;
-    }
     return null;
   }
-  if (value.upstream_url !== undefined) {
-    if (!boundedString(value.upstream_url, MAX_RUNTIME_URL_LENGTH)) return null;
+  if (!isValidUpstreamUrl(value.upstream_url)) return null;
+  canonical.origin = safeInventoryOrigin(value.upstream_url);
+  // Privileged projection is explicit, ephemeral, and never persisted. The
+  // default inventory projection contains no URL path, userinfo, query, hash,
+  // authentication, or custom-header values.
+  if (options.privileged === true) {
     canonical.upstream_url = value.upstream_url;
   }
   for (const key of [
     "auth_mode", "auth_username", "extra_header_1", "extra_value_1",
     "extra_header_2", "extra_value_2",
   ]) {
-    if (value[key] === undefined) continue;
+    if (value[key] == null) continue;
     const normalized = boundedString(value[key], MAX_PERSISTED_STRING_LENGTH);
     if (normalized === null) return null;
-    canonical[key] = normalized;
+    if (options.privileged === true) canonical[key] = normalized;
   }
   return canonical;
 }
 
+function safeInventoryOrigin(value) {
+  try {
+    const parsed = new URL(value);
+    if (
+      !["http:", "https:"].includes(parsed.protocol)
+      || parsed.username
+      || parsed.password
+      || parsed.search
+      || parsed.hash
+    ) return "";
+    const origin = formatUpstreamOrigin(value);
+    return origin === "Origin unavailable" ? "" : origin;
+  } catch {
+    return "";
+  }
+}
+
+function isValidUpstreamUrl(value) {
+  if (!boundedString(value, MAX_RUNTIME_URL_LENGTH)) return false;
+  try {
+    const parsed = new URL(value);
+    return ["http:", "https:"].includes(parsed.protocol) && Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function isPersistedUpstream(value) {
-  return isUpstreamRecord(value)
+  return isObjectRecord(value)
+    && Boolean(boundedString(value.name, MAX_PERSISTED_NAME_LENGTH))
     && Object.keys(value).every(key => persistedUpstreamKeySet.has(key))
     && Object.entries(value).every(([key, fieldValue]) => {
       const normalized = normalizePersistedField(key, fieldValue);
@@ -269,6 +316,7 @@ function getCachedFlatResponse(
   if (!globalState || typeof globalState.get !== "function") return null;
   const cached = globalState.get(cacheKey);
   if (cached === undefined) return null;
+  const inspectableFormats = getInspectableUpstreamFormats(requestedFormats);
   const valid = isAccountEnvelope(cached, account, [
     "accountEpoch", "activationId", "active", "failedFormats", "successfulFormats",
     "timestamp", "total", "upstreams", "version",
@@ -282,32 +330,40 @@ function getCachedFlatResponse(
     && cached.active === cached.upstreams.filter(upstream => upstream.is_active !== false).length
     && Array.isArray(cached.failedFormats) && cached.failedFormats.length === 0
     && Number.isInteger(cached.successfulFormats)
-    && cached.successfulFormats === requestedFormats.length
+    && cached.successfulFormats === inspectableFormats.length
     && cached.upstreams.every((upstream) => {
       const taggedFormats = [upstream._format, upstream.format]
         .filter(value => value !== undefined);
       return taggedFormats.length > 0
         && taggedFormats.every(value => value === taggedFormats[0])
-        && requestedFormats.includes(taggedFormats[0]);
+        && inspectableFormats.includes(taggedFormats[0]);
     })
-    && new Set(cached.upstreams.map(upstream => `${upstream._format || upstream.format}\0${upstream.name}`)).size
+    && new Set(cached.upstreams.map((upstream) => {
+      const format = upstream._format || upstream.format;
+      const identity = upstream.slug_perm ? `slug:${upstream.slug_perm}` : `name:${upstream.name}`;
+      return `${format}\0${identity}`;
+    })).size
       === cached.upstreams.length;
   if (!valid) {
     evictCacheEntry(globalState, cacheKey, workspace, repo);
     return null;
   }
-  return {
-    upstreams: cached.upstreams.map(upstream => ({ ...upstream })),
-    active: cached.active,
-    total: cached.total,
-    failedFormats: [],
-    uninspectedFormats: [],
-    successfulFormats: cached.successfulFormats,
-    complete: true,
-    incomplete: false,
-    partial: false,
-    cancelled: false,
-  };
+  const cachedUpstreams = cached.upstreams.map(upstream => ({ ...upstream }));
+  const outcomes = getUniqueRequestedDescriptors(requestedFormats).map((descriptor) => {
+    if (!descriptor.inspectable) {
+      return makeFormatOutcome(descriptor.format, null, "unsupported", [], true);
+    }
+    return makeFormatOutcome(
+      descriptor.format,
+      descriptor.apiFormat,
+      "success",
+      cachedUpstreams.filter(upstream => (
+        (upstream._format || upstream.format) === descriptor.format
+      )),
+      true
+    );
+  });
+  return buildAggregateResult(outcomes, 0);
 }
 
 async function persistFlatResponse(
@@ -360,12 +416,14 @@ async function persistFlatResponse(
   });
 }
 
-function isBenignUpstreamFormatError(error) {
-  return Boolean(error) && BENIGN_UPSTREAM_FORMAT_STATUS_CODES.has(error.status);
+// Retained for compatibility with callers outside the inventory path. HTTP
+// status alone can never prove that a format is unsupported or empty.
+function isBenignUpstreamFormatError() {
+  return false;
 }
 
-function isWarningWorthyUpstreamFormatError(error) {
-  return !isBenignUpstreamFormatError(error);
+function isWarningWorthyUpstreamFormatError() {
+  return true;
 }
 
 function isAbortError(error) {
@@ -374,6 +432,14 @@ function isAbortError(error) {
 
 function isCancelled(options = {}) {
   return Boolean(options.signal?.aborted || options.cancellationToken?.isCancellationRequested);
+}
+
+function isCanonicalRepositoryIdentity(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= MAX_REPOSITORY_IDENTITY_LENGTH
+    && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function getActiveUpstreamsFromRepositoryState(state, format) {
@@ -397,50 +463,292 @@ function sortUpstreams(left, right) {
 }
 
 async function fetchFormatUpstreams(api, workspace, repo, format, options = {}) {
+  const descriptor = getUpstreamFormatDescriptor(format);
+  if (!descriptor) {
+    return makeFormatOutcome(format, null, "failed", [], false, {
+      kind: "invalid_request",
+    });
+  }
+  if (!descriptor.inspectable) {
+    return makeFormatOutcome(descriptor.format, null, "unsupported", [], true, null);
+  }
+
+  const retained = [];
+  const seen = new Set();
+  let page = 1;
+  let paginationAnchor = null;
   try {
-    if (isCancelled(options)) return { format, status: "aborted", upstreams: [] };
-    const request = () => api.get(apiEndpoint(["repos", workspace, repo, "upstream", format]), {
+    while (page <= MAX_UPSTREAM_PAGES_PER_FORMAT) {
+      if (isCancelled(options)) {
+        return makeFormatOutcome(
+          descriptor.format, descriptor.apiFormat, "cancelled", retained, false,
+          { kind: "cancelled" }, page
+        );
+      }
+      const endpoint = apiEndpoint(
+        ["repos", workspace, repo, "upstream", descriptor.apiFormat],
+        { query: { page, page_size: UPSTREAM_PAGE_SIZE } }
+      );
+      const request = () => api.get(endpoint, {
         responseType: "array",
-        validate: value => isUpstreamArray(value, format),
+        validate: Array.isArray,
         retry: "never",
         signal: options.signal,
         cancellationToken: options.cancellationToken,
       });
-    const result = options.scheduler
-      ? await options.scheduler.run(request, options)
-      : await request();
-    if (isCancelled(options)) return { format, status: "aborted", upstreams: [] };
-    if (!result.ok) {
-      if (result.error.kind === "cancelled") return { format, status: "aborted", upstreams: [] };
-      return isWarningWorthyUpstreamFormatError(result.error)
-        ? { format, status: "failed", error: result.error, upstreams: [] }
-        : { format, status: "loaded", upstreams: [] };
+      const result = options.scheduler
+        ? await options.scheduler.run(request, options)
+        : await request();
+      if (isCancelled(options)) {
+        return makeFormatOutcome(
+          descriptor.format, descriptor.apiFormat, "cancelled", retained, false,
+          { kind: "cancelled" }, page
+        );
+      }
+      if (!result || !result.ok) {
+        const failure = normalizeUpstreamFailure(result || null);
+        const state = failure.category === "cancelled" ? "cancelled" : "failed";
+        return makeFormatOutcome(
+          descriptor.format, descriptor.apiFormat, state, retained, false, result || null, page
+        );
+      }
+      const raw = Array.isArray(result.data) ? result.data : null;
+      if (!raw || raw.length > MAX_RUNTIME_UPSTREAMS_PER_FORMAT) {
+        return makeFormatOutcome(
+          descriptor.format, descriptor.apiFormat, "failed", retained, false,
+          { kind: "invalid_response", status: result.status, requestId: result.requestId,
+            serverRequestId: result.serverRequestId }, page
+        );
+      }
+      const canonicalPage = raw.map(value => canonicalizeRuntimeUpstream(value, {
+        privileged: options.projection === "privileged",
+      }));
+      if (canonicalPage.some(value => value === null)) {
+        return makeFormatOutcome(
+          descriptor.format, descriptor.apiFormat, "failed", retained, false,
+          { kind: "invalid_response", status: result.status, requestId: result.requestId,
+            serverRequestId: result.serverRequestId }, page
+        );
+      }
+      for (const upstream of canonicalPage) {
+        const identity = upstreamIdentity(descriptor, upstream);
+        if (!identity || seen.has(identity)) {
+          return makeFormatOutcome(
+            descriptor.format, descriptor.apiFormat, "failed", retained, false,
+            { kind: "invalid_response", status: result.status, requestId: result.requestId,
+              serverRequestId: result.serverRequestId }, page
+          );
+        }
+        seen.add(identity);
+        retained.push({ ...upstream, _format: descriptor.format, format: descriptor.format });
+      }
+
+      const pagination = parseUpstreamPagination(result.headers || {}, page, raw.length);
+      if (pagination === "empty") {
+        return makeFormatOutcome(
+          descriptor.format, descriptor.apiFormat, "success", retained, true, null, page
+        );
+      }
+      if (!pagination) {
+        return makeFormatOutcome(
+          descriptor.format, descriptor.apiFormat, "incomplete", retained, false,
+          { kind: "invalid_response", status: result.status, requestId: result.requestId,
+            serverRequestId: result.serverRequestId }, page
+        );
+      }
+      if (pagination !== "empty") {
+        if (paginationAnchor && (
+          pagination.count !== paginationAnchor.count
+          || pagination.pageTotal !== paginationAnchor.pageTotal
+          || pagination.pageSize !== paginationAnchor.pageSize
+        )) {
+          return makeFormatOutcome(
+            descriptor.format, descriptor.apiFormat, "incomplete", retained, false,
+            { kind: "invalid_response", status: result.status, requestId: result.requestId,
+              serverRequestId: result.serverRequestId }, page
+          );
+        }
+        paginationAnchor ||= pagination;
+      }
+      if (page >= pagination.pageTotal) {
+        return makeFormatOutcome(
+          descriptor.format, descriptor.apiFormat, "success", retained, true, null, page
+        );
+      }
+      page += 1;
     }
-    if (!isUpstreamArray(result.data, format)) {
-      return {
-        format,
-        status: "failed",
-        error: invalidUpstreamResponseError(),
-        upstreams: [],
-      };
-    }
-    return {
-      format,
-      status: "loaded",
-      upstreams: result.data.map(upstream => ({
-        ...canonicalizeRuntimeUpstream(upstream),
-        _format: format,
-        format,
-      })),
-    };
+    return makeFormatOutcome(
+      descriptor.format, descriptor.apiFormat, "incomplete", retained, false,
+      { kind: "resource_limit" }, MAX_UPSTREAM_PAGES_PER_FORMAT
+    );
   } catch (error) {
-    if (["request_limit", "rate_limit_circuit"].includes(error && error.kind)) {
-      return { format, status: "uninspected", error, upstreams: [] };
-    }
-    return isAbortError(error) || error?.kind === "cancelled" || isCancelled(options)
-      ? { format, status: "aborted", upstreams: [] }
-      : { format, status: "failed", error, upstreams: [] };
+    const failure = normalizeUpstreamFailure(error);
+    const state = isCancelled(options) || failure.category === "cancelled"
+      ? "cancelled"
+      : ["request_limit", "rate_limit"].includes(failure.category)
+        ? "uninspected"
+        : "failed";
+    return makeFormatOutcome(
+      descriptor.format, descriptor.apiFormat, state, retained, false, error, page
+    );
   }
+}
+
+function upstreamIdentity(descriptor, upstream) {
+  const slug = boundedString(upstream.slug_perm, MAX_PERSISTED_NAME_LENGTH);
+  const fallback = boundedString(upstream.name, MAX_PERSISTED_NAME_LENGTH);
+  return slug
+    ? `${descriptor.apiFormat}\0slug:${slug}`
+    : fallback ? `${descriptor.apiFormat}\0name:${fallback}` : null;
+}
+
+function parseUpstreamPagination(headers, requestedPage, itemCount) {
+  const names = [
+    "x-pagination-page", "x-pagination-pagetotal", "x-pagination-count",
+    "x-pagination-pagesize",
+  ];
+  const present = names.some(name => headers[name] !== undefined);
+  if (!present) return requestedPage === 1 && itemCount === 0 ? "empty" : null;
+  const values = names.map(name => parseStrictNonNegativeInteger(headers[name]));
+  if (values.some(value => value === null)) return null;
+  const [page, pageTotal, count, pageSize] = values;
+  if (
+    page !== requestedPage
+    || pageTotal < 1
+    || page > pageTotal
+    || pageSize < 1
+    || pageSize > UPSTREAM_PAGE_SIZE
+    || itemCount > pageSize
+    || pageTotal !== Math.max(1, Math.ceil(count / pageSize))
+  ) return null;
+  const expected = Math.min(pageSize, Math.max(0, count - ((page - 1) * pageSize)));
+  return expected === itemCount ? { page, pageTotal, count, pageSize } : null;
+}
+
+function parseStrictNonNegativeInteger(value) {
+  if (value === undefined) return null;
+  const text = String(value).trim();
+  if (!/^\d+$/.test(text)) return null;
+  const parsed = Number(text);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function makeFormatOutcome(format, apiFormat, state, entries, authoritative, source = null, pageCount = 0) {
+  const failure = ["failed", "incomplete", "uninspected", "cancelled"].includes(state)
+    ? normalizeUpstreamFailure(source)
+    : null;
+  return Object.freeze({
+    format,
+    apiFormat,
+    state,
+    status: state === "success" ? "loaded" : state === "cancelled" ? "aborted" : state,
+    entries: Object.freeze(entries.map(entry => Object.freeze({ ...entry }))),
+    upstreams: Object.freeze(entries.map(entry => Object.freeze({ ...entry }))),
+    authoritative: authoritative === true,
+    failure,
+    pageCount,
+  });
+}
+
+function getUniqueRequestedDescriptors(formats) {
+  return formats.map(getUpstreamFormatDescriptor).filter(Boolean);
+}
+
+function createOperationDeadline(options, scheduler) {
+  const controller = new AbortController();
+  const externalSignal = options.signal;
+  let expired = false;
+  const abort = () => {
+    controller.abort();
+    scheduler.cancel();
+  };
+  const onExternalAbort = () => abort();
+  if (externalSignal?.aborted) abort();
+  else externalSignal?.addEventListener?.("abort", onExternalAbort, { once: true });
+  const requestedTimeout = Number(options.operationTimeoutMs);
+  const timeoutMs = Number.isSafeInteger(requestedTimeout) && requestedTimeout > 0
+    ? Math.min(requestedTimeout, UPSTREAM_OPERATION_TIMEOUT_MS)
+    : UPSTREAM_OPERATION_TIMEOUT_MS;
+  const timer = setTimeout(() => {
+    expired = true;
+    abort();
+  }, timeoutMs);
+  timer.unref?.();
+  return {
+    signal: controller.signal,
+    timedOut: () => expired,
+    dispose() {
+      clearTimeout(timer);
+      externalSignal?.removeEventListener?.("abort", onExternalAbort);
+    },
+  };
+}
+
+function buildAggregateResult(outcomes, requestCount, options = {}) {
+  const entries = outcomes.flatMap(outcome => outcome.entries);
+  if (entries.length > MAX_RUNTIME_UPSTREAMS) {
+    const overflow = outcomes.find(outcome => outcome.entries.length > 0);
+    return buildAggregateResult(outcomes.map(outcome => outcome === overflow
+      ? makeFormatOutcome(
+        outcome.format, outcome.apiFormat, "failed", [], false,
+        { kind: "resource_limit" }, outcome.pageCount
+      )
+      : outcome), requestCount, options);
+  }
+  entries.sort(sortUpstreams);
+  const failedOutcomes = outcomes.filter(outcome => outcome.state === "failed");
+  const uninspectedOutcomes = outcomes.filter(outcome => (
+    ["incomplete", "uninspected", "cancelled"].includes(outcome.state)
+  ));
+  const unsupportedOutcomes = outcomes.filter(outcome => outcome.state === "unsupported");
+  const successfulOutcomes = outcomes.filter(outcome => (
+    outcome.state === "success" && outcome.authoritative
+  ));
+  const inspectableOutcomes = outcomes.filter(outcome => outcome.apiFormat !== null);
+  const authoritative = outcomes.length === 0 || (
+    inspectableOutcomes.length > 0
+    && inspectableOutcomes.every(outcome => (
+      outcome.state === "success" && outcome.authoritative
+    ))
+  );
+  const cancelled = options.cancelled === true
+    || outcomes.some(outcome => outcome.state === "cancelled");
+  let state = "failed";
+  if (cancelled) state = "cancelled";
+  else if (inspectableOutcomes.length === 0 && unsupportedOutcomes.length > 0) {
+    state = "unsupported";
+  } else if (authoritative) state = entries.length > 0 ? "complete" : "empty";
+  else if (successfulOutcomes.length > 0 || entries.length > 0) state = "partial";
+  const failures = Object.freeze([
+    ...failedOutcomes,
+    ...uninspectedOutcomes.filter(outcome => outcome.failure),
+  ].map(outcome => Object.freeze({
+    format: outcome.format,
+    apiFormat: outcome.apiFormat,
+    state: outcome.state,
+    ...outcome.failure,
+  })));
+  const configuredTotal = authoritative ? entries.length : null;
+  return Object.freeze({
+    state,
+    outcomes: Object.freeze(outcomes.slice()),
+    upstreams: Object.freeze(entries),
+    entries: Object.freeze(entries),
+    active: entries.filter(upstream => upstream.is_active !== false).length,
+    loadedCount: entries.length,
+    total: configuredTotal,
+    configuredTotal,
+    failedFormats: Object.freeze(failedOutcomes.map(outcome => outcome.format)),
+    failures,
+    unsupportedFormats: Object.freeze(unsupportedOutcomes.map(outcome => outcome.format)),
+    uninspectedFormats: Object.freeze(uninspectedOutcomes.map(outcome => outcome.format)),
+    successfulFormats: successfulOutcomes.length,
+    complete: authoritative,
+    incomplete: !authoritative,
+    partial: state === "partial",
+    cancelled,
+    requestCount: Number.isSafeInteger(requestCount) ? requestCount : 0,
+  });
 }
 
 class UpstreamChecker {
@@ -528,54 +836,43 @@ class UpstreamChecker {
   }
 
   async getUpstreamsForFormat(workspace, repo, format, options = {}) {
-    const account = this._captureAccount(options);
-    if (!account) return { data: [], error: null, complete: false, stale: true };
-    let endpoint;
-    try {
-      endpoint = apiEndpoint(["repos", workspace, repo, "upstream", format]);
-    } catch (error) {
-      return { data: [], error, complete: false };
-    }
-    const result = await this.api.get(endpoint, {
-      responseType: "array",
-      validate: value => isUpstreamArray(value, format),
-      retry: "safe-read",
-      signal: options.signal,
-      cancellationToken: options.cancellationToken,
-    });
-    if (!isAccountCurrent(this.connectionManager, account)) {
-      return { data: [], error: null, complete: false, stale: true };
-    }
-    if (!result.ok) {
-      return isBenignUpstreamFormatError(result.error)
-        ? { data: [], error: null, complete: true }
-        : { data: [], error: result.error, complete: false };
-    }
-    if (!isUpstreamArray(result.data, format)) {
-      return { data: [], error: invalidUpstreamResponseError(), complete: false };
-    }
+    const result = await this.getUpstreamDataForFormats(workspace, repo, [format], options);
+    if (!result) return { data: [], error: null, complete: false, stale: true };
+    const failure = result.failures[0] || null;
     return {
-      data: result.data.map(canonicalizeRuntimeUpstream),
-      error: null,
-      complete: true,
+      data: result.upstreams,
+      error: failure,
+      complete: result.complete,
+      stale: false,
     };
   }
 
   async getUpstreamDataForFormats(workspace, repo, formats, options = {}) {
+    if (!isCanonicalRepositoryIdentity(workspace) || !isCanonicalRepositoryIdentity(repo)) {
+      throw new TypeError("Upstream repository identity must be a bounded canonical string");
+    }
+    if (!Array.isArray(formats)) {
+      throw new TypeError("Upstream formats must be an array");
+    }
+    if (formats.some(format => !getUpstreamFormatDescriptor(format))) {
+      throw new TypeError("Upstream formats contain an unrecognized format");
+    }
     const account = this._captureAccount(options);
     if (!account || isCancelled(options)) return null;
     const requestedFormats = getSupportedUpstreamFormats(formats);
+    if (formats.length > 0 && requestedFormats.length === 0) {
+      throw new TypeError("Upstream formats did not contain a recognized canonical format");
+    }
     if (requestedFormats.length === 0) {
-      return {
-        upstreams: [], active: 0, total: 0, failedFormats: [], uninspectedFormats: [],
-        successfulFormats: 0, complete: true, incomplete: false, partial: false, cancelled: false,
-      };
+      return buildAggregateResult([], 0);
     }
     const cacheKey = getUpstreamCacheKey(workspace, repo, requestedFormats);
     const globalState = this.context && this.context.globalState;
-    const operationToken = globalState ? beginCacheOperation(globalState, cacheKey) : null;
+    const operationToken = globalState && options.projection !== "privileged"
+      ? beginCacheOperation(globalState, cacheKey)
+      : null;
     try {
-      const cached = options.bypassCache === true
+      const cached = options.bypassCache === true || options.projection === "privileged"
         ? null
         : getCachedFlatResponse(
           globalState,
@@ -588,63 +885,44 @@ class UpstreamChecker {
         );
       if (cached && isAccountCurrent(this.connectionManager, account)) return cached;
 
-      const upstreams = [];
-      const failedFormats = [];
-      const uninspectedFormats = [];
-      let successfulFormats = 0;
-      const scheduler = options.scheduler || new UpstreamOperationScheduler();
-      for (let index = 0; index < requestedFormats.length; index += UPSTREAM_FETCH_BATCH_SIZE) {
-        if (isCancelled(options) || !isAccountCurrent(this.connectionManager, account)) {
-          scheduler.cancel();
-          return null;
-        }
-        const batch = requestedFormats.slice(index, index + UPSTREAM_FETCH_BATCH_SIZE);
-        const results = await Promise.all(batch.map(format => (
-          fetchFormatUpstreams(this.api, workspace, repo, format, { ...options, scheduler })
+      const descriptors = getUniqueRequestedDescriptors(requestedFormats);
+      const inspectableCount = descriptors.filter(descriptor => descriptor.inspectable).length;
+      const scheduler = options.scheduler || new UpstreamOperationScheduler({
+        concurrency: UPSTREAM_REQUEST_CONCURRENCY,
+        maxRequests: Math.max(1, inspectableCount * MAX_UPSTREAM_PAGES_PER_FORMAT),
+      });
+      const deadline = createOperationDeadline(options, scheduler);
+      let outcomes;
+      try {
+        outcomes = await Promise.all(descriptors.map(descriptor => fetchFormatUpstreams(
+          this.api,
+          workspace,
+          repo,
+          descriptor.format,
+          { ...options, signal: deadline.signal, scheduler }
         )));
-        if (!isAccountCurrent(this.connectionManager, account)) return null;
-        let cancelled = isCancelled(options);
-        for (const result of results) {
-          if (result.status === "aborted") {
-            cancelled = true;
-            uninspectedFormats.push(result.format);
-          }
-          if (result.status === "uninspected") uninspectedFormats.push(result.format);
-          if (result.status === "failed") failedFormats.push(result.format);
-          if (result.status === "loaded") {
-            if (upstreams.length + result.upstreams.length > MAX_RUNTIME_UPSTREAMS) {
-              failedFormats.push(result.format);
-              continue;
-            }
-            successfulFormats += 1;
-            upstreams.push(...result.upstreams);
-          }
-        }
-        if (cancelled) {
-          scheduler.cancel();
-          uninspectedFormats.push(...requestedFormats.slice(index + batch.length));
-          break;
-        }
+      } finally {
+        deadline.dispose();
       }
-      upstreams.sort(sortUpstreams);
-      const uniqueFailedFormats = [...new Set(failedFormats)];
-      const uniqueUninspectedFormats = [...new Set(uninspectedFormats)];
-      const complete = uniqueFailedFormats.length === 0 && uniqueUninspectedFormats.length === 0;
-      const response = {
-        upstreams,
-        active: upstreams.filter(upstream => upstream.is_active !== false).length,
-        total: upstreams.length,
-        failedFormats: uniqueFailedFormats,
-        uninspectedFormats: uniqueUninspectedFormats,
-        successfulFormats,
-        complete,
-        incomplete: !complete,
-        partial: !complete && successfulFormats > 0,
-        cancelled: isCancelled(options),
-        requestCount: scheduler.requestCount,
-      };
       if (!isAccountCurrent(this.connectionManager, account)) return null;
-      if (!isCancelled(options) && complete && globalState) {
+      if (deadline.timedOut()) {
+        outcomes = outcomes.map(outcome => outcome.state === "cancelled"
+          ? makeFormatOutcome(
+            outcome.format, outcome.apiFormat, "uninspected", outcome.entries, false,
+            { kind: "timeout", retryable: true }, outcome.pageCount
+          )
+          : outcome);
+      }
+      const response = buildAggregateResult(outcomes, scheduler.requestCount, {
+        cancelled: isCancelled(options),
+      });
+      if (!isAccountCurrent(this.connectionManager, account)) return null;
+      if (
+        !isCancelled(options)
+        && options.projection !== "privileged"
+        && response.complete
+        && globalState
+      ) {
         await persistFlatResponse(
           globalState,
           cacheKey,
@@ -654,7 +932,7 @@ class UpstreamChecker {
           account,
           this.connectionManager,
           operationToken,
-          requestedFormats,
+          getInspectableUpstreamFormats(requestedFormats),
           this.now
         );
       }
@@ -697,26 +975,9 @@ class UpstreamChecker {
   }
 
   async getRepositoryUpstreamState(workspace, repo, options = {}) {
-    const account = this._captureAccount(options);
-    if (!account || isCancelled(options)) return this._emptyRepositoryState();
-    const globalState = this.context && this.context.globalState;
-    const cacheKey = this._getRepositoryUpstreamCacheKey(workspace, repo);
-    const operationToken = globalState ? beginCacheOperation(globalState, cacheKey) : null;
-    try {
-      const cached = this._getCachedRepositoryUpstreamState(workspace, repo, account);
-      if (cached && isAccountCurrent(this.connectionManager, account)) return cached;
-      const fetched = await this._fetchRepositoryUpstreamState(workspace, repo, {
-        ...options,
-        account,
-      });
-      if (!isAccountCurrent(this.connectionManager, account)) return this._emptyRepositoryState();
-      if (!isCancelled(options) && fetched.complete) {
-        await this._cacheRepositoryUpstreamState(workspace, repo, fetched, account, operationToken);
-      }
-      return isAccountCurrent(this.connectionManager, account) ? fetched : this._emptyRepositoryState();
-    } finally {
-      finishCacheOperation(globalState, cacheKey, operationToken);
-    }
+    return this.getRepositoryUpstreamStateForFormats(
+      workspace, repo, SUPPORTED_UPSTREAM_FORMATS, options
+    );
   }
 
   async getRepositoryUpstreamStateForFormats(workspace, repo, formats, options = {}) {
@@ -739,13 +1000,10 @@ class UpstreamChecker {
       values.push(upstream);
       grouped.set(format, values);
     }
-    return this._buildRepositoryUpstreamState(
-      grouped,
-      result.failedFormats,
-      result.successfulFormats,
-      result.uninspectedFormats,
-      { cancelled: result.cancelled, requestCount: result.requestCount }
-    );
+    return {
+      ...result,
+      groupedUpstreams: grouped,
+    };
   }
 
   async getRepositoryUpstreams(workspace, repo, options = {}) {
@@ -830,7 +1088,9 @@ class UpstreamChecker {
         && cached.groupedUpstreams[format].every(upstream => (
           upstream._format === format && upstream.format === format
         ))
-        && new Set(cached.groupedUpstreams[format].map(upstream => upstream.name)).size
+        && new Set(cached.groupedUpstreams[format].map((upstream) => (
+          upstream.slug_perm ? `slug:${upstream.slug_perm}` : `name:${upstream.name}`
+        ))).size
           === cached.groupedUpstreams[format].length
       ))
       && formats.reduce((total, format) => (
@@ -889,53 +1149,11 @@ class UpstreamChecker {
   }
 
   async _fetchRepositoryUpstreamState(workspace, repo, options = {}) {
-    const grouped = new Map();
-    const failed = [];
-    const uninspected = [];
-    let successful = 0;
-    const scheduler = options.scheduler || new UpstreamOperationScheduler();
-    for (let index = 0; index < SUPPORTED_UPSTREAM_FORMATS.length; index += UPSTREAM_FETCH_BATCH_SIZE) {
-      if (isCancelled(options) || !isAccountCurrent(this.connectionManager, options.account)) {
-        scheduler.cancel();
-        uninspected.push(...SUPPORTED_UPSTREAM_FORMATS.slice(index));
-        return this._buildRepositoryUpstreamState(
-          grouped, failed, successful, uninspected, { cancelled: true }
-        );
-      }
-      const batch = SUPPORTED_UPSTREAM_FORMATS.slice(index, index + UPSTREAM_FETCH_BATCH_SIZE);
-      const results = await Promise.all(batch.map(format => (
-        fetchFormatUpstreams(this.api, workspace, repo, format, { ...options, scheduler })
-      )));
-      if (isCancelled(options) || !isAccountCurrent(this.connectionManager, options.account)) {
-        scheduler.cancel();
-      }
-      for (const result of results) {
-        if (["aborted", "uninspected"].includes(result.status)) uninspected.push(result.format);
-        if (result.status === "failed") failed.push(result.format);
-        if (result.status === "loaded") {
-          const retainedCount = Array.from(grouped.values()).reduce(
-            (total, upstreams) => total + upstreams.length,
-            0
-          );
-          if (retainedCount + result.upstreams.length > MAX_RUNTIME_UPSTREAMS) {
-            failed.push(result.format);
-            continue;
-          }
-          successful += 1;
-          if (result.upstreams.length > 0) grouped.set(result.format, result.upstreams);
-        }
-      }
-      if (isCancelled(options)) {
-        uninspected.push(...SUPPORTED_UPSTREAM_FORMATS.slice(index + batch.length));
-        break;
-      }
-    }
-    return this._buildRepositoryUpstreamState(
-      grouped,
-      failed,
-      successful,
-      uninspected,
-      { cancelled: isCancelled(options), requestCount: scheduler.requestCount }
+    return this.getRepositoryUpstreamStateForFormats(
+      workspace,
+      repo,
+      SUPPORTED_UPSTREAM_FORMATS,
+      options
     );
   }
 
@@ -1036,37 +1254,6 @@ function incompleteLocalPackageError() {
   });
 }
 
-function isUpstreamRecord(value) {
-  return canonicalizeRuntimeUpstream(value) !== null;
-}
-
-function isUpstreamArray(value, expectedFormat = null) {
-  if (
-    !Array.isArray(value)
-    || value.length > MAX_RUNTIME_UPSTREAMS_PER_FORMAT
-    || !value.every(isUpstreamRecord)
-  ) return false;
-  const names = value.map(upstream => upstream.name);
-  if (new Set(names).size !== names.length) return false;
-  return !expectedFormat || value.every(upstream => (
-    (upstream._format === undefined || upstream._format === expectedFormat)
-    && (upstream.format === undefined || upstream.format === expectedFormat)
-  ));
-}
-
-function invalidUpstreamResponseError() {
-  return Object.freeze({
-    kind: "invalid_response",
-    status: null,
-    retryable: false,
-    message: "Cloudsmith returned an invalid upstream response.",
-    requestId: null,
-    retryAfterMs: null,
-    outcomeUnknown: false,
-    diagnostic: Object.freeze({}),
-  });
-}
-
 async function getAllUpstreamData(context, workspace, repo, options = {}) {
   const checker = new UpstreamChecker(context, options);
   return checker.getAllUpstreamData(workspace, repo, options);
@@ -1092,5 +1279,6 @@ module.exports = {
   UpstreamChecker,
   UPSTREAM_CACHE_SCHEMA_VERSION,
   UPSTREAM_FETCH_BATCH_SIZE,
+  UPSTREAM_REQUEST_CONCURRENCY,
   UPSTREAM_CACHE_TTL_MS,
 };

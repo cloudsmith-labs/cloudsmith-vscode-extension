@@ -3,9 +3,11 @@
 const assert = require("assert");
 const {
   formatUpstreamError,
+  formatUpstreamFailureCategory,
   formatUpstreamOrigin,
   formatUpstreamText,
   getTerraformUpstreamUrl,
+  normalizeUpstreamFailure,
 } = require("../util/upstreamPresentation");
 
 suite("Upstream presentation safety", () => {
@@ -53,6 +55,113 @@ suite("Upstream presentation safety", () => {
       formatUpstreamError(hostile),
       "Upstream availability could not be determined."
     );
+  });
+
+  test("normalizes upstream failure categories with fixed safe copy", () => {
+    const cases = [
+      [{ kind: "unauthorized" }, "authentication"],
+      [{ kind: "auth" }, "authentication"],
+      [{ status: 401 }, "authentication"],
+      [{ kind: "forbidden" }, "permission"],
+      [{ status: 403 }, "permission"],
+      [{ kind: "not_found" }, "not_found"],
+      [{ status: 404 }, "not_found"],
+      [{ kind: "timeout" }, "timeout"],
+      [{ status: 408 }, "timeout"],
+      [{ kind: "rate_limited" }, "rate_limit"],
+      [{ kind: "rate_limit_circuit" }, "rate_limit"],
+      [{ status: 429 }, "rate_limit"],
+      [{ kind: "server_error" }, "server"],
+      [{ status: 503 }, "server"],
+      [{ kind: "network_error" }, "network"],
+      [{ kind: "transport_failure" }, "network"],
+      [{ kind: "invalid_response" }, "invalid_response"],
+      [{ kind: "cancelled" }, "cancelled"],
+      [{ name: "AbortError" }, "cancelled"],
+      [{ code: "ABORT_ERR" }, "cancelled"],
+      [{ kind: "invalid_request" }, "request_rejected"],
+      [{ kind: "redirect_rejected" }, "request_rejected"],
+      [{ status: 422 }, "request_rejected"],
+      [{ kind: "request_limit" }, "request_limit"],
+      [{ kind: "resource_limit" }, "request_limit"],
+      [{ kind: "uninspected" }, "uninspected"],
+      [new Error("unknown https://user:pass@example.com/?token=secret"), "unknown"],
+    ];
+
+    for (const [error, category] of cases) {
+      const normalized = normalizeUpstreamFailure(error);
+      assert.strictEqual(normalized.category, category);
+      assert.strictEqual(normalized.message, formatUpstreamFailureCategory(category));
+      assert.ok(!normalized.message.includes("[object Object]"));
+      assert.ok(!normalized.message.includes("secret"));
+    }
+
+    assert.strictEqual(
+      formatUpstreamFailureCategory("constructor"),
+      "Upstream availability could not be determined."
+    );
+  });
+
+  test("retains only validated failure metadata and ignores hostile properties", () => {
+    const normalized = normalizeUpstreamFailure({
+      ok: false,
+      status: 429,
+      requestId: "local-request-1234",
+      serverRequestId: "0123456789abcdef-IAD",
+      headers: { authorization: "Bearer secret" },
+      diagnostic: { url: "https://user:pass@example.com/?token=secret" },
+      error: {
+        kind: "rate_limited",
+        status: 429,
+        retryable: true,
+        retryAfterMs: 2500,
+        requestId: "local-request-1234",
+        message: "token=secret",
+        cause: new Error("api-key=secret"),
+        stack: "private stack",
+      },
+    });
+    assert.deepStrictEqual(normalized, {
+      category: "rate_limit",
+      message: "Cloudsmith rate limited the upstream request. Try again later.",
+      httpStatus: 429,
+      retryable: true,
+      retryAfterMs: 2500,
+      requestId: "local-request-1234",
+      serverRequestId: "0123456789abcdef-IAD",
+    });
+    assert.ok(Object.isFrozen(normalized));
+
+    const malformed = normalizeUpstreamFailure({
+      status: "429",
+      requestId: "https://example.com/?token=secret",
+      serverRequestId: "bad id with spaces",
+      error: {
+        retryable: "true",
+        retryAfterMs: 24 * 60 * 60 * 1000 + 1,
+      },
+    });
+    assert.deepStrictEqual(malformed, {
+      category: "unknown",
+      message: "Upstream availability could not be determined.",
+      httpStatus: null,
+      retryable: false,
+      retryAfterMs: null,
+      requestId: null,
+      serverRequestId: null,
+    });
+
+    const hostile = new Proxy({}, {
+      get(_target, property) {
+        if (property === "kind") return "timeout";
+        throw new Error(`secret from ${String(property)}`);
+      },
+    });
+    const hostileNormalized = normalizeUpstreamFailure(hostile);
+    assert.strictEqual(hostileNormalized.category, "timeout");
+    assert.strictEqual(hostileNormalized.message, "The upstream request timed out.");
+    assert.strictEqual(hostileNormalized.requestId, null);
+    assert.strictEqual(hostileNormalized.serverRequestId, null);
   });
 
   test("projects only safe HTTP origins and fails closed", () => {

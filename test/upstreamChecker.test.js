@@ -12,6 +12,7 @@ const {
   UPSTREAM_CACHE_SCHEMA_VERSION,
 } = require("../util/upstreamChecker");
 const {
+  INSPECTABLE_UPSTREAM_FORMATS,
   SUPPORTED_UPSTREAM_FORMATS: SHARED_SUPPORTED_UPSTREAM_FORMATS,
 } = require("../util/upstreamFormats");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
@@ -83,7 +84,7 @@ suite("UpstreamChecker repository upstream cache", () => {
     CredentialManager.prototype.getApiKey = async () => "test-api-key";
     CloudsmithAPI.prototype.get = async function(endpoint, options = {}) {
       requestCount += 1;
-      const match = endpoint.match(/upstream\/([^/]+)\/$/);
+      const match = endpoint.match(/upstream\/([^/?]+)\/(?:\?.*)?$/);
       const format = match ? match[1] : null;
       const response = formatResponses[format];
 
@@ -162,13 +163,12 @@ suite("UpstreamChecker repository upstream cache", () => {
       docker: [
         { name: "Docker Hub", upstream_url: "https://registry-1.docker.io/" },
       ],
-      conda: apiFailure("not_found", { status: 404 }),
     };
 
     const checker = createChecker(context);
     const firstState = await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
 
-    assert.strictEqual(requestCount, SUPPORTED_UPSTREAM_FORMATS.length);
+    assert.strictEqual(requestCount, INSPECTABLE_UPSTREAM_FORMATS.length);
     assert.strictEqual(firstState.total, 6);
     assert.strictEqual(firstState.active, 5);
     assert.deepStrictEqual(firstState.failedFormats, []);
@@ -188,7 +188,7 @@ suite("UpstreamChecker repository upstream cache", () => {
 
     const secondState = await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
 
-    assert.strictEqual(requestCount, SUPPORTED_UPSTREAM_FORMATS.length);
+    assert.strictEqual(requestCount, INSPECTABLE_UPSTREAM_FORMATS.length);
     assert.strictEqual(secondState.total, 6);
     assert.strictEqual(secondState.active, 5);
     assert.strictEqual(secondState.groupedUpstreams.get("python")[0].name, "Internal mirror");
@@ -227,13 +227,14 @@ suite("UpstreamChecker repository upstream cache", () => {
     const firstState = await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
 
     assert.ok(firstState.failedFormats.includes("npm"));
-    assert.strictEqual(firstState.total, 1);
+    assert.strictEqual(firstState.total, null);
+    assert.strictEqual(firstState.loadedCount, 1);
     assert.strictEqual(firstState.active, 1);
     assert.strictEqual(store.size, 0);
 
     await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
 
-    assert.strictEqual(requestCount, SUPPORTED_UPSTREAM_FORMATS.length * 2);
+    assert.strictEqual(requestCount, INSPECTABLE_UPSTREAM_FORMATS.length * 2);
     assert.strictEqual(store.size, 0);
   });
 
@@ -244,7 +245,7 @@ suite("UpstreamChecker repository upstream cache", () => {
     const state = await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
 
     assert.strictEqual(state.active, 0);
-    assert.strictEqual(state.total, 0);
+    assert.strictEqual(state.total, null);
     assert.ok(state.failedFormats.includes("python"));
     assert.strictEqual(store.size, 0);
   });
@@ -261,7 +262,7 @@ suite("UpstreamChecker repository upstream cache", () => {
 
     assert.strictEqual(state.complete, false);
     assert.strictEqual(state.active, 0);
-    assert.strictEqual(state.total, 0);
+    assert.strictEqual(state.total, null);
     assert.deepStrictEqual(state.failedFormats, ["python"]);
     assert.strictEqual(store.size, 0);
   });
@@ -362,13 +363,7 @@ suite("UpstreamChecker repository upstream cache", () => {
       assert.strictEqual(state.active, 2);
       assert.deepStrictEqual(state.failedFormats, []);
       assert.strictEqual(store.size, 0);
-      assert.strictEqual(logCalls.length, 1);
-      assert.deepStrictEqual(logCalls[0].slice(0, 3), [
-        "persist",
-        "workspace-a",
-        "repo-a",
-      ]);
-      assert.strictEqual(logCalls[0][3].message, "quota exceeded");
+      assert.strictEqual(logCalls.length, 0);
     } finally {
       context.globalState.update = originalUpdate;
     }
@@ -433,7 +428,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
 
     checker.api.get = async (endpoint) => {
       requestCount += 1;
-      const match = endpoint.match(/upstream\/([^/]+)\/$/);
+      const match = endpoint.match(/upstream\/([^/?]+)\/(?:\?.*)?$/);
       const format = match ? match[1] : null;
       const response = formatResponses[format];
 
@@ -492,10 +487,10 @@ suite("UpstreamChecker shared helper and format handling", () => {
   });
 
   [400, 404, 405, 422].forEach((statusCode) => {
-    test(`${statusCode} is classified as a benign upstream format error`, () => {
+    test(`${statusCode} is not misclassified as an empty upstream result`, () => {
       assert.strictEqual(
         isBenignUpstreamFormatError({ status: statusCode }),
-        true
+        false
       );
     });
   });
@@ -529,12 +524,11 @@ suite("UpstreamChecker shared helper and format handling", () => {
       docker: [
         { name: "Docker Hub", upstream_url: "https://registry-1.docker.io/" },
       ],
-      conda: apiFailure("not_found", { status: 404 }),
     });
 
     const firstState = await checker.getAllUpstreamData("workspace-a", "repo-a");
 
-    assert.strictEqual(getRequestCount(), SUPPORTED_UPSTREAM_FORMATS.length);
+    assert.strictEqual(getRequestCount(), INSPECTABLE_UPSTREAM_FORMATS.length);
     assert.strictEqual(firstState.total, 6);
     assert.strictEqual(firstState.active, 5);
     assert.deepStrictEqual(firstState.failedFormats, []);
@@ -559,7 +553,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
 
     const secondState = await checker.getAllUpstreamData("workspace-a", "repo-a");
 
-    assert.strictEqual(getRequestCount(), SUPPORTED_UPSTREAM_FORMATS.length);
+    assert.strictEqual(getRequestCount(), INSPECTABLE_UPSTREAM_FORMATS.length);
     assert.strictEqual(secondState.total, 6);
     assert.strictEqual(secondState.active, 5);
   });
@@ -582,7 +576,8 @@ suite("UpstreamChecker shared helper and format handling", () => {
     );
 
     assert.deepStrictEqual(firstState.failedFormats, ["npm"]);
-    assert.strictEqual(firstState.total, 1);
+    assert.strictEqual(firstState.total, null);
+    assert.strictEqual(firstState.loadedCount, 1);
     assert.strictEqual(firstState.active, 1);
     assert.strictEqual(updates.length, 0);
 
@@ -644,7 +639,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
       ["python"]
     );
     assert.deepStrictEqual(countResult.failedFormats, ["python"]);
-    assert.strictEqual(countResult.total, 0);
+    assert.strictEqual(countResult.total, null);
     assert.strictEqual(updates.length, 0);
 
     checker.api.get = async (_endpoint, options) => {
@@ -658,7 +653,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
       ["python"]
     );
     assert.deepStrictEqual(fieldResult.failedFormats, ["python"]);
-    assert.strictEqual(fieldResult.total, 0);
+    assert.strictEqual(fieldResult.total, null);
     assert.strictEqual(updates.length, 0);
   });
 
@@ -680,7 +675,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
 
     const state = await checker.getAllUpstreamData("workspace-a", "repo-a");
 
-    assert.strictEqual(getRequestCount(), SUPPORTED_UPSTREAM_FORMATS.length);
+    assert.strictEqual(getRequestCount(), INSPECTABLE_UPSTREAM_FORMATS.length);
     assert.strictEqual(state.total, 0);
     assert.strictEqual(updates[0].key, cacheKey);
     assert.strictEqual(updates[0].value, undefined);
@@ -695,7 +690,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
 
     const state = await checker.getAllUpstreamData("workspace-a", "repo-a");
 
-    assert.strictEqual(getRequestCount(), SUPPORTED_UPSTREAM_FORMATS.length);
+    assert.strictEqual(getRequestCount(), INSPECTABLE_UPSTREAM_FORMATS.length);
     assert.strictEqual(state.total, 0);
     assert.strictEqual(updates[0].key, cacheKey);
     assert.strictEqual(updates[0].value, undefined);
@@ -735,7 +730,8 @@ suite("UpstreamChecker shared helper and format handling", () => {
     );
 
     assert.strictEqual(getRequestCount(), 1);
-    assert.strictEqual(result.upstreams[0].upstream_url, "https://pypi.org/simple/");
+    assert.strictEqual(result.upstreams[0].upstream_url, undefined);
+    assert.strictEqual(result.upstreams[0].origin, "https://pypi.org");
   });
 
   test("evicts cached upstream summaries with duplicate, conflicting, or stale derived metadata", async () => {
@@ -917,6 +913,287 @@ suite("UpstreamChecker shared helper and format handling", () => {
 
     assert.strictEqual(await pending, null);
     assert.strictEqual(updates.length, 0);
+  });
+
+  test("accepts documented nullable fields while keeping inventory entries secret-free", async () => {
+    const { checker, getRequestCount } = createResponseAwareChecker({}, {
+      python: [{
+        name: "PyPI",
+        slug_perm: "pypi",
+        upstream_url: "https://user:password@pypi.org/simple?token=secret#signed",
+        auth_username: null,
+        auth_secret: null,
+        extra_header_1: null,
+        extra_value_1: null,
+        index_package_count: null,
+        index_status: null,
+        is_active: true,
+        verify_ssl: false,
+        priority: 0,
+        distro_versions: [],
+      }],
+    });
+
+    const result = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-a", ["python"]
+    );
+
+    assert.strictEqual(getRequestCount(), 1);
+    assert.strictEqual(result.complete, true);
+    assert.strictEqual(result.configuredTotal, 1);
+    assert.strictEqual(result.upstreams[0].slug_perm, "pypi");
+    assert.strictEqual(result.upstreams[0].origin, "");
+    const serialized = JSON.stringify(result);
+    for (const secret of ["password", "token=secret", "auth_secret", "extra_value_1"]) {
+      assert.strictEqual(serialized.includes(secret), false);
+    }
+  });
+
+  test("does not issue requests for recognized formats without an upstream API", async () => {
+    const { checker, getRequestCount } = createResponseAwareChecker({}, {});
+
+    const result = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-a", ["cocoapods", "conan", "luarocks", "raw", "terraform", "vagrant"]
+    );
+
+    assert.strictEqual(getRequestCount(), 0);
+    assert.deepStrictEqual(result.unsupportedFormats, [
+      "cocoapods", "conan", "luarocks", "raw", "terraform", "vagrant",
+    ]);
+    assert.deepStrictEqual(result.failedFormats, []);
+    assert.strictEqual(result.complete, false);
+    assert.strictEqual(result.configuredTotal, null);
+    assert.strictEqual(result.state, "unsupported");
+  });
+
+  test("normalizes each transport failure category without treating 404 as empty", async () => {
+    const cases = [
+      ["unauthorized", 401, "authentication"],
+      ["forbidden", 403, "permission"],
+      ["not_found", 404, "not_found"],
+      ["timeout", 408, "timeout"],
+      ["rate_limited", 429, "rate_limit"],
+      ["server_error", 503, "server"],
+    ];
+    for (const [kind, status, category] of cases) {
+      const checker = createChecker({}, {
+        cloudsmithAPI: {
+          async get() {
+            const result = apiFailure(kind, { status, requestId: `local-${status}` });
+            result.serverRequestId = `server-${status}`;
+            return result;
+          },
+        },
+      });
+      const result = await checker.getUpstreamDataForFormats(
+        "workspace-a", `repo-${status}`, ["python"]
+      );
+      assert.strictEqual(result.complete, false);
+      assert.strictEqual(result.configuredTotal, null);
+      assert.strictEqual(result.failures[0].category, category);
+      assert.strictEqual(result.failures[0].httpStatus, status);
+      assert.strictEqual(result.failures[0].requestId, `local-${status}`);
+      assert.strictEqual(result.failures[0].serverRequestId, `server-${status}`);
+    }
+  });
+
+  test("collects every validated upstream page and rejects duplicate canonical identities", async () => {
+    const calls = [];
+    const checker = createChecker({}, {
+      cloudsmithAPI: {
+        async get(endpoint) {
+          calls.push(endpoint);
+          const page = Number(new URL(`https://api.cloudsmith.io/v1/${endpoint}`).searchParams.get("page"));
+          const data = page === 1
+            ? [{ name: "First", slug_perm: "first", upstream_url: "https://first.example/path" }]
+            : [{ name: "Second", slug_perm: "second", upstream_url: "https://second.example/path" }];
+          return apiSuccess(data, { headers: {
+            "x-pagination-page": String(page),
+            "x-pagination-pagetotal": "2",
+            "x-pagination-count": "2",
+            "x-pagination-pagesize": "1",
+          } });
+        },
+      },
+    });
+
+    const complete = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-a", ["python"]
+    );
+    assert.strictEqual(calls.length, 2);
+    assert.strictEqual(complete.complete, true);
+    assert.deepStrictEqual(complete.upstreams.map(upstream => upstream.slug_perm), ["first", "second"]);
+
+    checker.api.get = async () => apiSuccess([
+      { name: "Duplicate", slug_perm: "same", upstream_url: "https://example.com" },
+      { name: "Other label", slug_perm: "same", upstream_url: "https://example.org" },
+    ]);
+    const duplicate = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-b", ["python"], { bypassCache: true }
+    );
+    assert.deepStrictEqual(duplicate.failedFormats, ["python"]);
+    assert.strictEqual(duplicate.configuredTotal, null);
+  });
+
+  test("keeps headerless non-empty data partial but accepts headerless empty as authoritative", async () => {
+    const checker = createChecker({}, {
+      cloudsmithAPI: {
+        async get() {
+          return apiSuccess(
+            [{ name: "PyPI", slug_perm: "pypi", upstream_url: "https://pypi.org/simple" }],
+            { headers: {} }
+          );
+        },
+      },
+    });
+    const partial = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-a", ["python"]
+    );
+    assert.strictEqual(partial.state, "partial");
+    assert.strictEqual(partial.loadedCount, 1);
+    assert.strictEqual(partial.configuredTotal, null);
+
+    checker.api.get = async () => apiSuccess([], { headers: {} });
+    const empty = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-b", ["python"]
+    );
+    assert.strictEqual(empty.state, "empty");
+    assert.strictEqual(empty.configuredTotal, 0);
+  });
+
+  test("bounds aggregate concurrency at four and settles the operation deadline", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const checker = createChecker({}, {
+      cloudsmithAPI: {
+        async get(_endpoint, options) {
+          active += 1;
+          maxActive = Math.max(maxActive, active);
+          await new Promise(resolve => setImmediate(resolve));
+          active -= 1;
+          if (options.signal.aborted) return apiFailure("cancelled");
+          return apiSuccess([]);
+        },
+      },
+    });
+    const complete = await checker.getAllUpstreamData("workspace-a", "repo-a");
+    assert.strictEqual(complete.requestCount, INSPECTABLE_UPSTREAM_FORMATS.length);
+    assert.ok(maxActive <= 4);
+
+    checker.api.get = async (_endpoint, options) => new Promise((resolve) => {
+      options.signal.addEventListener("abort", () => resolve(apiFailure("cancelled")), { once: true });
+    });
+    const timed = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-b", ["python", "npm"], { operationTimeoutMs: 5 }
+    );
+    assert.strictEqual(timed.complete, false);
+    assert.deepStrictEqual([...timed.uninspectedFormats].sort(), ["npm", "python"]);
+    assert.ok(timed.failures.every(failure => (
+      failure.category === "timeout" && failure.retryable === true
+    )));
+
+    const controller = new AbortController();
+    checker.api.get = async (_endpoint, options) => new Promise((resolve) => {
+      options.signal.addEventListener("abort", () => resolve(apiFailure("cancelled")), { once: true });
+    });
+    const cancelledPromise = checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-c", ["python"], { signal: controller.signal }
+    );
+    controller.abort();
+    const cancelled = await cancelledPromise;
+    assert.strictEqual(cancelled.state, "cancelled");
+    assert.strictEqual(cancelled.failures[0].category, "cancelled");
+  });
+
+  test("rejects malformed repository and format scopes without claiming empty success", async () => {
+    const checker = createChecker();
+    await assert.rejects(
+      checker.getUpstreamDataForFormats("", "repo-a", ["python"]),
+      /repository identity/
+    );
+    await assert.rejects(
+      checker.getUpstreamDataForFormats("w".repeat(501), "repo-a", ["python"]),
+      /repository identity/
+    );
+    await assert.rejects(
+      checker.getUpstreamDataForFormats("workspace-a", "repo-a", null),
+      /formats must be an array/
+    );
+    await assert.rejects(
+      checker.getUpstreamDataForFormats("workspace-a", "repo-a", ["unknown"]),
+      /unrecognized format/
+    );
+    await assert.rejects(
+      checker.getUpstreamDataForFormats("workspace-a", "repo-a", ["python", "unknown"]),
+      /unrecognized format/
+    );
+    const deliberateEmpty = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-a", []
+    );
+    assert.strictEqual(deliberateEmpty.state, "empty");
+    const unsupported = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-a", ["raw"]
+    );
+    assert.strictEqual(unsupported.state, "unsupported");
+    assert.strictEqual(unsupported.complete, false);
+  });
+
+  test("rejects cross-page upstream pagination drift while retaining verified data", async () => {
+    let page = 0;
+    const checker = createChecker({}, {
+      cloudsmithAPI: {
+        async get() {
+          page += 1;
+          return apiSuccess([{
+            name: `Mirror ${page}`,
+            slug_perm: `mirror-${page}`,
+            upstream_url: `https://mirror-${page}.example`,
+          }], {
+            headers: {
+              "x-pagination-page": String(page),
+              "x-pagination-pagetotal": String(page === 1 ? 2 : 3),
+              "x-pagination-count": String(page === 1 ? 2 : 3),
+              "x-pagination-pagesize": "1",
+            },
+          });
+        },
+      },
+    });
+    const result = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-a", ["python"]
+    );
+    assert.strictEqual(result.state, "partial");
+    assert.strictEqual(result.loadedCount, 2);
+    assert.strictEqual(result.failures[0].category, "invalid_response");
+  });
+
+  test("uses one canonical loader for safe and privileged projections", async () => {
+    const endpoints = [];
+    const checker = createChecker({}, {
+      cloudsmithAPI: {
+        async get(endpoint) {
+          endpoints.push(endpoint);
+          return apiSuccess([{
+            name: "Private",
+            slug_perm: "private",
+            upstream_url: "https://user:password@example.com/private?token=secret",
+            auth_username: "user",
+            extra_value_1: "header-secret",
+          }]);
+        },
+      },
+    });
+    const safe = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-a", ["python"], { bypassCache: true }
+    );
+    const privileged = await checker.getUpstreamDataForFormats(
+      "workspace-a", "repo-a", ["python"], { bypassCache: true, projection: "privileged" }
+    );
+    assert.strictEqual(endpoints[0], endpoints[1]);
+    assert.strictEqual(safe.upstreams[0].slug_perm, privileged.upstreams[0].slug_perm);
+    assert.strictEqual(safe.upstreams[0].upstream_url, undefined);
+    assert.strictEqual(privileged.upstreams[0].upstream_url.includes("password"), true);
+    assert.strictEqual(privileged.upstreams[0].extra_value_1, "header-secret");
   });
 });
 

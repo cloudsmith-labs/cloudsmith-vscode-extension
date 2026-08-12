@@ -1,7 +1,15 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const vscode = require("vscode");
-const { getAllUpstreamData } = require("../util/upstreamChecker");
-const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
+const crypto = require("crypto");
+const { getAllUpstreamData, getUpstreamDataForFormats } = require("../util/upstreamChecker");
 const {
+  getUpstreamFormatDescriptor,
+  INSPECTABLE_UPSTREAM_FORMATS,
+  SUPPORTED_UPSTREAM_FORMATS,
+} = require("../util/upstreamFormats");
+const {
+  formatUpstreamFailureCategory,
   formatUpstreamOrigin,
   formatUpstreamText,
 } = require("../util/upstreamPresentation");
@@ -9,13 +17,29 @@ const {
 const SUPPORTED_FORMATS = SUPPORTED_UPSTREAM_FORMATS;
 const MAX_RENDERED_UPSTREAMS = 200;
 const MAX_DISTRIBUTION_VERSIONS = 20;
+const FAILURE_CATEGORIES = new Set([
+  "authentication", "cancelled", "invalid_response", "network", "not_found",
+  "permission", "rate_limit", "request_limit", "request_rejected", "server",
+  "timeout", "uninspected", "unknown",
+]);
 
 class UpstreamDetailProvider {
-  constructor(context) {
+  constructor(context, options = {}) {
     this.context = context;
+    this._loadUpstreams = options.loadUpstreams || ((workspace, repoSlug, requestOptions) => (
+      Array.isArray(requestOptions.formats)
+        ? getUpstreamDataForFormats(
+          this.context, workspace, repoSlug, requestOptions.formats, requestOptions
+        )
+        : getAllUpstreamData(this.context, workspace, repoSlug, requestOptions)
+    ));
     this._panel = null;
     this._abortController = null;
     this._requestId = 0;
+    this._loadPromise = null;
+    this._lastSettled = null;
+    this._scope = null;
+    this._messageDisposable = null;
   }
 
   async show(workspace, repoSlug, repoName) {
@@ -24,11 +48,19 @@ class UpstreamDetailProvider {
       return;
     }
 
+    const scope = JSON.stringify([workspace, repoSlug]);
+    if (this._loadPromise && this._scope === scope) {
+      this._panel?.reveal(vscode.ViewColumn.One);
+      return this._loadPromise;
+    }
     this._abortInFlightRequest();
+    if (this._scope !== scope) this._lastSettled = null;
+    this._scope = scope;
     const requestId = ++this._requestId;
     const abortController = new AbortController();
     this._abortController = abortController;
     const panel = this._getOrCreatePanel(repoName);
+    let loadPromise = null;
 
     try {
       if (!this._canRender(panel, requestId)) {
@@ -36,9 +68,20 @@ class UpstreamDetailProvider {
       }
 
       panel.title = `Upstreams: ${formatUpstreamText(repoName, "Unknown repository")}`;
-      panel.webview.html = this._getLoadingHtml(workspace, repoSlug, repoName);
+      panel.webview.html = this._lastSettled
+        ? this._getHtmlContent(workspace, repoSlug, repoName, this._lastSettled, { refreshing: true })
+        : this._getLoadingHtml(workspace, repoSlug, repoName);
 
-      const fetchState = await this._fetchGroupedUpstreams(workspace, repoSlug, abortController.signal);
+      loadPromise = this._fetchGroupedUpstreams(
+        workspace, repoSlug, abortController.signal, { bypassCache: false }
+      );
+      this._loadPromise = loadPromise;
+      let fetchState;
+      try {
+        fetchState = await loadPromise;
+      } catch {
+        fetchState = failedFetchState();
+      }
 
       if (!fetchState) {
         if (this._canRender(panel, requestId) && !abortController.signal.aborted) {
@@ -58,11 +101,64 @@ class UpstreamDetailProvider {
       }
 
       panel.title = `Upstreams: ${formatUpstreamText(repoName, "Unknown repository")}`;
+      this._lastSettled = fetchState;
       panel.webview.html = this._getHtmlContent(workspace, repoSlug, repoName, fetchState);
     } finally {
       if (this._abortController === abortController) {
         this._abortController = null;
       }
+      if (this._loadPromise === loadPromise) this._loadPromise = null;
+    }
+  }
+
+  retry() {
+    if (!this._scope || this._loadPromise) return this._loadPromise;
+    const [workspace, repoSlug] = JSON.parse(this._scope);
+    const repoName = this._panel?.title?.replace(/^Upstreams:\s*/, "") || repoSlug;
+    return this._reload(workspace, repoSlug, repoName);
+  }
+
+  async _reload(workspace, repoSlug, repoName) {
+    const retryFormats = getRetryFormats(this._lastSettled);
+    if (retryFormats.length === 0) return;
+    this._abortInFlightRequest();
+    const requestId = ++this._requestId;
+    const abortController = new AbortController();
+    this._abortController = abortController;
+    const panel = this._panel;
+    if (!panel) return;
+    panel.webview.html = this._lastSettled
+      ? this._getHtmlContent(workspace, repoSlug, repoName, this._lastSettled, { refreshing: true })
+      : this._getLoadingHtml(workspace, repoSlug, repoName);
+    const promise = this._fetchGroupedUpstreams(workspace, repoSlug, abortController.signal, {
+      bypassCache: true,
+      formats: retryFormats,
+    });
+    this._loadPromise = promise;
+    try {
+      const result = await promise;
+      if (!result || !this._canRender(panel, requestId) || abortController.signal.aborted) return;
+      const settled = mergeRetryState(this._lastSettled, result, retryFormats);
+      this._lastSettled = settled;
+      panel.webview.html = this._getHtmlContent(
+        workspace,
+        repoSlug,
+        repoName,
+        settled,
+        settled.retainedFormats.length > 0 || result.complete !== true
+          ? { refreshFailed: true }
+          : {}
+      );
+    } catch {
+      if (this._canRender(panel, requestId) && !abortController.signal.aborted) {
+        const result = this._lastSettled || failedFetchState();
+        panel.webview.html = this._getHtmlContent(
+          workspace, repoSlug, repoName, result, { refreshFailed: true }
+        );
+      }
+    } finally {
+      if (this._abortController === abortController) this._abortController = null;
+      if (this._loadPromise === promise) this._loadPromise = null;
     }
   }
 
@@ -77,7 +173,7 @@ class UpstreamDetailProvider {
       `Upstreams: ${formatUpstreamText(repoName, "Unknown repository")}`,
       vscode.ViewColumn.One,
       {
-        enableScripts: false,
+        enableScripts: true,
         localResourceRoots: [],
       }
     );
@@ -88,19 +184,35 @@ class UpstreamDetailProvider {
         this._abortInFlightRequest();
       }
     });
+    this._messageDisposable?.dispose?.();
+    this._messageDisposable = panel.webview.onDidReceiveMessage?.((message) => {
+      let validRetry = false;
+      try {
+        const keys = message && typeof message === "object" && !Array.isArray(message)
+          ? Reflect.ownKeys(message)
+          : [];
+        validRetry = keys.length === 1 && keys[0] === "command" && message.command === "retry";
+      } catch {
+        validRetry = false;
+      }
+      if (!validRetry) return;
+      void this.retry();
+    }) || null;
 
     this._panel = panel;
     return panel;
   }
 
-  async _fetchGroupedUpstreams(workspace, repoSlug, signal) {
-    const upstreamData = await getAllUpstreamData(this.context, workspace, repoSlug, {
+  async _fetchGroupedUpstreams(workspace, repoSlug, signal, options = {}) {
+    const upstreamData = await this._loadUpstreams(workspace, repoSlug, {
       signal,
-      bypassCache: true,
+      bypassCache: options.bypassCache === true,
+      formats: options.formats,
     });
     if (upstreamData === null || signal.aborted) {
       return null;
     }
+    if (!isValidAggregate(upstreamData)) return failedFetchState();
 
     const grouped = new Map();
 
@@ -138,6 +250,15 @@ class UpstreamDetailProvider {
         ? upstreamData.successfulFormats
         : 0,
       complete: upstreamData.complete === true,
+      state: upstreamData.state,
+      failures: Array.isArray(upstreamData.failures) ? upstreamData.failures : [],
+      unsupportedFormats: Array.isArray(upstreamData.unsupportedFormats)
+        ? upstreamData.unsupportedFormats
+        : [],
+      configuredTotal: Number.isSafeInteger(upstreamData.configuredTotal)
+        ? upstreamData.configuredTotal
+        : null,
+      retainedFormats: [],
     };
   }
   _abortInFlightRequest() {
@@ -193,12 +314,14 @@ class UpstreamDetailProvider {
 </html>`;
   }
 
-  _getHtmlContent(workspace, repoSlug, repoName, fetchState) {
+  _getHtmlContent(workspace, repoSlug, repoName, fetchState, options = {}) {
     const {
       groupedUpstreams,
       failedFormats = [],
       uninspectedFormats = [],
       successfulFormats,
+      failures = [],
+      unsupportedFormats = [],
     } = fetchState;
     const formatSections = [];
     const hasLoadedUpstreams = groupedUpstreams.size > 0;
@@ -227,26 +350,57 @@ class UpstreamDetailProvider {
 </section>`);
     }
 
+    const safeFailureList = failures.slice(0, 20).map(failure => (
+      `<li><strong>${this._escape(failure.format)}</strong> — ${this._escape(
+        formatUpstreamFailureCategory(failure.category)
+      )}</li>`
+    )).join("");
+    const retryable = getRetryFormats(fetchState).length > 0;
     const partialWarning = hasLoadedUpstreams && hasFailures
       ? `<div class="error-state">
   <span class="error-state-title">Some upstream data could not be loaded.</span>
-  Loaded upstreams are shown, but configuration for ${this._escape(
-    unavailableFormats.length > 0 ? unavailableFormats.join(", ") : "one or more formats"
-  )} is incomplete.
+  ${this._escape(successfulFormats || 0)} formats loaded. The configured total is not available.
+  ${safeFailureList ? `<ul>${safeFailureList}</ul>` : this._escape(
+    unavailableFormats.length > 0 ? unavailableFormats.join(", ") : "One or more formats were not inspected."
+  )}
 </div>`
+      : "";
+    const unsupportedNotice = unsupportedFormats.length > 0
+      ? `<p class="subtle">Not applicable to this API: ${this._escape(unsupportedFormats.join(", "))}.</p>`
+      : "";
+    const refreshNotice = options.refreshing
+      ? `<p class="subtle">Refreshing upstreams… Existing results remain visible.</p>`
+      : options.refreshFailed
+        ? `<p class="subtle">Refresh failed; showing the previous verified results.${
+          Array.isArray(fetchState.retainedFormats) && fetchState.retainedFormats.length > 0
+            ? ` Previously verified: ${this._escape(fetchState.retainedFormats.join(", "))}.`
+            : ""
+        }</p>`
+        : "";
+    const retryButton = retryable
+      ? `<button id="retry" type="button">${options.refreshing ? "Retrying…" : "Retry"}</button>`
       : "";
     const displayLimitNotice = loadedCount > renderedCount
       ? `<p class="subtle">Showing ${renderedCount} of ${loadedCount} loaded upstreams.</p>`
       : "";
     const contentHtml = hasLoadedUpstreams
-      ? `${partialWarning}${displayLimitNotice}${formatSections.join("\n")}`
-      : this._getEmptyOrErrorState(hasFailures, successfulFormats);
+      ? `${refreshNotice}${partialWarning}${unsupportedNotice}${displayLimitNotice}${formatSections.join("\n")}${retryButton}`
+      : `${refreshNotice}${this._getEmptyOrErrorState(hasFailures, successfulFormats, failures)}${unsupportedNotice}${retryButton}`;
+    const nonce = crypto.randomBytes(16).toString("base64");
+    const script = retryButton ? `<script nonce="${nonce}">
+  const vscode = acquireVsCodeApi();
+  const retry = document.getElementById("retry");
+  retry?.addEventListener("click", () => {
+    retry.disabled = true;
+    vscode.postMessage({ command: "retry" });
+  });
+</script>` : "";
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none';">
   <style>
     body {
       margin: 0;
@@ -390,22 +544,29 @@ class UpstreamDetailProvider {
   <h1>${this._escape(repoName)}</h1>
   <p class="repo-meta">${this._escape(workspace)}/${this._escape(repoSlug)}</p>
   ${contentHtml}
+  ${script}
 </body>
 </html>`;
   }
 
-  _getEmptyOrErrorState(hasFailures, successfulFormats) {
+  _getEmptyOrErrorState(hasFailures, successfulFormats, failures = []) {
     if (!hasFailures) {
       return `<p class="empty-state">No upstreams configured for this repository.</p>`;
     }
 
     const detail = successfulFormats > 0
-      ? "Some upstream formats could not be loaded, so the upstream configuration could not be determined."
-      : "The upstream configuration could not be loaded for this repository.";
+      ? "No configured upstream could be verified; some formats were inspected successfully."
+      : "The upstream inventory could not be loaded for this repository.";
+    const lines = failures.slice(0, 20).map(failure => (
+      `<li><strong>${this._escape(failure.format)}</strong> — ${this._escape(
+        formatUpstreamFailureCategory(failure.category)
+      )}</li>`
+    )).join("");
 
     return `<div class="error-state">
   <span class="error-state-title">Could not load upstreams.</span>
   ${this._escape(detail)}
+  ${lines ? `<ul>${lines}</ul>` : ""}
 </div>`;
   }
 
@@ -415,7 +576,13 @@ class UpstreamDetailProvider {
     const statusClass = isActive ? "status-badge-active" : "status-badge-inactive";
 
     const details = [
-      this._renderDetail("Origin", formatUpstreamOrigin(upstream.upstream_url), "mono"),
+      this._renderDetail(
+        "Origin",
+        formatUpstreamOrigin(
+          typeof upstream.origin === "string" && upstream.origin ? upstream.origin : upstream.upstream_url
+        ),
+        "mono"
+      ),
       this._renderDetail("Mode", typeof upstream.mode === "string" ? upstream.mode : "", ""),
       this._renderDetail("Priority", this._getPriority(upstream), ""),
       this._renderDetail("SSL verification", this._getSslVerification(upstream), ""),
@@ -590,12 +757,178 @@ class UpstreamDetailProvider {
       this._panel.dispose();
       this._panel = null;
     }
+    this._messageDisposable?.dispose?.();
+    this._messageDisposable = null;
+    this._lastSettled = null;
+    this._scope = null;
   }
 
 
   resetForAccountChange() {
     this.dispose();
   }
+}
+
+function failedFetchState() {
+  return {
+    groupedUpstreams: new Map(),
+    failedFormats: INSPECTABLE_UPSTREAM_FORMATS,
+    uninspectedFormats: [],
+    unsupportedFormats: [],
+    failures: INSPECTABLE_UPSTREAM_FORMATS.map(format => ({
+      format,
+      message: "Upstream availability could not be determined.",
+    })),
+    successfulFormats: 0,
+    configuredTotal: null,
+    complete: false,
+    state: "failed",
+    retainedFormats: [],
+  };
+}
+
+function getRetryFormats(state) {
+  if (!state || typeof state !== "object") return [];
+  const retryableFailures = Array.isArray(state.failures)
+    ? state.failures.filter(failure => failure?.retryable !== false).map(failure => failure.format)
+    : [];
+  return [...new Set([
+    ...retryableFailures,
+    ...(Array.isArray(state.uninspectedFormats) ? state.uninspectedFormats : []),
+  ].filter(format => getUpstreamFormatDescriptor(format)?.inspectable))];
+}
+
+function mergeRetryState(previous, replacement, retriedFormats) {
+  if (!previous) return { ...replacement, retainedFormats: [] };
+  const retried = new Set(retriedFormats);
+  const replacementUnavailable = new Set([
+    ...replacement.failedFormats,
+    ...replacement.uninspectedFormats,
+  ]);
+  const groupedUpstreams = new Map(previous.groupedUpstreams);
+  const retainedFormats = [];
+  for (const format of retried) {
+    if (replacementUnavailable.has(format)) {
+      if (groupedUpstreams.has(format)) retainedFormats.push(format);
+      else if (replacement.groupedUpstreams.has(format)) {
+        groupedUpstreams.set(format, replacement.groupedUpstreams.get(format));
+      }
+    } else if (replacement.groupedUpstreams.has(format)) {
+      groupedUpstreams.set(format, replacement.groupedUpstreams.get(format));
+    } else {
+      groupedUpstreams.delete(format);
+    }
+  }
+  const mergeFormats = (oldValues, newValues) => [...new Set([
+    ...oldValues.filter(format => !retried.has(format)),
+    ...newValues,
+  ])];
+  const failedFormats = mergeFormats(previous.failedFormats, replacement.failedFormats);
+  const uninspectedFormats = mergeFormats(
+    previous.uninspectedFormats,
+    replacement.uninspectedFormats
+  );
+  const unsupportedFormats = mergeFormats(
+    previous.unsupportedFormats,
+    replacement.unsupportedFormats
+  );
+  const failures = [
+    ...previous.failures.filter(failure => !retried.has(failure.format)),
+    ...replacement.failures,
+  ];
+  const complete = failedFormats.length === 0 && uninspectedFormats.length === 0;
+  const loadedCount = [...groupedUpstreams.values()].reduce((sum, entries) => sum + entries.length, 0);
+  const cancelled = replacement.state === "cancelled";
+  const successfulFormats = complete
+    ? INSPECTABLE_UPSTREAM_FORMATS.length
+    : Math.max(previous.successfulFormats, replacement.successfulFormats);
+  return {
+    groupedUpstreams,
+    failedFormats,
+    uninspectedFormats,
+    unsupportedFormats,
+    failures,
+    successfulFormats,
+    configuredTotal: complete ? loadedCount : null,
+    complete,
+    state: complete
+      ? (loadedCount > 0 ? "complete" : "empty")
+      : cancelled
+        ? "cancelled"
+        : loadedCount > 0 || successfulFormats > 0 ? "partial" : "failed",
+    retainedFormats,
+  };
+}
+
+function isValidAggregate(value) {
+  if (!value || typeof value !== "object" || !Array.isArray(value.upstreams)) return false;
+  if (typeof value.complete !== "boolean") return false;
+  const validStates = new Set(["complete", "empty", "partial", "failed", "cancelled", "unsupported"]);
+  if (!validStates.has(value.state)) return false;
+  const formatLists = [
+    value.failedFormats,
+    value.uninspectedFormats,
+    value.unsupportedFormats,
+  ];
+  if (formatLists.some(list => !Array.isArray(list) || list.some(format => (
+    typeof format !== "string" || !getUpstreamFormatDescriptor(format)
+  )))) return false;
+  if (!Array.isArray(value.failures) || value.failures.some(failure => (
+    !failure || typeof failure !== "object"
+    || typeof failure.format !== "string"
+    || !getUpstreamFormatDescriptor(failure.format)
+    || typeof failure.category !== "string"
+    || !FAILURE_CATEGORIES.has(failure.category)
+    || typeof failure.retryable !== "boolean"
+    || failure.message !== formatUpstreamFailureCategory(failure.category)
+  ))) return false;
+  if (!Number.isSafeInteger(value.successfulFormats)
+    || value.successfulFormats < 0
+    || value.successfulFormats > INSPECTABLE_UPSTREAM_FORMATS.length) return false;
+  if (value.configuredTotal !== null && (
+    !Number.isSafeInteger(value.configuredTotal)
+    || value.configuredTotal < 0
+    || value.configuredTotal !== value.upstreams.length
+  )) return false;
+  if (value.complete === true && (
+    value.configuredTotal === null
+    || value.failedFormats.length > 0
+    || value.uninspectedFormats.length > 0
+  )) return false;
+  if (value.complete === false && value.configuredTotal !== null) return false;
+  if (value.complete !== ["complete", "empty"].includes(value.state)) return false;
+  if (value.state === "empty" && value.upstreams.length !== 0) return false;
+  if (value.state === "complete" && value.upstreams.length === 0) return false;
+  if (value.state === "unsupported" && value.unsupportedFormats.length === 0) return false;
+  const hasUsefulResult = value.upstreams.length > 0 || value.successfulFormats > 0;
+  if (value.state === "partial" && !hasUsefulResult) return false;
+  if (value.state === "failed" && hasUsefulResult) return false;
+  const unavailable = new Set([...value.failedFormats, ...value.uninspectedFormats]);
+  if (value.failures.some(failure => !unavailable.has(failure.format))) return false;
+  if (new Set([
+    ...value.failedFormats,
+    ...value.uninspectedFormats,
+    ...value.unsupportedFormats,
+  ]).size !== value.failedFormats.length
+    + value.uninspectedFormats.length
+    + value.unsupportedFormats.length) return false;
+  const identities = new Set();
+  return value.upstreams.every((upstream) => {
+    if (!upstream || typeof upstream !== "object"
+      || typeof upstream.name !== "string"
+      || !upstream.name
+      || upstream.name.length > 500) return false;
+    const format = typeof upstream._format === "string" ? upstream._format : upstream.format;
+    const descriptor = getUpstreamFormatDescriptor(format);
+    const identity = `${format}\0${upstream.slug_perm || upstream.name}`;
+    if (identities.has(identity)) return false;
+    identities.add(identity);
+    return Boolean(
+      descriptor?.inspectable
+      && upstream._format === upstream.format
+      && (upstream.origin === undefined || formatUpstreamOrigin(upstream.origin) === upstream.origin)
+    );
+  });
 }
 
 module.exports = { UpstreamDetailProvider, SUPPORTED_FORMATS };

@@ -16,7 +16,7 @@ const {
 const { canonicalFormat, normalizePackageName } = require("./packageNameNormalizer");
 const { UpstreamChecker } = require("./upstreamChecker");
 const { UpstreamOperationScheduler } = require("./upstreamOperationScheduler");
-const { normalizeUpstreamFormat } = require("./upstreamFormats");
+const { getUpstreamFormatDescriptor, normalizeUpstreamFormat } = require("./upstreamFormats");
 const {
   captureAccount,
   isAccountCurrent,
@@ -966,13 +966,17 @@ function normalizeRepositoryCollection(value) {
 
 function isRepositoryInspectionCompleteForFormats(state, formats) {
   if (!state || typeof state !== "object") return false;
+  const requested = Array.isArray(formats) ? formats : [];
+  if (requested.some(format => !getUpstreamFormatDescriptor(format)?.inspectable)) return false;
+  if (Array.isArray(state.unsupportedFormats)
+    && requested.some(format => state.unsupportedFormats.includes(format))) return false;
   if (state.complete === true) return true;
   const unavailable = [
     ...(Array.isArray(state.failedFormats) ? state.failedFormats : []),
     ...(Array.isArray(state.uninspectedFormats) ? state.uninspectedFormats : []),
   ];
   if (unavailable.length === 0) return false;
-  return !(Array.isArray(formats) ? formats : []).some(format => unavailable.includes(format));
+  return !requested.some(format => unavailable.includes(format));
 }
 
 function buildRegistryRequestHeaders(headers) {

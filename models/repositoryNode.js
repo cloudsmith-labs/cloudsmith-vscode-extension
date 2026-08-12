@@ -1,3 +1,5 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 // Repo node treeview
 
 const vscode = require("vscode");
@@ -674,7 +676,7 @@ class RepositoryNode {
         upstreamState = null;
       }
       if (!this._isMetadataCurrent(account, generation, descriptor)) return [];
-      if (upstreamState?.upstreams.length > 0) {
+      if (upstreamState) {
         children.push(new UpstreamIndicatorNode(
           upstreamState.upstreams,
           {
@@ -686,21 +688,12 @@ class RepositoryNode {
           {
             complete: upstreamState.complete,
             failedFormats: upstreamState.failedFormats,
+            failures: upstreamState.failures,
+            unsupportedFormats: upstreamState.unsupportedFormats,
             uninspectedFormats: upstreamState.uninspectedFormats,
           }
         ));
-      } else if (upstreamState && !upstreamState.complete) {
-        const unavailableCount = upstreamState.failedFormats.length
-          + upstreamState.uninspectedFormats.length;
-        children.push(new InfoNode(
-          "Upstreams: incomplete",
-          unavailableCount > 0
-            ? `${unavailableCount} formats could not be loaded`
-            : "The collection could not be verified",
-          "The configured upstream total could not be determined.",
-          "warning"
-        ));
-      } else if (!upstreamState) {
+      } else {
         children.push(new InfoNode(
           "Upstreams: failed to load",
           "The upstream collection could not be verified",
@@ -1181,10 +1174,21 @@ function normalizeUpstreamState(result) {
   const uninspectedFormats = Array.isArray(result.uninspectedFormats)
     ? [...result.uninspectedFormats]
     : [];
+  const failures = Array.isArray(result.failures) ? [...result.failures] : [];
+  const unsupportedFormats = Array.isArray(result.unsupportedFormats)
+    ? [...result.unsupportedFormats]
+    : [];
   return Object.freeze({
     upstreams: Object.freeze([...result.upstreams]),
     failedFormats: Object.freeze(failedFormats),
+    failures: Object.freeze(failures),
+    unsupportedFormats: Object.freeze(unsupportedFormats),
     uninspectedFormats: Object.freeze(uninspectedFormats),
+    configuredTotal: Number.isSafeInteger(result.configuredTotal)
+      ? result.configuredTotal
+      : null,
+    loadedCount: result.upstreams.length,
+    state: typeof result.state === "string" ? result.state : "failed",
     complete: result.complete === true
       && failedFormats.length === 0
       && uninspectedFormats.length === 0,
@@ -1195,7 +1199,12 @@ function emptyUpstreamState() {
   return Object.freeze({
     upstreams: Object.freeze([]),
     failedFormats: Object.freeze([]),
+    failures: Object.freeze([]),
+    unsupportedFormats: Object.freeze([]),
     uninspectedFormats: Object.freeze([]),
+    configuredTotal: null,
+    loadedCount: 0,
+    state: "cancelled",
     complete: false,
   });
 }

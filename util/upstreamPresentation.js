@@ -3,9 +3,12 @@
 const MAX_UPSTREAM_URL_LENGTH = 8192;
 const MAX_DISPLAY_TEXT_LENGTH = 500;
 const MAX_ERROR_MESSAGE_LENGTH = 256;
+const MAX_FAILURE_ID_LENGTH = 128;
+const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
 const CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u;
 const DISPLAY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/gu;
 const DOT_PATH_SEGMENTS = new Set([".", "..", "%2e", ".%2e", "%2e.", "%2e%2e"]);
+const FAILURE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u;
 
 const ERROR_COPY = Object.freeze({
   local: "The local package collection could not be verified.",
@@ -34,6 +37,158 @@ const ERROR_KIND_COPY = Object.freeze({
   timeout: "The upstream request timed out.",
   unauthorized: "Cloudsmith could not authorize the upstream request.",
 });
+
+const FAILURE_CATEGORY_COPY = Object.freeze({
+  authentication: "Authentication is required to inspect this format.",
+  cancelled: "The upstream request was cancelled.",
+  invalid_response: "Cloudsmith returned invalid upstream data.",
+  network: "Cloudsmith could not be reached.",
+  not_found: "The upstream configuration endpoint was not found.",
+  permission: "You do not have permission to inspect this format.",
+  rate_limit: "Cloudsmith rate limited the upstream request. Try again later.",
+  request_limit: "The upstream inspection reached its request limit.",
+  request_rejected: "The upstream request could not be completed.",
+  server: "Cloudsmith could not complete the upstream request.",
+  timeout: "The upstream request timed out.",
+  uninspected: "This format was not inspected.",
+  unknown: "Upstream availability could not be determined.",
+});
+
+const FAILURE_KIND_CATEGORY = Object.freeze({
+  ABORT_ERR: "cancelled",
+  AbortError: "cancelled",
+  abort: "cancelled",
+  auth: "authentication",
+  authentication: "authentication",
+  cancelled: "cancelled",
+  canceled: "cancelled",
+  forbidden: "permission",
+  http_error: "request_rejected",
+  incomplete_collection: "uninspected",
+  invalid_request: "request_rejected",
+  invalid_response: "invalid_response",
+  network: "network",
+  network_error: "network",
+  not_found: "not_found",
+  permission: "permission",
+  rate_limit_circuit: "rate_limit",
+  rate_limited: "rate_limit",
+  redirect_rejected: "request_rejected",
+  rejected: "request_rejected",
+  request_failed: "request_rejected",
+  request_limit: "request_limit",
+  resource_limit: "request_limit",
+  server_error: "server",
+  timeout: "timeout",
+  transport_error: "network",
+  transport_failure: "network",
+  unauthorized: "authentication",
+  uninspected: "uninspected",
+});
+
+/**
+ * Returns fixed public copy for a normalized failure category. Callers must not
+ * substitute transport messages, exception text, or response bodies.
+ */
+function formatUpstreamFailureCategory(category) {
+  return typeof category === "string"
+    && Object.prototype.hasOwnProperty.call(FAILURE_CATEGORY_COPY, category)
+    ? FAILURE_CATEGORY_COPY[category]
+    : FAILURE_CATEGORY_COPY.unknown;
+}
+
+/**
+ * Projects an arbitrary thrown value or transport result into a small public
+ * diagnostic. Every property access can execute caller-owned code, so reads
+ * are isolated and no arbitrary message, cause, stack, headers, diagnostic,
+ * body, or URL is retained.
+ */
+function normalizeUpstreamFailure(value) {
+  const result = isObjectLike(value) ? value : null;
+  const nestedError = safeProperty(result, "error");
+  const error = isObjectLike(nestedError) ? nestedError : result;
+
+  const kind = boundedFailureKind(safeProperty(error, "kind"))
+    || boundedFailureKind(safeProperty(error, "code"))
+    || boundedFailureKind(safeProperty(error, "name"));
+  const httpStatus = firstHttpStatus(
+    safeProperty(error, "httpStatus"),
+    safeProperty(error, "status"),
+    safeProperty(result, "httpStatus"),
+    safeProperty(result, "status")
+  );
+  const category = failureCategory(kind, httpStatus);
+  const retryable = safeProperty(error, "retryable") === true;
+  const retryAfterMs = normalizedRetryAfter(safeProperty(error, "retryAfterMs"));
+  const requestId = normalizedFailureId(safeProperty(error, "requestId"))
+    || normalizedFailureId(safeProperty(result, "requestId"));
+  const serverRequestId = normalizedFailureId(safeProperty(result, "serverRequestId"))
+    || normalizedFailureId(safeProperty(error, "serverRequestId"));
+
+  return Object.freeze({
+    category,
+    message: formatUpstreamFailureCategory(category),
+    httpStatus,
+    retryable,
+    retryAfterMs,
+    requestId,
+    serverRequestId,
+  });
+}
+
+function failureCategory(kind, httpStatus) {
+  if (httpStatus === 401) return "authentication";
+  if (httpStatus === 403) return "permission";
+  if (httpStatus === 404) return "not_found";
+  if (httpStatus === 408) return "timeout";
+  if (httpStatus === 429) return "rate_limit";
+  if (httpStatus !== null && httpStatus >= 500) return "server";
+  if (httpStatus !== null && httpStatus >= 400) return "request_rejected";
+  return kind && Object.prototype.hasOwnProperty.call(FAILURE_KIND_CATEGORY, kind)
+    ? FAILURE_KIND_CATEGORY[kind]
+    : "unknown";
+}
+
+function isObjectLike(value) {
+  return value !== null && (typeof value === "object" || typeof value === "function");
+}
+
+function safeProperty(value, property) {
+  if (!isObjectLike(value)) return null;
+  try {
+    return value[property];
+  } catch {
+    return null;
+  }
+}
+
+function boundedFailureKind(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 64
+    ? value
+    : null;
+}
+
+function firstHttpStatus(...values) {
+  for (const value of values) {
+    if (Number.isSafeInteger(value) && value >= 100 && value <= 599) return value;
+  }
+  return null;
+}
+
+function normalizedRetryAfter(value) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= MAX_RETRY_AFTER_MS
+    ? value
+    : null;
+}
+
+function normalizedFailureId(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= MAX_FAILURE_ID_LENGTH
+    && FAILURE_ID.test(value)
+    ? value
+    : null;
+}
 
 /**
  * Converts an upstream-domain failure to bounded public copy. This intentionally
@@ -172,7 +327,9 @@ function hasDotPathSegment(rawUrl) {
 
 module.exports = {
   formatUpstreamError,
+  formatUpstreamFailureCategory,
   formatUpstreamOrigin,
   formatUpstreamText,
   getTerraformUpstreamUrl,
+  normalizeUpstreamFailure,
 };

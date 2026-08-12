@@ -87,6 +87,26 @@ suite("upstreamGapAnalyzer", () => {
     assert.strictEqual(enriched[0].upstreamDetail, "Not available through Cloudsmith");
   });
 
+  test("does not inspect a recognized package format without an upstream API", async () => {
+    let calls = 0;
+    const enriched = await analyzeUpstreamGaps([{
+      name: "archive",
+      version: "1.0.0",
+      format: "raw",
+      ecosystem: "raw",
+      cloudsmithStatus: "NOT_FOUND",
+    }], "workspace-a", ["production"], {
+      upstreamChecker: {
+        async getRepositoryUpstreamStateForFormats() {
+          calls += 1;
+          return createState();
+        },
+      },
+    });
+    assert.strictEqual(calls, 0);
+    assert.strictEqual(enriched[0].upstreamStatus, "unreachable");
+  });
+
   test("limits upstream repository lookups to four concurrent requests and emits one final patch", async () => {
     const dependencies = [
       {
