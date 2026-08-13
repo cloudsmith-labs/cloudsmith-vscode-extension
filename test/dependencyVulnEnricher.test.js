@@ -88,6 +88,31 @@ suite("dependencyVulnEnricher", () => {
     assert.strictEqual(enriched[0].vulnerabilities.severityCounts.Medium, 1);
   });
 
+  test("mixed known and unrecognized severities keep the canonical maximum unknown", async () => {
+    const enriched = await enrichVulnerabilities(
+      [createFoundDependency("pkg-mixed", 2)],
+      "workspace-a",
+      {
+        cloudsmithAPI: {
+          async getV2() {
+            return apiSuccess({
+              results: [
+                { vulnerability_id: "CVE-1", severity: "HIGH" },
+                { vulnerability_id: "CVE-2", severity: "Future" },
+              ],
+            });
+          },
+        },
+      }
+    );
+
+    assert.strictEqual(enriched[0].vulnerabilities.maxSeverity, "Unknown");
+    assert.deepStrictEqual(
+      enriched[0].vulnerabilities.entries.map(entry => entry.severity),
+      ["High", "Unknown"]
+    );
+  });
+
   test("skips vulnerability lookups for dependencies not found in Cloudsmith", async () => {
     let calls = 0;
     const dependencies = [

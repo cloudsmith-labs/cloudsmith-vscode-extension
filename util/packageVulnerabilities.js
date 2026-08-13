@@ -3,6 +3,10 @@
 const { apiEndpoint, encodeApiPathSegment } = require("./apiEndpoint");
 const { PaginatedFetch } = require("./paginatedFetch");
 const { exactIdentityPart, unwrapIdentityValue } = require("./collectionIdentity");
+const {
+  deriveMaximumVulnerabilitySeverity,
+  normalizeVulnerabilitySeverity,
+} = require("./vulnerabilitySeverity");
 
 const VULNERABILITIES_DETECTED_STATUS = "scan detected vulnerabilities";
 const VULNERABILITIES_CLEAN_STATUS = "scan detected no vulnerabilities";
@@ -195,11 +199,12 @@ function getPackageVulnerabilityState(value) {
   };
 }
 
-function result(error, results = [], maxSeverity = "Unknown", numVulns = 0, complete = error == null) {
+function result(error, results = [], maxSeverity = "Unknown", numVulns = null, complete = error == null) {
+  const authoritativeCount = error == null && complete ? numVulns : null;
   return {
     results,
     maxSeverity,
-    numVulns: error == null && complete ? numVulns : -1,
+    numVulns: authoritativeCount === null ? -1 : authoritativeCount,
     error,
     complete,
     incomplete: !complete,
@@ -212,8 +217,10 @@ function result(error, results = [], maxSeverity = "Unknown", numVulns = 0, comp
  * Fetch the latest package scan and its vulnerability records from the v1 API.
  * API failures remain distinct from a successful zero-vulnerability response.
  */
-async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifier, expectedCount = 0, options = {}) {
-  const fallbackCount = expectedCount > 0 ? expectedCount : 0;
+async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifier, expectedCount = null, options = {}) {
+  const fallbackCount = Number.isSafeInteger(expectedCount) && expectedCount > 0
+    ? expectedCount
+    : null;
   let scanListEndpoint;
   try {
     scanListEndpoint = apiEndpoint(["vulnerabilities", workspace, repo, packageIdentifier]);
@@ -246,10 +253,12 @@ async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifi
   }
   const scanList = scanCollection.items;
   if (scanList.length === 0) {
-    if (fallbackCount > 0 || expectedCount < 0) {
-      return result("No vulnerability scan details were returned for this package.", [], "Unknown", fallbackCount);
-    }
-    return result(null);
+    return result(
+      "No vulnerability scan details were returned for this package.",
+      [],
+      "Unknown",
+      fallbackCount
+    );
   }
 
   const targetScan = selectLatestScan(scanList);
@@ -258,22 +267,25 @@ async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifi
   }
   const scanIndicator = getPackageVulnerabilityState(targetScan);
   const declaredCount = scanIndicator.unknown ? null : scanIndicator.count;
-  const maxSeverity = boundedString(
+  const reportedMaxSeverity = normalizeVulnerabilitySeverity(boundedString(
     unwrapValue(targetScan.max_severity),
     MAX_VULNERABILITY_SEVERITY_LENGTH
-  )
-    || "Unknown";
+  ));
   const numVulns = declaredCount !== null
     ? declaredCount
     : (scanIndicator.detected || scanIndicator.unknown ? -1 : fallbackCount);
   const scanId = unwrapValue(targetScan.identifier);
 
   if (!scanId) {
-    return result("The vulnerability scan did not include an identifier.", [], maxSeverity, numVulns);
+    return result("The vulnerability scan did not include an identifier.", [], reportedMaxSeverity, numVulns);
   }
 
-  if (normalizeBoolean(targetScan.has_vulnerabilities) === false && numVulns === 0) {
-    return result(null, [], maxSeverity, 0);
+  if (
+    scanIndicator.unknown === false
+    && scanIndicator.detected === false
+    && scanIndicator.count === 0
+  ) {
+    return result(null, [], "None", 0);
   }
 
   let scanDetailEndpoint;
@@ -283,7 +295,7 @@ async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifi
     return result(
       new Error("The vulnerability scan identifier was invalid."),
       [],
-      maxSeverity,
+      reportedMaxSeverity,
       numVulns
     );
   }
@@ -299,20 +311,20 @@ async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifi
     }
   );
   if (!scanDetailResult.ok) {
-    return result(scanDetailResult.error, [], maxSeverity, numVulns);
+    return result(scanDetailResult.error, [], reportedMaxSeverity, numVulns);
   }
   const scanDetail = scanDetailResult.data;
 
   const extractedResults = extractVulnerabilityResults(scanDetail);
   if (!isVulnerabilityRecordArray(extractedResults)) {
-    return result(invalidVulnerabilityDetailsError(), [], maxSeverity, numVulns, false);
+    return result(invalidVulnerabilityDetailsError(), [], reportedMaxSeverity, numVulns, false);
   }
   const results = extractedResults.map(normalizeVulnerabilityRecord);
   if (results.length === 0 && (numVulns > 0 || scanReportsVulnerabilities(targetScan))) {
     return result(
       "The scan reports vulnerabilities, but no vulnerability detail records were returned.",
       [],
-      maxSeverity,
+      reportedMaxSeverity,
       numVulns
     );
   }
@@ -324,13 +336,19 @@ async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifi
     return result(
       invalidVulnerabilityDetailsError(),
       results,
-      maxSeverity,
+      reportedMaxSeverity,
       numVulns,
       false
     );
   }
 
-  return result(null, results, maxSeverity, results.length || numVulns, true);
+  return result(
+    null,
+    results,
+    deriveMaximumVulnerabilitySeverity(results),
+    results.length,
+    true
+  );
 }
 
 function scanIdentity(scan) {
@@ -483,9 +501,14 @@ function isVulnerabilityRecord(value) {
 }
 
 function normalizeVulnerabilityRecord(value) {
-  return typeof value.vulnerability_id === "string" && value.vulnerability_id.trim().length > 0
-    ? value
-    : { ...value, vulnerability_id: vulnerabilityIdentifier(value) };
+  return {
+    ...value,
+    vulnerability_id: typeof value.vulnerability_id === "string"
+      && value.vulnerability_id.trim().length > 0
+      ? value.vulnerability_id
+      : vulnerabilityIdentifier(value),
+    severity: normalizeVulnerabilitySeverity(value.severity),
+  };
 }
 
 function hasRecognizedVulnerabilityArray(value) {

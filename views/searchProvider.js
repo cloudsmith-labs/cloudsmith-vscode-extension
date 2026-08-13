@@ -59,6 +59,16 @@ class SearchProvider {
             const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
             return config.get("searchPageSize");
         });
+        this._vulnerabilityStateService = options.vulnerabilityStateService || null;
+        this._vulnerabilitySummaries = new Map();
+        this._treeParents = new WeakMap();
+        this._vulnerabilityRefreshTimers = new Map();
+        this._treeView = null;
+        this._expandedVulnerabilitySummaries = new WeakSet();
+        this._treeExpansionSubscriptions = [];
+        this._vulnerabilityStateSubscription = this._vulnerabilityStateService?.onDidChange?.(
+            event => this._publishVulnerabilityState(event)
+        ) || null;
 
         this._onDidChangeTreeData = new vscode.EventEmitter();
         this.onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -302,7 +312,8 @@ class SearchProvider {
                 result.data,
                 this.context,
                 new Set(),
-                this.connectionManager
+                this.connectionManager,
+                this._vulnerabilityNodeOptions()
             );
         } catch (error) {
             this._failRoot(operation, `Could not display search results. ${safeErrorMessage(error)}`, null, "invalid_response");
@@ -416,7 +427,8 @@ class SearchProvider {
                 collection.packages,
                 this.context,
                 new Set(),
-                this.connectionManager
+                this.connectionManager,
+                this._vulnerabilityNodeOptions()
             ).nodes;
             const keptNodes = nodes.slice(0, MAX_RESULTS);
             built = {
@@ -643,7 +655,8 @@ class SearchProvider {
                 result.data,
                 this.context,
                 seen,
-                this.connectionManager
+                this.connectionManager,
+                this._vulnerabilityNodeOptions()
             );
         } catch (error) {
             this._failPage(
@@ -701,6 +714,7 @@ class SearchProvider {
         });
         if (!this._continuePage(operation, progressToken)) return;
         this._state = freezeState({ committed: nextCommitted, pending: null, failure: null });
+        this._pruneVulnerabilitySummaries(nextCommitted.results);
         this.refresh();
     }
 
@@ -723,6 +737,7 @@ class SearchProvider {
         });
         this._activeRoot = null;
         this._state = freezeState({ committed, pending: null, failure: null });
+        this._pruneVulnerabilitySummaries(committed.results);
         this.refresh();
         return true;
     }
@@ -854,6 +869,8 @@ class SearchProvider {
         if (!this._ownsRoot(operation)) return;
         this._activeRoot = null;
         this._state = freezeState({ committed: null, pending: null, failure: null });
+        this._vulnerabilitySummaries.clear();
+        this._clearVulnerabilityRefreshTimers();
         this.refresh();
     }
 
@@ -861,6 +878,8 @@ class SearchProvider {
         if (this._activePage?.operation !== operation) return;
         this._activePage = null;
         this._state = freezeState({ committed: null, pending: null, failure: null });
+        this._vulnerabilitySummaries.clear();
+        this._clearVulnerabilityRefreshTimers();
         this.refresh();
     }
 
@@ -882,6 +901,8 @@ class SearchProvider {
     clear() {
         this._invalidateOperations();
         this._state = freezeState({ committed: null, pending: null, failure: null });
+        this._vulnerabilitySummaries.clear();
+        this._clearVulnerabilityRefreshTimers();
         this.refresh();
     }
 
@@ -892,11 +913,35 @@ class SearchProvider {
         this._disposed = true;
         this._invalidateOperations();
         this._connectionSubscription?.dispose?.();
+        this._vulnerabilityStateSubscription?.dispose?.();
+        for (const subscription of this._treeExpansionSubscriptions) subscription.dispose?.();
+        this._vulnerabilitySummaries.clear();
+        this._clearVulnerabilityRefreshTimers();
         this._onDidChangeTreeData.dispose();
     }
 
     getTreeItem(element) {
         return element.getTreeItem();
+    }
+
+    getParent(element) {
+        return this._treeParents.get(element);
+    }
+
+    setTreeView(treeView) {
+        for (const subscription of this._treeExpansionSubscriptions) subscription.dispose?.();
+        this._treeExpansionSubscriptions = [];
+        this._treeView = treeView;
+        const expanded = treeView?.onDidExpandElement?.(({ element }) => {
+            if (element?.getTreeItem?.().contextValue === "vulnerabilitySummary") {
+                this._expandedVulnerabilitySummaries.add(element);
+            }
+        });
+        const collapsed = treeView?.onDidCollapseElement?.(({ element }) => {
+            this._expandedVulnerabilitySummaries.delete(element);
+        });
+        if (expanded) this._treeExpansionSubscriptions.push(expanded);
+        if (collapsed) this._treeExpansionSubscriptions.push(collapsed);
     }
 
     async getChildren(element) {
@@ -968,7 +1013,79 @@ class SearchProvider {
 
     refresh() {
         if (!this._disposed) {
+            this._pruneVulnerabilitySummaries(this._currentCommitted()?.results || []);
             this._onDidChangeTreeData.fire();
+        }
+    }
+
+    _vulnerabilityNodeOptions() {
+        return {
+            vulnerabilityStateService: this._vulnerabilityStateService,
+            registerVulnerabilitySummary: (identity, element, owner) => {
+                if (typeof identity !== "string" || !element || !owner) return;
+                let entries = this._vulnerabilitySummaries.get(identity);
+                if (!entries) {
+                    entries = new Set();
+                    this._vulnerabilitySummaries.set(identity, entries);
+                }
+                entries.add(Object.freeze({ element, owner }));
+                this._treeParents.set(element, owner);
+            },
+        };
+    }
+
+    _publishVulnerabilityState(event) {
+        const identity = vulnerabilityEventIdentity(event);
+        if (!identity) return;
+        const entries = this._vulnerabilitySummaries.get(identity);
+        if (!entries) return;
+        const committed = this._currentCommitted();
+        for (const entry of [...entries]) {
+            if (!committed || !committed.results.includes(entry.owner)) {
+                entries.delete(entry);
+                continue;
+            }
+            if (event.presentation) {
+                entry.element.acceptVulnerabilityPresentation?.(event.presentation);
+            }
+            if (event.state?.status !== "loading") {
+                this._scheduleVulnerabilityRefresh(entry.element, () => {
+                    const current = this._currentCommitted();
+                    return Boolean(current?.results.includes(entry.owner));
+                });
+            }
+        }
+        if (entries.size === 0) this._vulnerabilitySummaries.delete(identity);
+    }
+
+    _scheduleVulnerabilityRefresh(element, isCurrent) {
+        const current = this._vulnerabilityRefreshTimers.get(element);
+        if (current) clearTimeout(current);
+        const timer = setTimeout(() => {
+            this._vulnerabilityRefreshTimers.delete(element);
+            if (!isCurrent()) return;
+            const wasExpanded = this._expandedVulnerabilitySummaries.has(element);
+            this._onDidChangeTreeData.fire(element);
+            if (wasExpanded) {
+                void this._treeView?.reveal?.(element, { expand: true, focus: false, select: false })
+                    ?.catch?.(() => {});
+            }
+        }, 0);
+        this._vulnerabilityRefreshTimers.set(element, timer);
+    }
+
+    _clearVulnerabilityRefreshTimers() {
+        for (const timer of this._vulnerabilityRefreshTimers.values()) clearTimeout(timer);
+        this._vulnerabilityRefreshTimers.clear();
+    }
+
+    _pruneVulnerabilitySummaries(results) {
+        const owners = new Set(results || []);
+        for (const [identity, entries] of this._vulnerabilitySummaries) {
+            for (const entry of [...entries]) {
+                if (!owners.has(entry.owner)) entries.delete(entry);
+            }
+            if (entries.size === 0) this._vulnerabilitySummaries.delete(identity);
         }
     }
 
@@ -1234,7 +1351,7 @@ function packageKeyFromNode(node) {
     });
 }
 
-function buildUniqueNodes(packages, context, seen, connectionManager) {
+function buildUniqueNodes(packages, context, seen, connectionManager, nodeOptions = {}) {
     const nodes = [];
     let duplicateCount = 0;
     for (const pkg of packages) {
@@ -1248,18 +1365,38 @@ function buildUniqueNodes(packages, context, seen, connectionManager) {
             continue;
         }
         seen.add(key);
-        nodes.push(freezeSearchNode(new SearchResultNode(canonicalPackage, context, { connectionManager })));
+        nodes.push(freezeSearchNode(new SearchResultNode(canonicalPackage, context, {
+            connectionManager,
+            vulnerabilityStateService: nodeOptions.vulnerabilityStateService,
+            registerVulnerabilitySummary: nodeOptions.registerVulnerabilitySummary,
+        })));
     }
     return { nodes, duplicateCount };
 }
 
 function freezeSearchNode(node) {
     for (const key of Object.keys(node)) {
-        if (key !== "context" && key !== "_connectionManager") {
+        if (
+            key !== "context"
+            && key !== "_connectionManager"
+            && key !== "_vulnerabilityStateService"
+            && key !== "_vulnerabilitySummary"
+        ) {
             deepFreezeOwned(node[key]);
         }
     }
     return Object.freeze(node);
+}
+
+function vulnerabilityEventIdentity(event) {
+    if (typeof event === "string") return event;
+    if (typeof event?.identity === "string") return event.identity;
+    const ref = event?.ref || event?.packageRef || event;
+    try {
+        return packageCollectionIdentity(ref);
+    } catch {
+        return null;
+    }
 }
 
 function deepFreezeOwned(value) {

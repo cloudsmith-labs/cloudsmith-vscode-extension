@@ -77,6 +77,54 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(connectionManager.additionalCallerState, "still mutable");
   });
 
+  test("vulnerability publication targets the stable summary and ignores replaced search owners", async () => {
+    const vulnerabilityStateService = createVulnerabilityStateService();
+    const { provider } = createProvider({
+      vulnerabilityStateService,
+      fetchPage: async (_endpoint, _page, _size, query) => page([
+        pkg(query, { num_vulnerabilities: 1 }),
+      ]),
+    });
+    await provider.search("workspace-a", "first");
+    const firstOwner = provider.searchResults[0];
+    const firstSummary = firstOwner.getChildren().find(
+      child => child.getTreeItem().contextValue === "vulnerabilitySummary"
+    );
+    assert.strictEqual(firstSummary, firstOwner.getChildren().find(
+      child => child.getTreeItem().contextValue === "vulnerabilitySummary"
+    ));
+    const events = [];
+    const reveals = [];
+    let onExpand;
+    provider.setTreeView({
+      onDidExpandElement(listener) { onExpand = listener; return { dispose() {} }; },
+      onDidCollapseElement() { return { dispose() {} }; },
+      async reveal(...args) { reveals.push(args); },
+    });
+    provider.onDidChangeTreeData(element => events.push(element));
+    onExpand({ element: firstSummary });
+    assert.strictEqual(provider.getParent(firstSummary), firstOwner);
+    assert.strictEqual(provider.getParent(firstOwner), undefined);
+
+    vulnerabilityStateService.emit('["workspace-a","repo-a","first-perm"]', "loading");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepStrictEqual(events, []);
+
+    vulnerabilityStateService.emit('["workspace-a","repo-a","first-perm"]', "complete-vulnerable");
+    vulnerabilityStateService.emit('["workspace-a","repo-a","first-perm"]', "complete-vulnerable");
+    assert.deepStrictEqual(events, []);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepStrictEqual(events, [firstSummary]);
+    assert.deepStrictEqual(reveals, [[firstSummary, { expand: true, focus: false, select: false }]]);
+
+    events.length = 0;
+    vulnerabilityStateService.emit('["workspace-a","repo-a","first-perm"]', "complete-vulnerable");
+    await provider.search("workspace-a", "second");
+    events.length = 0;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepStrictEqual(events, []);
+  });
+
   test("canonicalizes every retained field without freezing the API response", async () => {
     const responsePackage = pkg("artifact", {
       is_copyable: true,
@@ -1735,6 +1783,7 @@ suite("SearchProvider atomic search state", () => {
           warning(message) { messages.warning.push(message); },
         },
         getAggregationPageSize: () => options.pageSize || 50,
+        vulnerabilityStateService: options.vulnerabilityStateService,
       }
     );
     providers.push(provider);
@@ -1764,6 +1813,26 @@ function createConnectionManager(initial = {}) {
       for (const listener of listeners) {
         listener(state);
       }
+    },
+  };
+}
+
+function createVulnerabilityStateService() {
+  const listeners = new Set();
+  const unknown = Object.freeze({ status: "unknown", records: [], count: null, detected: true });
+  return {
+    prime() { return unknown; },
+    peek() { return unknown; },
+    onDidChange(listener) {
+      listeners.add(listener);
+      return { dispose() { listeners.delete(listener); } };
+    },
+    emit(identity, status = "unknown") {
+      const state = status === "complete-vulnerable"
+        ? Object.freeze({ status, records: Object.freeze([{}]), count: 1, complete: true })
+        : Object.freeze({ ...unknown, status });
+      const event = Object.freeze({ identity, state });
+      for (const listener of [...listeners]) listener(event);
     },
   };
 }

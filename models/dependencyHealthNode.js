@@ -20,6 +20,7 @@ class DependencyHealthNode {
 
     this.context = hasExplicitCloudsmithMatch ? maybeContext : cloudsmithMatchOrContext;
     this.options = hasExplicitCloudsmithMatch ? (maybeOptions || {}) : (maybeContext || {});
+    this._vulnerabilitySummary = null;
     this.name = dep.name;
     this.declarationName = dep.declarationName || dep.name;
     this.declaredConstraint = dep.declaredConstraint || null;
@@ -497,14 +498,25 @@ class DependencyHealthNode {
 
     const vulnerabilities = this._getVulnerabilityData();
     if (vulnerabilities && this._hasVulnerabilities()) {
-      const VulnerabilitySummaryNode = require("./vulnerabilitySummaryNode");
-      children.push(new VulnerabilitySummaryNode({
-        namespace: this.cloudsmithMatch.namespace,
-        repository: this.cloudsmithMatch.repository,
-        slug_perm: this.cloudsmithMatch.slug_perm,
-        num_vulnerabilities: vulnerabilities.countKnown === false ? -1 : vulnerabilities.count,
-        max_severity: vulnerabilities.maxSeverity,
-      }, this.context, { connectionManager: this.options.connectionManager }));
+      if (!this._vulnerabilitySummary) {
+        const VulnerabilitySummaryNode = require("./vulnerabilitySummaryNode");
+        this._vulnerabilitySummary = new VulnerabilitySummaryNode({
+          namespace: this.cloudsmithMatch.namespace,
+          repository: this.cloudsmithMatch.repository,
+          slug_perm: this.cloudsmithMatch.slug_perm,
+          num_vulnerabilities: vulnerabilities.countKnown === false ? -1 : vulnerabilities.count,
+          max_severity: vulnerabilities.maxSeverity,
+        }, this.context, {
+          connectionManager: this.options.connectionManager,
+          vulnerabilityStateService: this.options.vulnerabilityStateService,
+        });
+        this.options.registerVulnerabilitySummary?.(
+          this._vulnerabilitySummary.identity,
+          this._vulnerabilitySummary,
+          this
+        );
+      }
+      children.push(this._vulnerabilitySummary);
     }
 
     const policy = this._getPolicyData();

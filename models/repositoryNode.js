@@ -67,6 +67,13 @@ class RepositoryNode {
     this._requestRefresh = typeof options.requestRefresh === "function"
       ? options.requestRefresh
       : () => {};
+    this._vulnerabilityStateService = options.vulnerabilityStateService || null;
+    this._registerVulnerabilitySummary = typeof options.registerVulnerabilitySummary === "function"
+      ? options.registerVulnerabilitySummary
+      : () => {};
+    this._unregisterVulnerabilitySummaries = typeof options.unregisterVulnerabilitySummaries === "function"
+      ? options.unregisterVulnerabilitySummaries
+      : () => {};
     this._withProgress = options.withProgress || ((progressOptions, task) => (
       vscode.window.withProgress(progressOptions, task)
     ));
@@ -88,6 +95,7 @@ class RepositoryNode {
 
   invalidate() {
     if (this._disposed) return;
+    this._unregisterVulnerabilitySummaries(this);
     this._disposed = true;
     this._generation += 1;
     this._lifecycleController.abort();
@@ -232,6 +240,7 @@ class RepositoryNode {
 
   _ensurePackageDescriptor(descriptor) {
     if (this._packageDescriptor?.key === descriptor.key) return;
+    this._unregisterVulnerabilitySummaries(this);
     this._generation += 1;
     this._lifecycleController.abort();
     this._lifecycleController = new AbortController();
@@ -464,7 +473,27 @@ class RepositoryNode {
     const PackageNode = require("./packageNode");
     return new PackageNode(item, this.context, {
       connectionManager: this._connectionManager,
+      vulnerabilityStateService: this._vulnerabilityStateService,
+      lifecycleSignal: this._lifecycleController.signal,
+      registerVulnerabilitySummary: (identity, element, packageNode) => (
+        this._registerVulnerabilitySummary(identity, element, {
+          repositoryNode: this,
+          packageNode,
+          generation: this._generation,
+        })
+      ),
     });
+  }
+
+  ownsVulnerabilitySummary(owner) {
+    return Boolean(
+      !this._disposed
+      && owner
+      && owner.repositoryNode === this
+      && owner.generation === this._generation
+      && this._packageState.nodes.includes(owner.packageNode)
+      && !this._lifecycleController.signal.aborted
+    );
   }
 
   _isOperationCurrent(operation) {

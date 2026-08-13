@@ -2,6 +2,7 @@
 const path = require("path");
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { vulnerabilitySeverityRank } = require("../util/vulnerabilitySeverity");
 const { apiEndpoint, appendApiQuery } = require("../util/apiEndpoint");
 const {
   ADAPTER_RESULT_STATUSES,
@@ -101,6 +102,18 @@ class DependencyHealthProvider {
     this.context = context;
     this._diagnosticsPublisher = diagnosticsPublisher || null;
     this._connectionManager = options.connectionManager || getConnectionManager(context);
+    this._vulnerabilityStateService = options.vulnerabilityStateService || null;
+    this._vulnerabilitySummaries = new Map();
+    this._treeParents = new WeakMap();
+    this._dependencySourceGroups = new WeakMap();
+    this._vulnerabilityRefreshTimers = new Map();
+    this._treeView = null;
+    this._expandedVulnerabilitySummaries = new WeakSet();
+    this._treeExpansionSubscriptions = [];
+    this._vulnerabilityTreeGeneration = 0;
+    this._vulnerabilityStateSubscription = this._vulnerabilityStateService?.onDidChange?.(
+      event => this._publishVulnerabilityState(event)
+    ) || null;
     this._services = {
       enrichVulnerabilities: options.enrichVulnerabilities || enrichVulnerabilities,
       enrichLicenses: options.enrichLicenses || enrichLicenses,
@@ -682,6 +695,7 @@ class DependencyHealthProvider {
         examinedDirectDependencies += 1;
         const healthNode = new DependencyHealthNode(dependency, null, this.context, {
           connectionManager: this._connectionManager,
+          ...this._vulnerabilityNodeOptions(),
         });
         if (!["quarantined", "violated", "not_found"].includes(healthNode.state)) {
           continue;
@@ -1341,14 +1355,15 @@ class DependencyHealthProvider {
   }
 
   buildDependencyNodesForTree(tree) {
+    const group = this._dependencySourceGroups.get(tree) || null;
     if (this._viewMode === "tree") {
-      return this._buildTreeModeNodes(tree);
+      return this._buildTreeModeNodes(tree, group);
     }
 
-    return this._buildListModeNodes(tree);
+    return this._buildListModeNodes(tree, group);
   }
 
-  _buildListModeNodes(tree) {
+  _buildListModeNodes(tree, group = null) {
     const visibleDependencies = this._viewMode === "direct"
       ? tree.dependencies.filter((dependency) => dependency.isDirect)
       : tree.dependencies.slice();
@@ -1356,15 +1371,23 @@ class DependencyHealthProvider {
     return visibleDependencies
       .filter((dependency) => matchesFilter(dependency, this._filterMode))
       .sort((left, right) => compareDependencies(left, right, this._sortMode, true))
-      .map((dependency) => new DependencyHealthNode(
-        dependency,
-        null,
-        this.context,
-        { childMode: "details", connectionManager: this._connectionManager }
-      ));
+      .map((dependency) => {
+        const node = new DependencyHealthNode(
+          dependency,
+          null,
+          this.context,
+          {
+            childMode: "details",
+            connectionManager: this._connectionManager,
+            ...this._vulnerabilityNodeOptions(),
+          }
+        );
+        if (group) this._treeParents.set(node, group);
+        return node;
+      });
   }
 
-  _buildTreeModeNodes(tree) {
+  _buildTreeModeNodes(tree, group = null) {
     const roots = getTreeRootDependencies(tree)
       .sort((left, right) => compareDependencies(left, right, this._sortMode, false));
 
@@ -1373,24 +1396,30 @@ class DependencyHealthProvider {
       .filter(Boolean);
 
     const duplicateAwareRoots = annotateDuplicateWrappers(filteredRoots, new Map(), []);
-    return duplicateAwareRoots.map((wrapper) => this._createTreeDependencyNode(wrapper));
+    return duplicateAwareRoots.map(wrapper => this._createTreeDependencyNode(wrapper, group));
   }
 
-  _createTreeDependencyNode(wrapper) {
-    return new DependencyHealthNode(
+  _createTreeDependencyNode(wrapper, parent = null) {
+    let node;
+    node = new DependencyHealthNode(
       wrapper.dependency,
       null,
       this.context,
       {
         connectionManager: this._connectionManager,
+        ...this._vulnerabilityNodeOptions(),
         childMode: "tree",
         treeChildren: wrapper.children,
         duplicateReference: wrapper.duplicate,
         firstOccurrencePath: wrapper.firstOccurrencePath,
         dimmedForFilter: wrapper.dimmedForFilter,
-        treeChildFactory: (children) => children.map((child) => this._createTreeDependencyNode(child)),
+        treeChildFactory: (children) => children.map(child => (
+          this._createTreeDependencyNode(child, node)
+        )),
       }
     );
+    if (parent) this._treeParents.set(node, parent);
+    return node;
   }
 
   async buildReport() {
@@ -1790,6 +1819,10 @@ class DependencyHealthProvider {
     return element.getTreeItem();
   }
 
+    getParent(element) {
+    return this._treeParents.get(element) || null;
+  }
+
   async getChildren(element) {
     if (element) {
       return element.getChildren();
@@ -1829,7 +1862,11 @@ class DependencyHealthProvider {
           "statusMessage"
         ));
       }
-      nodes.push(...this._displayTrees.map((tree) => new DependencySourceGroupNode(tree, this)));
+      nodes.push(...this._displayTrees.map((tree) => {
+        const group = new DependencySourceGroupNode(tree, this);
+        this._dependencySourceGroups.set(tree, group);
+        return group;
+      }));
       return nodes;
     }
 
@@ -1909,12 +1946,95 @@ class DependencyHealthProvider {
 
   refresh() {
     if (this._disposed) return;
+    this._vulnerabilityTreeGeneration += 1;
+    this._vulnerabilitySummaries.clear();
+    this._clearVulnerabilityRefreshTimers();
     this._onDidChangeTreeData.fire();
+  }
+
+  setTreeView(treeView) {
+    for (const subscription of this._treeExpansionSubscriptions) subscription.dispose?.();
+    this._treeExpansionSubscriptions = [];
+    this._treeView = treeView;
+    const expanded = treeView?.onDidExpandElement?.(({ element }) => {
+      if (element?.getTreeItem?.().contextValue === "vulnerabilitySummary") {
+        this._expandedVulnerabilitySummaries.add(element);
+      }
+    });
+    const collapsed = treeView?.onDidCollapseElement?.(({ element }) => {
+      this._expandedVulnerabilitySummaries.delete(element);
+    });
+    if (expanded) this._treeExpansionSubscriptions.push(expanded);
+    if (collapsed) this._treeExpansionSubscriptions.push(collapsed);
+  }
+
+  _vulnerabilityNodeOptions() {
+    const generation = this._vulnerabilityTreeGeneration;
+    return {
+      vulnerabilityStateService: this._vulnerabilityStateService,
+      registerVulnerabilitySummary: (identity, element, owner) => {
+        if (typeof identity !== "string" || !element || !owner) return;
+        let entries = this._vulnerabilitySummaries.get(identity);
+        if (!entries) {
+          entries = new Set();
+          this._vulnerabilitySummaries.set(identity, entries);
+        }
+        entries.add(Object.freeze({ element, owner, generation }));
+        this._treeParents.set(element, owner);
+      },
+    };
+  }
+
+  _publishVulnerabilityState(event) {
+    const identity = typeof event?.identity === "string" ? event.identity : null;
+    const entries = identity ? this._vulnerabilitySummaries.get(identity) : null;
+    if (!entries || this._disposed) return;
+    for (const entry of [...entries]) {
+      if (entry.generation !== this._vulnerabilityTreeGeneration) {
+        entries.delete(entry);
+        continue;
+      }
+      if (event.presentation) {
+        entry.element.acceptVulnerabilityPresentation?.(event.presentation);
+      }
+      if (event.state?.status !== "loading") {
+        const generation = entry.generation;
+        this._scheduleVulnerabilityRefresh(entry.element, () => (
+          !this._disposed && generation === this._vulnerabilityTreeGeneration
+        ));
+      }
+    }
+    if (entries.size === 0) this._vulnerabilitySummaries.delete(identity);
+  }
+
+  _scheduleVulnerabilityRefresh(element, isCurrent) {
+    const current = this._vulnerabilityRefreshTimers.get(element);
+    if (current) clearTimeout(current);
+    const timer = setTimeout(() => {
+      this._vulnerabilityRefreshTimers.delete(element);
+      if (!isCurrent()) return;
+      const wasExpanded = this._expandedVulnerabilitySummaries.has(element);
+      this._onDidChangeTreeData.fire(element);
+      if (wasExpanded) {
+        void this._treeView?.reveal?.(element, { expand: true, focus: false, select: false })
+          ?.catch?.(() => {});
+      }
+    }, 0);
+    this._vulnerabilityRefreshTimers.set(element, timer);
+  }
+
+  _clearVulnerabilityRefreshTimers() {
+    for (const timer of this._vulnerabilityRefreshTimers.values()) clearTimeout(timer);
+    this._vulnerabilityRefreshTimers.clear();
   }
 
   dispose() {
     if (this._disposed) return;
     this._disposed = true;
+    this._vulnerabilityStateSubscription?.dispose?.();
+    for (const subscription of this._treeExpansionSubscriptions) subscription.dispose?.();
+    this._vulnerabilitySummaries.clear();
+    this._clearVulnerabilityRefreshTimers();
     const disposedOperationId = ++this._nextScanOperationId;
     this._scanOperation = createScanOperation(SCAN_STATES.CANCELLED, disposedOperationId, {
       startedAt: this._scanOperation.startedAt,
@@ -3705,18 +3825,7 @@ function compareNamedRows(left, right) {
 }
 
 function severitySortWeight(severity) {
-  switch (severity) {
-    case "Critical":
-      return 0;
-    case "High":
-      return 1;
-    case "Medium":
-      return 2;
-    case "Low":
-      return 3;
-    default:
-      return 4;
-  }
+  return 4 - vulnerabilitySeverityRank(severity);
 }
 
 function upstreamStatusSortWeight(status) {
