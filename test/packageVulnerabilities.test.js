@@ -3,6 +3,11 @@ const {
   fetchPackageVulnerabilities,
   getPackageVulnerabilityCount,
 } = require("../util/packageVulnerabilities");
+const {
+  deriveMaximumVulnerabilitySeverity,
+  normalizeVulnerabilitySeverity,
+  vulnerabilitySeverityRank,
+} = require("../util/vulnerabilitySeverity");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
 suite("Package vulnerability scan collection", () => {
@@ -266,5 +271,53 @@ suite("Package vulnerability scan collection", () => {
     assert.strictEqual(getPackageVulnerabilityCount({
       security_scan_status: "Scan Pending",
     }), null);
+  });
+
+  test("does not infer clean state from empty scan history when default arguments are omitted", async () => {
+    const result = await fetchPackageVulnerabilities({
+      async get() { return page([], 1, 1, 0); },
+    }, "workspace-a", "repo-a", "package-a");
+
+    assert.strictEqual(result.complete, false);
+    assert.strictEqual(result.numVulns, -1);
+    assert.strictEqual(result.maxSeverity, "Unknown");
+    assert.ok(result.error);
+  });
+
+  test("derives complete clean severity from an explicit authoritative clean scan", async () => {
+    const result = await fetchPackageVulnerabilities({
+      async get() {
+        return page([{
+          identifier: "scan-clean",
+          created_at: "2026-02-01T00:00:00Z",
+          has_vulnerabilities: false,
+          num_vulnerabilities: 0,
+          max_severity: "Unknown",
+        }], 1, 1, 1);
+      },
+    }, "workspace-a", "repo-a", "package-clean");
+
+    assert.strictEqual(result.complete, true);
+    assert.strictEqual(result.numVulns, 0);
+    assert.strictEqual(result.maxSeverity, "None");
+    assert.deepStrictEqual(result.results, []);
+  });
+
+  test("normalizes supported severities and never compares them lexically", () => {
+    assert.deepStrictEqual(
+      ["critical", "HIGH", " Medium ", "low", "catastrophic", null]
+        .map(normalizeVulnerabilitySeverity),
+      ["Critical", "High", "Medium", "Low", "Unknown", "Unknown"]
+    );
+    assert.ok(vulnerabilitySeverityRank("Critical") > vulnerabilitySeverityRank("High"));
+    assert.ok(vulnerabilitySeverityRank("High") > vulnerabilitySeverityRank("Medium"));
+    assert.ok(vulnerabilitySeverityRank("Medium") > vulnerabilitySeverityRank("Low"));
+    assert.strictEqual(deriveMaximumVulnerabilitySeverity([]), "None");
+    assert.strictEqual(deriveMaximumVulnerabilitySeverity([
+      { severity: "Low" }, { severity: "critical" }, { severity: "High" },
+    ]), "Critical");
+    assert.strictEqual(deriveMaximumVulnerabilitySeverity([
+      { severity: "Critical" }, { severity: "future" },
+    ]), "Unknown");
   });
 });

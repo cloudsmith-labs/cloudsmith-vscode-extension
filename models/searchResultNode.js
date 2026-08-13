@@ -6,11 +6,17 @@ const path = require("path");
 const PackageDetailsNode = require("./packageDetailsNode");
 const { LicenseClassifier } = require("../util/licenseClassifier");
 const { getPackageVulnerabilityCount } = require("../util/packageVulnerabilities");
+const { packageCollectionIdentity } = require("../util/collectionIdentity");
+const VulnerabilitySummaryNode = require("./vulnerabilitySummaryNode");
 
 class SearchResultNode {
     constructor(pkg, context, options = {}) {
         this.context = context;
         this._connectionManager = options.connectionManager || null;
+        this._vulnerabilityStateService = options.vulnerabilityStateService || null;
+        this._registerVulnerabilitySummary = typeof options.registerVulnerabilitySummary === "function"
+            ? options.registerVulnerabilitySummary
+            : () => {};
 
         // Store fields matching PackageNode's shape so existing commands work
         this.name = pkg.name;
@@ -58,6 +64,27 @@ class SearchResultNode {
         this.max_severity = pkg.max_severity || null;
         this.vulnerability_scan_results_url = pkg.vulnerability_scan_results_url || null;
         this.security_scan_status = pkg.security_scan_status || null;
+        this._vulnerabilityIdentity = packageCollectionIdentity({
+            namespace: this.namespace,
+            repository: this.repository,
+            slug_perm: this.slug_perm_raw,
+        });
+        this._vulnerabilitySummary = new VulnerabilitySummaryNode({
+                namespace: this.namespace,
+                repository: this.repository,
+                slug_perm: this.slug_perm_raw,
+                num_vulnerabilities: this.num_vulnerabilities,
+                max_severity: this.max_severity,
+                security_scan_status: this.security_scan_status,
+            }, this.context, {
+                connectionManager: this._connectionManager,
+                vulnerabilityStateService: this._vulnerabilityStateService,
+            });
+        this._registerVulnerabilitySummary(
+            this._vulnerabilityIdentity,
+            this._vulnerabilitySummary,
+            this
+        );
 
         // License fields from API response (may be absent in list endpoint)
         this.licenseInfo = cloneCanonicalValue(LicenseClassifier.inspect(pkg));
@@ -208,16 +235,7 @@ class SearchResultNode {
         }
 
         // 4. Vulnerability summary (expandable)
-        if (this.num_vulnerabilities !== 0) {
-            const VulnerabilitySummaryNode = require("./vulnerabilitySummaryNode");
-            children.push(new VulnerabilitySummaryNode({
-                namespace: this.namespace,
-                repository: this.repository,
-                slug_perm: this.slug_perm_raw,
-                num_vulnerabilities: this.num_vulnerabilities,
-                max_severity: this.max_severity,
-            }, this.context, { connectionManager: this._connectionManager }));
-        }
+        children.push(this._vulnerabilitySummary);
 
         // 5. Quarantine Reason (if quarantined)
         if (this.status_str_raw === "Quarantined" && this.status_reason) {

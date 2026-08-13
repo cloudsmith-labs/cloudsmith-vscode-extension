@@ -4,6 +4,10 @@ const { apiEndpoint } = require("./apiEndpoint");
 const { getFoundDependencyKey } = require("./foundDependencyKey");
 const { getPackageVulnerabilityState } = require("./packageVulnerabilities");
 const {
+  deriveMaximumVulnerabilitySeverity,
+  normalizeVulnerabilitySeverity,
+} = require("./vulnerabilitySeverity");
+const {
   captureAccount,
   isAccountCurrent,
   resolveConnectionManager,
@@ -18,35 +22,8 @@ const MAX_VULNERABILITY_IDENTIFIER_LENGTH = 512;
 const MAX_VULNERABILITY_DISPLAY_LENGTH = 4096;
 const vulnerabilityCache = new Map();
 
-function severityRank(severity) {
-  switch (String(severity || "").trim().toLowerCase()) {
-    case "critical":
-      return 4;
-    case "high":
-      return 3;
-    case "medium":
-      return 2;
-    case "low":
-      return 1;
-    default:
-      return 0;
-  }
-}
-
 function canonicalSeverity(severity) {
-  const normalized = String(severity || "").trim().toLowerCase();
-  switch (normalized) {
-    case "critical":
-      return "Critical";
-    case "high":
-      return "High";
-    case "medium":
-      return "Medium";
-    case "low":
-      return "Low";
-    default:
-      return "Unknown";
-  }
+  return normalizeVulnerabilitySeverity(severity);
 }
 
 function getIndicatorCount(packageModel) {
@@ -244,7 +221,6 @@ function summarizeEntries(entries, fallbackSummary) {
   const cveIds = [];
   const seenCveIds = new Set();
   const normalizedEntries = [];
-  let maxSeverity = null;
   let hasFixAvailable = false;
 
   for (const entry of entries.map(normalizeEntry)) {
@@ -254,9 +230,6 @@ function summarizeEntries(entries, fallbackSummary) {
       cveIds.push(entry.cveId);
     }
     severityCounts[entry.severity] = (severityCounts[entry.severity] || 0) + 1;
-    if (!maxSeverity || severityRank(entry.severity) > severityRank(maxSeverity)) {
-      maxSeverity = entry.severity;
-    }
     if (entry.hasFixAvailable) {
       hasFixAvailable = true;
     }
@@ -264,7 +237,7 @@ function summarizeEntries(entries, fallbackSummary) {
 
   return {
     count: fallbackSummary.count,
-    maxSeverity: maxSeverity || fallbackSummary.maxSeverity || null,
+    maxSeverity: deriveMaximumVulnerabilitySeverity(normalizedEntries),
     cveIds,
     hasFixAvailable,
     severityCounts,

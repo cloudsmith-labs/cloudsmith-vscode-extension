@@ -92,12 +92,33 @@ suite("Package Metadata Flow Test Suite", () => {
       for (const NodeType of [PackageNode, SearchResultNode]) {
         const node = new NodeType(cleanPayload, {});
         assert.strictEqual(node.num_vulnerabilities, 0);
-        assert.strictEqual(
-          node.getChildren().some(child => child.getTreeItem().contextValue === "vulnerabilitySummary"),
-          false,
-          `${NodeType.name} exposed a false ${cleanPayload.format} vulnerability summary`
+        const summary = node.getChildren().find(
+          child => child.getTreeItem().contextValue === "vulnerabilitySummary"
         );
+        assert.ok(summary, `${NodeType.name} omitted the authoritative clean vulnerability state`);
+        assert.strictEqual(summary.getTreeItem().label, "Vulnerabilities: 0 (None)");
       }
+    }
+
+    const cachedVulnerable = Object.freeze({
+      status: "complete-vulnerable",
+      records: Object.freeze([{ vulnerability_id: "CVE-1", severity: "High" }]),
+      count: 1,
+      maxSeverity: "High",
+      complete: true,
+      detailed: true,
+      revision: 1,
+    });
+    const vulnerabilityStateService = {
+      prime() { return cachedVulnerable; },
+      peek() { return cachedVulnerable; },
+    };
+    for (const NodeType of [PackageNode, SearchResultNode]) {
+      const node = new NodeType(cleanPayloads[0], {}, { vulnerabilityStateService });
+      const summary = node.getChildren().find(
+        child => child.getTreeItem().contextValue === "vulnerabilitySummary"
+      );
+      assert.strictEqual(summary.getTreeItem().label, "Vulnerabilities: 1 (High)");
     }
 
     const vulnerablePayload = {
@@ -115,7 +136,8 @@ suite("Package Metadata Flow Test Suite", () => {
         child => child.getTreeItem().contextValue === "vulnerabilitySummary"
       );
       assert.ok(summary, `${NodeType.name} omitted a real vulnerability summary`);
-      assert.strictEqual(summary.getTreeItem().label, "Vulnerabilities: 2 (High)");
+      assert.strictEqual(summary.getTreeItem().label, "Vulnerabilities: detected");
+      assert.strictEqual(summary.getTreeItem().tooltip, "Expand to load vulnerability details.");
       assert.strictEqual(
         summary.getTreeItem().collapsibleState,
         vscode.TreeItemCollapsibleState.Collapsed

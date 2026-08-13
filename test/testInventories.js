@@ -10,6 +10,7 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/manifestParser.test.js",
   "test/packageQuery.test.js",
   "test/packageVulnerabilities.test.js",
+  "test/vulnerabilityStateService.test.js",
   "test/paginatedFetch.test.js",
   "test/policyDecisionLogs.test.js",
   "test/promotionContracts.test.js",

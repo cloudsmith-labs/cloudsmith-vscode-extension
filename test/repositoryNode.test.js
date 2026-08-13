@@ -447,11 +447,12 @@ suite("RepositoryNode Test Suite", () => {
     assert.strictEqual(packages.length, 2);
     for (const packageNode of packages) {
       const children = packageNode.getChildren();
-      assert.strictEqual(
-        children.some(child => child.getTreeItem().contextValue === "vulnerabilitySummary"),
-        false,
-        `${packageNode.format} package exposed a false vulnerability summary`
-      );
+      const summary = children.find(child => (
+        child.getTreeItem().contextValue === "vulnerabilitySummary"
+      ));
+      assert.ok(summary, `${packageNode.format} package did not expose its clean vulnerability state`);
+      assert.strictEqual(summary.getTreeItem().label, "Vulnerabilities: 0 (None)");
+      assert.strictEqual(summary.getTreeItem().tooltip, "0 vulnerabilities. Max severity: None.");
       assert.strictEqual(
         children.some(child => String(child.getTreeItem().label).includes("Vulnerabilities: detected")),
         false
@@ -536,12 +537,11 @@ suite("RepositoryNode Test Suite", () => {
       zero: 0,
       positive: 2,
     });
-    assert.strictEqual(
-      nodes.find(node => node.name === "zero").getChildren().some(child => (
-        child.getTreeItem().contextValue === "vulnerabilitySummary"
-      )),
-      false
-    );
+    const cleanSummary = nodes.find(node => node.name === "zero").getChildren().find(child => (
+      child.getTreeItem().contextValue === "vulnerabilitySummary"
+    ));
+    assert.ok(cleanSummary);
+    assert.strictEqual(cleanSummary.getTreeItem().label, "Vulnerabilities: 0 (None)");
     for (const name of ["no-evidence", "malformed", "presence", "status", "positive"]) {
       assert.strictEqual(
         nodes.find(node => node.name === name).getChildren().some(child => (

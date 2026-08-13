@@ -40,6 +40,7 @@ const { buildPackageGroupUrl, buildPackageUrl } = require("./util/webAppUrls");
 const recentPackages = require("./util/recentPackages");
 const filterState = require("./util/filterState");
 const { clearVulnerabilityCache } = require("./util/dependencyVulnEnricher");
+const { VulnerabilityStateService } = require("./util/vulnerabilityStateService");
 const { WorkspaceCache } = require("./util/workspaceCache");
 const { getWorkspaceContextProjector } = require("./util/workspaceContextProjector");
 const { captureAccount, isAccountCurrent } = require("./util/accountOperation");
@@ -393,6 +394,7 @@ async function resetAccountScopedState(context, options = {}) {
     () => (options.filterState || filterState).clear(),
     () => (options.recentPackages || recentPackages).clear(),
     () => (options.clearVulnerabilityCache || clearVulnerabilityCache)(),
+    () => options.vulnerabilityStateService?.clear?.(),
     () => options.vulnerabilityProvider?.resetForAccountChange?.(),
     () => options.quarantineExplainProvider?.resetForAccountChange?.(),
     () => options.upstreamPreviewProvider?.resetForAccountChange?.(),
@@ -910,10 +912,15 @@ async function activateOwned(context, own) {
 
   // Define main view provider which populates with data
   const workspaceCache = new WorkspaceCache(connectionManager);
+  const vulnerabilityStateService = new VulnerabilityStateService(context, {
+    connectionManager,
+  });
+  own(vulnerabilityStateService);
   const cloudsmithProvider = new CloudsmithProvider(context, {
     connectionManager,
     workspaceCache,
     workspaceContextProjector,
+    vulnerabilityStateService,
   });
   own({ dispose: () => cloudsmithProvider.dispose() });
   const treeView = vscode.window.createTreeView("cloudsmithView", {
@@ -955,18 +962,23 @@ async function activateOwned(context, own) {
   own(vscode.window.registerTreeDataProvider("helpView", provider));
 
   // Set Package Search view.
-  const searchProvider = new SearchProvider(context, { connectionManager });
+  const searchProvider = new SearchProvider(context, {
+    connectionManager,
+    vulnerabilityStateService,
+  });
   const searchTreeView = vscode.window.createTreeView("cloudsmithSearchView", {
     treeDataProvider: searchProvider,
     showCollapseAll: true,
   });
   own(searchTreeView);
+  searchProvider.setTreeView(searchTreeView);
 
   // Set Dependency Health view with diagnostics publisher.
   const diagnosticsPublisher = new DiagnosticsPublisher();
   own(diagnosticsPublisher);
   const dependencyHealthProvider = new DependencyHealthProvider(context, diagnosticsPublisher, {
     connectionManager,
+    vulnerabilityStateService,
   });
   own(
     { dispose: () => searchProvider.dispose() },
@@ -977,6 +989,7 @@ async function activateOwned(context, own) {
     showCollapseAll: false,
   });
   own(dependencyTreeView);
+  dependencyHealthProvider.setTreeView(dependencyTreeView);
 
   let projectedAccountEpoch = connectionManager.getState().accountEpoch;
   let promotionProvider = null;
@@ -993,6 +1006,7 @@ async function activateOwned(context, own) {
         searchProvider,
         dependencyHealthProvider,
         workspaceContextProjector,
+        vulnerabilityStateService,
         vulnerabilityProvider,
         quarantineExplainProvider,
         upstreamPreviewProvider,
@@ -1012,7 +1026,10 @@ async function activateOwned(context, own) {
   own(connectionSubscription);
 
   // Create vulnerability WebView provider
-  vulnerabilityProvider = new VulnerabilityProvider(context, { connectionManager });
+  vulnerabilityProvider = new VulnerabilityProvider(context, {
+    connectionManager,
+    vulnerabilityStateService,
+  });
   own({ dispose: () => vulnerabilityProvider.dispose() });
 
   // Create compliance report WebView provider

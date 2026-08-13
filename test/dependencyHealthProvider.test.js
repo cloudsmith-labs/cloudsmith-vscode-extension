@@ -2494,6 +2494,155 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(node.state, "unresolved");
   });
 
+  test("dependency package vulnerability details reuse one stable canonical summary", async () => {
+    const context = createContext();
+    const state = Object.freeze({
+      status: "complete-vulnerable",
+      records: Object.freeze([{ vulnerability_id: "CVE-1", severity: "High" }]),
+      count: 1,
+      maxSeverity: "High",
+      complete: true,
+      revision: 1,
+    });
+    const calls = { prime: 0, resolve: 0, register: 0 };
+    const vulnerabilityStateService = {
+      prime() { calls.prime += 1; return state; },
+      peek() { return state; },
+      async resolve() { calls.resolve += 1; return state; },
+    };
+    const node = new DependencyHealthNode({
+      ...createFoundDependency("left-pad", "1.0.0"),
+      vulnerabilities: {
+        count: 1,
+        countKnown: true,
+        detected: true,
+        maxSeverity: "High",
+      },
+    }, null, context, {
+      vulnerabilityStateService,
+      registerVulnerabilitySummary() { calls.register += 1; },
+    });
+
+    const first = node.getChildren().find(child => (
+      child.getTreeItem().contextValue === "vulnerabilitySummary"
+    ));
+    const second = node.getChildren().find(child => (
+      child.getTreeItem().contextValue === "vulnerabilitySummary"
+    ));
+    assert.strictEqual(first, second);
+    assert.strictEqual(first.getTreeItem().label, "Vulnerabilities: 1 (High)");
+    assert.deepStrictEqual((await first.getChildren()).map(child => child.cveId), ["CVE-1"]);
+    assert.deepStrictEqual(calls, { prime: 1, resolve: 1, register: 1 });
+  });
+
+  test("production dependency groups stay stable and provide the complete summary ancestry", async () => {
+    const context = createContext();
+    const state = Object.freeze({
+      status: "unknown",
+      records: Object.freeze([]),
+      count: null,
+      maxSeverity: "Unknown",
+      complete: false,
+      detected: true,
+      reportedCount: 1,
+    });
+    const vulnerabilityStateService = {
+      prime() { return state; },
+      peek() { return state; },
+      onDidChange() { return { dispose() {} }; },
+    };
+    const provider = new DependencyHealthProvider(context, null, {
+      vulnerabilityStateService,
+    });
+    const tree = {
+      sourceFile: "package-lock.json",
+      dependencies: [{
+        ...createFoundDependency("left-pad", "1.0.0"),
+        vulnerabilities: {
+          count: 1,
+          countKnown: true,
+          detected: true,
+          maxSeverity: "High",
+        },
+      }],
+    };
+    provider._displayTrees = [tree];
+    provider._hasSuccessfulScan = true;
+
+    const firstGroup = (await provider.getChildren()).find(node => (
+      node.getTreeItem().contextValue === "dependencyHealthSourceGroup"
+    ));
+    const secondGroup = (await provider.getChildren()).find(node => (
+      node.getTreeItem().contextValue === "dependencyHealthSourceGroup"
+    ));
+    const owner = firstGroup.getChildren()[0];
+    const summary = owner.getChildren().find(node => (
+      node.getTreeItem().contextValue === "vulnerabilitySummary"
+    ));
+
+    assert.strictEqual(firstGroup, secondGroup);
+    assert.strictEqual(provider.getParent(summary), owner);
+    assert.strictEqual(provider.getParent(owner), firstGroup);
+    assert.strictEqual(provider.getParent(firstGroup), null);
+    provider.dispose();
+  });
+
+  test("vulnerability publication defers and coalesces terminal refreshes", async () => {
+    const listeners = new Set();
+    const service = {
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      emit(identity, status) {
+        const state = status === "complete-vulnerable"
+          ? Object.freeze({ status, records: Object.freeze([{}]), count: 1, complete: true })
+          : Object.freeze({ status, records: Object.freeze([]), count: null, complete: false });
+        for (const listener of [...listeners]) listener(Object.freeze({ identity, state }));
+      },
+    };
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      vulnerabilityStateService: service,
+    });
+    const identity = '["workspace","repo","package"]';
+    const sourceGroup = {};
+    const owner = {};
+    provider._treeParents.set(owner, sourceGroup);
+    const element = { getTreeItem() { return { contextValue: "vulnerabilitySummary" }; } };
+    provider._vulnerabilityNodeOptions().registerVulnerabilitySummary(identity, element, owner);
+    const events = [];
+    const reveals = [];
+    let onExpand;
+    provider.setTreeView({
+      onDidExpandElement(listener) { onExpand = listener; return { dispose() {} }; },
+      onDidCollapseElement() { return { dispose() {} }; },
+      async reveal(...args) { reveals.push(args); },
+    });
+    provider.onDidChangeTreeData(value => events.push(value));
+    onExpand({ element });
+    assert.strictEqual(provider.getParent(element), owner);
+    assert.strictEqual(provider.getParent(owner), sourceGroup);
+    assert.strictEqual(provider.getParent(sourceGroup), null);
+
+    service.emit(identity, "loading");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepStrictEqual(events, []);
+    service.emit(identity, "complete-vulnerable");
+    service.emit(identity, "complete-vulnerable");
+    assert.deepStrictEqual(events, []);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepStrictEqual(events, [element]);
+    assert.deepStrictEqual(reveals, [[element, { expand: true, focus: false, select: false }]]);
+
+    events.length = 0;
+    service.emit(identity, "complete-vulnerable");
+    provider.refresh();
+    events.length = 0;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepStrictEqual(events, []);
+    provider.dispose();
+  });
+
   test("_runLicenseEnrichment flushes multiple progress patches in one refresh", async () => {
     const provider = new DependencyHealthProvider(createContext(), null, {
       enrichLicenses: async (_dependencies, options = {}) => {

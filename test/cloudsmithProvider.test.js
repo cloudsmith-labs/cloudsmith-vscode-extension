@@ -56,6 +56,26 @@ function createConnectionManager(overrides = {}) {
   };
 }
 
+function createVulnerabilityStateService() {
+  const listeners = new Set();
+  const unknown = Object.freeze({ status: "unknown", records: [], count: null, detected: true });
+  return {
+    prime() { return unknown; },
+    peek() { return unknown; },
+    onDidChange(listener) {
+      listeners.add(listener);
+      return { dispose() { listeners.delete(listener); } };
+    },
+    emit(identity, status = "unknown") {
+      const state = status === "complete-vulnerable"
+        ? Object.freeze({ status, records: Object.freeze([{}]), count: 1, complete: true })
+        : Object.freeze({ ...unknown, status });
+      const event = Object.freeze({ identity, state });
+      for (const listener of [...listeners]) listener(event);
+    },
+  };
+}
+
 suite("CloudsmithProvider", () => {
   let originalExecuteCommand;
   let originalGetConfiguration;
@@ -414,6 +434,78 @@ suite("CloudsmithProvider", () => {
 
     provider.refresh();
     assert.strictEqual(node._disposed, true);
+    subscription.dispose();
+  });
+
+  test("vulnerability publication refreshes only the owned stable summary", async () => {
+    const service = createVulnerabilityStateService();
+    const provider = createProvider(async () => workspaceSuccess([]), {
+      vulnerabilityStateService: service,
+    });
+    const repository = provider._createRepositoryNode(
+      { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
+      "workspace-a"
+    );
+    const packageNode = repository._createPackageNode({
+      namespace: "workspace-a",
+      repository: "repo-a",
+      name: "package-a",
+      format: "npm",
+      slug: "package-a",
+      slug_perm: "package-a",
+      version: "1.0.0",
+      status_str: "Completed",
+      num_vulnerabilities: 1,
+    }, "packages");
+    repository._packageState = Object.freeze({
+      ...repository._packageState,
+      nodes: Object.freeze([packageNode]),
+    });
+    const firstChildren = packageNode.getChildren();
+    const summary = firstChildren.find(child => child.getTreeItem().contextValue === "vulnerabilitySummary");
+    assert.strictEqual(summary, packageNode.getChildren().find(
+      child => child.getTreeItem().contextValue === "vulnerabilitySummary"
+    ));
+    const events = [];
+    const reveals = [];
+    let onExpand;
+    let onCollapse;
+    provider.setTreeView({
+      onDidExpandElement(listener) { onExpand = listener; return { dispose() {} }; },
+      onDidCollapseElement(listener) { onCollapse = listener; return { dispose() {} }; },
+      async reveal(...args) { reveals.push(args); },
+    });
+    const subscription = provider.onDidChangeTreeData(element => events.push(element));
+    onExpand({ element: summary });
+    assert.strictEqual(provider.getParent(summary), packageNode);
+    assert.strictEqual(provider.getParent(packageNode), repository);
+
+    service.emit('["workspace-a","repo-a","package-a"]', "loading");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepStrictEqual(events, []);
+
+    service.emit('["workspace-a","repo-a","package-a"]', "complete-vulnerable");
+    service.emit('["workspace-a","repo-a","package-a"]', "complete-vulnerable");
+    assert.deepStrictEqual(events, []);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    assert.deepStrictEqual(events, [summary]);
+    assert.deepStrictEqual(reveals, [[summary, { expand: true, focus: false, select: false }]]);
+    assert.strictEqual(repository._disposed, false);
+
+    onCollapse({ element: summary });
+    events.length = 0;
+    service.emit('["workspace-a","repo-a","package-a"]', "complete-vulnerable");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepStrictEqual(events, [summary]);
+    assert.strictEqual(reveals.length, 1);
+
+    events.length = 0;
+    service.emit('["workspace-a","repo-a","package-a"]', "complete-vulnerable");
+    provider.refresh();
+    events.length = 0;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepStrictEqual(events, []);
     subscription.dispose();
   });
 

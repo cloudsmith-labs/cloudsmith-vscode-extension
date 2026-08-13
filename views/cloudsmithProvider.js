@@ -17,6 +17,7 @@ const RepositoryNode = require("../models/repositoryNode");
 const workspaceFetcher = require("../util/workspaceFetcher");
 const workspaceRepositoryFetcher = require("../util/workspaceRepositoryFetcher");
 const { getWorkspaceContextProjector } = require("../util/workspaceContextProjector");
+const { packageCollectionIdentity } = require("../util/collectionIdentity");
 
 class CloudsmithProvider {
   constructor(context, options = {}) {
@@ -36,10 +37,19 @@ class CloudsmithProvider {
       upstreamChecker: options.upstreamChecker,
       withProgress: options.withProgress,
     });
+    this._vulnerabilityStateService = options.vulnerabilityStateService || null;
+    this._vulnerabilitySummaries = new Map();
+    this._treeParents = new WeakMap();
+    this._vulnerabilityRefreshTimers = new Map();
+    this._vulnerabilityStateSubscription = this._vulnerabilityStateService?.onDidChange?.(
+      event => this._publishVulnerabilityState(event)
+    ) || null;
     this._onDidChangeTreeData = new vscode.EventEmitter();
     this.onDidChangeTreeData = this._onDidChangeTreeData.event;
     this._defaultWorkspaceFallbackHandler = null;
     this._treeView = null;
+    this._expandedVulnerabilitySummaries = new WeakSet();
+    this._treeExpansionSubscriptions = [];
     this._suppressMissingCredentialsWarningOnce = false;
     this._operationId = 0;
     this._loadingOperationId = null;
@@ -49,6 +59,10 @@ class CloudsmithProvider {
 
   getTreeItem(element) {
     return element.getTreeItem();
+  }
+
+  getParent(element) {
+    return this._treeParents.get(element);
   }
 
   getChildren(element) {
@@ -83,6 +97,10 @@ class CloudsmithProvider {
     this._abortActiveOperation();
     this._operationId += 1;
     this._workspaceCache.clear();
+    this._vulnerabilitySummaries.clear();
+    this._clearVulnerabilityRefreshTimers();
+    this._vulnerabilityStateSubscription?.dispose?.();
+    for (const subscription of this._treeExpansionSubscriptions) subscription.dispose?.();
     this._onDidChangeTreeData.dispose();
   }
 
@@ -163,25 +181,37 @@ class CloudsmithProvider {
   }
 
   _createWorkspaceNodes(workspaces, signal = null) {
-    return workspaces.map(workspace => new WorkspaceNode(workspace, this.context, {
-      connectionManager: this._connectionManager,
-      createCloudsmithAPI: this._createCloudsmithAPI,
-      fetchWorkspaceRepositories: this._fetchWorkspaceRepositories,
-      signal,
-      createRepositoryNode: (repository, workspaceSlug) => (
-        this._createRepositoryNode(repository, workspaceSlug)
-      ),
-    }));
+    return workspaces.map((workspace) => {
+      let workspaceNode;
+      workspaceNode = new WorkspaceNode(workspace, this.context, {
+        connectionManager: this._connectionManager,
+        createCloudsmithAPI: this._createCloudsmithAPI,
+        fetchWorkspaceRepositories: this._fetchWorkspaceRepositories,
+        signal,
+        createRepositoryNode: (repository, workspaceSlug) => (
+          this._createRepositoryNode(repository, workspaceSlug, workspaceNode)
+        ),
+      });
+      return workspaceNode;
+    });
   }
 
-  _createRepositoryNode(repository, workspaceSlug) {
+  _createRepositoryNode(repository, workspaceSlug, parent = null) {
     const node = new RepositoryNode(repository, workspaceSlug, this.context, {
       connectionManager: this._connectionManager,
       createCloudsmithAPI: this._createCloudsmithAPI,
       requestRefresh: element => this.refreshNode(element),
+      vulnerabilityStateService: this._vulnerabilityStateService,
+      registerVulnerabilitySummary: (identity, element, owner) => (
+        this._registerVulnerabilitySummary(identity, element, owner)
+      ),
+      unregisterVulnerabilitySummaries: repositoryNode => (
+        this._unregisterVulnerabilitySummaries(repositoryNode)
+      ),
       ...this._repositoryNodeOptions,
     });
     this._repositoryNodes.add(node);
+    if (parent) this._treeParents.set(node, parent);
     return node;
   }
 
@@ -190,6 +220,8 @@ class CloudsmithProvider {
       node.invalidate();
     }
     this._repositoryNodes.clear();
+    this._vulnerabilitySummaries.clear();
+    this._clearVulnerabilityRefreshTimers();
   }
 
   refreshNode(element) {
@@ -198,12 +230,93 @@ class CloudsmithProvider {
     }
   }
 
+  _registerVulnerabilitySummary(identity, element, owner) {
+    if (typeof identity !== "string" || !element || !owner) return;
+    let entries = this._vulnerabilitySummaries.get(identity);
+    if (!entries) {
+      entries = new Set();
+      this._vulnerabilitySummaries.set(identity, entries);
+    }
+    entries.add(Object.freeze({ element, owner }));
+    this._treeParents.set(element, owner.packageNode);
+    this._treeParents.set(owner.packageNode, owner.repositoryNode);
+  }
+
+  _publishVulnerabilityState(event) {
+    const identity = vulnerabilityEventIdentity(event);
+    if (!identity) return;
+    const entries = this._vulnerabilitySummaries.get(identity);
+    if (!entries) return;
+    for (const entry of [...entries]) {
+      const repository = entry.owner.repositoryNode;
+      if (
+        !this._repositoryNodes.has(repository)
+        || !repository.ownsVulnerabilitySummary(entry.owner)
+      ) {
+        entries.delete(entry);
+        continue;
+      }
+      if (event.presentation) {
+        entry.element.acceptVulnerabilityPresentation?.(event.presentation);
+      }
+      if (event.state?.status !== "loading") {
+        this._scheduleVulnerabilityRefresh(entry.element, () => (
+          this._repositoryNodes.has(repository)
+          && repository.ownsVulnerabilitySummary(entry.owner)
+        ));
+      }
+    }
+    if (entries.size === 0) this._vulnerabilitySummaries.delete(identity);
+  }
+
+  _scheduleVulnerabilityRefresh(element, isCurrent) {
+    const current = this._vulnerabilityRefreshTimers.get(element);
+    if (current) clearTimeout(current);
+    const timer = setTimeout(() => {
+      this._vulnerabilityRefreshTimers.delete(element);
+      if (!isCurrent()) return;
+      const wasExpanded = this._expandedVulnerabilitySummaries.has(element);
+      this._onDidChangeTreeData.fire(element);
+      if (wasExpanded) {
+        void this._treeView?.reveal?.(element, { expand: true, focus: false, select: false })
+          ?.catch?.(() => {});
+      }
+    }, 0);
+    this._vulnerabilityRefreshTimers.set(element, timer);
+  }
+
+  _clearVulnerabilityRefreshTimers() {
+    for (const timer of this._vulnerabilityRefreshTimers.values()) clearTimeout(timer);
+    this._vulnerabilityRefreshTimers.clear();
+  }
+
+  _unregisterVulnerabilitySummaries(repositoryNode) {
+    for (const [identity, entries] of this._vulnerabilitySummaries) {
+      for (const entry of [...entries]) {
+        if (entry.owner.repositoryNode === repositoryNode) entries.delete(entry);
+      }
+      if (entries.size === 0) this._vulnerabilitySummaries.delete(identity);
+    }
+  }
+
   setDefaultWorkspaceFallbackHandler(handler) {
     this._defaultWorkspaceFallbackHandler = handler;
   }
 
   setTreeView(treeView) {
+    for (const subscription of this._treeExpansionSubscriptions) subscription.dispose?.();
+    this._treeExpansionSubscriptions = [];
     this._treeView = treeView;
+    const expanded = treeView?.onDidExpandElement?.(({ element }) => {
+      if (element?.getTreeItem?.().contextValue === "vulnerabilitySummary") {
+        this._expandedVulnerabilitySummaries.add(element);
+      }
+    });
+    const collapsed = treeView?.onDidCollapseElement?.(({ element }) => {
+      this._expandedVulnerabilitySummaries.delete(element);
+    });
+    if (expanded) this._treeExpansionSubscriptions.push(expanded);
+    if (collapsed) this._treeExpansionSubscriptions.push(collapsed);
   }
 
   async getWorkspaces() {
@@ -365,6 +478,17 @@ class CloudsmithProvider {
       failure?.message || "A safe collection limit was reached before completeness was proven.",
       "warning"
     );
+  }
+}
+
+function vulnerabilityEventIdentity(event) {
+  if (typeof event === "string") return event;
+  if (typeof event?.identity === "string") return event.identity;
+  const ref = event?.ref || event?.packageRef || event;
+  try {
+    return packageCollectionIdentity(ref);
+  } catch {
+    return null;
   }
 }
 
