@@ -26,6 +26,8 @@ const ADAPTER_RESULT_STATUSES = Object.freeze({
   UNSUPPORTED: "unsupported",
 });
 const ADAPTER_RESULT_STATUS_VALUES = new Set(Object.values(ADAPTER_RESULT_STATUSES));
+const MAX_STRUCTURAL_GRAPH_ENTRIES = 50000;
+const MAX_STRUCTURAL_GRAPH_EDGES = 500000;
 
 const RESOLUTION_AVAILABILITY = Object.freeze({
   AVAILABLE: "available",
@@ -319,13 +321,15 @@ function createResolverAdapter(resolver) {
           resolver.ecosystem,
           safeDetection.workspaceFolder
         );
+        const dependencyGraph = adaptPackageLockGraph(legacyTree && legacyTree.dependencyGraph);
         const dependencies = (legacyTree && legacyTree.dependencies || []).map((dependency) => (
           adaptLegacyDependency(
             dependency,
             legacyTree,
             sources,
             declaredConstraints,
-            safeDetection.workspaceFolder
+            safeDetection.workspaceFolder,
+            Boolean(dependencyGraph)
           )
         ));
         const warnings = Array.isArray(legacyTree && legacyTree.warnings)
@@ -341,6 +345,7 @@ function createResolverAdapter(resolver) {
           sourceFile: legacyTree && legacyTree.sourceFile || safeDetection.sourceFile,
           source: sources,
           dependencies,
+          dependencyGraph,
           warnings,
           resolutionAvailability: sources.resolution
             ? RESOLUTION_AVAILABILITY.AVAILABLE
@@ -596,7 +601,14 @@ async function readDeclaredConstraintIndex(sourceManifest, ecosystem, workspaceF
   return index;
 }
 
-function adaptLegacyDependency(dependency, tree, sources, declaredConstraints, workspaceFolder) {
+function adaptLegacyDependency(
+  dependency,
+  tree,
+  sources,
+  declaredConstraints,
+  workspaceFolder,
+  omitTransitives = false
+) {
   const ecosystem = dependency.ecosystem || tree.ecosystem;
   const format = dependency.format || canonicalFormat(ecosystem);
   const name = String(dependency.name || "").trim();
@@ -630,13 +642,14 @@ function adaptLegacyDependency(dependency, tree, sources, declaredConstraints, w
   } else if (resolvedVersion) {
     versionState = DEPENDENCY_VERSION_STATES.RESOLVED;
   }
-  const transitives = Array.isArray(dependency.transitives)
+  const transitives = !omitTransitives && Array.isArray(dependency.transitives)
     ? dependency.transitives.map((child) => adaptLegacyDependency(
       child,
       tree,
       sources,
       declaredConstraints,
-      workspaceFolder
+      workspaceFolder,
+      false
     ))
     : [];
   const sourceManifest = dependency.isDirect
@@ -661,6 +674,96 @@ function adaptLegacyDependency(dependency, tree, sources, declaredConstraints, w
     transitives,
     legacyVersion: dependency.version,
   });
+}
+
+function adaptPackageLockGraph(graph) {
+  if (graph == null) {
+    return null;
+  }
+  if (!graph || typeof graph !== "object" || Array.isArray(graph) || graph.kind !== "package-lock") {
+    throw new TypeError("Package-lock structural graph must use the package-lock contract.");
+  }
+  if (!Array.isArray(graph.entries) || graph.entries.length > MAX_STRUCTURAL_GRAPH_ENTRIES) {
+    throw new TypeError("Package-lock structural graph entries exceed the supported bound.");
+  }
+  if (!Array.isArray(graph.roots) || graph.roots.length > MAX_STRUCTURAL_GRAPH_ENTRIES) {
+    throw new TypeError("Package-lock structural graph roots exceed the supported bound.");
+  }
+
+  const keys = new Set();
+  let edgeCount = 0;
+  const entries = graph.entries.map((entry) => {
+    const key = requiredGraphString(entry && entry.key, "entry key");
+    if (keys.has(key)) {
+      throw new TypeError("Package-lock structural graph entry keys must be unique.");
+    }
+    keys.add(key);
+    if (!Array.isArray(entry.edges)) {
+      throw new TypeError("Package-lock structural graph entry edges must be an array.");
+    }
+    edgeCount += entry.edges.length;
+    if (edgeCount > MAX_STRUCTURAL_GRAPH_EDGES) {
+      throw new TypeError("Package-lock structural graph edges exceed the supported bound.");
+    }
+    return Object.freeze({
+      key,
+      name: requiredGraphString(entry.name, "package name"),
+      installedName: requiredGraphString(entry.installedName, "installed name"),
+      version: requiredGraphString(entry.version, "package version"),
+      isDevelopmentDependency: entry.isDevelopmentDependency === true,
+      edges: Object.freeze(entry.edges.map((edge) => Object.freeze({
+        declaredName: requiredGraphString(edge && edge.declaredName, "dependency name"),
+        childKey: edge && edge.childKey == null
+          ? null
+          : requiredGraphString(edge.childKey, "child key"),
+      }))),
+    });
+  });
+
+  const roots = graph.roots.map((root) => Object.freeze({
+    declaredName: requiredGraphString(root && root.declaredName, "root dependency name"),
+    entryKey: root && root.entryKey == null
+      ? null
+      : requiredGraphString(root.entryKey, "root entry key"),
+    isDevelopmentDependency: root && root.isDevelopmentDependency === true,
+  }));
+  for (const root of roots) {
+    if (root.entryKey && !keys.has(root.entryKey) && graph.incomplete !== true) {
+      throw new TypeError("Complete package-lock structural graph roots must reference known entries.");
+    }
+  }
+  for (const entry of entries) {
+    for (const edge of entry.edges) {
+      if (edge.childKey && !keys.has(edge.childKey) && graph.incomplete !== true) {
+        throw new TypeError("Complete package-lock structural graph edges must reference known entries.");
+      }
+    }
+  }
+
+  return Object.freeze({
+    kind: "package-lock",
+    entries: Object.freeze(entries),
+    roots: Object.freeze(roots),
+    incomplete: graph.incomplete === true,
+    maxDepth: requiredGraphLimit(graph.maxDepth, 128, "depth"),
+    maxNodes: requiredGraphLimit(graph.maxNodes, MAX_STRUCTURAL_GRAPH_ENTRIES, "node"),
+    maxEdges: requiredGraphLimit(graph.maxEdges, MAX_STRUCTURAL_GRAPH_EDGES, "edge"),
+  });
+}
+
+function requiredGraphLimit(value, maximum, label) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new TypeError(`Package-lock structural graph ${label} limit is invalid.`);
+  }
+  return value;
+}
+
+function requiredGraphString(value, label) {
+  const normalized = String(value || "").trim();
+  if (!normalized || normalized.length > 8192) {
+    throw new TypeError(`Package-lock structural graph ${label} is invalid.`);
+  }
+  return normalized;
 }
 
 function adaptLegacyManifestDependency(dependency, ecosystem, sourceManifest) {
@@ -810,6 +913,7 @@ function createAdapterResult(values) {
     sourceFile: values.sourceFile || null,
     source: values.source || null,
     dependencies: Object.freeze(Array.isArray(values.dependencies) ? values.dependencies.slice() : []),
+    dependencyGraph: values.dependencyGraph || null,
     warnings: Object.freeze(Array.isArray(values.warnings) ? values.warnings.slice() : []),
     error,
     resolutionAvailability: values.resolutionAvailability || RESOLUTION_AVAILABILITY.NOT_APPLICABLE,

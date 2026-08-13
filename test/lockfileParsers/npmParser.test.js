@@ -19,6 +19,33 @@ suite("npmParser Test Suite", () => {
     return workspace;
   }
 
+  async function resolveGeneratedPackageLock(manifest, packages, options = {}) {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "package.json");
+    const lockfilePath = path.join(workspace, "package-lock.json");
+    let metrics = null;
+
+    await writeTextFile(manifestPath, JSON.stringify(manifest));
+    await writeTextFile(lockfilePath, JSON.stringify({ lockfileVersion: 3, packages }));
+    const tree = await npmParser.resolve({
+      lockfilePath,
+      manifestPath,
+      workspaceFolder: workspace,
+      options: {
+        ...options,
+        onNpmGraphMetrics(snapshot) {
+          metrics = snapshot;
+        },
+      },
+    });
+
+    return { tree, metrics };
+  }
+
+  function dependencyKeys(tree) {
+    return tree.dependencies.map((dependency) => `${dependency.name}@${dependency.version}`);
+  }
+
   suiteTeardown(async () => {
     await Promise.all(tempDirs.map((tempDir) => removeDirectory(tempDir)));
   });
@@ -499,6 +526,291 @@ suite("npmParser Test Suite", () => {
     assert.ok(packageKeys.includes("accepts@1.0.0"));
   });
 
+  test("expands a shared package-lock DAG once per structural occurrence", async () => {
+    const rootCount = 16;
+    const sharedCount = 12;
+    const dependencies = {};
+    const packages = { "": { dependencies } };
+
+    for (let index = 0; index < rootCount; index += 1) {
+      const name = `root-${String(index).padStart(2, "0")}`;
+      dependencies[name] = "1.0.0";
+      packages[`node_modules/${name}`] = {
+        version: "1.0.0",
+        dependencies: { "shared-00": "1.0.0" },
+      };
+    }
+    for (let index = 0; index < sharedCount; index += 1) {
+      const name = `shared-${String(index).padStart(2, "0")}`;
+      const nextName = index + 1 < sharedCount
+        ? `shared-${String(index + 1).padStart(2, "0")}`
+        : null;
+      packages[`node_modules/${name}`] = {
+        version: "1.0.0",
+        ...(nextName ? { dependencies: { [nextName]: "1.0.0" } } : {}),
+      };
+    }
+
+    const { tree, metrics } = await resolveGeneratedPackageLock(
+      { dependencies },
+      packages
+    );
+    const structuralNodes = rootCount + sharedCount;
+    const structuralEdges = rootCount + sharedCount - 1;
+    const lastShared = tree.dependencies.find((dependency) => dependency.name === "shared-11");
+
+    assert.strictEqual(tree.dependencies.length, structuralNodes);
+    assert.strictEqual(tree.dependencies.filter((dependency) => dependency.isDirect).length, rootCount);
+    assert.deepStrictEqual(
+      tree.dependencies.find((dependency) => dependency.name === "shared-00").parentChain,
+      ["root-00"]
+    );
+    assert.strictEqual(lastShared.parentChain.length, sharedCount);
+    assert.strictEqual(lastShared.parentChain[0], "root-00");
+    assert.deepStrictEqual(tree.warnings, []);
+    assert.strictEqual(metrics.indexedOccurrences, structuralNodes);
+    assert.ok(metrics.structuralOccurrencesExpanded <= structuralNodes);
+    assert.strictEqual(metrics.structuralEdgesExamined, structuralEdges);
+    assert.ok(metrics.repeatedOccurrenceEncounters >= rootCount - 1);
+    assert.ok(metrics.dependencyRecordsMaterialized <= structuralNodes + structuralEdges);
+  });
+
+  test("keeps same-version package-lock occurrences structurally distinct by installed path", async () => {
+    const { tree, metrics } = await resolveGeneratedPackageLock({
+      dependencies: { a: "1.0.0", b: "1.0.0" },
+    }, {
+      "": { dependencies: { a: "1.0.0", b: "1.0.0" } },
+      "node_modules/a": { version: "1.0.0", dependencies: { shared: "1.0.0" } },
+      "node_modules/a/node_modules/shared": {
+        version: "1.0.0",
+        dependencies: { "nested-leaf": "1.0.0" },
+      },
+      "node_modules/a/node_modules/nested-leaf": { version: "1.0.0" },
+      "node_modules/b": { version: "1.0.0", dependencies: { shared: "1.0.0" } },
+      "node_modules/shared": {
+        version: "1.0.0",
+        dependencies: { "hoisted-leaf": "1.0.0" },
+      },
+      "node_modules/hoisted-leaf": { version: "1.0.0" },
+    });
+    const a = tree.dependencies.find((dependency) => dependency.name === "a");
+    const b = tree.dependencies.find((dependency) => dependency.name === "b");
+    const shared = tree.dependencies.find((dependency) => dependency.name === "shared");
+
+    assert.deepStrictEqual(new Set(dependencyKeys(tree)), new Set([
+      "a@1.0.0",
+      "b@1.0.0",
+      "shared@1.0.0",
+      "nested-leaf@1.0.0",
+      "hoisted-leaf@1.0.0",
+    ]));
+    assert.deepStrictEqual(shared.parentChain, ["a"]);
+    assert.strictEqual(a.transitives[0].transitives[0].name, "nested-leaf");
+    assert.strictEqual(b.transitives[0].transitives[0].name, "hoisted-leaf");
+    assert.strictEqual(metrics.indexedOccurrences, 6);
+    assert.strictEqual(metrics.structuralOccurrencesExpanded, 6);
+    assert.strictEqual(metrics.structuralEdgesExamined, 4);
+  });
+
+  test("preserves inherited development state on repeated structural references", async () => {
+    const { tree, metrics } = await resolveGeneratedPackageLock({
+      dependencies: { prod: "1.0.0" },
+      devDependencies: { dev: "1.0.0" },
+    }, {
+      "": {
+        dependencies: { prod: "1.0.0" },
+        devDependencies: { dev: "1.0.0" },
+      },
+      "node_modules/prod": { version: "1.0.0", dependencies: { shared: "1.0.0" } },
+      "node_modules/dev": { version: "1.0.0", dev: true, dependencies: { shared: "1.0.0" } },
+      "node_modules/shared": { version: "1.0.0", dependencies: { leaf: "1.0.0" } },
+      "node_modules/leaf": { version: "1.0.0" },
+    });
+    const dev = tree.dependencies.find((dependency) => dependency.name === "dev");
+    const shared = tree.dependencies.find((dependency) => dependency.name === "shared");
+    const leaf = tree.dependencies.find((dependency) => dependency.name === "leaf");
+
+    assert.strictEqual(dev.isDirect, true);
+    assert.strictEqual(dev.isDevelopmentDependency, true);
+    assert.strictEqual(dev.transitives[0].name, "shared");
+    assert.strictEqual(dev.transitives[0].isDevelopmentDependency, true);
+    assert.strictEqual(shared.isDevelopmentDependency, false);
+    assert.strictEqual(leaf.isDevelopmentDependency, false);
+    assert.deepStrictEqual(shared.parentChain, ["prod"]);
+    assert.strictEqual(metrics.structuralOccurrencesExpanded, 4);
+    assert.strictEqual(metrics.repeatedOccurrenceEncounters, 1);
+  });
+
+  test("terminates package-lock cycles without dropping acyclic siblings", async () => {
+    const cases = [
+      {
+        manifest: { dependencies: { self: "1.0.0" } },
+        packages: {
+          "": { dependencies: { self: "1.0.0" } },
+          "node_modules/self": { version: "1.0.0", dependencies: { self: "1.0.0" } },
+        },
+        keys: ["self@1.0.0"],
+        chains: { self: [] },
+      },
+      {
+        manifest: { dependencies: { a: "1.0.0" } },
+        packages: {
+          "": { dependencies: { a: "1.0.0" } },
+          "node_modules/a": { version: "1.0.0", dependencies: { b: "1.0.0" } },
+          "node_modules/b": { version: "1.0.0", dependencies: { a: "1.0.0" } },
+        },
+        keys: ["a@1.0.0", "b@1.0.0"],
+        chains: { a: [], b: ["a"] },
+      },
+      {
+        manifest: { dependencies: { a: "1.0.0" } },
+        packages: {
+          "": { dependencies: { a: "1.0.0" } },
+          "node_modules/a": { version: "1.0.0", dependencies: { b: "1.0.0" } },
+          "node_modules/b": { version: "1.0.0", dependencies: { c: "1.0.0" } },
+          "node_modules/c": {
+            version: "1.0.0",
+            dependencies: { a: "1.0.0", tail: "1.0.0" },
+          },
+          "node_modules/tail": { version: "1.0.0" },
+        },
+        keys: ["a@1.0.0", "b@1.0.0", "c@1.0.0", "tail@1.0.0"],
+        chains: { a: [], b: ["a"], c: ["a", "b"], tail: ["a", "b", "c"] },
+      },
+    ];
+
+    for (const fixture of cases) {
+      const { tree, metrics } = await resolveGeneratedPackageLock(
+        fixture.manifest,
+        fixture.packages
+      );
+      assert.deepStrictEqual(new Set(dependencyKeys(tree)), new Set(fixture.keys));
+      for (const [name, parentChain] of Object.entries(fixture.chains)) {
+        assert.deepStrictEqual(
+          tree.dependencies.find((dependency) => dependency.name === name).parentChain,
+          parentChain
+        );
+      }
+      assert.strictEqual(metrics.cycleEdgesSkipped, 1);
+      assert.deepStrictEqual(tree.warnings, []);
+    }
+  });
+
+  test("keeps direct representatives free of transitive parent chains", async () => {
+    const { tree } = await resolveGeneratedPackageLock({
+      dependencies: { direct: "1.0.0", root: "1.0.0" },
+    }, {
+      "": { dependencies: { direct: "1.0.0", root: "1.0.0" } },
+      "node_modules/direct": { version: "1.0.0" },
+      "node_modules/root": { version: "1.0.0", dependencies: { shared: "1.0.0" } },
+      "node_modules/shared": { version: "1.0.0", dependencies: { direct: "1.0.0" } },
+    });
+    const direct = tree.dependencies.find((dependency) => dependency.name === "direct");
+
+    assert.strictEqual(direct.isDirect, true);
+    assert.strictEqual(direct.parent, null);
+    assert.deepStrictEqual(direct.parentChain, []);
+  });
+
+  test("supports lower-only package-lock depth and node bounds with semantic warnings", async () => {
+    const createChain = (count) => {
+      const packages = { "": { dependencies: { "bound-00": "1.0.0" } } };
+      for (let index = 0; index < count; index += 1) {
+        const name = `bound-${String(index).padStart(2, "0")}`;
+        const nextName = index + 1 < count
+          ? `bound-${String(index + 1).padStart(2, "0")}`
+          : null;
+        packages[`node_modules/${name}`] = {
+          version: "1.0.0",
+          ...(nextName ? { dependencies: { [nextName]: "1.0.0" } } : {}),
+        };
+      }
+      return packages;
+    };
+    const manifest = { dependencies: { "bound-00": "1.0.0" } };
+    const depthResult = await resolveGeneratedPackageLock(manifest, createChain(12), {
+      npmGraphMaxDepth: 4,
+    });
+
+    assert.strictEqual(depthResult.tree.dependencies.length, 12);
+    assert.deepStrictEqual(depthResult.tree.warnings, [
+      "Some dependency relationships could not be fully analyzed.",
+    ]);
+    assert.strictEqual(depthResult.metrics.maxDepth, 4);
+    assert.strictEqual(depthResult.metrics.depthLimitReached, true);
+    assert.strictEqual(depthResult.metrics.nodeLimitReached, false);
+    assert.ok(Math.max(...depthResult.tree.dependencies.map(
+      (dependency) => dependency.parentChain.length
+    )) <= 4);
+
+    const nodeResult = await resolveGeneratedPackageLock(manifest, createChain(8), {
+      npmGraphMaxNodes: 6,
+    });
+    assert.strictEqual(nodeResult.tree.dependencies.length, 8);
+    assert.deepStrictEqual(nodeResult.tree.warnings, [
+      "Some dependency relationships could not be fully analyzed.",
+    ]);
+    assert.strictEqual(nodeResult.metrics.maxNodes, 6);
+    assert.strictEqual(nodeResult.metrics.nodeLimitReached, true);
+
+    const clampedResult = await resolveGeneratedPackageLock(manifest, createChain(1), {
+      npmGraphMaxDepth: Number.MAX_SAFE_INTEGER,
+      npmGraphMaxNodes: Number.MAX_SAFE_INTEGER,
+    });
+    assert.strictEqual(clampedResult.metrics.maxDepth, 128);
+    assert.strictEqual(clampedResult.metrics.maxNodes, 50000);
+    assert.strictEqual(clampedResult.metrics.maxEdges, 500000);
+    assert.deepStrictEqual(clampedResult.tree.warnings, []);
+  });
+
+  test("retains late direct roots when relationship materialization reaches its bound", async () => {
+    const { tree } = await resolveGeneratedPackageLock({
+      dependencies: { first: "1.0.0", second: "1.0.0" },
+    }, {
+      "": { dependencies: { first: "1.0.0", second: "1.0.0" } },
+      "node_modules/first": { version: "1.0.0", dependencies: { child: "1.0.0" } },
+      "node_modules/child": { version: "1.0.0" },
+      "node_modules/second": { version: "1.0.0" },
+    }, {
+      npmGraphMaxNodes: 1,
+    });
+    const second = tree.dependencies.find((dependency) => dependency.name === "second");
+    const secondRoot = tree.dependencyGraph.roots.find((root) => root.declaredName === "second");
+
+    assert.ok(second);
+    assert.strictEqual(second.isDirect, true);
+    assert.deepStrictEqual(second.parentChain, []);
+    assert.strictEqual(secondRoot.entryKey, "node_modules/second");
+    assert.ok(!tree.dependencyGraph.entries.some((entry) => entry.key === secondRoot.entryKey));
+    assert.ok(tree.warnings.includes("Some dependency relationships could not be fully analyzed."));
+  });
+
+  test("bounds structural edge discovery before adapting the graph", async () => {
+    const dependencies = {};
+    const packages = {
+      "": { dependencies: { root: "1.0.0" } },
+      "node_modules/root": { version: "1.0.0", dependencies },
+    };
+    for (let index = 0; index < 5; index += 1) {
+      const name = `edge-${index}`;
+      dependencies[name] = "1.0.0";
+      packages[`node_modules/${name}`] = { version: "1.0.0" };
+    }
+
+    const { tree, metrics } = await resolveGeneratedPackageLock(
+      { dependencies: { root: "1.0.0" } },
+      packages,
+      { npmGraphMaxEdges: 2 }
+    );
+
+    assert.strictEqual(tree.dependencies.length, 6);
+    assert.strictEqual(tree.dependencyGraph.entries.flatMap((entry) => entry.edges).length, 2);
+    assert.strictEqual(metrics.structuralEdgesExamined, 2);
+    assert.strictEqual(metrics.edgeLimitReached, true);
+    assert.strictEqual(metrics.maxEdges, 2);
+    assert.ok(tree.warnings.includes("Some dependency relationships could not be fully analyzed."));
+  });
+
   test("bounds package-lock dependency graph expansion by depth", async () => {
     const workspace = await createWorkspace();
     const lockfilePath = path.join(workspace, "package-lock.json");
@@ -527,7 +839,7 @@ suite("npmParser Test Suite", () => {
       options: { maxDependenciesToScan: 10000 },
     });
 
-    assert.ok(tree.warnings.some((warning) => /graph expansion reached its bounded limit/.test(warning)));
+    assert.ok(tree.warnings.includes("Some dependency relationships could not be fully analyzed."));
     assert.ok(Math.max(...tree.dependencies.map((dependency) => dependency.parentChain.length)) <= 128);
   });
 });
