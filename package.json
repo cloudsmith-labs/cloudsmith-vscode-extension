@@ -810,7 +810,7 @@
           "default": 50,
           "minimum": 10,
           "maximum": 100,
-          "description": "Number of results per page when searching packages."
+          "description": "Number of results per repository for Advanced Search across selected repositories. Workspace and single-repository searches request at most 10 results per page."
         },
         "cloudsmith-vsc.recentSearches": {
           "type": "integer",

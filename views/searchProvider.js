@@ -36,6 +36,10 @@ const MAX_MULTI_REPO_PAGES = 20;
 const MAX_SINGLE_SEARCH_PAGES = 20;
 const MAX_SINGLE_SEARCH_REQUESTS = 24;
 const MAX_FAILURE_DETAILS = 20;
+// Broad package queries can exceed the transport deadline at larger page sizes.
+// Keep the interactive workspace/repository path small and predictable; the
+// configurable size remains available only to bounded selected-repository runs.
+const INTERACTIVE_SEARCH_PAGE_SIZE = 10;
 
 class SearchProvider {
     constructor(context, options = {}) {
@@ -51,7 +55,7 @@ class SearchProvider {
             information: message => vscode.window.showInformationMessage(message),
             warning: message => vscode.window.showWarningMessage(message),
         };
-        this._getPageSize = options.getPageSize || (() => {
+        this._getAggregationPageSize = options.getAggregationPageSize || (() => {
             const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
             return config.get("searchPageSize");
         });
@@ -173,11 +177,22 @@ class SearchProvider {
             this._failRoot(operation, operation.validationError, null, "invalid_request");
             return;
         }
-        if (operation.descriptor.kind === "repositories") {
-            await this._executeRepositorySearch(operation);
-            return;
+        try {
+            if (operation.descriptor.kind === "repositories") {
+                await this._executeRepositorySearch(operation);
+                return;
+            }
+            await this._executeSingleSearch(operation);
+        } catch {
+            if (this._isCurrentRoot(operation)) {
+                this._failRoot(
+                    operation,
+                    "Could not search packages. The operation failed unexpectedly. Retry the search.",
+                    null,
+                    "unexpected"
+                );
+            }
         }
-        await this._executeSingleSearch(operation);
     }
 
     /** Execute a workspace or single-repository root search. */
@@ -206,7 +221,7 @@ class SearchProvider {
 
     async _executeSingleSearch(operation) {
         const { descriptor } = operation;
-        const pageSize = clampPageSize(this._getPageSize());
+        const pageSize = INTERACTIVE_SEARCH_PAGE_SIZE;
         let endpoint;
         try {
             endpoint = descriptor.kind === "repository"
@@ -218,14 +233,17 @@ class SearchProvider {
         }
 
         let result;
+        let progressToken = null;
         try {
             const paginatedFetch = this._createPaginatedFetch(this._createCloudsmithAPI());
             if (!this._isCurrentRoot(operation)) {
                 this._discardRoot(operation);
                 return;
             }
-            result = await this._withProgress(progressOptions(), (_progress, token) => (
-                paginatedFetch.fetchPage(
+            result = await this._withProgress(progressOptions(), (_progress, token) => {
+                progressToken = token;
+                if (token?.isCancellationRequested) return null;
+                return paginatedFetch.fetchPage(
                     endpoint,
                     descriptor.page,
                     pageSize,
@@ -236,20 +254,15 @@ class SearchProvider {
                         signal: operation.controller.signal,
                         validate: isPackageSearchArray,
                     }
-                )
-            ));
+                );
+            });
         } catch (error) {
-            if (!this._isCurrentRoot(operation)) {
-                return;
-            }
+            if (!this._continueRoot(operation, progressToken)) return;
             this._failRoot(operation, `Could not search packages. ${safeErrorMessage(error)}`, null, "unexpected");
             return;
         }
 
-        if (!this._isCurrentRoot(operation)) {
-            this._discardRoot(operation);
-            return;
-        }
+        if (!this._continueRoot(operation, progressToken)) return;
         if (result?.error) {
             if (result.error.kind === "cancelled") {
                 this._cancelRoot(operation);
@@ -282,6 +295,7 @@ class SearchProvider {
             return;
         }
 
+        if (!this._continueRoot(operation, progressToken)) return;
         let builtRoot;
         try {
             builtRoot = buildUniqueNodes(
@@ -294,9 +308,7 @@ class SearchProvider {
             this._failRoot(operation, `Could not display search results. ${safeErrorMessage(error)}`, null, "invalid_response");
             return;
         }
-        if (!this._isCurrentRoot(operation)) {
-            return;
-        }
+        if (!this._continueRoot(operation, progressToken)) return;
         if (builtRoot.duplicateCount > 0) {
             this._failRoot(
                 operation,
@@ -318,7 +330,7 @@ class SearchProvider {
         const pageLimitReached = successfulPageCount >= MAX_SINGLE_SEARCH_PAGES
             && pagination.page < pagination.pageTotal;
         const capReached = resultLimitReached || pageLimitReached;
-        this._commitRoot(operation, {
+        const committed = this._commitRoot(operation, {
             descriptor,
             results: keptNodes,
             pagination,
@@ -335,15 +347,15 @@ class SearchProvider {
                 pageCount: successfulPageCount,
                 pageLimitReached,
             },
-        });
-        if (keptNodes.length === 0) {
+        }, progressToken);
+        if (committed && keptNodes.length === 0) {
             this._notify("information", `No packages found for "${descriptor.query}".`);
         }
     }
 
     async _executeRepositorySearch(operation) {
         const { descriptor } = operation;
-        const pageSize = clampPageSize(this._getPageSize());
+        const pageSize = clampPageSize(this._getAggregationPageSize());
         const paginatedFetch = this._createPaginatedFetch(this._createCloudsmithAPI());
         if (!this._isCurrentRoot(operation)) {
             this._discardRoot(operation);
@@ -351,8 +363,10 @@ class SearchProvider {
         }
 
         let collection;
+        let progressToken = null;
         try {
             const outcome = await this._withProgress(progressOptions(), async (_progress, token) => {
+                progressToken = token;
                 const run = createRepositorySearchRun(descriptor);
                 await runRepositorySearchWorkers({
                     run,
@@ -368,25 +382,20 @@ class SearchProvider {
                     stale: run.stale,
                 };
             });
-            if (!this._isCurrentRoot(operation)) {
-                return;
-            }
+            if (!this._continueRoot(operation, progressToken)) return;
             if (outcome.cancelled || outcome.stale) {
                 this._cancelRoot(operation);
                 return;
             }
+            if (!this._continueRoot(operation, progressToken)) return;
             collection = finalizeRepositorySearchRun(outcome.run);
         } catch (error) {
-            if (!this._isCurrentRoot(operation)) {
-                return;
-            }
+            if (!this._continueRoot(operation, progressToken)) return;
             this._failRoot(operation, `Could not search packages. ${safeErrorMessage(error)}`, null, "unexpected");
             return;
         }
 
-        if (!this._isCurrentRoot(operation)) {
-            return;
-        }
+        if (!this._continueRoot(operation, progressToken)) return;
         if (collection.successfulPageCount === 0) {
             const detail = collection.failureDetails.length > 0
                 ? ` ${collection.failureDetails[0].message}`
@@ -400,6 +409,7 @@ class SearchProvider {
             return;
         }
 
+        if (!this._continueRoot(operation, progressToken)) return;
         let built;
         try {
             const nodes = buildUniqueNodes(
@@ -417,12 +427,10 @@ class SearchProvider {
             this._failRoot(operation, `Could not display search results. ${safeErrorMessage(error)}`, null, "invalid_response");
             return;
         }
-        if (!this._isCurrentRoot(operation)) {
-            return;
-        }
+        if (!this._continueRoot(operation, progressToken)) return;
 
         const partial = !collection.complete || built.droppedResultCount > 0;
-        this._commitRoot(operation, {
+        const committed = this._commitRoot(operation, {
             descriptor,
             results: built.nodes,
             pagination: null,
@@ -447,16 +455,16 @@ class SearchProvider {
                 requestLimitReached: collection.requestLimitReached,
                 pageLimitReached: collection.pageLimitReached,
             },
-        });
+        }, progressToken);
 
-        if (collection.failedRepositoryCount > 0) {
+        if (committed && collection.failedRepositoryCount > 0) {
             const names = collection.failureDetails.map(detail => detail.repository);
             const suffix = collection.failedRepositoryCount > names.length
                 ? `, and ${collection.failedRepositoryCount - names.length} more`
                 : "";
             this._notify("warning", `Could not search some repositories: ${names.join(", ")}${suffix}.`);
         }
-        if (built.nodes.length === 0 && !partial) {
+        if (committed && built.nodes.length === 0 && !partial) {
             this._notify("information", `No packages found for "${descriptor.query}".`);
         }
     }
@@ -494,7 +502,7 @@ class SearchProvider {
             targetPage,
             account,
             controller: new AbortController(),
-            attemptRequestCount: committed.diagnostics.requestCount + 1,
+            requestAttempt: { started: false },
         });
         const promise = Promise.resolve()
             .then(() => this._executePage(operation))
@@ -527,7 +535,7 @@ class SearchProvider {
         }
         const { committed, targetPage } = operation;
         const { descriptor } = committed;
-        const pageSize = committed.pagination.pageSize || clampPageSize(this._getPageSize());
+        const pageSize = committed.pagination.pageSize || INTERACTIVE_SEARCH_PAGE_SIZE;
         let endpoint;
         try {
             endpoint = descriptor.kind === "repository"
@@ -545,14 +553,18 @@ class SearchProvider {
         }
 
         let result;
+        let progressToken = null;
         try {
             const paginatedFetch = this._createPaginatedFetch(this._createCloudsmithAPI());
             if (!this._isCurrentPage(operation)) {
                 this._discardPage(operation);
                 return;
             }
-            result = await this._withProgress(progressOptions("Loading more packages..."), (_progress, token) => (
-                paginatedFetch.fetchPage(
+            result = await this._withProgress(progressOptions("Loading more packages..."), (_progress, token) => {
+                progressToken = token;
+                if (token?.isCancellationRequested) return null;
+                operation.requestAttempt.started = true;
+                return paginatedFetch.fetchPage(
                     endpoint,
                     targetPage,
                     pageSize,
@@ -563,12 +575,10 @@ class SearchProvider {
                         signal: operation.controller.signal,
                         validate: isPackageSearchArray,
                     }
-                )
-            ));
+                );
+            });
         } catch (error) {
-            if (!this._isCurrentPage(operation)) {
-                return;
-            }
+            if (!this._continuePage(operation, progressToken)) return;
             this._failPage(
                 operation,
                 `Could not load more packages. ${safeErrorMessage(error)}`,
@@ -579,10 +589,7 @@ class SearchProvider {
             return;
         }
 
-        if (!this._isCurrentPage(operation)) {
-            this._discardPage(operation);
-            return;
-        }
+        if (!this._continuePage(operation, progressToken)) return;
         if (result?.error) {
             if (result.error.kind === "cancelled") {
                 this._cancelPage(operation);
@@ -628,6 +635,7 @@ class SearchProvider {
             return;
         }
 
+        if (!this._continuePage(operation, progressToken)) return;
         let built;
         try {
             const seen = new Set(committed.resultKeys);
@@ -657,16 +665,14 @@ class SearchProvider {
             );
             return;
         }
-        if (!this._isCurrentPage(operation)) {
-            return;
-        }
+        if (!this._continuePage(operation, progressToken)) return;
 
         const available = Math.max(0, MAX_RESULTS - committed.results.length);
         const appended = built.nodes.slice(0, available);
         const results = [...committed.results, ...appended];
         const pagination = freezePagination(result.pagination);
         const pageDropped = built.nodes.length - appended.length;
-        const requestCount = operation.attemptRequestCount;
+        const requestCount = committed.diagnostics.requestCount + 1;
         const pageCount = committed.diagnostics.pageCount + 1;
         const resultLimitReached = results.length >= MAX_RESULTS
             && pagination.page < pagination.pageTotal;
@@ -693,13 +699,14 @@ class SearchProvider {
                 pageLimitReached,
             },
         });
+        if (!this._continuePage(operation, progressToken)) return;
         this._state = freezeState({ committed: nextCommitted, pending: null, failure: null });
         this.refresh();
     }
 
-    _commitRoot(operation, value) {
-        if (!this._isCurrentRoot(operation)) {
-            return;
+    _commitRoot(operation, value, progressToken = null) {
+        if (!this._continueRoot(operation, progressToken)) {
+            return false;
         }
         const resultKeys = value.results.map(packageKeyFromNode);
         const committed = freezeCommitted({
@@ -717,6 +724,7 @@ class SearchProvider {
         this._activeRoot = null;
         this._state = freezeState({ committed, pending: null, failure: null });
         this.refresh();
+        return true;
     }
 
     _cancelRoot(operation) {
@@ -809,6 +817,24 @@ class SearchProvider {
         );
     }
 
+    _continueRoot(operation, progressToken = null) {
+        if (!this._isCurrentRoot(operation)) return false;
+        if (progressToken?.isCancellationRequested) {
+            this._cancelRoot(operation);
+            return false;
+        }
+        return true;
+    }
+
+    _continuePage(operation, progressToken = null) {
+        if (!this._isCurrentPage(operation)) return false;
+        if (progressToken?.isCancellationRequested) {
+            this._cancelPage(operation);
+            return false;
+        }
+        return true;
+    }
+
     _readConnectedAccount() {
         return normalizeConnectedAccount(this.connectionManager.getState?.());
     }
@@ -899,7 +925,7 @@ class SearchProvider {
             if (pending) {
                 return [new InfoNode(
                     "Searching packages...",
-                    "The current search is still running.",
+                    `Searching for: ${pending.descriptor.query || ""}`,
                     `Query: ${pending.descriptor.query || ""}`,
                     "loading~spin"
                 )];
@@ -929,7 +955,7 @@ class SearchProvider {
         }
         children.push(...diagnosticNodes(committed));
         children.push(...committed.results);
-        if (committed.pageable) {
+        if (committed.pageable && !pending) {
             children.push(new LoadMoreNode(
                 committed.pagination.page,
                 committed.pagination.pageTotal,
@@ -1307,10 +1333,8 @@ function freezeCommitted(value) {
 
 function commitPageAttempt(operation, { terminal = false } = {}) {
     const committed = operation.committed;
-    const requestCount = Math.max(
-        committed.diagnostics.requestCount,
-        operation.attemptRequestCount
-    );
+    const requestCount = committed.diagnostics.requestCount
+        + (operation.requestAttempt.started ? 1 : 0);
     const requestLimitReached = requestCount >= MAX_SINGLE_SEARCH_REQUESTS;
     const pageLimitReached = committed.diagnostics.pageCount >= MAX_SINGLE_SEARCH_PAGES;
     const hardLimitReached = requestLimitReached || pageLimitReached;
@@ -1884,9 +1908,9 @@ function summaryNode(committed) {
 
 function failureNode(failure) {
     return new InfoNode(
-        "Search failed",
+        `Search failed for: ${failure.descriptor.query}`,
         failure.message,
-        failure.message,
+        `Query: ${failure.descriptor.query}\n${failure.message}`,
         "error"
     );
 }

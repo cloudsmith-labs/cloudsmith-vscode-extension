@@ -1,5 +1,7 @@
 const assert = require("assert");
 const { SearchProvider } = require("../views/searchProvider");
+const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { PaginatedFetch } = require("../util/paginatedFetch");
 
 suite("SearchProvider atomic search state", () => {
   let providers;
@@ -239,7 +241,24 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.state.failure.descriptor.query, "replacement");
     assert.strictEqual(messages.error.length, 1);
     const children = await provider.getChildren();
-    assert(children.some(node => node.getTreeItem().label === "Search failed"));
+    assert(children.some(node => node.getTreeItem().label === "Search failed for: replacement"));
+  });
+
+  test("typed first-page timeout is a failure for the requested query, never an empty result", async () => {
+    const { provider, messages } = createProvider({
+      fetchPage: async () => failedPage("timeout"),
+    });
+
+    await provider.search("workspace-a", "format:python");
+
+    assert.strictEqual(provider.state.committed, null);
+    assert.strictEqual(provider.state.pending, null);
+    assert.strictEqual(provider.state.failure.kind, "timeout");
+    assert.match(provider.state.failure.message, /timed out/);
+    assert.strictEqual(messages.information.length, 0);
+    const item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Search failed for: format:python");
+    assert.doesNotMatch(item.description, /0 packages/);
   });
 
   test("cancellation preserves the committed snapshot without a failure notification", async () => {
@@ -1075,6 +1094,54 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.searchResults.length, 3);
   });
 
+  test("typed continuation timeout retains validated results and the exact retry target", async () => {
+    let pageTwoCalls = 0;
+    const { provider } = createProvider({
+      fetchPage: async (_endpoint, requestedPage) => {
+        if (requestedPage === 1) {
+          return page([pkg("one"), pkg("two")], { pageTotal: 2, count: 3, pageSize: 2 });
+        }
+        pageTwoCalls += 1;
+        return pageTwoCalls === 1
+          ? failedPage("timeout", 2, 2)
+          : page([pkg("three")], { requestedPage: 2, pageTotal: 2, count: 3, pageSize: 2 });
+      },
+    });
+    await provider.search("workspace-a", "name:artifact");
+
+    await provider.loadNextPage();
+    assert.strictEqual(provider.currentPage, 1);
+    assert.strictEqual(provider.searchResults.length, 2);
+    assert.strictEqual(provider.state.failure.kind, "timeout");
+    assert.strictEqual(provider.state.committed.pageable, true);
+    assert.strictEqual(provider.state.pending, null);
+
+    await provider.loadNextPage();
+    assert.strictEqual(pageTwoCalls, 2);
+    assert.strictEqual(provider.currentPage, 2);
+    assert.strictEqual(provider.searchResults.length, 3);
+  });
+
+  test("a thrown continuation releases its guard and terminates without an unhandled rejection", async () => {
+    const { provider } = createProvider({
+      fetchPage: async (_endpoint, requestedPage) => {
+        if (requestedPage === 1) {
+          return page([pkg("one"), pkg("two")], { pageTotal: 2, count: 3, pageSize: 2 });
+        }
+        throw new Error("unexpected continuation failure");
+      },
+    });
+    await provider.search("workspace-a", "name:artifact");
+
+    await provider.loadNextPage();
+
+    assert.strictEqual(provider.currentPage, 1);
+    assert.strictEqual(provider.searchResults.length, 2);
+    assert.strictEqual(provider.state.pending, null);
+    assert.strictEqual(provider.state.failure.kind, "unexpected");
+    assert.strictEqual(provider.state.committed.pageable, false);
+  });
+
   test("a new root search prevents an older page from appending", async () => {
     const oldPage = deferred();
     const { provider } = createProvider({
@@ -1100,6 +1167,55 @@ suite("SearchProvider atomic search state", () => {
     assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["new"]);
   });
 
+  test("an in-flight old continuation cannot publish success or failure after a new root owns the view", async () => {
+    for (const lateOutcome of ["success", "failure"]) {
+      const oldPage = deferred();
+      let oldPageSignal = null;
+      const { provider, messages } = createProvider({
+        fetchPage: async (_endpoint, requestedPage, _size, query, options) => {
+          if (query === "A" && requestedPage === 1) {
+            return page([pkg("A-one"), pkg("A-two")], {
+              pageTotal: 2, count: 3, pageSize: 2,
+            });
+          }
+          if (query === "A") {
+            oldPageSignal = options.signal;
+            return oldPage.promise;
+          }
+          return page([pkg("B-one")], { pageSize: 10 });
+        },
+      });
+      let refreshCount = 0;
+      provider.onDidChangeTreeData(() => { refreshCount += 1; });
+
+      await provider.search("workspace-a", "A");
+      const loadingA2 = provider.loadNextPage();
+      while (!oldPageSignal) await nextTurn();
+      const searchB = provider.search("workspace-a", "B");
+      assert.strictEqual(oldPageSignal.aborted, true);
+      let items = (await provider.getChildren()).map(node => node.getTreeItem());
+      assert.strictEqual(items[0].label, "Results for: A");
+      assert(items.some(item => item.description === "Searching for: B"));
+      await searchB;
+      const refreshAfterB = refreshCount;
+
+      oldPage.resolve(lateOutcome === "success"
+        ? page([pkg("A-late")], { requestedPage: 2, pageTotal: 2, count: 3, pageSize: 2 })
+        : failedPage("server_error", 2, 2));
+      await loadingA2;
+
+      assert.strictEqual(provider.currentQuery, "B");
+      assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["B-one"]);
+      assert.strictEqual(provider.state.failure, null);
+      assert.strictEqual(provider.state.committed.pagination.page, 1);
+      assert.strictEqual(provider.state.committed.resultKeys.length, 1);
+      assert.strictEqual(refreshCount, refreshAfterB);
+      assert.deepStrictEqual(messages.error, []);
+      items = (await provider.getChildren()).map(node => node.getTreeItem());
+      assert.strictEqual(items[0].label, "Results for: B");
+    }
+  });
+
   test("stops single-scope pagination at the cumulative page limit", async function () {
     this.timeout(5000);
     let calls = 0;
@@ -1107,14 +1223,14 @@ suite("SearchProvider atomic search state", () => {
       pageSize: 100,
       fetchPage: async (_endpoint, requestedPage) => {
         calls += 1;
-        const data = Array.from({ length: 100 }, (_, index) => (
+        const data = Array.from({ length: 10 }, (_, index) => (
           pkg(`artifact-${requestedPage}-${index}`)
         ));
         return page(data, {
           requestedPage,
           pageTotal: 51,
-          count: 5100,
-          pageSize: 100,
+          count: 510,
+          pageSize: 10,
         });
       },
     });
@@ -1125,7 +1241,7 @@ suite("SearchProvider atomic search state", () => {
     }
 
     assert.strictEqual(calls, 20);
-    assert.strictEqual(provider.searchResults.length, 2000);
+    assert.strictEqual(provider.searchResults.length, 200);
     assert.strictEqual(provider.currentPage, 20);
     assert.strictEqual(provider.state.committed.pageable, false);
     assert.strictEqual(provider.state.committed.diagnostics.capReached, true);
@@ -1186,6 +1302,391 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.state.committed.pageable, false);
   });
 
+  test("workspace and repository searches use a fixed ten-item request independent of aggregation configuration", async () => {
+    const calls = [];
+    const { provider } = createProvider({
+      pageSize: 100,
+      fetchPage: async (endpoint, requestedPage, requestedPageSize, query, options) => {
+        calls.push({ endpoint, requestedPage, requestedPageSize, query, retry: options.retry });
+        if (query === "workspace-query" && requestedPage === 1) {
+          return page(Array.from({ length: 10 }, (_, index) => pkg(`workspace-${index}`, {
+            repository: "repo-b",
+          })), { pageTotal: 2, count: 11, pageSize: 10 });
+        }
+        if (query === "workspace-query") {
+          return page([pkg("workspace-final", { repository: "repo-b" })], {
+            requestedPage: 2, pageTotal: 2, count: 11, pageSize: 10,
+          });
+        }
+        return page([pkg(query, {
+          repository: endpoint.includes("/repo-a/") ? "repo-a" : "repo-b",
+        })], { pageSize: 10 });
+      },
+    });
+
+    await provider.search("workspace-a", "workspace-query");
+    await provider.loadNextPage();
+    await provider.search("workspace-a", "repository-query", 1, "repo-a");
+
+    assert.deepStrictEqual(calls.map(call => call.requestedPageSize), [10, 10, 10]);
+    assert.deepStrictEqual(calls.map(call => call.requestedPage), [1, 2, 1]);
+    assert.deepStrictEqual(calls.map(call => call.retry), ["never", "never", "never"]);
+    assert(calls[0].endpoint.endsWith("packages/workspace-a/"));
+    assert(calls[1].endpoint.endsWith("packages/workspace-a/"));
+    assert(calls[2].endpoint.endsWith("packages/workspace-a/repo-a/"));
+  });
+
+  test("composes SearchProvider, PaginatedFetch, and CloudsmithAPI into one encoded first-page dispatch", async () => {
+    const urls = [];
+    const api = new CloudsmithAPI({}, {
+      credentialManager: { async getApiKey() { return "csa_test_search_transport"; } },
+      randomUUID: () => "search-request-id",
+      fetchImpl: async (url, request) => {
+        urls.push(String(url));
+        assert.strictEqual(request.method, "GET");
+        assert.strictEqual(request.redirect, "manual");
+        return new Response(JSON.stringify(Array.from(
+          { length: 10 },
+          (_, index) => pkg(`python-package-${index}`)
+        )), {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "x-pagination-page": "1",
+            "x-pagination-pagetotal": "2",
+            "x-pagination-pagesize": "10",
+            "x-pagination-count": "11",
+          },
+        });
+      },
+    });
+    const provider = new SearchProvider({}, {
+      connectionManager: createConnectionManager(),
+      createCloudsmithAPI: () => api,
+      createPaginatedFetch: typedApi => new PaginatedFetch(typedApi),
+      withProgress: (_options, task) => task({ report() {} }, cancellationToken()),
+      notifications: { error() {}, information() {}, warning() {} },
+      getAggregationPageSize: () => 100,
+    });
+    providers.push(provider);
+
+    await provider.search("workspace-a", "format:python");
+
+    assert.deepStrictEqual(urls, [
+      "https://api.cloudsmith.io/v1/packages/workspace-a/?page=1&page_size=10&query=format%3Apython",
+    ]);
+    assert.strictEqual(provider.state.committed.diagnostics.requestCount, 1);
+    assert.strictEqual(provider.state.committed.pagination.page, 1);
+    assert.strictEqual(provider.state.committed.pagination.count, 11);
+    assert.strictEqual(provider.state.committed.pageable, true);
+  });
+
+  test("a composed transport request is aborted by clear and cannot publish", async () => {
+    let dispatchCount = 0;
+    let transportAborted = false;
+    const api = new CloudsmithAPI({}, {
+      credentialManager: { async getApiKey() { return "csa_test_search_transport"; } },
+      randomUUID: () => "search-request-id",
+      fetchImpl: (_url, request) => new Promise((_resolve, reject) => {
+        dispatchCount += 1;
+        request.signal.addEventListener("abort", () => {
+          transportAborted = true;
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      }),
+    });
+    const provider = new SearchProvider({}, {
+      connectionManager: createConnectionManager(),
+      createCloudsmithAPI: () => api,
+      createPaginatedFetch: typedApi => new PaginatedFetch(typedApi),
+      withProgress: (_options, task) => task({ report() {} }, cancellationToken()),
+      notifications: { error() {}, information() {}, warning() {} },
+    });
+    providers.push(provider);
+
+    const search = provider.search("workspace-a", "format:python");
+    while (dispatchCount === 0) await nextTurn();
+    provider.clear();
+    await search;
+
+    assert.strictEqual(dispatchCount, 1);
+    assert.strictEqual(transportAborted, true);
+    assert.strictEqual(provider.state.committed, null);
+    assert.strictEqual(provider.state.pending, null);
+    assert.strictEqual(provider.state.failure, null);
+  });
+
+  test("post-response cancellation suppresses single, multi-repository, and continuation publication", async () => {
+    const rootToken = cancellationToken();
+    const root = createProvider({
+      withProgress: async (_options, task) => {
+        const result = await task({ report() {} }, rootToken);
+        rootToken.cancel();
+        return result;
+      },
+      fetchPage: async () => page([pkg("root-result")]),
+    });
+    await root.provider.search("workspace-a", "root-query");
+    assert.strictEqual(root.provider.state.committed, null);
+    assert.strictEqual(root.provider.state.failure, null);
+    assert.deepStrictEqual(root.messages.error, []);
+
+    const multiToken = cancellationToken();
+    const multi = createProvider({
+      withProgress: async (_options, task) => {
+        const result = await task({ report() {} }, multiToken);
+        multiToken.cancel();
+        return result;
+      },
+      fetchPage: async () => page([pkg("multi-result")]),
+    });
+    await multi.provider.searchRepos("workspace-a", ["repo-a"], "multi-query");
+    assert.strictEqual(multi.provider.state.committed, null);
+    assert.strictEqual(multi.provider.state.failure, null);
+    assert.deepStrictEqual(multi.messages.error, []);
+
+    let invocation = 0;
+    const pageToken = cancellationToken();
+    const continuation = createProvider({
+      withProgress: async (_options, task) => {
+        invocation += 1;
+        const token = invocation === 1 ? cancellationToken() : pageToken;
+        const result = await task({ report() {} }, token);
+        if (invocation === 2) token.cancel();
+        return result;
+      },
+      fetchPage: async (_endpoint, requestedPage) => requestedPage === 1
+        ? page(Array.from({ length: 10 }, (_, index) => pkg(`first-${index}`)), {
+          pageTotal: 2, count: 11, pageSize: 10,
+        })
+        : page([pkg("late")], { requestedPage: 2, pageTotal: 2, count: 11, pageSize: 10 }),
+    });
+    await continuation.provider.search("workspace-a", "page-query");
+    const prior = continuation.provider.state.committed;
+    await continuation.provider.loadNextPage();
+    assert.strictEqual(continuation.provider.state.committed.results.length, 10);
+    assert.strictEqual(continuation.provider.state.committed.pagination.page, 1);
+    assert.strictEqual(continuation.provider.state.pending, null);
+    assert.strictEqual(continuation.provider.state.failure, null);
+    assert.notStrictEqual(continuation.provider.state.committed, prior);
+    assert.deepStrictEqual(continuation.messages.error, []);
+  });
+
+  test("pre-cancelled progress performs no root or continuation page dispatch", async () => {
+    const rootToken = cancellationToken();
+    rootToken.cancel();
+    let rootCalls = 0;
+    const root = createProvider({
+      cancellationToken: rootToken,
+      fetchPage: async () => {
+        rootCalls += 1;
+        return page([]);
+      },
+    });
+    await root.provider.search("workspace-a", "cancel-before-root");
+    assert.strictEqual(rootCalls, 0);
+    assert.strictEqual(root.provider.state.failure, null);
+
+    let invocation = 0;
+    let pageCalls = 0;
+    const continuation = createProvider({
+      withProgress: (_options, task) => {
+        invocation += 1;
+        const token = cancellationToken();
+        if (invocation === 2) token.cancel();
+        return task({ report() {} }, token);
+      },
+      fetchPage: async (_endpoint, requestedPage) => {
+        pageCalls += 1;
+        return requestedPage === 1
+          ? page(Array.from({ length: 10 }, (_, index) => pkg(`first-${index}`)), {
+            pageTotal: 2, count: 11, pageSize: 10,
+          })
+          : page([pkg("unexpected")], { requestedPage: 2, pageTotal: 2, count: 11, pageSize: 10 });
+      },
+    });
+    await continuation.provider.search("workspace-a", "cancel-before-page");
+    await continuation.provider.loadNextPage();
+    assert.strictEqual(pageCalls, 1);
+    assert.strictEqual(continuation.provider.state.committed.pagination.page, 1);
+    assert.strictEqual(continuation.provider.state.committed.diagnostics.requestCount, 1);
+    assert.strictEqual(continuation.provider.state.failure, null);
+  });
+
+  test("clear aborts an in-flight continuation and late completion cannot restore state", async () => {
+    const latePage = deferred();
+    let continuationSignal = null;
+    const { provider } = createProvider({
+      fetchPage: async (_endpoint, requestedPage, _size, _query, options) => {
+        if (requestedPage === 1) {
+          return page(Array.from({ length: 10 }, (_, index) => pkg(`first-${index}`)), {
+            pageTotal: 2, count: 11, pageSize: 10,
+          });
+        }
+        continuationSignal = options.signal;
+        return latePage.promise;
+      },
+    });
+    await provider.search("workspace-a", "clear-page");
+    const loading = provider.loadNextPage();
+    while (!continuationSignal) await nextTurn();
+
+    provider.clear();
+    assert.strictEqual(continuationSignal.aborted, true);
+    latePage.resolve(page([pkg("late")], {
+      requestedPage: 2, pageTotal: 2, count: 11, pageSize: 10,
+    }));
+    await loading;
+
+    assert.strictEqual(provider.state.committed, null);
+    assert.strictEqual(provider.state.pending, null);
+    assert.strictEqual(provider.state.failure, null);
+  });
+
+  test("pending and failed replacement rows visibly preserve old and new query identity", async () => {
+    const replacement = deferred();
+    const { provider } = createProvider({
+      fetchPage: async (_endpoint, _page, _size, query) => {
+        if (query === "old") return page([pkg("old-result")]);
+        return replacement.promise;
+      },
+    });
+    await provider.search("workspace-a", "old");
+    const searching = provider.search("workspace-a", "new");
+    await nextTurn();
+
+    let items = (await provider.getChildren()).map(node => node.getTreeItem());
+    assert.strictEqual(items[0].label, "Results for: old");
+    assert(items.some(item => item.description === "Searching for: new"));
+    assert.strictEqual(items.some(item => item.contextValue === "loadMore"), false);
+
+    replacement.resolve(failedPage("timeout"));
+    await searching;
+    items = (await provider.getChildren()).map(node => node.getTreeItem());
+    assert.strictEqual(items[0].label, "Results for: old");
+    assert(items.some(item => item.label === "Search failed for: new"));
+    assert(items.some(item => String(item.tooltip).includes("Query: new")));
+  });
+
+  test("a first search visibly names its pending query", async () => {
+    const response = deferred();
+    const { provider } = createProvider({ fetchPage: async () => response.promise });
+    const search = provider.search("workspace-a", "format:python");
+    await nextTurn();
+
+    const item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Searching packages...");
+    assert.strictEqual(item.description, "Searching for: format:python");
+
+    response.resolve(page([]));
+    await search;
+  });
+
+  test("Load More is hidden while a page is pending and final completion stays truthful", async () => {
+    const nextPage = deferred();
+    const { provider } = createProvider({
+      fetchPage: async (_endpoint, requestedPage) => requestedPage === 1
+        ? page(Array.from({ length: 10 }, (_, index) => pkg(`first-${index}`)), {
+          pageTotal: 2, count: 11, pageSize: 10,
+        })
+        : nextPage.promise,
+    });
+    await provider.search("workspace-a", "artifact");
+    let items = (await provider.getChildren()).map(node => node.getTreeItem());
+    assert(items.some(item => item.label === "Load more results (10 of 11 loaded; page 1 of 2)"));
+
+    const loading = provider.loadNextPage();
+    await nextTurn();
+    items = (await provider.getChildren()).map(node => node.getTreeItem());
+    assert.strictEqual(items.some(item => item.contextValue === "loadMore"), false);
+    assert(items.some(item => item.description === "Loading page 2..."));
+
+    nextPage.resolve(page([pkg("final")], {
+      requestedPage: 2, pageTotal: 2, count: 11, pageSize: 10,
+    }));
+    await loading;
+    items = (await provider.getChildren()).map(node => node.getTreeItem());
+    assert.strictEqual(items.some(item => item.contextValue === "loadMore"), false);
+    assert.match(items[0].description, /11 packages/);
+  });
+
+  test("setup failures release root ownership and allow the next search", async () => {
+    for (const boundary of ["api", "paginator", "progress"]) {
+      let fail = true;
+      const options = { fetchPage: async () => page([pkg(`${boundary}-success`)]) };
+      if (boundary === "api") {
+        options.createCloudsmithAPI = () => {
+          if (fail) throw new Error("api setup failed");
+          return {};
+        };
+      }
+      if (boundary === "paginator") {
+        options.createPaginatedFetch = () => {
+          if (fail) throw new Error("paginator setup failed");
+          return { fetchPage: options.fetchPage };
+        };
+      }
+      if (boundary === "progress") {
+        options.withProgress = (_progressOptions, task) => {
+          if (fail) throw new Error("progress setup failed");
+          return task({ report() {} }, cancellationToken());
+        };
+      }
+      const { provider } = createProvider(options);
+      await provider.search("workspace-a", `${boundary}-failure`);
+      assert.strictEqual(provider.state.pending, null, boundary);
+      assert.strictEqual(provider.state.failure.kind, "unexpected", boundary);
+
+      fail = false;
+      await provider.search("workspace-a", `${boundary}-success`);
+      assert.strictEqual(provider.currentQuery, `${boundary}-success`, boundary);
+    }
+  });
+
+  test("aggregation configuration failure is identity-safe and a subsequent selected-repository search succeeds", async () => {
+    let fail = true;
+    const messages = { error: [], information: [], warning: [] };
+    const provider = new SearchProvider({}, {
+      connectionManager: createConnectionManager(),
+      createCloudsmithAPI: () => ({}),
+      createPaginatedFetch: () => ({ fetchPage: async () => page([pkg("success")]) }),
+      withProgress: (_options, task) => task({ report() {} }, cancellationToken()),
+      getAggregationPageSize: () => {
+        if (fail) throw new Error("configuration unavailable");
+        return 10;
+      },
+      notifications: {
+        error(message) { messages.error.push(message); },
+        information(message) { messages.information.push(message); },
+        warning(message) { messages.warning.push(message); },
+      },
+    });
+    providers.push(provider);
+
+    await provider.searchRepos("workspace-a", ["repo-a"], "failure");
+    assert.strictEqual(provider.state.pending, null);
+    assert.strictEqual(provider.state.failure.kind, "unexpected");
+    fail = false;
+    await provider.searchRepos("workspace-a", ["repo-a"], "success");
+    assert.strictEqual(provider.currentQuery, "success");
+  });
+
+  test("same package names and versions in different repositories retain distinct canonical identities", async () => {
+    const { provider } = createProvider({
+      fetchPage: async () => page([
+        pkg("shared", { repository: "repo-a", slug_perm: "shared-perm" }),
+        pkg("shared", { repository: "repo-b", slug_perm: "shared-perm" }),
+      ]),
+    });
+
+    await provider.search("workspace-a", "name:shared");
+
+    assert.deepStrictEqual(provider.searchResults.map(node => node.repository), ["repo-a", "repo-b"]);
+    assert.strictEqual(new Set(provider.state.committed.resultKeys).size, 2);
+  });
+
   test("clear invalidates a pending root and publishes no later result", async () => {
     const pending = deferred();
     const { provider } = createProvider({ fetchPage: async () => pending.promise });
@@ -1219,21 +1720,21 @@ suite("SearchProvider atomic search state", () => {
       {},
       {
         connectionManager,
-        createCloudsmithAPI: () => ({}),
-        createPaginatedFetch: () => ({ fetchPage }),
-        withProgress: (_progressOptions, task) => task(
+        createCloudsmithAPI: options.createCloudsmithAPI || (() => ({})),
+        createPaginatedFetch: options.createPaginatedFetch || (() => ({ fetchPage })),
+        withProgress: options.withProgress || ((_progressOptions, task) => task(
           { report() {} },
           options.cancellationToken || {
             isCancellationRequested: false,
             onCancellationRequested() { return { dispose() {} }; },
           }
-        ),
+        )),
         notifications: {
           error(message) { messages.error.push(message); },
           information(message) { messages.information.push(message); },
           warning(message) { messages.warning.push(message); },
         },
-        getPageSize: () => options.pageSize || 50,
+        getAggregationPageSize: () => options.pageSize || 50,
       }
     );
     providers.push(provider);
@@ -1295,13 +1796,13 @@ function page(data, options = {}) {
       pageTotal,
       count: hasCount ? options.count : data.length,
       ...(hasCountAuthority ? { countAuthoritative: options.countAuthoritative } : {}),
-      pageSize: options.pageSize || 50,
+      pageSize: options.pageSize || 10,
     },
     error: null,
   };
 }
 
-function failedPage(kind, requestedPage = 1, pageSize = 50) {
+function failedPage(kind, requestedPage = 1, pageSize = 10) {
   return {
     data: [],
     pagination: { page: requestedPage, pageTotal: requestedPage, count: 0, pageSize },
@@ -1309,7 +1810,7 @@ function failedPage(kind, requestedPage = 1, pageSize = 50) {
       kind,
       status: kind === "rate_limited" ? 429 : null,
       retryable: kind === "rate_limited",
-      message: `Failure: ${kind}`,
+      message: kind === "timeout" ? "The Cloudsmith API request timed out." : `Failure: ${kind}`,
       requestId: null,
       retryAfterMs: null,
       outcomeUnknown: false,
@@ -1326,6 +1827,22 @@ function deferred() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function cancellationToken() {
+  const listeners = new Set();
+  return {
+    isCancellationRequested: false,
+    onCancellationRequested(listener) {
+      listeners.add(listener);
+      return { dispose() { listeners.delete(listener); } };
+    },
+    cancel() {
+      if (this.isCancellationRequested) return;
+      this.isCancellationRequested = true;
+      for (const listener of [...listeners]) listener();
+    },
+  };
 }
 
 function repositoryFromEndpoint(endpoint) {
