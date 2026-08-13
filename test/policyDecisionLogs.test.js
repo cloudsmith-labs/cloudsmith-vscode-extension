@@ -1,10 +1,8 @@
 const assert = require("assert");
 const {
-  MAX_POLICY_STATUS_REASON_LENGTH,
   createQuarantineLocator,
   fetchDecisionLogDetail,
   fetchPackageDecisionLogs,
-  hasQuarantineAction,
   normalizePolicyStatusReason,
   parsePolicyStatusReason,
   selectCausalDecision,
@@ -371,7 +369,7 @@ suite("Policy decision log collection", () => {
 
   test("bounds status reasons and extracts a canonical policy slug", () => {
     const hostile = `Quarantined by Policy. ${"x".repeat(10000)} (Policy: policy-a)`;
-    assert.strictEqual(normalizePolicyStatusReason(hostile).length, MAX_POLICY_STATUS_REASON_LENGTH);
+    assert.strictEqual(normalizePolicyStatusReason(hostile).length, 4096);
     const parsed = parsePolicyStatusReason(
       "Quarantined by Dependency policy. Dependency rule matched. (Policy: policy-a)"
     );
@@ -380,21 +378,24 @@ suite("Policy decision log collection", () => {
     assert.strictEqual(normalizePolicyStatusReason("Rule\u202e spoofed\nAction"), "Rule  spoofed Action");
   });
 
-  test("accepts only direct action evidence and rejects nested examples", () => {
-    assert.strictEqual(hasQuarantineAction({
-      action_type: "SetPackageState",
-      package_state: "QUARANTINED",
-    }), true);
-    assert.strictEqual(hasQuarantineAction([{
-      action_type: "SetPackageState",
-      package_state: "QUARANTINED",
-    }]), true);
-    assert.strictEqual(hasQuarantineAction({
-      example: {
-        action_type: "SetPackageState",
-        package_state: "QUARANTINED",
+  test("selects only direct action evidence through the collection contract", async () => {
+    const direct = summary(1);
+    const nestedExample = summary(2, {
+      actions: {
+        example: {
+          action_type: "SetPackageState",
+          package_state: "QUARANTINED",
+        },
       },
-    }), false);
+    });
+    const result = await fetchPackageDecisionLogs({
+      async getV2() { return page([direct, nestedExample]); },
+    }, locator, createdAfter);
+
+    assert.strictEqual(result.complete, true);
+    assert.strictEqual(result.items[0].action, "Quarantined");
+    assert.strictEqual(result.items[1].action, null);
+    assert.strictEqual(selectCausalDecision(result.items).id, direct.id);
   });
 
   function detail(selected) {

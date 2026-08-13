@@ -613,4 +613,4 @@ const QUARANTINE_MESSAGE_CONTRACTS = Object.freeze({
   showVulnerabilities: Object.freeze([]),
 });
 
-module.exports = { QuarantineExplainProvider, normalizeCurrentPackage };
+module.exports = { QuarantineExplainProvider };

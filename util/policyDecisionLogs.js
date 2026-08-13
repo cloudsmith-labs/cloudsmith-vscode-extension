@@ -382,15 +382,9 @@ function failedCollection(message) {
 }
 
 module.exports = {
-  MAX_POLICY_DECISION_LOG_ITEMS,
-  MAX_POLICY_DECISION_LOG_PAGES,
-  MAX_POLICY_STATUS_REASON_LENGTH,
-  POLICY_DECISION_LOG_PAGE_SIZE,
   createQuarantineLocator,
   fetchDecisionLogDetail,
   fetchPackageDecisionLogs,
-  hasQuarantineAction,
-  isDecisionLogResponse,
   normalizePolicyStatusReason,
   parsePolicyStatusReason,
   selectCausalDecision,

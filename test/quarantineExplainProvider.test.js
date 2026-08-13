@@ -1,4 +1,7 @@
 const assert = require("assert");
+const DependencyHealthNode = require("../models/dependencyHealthNode");
+const PackageNode = require("../models/packageNode");
+const SearchResultNode = require("../models/searchResultNode");
 const { QuarantineExplainProvider } = require("../views/quarantineExplainProvider");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { createWebviewPanelHarness } = require("./helpers/webviewPanelHarness");
@@ -250,6 +253,60 @@ suite("QuarantineExplainProvider", () => {
     assert.strictEqual(calls, 0);
     assert.strictEqual(panelHarness.panelCalls.length, 0);
     assert.strictEqual(warnings.length, 2);
+  });
+
+  test("production entry normalizes package, search, dependency, and legacy callers", async () => {
+    const payload = nodePackagePayload();
+    const nodeCases = [
+      new PackageNode(payload, {}),
+      new SearchResultNode(payload, {}),
+      new DependencyHealthNode({
+        name: payload.name,
+        version: payload.version,
+        format: payload.format,
+        devDependency: false,
+      }, payload, {}),
+      packageItem({
+        slug_perm_raw: null,
+        slug_perm: { value: { value: "package-a" } },
+        status_str_raw: null,
+        status_str: { value: { value: "Quarantined" } },
+        uploaded_at: { value: { value: payload.uploaded_at } },
+        version: { value: { value: payload.version } },
+      }),
+    ];
+
+    for (const item of nodeCases) {
+      const panelHarness = createWebviewPanelHarness();
+      const packageEndpoints = [];
+      let resolveCurrent;
+      const currentPackage = new Promise(resolve => { resolveCurrent = resolve; });
+      const provider = providerWith(panelHarness, {
+        async get(endpoint) {
+          packageEndpoints.push(endpoint);
+          return currentPackage;
+        },
+        async getV2(endpoint) {
+          return endpoint.includes("/policies/policy-a/")
+            ? apiFailure("not_found", { status: 404 })
+            : emptyDecisionPage();
+        },
+      });
+
+      const pending = provider.show(item);
+
+      assert.strictEqual(panelHarness.panelCalls.length, 1);
+      assert.match(packageEndpoints[0], /^packages\/workspace-a\/repo-a\/package-a\//);
+      assert.match(panelHarness.panel.webview.html, /<h1>artifact 1\.0\.0<\/h1>/);
+      assert.match(panelHarness.panel.webview.html, /Dependency rule matched/);
+      assert.match(panelHarness.panel.webview.html, /Refreshing current package status/);
+
+      resolveCurrent(apiSuccess(freshPackage()));
+      await pending;
+      assert.match(panelHarness.panel.webview.html, /<h1>artifact 1\.0\.0<\/h1>/);
+      assert.match(panelHarness.panel.webview.html, /Dependency rule matched/);
+      assert.doesNotMatch(panelHarness.panel.webview.html, /Refreshing current package status/);
+    }
   });
 
   test("fresh identity drift fails closed and never enables commands", async () => {
@@ -554,6 +611,23 @@ function packageItem(overrides = {}) {
     status_reason: "Quarantined by Dependency policy. Dependency rule matched. (Policy: policy-a)",
     uploaded_at: "2026-08-13T10:00:00.000Z",
     ...overrides,
+  };
+}
+
+function nodePackagePayload() {
+  return {
+    downloads: 0,
+    format: "npm",
+    name: "artifact",
+    namespace: "workspace-a",
+    repository: "repo-a",
+    slug: "artifact-1.0.0",
+    slug_perm: "package-a",
+    status_reason: "Quarantined by Dependency policy. Dependency rule matched. (Policy: policy-a)",
+    status_str: "Quarantined",
+    tags: {},
+    uploaded_at: "2026-08-13T10:00:00.000Z",
+    version: "1.0.0",
   };
 }
 
