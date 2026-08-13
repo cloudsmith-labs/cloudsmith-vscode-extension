@@ -49,7 +49,12 @@ const DependencyHealthNode = require("../models/dependencyHealthNode");
 const DependencySourceGroupNode = require("../models/dependencySourceGroupNode");
 const DependencySummaryNode = require("../models/dependencySummaryNode");
 const InfoNode = require("../models/infoNode");
+const { createConnectionStatusNode } = require("../models/connectionStatusNode");
 const { getConnectionManager } = require("../util/connectionManager");
+const {
+  CONNECTION_PRESENTATIONS,
+  connectionPresentation,
+} = require("../util/connectionPresentation");
 const { packageCollectionIdentity } = require("../util/collectionIdentity");
 
 const DEFAULT_MAX_DEPENDENCIES_TO_SCAN = 10000;
@@ -164,6 +169,15 @@ class DependencyHealthProvider {
     this._dependencyOperationRunning = false;
     this._scanOperation = createScanOperation(SCAN_STATES.IDLE, 0);
     this._hasSuccessfulScan = false;
+    this._connectionPresentation = connectionPresentation(
+      this._connectionManager?.getState?.()
+    );
+    this._connectionSubscription = this._connectionManager?.onDidChange?.(state => {
+      const nextPresentation = connectionPresentation(state);
+      if (nextPresentation === this._connectionPresentation) return;
+      this._connectionPresentation = nextPresentation;
+      this.refresh();
+    }) || null;
 
     this._updateContexts();
   }
@@ -1824,9 +1838,15 @@ class DependencyHealthProvider {
   }
 
   async getChildren(element) {
-    if (element) {
-      return element.getChildren();
+    if (this._disposed) return [];
+    const presentation = connectionPresentation(this._connectionManager?.getState?.());
+    if (presentation !== CONNECTION_PRESENTATIONS.CONNECTED) {
+      if (element || presentation === CONNECTION_PRESENTATIONS.DISPOSED) return [];
+      const node = createConnectionStatusNode(presentation);
+      return node ? [node] : [];
     }
+
+    if (element) return element.getChildren();
 
     const operationNode = this._getScanOperationNode();
     if (operationNode && !this._hasSuccessfulScan) {
@@ -1874,20 +1894,6 @@ class DependencyHealthProvider {
     }
 
     if (!this._hasSuccessfulScan && this._scanOperation.status === SCAN_STATES.IDLE) {
-      const state = this._connectionManager && this._connectionManager.getState();
-      if (!state || !state.sessionConnected) {
-        return [
-          new InfoNode(
-            "Connect to Cloudsmith",
-            "Use the key icon above to set up authentication.",
-            "Set up Cloudsmith authentication to get started.",
-            "plug",
-            undefined,
-            { command: "cloudsmith-vsc.configureCredentials", title: "Set up authentication" }
-          ),
-        ];
-      }
-
       return [
         new InfoNode(
           "Scan dependencies",
@@ -2035,6 +2041,7 @@ class DependencyHealthProvider {
     if (this._disposed) return;
     this._disposed = true;
     this._vulnerabilityStateSubscription?.dispose?.();
+    this._connectionSubscription?.dispose?.();
     for (const subscription of this._treeExpansionSubscriptions) subscription.dispose?.();
     this._vulnerabilitySummaries.clear();
     this._clearVulnerabilityRefreshTimers();

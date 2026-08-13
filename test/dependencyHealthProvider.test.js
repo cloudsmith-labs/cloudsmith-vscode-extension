@@ -55,6 +55,7 @@ suite("DependencyHealthProvider Test Suite", () => {
         return Object.freeze({
           activationId: this.activationId,
           accountEpoch: 1,
+          credentialPresent: connected,
           sessionConnected: connected,
           status: connected ? "connected" : "absent",
         });
@@ -1065,6 +1066,78 @@ suite("DependencyHealthProvider Test Suite", () => {
 
     assert.strictEqual(nodes.length, 1);
     assert.strictEqual(nodes[0].getTreeItem().label, "Connect to Cloudsmith");
+  });
+
+  test("projects startup and terminal connection states through its owned refresh path", async () => {
+    const listeners = new Set();
+    let state = Object.freeze({
+      activationId: "dependency-presentation",
+      accountEpoch: 1,
+      credentialPresent: null,
+      sessionConnected: false,
+      status: "indeterminate",
+      error: null,
+    });
+    const connectionManager = {
+      getState: () => state,
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      update(next) {
+        state = Object.freeze({ ...state, ...next });
+        for (const listener of listeners) listener(state);
+      },
+    };
+    const provider = new DependencyHealthProvider(createContext(), null, { connectionManager });
+    let refreshes = 0;
+    provider.onDidChangeTreeData(() => { refreshes += 1; });
+
+    let item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connecting to Cloudsmith...");
+    assert.strictEqual(item.command, undefined);
+
+    connectionManager.update({ status: "validating", credentialPresent: true });
+    assert.strictEqual(refreshes, 0);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connecting to Cloudsmith...");
+    assert.strictEqual(JSON.stringify(item).includes("Set up Cloudsmith authentication"), false);
+
+    connectionManager.update({ status: "failed", credentialPresent: true });
+    assert.strictEqual(refreshes, 1);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connection failed");
+
+    connectionManager.update({ status: "absent", credentialPresent: false });
+    assert.strictEqual(refreshes, 2);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connect to Cloudsmith");
+
+    connectionManager.update({
+      status: "connected",
+      credentialPresent: true,
+      sessionConnected: true,
+    });
+    assert.strictEqual(refreshes, 3);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Scan dependencies");
+
+    const staleChild = { getChildren: () => ["private result"] };
+    connectionManager.update({
+      status: "indeterminate",
+      credentialPresent: null,
+      sessionConnected: false,
+      error: { message: "SecretStorage csa_secret" },
+    });
+    assert.deepStrictEqual(await provider.getChildren(staleChild), []);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Could not check the connection");
+    assert.strictEqual(JSON.stringify(item).includes("csa_secret"), false);
+
+    provider.dispose();
+    connectionManager.update({ status: "disposed" });
+    assert.strictEqual(refreshes, 4);
+    assert.deepStrictEqual(await provider.getChildren(), []);
   });
 
   test("_performScan projects canonical adapter records into the compatibility tree", async () => {

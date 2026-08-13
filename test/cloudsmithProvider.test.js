@@ -44,15 +44,26 @@ function deferred() {
 }
 
 function createConnectionManager(overrides = {}) {
+  const listeners = new Set();
   let state = {
     activationId: "activation-a",
     accountEpoch: 1,
+    credentialPresent: true,
     sessionConnected: true,
+    status: "connected",
+    error: null,
     ...overrides,
   };
   return {
     getState() { return Object.freeze({ ...state }); },
-    setState(next) { state = { ...state, ...next }; },
+    setState(next) {
+      state = { ...state, ...next };
+      for (const listener of listeners) listener(Object.freeze({ ...state }));
+    },
+    onDidChange(listener) {
+      listeners.add(listener);
+      return { dispose() { listeners.delete(listener); } };
+    },
   };
 }
 
@@ -120,7 +131,11 @@ suite("CloudsmithProvider", () => {
   }
 
   test("fails closed to the signed-out root without making an API request", async () => {
-    manager.setState({ sessionConnected: false });
+    manager.setState({
+      credentialPresent: false,
+      sessionConnected: false,
+      status: "absent",
+    });
     let requests = 0;
     const provider = createProvider(async () => { requests += 1; });
     const treeView = { message: "old" };
@@ -136,6 +151,70 @@ suite("CloudsmithProvider", () => {
       && call[1] === "cloudsmith.hasMultipleWorkspaces"
       && call[2] === false
     )));
+  });
+
+  test("projects startup and terminal connection states without API work", async () => {
+    manager.setState({
+      credentialPresent: null,
+      sessionConnected: false,
+      status: "indeterminate",
+      error: null,
+    });
+    let apiCalls = 0;
+    const provider = createProvider(async () => {
+      apiCalls += 1;
+      return apiSuccess([]);
+    });
+    assert.deepStrictEqual(
+      await provider.getChildren({ getChildren: () => ["private result"] }),
+      []
+    );
+    const cases = [
+      [{ status: "indeterminate", credentialPresent: null, error: null }, "Connecting to Cloudsmith...", null],
+      [{ status: "validating", credentialPresent: true, error: null }, "Connecting to Cloudsmith...", null],
+      [{ status: "absent", credentialPresent: false, error: null }, "Connect to Cloudsmith", "cloudsmith-vsc.configureCredentials"],
+      [{ status: "failed", credentialPresent: true, error: { message: "unsafe raw detail" } }, "Connection failed", "cloudsmith-vsc.configureCredentials"],
+      [{ status: "indeterminate", credentialPresent: null, error: { message: "SecretStorage csa_secret" } }, "Could not check the connection", "cloudsmith-vsc.connectCloudsmith"],
+    ];
+    for (const [state, label, command] of cases) {
+      manager.setState({ ...state, sessionConnected: false });
+      const item = (await provider.getChildren())[0].getTreeItem();
+      assert.strictEqual(item.label, label);
+      assert.strictEqual(item.command?.command || null, command);
+      if (label !== "Connect to Cloudsmith") {
+        assert.strictEqual(JSON.stringify(item).includes("Set up Cloudsmith authentication"), false);
+      }
+      assert.strictEqual(JSON.stringify(item).includes("csa_secret"), false);
+    }
+    manager.setState({ status: "disposed", credentialPresent: null, sessionConnected: false });
+    assert.deepStrictEqual(await provider.getChildren(), []);
+    assert.strictEqual(apiCalls, 0);
+    provider.dispose();
+    assert.deepStrictEqual(await provider.getChildren(), []);
+  });
+
+  test("refreshes from validating to connected and only then starts workspace loading", async () => {
+    manager.setState({ status: "validating", credentialPresent: true, sessionConnected: false });
+    let fetches = 0;
+    const provider = createProvider(async () => apiSuccess([]), {
+      fetchWorkspaces: async () => {
+        fetches += 1;
+        return collectionResult([]);
+      },
+    });
+    let refreshes = 0;
+    provider.onDidChangeTreeData(() => { refreshes += 1; });
+
+    assert.strictEqual((await provider.getChildren())[0].getTreeItem().label, "Connecting to Cloudsmith...");
+    assert.strictEqual(fetches, 0);
+    manager.setState({ status: "connected", credentialPresent: true, sessionConnected: true });
+    assert.strictEqual(refreshes, 1);
+    await provider.getChildren();
+    assert.strictEqual(fetches, 1);
+    provider.dispose();
+    manager.setState({ status: "absent", credentialPresent: false, sessionConnected: false });
+    assert.strictEqual(refreshes, 1);
+    assert.deepStrictEqual(await provider.getChildren(), []);
   });
 
   test("reports malformed workspace payloads as load failures", async () => {

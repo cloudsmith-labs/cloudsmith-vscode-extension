@@ -1,6 +1,8 @@
 const STANDALONE_NODE_TESTS = Object.freeze([
+  "test/accountOperation.test.js",
   "test/apiEndpoint.test.js",
   "test/collectionIdentity.test.js",
+  "test/connectionPresentation.test.js",
   "test/dependencyAdapterRegistry.test.js",
   "test/dependencyManifestDiscovery.test.js",
   "test/dependencyPolicyEnricher.test.js",

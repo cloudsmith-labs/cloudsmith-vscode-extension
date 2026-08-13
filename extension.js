@@ -48,6 +48,9 @@ const { fetchWorkspaces, normalizedWorkspaceName } = require("./util/workspaceFe
 const { fetchWorkspaceRepositories } = require("./util/workspaceRepositoryFetcher");
 const { PaginatedFetch, replaceCollectionItems } = require("./util/paginatedFetch");
 const { packageCollectionIdentity } = require("./util/collectionIdentity");
+const {
+  connectionSetupAvailable,
+} = require("./util/connectionPresentation");
 
 let exportTerraformAbortController = null;
 let activeActivationOwner = null;
@@ -1000,13 +1003,32 @@ async function activateOwned(context, own) {
   let quarantineExplainProvider = null;
   let upstreamPreviewProvider = null;
   let upstreamDetailProvider = null;
+  let connectionPresentationProjection = Promise.resolve();
+  let connectionPresentationProjectionDisposed = false;
+  own({ dispose: () => { connectionPresentationProjectionDisposed = true; } });
+  const projectConnectionPresentation = (state) => {
+    const setupAvailable = connectionSetupAvailable(state);
+    const project = async () => {
+      if (connectionPresentationProjectionDisposed) return;
+      await vscode.commands.executeCommand(
+        "setContext",
+        "cloudsmith.connectionSetupAvailable",
+        setupAvailable
+      );
+    };
+    const run = connectionPresentationProjection.then(project, project);
+    connectionPresentationProjection = run.catch(() => {
+      console.warn("[Cloudsmith] Could not update the connection presentation indicator.");
+    });
+    return run;
+  };
   const handleConnectionStateChange = async (state) => {
+    void projectConnectionPresentation(state).catch(() => {});
     if (state.accountEpoch !== projectedAccountEpoch) {
       projectedAccountEpoch = state.accountEpoch;
       promotionProvider?.resetForAccountChange();
       await resetAccountScopedState(context, {
         workspaceCache,
-        searchProvider,
         dependencyHealthProvider,
         workspaceContextProjector,
         vulnerabilityStateService,
@@ -1017,9 +1039,6 @@ async function activateOwned(context, own) {
       });
     }
 
-    cloudsmithProvider.refresh({ suppressMissingCredentialsWarning: !state.credentialPresent });
-    searchProvider.refresh();
-    dependencyHealthProvider.refresh();
   };
   const connectionSubscription = connectionManager.onDidChange(state => {
     void handleConnectionStateChange(state).catch(() => {
@@ -1027,6 +1046,7 @@ async function activateOwned(context, own) {
     });
   });
   own(connectionSubscription);
+  void projectConnectionPresentation(connectionManager.getState()).catch(() => {});
 
   // Create vulnerability WebView provider
   vulnerabilityProvider = new VulnerabilityProvider(context, {
@@ -1114,27 +1134,39 @@ async function activateOwned(context, own) {
     return result;
   }
 
-  const initializationResult = await connectionManager.initialize();
-  await handleAuthenticationResult(initializationResult, {
-    showSuccess: false,
-    offerDefault: false,
-    reportFailure: false,
+  let initializationFollowUpDisposed = false;
+  let cliAutoDetectTimer = null;
+  own({
+    dispose() {
+      initializationFollowUpDisposed = true;
+      if (cliAutoDetectTimer) clearTimeout(cliAutoDetectTimer);
+    },
   });
-
-  // Auto-detect Cloudsmith CLI credentials on activation.
-  // If no API key is stored but CLI credentials exist, offer to import them.
-  const cliAutoDetectTimer = setTimeout(() => {
-    void runCLIAutoDetect({
-      connectionManager,
-      secrets: context.secrets,
-      ssoManager,
-      showInformationMessage: (...args) => vscode.window.showInformationMessage(...args),
-      handleAuthenticationResult,
-    }).catch(() => {
-      console.warn("[Cloudsmith] CLI credential auto-detection failed.");
+  const initialization = connectionManager.initialize();
+  void initialization.then(async result => {
+    await handleAuthenticationResult(result, {
+      showSuccess: false,
+      offerDefault: false,
+      reportFailure: false,
     });
-  }, 3000);
-  own({ dispose: () => clearTimeout(cliAutoDetectTimer) });
+    if (initializationFollowUpDisposed) return;
+
+    // Auto-detect Cloudsmith CLI credentials after the initial stored state settles.
+    cliAutoDetectTimer = setTimeout(() => {
+      if (initializationFollowUpDisposed) return;
+      void runCLIAutoDetect({
+        connectionManager,
+        secrets: context.secrets,
+        ssoManager,
+        showInformationMessage: (...args) => vscode.window.showInformationMessage(...args),
+        handleAuthenticationResult,
+      }).catch(() => {
+        console.warn("[Cloudsmith] CLI credential auto-detection failed.");
+      });
+    }, 3000);
+  }).catch(() => {
+    console.warn("[Cloudsmith] Connection initialization did not complete cleanly.");
+  });
 
   // register general commands. Will move this over to command Manager in future release.
   own(

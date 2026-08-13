@@ -7,6 +7,11 @@ const { PaginatedFetch } = require("../util/paginatedFetch");
 const SearchResultNode = require("../models/searchResultNode");
 const LoadMoreNode = require("../models/loadMoreNode");
 const InfoNode = require("../models/infoNode");
+const { createConnectionStatusNode } = require("../models/connectionStatusNode");
+const {
+    CONNECTION_PRESENTATIONS,
+    connectionPresentation,
+} = require("../util/connectionPresentation");
 const { formatApiError } = require("../util/errorFormatter");
 const {
     getPackagePolicyFlags,
@@ -78,15 +83,21 @@ class SearchProvider {
         this._activePage = null;
         this._disposed = false;
         this._account = this._readConnectedAccount();
+        this._connectionPresentation = connectionPresentation(
+            this.connectionManager.getState?.()
+        );
 
         this._connectionSubscription = this.connectionManager.onDidChange?.(state => {
             const nextAccount = normalizeConnectedAccount(state);
+            const nextPresentation = connectionPresentation(state);
+            const presentationChanged = nextPresentation !== this._connectionPresentation;
+            this._connectionPresentation = nextPresentation;
             if ((nextAccount || this._account) && !sameAccount(nextAccount, this._account)) {
                 this._account = nextAccount;
                 this.clear();
                 return;
             }
-            this.refresh();
+            if (presentationChanged) this.refresh();
         });
     }
 
@@ -945,20 +956,20 @@ class SearchProvider {
     }
 
     async getChildren(element) {
-        if (element) {
-            return element.getChildren();
+        if (this._disposed) return [];
+        const connectionState = this.connectionManager.getState?.();
+        const presentation = connectionPresentation(connectionState);
+        if (presentation !== CONNECTION_PRESENTATIONS.CONNECTED) {
+            if (element || presentation === CONNECTION_PRESENTATIONS.DISPOSED) return [];
+            const node = createConnectionStatusNode(presentation);
+            return node ? [node] : [];
         }
 
-        const account = this._readConnectedAccount();
+        if (element) return element.getChildren();
+
+        const account = normalizeConnectedAccount(connectionState);
         if (!account) {
-            return [new InfoNode(
-                "Connect to Cloudsmith",
-                "Use the key icon above to set up a personal or service account API key, CLI import, or SSO.",
-                "Set up Cloudsmith authentication to get started.",
-                "plug",
-                undefined,
-                { command: "cloudsmith-vsc.configureCredentials", title: "Set up authentication" }
-            )];
+            return [createConnectionStatusNode(CONNECTION_PRESENTATIONS.UNAVAILABLE)];
         }
         const committed = this._currentCommitted(account);
         const pending = sameAccount(account, this._state.pending) ? this._state.pending : null;
@@ -1533,7 +1544,8 @@ function disconnectedConnectionManager() {
             activationId: null,
             accountEpoch: 0,
             sessionConnected: false,
-            status: "absent",
+            credentialPresent: null,
+            status: "indeterminate",
         }),
         onDidChange: () => Object.freeze({ dispose() {} }),
     });

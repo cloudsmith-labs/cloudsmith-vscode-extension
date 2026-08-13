@@ -671,17 +671,17 @@
         {
           "command": "cloudsmith-vsc.connectCloudsmith",
           "group": "navigation",
-          "when": "view == cloudsmithView && !cloudsmith.connected"
+          "when": "view == cloudsmithView && !cloudsmith.connected && cloudsmith.connectionSetupAvailable"
         },
         {
           "command": "cloudsmith-vsc.configureCredentials",
           "group": "navigation",
-          "when": "view == cloudsmithView && !cloudsmith.connected"
+          "when": "view == cloudsmithView && !cloudsmith.connected && cloudsmith.connectionSetupAvailable"
         },
         {
           "command": "cloudsmith-vsc.ssoLogin",
           "group": "navigation",
-          "when": "view == cloudsmithView && !cloudsmith.connected"
+          "when": "view == cloudsmithView && !cloudsmith.connected && cloudsmith.connectionSetupAvailable"
         },
         {
           "command": "cloudsmith-vsc.openSettings",
@@ -696,42 +696,42 @@
         {
           "command": "cloudsmith-vsc.searchPackages",
           "group": "navigation",
-          "when": "view == cloudsmithSearchView"
+          "when": "view == cloudsmithSearchView && cloudsmith.connected"
         },
         {
           "command": "cloudsmith-vsc.clearSearch",
           "group": "navigation",
-          "when": "view == cloudsmithSearchView"
+          "when": "view == cloudsmithSearchView && cloudsmith.connected"
         },
         {
           "command": "cloudsmith-vsc.guidedSearch",
           "group": "navigation",
-          "when": "view == cloudsmithSearchView"
+          "when": "view == cloudsmithSearchView && cloudsmith.connected"
         },
         {
           "command": "cloudsmith-vsc.searchByLicense",
           "group": "navigation",
-          "when": "view == cloudsmithSearchView"
+          "when": "view == cloudsmithSearchView && cloudsmith.connected"
         },
         {
           "command": "cloudsmith-vsc.previewUpstreamResolution",
           "group": "navigation",
-          "when": "view == cloudsmithSearchView"
+          "when": "view == cloudsmithSearchView && cloudsmith.connected"
         },
         {
           "command": "cloudsmith-vsc.scanDependencies",
           "group": "navigation@1",
-          "when": "view == cloudsmithDependencyHealthView && !cloudsmith.depOperationRunning"
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.connected && !cloudsmith.depOperationRunning"
         },
         {
           "command": "cloudsmith-vsc.changeDependencyScanScope",
           "group": "navigation@1.5",
-          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
         },
         {
           "command": "cloudsmith-vsc.pullDependencies",
           "group": "navigation@2",
-          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depScanComplete && !cloudsmith.depOperationRunning"
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.depScanComplete && !cloudsmith.depOperationRunning"
         },
         {
           "command": "cloudsmith-vsc.cycleDepViewDirect",
