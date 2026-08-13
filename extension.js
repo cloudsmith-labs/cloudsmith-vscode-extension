@@ -394,6 +394,11 @@ async function evictPersistedUpstreamCaches(context) {
 }
 
 async function resetAccountScopedState(context, options = {}) {
+  const reset = beginAccountScopedStateReset(options);
+  return completeAccountScopedStateReset(context, options, reset);
+}
+
+function beginAccountScopedStateReset(options = {}) {
   const synchronousInvalidators = [
     () => options.workspaceCache?.clear?.(),
     () => options.searchProvider?.clear?.(),
@@ -405,6 +410,7 @@ async function resetAccountScopedState(context, options = {}) {
     () => options.quarantineExplainProvider?.resetForAccountChange?.(),
     () => options.upstreamPreviewProvider?.resetForAccountChange?.(),
     () => options.upstreamDetailProvider?.resetForAccountChange?.(),
+    () => options.promotionProvider?.resetForAccountChange?.(),
   ];
   const syncFailures = [];
   for (const invalidate of synchronousInvalidators) {
@@ -415,10 +421,14 @@ async function resetAccountScopedState(context, options = {}) {
     }
   }
 
+  return Object.freeze({ syncFailures });
+}
+
+async function completeAccountScopedStateReset(context, options, reset) {
   // Start each fallible authority projection independently. A rejected tree or
   // context update must not retain another cache from the previous account.
   const asynchronousInvalidators = [
-    () => options.dependencyHealthProvider?.resetForAccountChange?.(),
+    () => options.dependencyHealthProvider?.resetForAccountChange?.(options.accountState),
     () => (options.projectHasMultipleWorkspaces
       ? options.projectHasMultipleWorkspaces(false)
       : setHasMultipleWorkspacesContext(context, false, {
@@ -434,8 +444,13 @@ async function resetAccountScopedState(context, options = {}) {
     }
   });
   const asyncResults = await Promise.allSettled(pending);
+  try {
+    options.cloudsmithProvider?.completeAccountReset?.(options.accountState);
+  } catch (error) {
+    reset.syncFailures.push(error);
+  }
   return Object.freeze({
-    syncFailures: Object.freeze([...syncFailures]),
+    syncFailures: Object.freeze([...reset.syncFailures]),
     asyncResults: Object.freeze(asyncResults),
   });
 }
@@ -927,6 +942,7 @@ async function activateOwned(context, own) {
     workspaceCache,
     workspaceContextProjector,
     vulnerabilityStateService,
+    accountResetOrchestrated: true,
   });
   own({ dispose: () => cloudsmithProvider.dispose() });
   const treeView = vscode.window.createTreeView("cloudsmithView", {
@@ -985,6 +1001,7 @@ async function activateOwned(context, own) {
   const dependencyHealthProvider = new DependencyHealthProvider(context, diagnosticsPublisher, {
     connectionManager,
     vulnerabilityStateService,
+    accountResetOrchestrated: true,
   });
   own(
     { dispose: () => searchProvider.dispose() },
@@ -997,7 +1014,9 @@ async function activateOwned(context, own) {
   own(dependencyTreeView);
   dependencyHealthProvider.setTreeView(dependencyTreeView);
 
-  let projectedAccountEpoch = connectionManager.getState().accountEpoch;
+  let projectedAccountIdentity = connectionManager.getState();
+  let accountResetQueue = Promise.resolve();
+  own({ dispose: () => accountResetQueue });
   let promotionProvider = null;
   let vulnerabilityProvider = null;
   let quarantineExplainProvider = null;
@@ -1022,13 +1041,18 @@ async function activateOwned(context, own) {
     });
     return run;
   };
-  const handleConnectionStateChange = async (state) => {
+  const connectionSubscription = connectionManager.onDidChange(state => {
     void projectConnectionPresentation(state).catch(() => {});
-    if (state.accountEpoch !== projectedAccountEpoch) {
-      projectedAccountEpoch = state.accountEpoch;
-      promotionProvider?.resetForAccountChange();
-      await resetAccountScopedState(context, {
+    if (
+      state.accountEpoch !== projectedAccountIdentity.accountEpoch
+      || state.activationId !== projectedAccountIdentity.activationId
+    ) {
+      projectedAccountIdentity = state;
+      const resetOptions = {
         workspaceCache,
+        cloudsmithProvider,
+        accountState: state,
+        promotionProvider,
         dependencyHealthProvider,
         workspaceContextProjector,
         vulnerabilityStateService,
@@ -1036,14 +1060,14 @@ async function activateOwned(context, own) {
         quarantineExplainProvider,
         upstreamPreviewProvider,
         upstreamDetailProvider,
+      };
+      const reset = beginAccountScopedStateReset(resetOptions);
+      const complete = () => completeAccountScopedStateReset(context, resetOptions, reset);
+      const run = accountResetQueue.then(complete, complete);
+      accountResetQueue = run.catch(() => {
+        console.warn("[Cloudsmith] Could not refresh all account-scoped state.");
       });
     }
-
-  };
-  const connectionSubscription = connectionManager.onDidChange(state => {
-    void handleConnectionStateChange(state).catch(() => {
-      console.warn("[Cloudsmith] Could not refresh all account-scoped state.");
-    });
   });
   own(connectionSubscription);
   void projectConnectionPresentation(connectionManager.getState()).catch(() => {});

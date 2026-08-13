@@ -217,6 +217,138 @@ suite("CloudsmithProvider", () => {
     assert.deepStrictEqual(await provider.getChildren(), []);
   });
 
+  test("waits for an orchestrated account reset before refreshing connected Account B", async () => {
+    const fetchedEpochs = [];
+    const provider = createProvider(async () => { throw new Error("not used"); }, {
+      accountResetOrchestrated: true,
+      fetchWorkspaces: async () => {
+        const epoch = manager.getState().accountEpoch;
+        fetchedEpochs.push(epoch);
+        return collectionResult([{
+          slug: `workspace-${epoch}`,
+          name: `Workspace ${epoch}`,
+        }]);
+      },
+    });
+    let refreshes = 0;
+    provider.onDidChangeTreeData(() => { refreshes += 1; });
+
+    const accountANodes = await provider.getWorkspaces();
+    assert.strictEqual(accountANodes[0].workspace, "workspace-1");
+    manager.setState({ accountEpoch: 2 });
+    assert.strictEqual(refreshes, 1, "Account A must disappear immediately");
+    assert.strictEqual(
+      (await provider.getChildren())[0].getTreeItem().label,
+      "Connecting to Cloudsmith..."
+    );
+    assert.deepStrictEqual(fetchedEpochs, [1], "Account B must not load before reset");
+
+    provider._workspaceCache.clear();
+    assert.strictEqual(provider.completeAccountReset(manager.getState()), true);
+    assert.strictEqual(refreshes, 2);
+    const accountBNodes = await provider.getWorkspaces();
+    assert.strictEqual(accountBNodes[0].workspace, "workspace-2");
+    assert.deepStrictEqual(fetchedEpochs, [1, 2]);
+  });
+
+  test("an Account A fetch cannot publish after an orchestrated Account B switch", async () => {
+    const accountA = deferred();
+    let fetchStarted = false;
+    const provider = createProvider(async () => { throw new Error("not used"); }, {
+      accountResetOrchestrated: true,
+      fetchWorkspaces: async () => {
+        fetchStarted = true;
+        return accountA.promise;
+      },
+    });
+    const pending = provider.getWorkspaces();
+    while (!fetchStarted) await new Promise(resolve => setImmediate(resolve));
+
+    manager.setState({ accountEpoch: 2 });
+    accountA.resolve(collectionResult([{ slug: "account-a", name: "Account A" }]));
+
+    assert.deepStrictEqual(await pending, []);
+    assert.strictEqual(
+      (await provider.getChildren())[0].getTreeItem().label,
+      "Connecting to Cloudsmith..."
+    );
+  });
+
+  test("refreshes an account identity change when no external reset orchestrator is used", () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    let refreshes = 0;
+    provider.onDidChangeTreeData(() => { refreshes += 1; });
+
+    manager.setState({ accountEpoch: 2 });
+
+    assert.strictEqual(refreshes, 1);
+  });
+
+  test("connection roots supersede loading ownership for connecting, absent, and failed", async () => {
+    const cases = [
+      [{ status: "validating", credentialPresent: true }, "Connecting to Cloudsmith..."],
+      [{ status: "absent", credentialPresent: false }, "Connect to Cloudsmith"],
+      [{ status: "failed", credentialPresent: true }, "Connection failed"],
+    ];
+    for (const [state, expectedLabel] of cases) {
+      manager = createConnectionManager();
+      const response = deferred();
+      const provider = createProvider(async () => { throw new Error("not used"); }, {
+        fetchWorkspaces: async () => response.promise,
+      });
+      const treeView = {};
+      provider.setTreeView(treeView);
+      const oldLoad = provider.getWorkspaces();
+      assert.strictEqual(treeView.message, "Loading...");
+
+      manager.setState({ ...state, sessionConnected: false });
+      assert.strictEqual(treeView.message, undefined);
+      assert.strictEqual(provider._loadingOperationId, null);
+      assert.strictEqual((await provider.getChildren())[0].getTreeItem().label, expectedLabel);
+
+      response.resolve(collectionResult([{ slug: "old", name: "Old" }]));
+      assert.deepStrictEqual(await oldLoad, []);
+      assert.strictEqual(treeView.message, undefined);
+      assert.strictEqual(provider._loadingOperationId, null);
+      provider.dispose();
+    }
+  });
+
+  test("a stale operation finally cannot clear a newer loading operation", async () => {
+    const accountA = deferred();
+    const accountB = deferred();
+    let fetches = 0;
+    const provider = createProvider(async () => { throw new Error("not used"); }, {
+      fetchWorkspaces: async () => {
+        fetches += 1;
+        return fetches === 1 ? accountA.promise : accountB.promise;
+      },
+    });
+    const treeView = {};
+    provider.setTreeView(treeView);
+    const operationA = provider.getWorkspaces();
+    assert.strictEqual(treeView.message, "Loading...");
+    while (fetches === 0) await new Promise(resolve => setImmediate(resolve));
+
+    manager.setState({ status: "validating", sessionConnected: false });
+    assert.strictEqual(treeView.message, undefined);
+    manager.setState({ status: "connected", sessionConnected: true });
+    const operationB = provider.getWorkspaces();
+    const operationBLoadingId = provider._loadingOperationId;
+    assert.strictEqual(treeView.message, "Loading...");
+
+    accountA.resolve(collectionResult([{ slug: "account-a", name: "Account A" }]));
+    assert.deepStrictEqual(await operationA, []);
+    assert.strictEqual(provider._loadingOperationId, operationBLoadingId);
+    assert.strictEqual(treeView.message, "Loading...");
+
+    accountB.resolve(collectionResult([{ slug: "account-b", name: "Account B" }]));
+    const nodes = await operationB;
+    assert.strictEqual(nodes[0].workspace, "account-b");
+    assert.strictEqual(provider._loadingOperationId, null);
+    assert.strictEqual(treeView.message, undefined);
+  });
+
   test("reports malformed workspace payloads as load failures", async () => {
     const provider = createProvider(async (_endpoint, options) => {
       const malformed = [{ name: "Missing stable slug" }];

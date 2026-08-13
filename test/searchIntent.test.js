@@ -85,6 +85,47 @@ suite("search intent command boundary", () => {
     ]);
   });
 
+  test("account reset finishes every asynchronous invalidator before refreshing Cloudsmith", async () => {
+    const dependencyReset = deferred();
+    const order = [];
+    const accountState = Object.freeze({ activationId: "activation-b", accountEpoch: 2 });
+    const pending = resetAccountScopedState({ globalState: {} }, {
+      workspaceCache: { clear() { order.push("workspace-clear"); } },
+      filterState: { clear() {} },
+      recentPackages: { clear() {} },
+      clearVulnerabilityCache() {},
+      dependencyHealthProvider: {
+        async resetForAccountChange() {
+          order.push("dependency-start");
+          await dependencyReset.promise;
+          order.push("dependency-complete");
+        },
+      },
+      async projectHasMultipleWorkspaces() {
+        order.push("workspace-context");
+      },
+      async evictPersistedUpstreamCaches() {
+        order.push("persisted-cache");
+      },
+      cloudsmithProvider: {
+        completeAccountReset(state) {
+          assert.strictEqual(state, accountState);
+          order.push("cloudsmith-refresh");
+        },
+      },
+      accountState,
+    });
+
+    await Promise.resolve();
+    assert.strictEqual(order.includes("cloudsmith-refresh"), false);
+    dependencyReset.resolve();
+    await pending;
+    assert.ok(order.indexOf("workspace-clear") < order.indexOf("cloudsmith-refresh"));
+    assert.ok(order.indexOf("dependency-complete") < order.indexOf("cloudsmith-refresh"));
+    assert.ok(order.indexOf("workspace-context") < order.indexOf("cloudsmith-refresh"));
+    assert.ok(order.indexOf("persisted-cache") < order.indexOf("cloudsmith-refresh"));
+  });
+
   test("evicts persisted upstream state before account availability is known", async () => {
     const store = new Map([
       ["cloudsmith-upstreams:v3:stale", { version: 3 }],

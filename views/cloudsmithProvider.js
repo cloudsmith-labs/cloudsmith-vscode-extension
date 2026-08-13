@@ -61,11 +61,33 @@ class CloudsmithProvider {
     this._operationController = null;
     this._repositoryNodes = new Set();
     this._disposed = false;
+    this._accountResetOrchestrated = options.accountResetOrchestrated === true;
+    this._accountIdentity = accountIdentity(this._connectionManager?.getState?.());
+    this._pendingAccountIdentity = null;
     this._connectionPresentation = this._readConnectionPresentation();
     this._connectionSubscription = this._connectionManager?.onDidChange?.(state => {
+      const nextIdentity = accountIdentity(state);
+      const identityChanged = !sameAccountIdentity(nextIdentity, this._accountIdentity);
       const nextPresentation = connectionPresentation(state);
-      if (nextPresentation === this._connectionPresentation) return;
+      const presentationChanged = nextPresentation !== this._connectionPresentation;
+      this._accountIdentity = nextIdentity;
       this._connectionPresentation = nextPresentation;
+      if (identityChanged && this._accountResetOrchestrated) {
+        this._pendingAccountIdentity = nextIdentity;
+        this._invalidateAccountOperations();
+        this._onDidChangeTreeData.fire();
+      }
+      if (identityChanged && !this._accountResetOrchestrated) {
+        this.refresh();
+        return;
+      }
+      if (!presentationChanged) return;
+      if (
+        this._pendingAccountIdentity
+        && nextPresentation === CONNECTION_PRESENTATIONS.CONNECTED
+      ) {
+        return;
+      }
       this.refresh();
     }) || null;
   }
@@ -81,6 +103,7 @@ class CloudsmithProvider {
   getChildren(element) {
     if (this._disposed) return [];
     const connectionNodes = this._connectionRootNodes();
+    if (connectionNodes) this._clearLoading();
     if (!element) {
       if (connectionNodes) {
         if (connectionNodes.length === 0) return connectionNodes;
@@ -104,9 +127,7 @@ class CloudsmithProvider {
     if (options.suppressMissingCredentialsWarning) {
       this._suppressMissingCredentialsWarningOnce = true;
     }
-    this._invalidateRepositoryNodes();
-    this._abortActiveOperation();
-    this._operationId += 1;
+    this._invalidateAccountOperations();
     void this._projectMultipleWorkspaces(
       Boolean(captureAccount(this._connectionManager))
     ).catch(() => {});
@@ -119,6 +140,7 @@ class CloudsmithProvider {
     this._invalidateRepositoryNodes();
     this._abortActiveOperation();
     this._operationId += 1;
+    this._clearLoading();
     this._workspaceCache.clear();
     this._vulnerabilitySummaries.clear();
     this._clearVulnerabilityRefreshTimers();
@@ -167,11 +189,21 @@ class CloudsmithProvider {
     this._operationController = null;
   }
 
+  _invalidateAccountOperations() {
+    this._invalidateRepositoryNodes();
+    this._abortActiveOperation();
+    this._operationId += 1;
+    this._clearLoading();
+  }
+
   _readConnectionPresentation() {
     return connectionPresentation(this._connectionManager?.getState?.());
   }
 
   _connectionRootNodes() {
+    if (this._pendingAccountIdentity) {
+      return [createConnectionStatusNode(CONNECTION_PRESENTATIONS.CONNECTING)];
+    }
     const presentation = this._readConnectionPresentation();
     if (presentation === CONNECTION_PRESENTATIONS.CONNECTED) return null;
     if (presentation === CONNECTION_PRESENTATIONS.DISPOSED) return [];
@@ -197,6 +229,27 @@ class CloudsmithProvider {
     if (this._loadingOperationId !== operation.id) return;
     this._loadingOperationId = null;
     if (this._treeView) this._treeView.message = undefined;
+  }
+
+  _clearLoading() {
+    this._loadingOperationId = null;
+    if (this._treeView) this._treeView.message = undefined;
+  }
+
+  completeAccountReset(expectedState) {
+    if (this._disposed || !this._accountResetOrchestrated) return false;
+    const expectedIdentity = accountIdentity(expectedState);
+    const currentState = this._connectionManager?.getState?.();
+    const currentIdentity = accountIdentity(currentState);
+    if (
+      !sameAccountIdentity(expectedIdentity, currentIdentity)
+      || !sameAccountIdentity(this._pendingAccountIdentity, currentIdentity)
+    ) {
+      return false;
+    }
+    this._pendingAccountIdentity = null;
+    this._onDidChangeTreeData.fire();
+    return connectionPresentation(currentState) === CONNECTION_PRESENTATIONS.CONNECTED;
   }
 
   _projectMultipleWorkspaces(hasMultiple, operation = null) {
@@ -349,7 +402,7 @@ class CloudsmithProvider {
     this._consumeMissingCredentialsWarningSuppression();
     const connectionNodes = this._connectionRootNodes();
     if (connectionNodes) {
-      if (this._treeView) this._treeView.message = undefined;
+      this._clearLoading();
       if (connectionNodes.length > 0) await this._projectMultipleWorkspaces(false);
       return connectionNodes;
     }
@@ -420,7 +473,7 @@ class CloudsmithProvider {
     this._consumeMissingCredentialsWarningSuppression();
     const connectionNodes = this._connectionRootNodes();
     if (connectionNodes) {
-      if (this._treeView) this._treeView.message = undefined;
+      this._clearLoading();
       return connectionNodes;
     }
     const operation = this._beginOperation();
@@ -517,6 +570,31 @@ class CloudsmithProvider {
       "warning"
     );
   }
+}
+
+function accountIdentity(state) {
+  if (
+    !state
+    || typeof state.activationId !== "string"
+    || state.activationId.length === 0
+    || !Number.isSafeInteger(state.accountEpoch)
+    || state.accountEpoch < 0
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    activationId: state.activationId,
+    accountEpoch: state.accountEpoch,
+  });
+}
+
+function sameAccountIdentity(left, right) {
+  return Boolean(
+    left
+    && right
+    && left.activationId === right.activationId
+    && left.accountEpoch === right.accountEpoch
+  ) || (!left && !right);
 }
 
 function vulnerabilityEventIdentity(event) {

@@ -342,6 +342,25 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.state.pending, null);
   });
 
+  test("connected Account B cannot display Account A committed results", async () => {
+    const connectionManager = createConnectionManager();
+    let resultName = "account-a";
+    const { provider } = createProvider({
+      connectionManager,
+      fetchPage: async () => page([pkg(resultName)]),
+    });
+    await provider.search("workspace-a", "account-a");
+    assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["account-a"]);
+
+    connectionManager.update({ accountEpoch: 1 });
+    assert.strictEqual(provider.state.committed, null);
+    assert.deepStrictEqual(provider.searchResults, []);
+
+    resultName = "account-b";
+    await provider.search("workspace-a", "account-b");
+    assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["account-b"]);
+  });
+
   test("a same-epoch session disconnect aborts and suppresses root publication", async () => {
     const pending = deferred();
     const connectionManager = createConnectionManager();
