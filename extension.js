@@ -48,6 +48,9 @@ const { fetchWorkspaces, normalizedWorkspaceName } = require("./util/workspaceFe
 const { fetchWorkspaceRepositories } = require("./util/workspaceRepositoryFetcher");
 const { PaginatedFetch, replaceCollectionItems } = require("./util/paginatedFetch");
 const { packageCollectionIdentity } = require("./util/collectionIdentity");
+const {
+  connectionSetupAvailable,
+} = require("./util/connectionPresentation");
 
 let exportTerraformAbortController = null;
 let activeActivationOwner = null;
@@ -391,6 +394,11 @@ async function evictPersistedUpstreamCaches(context) {
 }
 
 async function resetAccountScopedState(context, options = {}) {
+  const reset = beginAccountScopedStateReset(options);
+  return completeAccountScopedStateReset(context, options, reset);
+}
+
+function beginAccountScopedStateReset(options = {}) {
   const synchronousInvalidators = [
     () => options.workspaceCache?.clear?.(),
     () => options.searchProvider?.clear?.(),
@@ -402,6 +410,7 @@ async function resetAccountScopedState(context, options = {}) {
     () => options.quarantineExplainProvider?.resetForAccountChange?.(),
     () => options.upstreamPreviewProvider?.resetForAccountChange?.(),
     () => options.upstreamDetailProvider?.resetForAccountChange?.(),
+    () => options.promotionProvider?.resetForAccountChange?.(),
   ];
   const syncFailures = [];
   for (const invalidate of synchronousInvalidators) {
@@ -412,10 +421,14 @@ async function resetAccountScopedState(context, options = {}) {
     }
   }
 
+  return Object.freeze({ syncFailures });
+}
+
+async function completeAccountScopedStateReset(context, options, reset) {
   // Start each fallible authority projection independently. A rejected tree or
   // context update must not retain another cache from the previous account.
   const asynchronousInvalidators = [
-    () => options.dependencyHealthProvider?.resetForAccountChange?.(),
+    () => options.dependencyHealthProvider?.resetForAccountChange?.(options.accountState),
     () => (options.projectHasMultipleWorkspaces
       ? options.projectHasMultipleWorkspaces(false)
       : setHasMultipleWorkspacesContext(context, false, {
@@ -431,8 +444,13 @@ async function resetAccountScopedState(context, options = {}) {
     }
   });
   const asyncResults = await Promise.allSettled(pending);
+  try {
+    options.cloudsmithProvider?.completeAccountReset?.(options.accountState);
+  } catch (error) {
+    reset.syncFailures.push(error);
+  }
   return Object.freeze({
-    syncFailures: Object.freeze([...syncFailures]),
+    syncFailures: Object.freeze([...reset.syncFailures]),
     asyncResults: Object.freeze(asyncResults),
   });
 }
@@ -924,6 +942,7 @@ async function activateOwned(context, own) {
     workspaceCache,
     workspaceContextProjector,
     vulnerabilityStateService,
+    accountResetOrchestrated: true,
   });
   own({ dispose: () => cloudsmithProvider.dispose() });
   const treeView = vscode.window.createTreeView("cloudsmithView", {
@@ -982,6 +1001,7 @@ async function activateOwned(context, own) {
   const dependencyHealthProvider = new DependencyHealthProvider(context, diagnosticsPublisher, {
     connectionManager,
     vulnerabilityStateService,
+    accountResetOrchestrated: true,
   });
   own(
     { dispose: () => searchProvider.dispose() },
@@ -994,19 +1014,45 @@ async function activateOwned(context, own) {
   own(dependencyTreeView);
   dependencyHealthProvider.setTreeView(dependencyTreeView);
 
-  let projectedAccountEpoch = connectionManager.getState().accountEpoch;
+  let projectedAccountIdentity = connectionManager.getState();
+  let accountResetQueue = Promise.resolve();
+  own({ dispose: () => accountResetQueue });
   let promotionProvider = null;
   let vulnerabilityProvider = null;
   let quarantineExplainProvider = null;
   let upstreamPreviewProvider = null;
   let upstreamDetailProvider = null;
-  const handleConnectionStateChange = async (state) => {
-    if (state.accountEpoch !== projectedAccountEpoch) {
-      projectedAccountEpoch = state.accountEpoch;
-      promotionProvider?.resetForAccountChange();
-      await resetAccountScopedState(context, {
+  let connectionPresentationProjection = Promise.resolve();
+  let connectionPresentationProjectionDisposed = false;
+  own({ dispose: () => { connectionPresentationProjectionDisposed = true; } });
+  const projectConnectionPresentation = (state) => {
+    const setupAvailable = connectionSetupAvailable(state);
+    const project = async () => {
+      if (connectionPresentationProjectionDisposed) return;
+      await vscode.commands.executeCommand(
+        "setContext",
+        "cloudsmith.connectionSetupAvailable",
+        setupAvailable
+      );
+    };
+    const run = connectionPresentationProjection.then(project, project);
+    connectionPresentationProjection = run.catch(() => {
+      console.warn("[Cloudsmith] Could not update the connection presentation indicator.");
+    });
+    return run;
+  };
+  const connectionSubscription = connectionManager.onDidChange(state => {
+    void projectConnectionPresentation(state).catch(() => {});
+    if (
+      state.accountEpoch !== projectedAccountIdentity.accountEpoch
+      || state.activationId !== projectedAccountIdentity.activationId
+    ) {
+      projectedAccountIdentity = state;
+      const resetOptions = {
         workspaceCache,
-        searchProvider,
+        cloudsmithProvider,
+        accountState: state,
+        promotionProvider,
         dependencyHealthProvider,
         workspaceContextProjector,
         vulnerabilityStateService,
@@ -1014,19 +1060,17 @@ async function activateOwned(context, own) {
         quarantineExplainProvider,
         upstreamPreviewProvider,
         upstreamDetailProvider,
+      };
+      const reset = beginAccountScopedStateReset(resetOptions);
+      const complete = () => completeAccountScopedStateReset(context, resetOptions, reset);
+      const run = accountResetQueue.then(complete, complete);
+      accountResetQueue = run.catch(() => {
+        console.warn("[Cloudsmith] Could not refresh all account-scoped state.");
       });
     }
-
-    cloudsmithProvider.refresh({ suppressMissingCredentialsWarning: !state.credentialPresent });
-    searchProvider.refresh();
-    dependencyHealthProvider.refresh();
-  };
-  const connectionSubscription = connectionManager.onDidChange(state => {
-    void handleConnectionStateChange(state).catch(() => {
-      console.warn("[Cloudsmith] Could not refresh all account-scoped state.");
-    });
   });
   own(connectionSubscription);
+  void projectConnectionPresentation(connectionManager.getState()).catch(() => {});
 
   // Create vulnerability WebView provider
   vulnerabilityProvider = new VulnerabilityProvider(context, {
@@ -1114,27 +1158,39 @@ async function activateOwned(context, own) {
     return result;
   }
 
-  const initializationResult = await connectionManager.initialize();
-  await handleAuthenticationResult(initializationResult, {
-    showSuccess: false,
-    offerDefault: false,
-    reportFailure: false,
+  let initializationFollowUpDisposed = false;
+  let cliAutoDetectTimer = null;
+  own({
+    dispose() {
+      initializationFollowUpDisposed = true;
+      if (cliAutoDetectTimer) clearTimeout(cliAutoDetectTimer);
+    },
   });
-
-  // Auto-detect Cloudsmith CLI credentials on activation.
-  // If no API key is stored but CLI credentials exist, offer to import them.
-  const cliAutoDetectTimer = setTimeout(() => {
-    void runCLIAutoDetect({
-      connectionManager,
-      secrets: context.secrets,
-      ssoManager,
-      showInformationMessage: (...args) => vscode.window.showInformationMessage(...args),
-      handleAuthenticationResult,
-    }).catch(() => {
-      console.warn("[Cloudsmith] CLI credential auto-detection failed.");
+  const initialization = connectionManager.initialize();
+  void initialization.then(async result => {
+    await handleAuthenticationResult(result, {
+      showSuccess: false,
+      offerDefault: false,
+      reportFailure: false,
     });
-  }, 3000);
-  own({ dispose: () => clearTimeout(cliAutoDetectTimer) });
+    if (initializationFollowUpDisposed) return;
+
+    // Auto-detect Cloudsmith CLI credentials after the initial stored state settles.
+    cliAutoDetectTimer = setTimeout(() => {
+      if (initializationFollowUpDisposed) return;
+      void runCLIAutoDetect({
+        connectionManager,
+        secrets: context.secrets,
+        ssoManager,
+        showInformationMessage: (...args) => vscode.window.showInformationMessage(...args),
+        handleAuthenticationResult,
+      }).catch(() => {
+        console.warn("[Cloudsmith] CLI credential auto-detection failed.");
+      });
+    }, 3000);
+  }).catch(() => {
+    console.warn("[Cloudsmith] Connection initialization did not complete cleanly.");
+  });
 
   // register general commands. Will move this over to command Manager in future release.
   own(

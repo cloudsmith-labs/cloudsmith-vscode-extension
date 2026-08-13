@@ -55,6 +55,7 @@ suite("DependencyHealthProvider Test Suite", () => {
         return Object.freeze({
           activationId: this.activationId,
           accountEpoch: 1,
+          credentialPresent: connected,
           sessionConnected: connected,
           status: connected ? "connected" : "absent",
         });
@@ -610,6 +611,196 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.deepStrictEqual(diagnostics.current, []);
   });
 
+  test("connected Account B cannot inherit Account A dependency health results", async () => {
+    let accountEpoch = 1;
+    const listeners = new Set();
+    const contextReset = deferred();
+    let holdContexts = false;
+    const connectionManager = {
+      getState() {
+        return Object.freeze({
+          activationId: "dependency-account-switch",
+          accountEpoch,
+          credentialPresent: true,
+          sessionConnected: true,
+          status: "connected",
+        });
+      },
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      updateEpoch(nextEpoch) {
+        accountEpoch = nextEpoch;
+        const state = this.getState();
+        for (const listener of listeners) listener(state);
+      },
+    };
+    const diagnostics = createDiagnosticsPublisher();
+    const provider = new DependencyHealthProvider(createContext(), diagnostics, {
+      connectionManager,
+      accountResetOrchestrated: true,
+      executeCommand: async () => {
+        if (holdContexts) await contextReset.promise;
+      },
+    });
+    installScanSteps(provider, [{ name: "account-a-result" }, { name: "account-b-result" }]);
+    await provider.scan("workspace-a", "repo-a", "/project-a");
+    assert.strictEqual(provider.dependencies[0].name, "account-a-result");
+
+    holdContexts = true;
+    connectionManager.updateEpoch(2);
+    assert.deepStrictEqual(provider.dependencies, []);
+    assert.strictEqual(provider.hasSuccessfulScan(), false);
+    assert.strictEqual(
+      (await provider.getChildren())[0].getTreeItem().label,
+      "Connecting to Cloudsmith..."
+    );
+    const reset = provider.resetForAccountChange(connectionManager.getState());
+    contextReset.resolve();
+    await reset;
+    assert.strictEqual((await provider.getChildren())[0].getTreeItem().label, "Scan dependencies");
+
+    await provider.scan("workspace-b", "repo-b", "/project-b");
+    assert.strictEqual(provider.dependencies[0].name, "account-b-result");
+    assert.deepStrictEqual(diagnostics.current.dependencies, ["account-b-result"]);
+  });
+
+  test("account-reset context failure releases the pending connection root", async () => {
+    let accountEpoch = 1;
+    let rejectContexts = false;
+    const listeners = new Set();
+    const connectionManager = {
+      getState: () => Object.freeze({
+        activationId: "dependency-context-failure",
+        accountEpoch,
+        credentialPresent: true,
+        sessionConnected: true,
+        status: "connected",
+      }),
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      updateEpoch(nextEpoch) {
+        accountEpoch = nextEpoch;
+        for (const listener of listeners) listener(this.getState());
+      },
+    };
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      connectionManager,
+      accountResetOrchestrated: true,
+      executeCommand: async () => {
+        if (rejectContexts) throw new Error("context projection failed");
+      },
+    });
+    connectionManager.updateEpoch(2);
+    assert.strictEqual(
+      (await provider.getChildren())[0].getTreeItem().label,
+      "Connecting to Cloudsmith..."
+    );
+
+    rejectContexts = true;
+    await assert.rejects(
+      provider.resetForAccountChange(connectionManager.getState()),
+      /context projection failed/
+    );
+    assert.strictEqual((await provider.getChildren())[0].getTreeItem().label, "Scan dependencies");
+  });
+
+  test("stale Account B reset completion cannot mutate pending Account C", async () => {
+    let accountEpoch = 1;
+    const listeners = new Set();
+    const connectionManager = {
+      getState: () => Object.freeze({
+        activationId: "dependency-overlap",
+        accountEpoch,
+        credentialPresent: true,
+        sessionConnected: true,
+        status: "connected",
+      }),
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      updateEpoch(nextEpoch) {
+        accountEpoch = nextEpoch;
+        for (const listener of listeners) listener(this.getState());
+      },
+    };
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      connectionManager,
+      accountResetOrchestrated: true,
+      executeCommand: async () => {},
+    });
+    connectionManager.updateEpoch(2);
+    const accountB = connectionManager.getState();
+    connectionManager.updateEpoch(3);
+    const accountC = connectionManager.getState();
+    const generation = provider._nextScanOperationId;
+
+    await provider.resetForAccountChange(accountB);
+    assert.strictEqual(provider._nextScanOperationId, generation);
+    assert.strictEqual(
+      (await provider.getChildren())[0].getTreeItem().label,
+      "Connecting to Cloudsmith..."
+    );
+
+    await provider.resetForAccountChange(accountC);
+    assert.strictEqual((await provider.getChildren())[0].getTreeItem().label, "Scan dependencies");
+  });
+
+  test("pending account reset blocks stale dependency pull commands", async () => {
+    let accountEpoch = 1;
+    let prepareCalls = 0;
+    let runCalls = 0;
+    const listeners = new Set();
+    const connectionManager = {
+      getState: () => Object.freeze({
+        activationId: "dependency-pull-switch",
+        accountEpoch,
+        credentialPresent: true,
+        sessionConnected: true,
+        status: "connected",
+      }),
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      updateEpoch(nextEpoch) {
+        accountEpoch = nextEpoch;
+        for (const listener of listeners) listener(this.getState());
+      },
+    };
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      connectionManager,
+      accountResetOrchestrated: true,
+      upstreamPullService: {
+        async prepareSingle() { prepareCalls += 1; },
+        async run() { runCalls += 1; },
+      },
+    });
+    provider.lastWorkspace = "workspace-a";
+    provider.lastRepo = "repo-a";
+    provider._fullTrees = [{ dependencies: [createProblemDependency(
+      "account-a-package",
+      "1.0.0",
+      "/project/package.json"
+    )] }];
+    connectionManager.updateEpoch(2);
+
+    await provider.pullSingleDependency({
+      name: "account-a-package",
+      version: "1.0.0",
+      format: "npm",
+      ecosystem: "npm",
+    });
+    await provider.pullDependencies();
+
+    assert.strictEqual(prepareCalls, 0);
+    assert.strictEqual(runCalls, 0);
+  });
+
   test("successful rescan leaves prior results visible while running and replaces them on commit", async () => {
     const diagnostics = createDiagnosticsPublisher();
     const provider = new DependencyHealthProvider(createContext(), diagnostics);
@@ -1065,6 +1256,78 @@ suite("DependencyHealthProvider Test Suite", () => {
 
     assert.strictEqual(nodes.length, 1);
     assert.strictEqual(nodes[0].getTreeItem().label, "Connect to Cloudsmith");
+  });
+
+  test("projects startup and terminal connection states through its owned refresh path", async () => {
+    const listeners = new Set();
+    let state = Object.freeze({
+      activationId: "dependency-presentation",
+      accountEpoch: 1,
+      credentialPresent: null,
+      sessionConnected: false,
+      status: "indeterminate",
+      error: null,
+    });
+    const connectionManager = {
+      getState: () => state,
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      update(next) {
+        state = Object.freeze({ ...state, ...next });
+        for (const listener of listeners) listener(state);
+      },
+    };
+    const provider = new DependencyHealthProvider(createContext(), null, { connectionManager });
+    let refreshes = 0;
+    provider.onDidChangeTreeData(() => { refreshes += 1; });
+
+    let item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connecting to Cloudsmith...");
+    assert.strictEqual(item.command, undefined);
+
+    connectionManager.update({ status: "validating", credentialPresent: true });
+    assert.strictEqual(refreshes, 0);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connecting to Cloudsmith...");
+    assert.strictEqual(JSON.stringify(item).includes("Set up Cloudsmith authentication"), false);
+
+    connectionManager.update({ status: "failed", credentialPresent: true });
+    assert.strictEqual(refreshes, 1);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connection failed");
+
+    connectionManager.update({ status: "absent", credentialPresent: false });
+    assert.strictEqual(refreshes, 2);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connect to Cloudsmith");
+
+    connectionManager.update({
+      status: "connected",
+      credentialPresent: true,
+      sessionConnected: true,
+    });
+    assert.strictEqual(refreshes, 3);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Scan dependencies");
+
+    const staleChild = { getChildren: () => ["private result"] };
+    connectionManager.update({
+      status: "indeterminate",
+      credentialPresent: null,
+      sessionConnected: false,
+      error: { message: "SecretStorage csa_secret" },
+    });
+    assert.deepStrictEqual(await provider.getChildren(staleChild), []);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Could not check the connection");
+    assert.strictEqual(JSON.stringify(item).includes("csa_secret"), false);
+
+    provider.dispose();
+    connectionManager.update({ status: "disposed" });
+    assert.strictEqual(refreshes, 4);
+    assert.deepStrictEqual(await provider.getChildren(), []);
   });
 
   test("_performScan projects canonical adapter records into the compatibility tree", async () => {

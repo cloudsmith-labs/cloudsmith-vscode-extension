@@ -342,6 +342,25 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.state.pending, null);
   });
 
+  test("connected Account B cannot display Account A committed results", async () => {
+    const connectionManager = createConnectionManager();
+    let resultName = "account-a";
+    const { provider } = createProvider({
+      connectionManager,
+      fetchPage: async () => page([pkg(resultName)]),
+    });
+    await provider.search("workspace-a", "account-a");
+    assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["account-a"]);
+
+    connectionManager.update({ accountEpoch: 1 });
+    assert.strictEqual(provider.state.committed, null);
+    assert.deepStrictEqual(provider.searchResults, []);
+
+    resultName = "account-b";
+    await provider.search("workspace-a", "account-b");
+    assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["account-b"]);
+  });
+
   test("a same-epoch session disconnect aborts and suppresses root publication", async () => {
     const pending = deferred();
     const connectionManager = createConnectionManager();
@@ -351,7 +370,11 @@ suite("SearchProvider atomic search state", () => {
     });
     const search = provider.search("workspace-a", "slow");
 
-    connectionManager.update({ sessionConnected: false, status: "absent" });
+    connectionManager.update({
+      credentialPresent: false,
+      sessionConnected: false,
+      status: "absent",
+    });
     pending.resolve(page([pkg("stale")]));
     await search;
 
@@ -411,6 +434,7 @@ suite("SearchProvider atomic search state", () => {
   test("does not dispatch a search while disconnected", async () => {
     let fetches = 0;
     const connectionManager = createConnectionManager({
+      credentialPresent: false,
       sessionConnected: false,
       status: "absent",
     });
@@ -1749,15 +1773,75 @@ suite("SearchProvider atomic search state", () => {
   });
 
   test("idle tree derives connection state from the shared manager", async () => {
-    const connectionManager = createConnectionManager({ accountEpoch: 0, sessionConnected: false });
+    const connectionManager = createConnectionManager({
+      accountEpoch: 0,
+      credentialPresent: false,
+      sessionConnected: false,
+      status: "absent",
+    });
     const { provider } = createProvider({ connectionManager });
 
     let nodes = await provider.getChildren();
     assert.strictEqual(nodes[0].getTreeItem().label, "Connect to Cloudsmith");
 
-    connectionManager.update({ accountEpoch: 0, sessionConnected: true });
+    connectionManager.update({
+      accountEpoch: 0,
+      credentialPresent: true,
+      sessionConnected: true,
+      status: "connected",
+    });
     nodes = await provider.getChildren();
     assert.strictEqual(nodes[0].getTreeItem().label, "Search packages across a Cloudsmith workspace");
+  });
+
+  test("projects connection states distinctly and refreshes on terminal resolution", async () => {
+    const connectionManager = createConnectionManager({
+      credentialPresent: null,
+      sessionConnected: false,
+      status: "indeterminate",
+      error: null,
+    });
+    const { provider } = createProvider({ connectionManager });
+    let refreshes = 0;
+    provider.onDidChangeTreeData(() => { refreshes += 1; });
+
+    let item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connecting to Cloudsmith...");
+    assert.strictEqual(item.command, undefined);
+    assert.deepStrictEqual(
+      await provider.getChildren({ getChildren: () => ["private result"] }),
+      []
+    );
+
+    connectionManager.update({ status: "validating", credentialPresent: true });
+    assert.strictEqual(refreshes, 0, "equivalent startup presentation should not refresh twice");
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connecting to Cloudsmith...");
+    assert.strictEqual(JSON.stringify(item).includes("Set up Cloudsmith authentication"), false);
+
+    connectionManager.update({ status: "failed", credentialPresent: true });
+    assert.strictEqual(refreshes, 1);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connection failed");
+
+    connectionManager.update({ status: "absent", credentialPresent: false });
+    assert.strictEqual(refreshes, 2);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Connect to Cloudsmith");
+
+    connectionManager.update({
+      status: "connected",
+      credentialPresent: true,
+      sessionConnected: true,
+    });
+    assert.strictEqual(refreshes, 3);
+    item = (await provider.getChildren())[0].getTreeItem();
+    assert.strictEqual(item.label, "Search packages across a Cloudsmith workspace");
+
+    provider.dispose();
+    connectionManager.update({ status: "disposed", sessionConnected: false });
+    assert.strictEqual(refreshes, 3);
+    assert.deepStrictEqual(await provider.getChildren(), []);
   });
 
   function createProvider(options = {}) {
@@ -1795,8 +1879,10 @@ function createConnectionManager(initial = {}) {
   let state = Object.freeze({
     activationId: "activation-a",
     accountEpoch: 0,
+    credentialPresent: true,
     sessionConnected: true,
     status: "connected",
+    error: null,
     ...initial,
   });
   const listeners = new Set();

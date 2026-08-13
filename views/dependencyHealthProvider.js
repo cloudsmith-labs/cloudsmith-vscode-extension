@@ -49,7 +49,12 @@ const DependencyHealthNode = require("../models/dependencyHealthNode");
 const DependencySourceGroupNode = require("../models/dependencySourceGroupNode");
 const DependencySummaryNode = require("../models/dependencySummaryNode");
 const InfoNode = require("../models/infoNode");
+const { createConnectionStatusNode } = require("../models/connectionStatusNode");
 const { getConnectionManager } = require("../util/connectionManager");
+const {
+  CONNECTION_PRESENTATIONS,
+  connectionPresentation,
+} = require("../util/connectionPresentation");
 const { packageCollectionIdentity } = require("../util/collectionIdentity");
 
 const DEFAULT_MAX_DEPENDENCIES_TO_SCAN = 10000;
@@ -164,6 +169,31 @@ class DependencyHealthProvider {
     this._dependencyOperationRunning = false;
     this._scanOperation = createScanOperation(SCAN_STATES.IDLE, 0);
     this._hasSuccessfulScan = false;
+    this._accountResetOrchestrated = options.accountResetOrchestrated === true;
+    this._accountIdentity = accountIdentity(this._connectionManager?.getState?.());
+    this._pendingAccountIdentity = null;
+    this._connectionPresentation = connectionPresentation(
+      this._connectionManager?.getState?.()
+    );
+    this._connectionSubscription = this._connectionManager?.onDidChange?.(state => {
+      const nextIdentity = accountIdentity(state);
+      const identityChanged = !sameAccountIdentity(nextIdentity, this._accountIdentity);
+      const nextPresentation = connectionPresentation(state);
+      const presentationChanged = nextPresentation !== this._connectionPresentation;
+      this._accountIdentity = nextIdentity;
+      this._connectionPresentation = nextPresentation;
+      if (identityChanged && this._accountResetOrchestrated) {
+        this._pendingAccountIdentity = nextIdentity;
+        this._invalidateAccountState();
+        this.refresh();
+        return;
+      }
+      if (identityChanged) {
+        void this.resetForAccountChange(state).catch(() => {});
+        return;
+      }
+      if (presentationChanged) this.refresh();
+    }) || null;
 
     this._updateContexts();
   }
@@ -260,7 +290,7 @@ class DependencyHealthProvider {
     };
   }
 
-  async resetForAccountChange() {
+  _invalidateAccountState() {
     this._nextScanOperationId += 1;
     if (this._activeScanCancellation) {
       this._activeScanCancellation.cancel();
@@ -285,8 +315,35 @@ class DependencyHealthProvider {
     if (this._diagnosticsPublisher) {
       this._diagnosticsPublisher.clear();
     }
-    await this._updateContexts();
-    this.refresh();
+  }
+
+  async resetForAccountChange(expectedState = null) {
+    const expectedIdentity = accountIdentity(expectedState);
+    if (
+      this._accountResetOrchestrated
+      && !sameAccountIdentity(expectedIdentity, this._pendingAccountIdentity)
+    ) {
+      return;
+    }
+    const alreadyInvalidated = this._accountResetOrchestrated
+      && sameAccountIdentity(expectedIdentity, this._pendingAccountIdentity);
+    if (!alreadyInvalidated) this._invalidateAccountState();
+    try {
+      await this._updateContexts();
+    } finally {
+      if (this._accountResetOrchestrated) {
+        const currentIdentity = accountIdentity(this._connectionManager?.getState?.());
+        if (
+          sameAccountIdentity(expectedIdentity, currentIdentity)
+          && sameAccountIdentity(this._pendingAccountIdentity, currentIdentity)
+        ) {
+          this._pendingAccountIdentity = null;
+          this.refresh();
+        }
+      } else {
+        this.refresh();
+      }
+    }
   }
 
   async setViewMode(mode) {
@@ -453,6 +510,7 @@ class DependencyHealthProvider {
 
   async scan(cloudsmithWorkspace, cloudsmithRepo, projectFolder) {
     if (this._disposed) return { status: "blocked" };
+    if (this._pendingAccountIdentity) return { status: "blocked" };
     if (this._dependencyOperationRunning) {
       this._userInteraction.showWarningMessage("Wait for the current dependency operation to finish.");
       return { status: "blocked" };
@@ -1439,6 +1497,7 @@ class DependencyHealthProvider {
 
   async pullDependencies() {
     if (this._disposed) return;
+    if (this._pendingAccountIdentity) return;
     if (this.isScanRunning() || this._dependencyOperationRunning) {
       this._userInteraction.showWarningMessage("Wait for the current dependency operation to finish.");
       return;
@@ -1545,6 +1604,7 @@ class DependencyHealthProvider {
 
   async pullSingleDependency(item) {
     if (this._disposed) return;
+    if (this._pendingAccountIdentity) return;
     if (this.isScanRunning() || this._dependencyOperationRunning) {
       this._userInteraction.showWarningMessage("Wait for the current dependency operation to finish.");
       return;
@@ -1824,9 +1884,19 @@ class DependencyHealthProvider {
   }
 
   async getChildren(element) {
-    if (element) {
-      return element.getChildren();
+    if (this._disposed) return [];
+    if (this._pendingAccountIdentity) {
+      if (element) return [];
+      return [createConnectionStatusNode(CONNECTION_PRESENTATIONS.CONNECTING)];
     }
+    const presentation = connectionPresentation(this._connectionManager?.getState?.());
+    if (presentation !== CONNECTION_PRESENTATIONS.CONNECTED) {
+      if (element || presentation === CONNECTION_PRESENTATIONS.DISPOSED) return [];
+      const node = createConnectionStatusNode(presentation);
+      return node ? [node] : [];
+    }
+
+    if (element) return element.getChildren();
 
     const operationNode = this._getScanOperationNode();
     if (operationNode && !this._hasSuccessfulScan) {
@@ -1874,20 +1944,6 @@ class DependencyHealthProvider {
     }
 
     if (!this._hasSuccessfulScan && this._scanOperation.status === SCAN_STATES.IDLE) {
-      const state = this._connectionManager && this._connectionManager.getState();
-      if (!state || !state.sessionConnected) {
-        return [
-          new InfoNode(
-            "Connect to Cloudsmith",
-            "Use the key icon above to set up authentication.",
-            "Set up Cloudsmith authentication to get started.",
-            "plug",
-            undefined,
-            { command: "cloudsmith-vsc.configureCredentials", title: "Set up authentication" }
-          ),
-        ];
-      }
-
       return [
         new InfoNode(
           "Scan dependencies",
@@ -2035,6 +2091,7 @@ class DependencyHealthProvider {
     if (this._disposed) return;
     this._disposed = true;
     this._vulnerabilityStateSubscription?.dispose?.();
+    this._connectionSubscription?.dispose?.();
     for (const subscription of this._treeExpansionSubscriptions) subscription.dispose?.();
     this._vulnerabilitySummaries.clear();
     this._clearVulnerabilityRefreshTimers();
@@ -2069,6 +2126,31 @@ class DependencyHealthProvider {
     });
     this.dependencies = this._displayTrees.flatMap((tree) => tree.dependencies);
   }
+}
+
+function accountIdentity(state) {
+  if (
+    !state
+    || typeof state.activationId !== "string"
+    || state.activationId.length === 0
+    || !Number.isSafeInteger(state.accountEpoch)
+    || state.accountEpoch < 0
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    activationId: state.activationId,
+    accountEpoch: state.accountEpoch,
+  });
+}
+
+function sameAccountIdentity(left, right) {
+  return Boolean(
+    left
+    && right
+    && left.activationId === right.activationId
+    && left.accountEpoch === right.accountEpoch
+  ) || (!left && !right);
 }
 
 function normalizeRepositoryCollection(value) {

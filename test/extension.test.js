@@ -91,7 +91,7 @@ suite("Extension Test Suite", () => {
     assert.deepStrictEqual(titleScanCommands, [{
       command: "cloudsmith-vsc.scanDependencies",
       group: "navigation@1",
-      when: "view == cloudsmithDependencyHealthView && !cloudsmith.depOperationRunning",
+      when: "view == cloudsmithDependencyHealthView && cloudsmith.connected && !cloudsmith.depOperationRunning",
     }]);
 
     const changeScopeEntry = manifest.contributes.menus["view/title"].find(
@@ -100,7 +100,30 @@ suite("Extension Test Suite", () => {
     assert.deepStrictEqual(changeScopeEntry, {
       command: "cloudsmith-vsc.changeDependencyScanScope",
       group: "navigation@1.5",
-      when: "view == cloudsmithDependencyHealthView && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning",
+      when: "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning",
     });
+  });
+
+  test("connection-sensitive title actions do not infer absence while initializing", () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+    const titleEntries = manifest.contributes.menus["view/title"];
+    const setupCommands = new Set([
+      "cloudsmith-vsc.connectCloudsmith",
+      "cloudsmith-vsc.configureCredentials",
+      "cloudsmith-vsc.ssoLogin",
+    ]);
+    const setupEntries = titleEntries.filter(entry => setupCommands.has(entry.command));
+    assert.strictEqual(setupEntries.length, 3);
+    for (const entry of setupEntries) {
+      assert.match(entry.when, /cloudsmith\.connectionSetupAvailable/);
+      assert.match(entry.when, /!cloudsmith\.connected/);
+    }
+
+    for (const entry of titleEntries.filter(entry => (
+      entry.when?.includes("view == cloudsmithSearchView")
+      || entry.command === "cloudsmith-vsc.scanDependencies"
+    ))) {
+      assert.match(entry.when, /cloudsmith\.connected/);
+    }
   });
 });

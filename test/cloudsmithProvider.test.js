@@ -44,15 +44,26 @@ function deferred() {
 }
 
 function createConnectionManager(overrides = {}) {
+  const listeners = new Set();
   let state = {
     activationId: "activation-a",
     accountEpoch: 1,
+    credentialPresent: true,
     sessionConnected: true,
+    status: "connected",
+    error: null,
     ...overrides,
   };
   return {
     getState() { return Object.freeze({ ...state }); },
-    setState(next) { state = { ...state, ...next }; },
+    setState(next) {
+      state = { ...state, ...next };
+      for (const listener of listeners) listener(Object.freeze({ ...state }));
+    },
+    onDidChange(listener) {
+      listeners.add(listener);
+      return { dispose() { listeners.delete(listener); } };
+    },
   };
 }
 
@@ -120,7 +131,11 @@ suite("CloudsmithProvider", () => {
   }
 
   test("fails closed to the signed-out root without making an API request", async () => {
-    manager.setState({ sessionConnected: false });
+    manager.setState({
+      credentialPresent: false,
+      sessionConnected: false,
+      status: "absent",
+    });
     let requests = 0;
     const provider = createProvider(async () => { requests += 1; });
     const treeView = { message: "old" };
@@ -136,6 +151,202 @@ suite("CloudsmithProvider", () => {
       && call[1] === "cloudsmith.hasMultipleWorkspaces"
       && call[2] === false
     )));
+  });
+
+  test("projects startup and terminal connection states without API work", async () => {
+    manager.setState({
+      credentialPresent: null,
+      sessionConnected: false,
+      status: "indeterminate",
+      error: null,
+    });
+    let apiCalls = 0;
+    const provider = createProvider(async () => {
+      apiCalls += 1;
+      return apiSuccess([]);
+    });
+    assert.deepStrictEqual(
+      await provider.getChildren({ getChildren: () => ["private result"] }),
+      []
+    );
+    const cases = [
+      [{ status: "indeterminate", credentialPresent: null, error: null }, "Connecting to Cloudsmith...", null],
+      [{ status: "validating", credentialPresent: true, error: null }, "Connecting to Cloudsmith...", null],
+      [{ status: "absent", credentialPresent: false, error: null }, "Connect to Cloudsmith", "cloudsmith-vsc.configureCredentials"],
+      [{ status: "failed", credentialPresent: true, error: { message: "unsafe raw detail" } }, "Connection failed", "cloudsmith-vsc.configureCredentials"],
+      [{ status: "indeterminate", credentialPresent: null, error: { message: "SecretStorage csa_secret" } }, "Could not check the connection", "cloudsmith-vsc.connectCloudsmith"],
+    ];
+    for (const [state, label, command] of cases) {
+      manager.setState({ ...state, sessionConnected: false });
+      const item = (await provider.getChildren())[0].getTreeItem();
+      assert.strictEqual(item.label, label);
+      assert.strictEqual(item.command?.command || null, command);
+      if (label !== "Connect to Cloudsmith") {
+        assert.strictEqual(JSON.stringify(item).includes("Set up Cloudsmith authentication"), false);
+      }
+      assert.strictEqual(JSON.stringify(item).includes("csa_secret"), false);
+    }
+    manager.setState({ status: "disposed", credentialPresent: null, sessionConnected: false });
+    assert.deepStrictEqual(await provider.getChildren(), []);
+    assert.strictEqual(apiCalls, 0);
+    provider.dispose();
+    assert.deepStrictEqual(await provider.getChildren(), []);
+  });
+
+  test("refreshes from validating to connected and only then starts workspace loading", async () => {
+    manager.setState({ status: "validating", credentialPresent: true, sessionConnected: false });
+    let fetches = 0;
+    const provider = createProvider(async () => apiSuccess([]), {
+      fetchWorkspaces: async () => {
+        fetches += 1;
+        return collectionResult([]);
+      },
+    });
+    let refreshes = 0;
+    provider.onDidChangeTreeData(() => { refreshes += 1; });
+
+    assert.strictEqual((await provider.getChildren())[0].getTreeItem().label, "Connecting to Cloudsmith...");
+    assert.strictEqual(fetches, 0);
+    manager.setState({ status: "connected", credentialPresent: true, sessionConnected: true });
+    assert.strictEqual(refreshes, 1);
+    await provider.getChildren();
+    assert.strictEqual(fetches, 1);
+    provider.dispose();
+    manager.setState({ status: "absent", credentialPresent: false, sessionConnected: false });
+    assert.strictEqual(refreshes, 1);
+    assert.deepStrictEqual(await provider.getChildren(), []);
+  });
+
+  test("waits for an orchestrated account reset before refreshing connected Account B", async () => {
+    const fetchedEpochs = [];
+    const provider = createProvider(async () => { throw new Error("not used"); }, {
+      accountResetOrchestrated: true,
+      fetchWorkspaces: async () => {
+        const epoch = manager.getState().accountEpoch;
+        fetchedEpochs.push(epoch);
+        return collectionResult([{
+          slug: `workspace-${epoch}`,
+          name: `Workspace ${epoch}`,
+        }]);
+      },
+    });
+    let refreshes = 0;
+    provider.onDidChangeTreeData(() => { refreshes += 1; });
+
+    const accountANodes = await provider.getWorkspaces();
+    assert.strictEqual(accountANodes[0].workspace, "workspace-1");
+    manager.setState({ accountEpoch: 2 });
+    assert.strictEqual(refreshes, 1, "Account A must disappear immediately");
+    assert.strictEqual(
+      (await provider.getChildren())[0].getTreeItem().label,
+      "Connecting to Cloudsmith..."
+    );
+    assert.deepStrictEqual(fetchedEpochs, [1], "Account B must not load before reset");
+
+    provider._workspaceCache.clear();
+    assert.strictEqual(provider.completeAccountReset(manager.getState()), true);
+    assert.strictEqual(refreshes, 2);
+    const accountBNodes = await provider.getWorkspaces();
+    assert.strictEqual(accountBNodes[0].workspace, "workspace-2");
+    assert.deepStrictEqual(fetchedEpochs, [1, 2]);
+  });
+
+  test("an Account A fetch cannot publish after an orchestrated Account B switch", async () => {
+    const accountA = deferred();
+    let fetchStarted = false;
+    const provider = createProvider(async () => { throw new Error("not used"); }, {
+      accountResetOrchestrated: true,
+      fetchWorkspaces: async () => {
+        fetchStarted = true;
+        return accountA.promise;
+      },
+    });
+    const pending = provider.getWorkspaces();
+    while (!fetchStarted) await new Promise(resolve => setImmediate(resolve));
+
+    manager.setState({ accountEpoch: 2 });
+    accountA.resolve(collectionResult([{ slug: "account-a", name: "Account A" }]));
+
+    assert.deepStrictEqual(await pending, []);
+    assert.strictEqual(
+      (await provider.getChildren())[0].getTreeItem().label,
+      "Connecting to Cloudsmith..."
+    );
+  });
+
+  test("refreshes an account identity change when no external reset orchestrator is used", () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    let refreshes = 0;
+    provider.onDidChangeTreeData(() => { refreshes += 1; });
+
+    manager.setState({ accountEpoch: 2 });
+
+    assert.strictEqual(refreshes, 1);
+  });
+
+  test("connection roots supersede loading ownership for connecting, absent, and failed", async () => {
+    const cases = [
+      [{ status: "validating", credentialPresent: true }, "Connecting to Cloudsmith..."],
+      [{ status: "absent", credentialPresent: false }, "Connect to Cloudsmith"],
+      [{ status: "failed", credentialPresent: true }, "Connection failed"],
+    ];
+    for (const [state, expectedLabel] of cases) {
+      manager = createConnectionManager();
+      const response = deferred();
+      const provider = createProvider(async () => { throw new Error("not used"); }, {
+        fetchWorkspaces: async () => response.promise,
+      });
+      const treeView = {};
+      provider.setTreeView(treeView);
+      const oldLoad = provider.getWorkspaces();
+      assert.strictEqual(treeView.message, "Loading...");
+
+      manager.setState({ ...state, sessionConnected: false });
+      assert.strictEqual(treeView.message, undefined);
+      assert.strictEqual(provider._loadingOperationId, null);
+      assert.strictEqual((await provider.getChildren())[0].getTreeItem().label, expectedLabel);
+
+      response.resolve(collectionResult([{ slug: "old", name: "Old" }]));
+      assert.deepStrictEqual(await oldLoad, []);
+      assert.strictEqual(treeView.message, undefined);
+      assert.strictEqual(provider._loadingOperationId, null);
+      provider.dispose();
+    }
+  });
+
+  test("a stale operation finally cannot clear a newer loading operation", async () => {
+    const accountA = deferred();
+    const accountB = deferred();
+    let fetches = 0;
+    const provider = createProvider(async () => { throw new Error("not used"); }, {
+      fetchWorkspaces: async () => {
+        fetches += 1;
+        return fetches === 1 ? accountA.promise : accountB.promise;
+      },
+    });
+    const treeView = {};
+    provider.setTreeView(treeView);
+    const operationA = provider.getWorkspaces();
+    assert.strictEqual(treeView.message, "Loading...");
+    while (fetches === 0) await new Promise(resolve => setImmediate(resolve));
+
+    manager.setState({ status: "validating", sessionConnected: false });
+    assert.strictEqual(treeView.message, undefined);
+    manager.setState({ status: "connected", sessionConnected: true });
+    const operationB = provider.getWorkspaces();
+    const operationBLoadingId = provider._loadingOperationId;
+    assert.strictEqual(treeView.message, "Loading...");
+
+    accountA.resolve(collectionResult([{ slug: "account-a", name: "Account A" }]));
+    assert.deepStrictEqual(await operationA, []);
+    assert.strictEqual(provider._loadingOperationId, operationBLoadingId);
+    assert.strictEqual(treeView.message, "Loading...");
+
+    accountB.resolve(collectionResult([{ slug: "account-b", name: "Account B" }]));
+    const nodes = await operationB;
+    assert.strictEqual(nodes[0].workspace, "account-b");
+    assert.strictEqual(provider._loadingOperationId, null);
+    assert.strictEqual(treeView.message, undefined);
   });
 
   test("reports malformed workspace payloads as load failures", async () => {
