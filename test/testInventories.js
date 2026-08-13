@@ -83,6 +83,7 @@ const VSCODE_SMOKE_TESTS = Object.freeze([
 ]);
 
 const LIVE_TESTS = Object.freeze([
+  "test/integration/policyDecisionLogs.test.js",
   "test/integration/search.test.js",
   "test/integration/upstreams.test.js",
   "test/integration/vulnerabilities.test.js",

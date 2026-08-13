@@ -107,22 +107,23 @@ function recentPackageIdentity(normalized) {
     || normalized.name.length === 0
     || typeof normalized.workspace !== "string"
     || typeof normalized.repository !== "string"
+    || typeof normalized.packageIdentifier !== "string"
+    || normalized.packageIdentifier.length === 0
     || !normalized.versionValid
   ) {
     return null;
   }
   return JSON.stringify([
     normalized.workspace,
-    normalized.name,
-    normalized.version,
     normalized.repository,
+    normalized.packageIdentifier,
   ]);
 }
 
 /**
  * Add a package to the recent list.
  * Workspace and repository may use their current or compatibility aliases. Only
- * records with a canonical workspace/repository/name/version tuple are deduplicated.
+ * records with a canonical workspace/repository/package identity are deduplicated.
  * @param {Object} pkg Must have a non-empty name and a supported version shape.
  */
 function add(pkg) {
@@ -132,11 +133,10 @@ function add(pkg) {
   const normalized = normalizeRecentPackage(pkg);
   if (!normalized.versionValid) return;
   const key = recentPackageIdentity(normalized);
-  if (key !== null) {
-    for (let index = _recent.length - 1; index >= 0; index -= 1) {
-      if (recentPackageIdentity(normalizeRecentPackage(_recent[index])) === key) {
-        _recent.splice(index, 1);
-      }
+  if (key === null) return;
+  for (let index = _recent.length - 1; index >= 0; index -= 1) {
+    if (recentPackageIdentity(normalizeRecentPackage(_recent[index])) === key) {
+      _recent.splice(index, 1);
     }
   }
   const rawTags = getRawTags(pkg);
@@ -164,6 +164,8 @@ function add(pkg) {
     cdn_url: getNestedField(pkg, "cdn_url") || null,
     filename: getNestedField(pkg, "filename") || null,
     status_str: unwrapValue(pkg.status_str) || pkg.status_str_raw || getNestedField(pkg, "status_str") || null,
+    status_reason: typeof pkg.status_reason === "string" ? pkg.status_reason : null,
+    uploaded_at: unwrapValue(pkg.uploaded_at) || getNestedField(pkg, "uploaded_at") || null,
     cloudsmithWorkspace: normalized.workspace,
     cloudsmithRepo: normalized.repository,
   });

@@ -294,10 +294,13 @@ async function pickInstallCommandVariant(result) {
  * Prompt user to select from recently interacted packages.
  * Returns a package-like object or null if no selection made.
  */
-async function pickRecentPackage() {
-  const recent = recentPackages.getAll();
+async function pickRecentPackage(options = {}) {
+  const predicate = typeof options.predicate === "function" ? options.predicate : () => true;
+  const recent = recentPackages.getAll().filter(predicate);
   if (recent.length === 0) {
-    vscode.window.showInformationMessage("No recent packages. Run this command from a package context menu.");
+    vscode.window.showInformationMessage(
+      options.emptyMessage || "No recent packages. Run this command from a package context menu."
+    );
     return null;
   }
   const selected = await vscode.window.showQuickPick(
@@ -306,7 +309,7 @@ async function pickRecentPackage() {
       description: `${p.version || ""} — ${p.repository || ""}`,
       _pkg: p,
     })),
-    { placeHolder: "Select a package" }
+    { placeHolder: options.placeHolder || "Select a package" }
   );
   if (!selected) {
     return null;
@@ -2109,7 +2112,11 @@ async function activateOwned(context, own) {
     // Register explain quarantine command — opens WebView panel with policy trace
     vscode.commands.registerCommand("cloudsmith-vsc.explainQuarantine", async (item) => {
       if (!item) {
-        item = await pickRecentPackage();
+        item = await pickRecentPackage({
+          predicate: isQuarantinedPackage,
+          emptyMessage: "No recent quarantined packages. Run this command from a quarantined package context menu.",
+          placeHolder: "Select a quarantined package",
+        });
         if (!item) return;
       }
       recentPackages.add(item);
