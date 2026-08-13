@@ -2535,6 +2535,58 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.deepStrictEqual(calls, { prime: 1, resolve: 1, register: 1 });
   });
 
+  test("production dependency groups stay stable and provide the complete summary ancestry", async () => {
+    const context = createContext();
+    const state = Object.freeze({
+      status: "unknown",
+      records: Object.freeze([]),
+      count: null,
+      maxSeverity: "Unknown",
+      complete: false,
+      detected: true,
+      reportedCount: 1,
+    });
+    const vulnerabilityStateService = {
+      prime() { return state; },
+      peek() { return state; },
+      onDidChange() { return { dispose() {} }; },
+    };
+    const provider = new DependencyHealthProvider(context, null, {
+      vulnerabilityStateService,
+    });
+    const tree = {
+      sourceFile: "package-lock.json",
+      dependencies: [{
+        ...createFoundDependency("left-pad", "1.0.0"),
+        vulnerabilities: {
+          count: 1,
+          countKnown: true,
+          detected: true,
+          maxSeverity: "High",
+        },
+      }],
+    };
+    provider._displayTrees = [tree];
+    provider._hasSuccessfulScan = true;
+
+    const firstGroup = (await provider.getChildren()).find(node => (
+      node.getTreeItem().contextValue === "dependencyHealthSourceGroup"
+    ));
+    const secondGroup = (await provider.getChildren()).find(node => (
+      node.getTreeItem().contextValue === "dependencyHealthSourceGroup"
+    ));
+    const owner = firstGroup.getChildren()[0];
+    const summary = owner.getChildren().find(node => (
+      node.getTreeItem().contextValue === "vulnerabilitySummary"
+    ));
+
+    assert.strictEqual(firstGroup, secondGroup);
+    assert.strictEqual(provider.getParent(summary), owner);
+    assert.strictEqual(provider.getParent(owner), firstGroup);
+    assert.strictEqual(provider.getParent(firstGroup), null);
+    provider.dispose();
+  });
+
   test("vulnerability publication defers and coalesces terminal refreshes", async () => {
     const listeners = new Set();
     const service = {

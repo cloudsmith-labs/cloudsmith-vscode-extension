@@ -1863,8 +1863,11 @@ class DependencyHealthProvider {
         ));
       }
       nodes.push(...this._displayTrees.map((tree) => {
-        const group = new DependencySourceGroupNode(tree, this);
-        this._dependencySourceGroups.set(tree, group);
+        let group = this._dependencySourceGroups.get(tree);
+        if (!group) {
+          group = new DependencySourceGroupNode(tree, this);
+          this._dependencySourceGroups.set(tree, group);
+        }
         return group;
       }));
       return nodes;
