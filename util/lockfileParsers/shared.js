@@ -444,6 +444,7 @@ function deduplicateDeps(dependencies) {
     }
 
     if (
+      !existing.isDirect &&
       Array.isArray(existing.parentChain) &&
       existing.parentChain.length === 0 &&
       Array.isArray(dependency.parentChain) &&

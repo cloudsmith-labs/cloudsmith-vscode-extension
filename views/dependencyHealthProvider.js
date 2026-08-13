@@ -845,6 +845,7 @@ class DependencyHealthProvider {
             sourceFile: result.sourceFile,
             source: result.source,
             dependencies: result.dependencies,
+            dependencyGraph: result.dependencyGraph || null,
             warnings: result.warnings,
           });
           const sourceManifestPath = result.source
@@ -1446,14 +1447,18 @@ class DependencyHealthProvider {
   }
 
   _buildTreeModeNodes(tree, group = null) {
-    const roots = getTreeRootDependencies(tree)
-      .sort((left, right) => compareDependencies(left, right, this._sortMode, false));
-
-    const filteredRoots = roots
-      .map((dependency) => buildFilteredTreeWrapper(dependency, this._filterMode, this._sortMode))
-      .filter(Boolean);
-
-    const duplicateAwareRoots = annotateDuplicateWrappers(filteredRoots, new Map(), []);
+    let duplicateAwareRoots;
+    if (tree.dependencyGraph?.kind === "package-lock") {
+      const rendered = buildPackageLockGraphWrappers(tree, this._filterMode, this._sortMode);
+      duplicateAwareRoots = rendered.wrappers;
+      const warning = "Some dependency relationships could not be displayed. Use list view to inspect the bounded dependency inventory.";
+      if (rendered.truncated && !this._warnings.includes(warning)) {
+        this._warnings.push(warning);
+        queueMicrotask(() => this.refresh());
+      }
+    } else {
+      duplicateAwareRoots = buildLegacyTreeWrappers(tree, this._filterMode, this._sortMode);
+    }
     return duplicateAwareRoots.map(wrapper => this._createTreeDependencyNode(wrapper, group));
   }
 
@@ -3068,13 +3073,17 @@ function limitDisplayTrees(trees, maxDependencies) {
   );
 
   const limitedTrees = trees
-    .map((tree) => ({
-      ...tree,
-      dependencies: tree.dependencies
+    .map((tree) => {
+      const dependencies = tree.dependencies
         .filter((dependency) => allowedKeys.has(displayDependencyKey(dependency)))
         .map((dependency) => pruneDependencyTree(dependency, allowedKeys))
-        .sort((left, right) => compareDependencies(left, right, SORT_MODES.ALPHABETICAL, true)),
-    }))
+        .sort((left, right) => compareDependencies(left, right, SORT_MODES.ALPHABETICAL, true));
+      return {
+        ...tree,
+        dependencies,
+        dependencyGraph: limitPackageLockGraph(tree.dependencyGraph, dependencies),
+      };
+    })
     .filter((tree) => tree.dependencies.length > 0);
 
   return {
@@ -3082,6 +3091,63 @@ function limitDisplayTrees(trees, maxDependencies) {
     truncated: true,
     totalDependencies: allDependencies.length,
   };
+}
+
+function limitPackageLockGraph(graph, dependencies) {
+  if (!graph || graph.kind !== "package-lock") {
+    return graph || null;
+  }
+  const allowedResolved = new Set();
+  const allowedUnresolved = new Set();
+  const allowedDirectDeclarations = new Set();
+  for (const dependency of dependencies) {
+    const concreteVersion = getConcreteDependencyVersion(dependency);
+    if (concreteVersion) {
+      allowedResolved.add(graphPackageIdentity(dependency.name, concreteVersion));
+    } else {
+      allowedUnresolved.add(String(dependency.name || "").trim().toLowerCase());
+    }
+    if (dependency.isDirect) {
+      allowedDirectDeclarations.add(String(
+        dependency.declarationName || dependency.name || ""
+      ).trim().toLowerCase());
+    }
+  }
+
+  const sourceEntries = new Map(graph.entries.map((entry) => [entry.key, entry]));
+  const entryAllowed = (entry) => Boolean(entry) && allowedResolved.has(
+    graphPackageIdentity(entry.name, entry.version)
+  );
+  const entries = graph.entries
+    .filter(entryAllowed)
+    .map((entry) => Object.freeze({
+      ...entry,
+      edges: Object.freeze(entry.edges.filter((edge) => {
+        if (!edge.childKey) {
+          return allowedUnresolved.has(String(edge.declaredName || "").trim().toLowerCase());
+        }
+        return entryAllowed(sourceEntries.get(edge.childKey));
+      })),
+    }));
+  const roots = graph.roots.filter((root) => {
+    const declarationAllowed = allowedDirectDeclarations.has(
+      String(root.declaredName || "").trim().toLowerCase()
+    );
+    if (!declarationAllowed) {
+      return false;
+    }
+    if (root.entryKey) {
+      const entry = sourceEntries.get(root.entryKey);
+      return !entry || entryAllowed(entry);
+    }
+    return allowedUnresolved.has(String(root.declaredName || "").trim().toLowerCase());
+  });
+
+  return Object.freeze({
+    ...graph,
+    entries: Object.freeze(entries),
+    roots: Object.freeze(roots),
+  });
 }
 
 function pruneDependencyTree(dependency, allowedKeys) {
@@ -3181,6 +3247,368 @@ function getTreeRootDependencies(tree) {
     const hasParentChain = Array.isArray(dependency.parentChain) && dependency.parentChain.length > 0;
     return !dependency.parent && !hasParentChain;
   });
+}
+
+function buildLegacyTreeWrappers(tree, filterMode, sortMode) {
+  const roots = getTreeRootDependencies(tree)
+    .sort((left, right) => compareDependencies(left, right, sortMode, false));
+  const filteredRoots = roots
+    .map((dependency) => buildFilteredTreeWrapper(dependency, filterMode, sortMode))
+    .filter(Boolean);
+  return annotateDuplicateWrappers(filteredRoots, new Map(), []);
+}
+
+function buildPackageLockGraphWrappers(tree, filterMode, sortMode) {
+  const graph = tree.dependencyGraph;
+  const baseDependencies = buildGraphDependencyIndex(tree.dependencies);
+  const entryMap = new Map(graph.entries
+    .filter((entry) => baseDependencies.has(graphPackageIdentity(entry.name, entry.version)))
+    .map((entry) => [entry.key, entry]));
+  const directDependencies = new Map(
+    tree.dependencies
+      .filter((dependency) => dependency.isDirect)
+      .map((dependency) => [
+        String(dependency.declarationName || dependency.name || "").toLowerCase(),
+        dependency,
+      ])
+  );
+  const entryDependencies = new Map();
+  for (const entry of graph.entries) {
+    entryDependencies.set(entry.key, graphDependencyForEntry(
+      entry,
+      entry.installedName,
+      [],
+      false,
+      entry.isDevelopmentDependency,
+      baseDependencies,
+      directDependencies
+    ));
+  }
+  const reachableMatches = computeGraphFilterReachability(
+    graph,
+    entryDependencies,
+    filterMode
+  );
+  const seen = new Map();
+  const presentation = {
+    materialized: 0,
+    maxNodes: graph.maxNodes || 50000,
+    truncated: false,
+  };
+
+  const roots = graph.roots
+    .filter((root) => directDependencies.has(String(root.declaredName || "").toLowerCase()))
+    .map((root) => ({
+      root,
+      dependency: graphDependencyForRoot(
+        root,
+        entryMap,
+        baseDependencies,
+        directDependencies
+      ),
+    }))
+    .sort((left, right) => compareDependencies(
+      left.dependency,
+      right.dependency,
+      sortMode,
+      false
+    ));
+
+  const wrappers = roots.map(({ root, dependency }) => materializeGraphWrapper({
+    root,
+    dependency,
+    entryMap,
+    baseDependencies,
+    directDependencies,
+    reachableMatches,
+    filterMode,
+    sortMode,
+    seen,
+    ancestry: [],
+    visiting: new Set(),
+    presentation,
+    maxDepth: graph.maxDepth || 128,
+  })).filter(Boolean);
+  return { wrappers, truncated: presentation.truncated };
+}
+
+function buildGraphDependencyIndex(dependencies) {
+  const index = new Map();
+  for (const dependency of dependencies || []) {
+    const key = graphPackageIdentity(dependency.name, dependency.version);
+    if (!index.has(key) || (!index.get(key).isDirect && dependency.isDirect)) {
+      index.set(key, dependency);
+    }
+  }
+  return index;
+}
+
+function graphDependencyForRoot(root, entryMap, baseDependencies, directDependencies) {
+  const direct = directDependencies.get(String(root.declaredName || "").toLowerCase());
+  if (!root.entryKey) {
+    return direct || graphUnresolvedDependency(root.declaredName, [], true, root.isDevelopmentDependency);
+  }
+  if (!entryMap.has(root.entryKey)) {
+    // A non-null missing key means the parser knew the resolved occurrence but
+    // omitted its adjacency at the graph bound. Preserve the authoritative
+    // direct record as a leaf instead of mislabelling it as unresolved.
+    return direct || graphUnresolvedDependency(root.declaredName, [], true, root.isDevelopmentDependency);
+  }
+  return graphDependencyForEntry(
+    entryMap.get(root.entryKey),
+    root.declaredName,
+    [],
+    true,
+    root.isDevelopmentDependency,
+    baseDependencies,
+    directDependencies
+  );
+}
+
+function graphDependencyForEntry(
+  entry,
+  declaredName,
+  parentChain,
+  isDirect,
+  inheritedDevelopment,
+  baseDependencies,
+  directDependencies
+) {
+  const direct = isDirect
+    ? directDependencies.get(String(declaredName || "").toLowerCase())
+    : null;
+  const base = direct || baseDependencies.get(graphPackageIdentity(entry.name, entry.version));
+  const parent = parentChain[parentChain.length - 1] || null;
+  return {
+    ...(base || {}),
+    ecosystem: base?.ecosystem || "npm",
+    format: base?.format || "npm",
+    name: entry.name,
+    normalizedName: base?.normalizedName || entry.name.toLowerCase(),
+    declarationName: declaredName || entry.installedName || entry.name,
+    resolvedVersion: base?.resolvedVersion || entry.version,
+    version: base?.version || entry.version,
+    legacyVersion: base?.legacyVersion || entry.version,
+    versionState: base?.versionState || "resolved",
+    isDirect,
+    isDevelopmentDependency: Boolean(
+      inheritedDevelopment || entry.isDevelopmentDependency
+    ),
+    devDependency: Boolean(inheritedDevelopment || entry.isDevelopmentDependency),
+    parent,
+    parentChain: parentChain.slice(),
+    transitives: [],
+    declaredConstraint: isDirect ? direct?.declaredConstraint || null : null,
+    environmentMarker: isDirect ? direct?.environmentMarker || null : null,
+    sourceManifest: isDirect ? direct?.sourceManifest || null : null,
+  };
+}
+
+function graphUnresolvedDependency(declaredName, parentChain, isDirect, inheritedDevelopment, base) {
+  const parent = parentChain[parentChain.length - 1] || null;
+  return {
+    ...(base || {}),
+    ecosystem: base?.ecosystem || "npm",
+    format: base?.format || "npm",
+    name: base?.name || declaredName,
+    normalizedName: base?.normalizedName || String(declaredName || "").toLowerCase(),
+    declarationName: declaredName,
+    resolvedVersion: null,
+    version: "",
+    legacyVersion: "",
+    versionState: base?.versionState || "incomplete",
+    isDirect,
+    isDevelopmentDependency: Boolean(inheritedDevelopment),
+    devDependency: Boolean(inheritedDevelopment),
+    parent,
+    parentChain: parentChain.slice(),
+    transitives: [],
+    sourceManifest: isDirect ? base?.sourceManifest || null : null,
+  };
+}
+
+function computeGraphFilterReachability(graph, entryDependencies, filterMode) {
+  const reachable = new Map();
+  const reverseEdges = new Map();
+  const queue = [];
+  for (const entry of graph.entries) {
+    const matches = !filterMode || matchesFilter(entryDependencies.get(entry.key), filterMode);
+    reachable.set(entry.key, matches);
+    if (matches) {
+      queue.push(entry.key);
+    }
+    for (const edge of entry.edges) {
+      if (!edge.childKey) {
+        continue;
+      }
+      if (!reverseEdges.has(edge.childKey)) {
+        reverseEdges.set(edge.childKey, []);
+      }
+      reverseEdges.get(edge.childKey).push(entry.key);
+    }
+  }
+  if (!filterMode) {
+    return reachable;
+  }
+
+  for (let index = 0; index < queue.length; index += 1) {
+    for (const parentKey of reverseEdges.get(queue[index]) || []) {
+      if (reachable.get(parentKey)) {
+        continue;
+      }
+      reachable.set(parentKey, true);
+      queue.push(parentKey);
+    }
+  }
+  return reachable;
+}
+
+function materializeGraphWrapper(context) {
+  const {
+    root,
+    dependency,
+    entryMap,
+    baseDependencies,
+    directDependencies,
+    reachableMatches,
+    filterMode,
+    sortMode,
+    seen,
+    ancestry,
+    visiting,
+    presentation,
+    maxDepth,
+  } = context;
+  if (presentation.materialized >= presentation.maxNodes) {
+    presentation.truncated = true;
+    return null;
+  }
+
+  const entryKey = root.entryKey;
+  const entry = entryKey ? entryMap.get(entryKey) : null;
+  const selfMatches = matchesFilter(dependency, filterMode);
+  if (filterMode && !selfMatches && (!entryKey || !reachableMatches.get(entryKey))) {
+    return null;
+  }
+  if (entryKey && visiting.has(entryKey)) {
+    return null;
+  }
+
+  presentation.materialized += 1;
+  const pathLabel = ancestry.concat(dependency.name).join(" > ");
+  const duplicateKey = buildDuplicateKey(dependency);
+  if (duplicateKey && seen.has(duplicateKey)) {
+    return {
+      dependency,
+      children: [],
+      duplicate: true,
+      firstOccurrencePath: seen.get(duplicateKey),
+      dimmedForFilter: Boolean(filterMode) && !selfMatches,
+    };
+  }
+  if (duplicateKey) {
+    seen.set(duplicateKey, pathLabel);
+  }
+
+  if (!entry) {
+    return {
+      dependency,
+      children: [],
+      duplicate: false,
+      firstOccurrencePath: null,
+      dimmedForFilter: Boolean(filterMode) && !selfMatches,
+    };
+  }
+
+  if (dependency.parentChain.length >= maxDepth && entry.edges.length > 0) {
+    presentation.truncated = true;
+    return {
+      dependency,
+      children: [],
+      duplicate: false,
+      firstOccurrencePath: null,
+      dimmedForFilter: Boolean(filterMode) && !selfMatches,
+    };
+  }
+
+  const nextVisiting = new Set(visiting);
+  nextVisiting.add(entry.key);
+  const nextParentChain = dependency.parentChain.concat(dependency.name);
+  const childCandidates = entry.edges.map((edge) => {
+    // A non-null key missing from the bounded structural graph represents an
+    // omitted resolved relationship. The parser warning already qualifies the
+    // result; do not fabricate an unresolved dependency for that edge.
+    if (edge.childKey && !entryMap.has(edge.childKey)) {
+      return null;
+    }
+    const childEntry = edge.childKey ? entryMap.get(edge.childKey) : null;
+    const childDependency = childEntry
+      ? graphDependencyForEntry(
+        childEntry,
+        edge.declaredName,
+        nextParentChain,
+        false,
+        dependency.isDevelopmentDependency,
+        baseDependencies,
+        directDependencies
+      )
+      : graphUnresolvedDependency(
+        edge.declaredName,
+        nextParentChain,
+        false,
+        dependency.isDevelopmentDependency
+      );
+    return {
+      root: {
+        declaredName: edge.declaredName,
+        entryKey: childEntry ? childEntry.key : null,
+        isDevelopmentDependency: dependency.isDevelopmentDependency,
+      },
+      dependency: childDependency,
+    };
+  }).filter(Boolean).filter(({ root: childRoot, dependency: child }) => (
+    !filterMode
+    || matchesFilter(child, filterMode)
+    || (childRoot.entryKey && reachableMatches.get(childRoot.entryKey))
+  )).sort((left, right) => compareDependencies(
+    left.dependency,
+    right.dependency,
+    sortMode,
+    false
+  ));
+
+  const children = childCandidates.map(({ root: childRoot, dependency: child }) => (
+    materializeGraphWrapper({
+      root: childRoot,
+      dependency: child,
+      entryMap,
+      baseDependencies,
+      directDependencies,
+      reachableMatches,
+      filterMode,
+      sortMode,
+      seen,
+      ancestry: ancestry.concat(dependency.name),
+      visiting: nextVisiting,
+      presentation,
+      maxDepth,
+    })
+  )).filter(Boolean);
+
+  return {
+    dependency,
+    children,
+    duplicate: false,
+    firstOccurrencePath: null,
+    dimmedForFilter: Boolean(filterMode) && !selfMatches,
+  };
+}
+
+function graphPackageIdentity(name, version) {
+  return JSON.stringify([
+    String(name || "").trim().toLowerCase(),
+    String(version || "").trim(),
+  ]);
 }
 
 function buildFilteredTreeWrapper(dependency, filterMode, sortMode) {

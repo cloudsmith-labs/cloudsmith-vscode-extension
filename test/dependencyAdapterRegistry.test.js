@@ -338,6 +338,11 @@ suite("dependencyAdapterRegistry", () => {
     assert.strictEqual(express.sourceManifest.filePath, manifestPath);
     assert.strictEqual(express.resolutionSource.kind, RESOLUTION_SOURCE_KINDS.LOCKFILE);
     assert.strictEqual(express.resolutionSource.filePath, lockfilePath);
+    assert.ok(result.dependencyGraph);
+    assert.strictEqual(result.dependencyGraph.kind, "package-lock");
+    assert.ok(result.dependencyGraph.entries.length > result.dependencies.length);
+    assert.strictEqual(result.dependencyGraph.maxEdges, 500000);
+    assert.deepStrictEqual(express.transitives, []);
   });
 
   test("classifies npm partial and wildcard declarations as ranges", async () => {

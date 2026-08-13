@@ -18,6 +18,7 @@ const { parsePackageJsonManifest } = require("./manifestHelpers");
 const LOCKFILE_NAMES = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml"];
 const MAX_GRAPH_DEPTH = 128;
 const MAX_GRAPH_NODES = 50000;
+const MAX_GRAPH_EDGES = 500000;
 
 const npmParser = {
   name: "npmParser",
@@ -141,14 +142,26 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
 
   const directRoots = [];
   const seenDirectKeys = new Set();
-  const traversalState = createGraphTraversalState();
+  const traversalState = createGraphTraversalState(options);
+  const dependencyGraph = buildPackageLockGraph(entriesByPath, directNames, manifest, traversalState);
 
   for (const directName of directNames) {
     const entry = selectPackageLockEntry(entriesByPath, "", directName);
     const dependency = buildNpmDependency(entry, directName, [], entriesByPath, new Set(), {
       sourceFile: getSourceFileName(lockfilePath),
       devNames: manifest.devNames,
-    }, manifest.devNames.has(directName), traversalState);
+    }, manifest.devNames.has(directName), traversalState, true) || createNpmDependency({
+      name: entry ? entry.name : directName,
+      version: entry ? entry.version : "",
+      ecosystem: "npm",
+      isDirect: true,
+      parent: null,
+      parentChain: [],
+      transitives: [],
+      sourceFile: getSourceFileName(lockfilePath),
+      isDevelopmentDependency: manifest.devNames.has(directName)
+        || Boolean(entry && entry.isDevelopmentDependency),
+    }, entry ? entry.installedName : directName);
     const key = npmPackageVersionKey(dependency.name, dependency.version);
     if (!seenDirectKeys.has(key)) {
       seenDirectKeys.add(key);
@@ -185,8 +198,91 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
     );
   }
   appendGraphLimitWarning(warnings, traversalState);
+  publishGraphMetrics(options, traversalState, entriesByPath.size, uniqueEntries.size);
 
-  return buildTree("npm", getSourceFileName(lockfilePath), dependencies, warnings);
+  return {
+    ...buildTree("npm", getSourceFileName(lockfilePath), dependencies, warnings),
+    dependencyGraph,
+  };
+}
+
+function buildPackageLockGraph(entriesByPath, directNames, manifest, traversalState) {
+  const graphEntries = [];
+  const includedKeys = new Set();
+  let edgeCount = 0;
+
+  for (const entry of entriesByPath.values()) {
+    if (graphEntries.length >= traversalState.maxNodes) {
+      traversalState.nodeLimitReached = true;
+      traversalState.truncated = true;
+      break;
+    }
+    const edges = [];
+    for (const declaredName in entry.dependencies || {}) {
+      if (!Object.prototype.hasOwnProperty.call(entry.dependencies, declaredName)) {
+        continue;
+      }
+      if (edgeCount >= traversalState.maxEdges) {
+        traversalState.edgeLimitReached = true;
+        traversalState.truncated = true;
+        break;
+      }
+      const child = selectPackageLockEntry(entriesByPath, entry.packagePath, declaredName);
+      traversalState.structuralEdgesExamined += 1;
+      edgeCount += 1;
+      if (child) {
+        traversalState.resolvedEdges += 1;
+      } else {
+        traversalState.unresolvedEdges += 1;
+      }
+      edges.push(Object.freeze({
+        declaredName,
+        childKey: child ? child.key : null,
+      }));
+    }
+    includedKeys.add(entry.key);
+    graphEntries.push(Object.freeze({
+      key: entry.key,
+      name: entry.name,
+      installedName: entry.installedName,
+      version: entry.version,
+      isDevelopmentDependency: entry.isDevelopmentDependency,
+      edges: Object.freeze(edges),
+    }));
+  }
+
+  const roots = [...directNames].map((declaredName) => {
+    const entry = selectPackageLockEntry(entriesByPath, "", declaredName);
+    return Object.freeze({
+      declaredName,
+      // Keep the authoritative occurrence key even when the structural graph
+      // was truncated before indexing it. Consumers can then distinguish a
+      // resolved-but-omitted root from a genuinely unresolved declaration.
+      entryKey: entry ? entry.key : null,
+      isDevelopmentDependency: manifest.devNames.has(declaredName),
+    });
+  });
+
+  let hasOmittedRelationships = traversalState.nodeLimitReached
+    || traversalState.edgeLimitReached;
+  if (!hasOmittedRelationships) {
+    hasOmittedRelationships = graphEntries.some((entry) => entry.edges.some((edge) => (
+      edge.childKey && !includedKeys.has(edge.childKey)
+    )));
+  }
+  if (hasOmittedRelationships) {
+    traversalState.truncated = true;
+  }
+
+  return Object.freeze({
+    kind: "package-lock",
+    entries: Object.freeze(graphEntries),
+    roots: Object.freeze(roots),
+    incomplete: hasOmittedRelationships,
+    maxDepth: traversalState.maxDepth,
+    maxNodes: traversalState.maxNodes,
+    maxEdges: traversalState.maxEdges,
+  });
 }
 
 function collectDependencyKeys(dependencies, addedKeys) {
@@ -206,8 +302,12 @@ function buildNpmDependency(
   visiting,
   context,
   inheritedDevelopment,
-  traversalState
+  traversalState,
+  forceExpand = false
 ) {
+  if (!reserveMaterializedNode(parentChain, traversalState)) {
+    return null;
+  }
   if (!entry) {
     return createNpmDependency({
       name: fallbackName,
@@ -223,6 +323,7 @@ function buildNpmDependency(
   }
 
   if (visiting.has(entry.key)) {
+    traversalState.cycleEdgesSkipped += 1;
     return createNpmDependency({
       name: entry.name,
       version: entry.version,
@@ -244,7 +345,7 @@ function buildNpmDependency(
     || entry.isDevelopmentDependency
     || context.devNames.has(entry.installedName);
 
-  if (!canExpandGraphNode(parentChain, traversalState)) {
+  if (!canExpandGraphNode(parentChain, entry.key, traversalState, forceExpand)) {
     return createNpmDependency({
       name: entry.name,
       version: entry.version,
@@ -261,9 +362,10 @@ function buildNpmDependency(
   for (const dependencyName of Object.keys(entry.dependencies || {})) {
     const childEntry = selectPackageLockEntry(entriesByPath, entry.packagePath, dependencyName);
     if (childEntry && nextVisiting.has(childEntry.key)) {
+      traversalState.cycleEdgesSkipped += 1;
       continue;
     }
-    transitives.push(buildNpmDependency(
+    const childDependency = buildNpmDependency(
       childEntry,
       dependencyName,
       nextParentChain,
@@ -271,8 +373,12 @@ function buildNpmDependency(
       nextVisiting,
       context,
       isDevelopmentDependency,
-      traversalState
-    ));
+      traversalState,
+      false
+    );
+    if (childDependency) {
+      transitives.push(childDependency);
+    }
   }
 
   return createNpmDependency({
@@ -819,29 +925,103 @@ function buildPnpmDependency(
   }, entry.installedName || entry.name);
 }
 
-function createGraphTraversalState() {
-  return { expandedNodes: 0, truncated: false };
+function createGraphTraversalState(options = {}) {
+  return {
+    expandedNodes: 0,
+    materializedNodes: 0,
+    repeatedOccurrenceEncounters: 0,
+    directRootReexpansions: 0,
+    structuralEdgesExamined: 0,
+    resolvedEdges: 0,
+    unresolvedEdges: 0,
+    cycleEdgesSkipped: 0,
+    maxObservedDepth: 0,
+    depthLimitReached: false,
+    nodeLimitReached: false,
+    edgeLimitReached: false,
+    truncated: false,
+    expandedEntryKeys: new Set(),
+    maxDepth: lowerOnlyGraphLimit(options.npmGraphMaxDepth, MAX_GRAPH_DEPTH),
+    maxNodes: lowerOnlyGraphLimit(options.npmGraphMaxNodes, MAX_GRAPH_NODES),
+    maxEdges: lowerOnlyGraphLimit(options.npmGraphMaxEdges, MAX_GRAPH_EDGES),
+  };
 }
 
-function canExpandGraphNode(parentChain, state) {
+function lowerOnlyGraphLimit(requested, productionMaximum) {
+  return Number.isSafeInteger(requested) && requested > 0
+    ? Math.min(requested, productionMaximum)
+    : productionMaximum;
+}
+
+function reserveMaterializedNode(parentChain, state) {
   if (!state) {
     return true;
   }
-  if (parentChain.length >= MAX_GRAPH_DEPTH || state.expandedNodes >= MAX_GRAPH_NODES) {
+  state.maxObservedDepth = Math.max(state.maxObservedDepth, parentChain.length);
+  if (state.materializedNodes >= state.maxNodes) {
+    state.nodeLimitReached = true;
     state.truncated = true;
     return false;
   }
+  state.materializedNodes += 1;
+  return true;
+}
+
+function canExpandGraphNode(parentChain, entryKey, state, forceExpand) {
+  if (!state) {
+    return true;
+  }
+  if (parentChain.length >= state.maxDepth) {
+    state.depthLimitReached = true;
+    state.truncated = true;
+    return false;
+  }
+  if (state.expandedEntryKeys.has(entryKey) && !forceExpand) {
+    state.repeatedOccurrenceEncounters += 1;
+    return false;
+  }
+  if (state.expandedNodes >= state.maxNodes) {
+    state.nodeLimitReached = true;
+    state.truncated = true;
+    return false;
+  }
+  if (forceExpand && state.expandedEntryKeys.has(entryKey)) {
+    state.directRootReexpansions += 1;
+  }
+  state.expandedEntryKeys.add(entryKey);
   state.expandedNodes += 1;
   return true;
 }
 
 function appendGraphLimitWarning(warnings, state) {
   if (state && state.truncated) {
-    warnings.push(
-      `npm dependency graph expansion reached its bounded limit `
-      + `(${MAX_GRAPH_NODES} nodes or depth ${MAX_GRAPH_DEPTH}); deeper relationships were omitted.`
-    );
+    warnings.push("Some dependency relationships could not be fully analyzed.");
   }
+}
+
+function publishGraphMetrics(options, state, indexedOccurrences, uniquePackageIdentities) {
+  if (!options || typeof options.onNpmGraphMetrics !== "function") {
+    return;
+  }
+  options.onNpmGraphMetrics(Object.freeze({
+    indexedOccurrences,
+    uniquePackageIdentities,
+    structuralOccurrencesExpanded: state.expandedNodes,
+    dependencyRecordsMaterialized: state.materializedNodes,
+    repeatedOccurrenceEncounters: state.repeatedOccurrenceEncounters,
+    directRootReexpansions: state.directRootReexpansions,
+    structuralEdgesExamined: state.structuralEdgesExamined,
+    resolvedEdges: state.resolvedEdges,
+    unresolvedEdges: state.unresolvedEdges,
+    cycleEdgesSkipped: state.cycleEdgesSkipped,
+    maxObservedDepth: state.maxObservedDepth,
+    depthLimitReached: state.depthLimitReached,
+    nodeLimitReached: state.nodeLimitReached,
+    edgeLimitReached: state.edgeLimitReached,
+    maxDepth: state.maxDepth,
+    maxNodes: state.maxNodes,
+    maxEdges: state.maxEdges,
+  }));
 }
 
 function selectPnpmEntry(packageEntries, dependencyName, versionHint) {
