@@ -30,6 +30,8 @@ suite("RecentPackages Test Suite", () => {
       version: { id: "Version", value: "1.25" },
       namespace: "workspace-a",
       repository: "containers",
+      slug_perm: "package-nginx",
+      slug_perm_raw: "package-nginx",
       checksum_sha256: "abc123",
       version_digest: "digest123",
       cdn_url: "https://cdn.example.com/nginx.tar",
@@ -65,6 +67,7 @@ suite("RecentPackages Test Suite", () => {
       version: "1.0.0",
       namespace: "workspace-a",
       repository: "downloads",
+      slug_perm: "package-shared",
     });
     recentPackages.add({
       name: "shared-lib",
@@ -72,6 +75,7 @@ suite("RecentPackages Test Suite", () => {
       version: "1.0.0",
       namespace: "workspace-b",
       repository: "downloads",
+      slug_perm: "package-shared",
     });
 
     const all = recentPackages.getAll();
@@ -117,12 +121,7 @@ suite("RecentPackages Test Suite", () => {
       is_copyable: "false",
     });
 
-    const [stored] = recentPackages.getAll();
-    assert.strictEqual(stored.namespace, null);
-    assert.strictEqual(stored.cloudsmithWorkspace, null);
-    assert.strictEqual(stored.slug_perm, null);
-    assert.strictEqual(stored.slug_perm_raw, null);
-    assert.strictEqual(stored.is_copyable, null);
+    assert.deepStrictEqual(recentPackages.getAll(), []);
   });
 
   test("repository and workspace alias inversions share one recent-package identity", () => {
@@ -209,35 +208,40 @@ suite("RecentPackages Test Suite", () => {
       recentPackages.add(identityPackage(overrides));
 
       const all = recentPackages.getAll();
-      assert.strictEqual(all.length, 2);
+      assert.strictEqual(all.length, 1);
       assert.strictEqual(all.filter(pkg => (
         pkg.namespace === "workspace" && pkg.repository === "source"
-      )).length, 1);
-      assert.strictEqual(all.filter(pkg => (
-        pkg.namespace === null || pkg.repository === null
       )).length, 1);
     }
   });
 
   test("structured recent identities cannot collide through delimiters", () => {
-    recentPackages.add(identityPackage({ name: "artifact:1", version: "2" }));
-    recentPackages.add(identityPackage({ name: "artifact", version: "1:2" }));
+    recentPackages.add(identityPackage({ name: "artifact:1", version: "2", slug_perm: "package:1", slug_perm_raw: "package:1" }));
+    recentPackages.add(identityPackage({ name: "artifact", version: "1:2", slug_perm: "package", slug_perm_raw: "package" }));
 
     assert.strictEqual(recentPackages.getAll().length, 2);
   });
 
-  test("distinct workspace, repository, package, and version coordinates remain distinct", () => {
+  test("exact workspace, repository, and package identifiers remain distinct", () => {
     for (const record of [
       identityPackage(),
       identityPackage({ cloudsmithWorkspace: "other-workspace", namespace: "other-workspace" }),
       identityPackage({ cloudsmithRepo: "other-source", repository: "other-source" }),
-      identityPackage({ name: "other-artifact" }),
-      identityPackage({ version: "2.0.0" }),
+      identityPackage({ slug_perm: "other-package", slug_perm_raw: "other-package" }),
     ]) {
       recentPackages.add(record);
     }
 
-    assert.strictEqual(recentPackages.getAll().length, 5);
+    assert.strictEqual(recentPackages.getAll().length, 4);
+  });
+
+  test("same package identity updates display metadata without creating a duplicate", () => {
+    recentPackages.add(identityPackage({ name: "old-name", version: "1.0.0" }));
+    recentPackages.add(identityPackage({ name: "new-name", version: "2.0.0" }));
+    const [stored] = recentPackages.getAll();
+    assert.strictEqual(recentPackages.getAll().length, 1);
+    assert.strictEqual(stored.name, "new-name");
+    assert.strictEqual(stored.version, "2.0.0");
   });
 
   test("malformed identities cannot remove valid entries or collapse into false equality", () => {
@@ -253,9 +257,8 @@ suite("RecentPackages Test Suite", () => {
     }));
 
     const all = recentPackages.getAll();
-    assert.strictEqual(all.length, 3);
+    assert.strictEqual(all.length, 1);
     assert.strictEqual(all.filter(pkg => pkg.repository === "source").length, 1);
-    assert.strictEqual(all.filter(pkg => pkg.repository === null).length, 2);
   });
 
   test("re-adding a valid identity collapses every historical duplicate and moves it first", () => {
@@ -276,5 +279,17 @@ suite("RecentPackages Test Suite", () => {
     const all = recentPackages.getAll();
     assert.deepStrictEqual(all.map(pkg => pkg.name), ["artifact", "first"]);
     assert.strictEqual(all[0].repository, "source");
+  });
+
+  test("preserves the current quarantine reason and upload boundary", () => {
+    recentPackages.add(identityPackage({
+      status_str_raw: "Quarantined",
+      status_reason: "Quarantined by Policy. Rule matched. (Policy: policy-a)",
+      uploaded_at: { value: "2026-08-13T10:00:00.000Z" },
+    }));
+    const [stored] = recentPackages.getAll();
+    assert.strictEqual(stored.status_str, "Quarantined");
+    assert.strictEqual(stored.status_reason, "Quarantined by Policy. Rule matched. (Policy: policy-a)");
+    assert.strictEqual(stored.uploaded_at, "2026-08-13T10:00:00.000Z");
   });
 });
