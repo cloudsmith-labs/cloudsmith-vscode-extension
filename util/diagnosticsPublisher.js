@@ -43,7 +43,9 @@ class DiagnosticPreparationCancelledError extends Error {
 
 /**
  * Create a bounded immutable diagnostic input without retaining mutable health
- * overlays or the dependency's transitive graph.
+ * overlays or the dependency's transitive graph. Optional Cloudsmith package
+ * metadata must be supplied as values.cloudsmithPackage and must be a branded
+ * canonical exact package.
  */
 function createDiagnosticCandidate(dependency, values = {}) {
   const dependencyProperties = getPlainDataProperties(dependency, "dependency occurrence");
@@ -138,6 +140,9 @@ function createDiagnosticCandidate(dependency, values = {}) {
   });
 
   const valuesProperties = getPlainDataProperties(values, "diagnostic candidate values");
+  if (Object.prototype.hasOwnProperty.call(valuesProperties, "cloudsmithMatch")) {
+    throw new TypeError("Diagnostic package metadata must use cloudsmithPackage.");
+  }
   const state = boundedString(
     ownDataValue(valuesProperties, "state", true),
     "diagnostic state",
@@ -151,8 +156,8 @@ function createDiagnosticCandidate(dependency, values = {}) {
     "diagnostic display version",
     MAX_IDENTITY_FIELD_LENGTH
   );
-  const cloudsmith = snapshotCloudsmithMetadata(
-    ownDataValue(valuesProperties, "cloudsmithMatch", false)
+  const cloudsmith = snapshotCanonicalPackageMetadata(
+    ownDataValue(valuesProperties, "cloudsmithPackage", false)
   );
   const candidate = Object.freeze({ occurrence, state, displayVersion, cloudsmith });
   DIAGNOSTIC_CANDIDATES.add(candidate);
@@ -418,12 +423,12 @@ class DiagnosticsPublisher {
     );
     diagnostic.source = "Cloudsmith";
 
-    if (candidate.cloudsmith && candidate.cloudsmith.numVulnerabilities > 0) {
+    if (candidate.cloudsmith && candidate.cloudsmith.vulnerabilityCount > 0) {
       const repositoryUrl = buildRepositoryUrl(
-        candidate.cloudsmith.namespace,
+        candidate.cloudsmith.workspace,
         candidate.cloudsmith.repository
       );
-      const vulnerabilityCode = `${candidate.cloudsmith.numVulnerabilities} vulnerabilities`;
+      const vulnerabilityCode = `${candidate.cloudsmith.vulnerabilityCount} vulnerabilities`;
       diagnostic.code = repositoryUrl
         ? { value: vulnerabilityCode, target: vscode.Uri.parse(repositoryUrl) }
         : vulnerabilityCode;
@@ -448,6 +453,12 @@ class DiagnosticsPublisher {
       case "quarantined":
         return `${candidate.occurrence.name}${version} is quarantined in Cloudsmith. Use "Find safe version" to find an alternative.`;
       case "violated":
+        if (candidate.cloudsmith?.vulnerabilitiesDetected) {
+          return `${candidate.occurrence.name}${version} has vulnerabilities detected in Cloudsmith.`;
+        }
+        if (candidate.cloudsmith?.vulnerabilityEvidence === "unknown") {
+          return `${candidate.occurrence.name}${version} has unknown vulnerability status in Cloudsmith.`;
+        }
         return `${candidate.occurrence.name}${version} has policy violations in Cloudsmith.`;
       default:
         return `${candidate.occurrence.name}${version} was not found in the configured Cloudsmith workspace.`;
@@ -556,19 +567,17 @@ function snapshotStringArray(values, label) {
   return Object.freeze(copy);
 }
 
-function snapshotCloudsmithMetadata(value) {
+function snapshotCanonicalPackageMetadata(value) {
   if (value == null) {
     return null;
   }
   const pkg = assertExactPackage(value);
-  const numVulnerabilities = Number.isInteger(pkg.vulnerability.count)
-    && pkg.vulnerability.count > 0
-    ? pkg.vulnerability.count
-    : 0;
   return Object.freeze({
-    namespace: pkg.workspace,
+    workspace: pkg.workspace,
     repository: pkg.repository,
-    numVulnerabilities,
+    vulnerabilityEvidence: pkg.vulnerability.evidence,
+    vulnerabilitiesDetected: pkg.vulnerability.detected,
+    vulnerabilityCount: pkg.vulnerability.count,
   });
 }
 

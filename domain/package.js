@@ -14,6 +14,7 @@ const CONTROL_OR_BIDI_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\
 const UNSAFE_PATH_PATTERN = /[\\/?#]/;
 const EXACT_PACKAGES = new WeakSet();
 const PACKAGE_COORDINATES = new WeakSet();
+const PACKAGE_DOMAIN_ERRORS = new WeakSet();
 const SEMANTIC_FIELDS = Object.freeze([
   "kind",
   "identityState",
@@ -59,6 +60,11 @@ class PackageDomainError extends TypeError {
     this.name = "PackageDomainError";
     this.code = code;
     this.field = field;
+    PACKAGE_DOMAIN_ERRORS.add(this);
+  }
+
+  static isTrusted(value) {
+    return PACKAGE_DOMAIN_ERRORS.has(value);
   }
 }
 

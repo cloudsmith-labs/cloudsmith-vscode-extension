@@ -7,7 +7,10 @@ const PackageNode = require("../models/packageNode");
 const SearchResultNode = require("../models/searchResultNode");
 const DependencyHealthNode = require("../models/dependencyHealthNode");
 const DependencySummaryNode = require("../models/dependencySummaryNode");
-const { fromApiPackageRecord } = require("../domain/packageAdapters");
+const {
+  PackageAdapterError,
+  fromApiPackageRecord,
+} = require("../domain/packageAdapters");
 const { createPackageCoordinate } = require("../domain/package");
 
 suite("Package Metadata Flow Test Suite", () => {
@@ -215,6 +218,114 @@ suite("Package Metadata Flow Test Suite", () => {
     assert.strictEqual(rawNode.package.workspace, canonical.workspace);
     assert.strictEqual(rawNode.package.repository, canonical.repository);
     assert.strictEqual(rawNode.package.packageIdentifier, canonical.packageIdentifier);
+  });
+
+  test("DependencyHealthNode renders only meaningful status details", () => {
+    const baseDependency = {
+      name: "artifact",
+      version: "1.0.0",
+      format: "raw",
+      cloudsmithStatus: "FOUND",
+    };
+    const packageWithStatus = fromApiPackageRecord(pkg);
+    const packageWithoutStatus = fromApiPackageRecord({
+      ...pkg,
+      status_str: undefined,
+    });
+    const statusNode = new DependencyHealthNode({
+      ...baseDependency,
+      cloudsmithPackage: packageWithStatus,
+    }, null, {});
+    const policyNode = new DependencyHealthNode({
+      ...baseDependency,
+      cloudsmithPackage: packageWithStatus,
+      policy: { status: "Policy quarantined" },
+    }, null, {});
+    const noStatusNode = new DependencyHealthNode({
+      ...baseDependency,
+      cloudsmithPackage: packageWithoutStatus,
+    }, null, {});
+    const invalidDisplayNodes = [{ unsafe: true }, 2].map(status => new DependencyHealthNode({
+      ...baseDependency,
+      cloudsmithPackage: packageWithoutStatus,
+      policy: { status },
+    }, null, {}));
+
+    const details = node => node.getChildren().map(child => child.getTreeItem());
+    assert.strictEqual(
+      details(statusNode).find(item => item.tooltip.startsWith("Status:")).label,
+      "Completed"
+    );
+    assert.strictEqual(
+      details(policyNode).find(item => item.tooltip.startsWith("Status:")).label,
+      "Policy quarantined"
+    );
+    for (const node of [noStatusNode, ...invalidDisplayNodes]) {
+      const items = details(node);
+      assert.strictEqual(items.some(item => item.tooltip.startsWith("Status:")), false);
+      assert.ok(items.some(item => item.tooltip.startsWith("Version:") && item.label === "1.0.0"));
+      assert.strictEqual(items.some(item => ["Not available", "Unknown", "undefined", "[object Object]"].includes(item.label)), false);
+    }
+    assert.throws(() => fromApiPackageRecord({ ...pkg, status_str: "" }), /status/);
+  });
+
+  test("DependencyHealthNode reports unclassified match failures without exposing input", () => {
+    const originalWarn = Object.getOwnPropertyDescriptor(console, "warn");
+    const warnings = [];
+    Object.defineProperty(console, "warn", {
+      configurable: true,
+      value: (...args) => warnings.push(args),
+      writable: true,
+    });
+    try {
+      const expectedBoundaryFailure = new DependencyHealthNode({
+        name: "artifact",
+        version: "1.0.0",
+        format: "raw",
+        cloudsmithStatus: "FOUND",
+        cloudsmithPackage: { ...pkg, slug_perm: undefined },
+      }, null, {});
+      assert.strictEqual(expectedBoundaryFailure.package, null);
+      assert.strictEqual(expectedBoundaryFailure.cloudsmithStatus, "LOOKUP_FAILED");
+      assert.deepStrictEqual(warnings, []);
+
+      const forgedAdapterError = Object.create(PackageAdapterError.prototype);
+      Object.defineProperty(forgedAdapterError, "unexpected", { value: false });
+      for (const thrownValue of [
+        new Error("secret-bearing unexpected validation detail"),
+        undefined,
+        forgedAdapterError,
+      ]) {
+        const unstableTarget = { ...pkg };
+        const targetPropertyCount = Reflect.ownKeys(unstableTarget).length;
+        let descriptorReads = 0;
+        const node = new DependencyHealthNode({
+          name: "artifact",
+          version: "1.0.0",
+          format: "raw",
+          cloudsmithStatus: "FOUND",
+          cloudsmithPackage: new Proxy(unstableTarget, {
+            getOwnPropertyDescriptor(target, field) {
+              descriptorReads += 1;
+              if (descriptorReads > targetPropertyCount) throw thrownValue;
+              return Reflect.getOwnPropertyDescriptor(target, field);
+            },
+          }),
+        }, null, {});
+
+        assert.strictEqual(node.package, null);
+        assert.strictEqual(node.cloudsmithStatus, "LOOKUP_FAILED");
+        assert.deepStrictEqual(node.getChildren(), []);
+      }
+      assert.deepStrictEqual(warnings, [
+        ["[Cloudsmith] Unexpected dependency package match validation failure."],
+        ["[Cloudsmith] Unexpected dependency package match validation failure."],
+        ["[Cloudsmith] Unexpected dependency package match validation failure."],
+      ]);
+      assert.doesNotMatch(JSON.stringify(warnings), /secret-bearing|validation detail/);
+    } finally {
+      Object.defineProperty(console, "warn", originalWarn);
+    }
   });
 
   test("DependencyHealthNode contains malformed optional matches without restoring raw identity", () => {

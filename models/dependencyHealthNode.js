@@ -11,9 +11,14 @@ const {
   normalizeDependencyDisplayValue,
 } = require("../util/dependencyRecord");
 const {
+  PackageAdapterError,
   fromApiPackageRecord,
   fromDependencyHealthNode,
 } = require("../domain/packageAdapters");
+const { PackageDomainError } = require("../domain/package");
+
+const UNEXPECTED_PACKAGE_MATCH_WARNING =
+  "[Cloudsmith] Unexpected dependency package match validation failure.";
 
 class DependencyHealthNode {
   constructor(dep, cloudsmithMatchOrContext, maybeContext, maybeOptions) {
@@ -559,12 +564,18 @@ class DependencyHealthNode {
     const PackageDetailsNode = require("./packageDetailsNode");
     const children = [];
 
-    children.push(new PackageDetailsNode({
-      id: "Status",
-      value: this.policy && this.policy.status
-        ? this.policy.status
-        : this.package.status,
-    }, this.context));
+    const statusSource = this.policy && this.policy.status
+      ? this.policy.status
+      : this.package.status;
+    const status = typeof statusSource === "string"
+      ? normalizeDependencyDisplayValue(statusSource)
+      : null;
+    if (status) {
+      children.push(new PackageDetailsNode({
+        id: "Status",
+        value: status,
+      }, this.context));
+    }
 
     children.push(new PackageDetailsNode({
       id: "Version",
@@ -755,8 +766,30 @@ function canonicalMatchedPackage(dep, explicitMatch) {
       if (descriptor) Object.defineProperty(boundary, field, descriptor);
     }
     return fromDependencyHealthNode(boundary);
-  } catch {
+  } catch (error) {
+    if (shouldReportUnexpectedPackageMatchError(error)) {
+      reportUnexpectedPackageMatchError();
+    }
     return null;
+  }
+}
+
+function shouldReportUnexpectedPackageMatchError(error) {
+  try {
+    if (PackageDomainError.isTrusted(error)) return false;
+    if (!PackageAdapterError.isTrusted(error)) return true;
+    const unexpected = Object.getOwnPropertyDescriptor(error, "unexpected");
+    return Boolean(unexpected && "value" in unexpected && unexpected.value === true);
+  } catch {
+    return true;
+  }
+}
+
+function reportUnexpectedPackageMatchError() {
+  try {
+    console.warn(UNEXPECTED_PACKAGE_MATCH_WARNING);
+  } catch {
+    // Tree rendering must remain available even if the internal reporting sink fails.
   }
 }
 

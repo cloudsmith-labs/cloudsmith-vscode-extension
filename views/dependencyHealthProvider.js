@@ -770,7 +770,7 @@ class DependencyHealthProvider {
         candidates.push(createDiagnosticCandidate(dependency, {
           state: healthNode.state,
           displayVersion: healthNode.declaredVersion || null,
-          cloudsmithMatch: healthNode.cloudsmithMatch || null,
+          cloudsmithPackage: healthNode.package || null,
         }));
       }
     }
