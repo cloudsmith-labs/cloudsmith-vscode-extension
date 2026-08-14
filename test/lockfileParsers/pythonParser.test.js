@@ -1,6 +1,7 @@
 const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
+const { createDefaultDependencyAdapterRegistry } = require("../../util/dependencyAdapterRegistry");
 const pythonParser = require("../../util/lockfileParsers/pythonParser");
 const {
   makeTempWorkspace,
@@ -212,6 +213,211 @@ suite("pythonParser Test Suite", () => {
     assert.strictEqual(tree.dependencies.find((dependency) => dependency.name === "flask").isDevelopmentDependency, false);
     assert.strictEqual(tree.dependencies.find((dependency) => dependency.name === "pytest").version, "8.2.0");
     assert.strictEqual(tree.dependencies.find((dependency) => dependency.name === "pytest").isDevelopmentDependency, true);
+  });
+
+  test("uses Pipfile roots instead of treating locked transitives as direct", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "Pipfile");
+    const lockfilePath = path.join(workspace, "Pipfile.lock");
+    await writeTextFile(manifestPath, [
+      "[packages]",
+      'flask = "==2.3.0"',
+      "",
+      "[dev-packages]",
+      'pytest = "==8.2.0"',
+    ].join("\n"));
+    await writeTextFile(lockfilePath, JSON.stringify({
+      default: {
+        flask: { version: "==2.3.0" },
+        werkzeug: { version: "==2.3.8" },
+      },
+      develop: {
+        pytest: { version: "==8.2.0" },
+        pluggy: { version: "==1.5.0" },
+      },
+    }));
+
+    const tree = await pythonParser.resolve({
+      lockfilePath,
+      manifestPath,
+      workspaceFolder: workspace,
+      options: {},
+    });
+    const detections = await pythonParser.detect(workspace);
+
+    assert.deepStrictEqual(
+      tree.dependencies.filter((dependency) => dependency.isDirect).map((dependency) => dependency.name).sort(),
+      ["flask", "pytest"]
+    );
+    assert.strictEqual(tree.dependencies.find((dependency) => dependency.name === "werkzeug").isDirect, false);
+    assert.strictEqual(tree.dependencies.find((dependency) => dependency.name === "pluggy").isDirect, false);
+    assert.deepStrictEqual(
+      tree.dependencies.filter((dependency) => dependency.isDevelopmentDependency).map((dependency) => dependency.name).sort(),
+      ["pluggy", "pytest"]
+    );
+    assert.deepStrictEqual(tree.warnings, []);
+    assert.strictEqual(path.basename(detections[0].manifestPath), "Pipfile");
+
+    const registry = createDefaultDependencyAdapterRegistry();
+    const pipfileManifest = (await registry.detectManifests(workspace)).find((manifest) => (
+      manifest.manifestType === "Pipfile"
+    ));
+    const manifestResult = await registry.parseManifest(pipfileManifest);
+    assert.strictEqual(manifestResult.status, "success");
+    assert.deepStrictEqual(
+      manifestResult.dependencies.map((dependency) => dependency.name).sort(),
+      ["flask", "pytest"]
+    );
+  });
+
+  test("handles quoted Poetry names and lockfile development groups", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "pyproject.toml");
+    const lockfilePath = path.join(workspace, "poetry.lock");
+    await writeTextFile(manifestPath, [
+      "[tool.poetry.dependencies]",
+      'python = "^3.11"',
+      '"ruamel.yaml" = "0.18.6"',
+      "",
+      "[tool.poetry.group.dev.dependencies]",
+      'pytest = "8.2.1"',
+    ].join("\n"));
+    await writeTextFile(lockfilePath, [
+      "[[package]]",
+      'name = "ruamel-yaml"',
+      'version = "0.18.6"',
+      'groups = ["main"]',
+      "",
+      "[[package]]",
+      'name = "pytest"',
+      'version = "8.2.1"',
+      'groups = ["dev"]',
+      "[package.dependencies]",
+      'iniconfig = ">=1"',
+      "",
+      "[[package]]",
+      'name = "iniconfig"',
+      'version = "2.0.0"',
+      'groups = ["dev"]',
+    ].join("\n"));
+
+    const tree = await pythonParser.resolve({
+      lockfilePath,
+      manifestPath,
+      workspaceFolder: workspace,
+      options: {},
+    });
+    const ruamel = tree.dependencies.find((dependency) => dependency.name === "ruamel-yaml");
+    const pytest = tree.dependencies.find((dependency) => dependency.name === "pytest");
+    const iniconfig = tree.dependencies.find((dependency) => dependency.name === "iniconfig");
+
+    assert.strictEqual(ruamel.isDirect, true);
+    assert.strictEqual(pytest.isDirect, true);
+    assert.strictEqual(pytest.isDevelopmentDependency, true);
+    assert.strictEqual(iniconfig.isDirect, false);
+    assert.strictEqual(iniconfig.isDevelopmentDependency, true);
+    assert.deepStrictEqual(iniconfig.parentChain, ["pytest"]);
+  });
+
+  test("keeps path and git Python sources ineligible for registry lookup", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "pyproject.toml");
+    const lockfilePath = path.join(workspace, "uv.lock");
+    await writeTextFile(manifestPath, [
+      "[project]",
+      'name = "fixture"',
+      'dependencies = ["path-package", "git-package"]',
+    ].join("\n"));
+    await writeTextFile(lockfilePath, [
+      "[[package]]",
+      'name = "fixture"',
+      'version = "0.1.0"',
+      'source = { editable = "." }',
+      'dependencies = [{ name = "path-package" }, { name = "git-package" }]',
+      "",
+      "[[package]]",
+      'name = "path-package"',
+      'version = "1.0.0"',
+      'source = { path = "../path-package" }',
+      "",
+      "[[package]]",
+      'name = "git-package"',
+      'version = "2.0.0"',
+      'source = { git = "https://example.invalid/repo.git", rev = "abc123" }',
+    ].join("\n"));
+
+    const tree = await pythonParser.resolve({
+      lockfilePath,
+      manifestPath,
+      workspaceFolder: workspace,
+      options: {},
+    });
+    const pathPackage = tree.dependencies.find((dependency) => dependency.name === "path-package");
+    const gitPackage = tree.dependencies.find((dependency) => dependency.name === "git-package");
+
+    assert.deepStrictEqual(pathPackage.packageSource, {
+      kind: "path", location: "../path-package", branch: null, revision: null,
+    });
+    assert.deepStrictEqual(gitPackage.packageSource, {
+      kind: "git",
+      location: "https://example.invalid/repo.git",
+      branch: null,
+      revision: "abc123",
+    });
+  });
+
+  test("keeps complete Python inventory when graph depth is bounded", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "pyproject.toml");
+    const lockfilePath = path.join(workspace, "uv.lock");
+    await writeTextFile(manifestPath, [
+      "[project]",
+      'name = "fixture"',
+      'dependencies = ["root==1.0.0"]',
+    ].join("\n"));
+    await writeTextFile(lockfilePath, [
+      "[[package]]",
+      'name = "root"',
+      'version = "1.0.0"',
+      'dependencies = [{ name = "child" }]',
+      "",
+      "[[package]]",
+      'name = "child"',
+      'version = "1.0.0"',
+      'dependencies = [{ name = "leaf" }]',
+      "",
+      "[[package]]",
+      'name = "leaf"',
+      'version = "1.0.0"',
+    ].join("\n"));
+
+    const tree = await pythonParser.resolve({
+      lockfilePath,
+      manifestPath,
+      workspaceFolder: workspace,
+      options: { pythonGraphMaxDepth: 1 },
+    });
+
+    assert.deepStrictEqual(
+      new Set(tree.dependencies.map((dependency) => `${dependency.name}@${dependency.version}`)),
+      new Set(["root@1.0.0", "child@1.0.0", "leaf@1.0.0"])
+    );
+    assert.match(tree.warnings[0], /relationships could not be fully analyzed/i);
+  });
+
+  test("honors parser cancellation before reading Python dependency data", async () => {
+    const workspace = await createWorkspace();
+    const requirementsPath = path.join(workspace, "requirements.txt");
+    await writeTextFile(requirementsPath, "requests==2.31.0\n");
+
+    await assert.rejects(
+      () => pythonParser.resolve({
+        lockfilePath: requirementsPath,
+        workspaceFolder: workspace,
+        options: { cancellationToken: { isCancellationRequested: true } },
+      }),
+      (error) => error && error.code === "ERR_DEPENDENCY_PARSING_CANCELLED"
+    );
   });
 
   test("resolves multiline PEP 621 direct declarations and preserves multiple locked versions", async () => {

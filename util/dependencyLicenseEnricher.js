@@ -45,6 +45,14 @@ function buildLicensePatch(dependencies) {
   return patchMap;
 }
 
+function throwIfCancelled(cancellationToken) {
+  if (cancellationToken && cancellationToken.isCancellationRequested) {
+    const error = new Error("Dependency license enrichment was cancelled.");
+    error.code = "ERR_DEPENDENCY_ENRICHMENT_CANCELLED";
+    throw error;
+  }
+}
+
 function applyLicensePatch(dependencies, patchMap) {
   return (Array.isArray(dependencies) ? dependencies : []).map((dependency) => {
     const key = getFoundDependencyKey(dependency);
@@ -61,12 +69,15 @@ function applyLicensePatch(dependencies, patchMap) {
 
 async function enrichLicenses(dependencies, options = {}) {
   const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
+  throwIfCancelled(options.cancellationToken);
   const patchMap = buildLicensePatch(dependencies);
+  throwIfCancelled(options.cancellationToken);
 
   if (onProgress && patchMap.size > 0) {
     onProgress(new Map(patchMap), { stage: "licenses" });
   }
 
+  throwIfCancelled(options.cancellationToken);
   return applyLicensePatch(dependencies, patchMap);
 }
 

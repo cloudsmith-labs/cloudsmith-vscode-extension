@@ -5,7 +5,11 @@ const {
   RESOLUTION_SOURCE_KINDS,
   createDependencyRecord,
   createDependencySource,
+  getDependencyArtifactKey,
   getDependencyOccurrenceKey,
+  getDependencyPackageSourceDisplayLocation,
+  getDependencyPackageSourceDisplayRef,
+  isDependencyLookupEligible,
 } = require("../util/dependencyRecord");
 
 suite("dependencyRecord", () => {
@@ -328,5 +332,364 @@ suite("dependencyRecord", () => {
     ]);
 
     assert.strictEqual(keys.size, 4);
+  });
+
+  test("keeps bounded qualifiers and package-source eligibility immutable and fail closed", () => {
+    const registry = createDependencyRecord({
+      ecosystem: "nuget",
+      name: "Example.Package",
+      versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
+      legacyVersion: "1.2.3",
+      qualifiers: { targetFramework: "net8.0" },
+      packageSource: { kind: "registry", location: "https://api.nuget.org/v3/index.json" },
+    });
+    const local = createDependencyRecord({
+      ecosystem: "nuget",
+      name: "Example.Package",
+      versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
+      legacyVersion: "1.2.3",
+      qualifiers: { targetFramework: "net8.0" },
+      packageSource: { kind: "path", location: "../Example.Package" },
+    });
+
+    assert.strictEqual(isDependencyLookupEligible(registry), true);
+    assert.deepStrictEqual(local.lookupEligibility, {
+      state: "not-applicable",
+      reason: "path-source",
+    });
+    const omittedSource = createDependencyRecord({
+      ecosystem: "nuget",
+      name: "Unproven.Package",
+      versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
+      legacyVersion: "1.2.3",
+    });
+    assert.deepStrictEqual(omittedSource.lookupEligibility, {
+      state: "not-applicable",
+      reason: "unknown-source",
+    });
+    assert.strictEqual(Object.isFrozen(registry.qualifiers), true);
+    assert.strictEqual(Object.isFrozen(registry.packageSource), true);
+    assert.strictEqual(Object.isFrozen(registry.lookupEligibility), true);
+    assert.throws(() => createDependencyRecord({
+      ecosystem: "nuget",
+      name: "unsafe",
+      qualifiers: { targetFramework: "net8.0", unexpected: "value" },
+    }), /unsupported property/);
+    assert.throws(() => createDependencyRecord({
+      ecosystem: "nuget",
+      name: "unsafe",
+      packageSource: { kind: "registry", eligible: true },
+    }), /unsupported property/);
+  });
+
+  test("separates occurrence identity from ecosystem-aware artifact identity", () => {
+    const createNuget = (targetFramework) => createDependencyRecord({
+      ecosystem: "nuget",
+      name: "Example.Package",
+      resolvedVersion: "4.5.6",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      legacyVersion: "4.5.6",
+      qualifiers: { targetFramework },
+      packageSource: { kind: "registry" },
+    });
+    const netEight = createNuget("net8.0");
+    const netStandard = createNuget("netstandard2.0");
+    assert.notStrictEqual(
+      getDependencyOccurrenceKey(netEight),
+      getDependencyOccurrenceKey(netStandard)
+    );
+    assert.strictEqual(
+      getDependencyArtifactKey(netEight),
+      getDependencyArtifactKey(netStandard)
+    );
+
+    const createRuby = (platform) => createDependencyRecord({
+      ecosystem: "ruby",
+      name: "nokogiri",
+      resolvedVersion: "1.18.0",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      legacyVersion: "1.18.0",
+      qualifiers: { platform },
+      packageSource: { kind: "registry" },
+    });
+    assert.notStrictEqual(
+      getDependencyArtifactKey(createRuby("ruby")),
+      getDependencyArtifactKey(createRuby("x86_64-linux"))
+    );
+  });
+
+  test("derives workspace-relative source labels", () => {
+    const workspaceFolder = path.resolve("test", "fixtures");
+    const source = createDependencySource({
+      kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
+      filePath: path.join(workspaceFolder, "npm", "package.json"),
+      workspaceFolder,
+    });
+    assert.strictEqual(source.label, "npm/package.json");
+  });
+
+  test("bounds canonical values, parent chains, and transitive graph depth", () => {
+    const base = { ecosystem: "npm", name: "bounded-package" };
+    for (const [field, value] of [
+      ["declaredConstraint", "x".repeat(8193)],
+      ["resolvedVersion", "x".repeat(8193)],
+      ["environmentMarker", "x".repeat(8193)],
+      ["legacyVersion", "x".repeat(8193)],
+      ["parent", "x".repeat(4097)],
+    ]) {
+      assert.throws(
+        () => createDependencyRecord({ ...base, [field]: value }),
+        /invalid or exceeds the supported bound/
+      );
+    }
+    assert.throws(
+      () => createDependencyRecord({
+        ...base,
+        parentChain: Array.from({ length: 129 }, (_, index) => `parent-${index}`),
+      }),
+      /parent chain exceeds the supported length/
+    );
+    assert.throws(
+      () => createDependencyRecord({ ...base, parentChain: ["valid", "bad\nparent"] }),
+      /parent chain entry is invalid/
+    );
+
+    let nested = { ecosystem: "npm", name: "leaf" };
+    for (let index = 0; index < 129; index += 1) {
+      nested = { ecosystem: "npm", name: `node-${index}`, transitives: [nested] };
+    }
+    assert.throws(
+      () => createDependencyRecord(nested),
+      /transitive graphs exceed the supported depth/
+    );
+  });
+
+  test("sanitizes source-location display without erasing canonical provenance", () => {
+    const remote = createDependencyRecord({
+      ecosystem: "cargo",
+      name: "remote-package",
+      packageSource: {
+        kind: "git",
+        location: "https://user:secret@example.com/team/repo.git?token=hidden#main",
+      },
+    });
+    const local = createDependencyRecord({
+      ecosystem: "maven",
+      name: "com.example:local-package",
+      packageSource: {
+        kind: "path",
+        location: "/Users/private-user/workspace/libs/local-package.jar",
+      },
+    });
+
+    assert.strictEqual(
+      remote.packageSource.location,
+      "https://user:secret@example.com/team/repo.git?token=hidden#main"
+    );
+    assert.strictEqual(
+      getDependencyPackageSourceDisplayLocation(remote.packageSource),
+      "https://example.com/team/repo.git"
+    );
+    assert.strictEqual(
+      getDependencyPackageSourceDisplayLocation(local.packageSource),
+      "local-package.jar"
+    );
+    assert.strictEqual(
+      getDependencyPackageSourceDisplayLocation({
+        kind: "path",
+        location: "file:///Users/private-user/workspace/%E0%A4%A-secret.tgz",
+      }),
+      "%E0%A4%A-secret.tgz"
+    );
+    assert.strictEqual(
+      getDependencyPackageSourceDisplayLocation({
+        kind: "path",
+        location: "\\\\server\\share\\Users\\private-user\\secret.jar",
+      }),
+      "secret.jar"
+    );
+    assert.strictEqual(
+      getDependencyPackageSourceDisplayLocation({
+        kind: "path",
+        location: "\\\\?\\C:\\Users\\private-user\\extended-secret.jar",
+      }),
+      "extended-secret.jar"
+    );
+    for (const [kind, unsafeLocation] of [
+      ["path", "file://[bad/Users/private-user/private/secret.jar"],
+      ["path", "path:///Users/private-user/private/secret.jar"],
+      ["local", "local:///Users/private-user/private/secret.jar"],
+      ["path", "file:%2F%2F%2FUsers%2Fprivate-user%2Fprivate%2Fsecret.jar"],
+      ["path", "file:%2FC:%5CUsers%5Cprivate-user%5Cprivate%5Csecret.jar"],
+      ["path", "file%3A%2F%2F%2FUsers%2Fprivate-user%2Fprivate%2Fsecret.jar"],
+      ["path", "path%3A%2F%2F%2FUsers%2Fprivate-user%2Fprivate%2Fsecret.jar"],
+      ["path", "file%253A%252F%252F%252FUsers%252Fprivate-user%252Fprivate%252Fsecret.jar"],
+    ]) {
+      assert.strictEqual(
+        getDependencyPackageSourceDisplayLocation({ kind, location: unsafeLocation }),
+        "secret.jar"
+      );
+    }
+    for (const unsafeLocation of [
+      "ssh://user:secret@host:path",
+      "https://user:secret@example.com:bad/path",
+      "git+ssh://user:secret@example.com:bad/repo.git",
+      "https://user:secret@[::1",
+      "user:secret@host:path",
+      "file://user:secret@localhost/Users/private-user/private.tgz",
+      "ssh:/user:secret@host/path/repo.git",
+      "ssh:///user:secret@host/path",
+      "git+ssh:/user:secret@host/path/repo.git",
+      "ssh:/user@domain:secret@host/path/repo.git",
+      "user@domain:secret@host:path",
+      "ssh:%2Fuser%3Asecret%40host/path/repo.git",
+      "https://user%3Asecret%40example.com/path",
+      "%68%74%74%70%73%3A%2F%2Fuser%3Asecret%40example.com%2Fpath%3Ftoken%3Dhidden",
+    ]) {
+      const display = getDependencyPackageSourceDisplayLocation({
+        kind: "git",
+        location: unsafeLocation,
+      });
+      assert.doesNotMatch(display, /user|secret|private-user/);
+    }
+    assert.strictEqual(
+      getDependencyPackageSourceDisplayRef("https://user:secret@example.com/ref?token=hidden"),
+      "https://example.com/ref"
+    );
+    assert.strictEqual(
+      getDependencyPackageSourceDisplayRef("/Users/private-user/private/revision.txt"),
+      "revision.txt"
+    );
+    const encodeRepeatedly = (value, count) => {
+      let encoded = value;
+      for (let index = 0; index < count; index += 1) {
+        encoded = encodeURIComponent(encoded);
+      }
+      return encoded;
+    };
+    const overBudgetLocator =
+      "https://user:placeholder@example.invalid/repo.tgz?token=placeholder#frag";
+    for (const layers of [5, 6]) {
+      const display = getDependencyPackageSourceDisplayLocation({
+        kind: "git",
+        location: encodeRepeatedly(overBudgetLocator, layers),
+      });
+      assert.strictEqual(display, "source");
+      assert.doesNotMatch(display, /user|placeholder|token|frag/);
+    }
+  });
+
+  test("rejects control-bearing canonical identities and oversized source positions", () => {
+    for (const values of [
+      { ecosystem: "np\nm", name: "package" },
+      { ecosystem: "npm", name: "pack\tage" },
+      { ecosystem: "npm", format: "np\rm", name: "package" },
+    ]) {
+      assert.throws(
+        () => createDependencyRecord(values),
+        /require an ecosystem, format, and package name/
+      );
+    }
+    assert.throws(
+      () => createManifestSource("package.json", {
+        start: { line: 0, character: 0 },
+        end: { line: Number.MAX_SAFE_INTEGER, character: 0 },
+      }),
+      /non-negative integers/
+    );
+  });
+
+  test("rejects root, source, range, and indexed array accessors without invoking them", () => {
+    let accessorCalls = 0;
+    const root = { ecosystem: "npm" };
+    Object.defineProperty(root, "name", {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        return "package";
+      },
+    });
+    assert.throws(() => createDependencyRecord(root), /only data properties/);
+
+    const sourceValues = {
+      kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
+      filePath: path.resolve("package.json"),
+    };
+    Object.defineProperty(sourceValues, "type", {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        return "package.json";
+      },
+    });
+    assert.throws(() => createDependencySource(sourceValues), /only data properties/);
+
+    const range = { end: { line: 0, character: 1 } };
+    Object.defineProperty(range, "start", {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        return { line: 0, character: 0 };
+      },
+    });
+    assert.throws(
+      () => createManifestSource("package.json", range),
+      /only data properties/
+    );
+
+    const parentChain = ["parent"];
+    Object.defineProperty(parentChain, "0", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        accessorCalls += 1;
+        return "parent";
+      },
+    });
+    assert.throws(
+      () => createDependencyRecord({
+        ecosystem: "npm",
+        name: "package",
+        parentChain,
+      }),
+      /only indexed data properties/
+    );
+
+    const configurations = ["runtime"];
+    Object.defineProperty(configurations, "0", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        accessorCalls += 1;
+        return "runtime";
+      },
+    });
+    assert.throws(
+      () => createDependencyRecord({
+        ecosystem: "gradle",
+        name: "group:artifact",
+        qualifiers: { configurations },
+      }),
+      /only indexed data properties/
+    );
+
+    const transitives = [{ ecosystem: "npm", name: "child" }];
+    Object.defineProperty(transitives, "0", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        accessorCalls += 1;
+        return { ecosystem: "npm", name: "child" };
+      },
+    });
+    assert.throws(
+      () => createDependencyRecord({
+        ecosystem: "npm",
+        name: "package",
+        transitives,
+      }),
+      /only indexed data properties/
+    );
+    assert.strictEqual(accessorCalls, 0);
   });
 });

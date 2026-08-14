@@ -46,6 +46,8 @@ const MAX_LOCAL_PACKAGES = LOCAL_PACKAGE_PAGE_SIZE * MAX_LOCAL_PACKAGE_PAGES;
 const UPSTREAM_PAGE_SIZE = 100;
 const MAX_UPSTREAM_PAGES_PER_FORMAT = 5;
 const UPSTREAM_OPERATION_TIMEOUT_MS = 45_000;
+const DEFAULT_UPSTREAM_CACHE_WRITE_WAIT_MS = 250;
+const MAX_UPSTREAM_CACHE_WRITE_WAIT_MS = 1_000;
 const PERSISTED_UPSTREAM_KEYS = Object.freeze([
   "name",
   "slug_perm",
@@ -535,10 +537,35 @@ async function persistFlatResponse(
         failedFormats: [],
         successfulFormats: response.successfulFormats,
       });
-    } catch (error) {
-      logCacheError("persist", workspace, repo, error);
+    } catch {
+      if (isCacheOperationCurrent(globalState, cacheKey, operationId)) {
+        logCacheError("persist");
+      }
     }
   });
+}
+
+async function waitForOptionalCacheWrite(cacheWritePromise, timeoutMs) {
+  let timeoutHandle = null;
+  const settledWrite = Promise.resolve(cacheWritePromise).then(
+    () => true,
+    () => true
+  );
+  const timeout = new Promise((resolve) => {
+    timeoutHandle = setTimeout(() => resolve(false), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([settledWrite, timeout]);
+  } finally {
+    if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+  }
+}
+
+function boundedCacheWriteWaitMs(value) {
+  return Number.isSafeInteger(value) && value > 0
+    ? Math.min(value, MAX_UPSTREAM_CACHE_WRITE_WAIT_MS)
+    : DEFAULT_UPSTREAM_CACHE_WRITE_WAIT_MS;
 }
 
 // Retained for compatibility with callers outside the inventory path. HTTP
@@ -789,34 +816,68 @@ function getUniqueRequestedDescriptors(formats) {
   return formats.map(getUpstreamFormatDescriptor).filter(Boolean);
 }
 
-function createOperationDeadline(options, scheduler) {
+function createOperationDeadline(options, ownedScheduler = null) {
   const controller = new AbortController();
   const externalSignal = options.signal;
+  const cancellationToken = options.cancellationToken;
   let expired = false;
-  const abort = () => {
-    controller.abort();
-    scheduler.cancel();
+  let settled = false;
+  let resolveBoundary;
+  let cancellationDisposable = null;
+  const boundary = new Promise((resolve) => {
+    resolveBoundary = resolve;
+  });
+  const abort = (kind) => {
+    if (!controller.signal.aborted) controller.abort();
+    ownedScheduler?.cancel();
+    if (!settled) {
+      settled = true;
+      resolveBoundary(kind);
+    }
   };
-  const onExternalAbort = () => abort();
-  if (externalSignal?.aborted) abort();
+  const onExternalAbort = () => abort("cancelled");
+  if (externalSignal?.aborted) abort("cancelled");
   else externalSignal?.addEventListener?.("abort", onExternalAbort, { once: true });
+  if (cancellationToken?.isCancellationRequested) {
+    abort("cancelled");
+  } else if (typeof cancellationToken?.onCancellationRequested === "function") {
+    cancellationDisposable = cancellationToken.onCancellationRequested(() => abort("cancelled"));
+  }
   const requestedTimeout = Number(options.operationTimeoutMs);
   const timeoutMs = Number.isSafeInteger(requestedTimeout) && requestedTimeout > 0
     ? Math.min(requestedTimeout, UPSTREAM_OPERATION_TIMEOUT_MS)
     : UPSTREAM_OPERATION_TIMEOUT_MS;
-  const timer = setTimeout(() => {
+  const timer = controller.signal.aborted ? null : setTimeout(() => {
     expired = true;
-    abort();
+    abort("timeout");
   }, timeoutMs);
-  timer.unref?.();
+  timer?.unref?.();
   return {
     signal: controller.signal,
+    boundary,
     timedOut: () => expired,
     dispose() {
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
       externalSignal?.removeEventListener?.("abort", onExternalAbort);
+      cancellationDisposable?.dispose?.();
     },
   };
+}
+
+function makeDeadlineOutcome(descriptor, kind) {
+  if (!descriptor.inspectable) {
+    return makeFormatOutcome(descriptor.format, null, "unsupported", [], true, null);
+  }
+  const timedOut = kind === "timeout";
+  return makeFormatOutcome(
+    descriptor.format,
+    descriptor.apiFormat,
+    timedOut ? "uninspected" : "cancelled",
+    [],
+    false,
+    timedOut ? { kind: "timeout", retryable: true } : { kind: "cancelled" },
+    0
+  );
 }
 
 function buildAggregateResult(outcomes, requestCount, options = {}) {
@@ -892,6 +953,7 @@ class UpstreamChecker {
     this.connectionManager = resolveConnectionManager(context, options.connectionManager);
     this.api = options.cloudsmithAPI || new CloudsmithAPI(context);
     this.now = options.now || Date.now;
+    this._cacheWriteWaitMs = boundedCacheWriteWaitMs(options.cacheWriteWaitMs);
   }
 
   _captureAccount(options = {}) {
@@ -1022,23 +1084,45 @@ class UpstreamChecker {
 
       const descriptors = getUniqueRequestedDescriptors(requestedFormats);
       const inspectableCount = descriptors.filter(descriptor => descriptor.inspectable).length;
+      const ownsScheduler = !options.scheduler;
       const scheduler = options.scheduler || new UpstreamOperationScheduler({
         concurrency: UPSTREAM_REQUEST_CONCURRENCY,
         maxRequests: Math.max(1, inspectableCount * MAX_UPSTREAM_PAGES_PER_FORMAT),
       });
-      const deadline = createOperationDeadline(options, scheduler);
+      const deadline = createOperationDeadline(options, ownsScheduler ? scheduler : null);
+      const settledOutcomes = [];
+      const pendingOutcomes = descriptors.map((descriptor, index) => fetchFormatUpstreams(
+        this.api,
+        workspace,
+        repo,
+        descriptor.format,
+        { ...options, signal: deadline.signal, scheduler }
+      ).then((outcome) => {
+        settledOutcomes[index] = outcome;
+        return outcome;
+      }));
+      // Always observe the aggregate. If the deadline wins, active transports may
+      // still settle later even though the caller has already received a bounded result.
+      const aggregate = Promise.all(pendingOutcomes).then(
+        outcomes => ({ kind: "complete", outcomes }),
+        error => ({ kind: "failed", error })
+      );
       let outcomes;
+      let completion;
       try {
-        outcomes = await Promise.all(descriptors.map(descriptor => fetchFormatUpstreams(
-          this.api,
-          workspace,
-          repo,
-          descriptor.format,
-          { ...options, signal: deadline.signal, scheduler }
-        )));
+        completion = await Promise.race([
+          aggregate,
+          deadline.boundary.then(kind => ({ kind })),
+        ]);
       } finally {
         deadline.dispose();
       }
+      if (completion.kind === "failed") throw completion.error;
+      outcomes = completion.kind === "complete"
+        ? completion.outcomes
+        : descriptors.map((descriptor, index) => (
+          settledOutcomes[index] || makeDeadlineOutcome(descriptor, completion.kind)
+        ));
       if (!isAccountCurrent(this.connectionManager, account)) return null;
       if (deadline.timedOut()) {
         outcomes = outcomes.map(outcome => outcome.state === "cancelled"
@@ -1058,17 +1142,20 @@ class UpstreamChecker {
         && response.complete
         && globalState
       ) {
-        await persistFlatResponse(
-          globalState,
-          cacheKey,
-          workspace,
-          repo,
-          response,
-          account,
-          this.connectionManager,
-          operationToken,
-          getInspectableUpstreamFormats(requestedFormats),
-          this.now
+        await waitForOptionalCacheWrite(
+          persistFlatResponse(
+            globalState,
+            cacheKey,
+            workspace,
+            repo,
+            response,
+            account,
+            this.connectionManager,
+            operationToken,
+            getInspectableUpstreamFormats(requestedFormats),
+            this.now
+          ),
+          this._cacheWriteWaitMs
         );
       }
       return isAccountCurrent(this.connectionManager, account) ? response : null;

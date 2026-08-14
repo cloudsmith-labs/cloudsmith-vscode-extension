@@ -1,6 +1,11 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const fs = require("fs");
 const path = require("path");
+const {
+  DEPENDENCY_PACKAGE_SOURCE_KINDS,
+  createDependencyPackageSource,
+  createDependencyQualifiers,
+} = require("../dependencyRecord");
 
 const MAX_DEPENDENCY_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES = 50000;
@@ -135,6 +140,22 @@ async function resolveWorkspaceReadPath(targetPath, workspaceFolder) {
     resolvedTargetPath
   );
   const isCanonicalPathContained = isWithinWorkspace(workspaceRoot, resolvedTargetPath);
+  let initialTargetStats;
+  try {
+    // Capture the identity before resolving the canonical pathname. Otherwise
+    // a replacement performed immediately after realpath can become the
+    // trusted baseline for the later open.
+    initialTargetStats = await fs.promises.stat(resolvedTargetPath, { bigint: true });
+  } catch (error) {
+    if (!isLexicallyContained && !isCanonicalPathContained) {
+      throw createDependencyFileError(
+        DEPENDENCY_FILE_ERROR_CODES.OUTSIDE_WORKSPACE,
+        WORKSPACE_PATH_ERROR,
+        error
+      );
+    }
+    throw createReadFileSystemError(error);
+  }
   let realTargetPath;
   try {
     realTargetPath = await fs.promises.realpath(resolvedTargetPath);
@@ -162,11 +183,30 @@ async function resolveWorkspaceReadPath(targetPath, workspaceFolder) {
     );
   }
 
-  return { safePath: realTargetPath, workspaceRoot };
+  let expectedStats;
+  try {
+    expectedStats = await fs.promises.lstat(realTargetPath, { bigint: true });
+  } catch (error) {
+    throw createReadFileSystemError(error);
+  }
+  if (expectedStats.isSymbolicLink()) {
+    throw createDependencyFileChangedError();
+  }
+  if (!isSameFileIdentity(initialTargetStats, expectedStats)) {
+    throw createDependencyFileChangedError();
+  }
+
+  return { safePath: realTargetPath, workspaceRoot, expectedStats };
 }
 
-async function readUtf8(targetPath, workspaceFolder) {
-  const { safePath, workspaceRoot } = await resolveWorkspaceReadPath(targetPath, workspaceFolder);
+async function readUtf8(targetPath, workspaceFolder, options = {}) {
+  throwIfTraversalCancelled(options && options.cancellationToken);
+  const {
+    safePath,
+    workspaceRoot,
+    expectedStats,
+  } = await resolveWorkspaceReadPath(targetPath, workspaceFolder);
+  throwIfTraversalCancelled(options && options.cancellationToken);
   const noFollowFlag = Number.isInteger(fs.constants.O_NOFOLLOW)
     ? fs.constants.O_NOFOLLOW
     : 0;
@@ -190,7 +230,8 @@ async function readUtf8(targetPath, workspaceFolder) {
     const stats = await validateOpenedWorkspaceFile(
       fileHandle,
       safePath,
-      workspaceRoot
+      workspaceRoot,
+      expectedStats
     );
     if (!stats.isFile()) {
       throw createDependencyFileError(
@@ -201,13 +242,19 @@ async function readUtf8(targetPath, workspaceFolder) {
     if (stats.size > MAX_DEPENDENCY_FILE_BYTES) {
       throw createDependencyFileError(
         DEPENDENCY_FILE_ERROR_CODES.TOO_LARGE,
-        `Dependency file exceeds the ${MAX_DEPENDENCY_FILE_BYTES} byte parsing limit.`
+        "Dependency file exceeds the supported parsing size."
       );
     }
 
-    result = await readFileHandleUtf8(fileHandle);
+    result = await readFileHandleUtf8(
+      fileHandle,
+      options && options.cancellationToken
+    );
+    throwIfTraversalCancelled(options && options.cancellationToken);
   } catch (error) {
-    readError = isDependencyFileError(error) ? error : createReadFileSystemError(error);
+    readError = isDependencyFileError(error) || isTraversalCancellationError(error)
+      ? error
+      : createReadFileSystemError(error);
   }
 
   try {
@@ -222,8 +269,16 @@ async function readUtf8(targetPath, workspaceFolder) {
   return result;
 }
 
-async function validateOpenedWorkspaceFile(fileHandle, safePath, workspaceRoot) {
+async function validateOpenedWorkspaceFile(
+  fileHandle,
+  safePath,
+  workspaceRoot,
+  expectedStats
+) {
   const openedStats = await fileHandle.stat({ bigint: true });
+  if (!isSameFileIdentity(expectedStats, openedStats)) {
+    throw createDependencyFileChangedError();
+  }
   let currentRealPath;
   let currentPathStats;
   try {
@@ -260,14 +315,16 @@ function createDependencyFileChangedError(cause) {
   );
 }
 
-async function readFileHandleUtf8(fileHandle) {
+async function readFileHandleUtf8(fileHandle, cancellationToken = null) {
   const chunks = [];
   let totalBytes = 0;
 
   while (totalBytes <= MAX_DEPENDENCY_FILE_BYTES) {
+    throwIfTraversalCancelled(cancellationToken);
     const bytesRemaining = (MAX_DEPENDENCY_FILE_BYTES + 1) - totalBytes;
     const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, bytesRemaining));
     const { bytesRead } = await fileHandle.read(buffer, 0, buffer.length, null);
+    throwIfTraversalCancelled(cancellationToken);
     if (bytesRead === 0) {
       return Buffer.concat(chunks, totalBytes).toString("utf8");
     }
@@ -276,7 +333,7 @@ async function readFileHandleUtf8(fileHandle) {
     if (totalBytes > MAX_DEPENDENCY_FILE_BYTES) {
       throw createDependencyFileError(
         DEPENDENCY_FILE_ERROR_CODES.TOO_LARGE,
-        `Dependency file exceeds the ${MAX_DEPENDENCY_FILE_BYTES} byte parsing limit.`
+        "Dependency file exceeds the supported parsing size."
       );
     }
     chunks.push(buffer.subarray(0, bytesRead));
@@ -284,7 +341,7 @@ async function readFileHandleUtf8(fileHandle) {
 
   throw createDependencyFileError(
     DEPENDENCY_FILE_ERROR_CODES.TOO_LARGE,
-    `Dependency file exceeds the ${MAX_DEPENDENCY_FILE_BYTES} byte parsing limit.`
+    "Dependency file exceeds the supported parsing size."
   );
 }
 
@@ -317,8 +374,12 @@ function isDependencyFileError(error) {
   return Boolean(error && Object.values(DEPENDENCY_FILE_ERROR_CODES).includes(error.code));
 }
 
-async function readJson(targetPath, workspaceFolder) {
-  return JSON.parse(await readUtf8(targetPath, workspaceFolder));
+function isTraversalCancellationError(error) {
+  return Boolean(error && error.code === "ERR_DEPENDENCY_TRAVERSAL_CANCELLED");
+}
+
+async function readJson(targetPath, workspaceFolder, options = {}) {
+  return JSON.parse(await readUtf8(targetPath, workspaceFolder, options));
 }
 
 async function statSafe(targetPath, workspaceFolder) {
@@ -334,24 +395,226 @@ async function statSafe(targetPath, workspaceFolder) {
   }
 }
 
-async function readBoundedDirectoryEntries(directoryPath, maxEntries = MAX_DIRECTORY_ENTRIES) {
+async function readBoundedDirectoryEntries(
+  directoryPath,
+  maxEntries = MAX_DIRECTORY_ENTRIES,
+  options = {}
+) {
+  throwIfTraversalCancelled(options && options.cancellationToken);
   const requestedLimit = Number.isInteger(maxEntries) && maxEntries > 0
     ? maxEntries
     : MAX_DIRECTORY_ENTRIES;
   const limit = Math.min(requestedLimit, MAX_DIRECTORY_ENTRIES);
-  const directory = await fs.promises.opendir(directoryPath);
+  const workspaceFolder = options && options.workspaceFolder || directoryPath;
+  const workspaceRoot = await resolveWorkspaceRoot(directoryPath, workspaceFolder);
+  const requestedPath = path.resolve(String(directoryPath || ""));
+  let expectedStats;
+  let safePath;
+  try {
+    expectedStats = await fs.promises.stat(requestedPath, { bigint: true });
+    safePath = await fs.promises.realpath(requestedPath);
+  } catch (error) {
+    throw createReadFileSystemError(error);
+  }
+  if (!expectedStats.isDirectory() || !isWithinWorkspace(workspaceRoot, safePath)) {
+    throw createDependencyFileChangedError();
+  }
+  const noFollowFlag = Number.isInteger(fs.constants.O_NOFOLLOW)
+    ? fs.constants.O_NOFOLLOW
+    : 0;
+  const directoryOnlyFlag = Number.isInteger(fs.constants.O_DIRECTORY)
+    ? fs.constants.O_DIRECTORY
+    : 0;
+  let directoryHandle;
+  let directory;
+  try {
+    directoryHandle = await fs.promises.open(
+      safePath,
+      fs.constants.O_RDONLY | noFollowFlag | directoryOnlyFlag
+    );
+    const openedStats = await directoryHandle.stat({ bigint: true });
+    const currentRealPath = await fs.promises.realpath(safePath);
+    const currentStats = await fs.promises.stat(currentRealPath, { bigint: true });
+    if (
+      !isWithinWorkspace(workspaceRoot, currentRealPath)
+      || !openedStats.isDirectory()
+      || !isSameFileIdentity(expectedStats, openedStats)
+      || !isSameFileIdentity(openedStats, currentStats)
+    ) {
+      throw createDependencyFileChangedError();
+    }
+    directory = await fs.promises.opendir(safePath);
+    const postOpenRealPath = await fs.promises.realpath(safePath);
+    const postOpenStats = await fs.promises.stat(postOpenRealPath, { bigint: true });
+    if (
+      !isWithinWorkspace(workspaceRoot, postOpenRealPath)
+      || !isSameFileIdentity(openedStats, postOpenStats)
+    ) {
+      throw createDependencyFileChangedError();
+    }
+  } catch (error) {
+    if (directory) await directory.close().catch(() => {});
+    if (directoryHandle) await directoryHandle.close().catch(() => {});
+    throw isDependencyFileError(error) ? error : createReadFileSystemError(error);
+  }
   const entries = [];
   let truncated = false;
-
-  for await (const entry of directory) {
-    if (entries.length >= limit) {
-      truncated = true;
-      break;
+  let enumerationError = null;
+  try {
+    for await (const entry of directory) {
+      throwIfTraversalCancelled(options && options.cancellationToken);
+      if (entries.length >= limit) {
+        truncated = true;
+        break;
+      }
+      entries.push(await validateBoundedDirectoryEntry(
+        entry,
+        safePath,
+        workspaceRoot,
+        expectedStats
+      ));
     }
-    entries.push(entry);
+    throwIfTraversalCancelled(options && options.cancellationToken);
+    const finalRealPath = await fs.promises.realpath(safePath);
+    const finalStats = await fs.promises.stat(finalRealPath, { bigint: true });
+    if (
+      !isWithinWorkspace(workspaceRoot, finalRealPath)
+      || !isSameFileIdentity(expectedStats, finalStats)
+    ) {
+      throw createDependencyFileChangedError();
+    }
+  } catch (error) {
+    enumerationError = error;
   }
+  try {
+    await directoryHandle.close();
+  } catch (error) {
+    enumerationError ||= createReadFileSystemError(error);
+  }
+  if (enumerationError) throw enumerationError;
 
   return { entries, truncated };
+}
+
+async function validateBoundedDirectoryEntry(
+  entry,
+  safeDirectoryPath,
+  workspaceRoot,
+  expectedDirectoryStats
+) {
+  const name = entry && entry.name;
+  if (
+    typeof name !== "string"
+    || !name
+    || name === "."
+    || name === ".."
+    || path.basename(name) !== name
+    || name.includes("/")
+    || name.includes("\\")
+  ) {
+    throw createDependencyFileChangedError();
+  }
+
+  await validateCurrentDirectoryIdentity(
+    safeDirectoryPath,
+    workspaceRoot,
+    expectedDirectoryStats
+  );
+  const childPath = path.join(safeDirectoryPath, name);
+  let initialChildStats;
+  try {
+    initialChildStats = await fs.promises.lstat(childPath, { bigint: true });
+  } catch (error) {
+    throw createDependencyFileChangedError(error);
+  }
+
+  // Never follow a symlink merely to recover a Dirent type. Consumers already
+  // skip symbolic-link entries, and the parent identity checks ensure this
+  // snapshot refers to the verified workspace directory.
+  if (initialChildStats.isSymbolicLink()) {
+    await validateCurrentDirectoryIdentity(
+      safeDirectoryPath,
+      workspaceRoot,
+      expectedDirectoryStats
+    );
+    return createDirectoryEntrySnapshot(name, initialChildStats);
+  }
+
+  if (!initialChildStats.isFile() && !initialChildStats.isDirectory()) {
+    await validateCurrentDirectoryIdentity(
+      safeDirectoryPath,
+      workspaceRoot,
+      expectedDirectoryStats
+    );
+    return createDirectoryEntrySnapshot(name, initialChildStats);
+  }
+
+  const noFollowFlag = Number.isInteger(fs.constants.O_NOFOLLOW)
+    ? fs.constants.O_NOFOLLOW
+    : 0;
+  const directoryOnlyFlag = initialChildStats.isDirectory()
+    && Number.isInteger(fs.constants.O_DIRECTORY)
+    ? fs.constants.O_DIRECTORY
+    : 0;
+  let childHandle;
+  try {
+    childHandle = await fs.promises.open(
+      childPath,
+      fs.constants.O_RDONLY | noFollowFlag | directoryOnlyFlag
+    );
+    const openedChildStats = await childHandle.stat({ bigint: true });
+    const currentChildStats = await fs.promises.lstat(childPath, { bigint: true });
+    if (
+      currentChildStats.isSymbolicLink()
+      || !isSameFileIdentity(initialChildStats, openedChildStats)
+      || !isSameFileIdentity(openedChildStats, currentChildStats)
+    ) {
+      throw createDependencyFileChangedError();
+    }
+    await validateCurrentDirectoryIdentity(
+      safeDirectoryPath,
+      workspaceRoot,
+      expectedDirectoryStats
+    );
+    return createDirectoryEntrySnapshot(name, openedChildStats);
+  } catch (error) {
+    throw isDependencyFileError(error)
+      ? error
+      : createDependencyFileChangedError(error);
+  } finally {
+    if (childHandle) await childHandle.close().catch(() => {});
+  }
+}
+
+async function validateCurrentDirectoryIdentity(safePath, workspaceRoot, expectedStats) {
+  let currentRealPath;
+  let currentStats;
+  try {
+    currentRealPath = await fs.promises.realpath(safePath);
+    currentStats = await fs.promises.stat(currentRealPath, { bigint: true });
+  } catch (error) {
+    throw createDependencyFileChangedError(error);
+  }
+  if (
+    !isWithinWorkspace(workspaceRoot, currentRealPath)
+    || !currentStats.isDirectory()
+    || !isSameFileIdentity(expectedStats, currentStats)
+  ) {
+    throw createDependencyFileChangedError();
+  }
+}
+
+function createDirectoryEntrySnapshot(name, stats) {
+  return Object.freeze({
+    name,
+    isBlockDevice: () => stats.isBlockDevice(),
+    isCharacterDevice: () => stats.isCharacterDevice(),
+    isDirectory: () => stats.isDirectory(),
+    isFIFO: () => stats.isFIFO(),
+    isFile: () => stats.isFile(),
+    isSocket: () => stats.isSocket(),
+    isSymbolicLink: () => stats.isSymbolicLink(),
+  });
 }
 
 function getSourceFileName(targetPath) {
@@ -380,7 +643,56 @@ function createDependency({
   transitives,
   sourceFile,
   isDevelopmentDependency,
+  qualifiers,
+  packageSource,
+  repository,
+  alias,
+  service,
+  pullPolicy,
+  tag,
+  digest,
+  stage,
+  platform,
+  targetFramework,
+  environment,
+  section,
+  scope,
+  type,
+  classifier,
+  configurations,
+  sourceKind,
+  sourceLocation,
+  sourceBranch,
+  sourceRevision,
 }) {
+  const canonicalQualifiers = createDependencyQualifiers(qualifiers || {});
+  const compatibilityQualifiers = {
+    ...canonicalQualifiers,
+    ...optionalQualifierValues({
+      repository,
+      alias,
+      service,
+      pullPolicy,
+      tag,
+      digest,
+      stage,
+      platform,
+      targetFramework,
+      environment,
+      section,
+      scope,
+      type,
+      classifier,
+      configurations,
+    }),
+  };
+  const normalizedQualifiers = createDependencyQualifiers(compatibilityQualifiers);
+  const normalizedPackageSource = createDependencyPackageSource(packageSource || {
+    kind: sourceKind || DEPENDENCY_PACKAGE_SOURCE_KINDS.REGISTRY,
+    ...(sourceLocation ? { location: sourceLocation } : {}),
+    ...(sourceBranch ? { branch: sourceBranch } : {}),
+    ...(sourceRevision ? { revision: sourceRevision } : {}),
+  });
   return {
     name: String(name || "").trim(),
     version: String(version || "").trim(),
@@ -393,32 +705,79 @@ function createDependency({
     cloudsmithPackage: null,
     sourceFile: sourceFile || null,
     isDevelopmentDependency: Boolean(isDevelopmentDependency),
+    qualifiers: normalizedQualifiers,
+    packageSource: normalizedPackageSource,
   };
 }
 
-function flattenDependencies(dependencies) {
-  const flattened = [];
+function optionalQualifierValues(values) {
+  return Object.fromEntries(Object.entries(values).filter(([, value]) => value != null));
+}
 
-  for (const dependency of Array.isArray(dependencies) ? dependencies : []) {
+function flattenDependencies(dependencies, options = {}) {
+  const flattened = [];
+  const stack = (Array.isArray(dependencies) ? dependencies : []).slice().reverse();
+  const cancellationToken = options && options.cancellationToken || null;
+  while (stack.length > 0) {
+    if (cancellationToken && cancellationToken.isCancellationRequested) {
+      throwIfTraversalCancelled(cancellationToken);
+    }
+    if (flattened.length >= MAX_DIRECTORY_ENTRIES) {
+      throw new Error("Dependency traversal exceeded the supported occurrence limit.");
+    }
+    const dependency = stack.pop();
+    if (!dependency || typeof dependency !== "object" || Array.isArray(dependency)) {
+      continue;
+    }
     flattened.push(dependency);
     if (Array.isArray(dependency.transitives) && dependency.transitives.length > 0) {
-      flattened.push(...flattenDependencies(dependency.transitives));
+      for (let index = dependency.transitives.length - 1; index >= 0; index -= 1) {
+        stack.push(dependency.transitives[index]);
+      }
     }
   }
-
   return flattened;
+}
+
+function throwIfTraversalCancelled(cancellationToken) {
+  if (cancellationToken && cancellationToken.isCancellationRequested) {
+    const error = new Error("Dependency traversal was cancelled.");
+    error.code = "ERR_DEPENDENCY_TRAVERSAL_CANCELLED";
+    throw error;
+  }
 }
 
 function dependencyKey(dependency) {
   const ecosystem = String(dependency.ecosystem || "").trim().toLowerCase();
   const packageName = String(dependency.name || "").trim();
-  return [
+  const qualifiers = dependency && dependency.qualifiers || {};
+  const artifactQualifiers = {};
+  if (ecosystem === "ruby" && qualifiers.platform) {
+    artifactQualifiers.platform = qualifiers.platform;
+  }
+  if (ecosystem === "nuget" && qualifiers.targetFramework) {
+    artifactQualifiers.targetFramework = qualifiers.targetFramework;
+  }
+  if (["maven", "gradle"].includes(ecosystem)) {
+    if (qualifiers.type) artifactQualifiers.type = qualifiers.type;
+    if (qualifiers.classifier) artifactQualifiers.classifier = qualifiers.classifier;
+  }
+  if (ecosystem === "docker") {
+    if (qualifiers.tag) artifactQualifiers.tag = qualifiers.tag;
+    if (qualifiers.digest) artifactQualifiers.digest = qualifiers.digest;
+    if (qualifiers.service) artifactQualifiers.service = qualifiers.service;
+    if (qualifiers.stage) artifactQualifiers.stage = qualifiers.stage;
+    if (qualifiers.pullPolicy) artifactQualifiers.pullPolicy = qualifiers.pullPolicy;
+  }
+  return JSON.stringify([
     ecosystem,
     CASE_SENSITIVE_PACKAGE_NAME_ECOSYSTEMS.has(ecosystem)
       ? packageName
       : packageName.toLowerCase(),
     String(dependency.version || "").trim(),
-  ].join(":");
+    artifactQualifiers,
+    dependency.packageSource && dependency.packageSource.kind || null,
+  ]);
 }
 
 function deduplicateDeps(dependencies) {
@@ -650,4 +1009,5 @@ module.exports = {
   statSafe,
   stripTomlComment,
   stripYamlComment,
+  throwIfTraversalCancelled,
 };

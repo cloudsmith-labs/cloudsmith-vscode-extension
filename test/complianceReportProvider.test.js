@@ -91,6 +91,7 @@ suite("ComplianceReportProvider", () => {
     });
 
     assert.strictEqual(reportData.summary.total, 5);
+    assert.strictEqual(reportData.summary.occurrences, 5);
     assert.strictEqual(reportData.summary.found, 3);
     assert.strictEqual(reportData.summary.notFound, 2);
     assert.strictEqual(reportData.summary.coveragePct, 60);
@@ -193,5 +194,30 @@ suite("ComplianceReportProvider", () => {
     });
     assert.match(upstreamHtml, /Reachability unknown/);
     assert.doesNotMatch(upstreamHtml, /<h3>Not reachable<\/h3>/);
+  });
+
+  test("report provenance does not expose source credentials or absolute paths", () => {
+    const reportData = buildComplianceReportData("fixture", [{
+      name: "local-package",
+      version: "1.0.0",
+      format: "maven",
+      ecosystem: "maven",
+      isDirect: true,
+      cloudsmithStatus: "NOT_APPLICABLE",
+      cloudsmithLookupDetail: "Local dependency",
+      lookupEligibility: { state: "not-applicable", reason: "path-source" },
+      packageSource: {
+        kind: "path",
+        location: "/Users/private-user/workspace/libs/local-package.jar",
+      },
+      qualifiers: {
+        repository: "https://user:secret@example.com/index?token=hidden#private",
+      },
+    }]);
+
+    const html = new ComplianceReportProvider({})._getHtml(reportData);
+    assert.match(html, /Package source: local-package\.jar/);
+    assert.match(html, /Repository: https:\/\/example\.com\/index/);
+    assert.doesNotMatch(html, /private-user|\/Users\/|user:secret|token=|#private/);
   });
 });

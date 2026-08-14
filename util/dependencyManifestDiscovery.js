@@ -1,8 +1,8 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
-const fs = require("fs");
 const path = require("path");
 const {
   getWorkspacePath,
+  readBoundedDirectoryEntries,
   resolveWorkspaceFilePath,
 } = require("./lockfileParsers/shared");
 
@@ -40,6 +40,7 @@ const MANIFEST_DESCRIPTORS = Object.freeze({
   "package.json": { format: "npm", parserMethod: "parseNpm" },
   "requirements.txt": { format: "python", parserMethod: "parsePythonRequirements" },
   "pyproject.toml": { format: "python", parserMethod: "parsePyproject" },
+  "pipfile": { format: "python", parserMethod: null },
   "pom.xml": { format: "maven", parserMethod: "parseMaven" },
   "build.gradle": { format: "gradle", parserMethod: null },
   "build.gradle.kts": { format: "gradle", parserMethod: null },
@@ -58,7 +59,8 @@ const MANIFEST_DESCRIPTORS = Object.freeze({
   "mix.exs": { format: "hex", parserMethod: null },
 });
 
-async function discoverDependencyManifests(workspaceFolder) {
+async function discoverDependencyManifests(workspaceFolder, options = {}) {
+  throwIfDiscoveryCancelled(options);
   const workspacePath = getWorkspacePath(workspaceFolder);
   const workspaceRoot = await resolveWorkspaceFilePath(workspacePath, workspacePath);
   if (!workspaceRoot) {
@@ -71,25 +73,29 @@ async function discoverDependencyManifests(workspaceFolder) {
   let directoriesQueued = 1;
   let entriesScanned = 0;
   let truncated = false;
+  let incompleteTraversal = false;
 
   while (queue.length > 0 && !truncated) {
+    throwIfDiscoveryCancelled(options);
     const current = queue.shift();
-    let directory;
+    let directoryResult;
     try {
-      directory = await fs.promises.opendir(current.directory);
-    } catch {
+      directoryResult = await readBoundedDirectoryEntries(
+        current.directory,
+        MAX_DISCOVERY_ENTRIES - entriesScanned,
+        { ...options, workspaceFolder: workspaceRoot }
+      );
+    } catch (error) {
+      if (error && error.code === "ERR_DEPENDENCY_TRAVERSAL_CANCELLED") {
+        throwIfDiscoveryCancelled(options);
+        throw error;
+      }
+      incompleteTraversal = true;
       continue;
     }
 
-    const entries = [];
-    const remainingEntryBudget = MAX_DISCOVERY_ENTRIES - entriesScanned;
-    for await (const entry of directory) {
-      if (entries.length >= remainingEntryBudget) {
-        truncated = true;
-        break;
-      }
-      entries.push(entry);
-    }
+    const entries = directoryResult.entries;
+    if (directoryResult.truncated) truncated = true;
     entriesScanned += entries.length;
     // Sorting the bounded sample keeps processing stable without materializing
     // an unbounded directory. At the global cap, the filesystem determines the
@@ -98,6 +104,7 @@ async function discoverDependencyManifests(workspaceFolder) {
 
     const childDirectories = [];
     for (const entry of entries) {
+      throwIfDiscoveryCancelled(options);
       if (entry.isSymbolicLink()) {
         continue;
       }
@@ -132,6 +139,7 @@ async function discoverDependencyManifests(workspaceFolder) {
 
     childDirectories.sort((left, right) => left.localeCompare(right));
     for (const childDirectory of childDirectories) {
+      throwIfDiscoveryCancelled(options);
       if (directoriesQueued >= MAX_DISCOVERY_DIRECTORIES) {
         truncated = true;
         break;
@@ -146,9 +154,23 @@ async function discoverDependencyManifests(workspaceFolder) {
       "Dependency manifest discovery reached its bounded scan limit; some nested projects may not have been scanned."
     );
   }
+  if (incompleteTraversal) {
+    warnings.push(
+      "Dependency manifest discovery could not safely scan every directory; some nested projects may not have been scanned."
+    );
+  }
 
   manifests.sort((left, right) => left.filePath.localeCompare(right.filePath));
   return { manifests, warnings };
+}
+
+function throwIfDiscoveryCancelled(options) {
+  if (!(options && options.cancellationToken && options.cancellationToken.isCancellationRequested)) {
+    return;
+  }
+  const error = new Error("Dependency manifest discovery was canceled.");
+  error.code = "ERR_DEPENDENCY_DISCOVERY_CANCELLED";
+  throw error;
 }
 
 function describeManifest(fileName) {

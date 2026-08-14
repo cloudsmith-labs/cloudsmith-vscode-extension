@@ -344,6 +344,7 @@ class InstallCommandBuilder {
     const safeName = usesShellArguments ? InstallCommandBuilder.shellEscape(validatedName) : "";
     const safeVersion = usesShellArguments ? InstallCommandBuilder.shellEscape(validatedVersion) : "";
     const shellArgument = value => usesShellArguments ? InstallCommandBuilder.shellEscape(value) : "";
+    const goVersion = `v${validatedVersion.replace(/^v+/i, "")}`;
     const commands = {
       python: {
         command: `# Verify package details before running\npip install ${shellArgument(`${validatedName}==${validatedVersion}`)} --index-url https://dl.cloudsmith.io/basic/${encodedWorkspace}/${encodedRepo}/python/simple/`,
@@ -376,7 +377,7 @@ class InstallCommandBuilder {
         note: `Add registry to .cargo/config.toml:\n[registries.cloudsmith]\nindex = "sparse+https://cargo.cloudsmith.io/${encodedWorkspace}/${encodedRepo}/"`,
       },
       go: {
-        command: `# Verify package details before running\nGONOSUMCHECK=${safeName} go get ${shellArgument(`${validatedName}@v${validatedVersion}`)}`,
+        command: `# Verify package details before running\nGONOSUMCHECK=${safeName} go get ${shellArgument(`${validatedName}@${goVersion}`)}`,
         note: `Set GOPROXY=https://go.cloudsmith.io/basic/${encodedWorkspace}/${encodedRepo}/,direct`,
       },
       ruby: {

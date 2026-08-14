@@ -178,7 +178,11 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
 
     let state;
     try {
-      const requestOptions = { cancellationToken, scheduler };
+      const requestOptions = {
+        cancellationToken,
+        scheduler,
+        operationTimeoutMs: options.operationTimeoutMs,
+      };
       state = typeof upstreamChecker.getRepositoryUpstreamStateForFormats === "function"
         ? await upstreamChecker.getRepositoryUpstreamStateForFormats(
           workspace,

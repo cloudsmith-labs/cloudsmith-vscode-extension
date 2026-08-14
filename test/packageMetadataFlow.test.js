@@ -396,6 +396,47 @@ suite("Package Metadata Flow Test Suite", () => {
     assert.match(node.getTreeItem().tooltip, /License: No license detected/);
   });
 
+  test("dependency health tooltips do not expose source credentials or absolute paths", () => {
+    const remoteNode = new DependencyHealthNode({
+      name: "remote-artifact",
+      version: "1.0.0",
+      format: "cargo",
+      cloudsmithStatus: "NOT_APPLICABLE",
+      packageSource: {
+        kind: "git",
+        location: "https://user:secret@example.com/team/repo.git?token=hidden#main",
+        branch: "https://branch-user:branch-secret@example.com/release?token=hidden",
+        revision: "/Users/private-user/workspace/private-revision.txt",
+      },
+      qualifiers: {
+        repository: "https://repo-user:repo-secret@example.com/index?api_key=hidden",
+      },
+    }, {});
+    const localNode = new DependencyHealthNode({
+      name: "local-artifact",
+      version: "1.0.0",
+      format: "maven",
+      cloudsmithStatus: "NOT_APPLICABLE",
+      packageSource: {
+        kind: "path",
+        location: "/Users/private-user/workspace/libs/local-artifact.jar",
+      },
+    }, {});
+
+    const remoteTooltip = remoteNode.getTreeItem().tooltip;
+    const localTooltip = localNode.getTreeItem().tooltip;
+    assert.match(remoteTooltip, /Source location: https:\/\/example\.com\/team\/repo\.git/);
+    assert.match(remoteTooltip, /Source branch: https:\/\/example\.com\/release/);
+    assert.match(remoteTooltip, /Source revision: private-revision\.txt/);
+    assert.match(remoteTooltip, /Repository: https:\/\/example\.com\/index/);
+    assert.doesNotMatch(
+      remoteTooltip,
+      /user:secret|branch-user|branch-secret|repo-user|repo-secret|private-user|\/Users\/|token=|api_key=|#main/
+    );
+    assert.match(localTooltip, /Source location: local-artifact\.jar/);
+    assert.doesNotMatch(localTooltip, /private-user|\/Users\//);
+  });
+
   test("dependency health missing nodes use format icons and upstream-aware context values", () => {
     const context = { extensionPath: path.resolve(__dirname, "..") };
 

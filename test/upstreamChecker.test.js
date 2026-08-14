@@ -16,6 +16,7 @@ const {
   INSPECTABLE_UPSTREAM_FORMATS,
   SUPPORTED_UPSTREAM_FORMATS: SHARED_SUPPORTED_UPSTREAM_FORMATS,
 } = require("../util/upstreamFormats");
+const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
 function toApiResult(response) {
@@ -620,6 +621,56 @@ suite("UpstreamChecker shared helper and format handling", () => {
     await pending;
 
     assert.strictEqual(getActiveUpstreamCacheOperationCount(context.globalState), 0);
+  });
+
+  test("bounds optional cache persistence and contains a late write failure", async () => {
+    const { context } = createContext();
+    let rejectUpdate;
+    const update = new Promise((_resolve, reject) => {
+      rejectUpdate = reject;
+    });
+    let updateCalls = 0;
+    context.globalState.update = async () => {
+      updateCalls += 1;
+      return update;
+    };
+    const checker = createChecker(context, {
+      cacheWriteWaitMs: 5,
+      cloudsmithAPI: {
+        async get() {
+          return apiSuccess([]);
+        },
+      },
+    });
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = warning => warnings.push(warning);
+
+    try {
+      const state = await Promise.race([
+        checker.getUpstreamDataForFormats("workspace-a", "repo-a", ["npm"]),
+        new Promise((_resolve, reject) => {
+          setTimeout(() => reject(new Error("optional cache write blocked the result")), 250);
+        }),
+      ]);
+
+      assert.strictEqual(state.complete, true);
+      assert.strictEqual(state.total, 0);
+      assert.strictEqual(updateCalls, 1);
+      assert.strictEqual(getActiveUpstreamCacheOperationCount(context.globalState), 0);
+
+      rejectUpdate(new Error("late persistence secret"));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepStrictEqual(warnings, []);
+      assert.doesNotMatch(warnings.join(" "), /late persistence secret/);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test("caps the optional cache persistence wait configured by callers", () => {
+    const checker = createChecker({}, { cacheWriteWaitMs: Number.MAX_SAFE_INTEGER });
+    assert.strictEqual(checker._cacheWriteWaitMs, 1_000);
   });
 
   test("rejects over-count and over-limit runtime upstream responses before use", async () => {
@@ -1268,6 +1319,87 @@ suite("UpstreamChecker shared helper and format handling", () => {
     const cancelled = await cancelledPromise;
     assert.strictEqual(cancelled.state, "cancelled");
     assert.strictEqual(cancelled.failures[0].category, "cancelled");
+  });
+
+  test("settles the operation deadline when an active transport ignores abort", async () => {
+    let rejectLate;
+    const unhandled = [];
+    const onUnhandled = reason => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    const checker = createChecker({}, {
+      cloudsmithAPI: {
+        async get() {
+          return new Promise((_resolve, reject) => {
+            rejectLate = reject;
+          });
+        },
+      },
+    });
+
+    try {
+      const timed = await Promise.race([
+        checker.getUpstreamDataForFormats(
+          "workspace-a", "repo-hung", ["npm"], { operationTimeoutMs: 5 }
+        ),
+        new Promise((_resolve, reject) => {
+          setTimeout(() => reject(new Error("true deadline did not settle")), 250);
+        }),
+      ]);
+
+      assert.strictEqual(timed.complete, false);
+      assert.deepStrictEqual(timed.uninspectedFormats, ["npm"]);
+      assert.strictEqual(timed.failures[0].category, "timeout");
+      assert.strictEqual(timed.failures[0].retryable, true);
+
+      const snapshot = JSON.stringify(timed);
+      rejectLate(new Error("late transport failure"));
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.strictEqual(JSON.stringify(timed), snapshot);
+      assert.deepStrictEqual(unhandled, []);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
+  });
+
+  test("external cancellation retires a non-cooperative shared-scheduler request", async () => {
+    let rejectLate;
+    const checker = createChecker({}, {
+      cloudsmithAPI: {
+        async get() {
+          return new Promise((_resolve, reject) => {
+            rejectLate = reject;
+          });
+        },
+      },
+    });
+    const scheduler = new UpstreamOperationScheduler({ concurrency: 1, maxRequests: 10 });
+    const controller = new AbortController();
+    const pending = checker.getUpstreamDataForFormats(
+      "workspace-a",
+      "repo-cancelled",
+      ["npm"],
+      { operationTimeoutMs: 1_000, scheduler, signal: controller.signal }
+    );
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(scheduler.activeCount, 1);
+
+    controller.abort();
+    const cancelled = await Promise.race([
+      pending,
+      new Promise((_resolve, reject) => {
+        setTimeout(() => reject(new Error("external cancellation did not settle")), 250);
+      }),
+    ]);
+
+    assert.strictEqual(cancelled.state, "cancelled");
+    assert.strictEqual(cancelled.failures[0].category, "cancelled");
+    assert.strictEqual(scheduler.activeCount, 0);
+    assert.strictEqual(scheduler.queuedCount, 0);
+    assert.strictEqual(scheduler.stopped, false);
+
+    rejectLate(new Error("late cancelled transport failure"));
+    await new Promise(resolve => setImmediate(resolve));
   });
 
   test("rejects malformed repository and format scopes without claiming empty success", async () => {

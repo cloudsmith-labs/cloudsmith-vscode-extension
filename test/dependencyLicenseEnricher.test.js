@@ -65,4 +65,11 @@ suite("dependencyLicenseEnricher", () => {
     assert.strictEqual(enriched[1].license.spdx, "LGPL-2.1");
     assert.strictEqual(enriched[2].license, undefined);
   });
+
+  test("honors cancellation before license enrichment", async () => {
+    await assert.rejects(
+      () => enrichLicenses([], { cancellationToken: { isCancellationRequested: true } }),
+      (error) => error.code === "ERR_DEPENDENCY_ENRICHMENT_CANCELLED"
+    );
+  });
 });

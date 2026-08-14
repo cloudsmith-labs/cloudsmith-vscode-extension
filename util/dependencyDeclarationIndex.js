@@ -13,6 +13,7 @@ const EXACT_SOURCE_ECOSYSTEMS = new Map([
   ["package.json", "npm"],
   ["composer.json", "composer"],
   ["pyproject.toml", "python"],
+  ["pipfile", "python"],
   ["pom.xml", "maven"],
   ["go.mod", "go"],
 ]);
@@ -89,6 +90,9 @@ function buildDependencyDeclarationIndex({
   } else if (normalizedType === "pyproject.toml") {
     precision = "exact";
     indexPyproject(text, state);
+  } else if (normalizedType === "pipfile") {
+    precision = "exact";
+    indexPipfile(text, state);
   } else if (format === "python") {
     precision = "exact";
     indexRequirements(text, state);
@@ -525,6 +529,51 @@ function indexPyproject(content, state) {
   if (collectingProjectDependencies) {
     throw new DependencyDeclarationIndexError("Dependency pyproject source has an unterminated dependencies array.");
   }
+}
+
+function indexPipfile(content, state) {
+  let section = "";
+  forEachLine(content, (rawLine, lineStart) => {
+    const commentOffset = findTomlCommentOffset(rawLine);
+    const visibleLine = rawLine.slice(0, commentOffset).trimEnd();
+    const leading = firstNonWhitespaceOffset(visibleLine);
+    if (leading === -1) {
+      return;
+    }
+    const trimmed = visibleLine.slice(leading);
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      section = trimmed.toLowerCase();
+      return;
+    }
+    if (!["[packages]", "[dev-packages]"].includes(section)) {
+      return;
+    }
+    const separator = findUnquotedCharacter(trimmed, "=");
+    if (separator < 0) {
+      return;
+    }
+    const rawKey = trimmed.slice(0, separator).trim();
+    const key = unquote(rawKey);
+    if (!key) {
+      return;
+    }
+    const value = trimmed.slice(separator + 1).trim();
+    const declaredConstraint = value.startsWith("{")
+      ? findInlineStringAssignment(value, "version")
+      : unquote(value);
+    const keyOffset = trimmed.indexOf(rawKey)
+      + (rawKey.startsWith('"') || rawKey.startsWith("'") ? 1 : 0);
+    addDeclaration(state, {
+      name: key,
+      declaredConstraint: declaredConstraint === "*" ? null : declaredConstraint,
+      isDevelopmentDependency: section === "[dev-packages]",
+      qualifier: section,
+      offsetRange: Object.freeze({
+        start: lineStart + leading + keyOffset,
+        end: lineStart + leading + keyOffset + key.length,
+      }),
+    });
+  }, state.shouldCancel);
 }
 
 function indexProjectDependencyStrings(text, lineStart, state, baseOffset) {

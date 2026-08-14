@@ -67,16 +67,16 @@ suite("DependencyHealthProvider Test Suite", () => {
 
   function createDependency(name, version, format = "npm") {
     const manifestPath = "/project/package.json";
-    return {
+    const canonical = createDependencyRecord({
       name,
       declarationName: name,
-      version,
       legacyVersion: version,
       declaredConstraint: version,
       resolvedVersion: null,
       versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
       format,
       ecosystem: format,
+      packageSource: { kind: "registry" },
       isDirect: true,
       parent: null,
       parentChain: [],
@@ -88,10 +88,14 @@ suite("DependencyHealthProvider Test Suite", () => {
       }),
       resolutionSource: null,
       environmentMarker: null,
+      isDevelopmentDependency: false,
+    });
+    return {
+      ...canonical,
+      version,
+      sourceFile: "package-lock.json",
       cloudsmithStatus: "CHECKING",
       cloudsmithPackage: null,
-      sourceFile: "package-lock.json",
-      isDevelopmentDependency: false,
     };
   }
 
@@ -562,6 +566,8 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(diagnostics.replacements.length, 0);
     const nodes = await provider.getChildren();
     assert.strictEqual(nodes[0].getTreeItem().label, "Dependency scan failed");
+    assert.doesNotMatch(provider.getScanState().failureMessage, /index unavailable/);
+    assert.match(provider.getScanState().failureMessage, /Check the dependency files/);
   });
 
   test("first scan cancellation publishes neither partial results nor diagnostics", async () => {
@@ -882,7 +888,8 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(provider.dependencies[0].name, "known-good");
     assert.strictEqual(diagnostics.current, priorDiagnostics);
     assert.strictEqual(diagnostics.replacements.length, 1);
-    assert.match(provider.getScanState().failureMessage, /diagnostic index unavailable/);
+    assert.doesNotMatch(provider.getScanState().failureMessage, /diagnostic index unavailable/);
+    assert.match(provider.getScanState().failureMessage, /Check the dependency files/);
   });
 
   test("cancellation during diagnostic preparation preserves the prior snapshot", async () => {
@@ -983,7 +990,8 @@ suite("DependencyHealthProvider Test Suite", () => {
       && candidate.occurrence.transitives.length === 0
     )));
     assert.deepStrictEqual(provider._warnings, ["previous successful warning"]);
-    assert.match(scanWorker._warnings[0], /capped at 10000 direct occurrences/);
+    assert.match(scanWorker._warnings[0], /reached its safety limit/);
+    assert.doesNotMatch(scanWorker._warnings[0], /10000/);
 
     provider._scanOperation = {
       ...provider._scanOperation,
@@ -996,7 +1004,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       repository: "repo-a",
       projectFolder: "/project",
     }, 1, 1);
-    assert.match(provider._warnings[0], /capped at 10000 direct occurrences/);
+    assert.match(provider._warnings[0], /reached its safety limit/);
   });
 
   test("scope change can select a different project folder without mutating successful scope", async () => {
@@ -1151,7 +1159,8 @@ suite("DependencyHealthProvider Test Suite", () => {
 
     await provider.scan("workspace-a", null, "/project-a");
     assert.strictEqual(provider.getScanState().status, SCAN_STATES.FAILED);
-    assert.match(provider.getScanState().failureMessage, /temporary failure/);
+    assert.doesNotMatch(provider.getScanState().failureMessage, /temporary failure/);
+    assert.match(provider.getScanState().failureMessage, /Check the dependency files/);
 
     await provider.scan("workspace-a", null, "/project-a");
 
@@ -1345,6 +1354,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       resolvedVersion: null,
       versionState: DEPENDENCY_VERSION_STATES.RANGE,
       sourceManifest: manifestSource,
+      packageSource: { kind: "registry" },
       isDirect: true,
       legacyVersion: "1.0.0",
     });
@@ -1402,7 +1412,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       assert.strictEqual(projected.declaredConstraint, "^1.0.0");
       assert.strictEqual(projected.resolvedVersion, null);
       assert.strictEqual(projected.sourceManifest.filePath, "/project/package.json");
-      assert.strictEqual(projected.cloudsmithStatus, "CHECKING");
+      assert.strictEqual(projected.cloudsmithStatus, "UNRESOLVED");
     } finally {
       vscode.workspace.getConfiguration = originalGetConfiguration;
     }
@@ -1450,7 +1460,7 @@ suite("DependencyHealthProvider Test Suite", () => {
           { report() {} },
           { isCancellationRequested: false }
         ),
-        /parsing did not complete.*Malformed package\.json/
+        /parsing did not complete.*Dependency data could not be parsed/
       );
       assert.deepStrictEqual(provider._fullTrees, []);
       assert.deepStrictEqual(provider._displayTrees, []);
@@ -1533,6 +1543,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       declaredConstraint: "^1.0.0",
       resolvedVersion: "1.4.0",
       versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      packageSource: { kind: "registry" },
       resolutionSource: createDependencySource({
         kind: RESOLUTION_SOURCE_KINDS.LOCKFILE,
         filePath: "/project/package-lock.json",
@@ -1550,6 +1561,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       resolvedVersion: null,
       versionState: DEPENDENCY_VERSION_STATES.RANGE,
       sourceManifest: nestedSource,
+      packageSource: { kind: "registry" },
       isDirect: true,
       legacyVersion: "2",
     });
@@ -1646,6 +1658,7 @@ suite("DependencyHealthProvider Test Suite", () => {
             name: "root-package",
             resolvedVersion: "1.0.0",
             versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+            packageSource: { kind: "registry" },
             resolutionSource: createDependencySource({
               kind: RESOLUTION_SOURCE_KINDS.LOCKFILE,
               filePath: "/project/package-lock.json",
@@ -1688,7 +1701,10 @@ suite("DependencyHealthProvider Test Suite", () => {
       );
 
       assert.strictEqual(provider._fullTrees[0].dependencies[0].name, "root-package");
-      assert.ok(provider._warnings.includes("Malformed nested pyproject.toml."));
+      assert.ok(provider._warnings.includes(
+        "Dependency data could not be parsed. Check the dependency files and rescan."
+      ));
+      assert.doesNotMatch(provider._warnings.join(" "), /Malformed nested/);
     } finally {
       vscode.workspace.getConfiguration = originalGetConfiguration;
     }
@@ -1727,7 +1743,7 @@ suite("DependencyHealthProvider Test Suite", () => {
           { report() {} },
           { isCancellationRequested: false }
         ),
-        /parsing did not complete.*No direct manifest parser supports build\.gradle/
+        /parsing did not complete.*Dependency data could not be parsed/
       );
     } finally {
       vscode.workspace.getConfiguration = originalGetConfiguration;
@@ -1935,6 +1951,137 @@ suite("DependencyHealthProvider Test Suite", () => {
       provider._fullTrees[1].dependencies[0].cloudsmithLookupDetail,
       /request budget was exhausted/
     );
+  });
+
+  test("deduplicates NuGet target-framework occurrences to one artifact lookup", async () => {
+    const base = createDependencyRecord({
+      ecosystem: "nuget",
+      name: "Example.Package",
+      resolvedVersion: "1.2.3",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      legacyVersion: "1.2.3",
+      packageSource: { kind: "registry" },
+      qualifiers: { targetFramework: "net8.0" },
+      isDirect: true,
+    });
+    const transitive = createDependencyRecord({
+      ecosystem: "nuget",
+      name: "Example.Package",
+      resolvedVersion: "1.2.3",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      legacyVersion: "1.2.3",
+      packageSource: { kind: "registry" },
+      qualifiers: { targetFramework: "net9.0" },
+      isDirect: false,
+      parent: "Parent.Package",
+      parentChain: ["Parent.Package"],
+    });
+    const api = createLookupApi(() => lookupPage([{
+      name: "Example.Package",
+      version: "1.2.3",
+      format: "nuget",
+    }]));
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCloudsmithAPI: () => api,
+    });
+    provider._fullTrees = [{
+      ecosystem: "nuget",
+      sourceFile: "packages.lock.json",
+      dependencies: [base, transitive],
+    }];
+    provider._displayTrees = cloneTrees(provider._fullTrees);
+    provider.refresh = () => {};
+
+    await provider._runCoverageChecks(
+      "workspace",
+      "repo",
+      1,
+      { report() {} },
+      { isCancellationRequested: false }
+    );
+
+    assert.strictEqual(api.calls.length, 1);
+    assert.deepStrictEqual(
+      provider._fullTrees[0].dependencies.map((dependency) => dependency.cloudsmithStatus),
+      [CLOUDSMITH_COVERAGE_STATUS.FOUND, CLOUDSMITH_COVERAGE_STATUS.FOUND]
+    );
+  });
+
+  test("skips non-registry dependencies without starting lookup or enrichment", async () => {
+    const local = createDependencyRecord({
+      ecosystem: "npm",
+      name: "workspace-package",
+      resolvedVersion: "1.0.0",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      legacyVersion: "1.0.0",
+      packageSource: { kind: "local", location: "packages/workspace-package" },
+      isDirect: true,
+    });
+    let vulnerabilityInput = null;
+    let licenseInput = null;
+    let policyInput = null;
+    let upstreamCalled = false;
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCloudsmithAPI: () => ({ get: async () => { throw new Error("must not look up local dependencies"); } }),
+      enrichVulnerabilities: async (dependencies) => { vulnerabilityInput = dependencies; },
+      enrichLicenses: async (dependencies) => { licenseInput = dependencies; },
+      enrichPolicies: async (dependencies) => { policyInput = dependencies; },
+      analyzeUpstreamGaps: async () => { upstreamCalled = true; },
+    });
+    provider._fullTrees = [{ ecosystem: "npm", sourceFile: "package.json", dependencies: [local] }];
+    provider._displayTrees = cloneTrees(provider._fullTrees);
+    provider.refresh = () => {};
+
+    provider._fullTrees = provider._fullTrees.map((tree) => ({
+      ...tree,
+      dependencies: tree.dependencies.map((dependency) => ({
+        ...dependency,
+        cloudsmithStatus: CLOUDSMITH_COVERAGE_STATUS.NOT_APPLICABLE,
+      })),
+    }));
+    await provider._runCoverageChecks(
+      "workspace", "repo", 0, { report() {} }, { isCancellationRequested: false }
+    );
+    await provider._runEnrichmentPasses(
+      "workspace", "repo", { report() {} }, { isCancellationRequested: false }
+    );
+
+    assert.deepStrictEqual(vulnerabilityInput, []);
+    assert.deepStrictEqual(licenseInput, []);
+    assert.deepStrictEqual(policyInput, []);
+    assert.strictEqual(upstreamCalled, false);
+  });
+
+  test("lookup fails closed when source provenance is missing or contradicts eligibility", async () => {
+    let apiCalls = 0;
+    const api = {
+      async get() {
+        apiCalls += 1;
+        throw new Error("ineligible dependencies must not dispatch network requests");
+      },
+    };
+    const registry = createDependency("registry-package", "1.0.0");
+    const forgedLocal = {
+      ...registry,
+      packageSource: { kind: "path", location: "../local" },
+      lookupEligibility: { state: "eligible", reason: null },
+    };
+    const missingSource = {
+      ...registry,
+      packageSource: null,
+      lookupEligibility: { state: "eligible", reason: null },
+    };
+
+    for (const dependency of [forgedLocal, missingSource]) {
+      const result = await lookupExactDependency({
+        api,
+        cloudsmithWorkspace: "workspace",
+        cloudsmithRepo: "repository",
+        dependency,
+      });
+      assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.NOT_APPLICABLE);
+    }
+    assert.strictEqual(apiCalls, 0);
   });
 
   test("exact lookup finds a package on the first page with escaped name and version terms", async () => {
@@ -2318,6 +2465,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       declaredConstraint: "^1.0.0",
       resolvedVersion: null,
       versionState: DEPENDENCY_VERSION_STATES.RANGE,
+      packageSource: { kind: "registry" },
       isDirect: true,
       legacyVersion: "1.0.0",
     });
@@ -2338,7 +2486,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(api.calls.length, 0);
   });
 
-  test("legacy plain versions without evidence remain unresolved", async () => {
+  test("legacy plain versions without source provenance remain not applicable", async () => {
     const dependency = {
       name: "left-pad",
       version: "1.0.0",
@@ -2358,7 +2506,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     });
 
     assert.strictEqual(getConcreteDependencyVersion(dependency), null);
-    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.UNRESOLVED);
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.NOT_APPLICABLE);
     assert.strictEqual(api.calls.length, 0);
   });
 
@@ -2370,6 +2518,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       declaredConstraint: ">=1.0.0 <2.0.0",
       resolvedVersion: null,
       versionState: DEPENDENCY_VERSION_STATES.RANGE,
+      packageSource: { kind: "registry" },
       isDirect: true,
       legacyVersion: "1.0.0 <2.0.0",
     });
@@ -2415,6 +2564,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       declaredConstraint: "1.0.0",
       resolvedVersion: null,
       versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
+      packageSource: { kind: "registry" },
       isDirect: true,
       legacyVersion: "1.0.0",
     });
@@ -2441,6 +2591,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       declaredConstraint: "==2.32.3",
       resolvedVersion: null,
       versionState: DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
+      packageSource: { kind: "registry" },
       isDirect: true,
       legacyVersion: "",
     });
@@ -3090,7 +3241,10 @@ suite("DependencyHealthProvider Test Suite", () => {
     gate.resolve();
     await pending;
     assert.strictEqual(siblingCompletions, 2);
-    assert.ok(provider._warnings.some(warning => /vulnerability enrichment failed/.test(warning)));
+    assert.ok(provider._warnings.includes(
+      "Some dependency details could not be loaded. Retry the dependency scan."
+    ));
+    assert.doesNotMatch(provider._warnings.join(" "), /vulnerability enrichment failed/);
   });
 
   test("pullSingleDependency reserves the operation before asynchronous preparation", async () => {

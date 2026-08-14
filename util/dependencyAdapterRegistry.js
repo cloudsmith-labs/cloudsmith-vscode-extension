@@ -4,12 +4,16 @@ const { ManifestParser } = require("./manifestParser");
 const { LockfileResolver } = require("./lockfileResolver");
 const { discoverDependencyManifests } = require("./dependencyManifestDiscovery");
 const {
+  DEPENDENCY_PACKAGE_SOURCE_KINDS,
   DEPENDENCY_VERSION_STATES,
   RESOLUTION_SOURCE_KINDS,
+  createDependencyPackageSource,
+  createDependencyQualifiers,
   createDependencyRecord,
   createDependencySource,
 } = require("./dependencyRecord");
 const {
+  DEPENDENCY_FILE_ERROR_CODES,
   getWorkspacePath,
   readUtf8,
   resolveWorkspaceFilePath,
@@ -26,6 +30,50 @@ const ADAPTER_RESULT_STATUSES = Object.freeze({
   UNSUPPORTED: "unsupported",
 });
 const ADAPTER_RESULT_STATUS_VALUES = new Set(Object.values(ADAPTER_RESULT_STATUSES));
+const ADAPTER_ERROR_CODES = Object.freeze({
+  CANCELLED: "scan-cancelled",
+  DEPENDENCY_FILE_CHANGED: "dependency-file-changed",
+  DEPENDENCY_FILE_MISSING: "dependency-file-missing",
+  DEPENDENCY_FILE_NOT_REGULAR: "dependency-file-not-regular",
+  DEPENDENCY_FILE_OUTSIDE_WORKSPACE: "dependency-file-outside-workspace",
+  DEPENDENCY_FILE_TOO_LARGE: "dependency-file-too-large",
+  DEPENDENCY_FILE_UNREADABLE: "dependency-file-unreadable",
+  PARSE_ERROR: "parse-error",
+  UNSUPPORTED_ADAPTER: "unsupported-adapter",
+  UNSUPPORTED_MANIFEST: "unsupported-manifest",
+});
+const SAFE_ADAPTER_ERROR_MESSAGES = Object.freeze({
+  [ADAPTER_ERROR_CODES.CANCELLED]: "Dependency scanning was canceled.",
+  [ADAPTER_ERROR_CODES.DEPENDENCY_FILE_CHANGED]:
+    "A dependency file changed during the scan. Rescan the workspace.",
+  [ADAPTER_ERROR_CODES.DEPENDENCY_FILE_MISSING]:
+    "A dependency file could not be found. Rescan the workspace.",
+  [ADAPTER_ERROR_CODES.DEPENDENCY_FILE_NOT_REGULAR]:
+    "A dependency path could not be read as a file. Check the dependency files and rescan.",
+  [ADAPTER_ERROR_CODES.DEPENDENCY_FILE_OUTSIDE_WORKSPACE]:
+    "A dependency file is outside the selected workspace. Check the dependency paths and rescan.",
+  [ADAPTER_ERROR_CODES.DEPENDENCY_FILE_TOO_LARGE]:
+    "A dependency file could not be scanned because of its size. Check the dependency file and rescan.",
+  [ADAPTER_ERROR_CODES.DEPENDENCY_FILE_UNREADABLE]:
+    "A dependency file could not be read. Check file access and rescan.",
+  [ADAPTER_ERROR_CODES.PARSE_ERROR]:
+    "Dependency data could not be parsed. Check the dependency files and rescan.",
+  [ADAPTER_ERROR_CODES.UNSUPPORTED_ADAPTER]:
+    "Dependency data could not be read from this source.",
+  [ADAPTER_ERROR_CODES.UNSUPPORTED_MANIFEST]:
+    "Dependency data could not be read from this file.",
+});
+const DEPENDENCY_FILE_ADAPTER_ERROR_CODES = Object.freeze({
+  [DEPENDENCY_FILE_ERROR_CODES.CHANGED]: ADAPTER_ERROR_CODES.DEPENDENCY_FILE_CHANGED,
+  [DEPENDENCY_FILE_ERROR_CODES.MISSING]: ADAPTER_ERROR_CODES.DEPENDENCY_FILE_MISSING,
+  [DEPENDENCY_FILE_ERROR_CODES.NOT_REGULAR]: ADAPTER_ERROR_CODES.DEPENDENCY_FILE_NOT_REGULAR,
+  [DEPENDENCY_FILE_ERROR_CODES.OUTSIDE_WORKSPACE]:
+    ADAPTER_ERROR_CODES.DEPENDENCY_FILE_OUTSIDE_WORKSPACE,
+  [DEPENDENCY_FILE_ERROR_CODES.SYMLINK_ESCAPE]:
+    ADAPTER_ERROR_CODES.DEPENDENCY_FILE_OUTSIDE_WORKSPACE,
+  [DEPENDENCY_FILE_ERROR_CODES.TOO_LARGE]: ADAPTER_ERROR_CODES.DEPENDENCY_FILE_TOO_LARGE,
+  [DEPENDENCY_FILE_ERROR_CODES.UNREADABLE]: ADAPTER_ERROR_CODES.DEPENDENCY_FILE_UNREADABLE,
+});
 const MAX_STRUCTURAL_GRAPH_ENTRIES = 50000;
 const MAX_STRUCTURAL_GRAPH_EDGES = 500000;
 
@@ -37,7 +85,7 @@ const RESOLUTION_AVAILABILITY = Object.freeze({
 
 const RESOLVER_MANIFEST_TYPES = Object.freeze({
   npmParser: ["package.json"],
-  pythonParser: ["requirements.txt", "pyproject.toml"],
+  pythonParser: ["requirements.txt", "pyproject.toml", "Pipfile"],
   mavenParser: ["pom.xml"],
   gradleParser: ["build.gradle", "build.gradle.kts"],
   goParser: ["go.mod"],
@@ -56,6 +104,9 @@ const LEGACY_MANIFEST_PARSERS = Object.freeze({
   "package.json": (content) => ManifestParser.parseNpm(content, "npm"),
   "requirements.txt": (content) => ManifestParser.parsePythonRequirements(content, "python"),
   "pyproject.toml": (content) => ManifestParser.parsePyproject(content, "python"),
+  "pipfile": (content, _resolver, options) => (
+    require("./lockfileParsers/pythonParser").parsePipfileManifest(content, options)
+  ),
   "pom.xml": (content) => ManifestParser.parseMaven(content, "maven"),
   "go.mod": (content) => ManifestParser.parseGoMod(content, "go"),
   "cargo.toml": (content) => ManifestParser.parseCargo(content, "cargo"),
@@ -156,9 +207,10 @@ class DependencyAdapterRegistry {
     return null;
   }
 
-  async detect(workspaceFolder) {
+  async detect(workspaceFolder, options = {}) {
     const workspaceRoot = getWorkspacePath(workspaceFolder);
-    const discovery = await discoverDependencyManifests(workspaceRoot);
+    throwIfCancelled(options.cancellationToken);
+    const discovery = await discoverDependencyManifests(workspaceRoot, options);
     this._discoveryWarnings = discovery.warnings.slice();
     const nestedAdapterRoots = new Map();
     for (const manifest of discovery.manifests) {
@@ -184,10 +236,11 @@ class DependencyAdapterRegistry {
     const seen = new Set();
     for (const [projectRoot, adapterIds] of detectionTargets) {
       for (const adapterId of adapterIds) {
+        throwIfCancelled(options.cancellationToken);
         const adapter = this._adapters.get(adapterId);
         const adapterDetections = validateDetectionResult(
           adapter,
-          await adapter.detect(projectRoot)
+          await adapter.detect(projectRoot, options)
         );
         for (const detection of adapterDetections) {
           const detectionKey = JSON.stringify([
@@ -220,8 +273,9 @@ class DependencyAdapterRegistry {
     return this._discoveryWarnings.slice();
   }
 
-  async detectManifests(workspaceFolder) {
-    const discovery = await discoverDependencyManifests(workspaceFolder);
+  async detectManifests(workspaceFolder, options = {}) {
+    throwIfCancelled(options.cancellationToken);
+    const discovery = await discoverDependencyManifests(workspaceFolder, options);
     this._discoveryWarnings = discovery.warnings.slice();
     const manifests = discovery.manifests;
     return manifests.map((manifest) => {
@@ -235,6 +289,18 @@ class DependencyAdapterRegistry {
   }
 
   async parse(detection, options = {}) {
+    try {
+      throwIfCancelled(options.cancellationToken);
+    } catch (error) {
+      return createAdapterResult({
+        status: ADAPTER_RESULT_STATUSES.ERROR,
+        adapterId: null,
+        ecosystem: null,
+        sourceFile: null,
+        resolutionAvailability: RESOLUTION_AVAILABILITY.UNKNOWN,
+        error,
+      });
+    }
     const adapterId = detection && (detection.adapterId || detection.resolverName);
     const adapter = this.getAdapter(adapterId);
     if (!adapter) {
@@ -254,7 +320,7 @@ class DependencyAdapterRegistry {
     return validateAdapterResult(adapter, "parse", await adapter.parse(detection, options));
   }
 
-  async parseManifest(manifest) {
+  async parseManifest(manifest, options = {}) {
     const manifestType = path.basename(String(manifest && manifest.filePath || manifest && manifest.manifestType || ""));
     const adapter = this.getAdapterForManifest(manifestType);
     if (!adapter || typeof adapter.parseManifest !== "function") {
@@ -271,7 +337,12 @@ class DependencyAdapterRegistry {
       });
     }
 
-    return validateAdapterResult(adapter, "parseManifest", await adapter.parseManifest(manifest));
+    throwIfCancelled(options.cancellationToken);
+    return validateAdapterResult(
+      adapter,
+      "parseManifest",
+      await adapter.parseManifest(manifest, options)
+    );
   }
 }
 
@@ -290,18 +361,22 @@ function createResolverAdapter(resolver) {
     normalizeName(name) {
       return normalizePackageName(name, resolver.ecosystem);
     },
-    async detect(workspaceFolder) {
+    async detect(workspaceFolder, options = {}) {
       const rootPath = getWorkspacePath(workspaceFolder);
-      if (!rootPath || (typeof resolver.canResolve === "function" && !(await resolver.canResolve(rootPath)))) {
+      throwIfCancelled(options.cancellationToken);
+      if (!rootPath || (typeof resolver.canResolve === "function" && !(await resolver.canResolve(rootPath, options)))) {
         return [];
       }
+      throwIfCancelled(options.cancellationToken);
       const detections = typeof resolver.detect === "function"
-        ? await resolver.detect(rootPath)
+        ? await resolver.detect(rootPath, options)
         : [];
+      throwIfCancelled(options.cancellationToken);
       return detections;
     },
     async parse(detection, options) {
       try {
+        throwIfCancelled(options && options.cancellationToken);
         const safeDetection = await resolveDetectionPaths(
           detection,
           options && options.workspaceFolder
@@ -315,11 +390,13 @@ function createResolverAdapter(resolver) {
             workspaceFolder: safeDetection.workspaceFolder,
           }
         );
+        throwIfCancelled(options && options.cancellationToken);
         const sources = createSourceSet(safeDetection, resolver);
         const declaredConstraints = await readDeclaredConstraintIndex(
           sources.manifest,
           resolver.ecosystem,
-          safeDetection.workspaceFolder
+          safeDetection.workspaceFolder,
+          options
         );
         const dependencyGraph = adaptPackageLockGraph(legacyTree && legacyTree.dependencyGraph);
         const dependencies = (legacyTree && legacyTree.dependencies || []).map((dependency) => (
@@ -342,7 +419,7 @@ function createResolverAdapter(resolver) {
             : ADAPTER_RESULT_STATUSES.SUCCESS,
           adapterId: resolver.name,
           ecosystem: resolver.ecosystem,
-          sourceFile: legacyTree && legacyTree.sourceFile || safeDetection.sourceFile,
+          sourceFile: getAdapterSourceLabel(sources, legacyTree && legacyTree.sourceFile || safeDetection.sourceFile),
           source: sources,
           dependencies,
           dependencyGraph,
@@ -358,20 +435,17 @@ function createResolverAdapter(resolver) {
           ecosystem: resolver.ecosystem,
           sourceFile: detection && detection.sourceFile || null,
           resolutionAvailability: RESOLUTION_AVAILABILITY.NOT_APPLICABLE,
-          error: {
-            code: "parse-error",
-            message: error && error.message ? error.message : "Dependency parsing failed.",
-          },
+          error: createSafeAdapterError(error),
         });
       }
     },
     parseManifest: manifestTypes.length > 0 || resolver.name === "nugetParser"
-      ? (manifest) => parseLegacyManifest(resolver, manifest)
+      ? (manifest, options) => parseLegacyManifest(resolver, manifest, options)
       : undefined,
   });
 }
 
-async function parseLegacyManifest(resolver, manifest) {
+async function parseLegacyManifest(resolver, manifest, options = {}) {
   const manifestType = normalizeManifestType(path.basename(String(manifest && manifest.filePath || "")));
   const parser = LEGACY_MANIFEST_PARSERS[manifestType];
   const useResolverDirectly = RESOLVER_DIRECT_MANIFEST_TYPES.has(manifestType)
@@ -392,16 +466,17 @@ async function parseLegacyManifest(resolver, manifest) {
   }
 
   try {
+    throwIfCancelled(options.cancellationToken);
     const workspaceFolder = getWorkspacePath(manifest.workspaceFolder);
     if (!workspaceFolder) {
-      throw new Error("Dependency manifests require a workspace folder.");
+      throw createDependencyFileBoundaryError();
     }
     const safeWorkspaceFolder = await resolveWorkspaceFilePath(workspaceFolder, workspaceFolder);
     const safeFilePath = await resolveWorkspaceFilePath(manifest.filePath, workspaceFolder);
     if (!safeFilePath) {
-      throw new Error("Manifest paths must stay within the workspace folder.");
+      throw createDependencyFileBoundaryError();
     }
-    const content = await readUtf8(safeFilePath, workspaceFolder);
+    const content = await readUtf8(safeFilePath, workspaceFolder, options);
     if (manifestType === "package.json") {
       JSON.parse(content);
     }
@@ -410,16 +485,19 @@ async function parseLegacyManifest(resolver, manifest) {
       kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
       filePath: safeFilePath,
       type: path.basename(safeFilePath),
+      workspaceFolder,
     });
     if (useResolverDirectly) {
-      return parseResolverManifest(
+      const resolverResult = await parseResolverManifest(
         resolver,
         safeFilePath,
         safeWorkspaceFolder || workspaceFolder,
-        sourceManifest
+        sourceManifest,
+        options
       );
+      return resolverResult;
     }
-    const dependencies = parser(content).map((dependency) => adaptLegacyManifestDependency(
+    const dependencies = parser(content, resolver, options).map((dependency) => adaptLegacyManifestDependency(
       dependency,
       resolver.ecosystem,
       sourceManifest
@@ -429,7 +507,7 @@ async function parseLegacyManifest(resolver, manifest) {
       status: ADAPTER_RESULT_STATUSES.SUCCESS,
       adapterId: resolver.name,
       ecosystem: resolver.ecosystem,
-      sourceFile: path.basename(safeFilePath),
+      sourceFile: sourceManifest.label,
       source: Object.freeze({ manifest: sourceManifest, resolution: null }),
       dependencies,
       resolutionAvailability: missingResolutionAvailability(resolver.name),
@@ -441,15 +519,12 @@ async function parseLegacyManifest(resolver, manifest) {
       ecosystem: resolver.ecosystem,
       sourceFile: manifestType || null,
       resolutionAvailability: RESOLUTION_AVAILABILITY.NOT_APPLICABLE,
-      error: {
-        code: "parse-error",
-        message: error && error.message ? error.message : "Manifest parsing failed.",
-      },
+      error: createSafeAdapterError(error),
     });
   }
 }
 
-async function parseResolverManifest(resolver, safeFilePath, workspaceFolder, sourceManifest) {
+async function parseResolverManifest(resolver, safeFilePath, workspaceFolder, sourceManifest, options = {}) {
   const manifestType = normalizeManifestType(path.basename(safeFilePath));
   const isLockfileShapedManifest = manifestType === "requirements.txt"
     || manifestType === "dockerfile"
@@ -459,7 +534,7 @@ async function parseResolverManifest(resolver, safeFilePath, workspaceFolder, so
     resolver.name,
     isLockfileShapedManifest ? safeFilePath : null,
     isLockfileShapedManifest ? null : safeFilePath,
-    { workspaceFolder }
+    { ...options, workspaceFolder }
   );
   const sources = Object.freeze({
     manifest: sourceManifest,
@@ -469,7 +544,8 @@ async function parseResolverManifest(resolver, safeFilePath, workspaceFolder, so
   const declaredConstraints = await readDeclaredConstraintIndex(
     sourceManifest,
     resolver.ecosystem,
-    workspaceFolder
+    workspaceFolder,
+    options
   );
   const dependencies = (legacyTree && legacyTree.dependencies || []).map((dependency) => (
     adaptLegacyDependency(
@@ -490,7 +566,7 @@ async function parseResolverManifest(resolver, safeFilePath, workspaceFolder, so
       : ADAPTER_RESULT_STATUSES.SUCCESS,
     adapterId: resolver.name,
     ecosystem: resolver.ecosystem,
-    sourceFile: legacyTree && legacyTree.sourceFile || path.basename(safeFilePath),
+    sourceFile: sourceManifest.label || legacyTree && legacyTree.sourceFile || path.basename(safeFilePath),
     source: sources,
     dependencies,
     warnings,
@@ -503,7 +579,7 @@ async function resolveDetectionPaths(detection, callerWorkspaceFolder) {
     callerWorkspaceFolder || detection && detection.workspaceFolder
   );
   if (!workspaceFolder) {
-    throw new Error("Dependency detections require a workspace folder.");
+    throw createDependencyFileBoundaryError();
   }
   const safeWorkspaceFolder = await resolveWorkspaceFilePath(workspaceFolder, workspaceFolder);
 
@@ -514,10 +590,10 @@ async function resolveDetectionPaths(detection, callerWorkspaceFolder) {
     ? await resolveWorkspaceFilePath(detection.manifestPath, workspaceFolder)
     : null;
   if (detection && detection.lockfilePath && !lockfilePath) {
-    throw new Error("Lockfile paths must stay within the workspace folder.");
+    throw createDependencyFileBoundaryError();
   }
   if (detection && detection.manifestPath && !manifestPath) {
-    throw new Error("Manifest paths must stay within the workspace folder.");
+    throw createDependencyFileBoundaryError();
   }
 
   return {
@@ -545,6 +621,7 @@ function createSourceSet(detection, resolver) {
         kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
         filePath: manifestPath,
         type: path.basename(manifestPath),
+        workspaceFolder: detection.workspaceFolder,
       })
       : null,
     resolution: resolutionPath
@@ -552,6 +629,7 @@ function createSourceSet(detection, resolver) {
         kind: lockfileKind,
         filePath: resolutionPath,
         type: path.basename(resolutionPath),
+        workspaceFolder: detection.workspaceFolder,
       })
       : null,
     adapterId: resolver.name,
@@ -572,7 +650,7 @@ function getSourceKind(filePath) {
   return RESOLUTION_SOURCE_KINDS.MANIFEST;
 }
 
-async function readDeclaredConstraintIndex(sourceManifest, ecosystem, workspaceFolder) {
+async function readDeclaredConstraintIndex(sourceManifest, ecosystem, workspaceFolder, options = {}) {
   const index = new Map();
   if (!sourceManifest) {
     return index;
@@ -582,11 +660,12 @@ async function readDeclaredConstraintIndex(sourceManifest, ecosystem, workspaceF
     return index;
   }
 
-  const content = await readUtf8(sourceManifest.filePath, workspaceFolder);
+  throwIfCancelled(options.cancellationToken);
+  const content = await readUtf8(sourceManifest.filePath, workspaceFolder, options);
   if (normalizeManifestType(sourceManifest.type) === "package.json") {
     JSON.parse(content);
   }
-  for (const dependency of parser(content)) {
+  for (const dependency of parser(content, null, options)) {
     const name = normalizePackageName(dependency.name, ecosystem);
     if (!name || index.has(name)) {
       continue;
@@ -627,8 +706,15 @@ function adaptLegacyDependency(
     dependency,
     "hasResolutionEvidence"
   );
+  const parserQualifiers = adaptDependencyQualifiers(dependency);
+  const usesAuthoritativeManifestResolution = format === "docker"
+    && dependency.hasResolutionEvidence === true
+    && Boolean(parserQualifiers.tag || parserQualifiers.digest)
+    && Boolean(sources.manifest);
+  const effectiveResolutionSource = sources.resolution
+    || (usesAuthoritativeManifestResolution ? sources.manifest : null);
   const hasResolutionEvidence = Boolean(
-    sources.resolution
+    effectiveResolutionSource
     && candidateResolvedVersion
     && !environmentMarker
     && (!hasExplicitResolutionFlag || dependency.hasResolutionEvidence === true)
@@ -655,6 +741,8 @@ function adaptLegacyDependency(
   const sourceManifest = dependency.isDirect
     ? createDependencyManifestSource(dependency, sources.manifest, workspaceFolder)
     : null;
+  const qualifiers = parserQualifiers;
+  const packageSource = adaptDependencyPackageSource(dependency, declaredConstraint);
 
   return createDependencyRecord({
     ecosystem,
@@ -664,8 +752,10 @@ function adaptLegacyDependency(
     declaredConstraint,
     resolvedVersion,
     versionState,
-    resolutionSource: resolvedVersion ? sources.resolution : null,
+    resolutionSource: resolvedVersion ? effectiveResolutionSource : null,
     sourceManifest,
+    packageSource,
+    qualifiers,
     environmentMarker,
     isDirect: dependency.isDirect,
     isDevelopmentDependency: dependency.isDevelopmentDependency || dependency.devDependency,
@@ -784,6 +874,8 @@ function adaptLegacyManifestDependency(dependency, ecosystem, sourceManifest) {
     versionState,
     resolutionSource: null,
     sourceManifest,
+    packageSource: adaptDependencyPackageSource(dependency, declaredConstraint),
+    qualifiers: adaptDependencyQualifiers(dependency),
     environmentMarker: dependency.environmentMarker,
     isDirect: true,
     isDevelopmentDependency: dependency.isDevelopmentDependency || dependency.devDependency,
@@ -885,6 +977,145 @@ function createDependencyManifestSource(dependency, fallbackSource, workspaceFol
     kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
     filePath: candidatePath,
     type: path.basename(candidatePath),
+    workspaceFolder,
+  });
+}
+
+function adaptDependencyQualifiers(dependency) {
+  const canonical = dependency && dependency.qualifiers != null
+    ? createDependencyQualifiers(dependency.qualifiers)
+    : Object.freeze({});
+  const compatibilityValues = {
+    targetFramework: dependency && dependency.targetFramework,
+    platform: dependency && dependency.platform,
+    scope: dependency && dependency.scope,
+    type: dependency && (dependency.mavenType || dependency.type),
+    classifier: dependency && (dependency.mavenClassifier || dependency.classifier),
+    configurations: dependency && dependency.configurations,
+    repository: dependency && dependency.repository,
+    alias: dependency && dependency.alias,
+    service: dependency && dependency.service,
+    pullPolicy: dependency && dependency.pullPolicy,
+    tag: dependency && dependency.tag,
+    digest: dependency && dependency.digest,
+    stage: dependency && dependency.stage,
+    environment: dependency && dependency.environment,
+    section: dependency && dependency.section,
+  };
+  const compatibility = Object.fromEntries(Object.entries(compatibilityValues).filter(
+    ([key, value]) => value != null && !Object.prototype.hasOwnProperty.call(canonical, key)
+  ));
+  return createDependencyQualifiers({ ...compatibility, ...canonical });
+}
+
+function adaptDependencyPackageSource(dependency, declaredConstraint) {
+  if (dependency && dependency.packageSource != null) {
+    return createDependencyPackageSource(dependency.packageSource);
+  }
+  const compatibilityKind = optionalConstraint(dependency && dependency.sourceKind);
+  if (compatibilityKind) {
+    return createDependencyPackageSource({
+      kind: compatibilityKind,
+      ...(dependency.sourceLocation != null ? { location: dependency.sourceLocation } : {}),
+      ...(dependency.sourceBranch != null ? { branch: dependency.sourceBranch } : {}),
+      ...(dependency.sourceRevision != null ? { revision: dependency.sourceRevision } : {}),
+    });
+  }
+
+  const branch = optionalConstraint(dependency && dependency.sourceBranch);
+  const revision = optionalConstraint(dependency && dependency.sourceRevision);
+  const sourceLocation = optionalConstraint(
+    dependency && (dependency.sourceLocation || dependency.repositoryUrl)
+  );
+  if (branch || revision) {
+    return createDependencyPackageSource({
+      kind: DEPENDENCY_PACKAGE_SOURCE_KINDS.SCM,
+      ...(sourceLocation ? { location: sourceLocation } : {}),
+      ...(branch ? { branch } : {}),
+      ...(revision ? { revision } : {}),
+    });
+  }
+
+  const evidence = [
+    declaredConstraint,
+    dependency && dependency.resolved,
+    dependency && dependency.source,
+    dependency && dependency.replacementTarget,
+  ].map((value) => String(value || "").trim()).filter(Boolean).join(" ");
+  const inferredKind = inferPackageSourceKind(evidence);
+  return createDependencyPackageSource({
+    kind: inferredKind,
+    ...(sourceLocation ? { location: sourceLocation } : {}),
+  });
+}
+
+function inferPackageSourceKind(evidence) {
+  const value = String(evidence || "").trim();
+  if (!value) return DEPENDENCY_PACKAGE_SOURCE_KINDS.REGISTRY;
+  if (/(?:^|\s)(?:workspace|link):/i.test(value)) return DEPENDENCY_PACKAGE_SOURCE_KINDS.LOCAL;
+  if (/(?:^|\s)(?:file|path):/i.test(value) || /(?:^|\s)(?:\.\.?[/\\]|[/\\])/i.test(value)) {
+    return DEPENDENCY_PACKAGE_SOURCE_KINDS.PATH;
+  }
+  if (/(?:^|\s)(?:git\+|git:|github:|gitlab:|bitbucket:)/i.test(value) || /(?:^|\s)git@/i.test(value)) {
+    return DEPENDENCY_PACKAGE_SOURCE_KINDS.GIT;
+  }
+  if (/(?:^|\s)(?:sdk|system):/i.test(value)) {
+    return /(?:^|\s)sdk:/i.test(value)
+      ? DEPENDENCY_PACKAGE_SOURCE_KINDS.SDK
+      : DEPENDENCY_PACKAGE_SOURCE_KINDS.SYSTEM;
+  }
+  if (/(?:^|\s)https?:/i.test(value)) return DEPENDENCY_PACKAGE_SOURCE_KINDS.SCM;
+  return DEPENDENCY_PACKAGE_SOURCE_KINDS.REGISTRY;
+}
+
+function getAdapterSourceLabel(sources, fallback) {
+  return sources && (sources.resolution && sources.resolution.label
+    || sources.manifest && sources.manifest.label)
+    || String(fallback || "");
+}
+
+function throwIfCancelled(cancellationToken) {
+  if (cancellationToken && cancellationToken.isCancellationRequested) {
+    const error = new Error("Dependency adapter operation was cancelled.");
+    error.code = "ERR_DEPENDENCY_ADAPTER_CANCELLED";
+    throw error;
+  }
+}
+
+function createDependencyFileBoundaryError() {
+  const error = new Error("Dependency file path rejected by the workspace boundary.");
+  error.code = DEPENDENCY_FILE_ERROR_CODES.OUTSIDE_WORKSPACE;
+  return error;
+}
+
+/**
+ * Map parser and filesystem failures onto closed, customer-safe adapter
+ * categories. Parser messages can contain complete source lines, absolute
+ * paths, URLs, credentials, or internal safety bounds, so none of their text
+ * crosses the adapter boundary.
+ */
+function createSafeAdapterError(error) {
+  const internalCode = error && typeof error.code === "string"
+    ? error.code
+    : "";
+  let publicCode;
+  if (Object.prototype.hasOwnProperty.call(SAFE_ADAPTER_ERROR_MESSAGES, internalCode)) {
+    publicCode = internalCode;
+  } else if (Object.prototype.hasOwnProperty.call(
+    DEPENDENCY_FILE_ADAPTER_ERROR_CODES,
+    internalCode
+  )) {
+    publicCode = DEPENDENCY_FILE_ADAPTER_ERROR_CODES[internalCode];
+  } else if (internalCode === "ENOENT" || internalCode === "ENOTDIR") {
+    publicCode = ADAPTER_ERROR_CODES.DEPENDENCY_FILE_MISSING;
+  } else if (/cancel(?:led|ed|lation)/i.test(internalCode)) {
+    publicCode = ADAPTER_ERROR_CODES.CANCELLED;
+  } else {
+    publicCode = ADAPTER_ERROR_CODES.PARSE_ERROR;
+  }
+  return Object.freeze({
+    code: publicCode,
+    message: SAFE_ADAPTER_ERROR_MESSAGES[publicCode],
   });
 }
 
@@ -901,23 +1132,69 @@ function createAdapterResult(values) {
   }
 
   const error = values.error
-    ? Object.freeze({
-      code: String(values.error.code || "unknown-error"),
-      message: String(values.error.message || "Dependency adapter failed."),
-    })
+    ? createSafeAdapterError(values.error)
     : null;
+  const warnings = Array.isArray(values.warnings)
+    ? [...new Set(values.warnings.map(createSafeAdapterWarning))]
+    : [];
   return Object.freeze({
     status: values.status,
     adapterId: values.adapterId || null,
     ecosystem: values.ecosystem || null,
-    sourceFile: values.sourceFile || null,
+    sourceFile: values.sourceFile
+      ? boundedAdapterText(values.sourceFile, "source file", 8192)
+      : null,
     source: values.source || null,
     dependencies: Object.freeze(Array.isArray(values.dependencies) ? values.dependencies.slice() : []),
     dependencyGraph: values.dependencyGraph || null,
-    warnings: Object.freeze(Array.isArray(values.warnings) ? values.warnings.slice() : []),
+    warnings: Object.freeze(warnings),
     error,
     resolutionAvailability: values.resolutionAvailability || RESOLUTION_AVAILABILITY.NOT_APPLICABLE,
   });
+}
+
+function createSafeAdapterWarning(warning) {
+  const normalized = boundedAdapterText(String(warning || ""), "warning").toLowerCase();
+  if (normalized.includes("display is capped") || normalized.includes("display reached")) {
+    return "Dependency display reached its configured safety limit.";
+  }
+  if (normalized.includes("environment marker") || normalized.includes("conditional requirement")) {
+    return "Some conditional dependencies do not have a concrete version.";
+  }
+  if (normalized.includes("direct dependency relationship")) {
+    return "Direct dependency relationships could not be determined for some packages.";
+  }
+  if (normalized.includes("no locally resolvable version")) {
+    return "Some Maven dependencies do not have a locally resolvable version.";
+  }
+  if (normalized.includes("maven dependency tree output")) {
+    return "Some Maven dependency relationships could not be resolved.";
+  }
+  if (normalized.includes("compose")) {
+    return "Some Compose dependencies could not be fully resolved.";
+  }
+  if (
+    normalized.includes("relationship")
+    || normalized.includes("transitive")
+    || normalized.includes("graph")
+  ) {
+    return "Some dependency relationships could not be fully analyzed.";
+  }
+  if (normalized.includes("skipped") || normalized.includes("omitted")) {
+    return "Some dependency declarations could not be fully analyzed.";
+  }
+  return "Some dependency data could not be fully analyzed.";
+}
+
+function boundedAdapterText(value, label, maximum = 2048) {
+  if (typeof value !== "string") {
+    throw new TypeError(`Dependency adapter ${label} values must be strings.`);
+  }
+  const normalized = value.replace(/[\r\n\t\u0000-\u001f\u007f]+/g, " ").trim();
+  if (!normalized) {
+    throw new TypeError(`Dependency adapter ${label} values must not be empty.`);
+  }
+  return normalized.length <= maximum ? normalized : `${normalized.slice(0, maximum - 1)}…`;
 }
 
 function validateDetectionResult(adapter, detections) {
@@ -955,8 +1232,11 @@ function normalizeManifestType(manifestType) {
 }
 
 module.exports = {
+  ADAPTER_ERROR_CODES,
   ADAPTER_RESULT_STATUSES,
   DependencyAdapterRegistry,
   RESOLUTION_AVAILABILITY,
   createDefaultDependencyAdapterRegistry,
+  createSafeAdapterError,
+  createSafeAdapterWarning,
 };

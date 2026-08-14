@@ -41,21 +41,22 @@ class LockfileResolver {
     return REGISTERED_RESOLVERS.slice();
   }
 
-  static async detectResolvers(workspaceFolder) {
+  static async detectResolvers(workspaceFolder, options = {}) {
     const rootPath = getWorkspacePath(workspaceFolder);
     const matches = [];
 
     for (const resolver of REGISTERED_RESOLVERS) {
+      throwIfCancelled(options.cancellationToken);
       if (!resolver || typeof resolver.canResolve !== "function") {
         continue;
       }
 
-      if (!(await resolver.canResolve(rootPath))) {
+      if (!(await resolver.canResolve(rootPath, options))) {
         continue;
       }
 
       const detections = typeof resolver.detect === "function"
-        ? await resolver.detect(rootPath)
+        ? await resolver.detect(rootPath, options)
         : [{
           resolverName: resolver.name,
           ecosystem: resolver.ecosystem,
@@ -65,6 +66,7 @@ class LockfileResolver {
         }];
 
       for (const detection of detections) {
+        throwIfCancelled(options.cancellationToken);
         matches.push({
           resolverName: resolver.name,
           ecosystem: resolver.ecosystem,
@@ -111,10 +113,11 @@ class LockfileResolver {
   }
 
   static async resolveAll(workspaceFolder, options = {}) {
-    const matches = await LockfileResolver.detectResolvers(workspaceFolder);
+    const matches = await LockfileResolver.detectResolvers(workspaceFolder, options);
     const trees = [];
 
     for (const match of matches) {
+      throwIfCancelled(options.cancellationToken);
       const tree = await LockfileResolver.resolve(
         match.resolverName,
         match.lockfilePath,
@@ -132,6 +135,14 @@ class LockfileResolver {
     }
 
     return trees;
+  }
+}
+
+function throwIfCancelled(cancellationToken) {
+  if (cancellationToken && cancellationToken.isCancellationRequested) {
+    const error = new Error("Dependency resolution was cancelled.");
+    error.code = "ERR_DEPENDENCY_RESOLUTION_CANCELLED";
+    throw error;
   }
 }
 

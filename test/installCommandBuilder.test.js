@@ -192,6 +192,14 @@ suite("InstallCommandBuilder Test Suite", () => {
     assert.ok(result.note.includes("GOPROXY"));
   });
 
+  test("go preserves exactly one leading v in install coordinates", () => {
+    const result = InstallCommandBuilder.build(
+      "go", "github.com/gin-gonic/gin", "v1.9.1", "my-org", "my-repo"
+    );
+    assert.match(result.command, /github\.com\/gin-gonic\/gin@v1\.9\.1/);
+    assert.doesNotMatch(result.command, /@vv/);
+  });
+
   test("ruby generates gem install", () => {
     const result = InstallCommandBuilder.build("ruby", "rails", "7.0.0", ws, repo);
     assert.strictEqual(

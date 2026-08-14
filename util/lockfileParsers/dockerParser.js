@@ -6,34 +6,41 @@ const {
   createDependency,
   getSourceFileName,
   getWorkspacePath,
+  pathExists,
   readBoundedDirectoryEntries,
   readUtf8,
   resolveWorkspaceFilePath,
   stripYamlComment,
+  throwIfTraversalCancelled,
 } = require("./shared");
 
 const dockerParser = {
   name: "dockerParser",
   ecosystem: "docker",
 
-  async canResolve(workspaceFolder) {
-    const matches = await this.detect(workspaceFolder);
+  async canResolve(workspaceFolder, options = {}) {
+    const matches = await this.detect(workspaceFolder, options);
     return matches.length > 0;
   },
 
-  async detect(workspaceFolder) {
+  async detect(workspaceFolder, options = {}) {
+    throwIfTraversalCancelled(options.cancellationToken);
     const rootPath = getWorkspacePath(workspaceFolder);
     const safeRootPath = await resolveWorkspaceFilePath(rootPath, workspaceFolder);
     if (!safeRootPath) {
       return [];
     }
     const entries = [];
-    const directory = await readBoundedDirectoryEntries(safeRootPath);
+    const directory = await readBoundedDirectoryEntries(safeRootPath, undefined, {
+      ...options,
+      workspaceFolder,
+    });
     const allFiles = directory.entries
       .filter((entry) => entry.isFile())
       .map((entry) => entry.name);
 
     for (const fileName of allFiles.sort()) {
+      throwIfTraversalCancelled(options.cancellationToken);
       const isDockerfile = fileName === "Dockerfile" || fileName.startsWith("Dockerfile.");
       const isComposeFile = [
         "docker-compose.yml",
@@ -56,22 +63,32 @@ const dockerParser = {
     return entries;
   },
 
-  async resolve({ lockfilePath, workspaceFolder }) {
+  async resolve({ lockfilePath, workspaceFolder, options = {} }) {
+    const cancellationToken = options.cancellationToken;
+    throwIfTraversalCancelled(cancellationToken);
     const sourceFile = getSourceFileName(lockfilePath);
-    const content = await readUtf8(lockfilePath, workspaceFolder);
-    const dependencies = isComposeFileName(sourceFile)
-      ? parseCompose(content, sourceFile)
-      : parseDockerfile(content, sourceFile);
-    return buildTree("docker", sourceFile, dependencies);
+    const content = await readUtf8(lockfilePath, workspaceFolder, options);
+    if (isComposeFileName(sourceFile)) {
+      const projectEnvironment = await readComposeProjectEnvironment(
+        lockfilePath,
+        workspaceFolder,
+        options
+      );
+      const parsed = parseCompose(content, sourceFile, projectEnvironment, cancellationToken);
+      return buildTree("docker", sourceFile, parsed.dependencies, parsed.warnings);
+    }
+    return buildTree("docker", sourceFile, parseDockerfile(content, sourceFile, cancellationToken));
   },
 };
 
-function parseDockerfile(content, sourceFile) {
+function parseDockerfile(content, sourceFile, cancellationToken) {
   const dependencies = [];
   const stageAliases = new Set();
   const argDefaults = new Map();
+  let stageIndex = 0;
 
   for (const instruction of toLogicalDockerLines(content)) {
+    throwIfTraversalCancelled(cancellationToken);
     const cleaned = stripDockerComment(instruction).trim();
     if (!cleaned) {
       continue;
@@ -98,10 +115,11 @@ function parseDockerfile(content, sourceFile) {
       stageAliases.add(parsed.alias.toLowerCase());
     }
     if (!parsed.isDependency) {
+      stageIndex += 1;
       continue;
     }
 
-    dependencies.push(createDependency({
+    dependencies.push(withDockerResolutionEvidence(createDependency({
       name: parsed.name,
       version: parsed.version,
       ecosystem: "docker",
@@ -111,25 +129,49 @@ function parseDockerfile(content, sourceFile) {
       transitives: [],
       sourceFile,
       isDevelopmentDependency: false,
-    }));
+      tag: parsed.tag,
+      digest: parsed.digest,
+      stage: parsed.alias || `stage-${stageIndex + 1}`,
+      packageSource: { kind: "registry" },
+    }), parsed));
+    stageIndex += 1;
   }
 
   return dependencies;
 }
 
-function parseCompose(content, sourceFile) {
+function parseCompose(content, sourceFile, projectEnvironment = new Map(), cancellationToken) {
   const dependencies = [];
+  const warnings = [];
   let servicesIndent = null;
+  let serviceIndent = null;
   let currentService = null;
 
   const flushCurrentService = () => {
     if (!currentService) {
       return;
     }
-    if (!currentService.hasBuild && currentService.image) {
-      const parsed = parseDockerImageReference(currentService.image);
+    const pullPolicy = interpolateComposeValue(currentService.pullPolicy, projectEnvironment);
+    if (pullPolicy.unresolved) {
+      warnings.push("A Compose pull policy could not be resolved, so dependency results are partial.");
+      currentService = null;
+      return;
+    }
+    const normalizedPullPolicy = pullPolicy.value.toLowerCase();
+    if (normalizedPullPolicy === "build" && !currentService.hasBuild) {
+      warnings.push("A Compose service requests a local build but has no usable build definition.");
+    }
+    const shouldIncludeImage = currentService.image && normalizedPullPolicy !== "build";
+    if (shouldIncludeImage) {
+      const interpolated = interpolateComposeValue(currentService.image, projectEnvironment);
+      if (interpolated.unresolved) {
+        warnings.push("A Compose image reference could not be resolved, so dependency results are partial.");
+        currentService = null;
+        return;
+      }
+      const parsed = parseDockerImageReference(interpolated.value);
       if (parsed && parsed.name.toLowerCase() !== "scratch") {
-        dependencies.push(createDependency({
+        dependencies.push(withDockerResolutionEvidence(createDependency({
           name: parsed.name,
           version: parsed.version,
           ecosystem: "docker",
@@ -139,13 +181,21 @@ function parseCompose(content, sourceFile) {
           transitives: [],
           sourceFile,
           isDevelopmentDependency: false,
-        }));
+          service: currentService.name,
+          pullPolicy: normalizedPullPolicy || "default",
+          tag: parsed.tag,
+          digest: parsed.digest,
+          packageSource: { kind: "registry" },
+        }), parsed));
+      } else if (interpolated.value) {
+        warnings.push("A Compose image reference was invalid and could not be checked.");
       }
     }
     currentService = null;
   };
 
   for (const rawLine of String(content || "").split(/\r?\n/)) {
+    throwIfTraversalCancelled(cancellationToken);
     const cleaned = stripYamlComment(rawLine).trim();
     if (!cleaned) {
       continue;
@@ -155,19 +205,28 @@ function parseCompose(content, sourceFile) {
     if (cleaned === "services:") {
       flushCurrentService();
       servicesIndent = indent;
+      serviceIndent = null;
       continue;
     }
     if (servicesIndent != null && indent <= servicesIndent && cleaned.endsWith(":")) {
       flushCurrentService();
       servicesIndent = null;
+      serviceIndent = null;
     }
     if (servicesIndent == null || indent <= servicesIndent) {
       continue;
     }
 
-    if (indent === servicesIndent + 2 && cleaned.endsWith(":")) {
+    if (cleaned.endsWith(":") && (serviceIndent == null || indent === serviceIndent)) {
       flushCurrentService();
-      currentService = { indent, hasBuild: false, image: "" };
+      serviceIndent = indent;
+      currentService = {
+        name: unquote(cleaned.slice(0, -1)),
+        indent,
+        hasBuild: false,
+        image: "",
+        pullPolicy: "",
+      };
       continue;
     }
 
@@ -181,11 +240,18 @@ function parseCompose(content, sourceFile) {
     }
     if (cleaned.startsWith("image:")) {
       currentService.image = unquote(cleaned.slice("image:".length).trim());
+      continue;
+    }
+    if (cleaned.startsWith("pull_policy:")) {
+      currentService.pullPolicy = unquote(cleaned.slice("pull_policy:".length).trim());
     }
   }
 
   flushCurrentService();
-  return dependencies;
+  return {
+    dependencies,
+    warnings: [...new Set(warnings)],
+  };
 }
 
 function toLogicalDockerLines(content) {
@@ -248,6 +314,82 @@ function resolveDockerArgs(value, args) {
     .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, name) => (args.has(name) ? args.get(name) : match));
 }
 
+async function readComposeProjectEnvironment(lockfilePath, workspaceFolder, options = {}) {
+  const environment = new Map();
+  const envPath = path.join(path.dirname(lockfilePath), ".env");
+  if (await pathExists(envPath, workspaceFolder)) {
+    const content = await readUtf8(envPath, workspaceFolder, options);
+    for (const rawLine of String(content || "").split(/\r?\n/)) {
+      throwIfTraversalCancelled(options.cancellationToken);
+      const line = stripDockerComment(rawLine).trim();
+      if (!line || line.startsWith("#")) {
+        continue;
+      }
+      const separator = line.indexOf("=");
+      if (separator <= 0) {
+        continue;
+      }
+      const name = line.slice(0, separator).trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+        continue;
+      }
+      const value = unquote(line.slice(separator + 1).trim());
+      if (value.length <= 4096 && !/[\u0000-\u001f\u007f]/.test(value)) {
+        environment.set(name, value);
+      }
+    }
+  }
+  // Compose gives the invoking process environment precedence over project
+  // .env values. Copy only bounded, plain values; do not mutate process.env.
+  for (const [name, value] of Object.entries(process.env || {})) {
+    throwIfTraversalCancelled(options.cancellationToken);
+    if (
+      /^[A-Za-z_][A-Za-z0-9_]*$/.test(name)
+      && typeof value === "string"
+      && value.length <= 4096
+      && !/[\u0000-\u001f\u007f]/.test(value)
+    ) {
+      environment.set(name, value);
+    }
+  }
+  return environment;
+}
+
+function interpolateComposeValue(input, environment) {
+  const escapedDollar = "\u0000CLOUDSMITH_DOLLAR\u0000";
+  let unresolved = false;
+  const value = String(input || "")
+    .replace(/\$\$/g, escapedDollar)
+    .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-+?])([^}]*))?}/g, (_match, name, operator, fallback = "") => {
+      const isSet = environment.has(name);
+      const resolved = isSet ? String(environment.get(name) || "") : "";
+      const hasValue = resolved !== "";
+      if (!operator) {
+        if (!isSet) unresolved = true;
+        return isSet ? resolved : "";
+      }
+      if (operator === "-") return isSet ? resolved : fallback;
+      if (operator === ":-") return hasValue ? resolved : fallback;
+      if (operator === "+") return isSet ? fallback : "";
+      if (operator === ":+") return hasValue ? fallback : "";
+      if (operator === "?" || operator === ":?") {
+        if (operator === "?" ? !isSet : !hasValue) unresolved = true;
+        return operator === "?" ? (isSet ? resolved : "") : (hasValue ? resolved : "");
+      }
+      unresolved = true;
+      return "";
+    })
+    .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name) => {
+      if (!environment.has(name)) {
+        unresolved = true;
+        return "";
+      }
+      return String(environment.get(name) || "");
+    })
+    .replaceAll(escapedDollar, "$");
+  return { value, unresolved };
+}
+
 function parseFromInstruction(line, argDefaults, stageAliases) {
   const parts = line.split(/\s+/).filter(Boolean);
   let index = 1;
@@ -280,17 +422,37 @@ function parseDockerImageReference(reference) {
   if (!raw || raw.includes("$")) {
     return null;
   }
-  const withoutDigest = raw.split("@")[0];
-  const digest = raw.includes("@") ? raw.split("@")[1] : "";
+  const digestSeparator = raw.indexOf("@");
+  const withoutDigest = digestSeparator >= 0 ? raw.slice(0, digestSeparator) : raw;
+  const digest = digestSeparator >= 0 ? raw.slice(digestSeparator + 1) : "";
+  if (digestSeparator >= 0 && (!digest || !/^[A-Za-z0-9_+.-]+:[A-Fa-f0-9]+$/.test(digest))) {
+    return null;
+  }
   const lastSlash = withoutDigest.lastIndexOf("/");
   const lastColon = withoutDigest.lastIndexOf(":");
   const hasTag = lastColon > lastSlash;
   const name = hasTag ? withoutDigest.slice(0, lastColon) : withoutDigest;
-  const version = hasTag ? withoutDigest.slice(lastColon + 1) : digest || "latest";
-  if (!name) {
+  const tag = hasTag ? withoutDigest.slice(lastColon + 1) : "";
+  const version = tag || digest;
+  if (!name || (hasTag && !tag)) {
     return null;
   }
-  return { name, version };
+  return {
+    name,
+    version,
+    tag,
+    digest,
+    hasResolutionEvidence: Boolean(tag || digest),
+  };
+}
+
+function withDockerResolutionEvidence(dependency, parsed) {
+  return {
+    ...dependency,
+    hasResolutionEvidence: Boolean(parsed && parsed.hasResolutionEvidence),
+    resolvedVersion: parsed && parsed.hasResolutionEvidence ? parsed.version : null,
+    declaredConstraint: parsed && (parsed.tag || parsed.digest) || null,
+  };
 }
 
 function unquote(value) {

@@ -56,6 +56,22 @@ suite("LockfileResolver Test Suite", () => {
     assert.strictEqual(bySource.get("docker-compose.yml").ecosystem, "docker");
   });
 
+  test("honors cancellation before legacy resolver detection and resolution", async () => {
+    const workspace = await createWorkspace();
+    await copyFixtureDir("npm", workspace);
+    const options = { cancellationToken: { isCancellationRequested: true } };
+
+    for (const operation of [
+      () => LockfileResolver.detectResolvers(workspace, options),
+      () => LockfileResolver.resolveAll(workspace, options),
+    ]) {
+      await assert.rejects(
+        operation,
+        (error) => error.code === "ERR_DEPENDENCY_RESOLUTION_CANCELLED"
+      );
+    }
+  });
+
   test("deduplicateDeps keeps a single package and prefers direct dependencies", () => {
     const dependencies = [
       {

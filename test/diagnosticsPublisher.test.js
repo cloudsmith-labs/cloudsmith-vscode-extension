@@ -8,6 +8,7 @@ const {
   createDiagnosticCandidate,
 } = require("../util/diagnosticsPublisher");
 const {
+  DEPENDENCY_PACKAGE_SOURCE_KINDS,
   DEPENDENCY_VERSION_STATES,
   RESOLUTION_SOURCE_KINDS,
   createDependencyRecord,
@@ -71,6 +72,7 @@ suite("DiagnosticsPublisher Test Suite", () => {
     isDirect = true,
     isDevelopmentDependency = false,
     environmentMarker = null,
+    packageSource = { kind: DEPENDENCY_PACKAGE_SOURCE_KINDS.REGISTRY },
   }) {
     const dependency = createDependencyRecord({
       ecosystem,
@@ -83,6 +85,7 @@ suite("DiagnosticsPublisher Test Suite", () => {
         ? DEPENDENCY_VERSION_STATES.RESOLVED
         : DEPENDENCY_VERSION_STATES.EXACT_DECLARATION,
       sourceManifest: manifest,
+      packageSource,
       environmentMarker,
       isDirect,
       isDevelopmentDependency,
@@ -172,6 +175,28 @@ suite("DiagnosticsPublisher Test Suite", () => {
     assert.deepStrictEqual(collectionNames, ["cloudsmith"]);
     assert.strictEqual(collection.clearCalls, 1);
     assert.strictEqual(collection.disposeCalls, 1);
+  });
+
+  test("skips local-source dependencies before reading diagnostic provenance", async () => {
+    const filePath = "/project/package.json";
+    const { publisher, reads } = createMemoryPublisher(new Map());
+    const prepared = await publisher.prepare({
+      workspaceFolder: "/project",
+      candidates: [candidate({
+        name: "local-package",
+        manifest: source(filePath),
+        packageSource: {
+          kind: DEPENDENCY_PACKAGE_SOURCE_KINDS.PATH,
+          location: "../local-package",
+        },
+      })],
+    });
+
+    assert.strictEqual(reads.length, 0);
+    assert.strictEqual(prepared.entries.length, 0);
+    assert.strictEqual(prepared.stats.candidates, 1);
+    assert.strictEqual(prepared.stats.uniqueOccurrences, 0);
+    assert.strictEqual(prepared.stats.diagnostics, 0);
   });
 
   test("derives dependency source contract fields from one normalized ecosystem", () => {
@@ -960,7 +985,8 @@ suite("DiagnosticsPublisher Test Suite", () => {
 
     assert.strictEqual(prepared.stats.diagnostics, 2);
     assert.strictEqual(prepared.stats.truncated, true);
-    assert.match(prepared.warnings[0], /capped at 2 occurrences/);
+    assert.match(prepared.warnings[0], /reached their safety limit/);
+    assert.doesNotMatch(prepared.warnings[0], /\b2\b/);
   });
 
   test("a truncated declaration index uses a coarse range and distinct warning", async () => {

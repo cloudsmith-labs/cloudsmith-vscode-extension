@@ -3,6 +3,12 @@ const vscode = require("vscode");
 const { LicenseClassifier } = require("../util/licenseClassifier");
 const { getFormatIconPath } = require("../util/formatIcons");
 const { canonicalFormat } = require("../util/packageNameNormalizer");
+const {
+  getDependencyPackageSourceDisplayLocation,
+  getDependencyPackageSourceDisplayRef,
+  getDependencyQualifierDisplayValue,
+  getDependencySourceLabel,
+} = require("../util/dependencyRecord");
 const { getPackageVulnerabilityState } = require("../util/packageVulnerabilities");
 
 class DependencyHealthNode {
@@ -28,6 +34,9 @@ class DependencyHealthNode {
     this.versionState = dep.versionState || null;
     this.resolutionSource = dep.resolutionSource || null;
     this.sourceManifest = dep.sourceManifest || null;
+    this.packageSource = dep.packageSource || null;
+    this.lookupEligibility = dep.lookupEligibility || null;
+    this.qualifiers = dep.qualifiers || {};
     this.environmentMarker = dep.environmentMarker || null;
     this.normalizedName = dep.normalizedName || null;
     this.cloudsmithLookupDetail = dep.cloudsmithLookupDetail || null;
@@ -125,6 +134,10 @@ class DependencyHealthNode {
 
     if (this.cloudsmithStatus === "UNRESOLVED") {
       return "unresolved";
+    }
+
+    if (this.cloudsmithStatus === "NOT_APPLICABLE") {
+      return "not_applicable";
     }
 
     if (this.cloudsmithStatus === "LOOKUP_FAILED") {
@@ -226,6 +239,10 @@ class DependencyHealthNode {
       return "dependencyHealthSyncing";
     }
 
+    if (this.cloudsmithStatus === "NOT_APPLICABLE") {
+      return "dependencyHealthNotApplicable";
+    }
+
     if (this.cloudsmithStatus === "ABSENT" || this.cloudsmithStatus === "NOT_FOUND") {
       if (this.upstreamStatus === "reachable") {
         return "dependencyHealthUpstreamReachable";
@@ -256,6 +273,12 @@ class DependencyHealthNode {
   _getStateIcon() {
     if (this.cloudsmithStatus === "CHECKING") {
       return new vscode.ThemeIcon("loading~spin");
+    }
+
+    if (this.cloudsmithStatus === "NOT_APPLICABLE") {
+      return getFormatIconPath(this.format, this.context && this.context.extensionPath, {
+        fallbackIcon: new vscode.ThemeIcon("circle-slash", new vscode.ThemeColor("descriptionForeground")),
+      });
     }
 
     if (this.cloudsmithStatus !== "FOUND") {
@@ -341,6 +364,8 @@ class DependencyHealthNode {
         return "Cloudsmith lookup incomplete";
       case "RATE_LIMITED":
         return "Cloudsmith lookup rate limited";
+      case "NOT_APPLICABLE":
+        return "Cloudsmith lookup not applicable";
       default:
         return "Cloudsmith status unknown";
     }
@@ -378,13 +403,40 @@ class DependencyHealthNode {
       detail += " · context";
     }
 
-    return `${this._buildVersionPrefix()} — ${detail}`;
+    return `${this._buildVersionPrefix()}${this._buildQualifierSuffix()} — ${detail}`;
+  }
+
+  _buildQualifierSuffix() {
+    const values = [
+      this.qualifiers.targetFramework,
+      this.qualifiers.platform,
+      this.qualifiers.classifier,
+      this.qualifiers.stage,
+    ].filter(Boolean);
+    return values.length > 0 ? ` [${values.join(", ")}]` : "";
   }
 
   _buildTooltip() {
     const lines = [`${this.name} ${this._buildVersionPrefix()}`.trim()];
     lines.push(`Format: ${this.format}`);
     lines.push(`Relationship: ${this._getRelationshipLabel()}`);
+    const sourceLabel = getDependencySourceLabel(this);
+    if (sourceLabel) {
+      lines.push(`Source: ${sourceLabel}`);
+    }
+    for (const [key, value] of Object.entries(this.qualifiers)) {
+      const displayValue = getDependencyQualifierDisplayValue(key, value);
+      lines.push(`${formatQualifierLabel(key)}: ${displayValue}`);
+    }
+    if (this.packageSource && this.packageSource.kind) {
+      lines.push(`Package source: ${this.packageSource.kind}`);
+      const displayLocation = getDependencyPackageSourceDisplayLocation(this.packageSource);
+      if (displayLocation) lines.push(`Source location: ${displayLocation}`);
+      const displayBranch = getDependencyPackageSourceDisplayRef(this.packageSource.branch);
+      const displayRevision = getDependencyPackageSourceDisplayRef(this.packageSource.revision);
+      if (displayBranch) lines.push(`Source branch: ${displayBranch}`);
+      if (displayRevision) lines.push(`Source revision: ${displayRevision}`);
+    }
     if (this.isDev) {
       lines.push("Development dependency");
     }
@@ -672,6 +724,12 @@ function classificationFromTier(tier) {
     default:
       return "unknown";
   }
+}
+
+function formatQualifierLabel(key) {
+  return String(key || "")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/^./, (character) => character.toUpperCase());
 }
 
 module.exports = DependencyHealthNode;

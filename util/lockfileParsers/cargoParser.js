@@ -3,8 +3,6 @@ const path = require("path");
 const {
   buildTree,
   createDependency,
-  deduplicateDeps,
-  flattenDependencies,
   getSourceFileName,
   getWorkspacePath,
   parseInlineTomlValue,
@@ -17,6 +15,7 @@ const { parseCargoTomlManifest } = require("./manifestHelpers");
 
 const MAX_CARGO_GRAPH_DEPTH = 128;
 const MAX_CARGO_GRAPH_NODES = 10000;
+const MAX_CARGO_GRAPH_EDGES = 50000;
 
 const cargoParser = {
   name: "cargoParser",
@@ -49,8 +48,9 @@ const cargoParser = {
   },
 
   async resolve({ lockfilePath, manifestPath, workspaceFolder, options = {} }) {
+    throwIfCargoCancelled(options.cancellationToken);
     const manifestContent = manifestPath && await pathExists(manifestPath, workspaceFolder)
-      ? await readUtf8(manifestPath, workspaceFolder)
+      ? await readUtf8(manifestPath, workspaceFolder, options)
       : "";
     const manifest = parseCargoManifest(manifestContent);
     const manifestDependencies = manifest.dependencies;
@@ -58,12 +58,9 @@ const cargoParser = {
     const graphState = createCargoGraphState(options);
 
     if (!lockfilePath) {
-      const dependencies = [];
-      for (const dependency of manifestDependencies) {
-        if (!reserveCargoGraphNode(graphState)) {
-          break;
-        }
-        dependencies.push(createCargoDependency({
+      const dependencies = manifestDependencies.map((dependency) => {
+        throwIfCargoCancelled(options.cancellationToken);
+        return createCargoDependency({
           name: dependency.name,
           version: dependency.version,
           ecosystem: "cargo",
@@ -73,61 +70,69 @@ const cargoParser = {
           transitives: [],
           sourceFile,
           isDevelopmentDependency: dependency.isDevelopmentDependency,
-        }, dependency));
-      }
-      return buildTree("cargo", sourceFile, dependencies, cargoGraphWarnings(graphState));
+        }, dependency);
+      });
+      return buildTree("cargo", sourceFile, dependencies);
     }
 
-    const records = parseCargoLock(await readUtf8(lockfilePath, workspaceFolder));
-    const packageRecords = records.filter(isRegistryCargoRecord);
+    const records = parseCargoLock(await readUtf8(lockfilePath, workspaceFolder, options));
+    throwIfCargoCancelled(options.cancellationToken);
+    const projectRecord = selectCargoProjectRecord(records, manifest.project);
+    const packageRecords = records.filter((record) => record !== projectRecord);
     if (packageRecords.length === 0) {
       throw new Error("Malformed Cargo.lock: no package entries found");
     }
     const recordsByName = new Map();
 
     for (const record of packageRecords) {
+      throwIfCargoCancelled(options.cancellationToken);
       if (!recordsByName.has(record.name.toLowerCase())) {
         recordsByName.set(record.name.toLowerCase(), []);
       }
       recordsByName.get(record.name.toLowerCase()).push(record);
     }
 
-    const projectRecord = selectCargoProjectRecord(records, manifest.project);
     const rootSelections = manifestDependencies.map((dependency) => ({
       dependency,
       record: selectDirectCargoRecord(recordsByName, projectRecord, dependency),
     }));
-    const directRecordKeys = new Set(
-      rootSelections
-        .filter((selection) => selection.record)
-        .map((selection) => cargoRecordKey(selection.record))
-    );
-
-    const directRootCandidates = [];
-    for (const { dependency, record } of rootSelections) {
-      if (graphState.nodeLimitReached) {
-        break;
-      }
-      if (record) {
-        const resolvedDependency = buildCargoDependency(
-          record,
-          [],
-          recordsByName,
-          new Set(),
-          sourceFile,
-          dependency.isDevelopmentDependency,
-          graphState
-        );
-        if (resolvedDependency) {
-          directRootCandidates.push(attachCargoDeclaration(resolvedDependency, dependency));
-        }
+    const directDeclarations = new Map();
+    for (const selection of rootSelections) {
+      if (!selection.record) {
         continue;
       }
+      const key = cargoRecordKey(selection.record);
+      const existing = directDeclarations.get(key);
+      directDeclarations.set(key, {
+        dependency: existing ? existing.dependency : selection.dependency,
+        isDevelopmentDependency: Boolean(
+          (existing && existing.isDevelopmentDependency)
+          || selection.dependency.isDevelopmentDependency
+        ),
+      });
+    }
 
-      if (!reserveCargoGraphNode(graphState)) {
-        break;
+    const relationships = buildCargoRelationships({
+      rootSelections,
+      recordsByName,
+      inventoryKeys: new Set(packageRecords.map(cargoRecordKey)),
+      graphState,
+      cancellationToken: options.cancellationToken,
+    });
+    const dependencies = materializeCargoInventory({
+      packageRecords,
+      directDeclarations,
+      relationships,
+      sourceFile,
+      cancellationToken: options.cancellationToken,
+    });
+
+    for (const { dependency, record } of rootSelections) {
+      throwIfCargoCancelled(options.cancellationToken);
+      if (record) {
+        continue;
       }
-      directRootCandidates.push(createCargoDependency({
+      dependencies.push(createCargoDependency({
         name: dependency.name,
         version: "",
         ecosystem: "cargo",
@@ -139,33 +144,13 @@ const cargoParser = {
         isDevelopmentDependency: dependency.isDevelopmentDependency,
       }, dependency));
     }
-    const directRoots = deduplicateDeps(directRootCandidates);
 
-    const dependencies = deduplicateDeps(flattenDependencies(directRoots));
-    const dependencyKeys = new Set(dependencies.map(cargoDependencyKey));
-    for (const record of packageRecords) {
-      const key = cargoRecordKey(record);
-      if (dependencyKeys.has(key)) {
-        continue;
-      }
-      if (!reserveCargoGraphNode(graphState)) {
-        break;
-      }
-      dependencies.push(createDependency({
-        name: record.name,
-        version: record.version,
-        ecosystem: "cargo",
-        isDirect: directRecordKeys.has(key),
-        parent: null,
-        parentChain: [],
-        transitives: [],
-        sourceFile,
-        isDevelopmentDependency: false,
-      }));
-      dependencyKeys.add(key);
-    }
-
-    return buildTree("cargo", sourceFile, dependencies, cargoGraphWarnings(graphState));
+    return {
+      ecosystem: "cargo",
+      sourceFile,
+      dependencies,
+      warnings: cargoGraphWarnings(graphState),
+    };
   },
 };
 
@@ -252,7 +237,7 @@ function deduplicateCargoRecords(records) {
   const seen = new Set();
   const results = [];
   for (const record of records) {
-    const key = `${record.name.toLowerCase()}@${record.version}`;
+    const key = cargoRecordKey(record);
     if (seen.has(key)) {
       continue;
     }
@@ -262,13 +247,16 @@ function deduplicateCargoRecords(records) {
   return results;
 }
 
-function selectCargoRecord(recordsByName, name, version) {
+function selectCargoRecord(recordsByName, name, version, source = "") {
   const candidates = recordsByName.get(name.toLowerCase()) || [];
   if (candidates.length === 0) {
     return null;
   }
   if (version) {
-    const exactMatch = candidates.find((record) => record.version === version);
+    const versionMatches = candidates.filter((record) => record.version === version);
+    const exactMatch = source
+      ? versionMatches.find((record) => record.source === source)
+      : versionMatches.length === 1 ? versionMatches[0] : null;
     if (exactMatch) {
       return exactMatch;
     }
@@ -276,83 +264,152 @@ function selectCargoRecord(recordsByName, name, version) {
   return candidates.length === 1 ? candidates[0] : null;
 }
 
-function buildCargoDependency(
-  record,
-  parentChain,
+function buildCargoRelationships({
+  rootSelections,
   recordsByName,
-  visiting,
-  sourceFile,
-  inheritedDevelopment,
-  graphState
-) {
-  if (!reserveCargoGraphNode(graphState)) {
-    return null;
-  }
+  inventoryKeys,
+  graphState,
+  cancellationToken,
+}) {
+  const parents = new Map();
+  const children = new Map();
+  const depths = new Map();
+  const visited = new Set();
+  const queue = [];
 
-  const key = cargoRecordKey(record);
-  if (visiting.has(key)) {
-    return createCargoLockDependency(record, parentChain, [], sourceFile, inheritedDevelopment);
-  }
-
-  const nextVisiting = new Set(visiting);
-  nextVisiting.add(key);
-
-  if (parentChain.length >= graphState.maxDepth) {
-    const hasUnvisitedChild = record.dependencies.some((dependency) => {
-      const childRecord = selectCargoRecord(recordsByName, dependency.name, dependency.version);
-      return childRecord && !nextVisiting.has(cargoRecordKey(childRecord));
-    });
-    if (hasUnvisitedChild) {
-      graphState.depthLimitReached = true;
-    }
-    return createCargoLockDependency(record, parentChain, [], sourceFile, inheritedDevelopment);
-  }
-
-  const nextParentChain = parentChain.concat(record.name);
-  const transitives = [];
-
-  for (const dependency of record.dependencies) {
-    const childRecord = selectCargoRecord(recordsByName, dependency.name, dependency.version);
-    if (!childRecord) {
+  for (const { record } of rootSelections) {
+    throwIfCargoCancelled(cancellationToken);
+    if (!record) {
       continue;
     }
-    const childDependency = buildCargoDependency(
-      childRecord,
-      nextParentChain,
-      recordsByName,
-      nextVisiting,
-      sourceFile,
-      inheritedDevelopment,
-      graphState
-    );
-    if (childDependency) {
-      transitives.push(childDependency);
+    const key = cargoRecordKey(record);
+    if (visited.has(key)) {
+      continue;
     }
-    if (graphState.nodeLimitReached) {
-      break;
+    if (!reserveCargoGraphNode(graphState)) {
+      continue;
+    }
+    visited.add(key);
+    depths.set(key, 0);
+    queue.push({ record, key, depth: 0, parentChain: [] });
+  }
+
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    throwIfCargoCancelled(cancellationToken);
+    const current = queue[cursor];
+    if (current.depth >= graphState.maxDepth) {
+      if (current.record.dependencies.some((reference) => {
+        const child = selectCargoRecord(
+          recordsByName,
+          reference.name,
+          reference.version,
+          reference.source
+        );
+        return child && inventoryKeys.has(cargoRecordKey(child));
+      })) {
+        graphState.depthLimitReached = true;
+      }
+      continue;
+    }
+
+    for (const reference of current.record.dependencies) {
+      throwIfCargoCancelled(cancellationToken);
+      if (!reserveCargoGraphEdge(graphState)) {
+        break;
+      }
+      const child = selectCargoRecord(
+        recordsByName,
+        reference.name,
+        reference.version,
+        reference.source
+      );
+      if (!child) {
+        continue;
+      }
+      const childKey = cargoRecordKey(child);
+      if (!inventoryKeys.has(childKey) || visited.has(childKey)) {
+        continue;
+      }
+      if (!reserveCargoGraphNode(graphState)) {
+        break;
+      }
+
+      const childParentChain = current.parentChain.concat(current.record.name);
+      visited.add(childKey);
+      depths.set(childKey, current.depth + 1);
+      parents.set(childKey, {
+        parentKey: current.key,
+        parentName: current.record.name,
+        parentChain: childParentChain,
+      });
+      if (!children.has(current.key)) {
+        children.set(current.key, []);
+      }
+      children.get(current.key).push(childKey);
+      queue.push({
+        record: child,
+        key: childKey,
+        depth: current.depth + 1,
+        parentChain: childParentChain,
+      });
     }
   }
 
-  return createCargoLockDependency(
-    record,
-    parentChain,
-    deduplicateDeps(transitives),
-    sourceFile,
-    inheritedDevelopment
-  );
+  return { parents, children, depths };
 }
 
-function createCargoLockDependency(record, parentChain, transitives, sourceFile, inheritedDevelopment) {
-  return createDependency({
-    name: record.name,
-    version: record.version,
-    ecosystem: "cargo",
-    isDirect: parentChain.length === 0,
-    parent: parentChain[parentChain.length - 1] || null,
-    parentChain,
-    transitives,
-    sourceFile,
-    isDevelopmentDependency: inheritedDevelopment,
+function materializeCargoInventory({
+  packageRecords,
+  directDeclarations,
+  relationships,
+  sourceFile,
+  cancellationToken,
+}) {
+  const recordsByKey = new Map(packageRecords.map((record) => [cargoRecordKey(record), record]));
+  const orderedKeys = packageRecords
+    .map(cargoRecordKey)
+    .sort((left, right) => (
+      (relationships.depths.get(right) ?? -1) - (relationships.depths.get(left) ?? -1)
+    ));
+  const materialized = new Map();
+
+  for (const key of orderedKeys) {
+    throwIfCargoCancelled(cancellationToken);
+    const record = recordsByKey.get(key);
+    const declaration = directDeclarations.get(key) || null;
+    const parent = relationships.parents.get(key) || null;
+    const transitives = (relationships.children.get(key) || [])
+      .map((childKey) => materialized.get(childKey))
+      .filter(Boolean);
+    const dependency = createDependency({
+      name: record.name,
+      version: record.version,
+      ecosystem: "cargo",
+      isDirect: Boolean(declaration),
+      parent: parent && parent.parentName || null,
+      parentChain: parent ? parent.parentChain : [],
+      transitives,
+      sourceFile,
+      // Development is a property of a direct Cargo root, not every package
+      // reachable below that root.
+      isDevelopmentDependency: Boolean(declaration && declaration.isDevelopmentDependency),
+    });
+    materialized.set(key, attachCargoDeclaration({
+      ...dependency,
+      cargoSource: record.source || null,
+      packageSource: cargoPackageSourceForRecord(record),
+    }, declaration && declaration.dependency));
+  }
+
+  return packageRecords.map((record) => {
+    const key = cargoRecordKey(record);
+    const dependency = materialized.get(key);
+    // Only direct roots need nested relationship objects for presentation.
+    // Every lock record remains a top-level inventory entry, but shallow
+    // non-roots avoid re-adapting the same descendant subtree repeatedly.
+    return directDeclarations.has(key)
+      ? dependency
+      : { ...dependency, transitives: [] };
   });
 }
 
@@ -366,9 +423,15 @@ function createCargoGraphState(options) {
       options && options.cargoGraphMaxNodes,
       MAX_CARGO_GRAPH_NODES
     ),
+    maxEdges: boundedCargoGraphLimit(
+      options && options.cargoGraphMaxEdges,
+      MAX_CARGO_GRAPH_EDGES
+    ),
     expandedNodes: 0,
+    expandedEdges: 0,
     depthLimitReached: false,
     nodeLimitReached: false,
+    edgeLimitReached: false,
   };
 }
 
@@ -389,19 +452,19 @@ function reserveCargoGraphNode(graphState) {
   return true;
 }
 
+function reserveCargoGraphEdge(graphState) {
+  if (graphState.expandedEdges >= graphState.maxEdges) {
+    graphState.edgeLimitReached = true;
+    return false;
+  }
+  graphState.expandedEdges += 1;
+  return true;
+}
+
 function cargoGraphWarnings(graphState) {
-  const warnings = [];
-  if (graphState.depthLimitReached) {
-    warnings.push(
-      `Cargo dependency graph exceeded the maximum depth of ${graphState.maxDepth}; nested dependency paths were truncated.`
-    );
-  }
-  if (graphState.nodeLimitReached) {
-    warnings.push(
-      `Cargo dependency graph exceeded the maximum expansion of ${graphState.maxNodes} nodes; results are incomplete.`
-    );
-  }
-  return warnings;
+  return graphState.depthLimitReached || graphState.nodeLimitReached || graphState.edgeLimitReached
+    ? ["Some Cargo dependency relationships were omitted to keep the scan responsive. Package inventory remains complete."]
+    : [];
 }
 
 function parseCargoManifest(content) {
@@ -442,6 +505,7 @@ function parseCargoManifest(content) {
     declarations.get(key).push({
       declaredConstraint,
       versionState: classifyCargoDeclaredConstraint(declaredConstraint),
+      packageSource: cargoPackageSourceForDeclaration(parts.value),
     });
   }
 
@@ -457,6 +521,7 @@ function parseCargoManifest(content) {
           : dependency.version,
         declaredConstraint: declaration && declaration.declaredConstraint || null,
         versionState: declaration && declaration.versionState || "unresolved",
+        packageSource: declaration && declaration.packageSource || { kind: "registry" },
       };
     }),
   };
@@ -504,7 +569,7 @@ function selectCargoProjectRecord(records, project) {
     return null;
   }
   const candidates = records.filter((record) => (
-    !isRegistryCargoRecord(record)
+    !record.source
     && record.name.toLowerCase() === project.name.toLowerCase()
   ));
   if (project.version) {
@@ -517,17 +582,22 @@ function selectCargoProjectRecord(records, project) {
 }
 
 function selectDirectCargoRecord(recordsByName, projectRecord, dependency) {
-  if (dependency.versionState === "incomplete") {
-    return null;
-  }
-
   const rootReferences = projectRecord
     ? projectRecord.dependencies.filter((candidate) => (
       candidate.name.toLowerCase() === dependency.name.toLowerCase()
     ))
     : [];
   if (rootReferences.length === 1) {
-    return selectCargoRecord(recordsByName, rootReferences[0].name, rootReferences[0].version);
+    return selectCargoRecord(
+      recordsByName,
+      rootReferences[0].name,
+      rootReferences[0].version,
+      rootReferences[0].source
+    );
+  }
+
+  if (dependency.versionState === "incomplete") {
+    return null;
   }
 
   const exactVersion = getExactCargoDeclarationVersion(dependency.declaredConstraint);
@@ -554,21 +624,19 @@ function getExactCargoDeclarationVersion(declaredConstraint) {
 
 function parseCargoDependencyReference(reference) {
   const match = String(reference || "").trim().match(
-    /^(\S+?)(?:\s+([^\s()]+))?(?:\s+\([^)]*\))?$/
+    /^(\S+?)(?:\s+([^\s()]+))?(?:\s+\(([^)]*)\))?$/
   );
   if (!match) {
     return null;
   }
-  return { name: match[1], version: match[2] || "" };
-}
-
-function isRegistryCargoRecord(record) {
-  const source = String(record && record.source || "").trim();
-  return Boolean(source) && !source.startsWith("path+") && !source.startsWith("git+");
+  return { name: match[1], version: match[2] || "", source: match[3] || "" };
 }
 
 function createCargoDependency(values, declaration) {
-  return attachCargoDeclaration(createDependency(values), declaration);
+  return attachCargoDeclaration({
+    ...createDependency(values),
+    packageSource: declaration && declaration.packageSource || { kind: "registry" },
+  }, declaration);
 }
 
 function attachCargoDeclaration(dependency, declaration) {
@@ -584,11 +652,54 @@ function cargoManifestDependencyKey(name, isDevelopmentDependency) {
 }
 
 function cargoRecordKey(record) {
-  return `${record.name.toLowerCase()}@${record.version}`;
+  return JSON.stringify([
+    record.name.toLowerCase(),
+    record.version,
+    String(record.source || "").trim(),
+  ]);
 }
 
-function cargoDependencyKey(dependency) {
-  return `${dependency.name.toLowerCase()}@${dependency.version}`;
+function cargoPackageSourceForDeclaration(rawValue) {
+  const value = String(rawValue || "").trim();
+  const localPath = parseInlineTomlValue(value, "path");
+  if (localPath) {
+    return { kind: "path", location: localPath };
+  }
+  const gitUrl = parseInlineTomlValue(value, "git");
+  if (gitUrl) {
+    return { kind: "git", location: gitUrl };
+  }
+  if (/\bworkspace\s*=\s*true\b/.test(value)) {
+    return { kind: "local" };
+  }
+  return { kind: "registry" };
+}
+
+function cargoPackageSourceForRecord(record) {
+  const rawSource = String(record && record.source || "").trim();
+  if (!rawSource) {
+    return { kind: "local" };
+  }
+  for (const [prefix, kind] of [
+    ["registry+", "registry"],
+    ["sparse+", "registry"],
+    ["git+", "git"],
+    ["path+", "path"],
+  ]) {
+    if (rawSource.startsWith(prefix)) {
+      return { kind, location: rawSource.slice(prefix.length) };
+    }
+  }
+  return { kind: "unknown" };
+}
+
+function throwIfCargoCancelled(cancellationToken) {
+  if (!cancellationToken || cancellationToken.isCancellationRequested !== true) {
+    return;
+  }
+  const error = new Error("Cargo dependency parsing was canceled.");
+  error.code = "dependency-scan-cancelled";
+  throw error;
 }
 
 function unquote(value) {

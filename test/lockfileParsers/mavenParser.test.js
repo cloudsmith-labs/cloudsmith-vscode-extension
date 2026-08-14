@@ -47,6 +47,12 @@ suite("mavenParser Test Suite", () => {
     assert.strictEqual(springCore.resolvedVersion, "6.1.0");
     assert.strictEqual(junit.version, "4.13.2");
     assert.strictEqual(junit.isDevelopmentDependency, true);
+    assert.deepStrictEqual(junit.qualifiers, {
+      scope: "test",
+      type: "jar",
+      classifier: "",
+    });
+    assert.deepStrictEqual(junit.packageSource, { kind: "registry" });
   });
 
   test("resolves bounded local POM semantics without treating dependency management as direct", async () => {
@@ -171,6 +177,90 @@ suite("mavenParser Test Suite", () => {
     assert.ok(resolvedJar);
   });
 
+  test("preserves same-version Maven occurrences with distinct type and classifier qualifiers", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "pom.xml");
+    const lockfilePath = path.join(workspace, "dependency-tree.txt");
+    await writeTextFile(manifestPath, [
+      "<project>",
+      "  <dependencies>",
+      "    <dependency>",
+      "      <groupId>com.example</groupId>",
+      "      <artifactId>shared</artifactId>",
+      "      <version>1.0.0</version>",
+      "    </dependency>",
+      "    <dependency>",
+      "      <groupId>com.example</groupId>",
+      "      <artifactId>shared</artifactId>",
+      "      <type>test-jar</type>",
+      "      <classifier>tests</classifier>",
+      "      <version>1.0.0</version>",
+      "      <scope>test</scope>",
+      "    </dependency>",
+      "  </dependencies>",
+      "</project>",
+      "",
+    ].join("\n"));
+    await writeTextFile(lockfilePath, [
+      "[INFO] +- com.example:shared:jar:1.0.0:compile",
+      "[INFO] +- com.example:shared:test-jar:tests:1.0.0:test",
+      "",
+    ].join("\n"));
+
+    const tree = await mavenParser.resolve({ lockfilePath, manifestPath, workspaceFolder: workspace });
+    const shared = tree.dependencies.filter((dependency) => (
+      dependency.name === "com.example:shared" && dependency.version === "1.0.0"
+    ));
+
+    assert.strictEqual(shared.length, 2);
+    assert.deepStrictEqual(
+      new Set(shared.map((dependency) => dependency.mavenIdentity)),
+      new Set(["com.example:shared:jar:", "com.example:shared:test-jar:tests"])
+    );
+    assert.deepStrictEqual(
+      shared.map((dependency) => dependency.qualifiers),
+      [
+        { scope: "compile", type: "jar", classifier: "" },
+        { scope: "test", type: "test-jar", classifier: "tests" },
+      ]
+    );
+  });
+
+  test("preserves Maven system scope and local source without making it a registry source", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "pom.xml");
+    await writeTextFile(manifestPath, [
+      "<project>",
+      "  <properties><local.jar>/workspace/lib/local.jar</local.jar></properties>",
+      "  <dependencies>",
+      "    <dependency>",
+      "      <groupId>com.example</groupId>",
+      "      <artifactId>local-system</artifactId>",
+      "      <version>1.0.0</version>",
+      "      <scope>system</scope>",
+      "      <systemPath>${local.jar}</systemPath>",
+      "    </dependency>",
+      "  </dependencies>",
+      "</project>",
+      "",
+    ].join("\n"));
+
+    const tree = await mavenParser.resolve({ manifestPath, workspaceFolder: workspace });
+    const dependency = tree.dependencies[0];
+
+    assert.strictEqual(dependency.mavenScope, "system");
+    assert.strictEqual(dependency.mavenSystemPath, "/workspace/lib/local.jar");
+    assert.deepStrictEqual(dependency.qualifiers, {
+      scope: "system",
+      type: "jar",
+      classifier: "",
+    });
+    assert.deepStrictEqual(dependency.packageSource, {
+      kind: "system",
+      location: "/workspace/lib/local.jar",
+    });
+  });
+
   test("rejects dependency trees above the structural depth limit", async () => {
     const workspace = await createWorkspace();
     const manifestPath = path.join(workspace, "pom.xml");
@@ -189,7 +279,7 @@ suite("mavenParser Test Suite", () => {
 
     await assert.rejects(
       () => mavenParser.resolve({ lockfilePath, manifestPath, workspaceFolder: workspace }),
-      /exceeds depth 128/
+      (error) => error.message === "Maven dependency tree is too deeply nested to scan safely."
     );
   });
 

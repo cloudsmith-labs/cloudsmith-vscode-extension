@@ -5,6 +5,9 @@ class DependencySummaryNode {
   constructor(summary) {
     this.summary = {
       total: 0,
+      artifacts: 0,
+      applicableArtifacts: 0,
+      notApplicable: 0,
       direct: 0,
       transitive: 0,
       found: 0,
@@ -55,7 +58,8 @@ function buildPrimaryLabel(summary) {
   }
 
   const parts = [
-    `${summary.total} dependencies (${summary.direct} direct, ${summary.transitive} transitive)`,
+    `${summary.total} occurrences (${summary.direct} direct, ${summary.transitive} transitive)`,
+    `${summary.artifacts} artifacts`,
     `${summary.coveragePercent}% coverage`,
   ];
 
@@ -99,6 +103,10 @@ function buildSecondaryLabel(summary) {
     parts.push(`${summary.unresolved} unresolved versions`);
   }
 
+  if (summary.notApplicable > 0) {
+    parts.push(`${summary.notApplicable} not applicable to registry lookup`);
+  }
+
   if (summary.lookupFailed > 0) {
     parts.push(`${summary.lookupFailed} lookup failures`);
   }
@@ -130,7 +138,9 @@ function buildSeverityParts(severityCounts) {
 
 function buildTooltip(summary) {
   const lines = [
-    `${summary.total} total dependencies`,
+    `${summary.total} dependency occurrences`,
+    `${summary.artifacts} unique artifacts`,
+    `${summary.applicableArtifacts} registry lookup artifacts`,
     `${summary.direct} direct`,
     `${summary.transitive} transitive`,
     `${summary.found} covered in Cloudsmith`,
@@ -138,6 +148,7 @@ function buildTooltip(summary) {
     `${summary.unresolved} unresolved`,
     `${summary.lookupFailed} lookup failures`,
     `${summary.lookupIncomplete} incomplete lookups`,
+    `${summary.notApplicable} not applicable`,
     `${summary.coveragePercent}% coverage`,
   ];
 

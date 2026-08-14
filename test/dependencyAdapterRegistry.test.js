@@ -2,6 +2,7 @@ const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
 const {
+  ADAPTER_ERROR_CODES,
   ADAPTER_RESULT_STATUSES,
   DependencyAdapterRegistry,
   createDefaultDependencyAdapterRegistry,
@@ -10,6 +11,7 @@ const {
   DEPENDENCY_VERSION_STATES,
   RESOLUTION_SOURCE_KINDS,
 } = require("../util/dependencyRecord");
+const { MAX_DEPENDENCY_FILE_BYTES } = require("../util/lockfileParsers/shared");
 const {
   makeTempWorkspace,
   removeDirectory,
@@ -76,6 +78,55 @@ suite("dependencyAdapterRegistry", () => {
       ecosystem: "npm",
       workspaceFolder: "/workspace",
     }]);
+  });
+
+  test("passes cancellation through detection and parser boundaries", async () => {
+    const token = { isCancellationRequested: false };
+    let detectOptions = null;
+    let parseOptions = null;
+    let manifestOptions = null;
+    const adapter = createContractAdapter("cancellable-adapter", async (_root, options) => {
+      detectOptions = options;
+      return [];
+    });
+    adapter.manifestTypes = ["custom.json"];
+    adapter.parse = async (_detection, options) => {
+      parseOptions = options;
+      return { status: ADAPTER_RESULT_STATUSES.SUCCESS, dependencies: [], warnings: [] };
+    };
+    adapter.parseManifest = async (_manifest, options) => {
+      manifestOptions = options;
+      return { status: ADAPTER_RESULT_STATUSES.SUCCESS, dependencies: [], warnings: [] };
+    };
+    const registry = new DependencyAdapterRegistry([adapter]);
+
+    await registry.detect("/workspace", { cancellationToken: token });
+    await registry.parse({ adapterId: adapter.id }, { cancellationToken: token });
+    await registry.parseManifest(
+      { filePath: "/workspace/custom.json" },
+      { cancellationToken: token }
+    );
+    assert.strictEqual(detectOptions.cancellationToken, token);
+    assert.strictEqual(parseOptions.cancellationToken, token);
+    assert.strictEqual(manifestOptions.cancellationToken, token);
+  });
+
+  test("fails before invoking a parser when cancellation is already requested", async () => {
+    let parseCalls = 0;
+    const adapter = createContractAdapter("pre-cancelled-adapter", async () => []);
+    adapter.parse = async () => {
+      parseCalls += 1;
+      return { status: ADAPTER_RESULT_STATUSES.SUCCESS, dependencies: [], warnings: [] };
+    };
+    const registry = new DependencyAdapterRegistry([adapter]);
+
+    const result = await registry.parse(
+      { adapterId: adapter.id },
+      { cancellationToken: { isCancellationRequested: true } }
+    );
+    assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.ERROR);
+    assert.strictEqual(result.error.code, ADAPTER_ERROR_CODES.CANCELLED);
+    assert.strictEqual(parseCalls, 0);
   });
 
   for (const [label, invalidResult] of [
@@ -164,9 +215,38 @@ suite("dependencyAdapterRegistry", () => {
     assert.strictEqual(express.resolutionSource, null);
     assert.strictEqual(express.sourceManifest.kind, RESOLUTION_SOURCE_KINDS.MANIFEST);
     assert.strictEqual(express.sourceManifest.filePath, filePath);
+    assert.strictEqual(express.sourceManifest.label, "package.json");
     assert.strictEqual(express.sourceManifest.type, "package.json");
     assert.strictEqual(express.isDirect, true);
     assert.strictEqual(express.legacyVersion, "4.18.2");
+  });
+
+  test("parses Pipfile declarations through the Python manifest adapter", async () => {
+    const workspace = await createWorkspace();
+    const filePath = path.join(workspace, "Pipfile");
+    await writeTextFile(filePath, [
+      "[packages]",
+      'requests = "==2.32.3"',
+      'local-lib = {path = "../local-lib"}',
+      "[dev-packages]",
+      'pytest = "==8.3.2"',
+    ].join("\n"));
+
+    const result = await createDefaultDependencyAdapterRegistry().parseManifest({
+      filePath,
+      format: "python",
+      workspaceFolder: workspace,
+    });
+    const requests = result.dependencies.find((dependency) => dependency.name === "requests");
+    const local = result.dependencies.find((dependency) => dependency.name === "local-lib");
+    const pytest = result.dependencies.find((dependency) => dependency.name === "pytest");
+    assert.notStrictEqual(result.status, ADAPTER_RESULT_STATUSES.UNSUPPORTED);
+    assert.ok(requests);
+    assert.strictEqual(requests.versionState, DEPENDENCY_VERSION_STATES.EXACT_DECLARATION);
+    assert.strictEqual(requests.lookupEligibility.state, "eligible");
+    assert.strictEqual(local.packageSource.kind, "path");
+    assert.strictEqual(local.lookupEligibility.state, "not-applicable");
+    assert.strictEqual(pytest.isDevelopmentDependency, true);
   });
 
   test("distinguishes malformed package.json from a valid empty manifest", async () => {
@@ -194,7 +274,79 @@ suite("dependencyAdapterRegistry", () => {
     assert.strictEqual(malformed.status, ADAPTER_RESULT_STATUSES.ERROR);
     assert.deepStrictEqual(malformed.dependencies, []);
     assert.ok(malformed.error);
-    assert.strictEqual(malformed.error.code, "parse-error");
+    assert.strictEqual(malformed.error.code, ADAPTER_ERROR_CODES.PARSE_ERROR);
+    assert.strictEqual(
+      malformed.error.message,
+      "Dependency data could not be parsed. Check the dependency files and rescan."
+    );
+  });
+
+  test("does not expose secret-bearing parser input in adapter errors", async () => {
+    const workspace = await createWorkspace();
+    const requirementsPath = path.join(workspace, "requirements.txt");
+    const secret = "token=cloudsmith-secret-value";
+    await writeTextFile(requirementsPath, `not a valid requirement ${secret}\n`);
+
+    const result = await createDefaultDependencyAdapterRegistry().parseManifest({
+      filePath: requirementsPath,
+      format: "python",
+      workspaceFolder: workspace,
+    });
+
+    assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.ERROR);
+    assert.strictEqual(result.error.code, ADAPTER_ERROR_CODES.PARSE_ERROR);
+    assert.strictEqual(
+      result.error.message,
+      "Dependency data could not be parsed. Check the dependency files and rescan."
+    );
+    assert.doesNotMatch(result.error.message, /cloudsmith-secret-value|token=|not a valid/i);
+    assert.doesNotMatch(result.error.message, new RegExp(workspace.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  });
+
+  test("maps dependency file size failures without exposing internal bounds", async () => {
+    const workspace = await createWorkspace();
+    const requirementsPath = path.join(workspace, "requirements.txt");
+    await writeTextFile(requirementsPath, "placeholder==1.0.0\n");
+    await fs.promises.truncate(requirementsPath, MAX_DEPENDENCY_FILE_BYTES + 1);
+
+    const result = await createDefaultDependencyAdapterRegistry().parseManifest({
+      filePath: requirementsPath,
+      format: "python",
+      workspaceFolder: workspace,
+    });
+
+    assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.ERROR);
+    assert.strictEqual(result.error.code, ADAPTER_ERROR_CODES.DEPENDENCY_FILE_TOO_LARGE);
+    assert.strictEqual(
+      result.error.message,
+      "A dependency file could not be scanned because of its size. Check the dependency file and rescan."
+    );
+    assert.doesNotMatch(result.error.message, /\d/);
+  });
+
+  test("maps parser cancellation onto a stable customer-safe category", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "package.json");
+    const lockfilePath = path.join(workspace, "package-lock.json");
+    await writeTextFile(manifestPath, JSON.stringify({ dependencies: { alpha: "1.0.0" } }));
+    await writeTextFile(lockfilePath, JSON.stringify({ lockfileVersion: 3, packages: { "": {} } }));
+
+    const result = await createDefaultDependencyAdapterRegistry().parse({
+      adapterId: "npmParser",
+      resolverName: "npmParser",
+      ecosystem: "npm",
+      workspaceFolder: workspace,
+      lockfilePath,
+      manifestPath,
+      sourceFile: "package-lock.json",
+    }, {
+      workspaceFolder: workspace,
+      cancellationToken: { isCancellationRequested: true },
+    });
+
+    assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.ERROR);
+    assert.strictEqual(result.error.code, ADAPTER_ERROR_CODES.CANCELLED);
+    assert.strictEqual(result.error.message, "Dependency scanning was canceled.");
   });
 
   test("surfaces a malformed npm manifest paired with a valid lockfile", async () => {
@@ -219,8 +371,11 @@ suite("dependencyAdapterRegistry", () => {
 
     assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.ERROR);
     assert.deepStrictEqual(result.dependencies, []);
-    assert.strictEqual(result.error.code, "parse-error");
-    assert.match(result.error.message, /Malformed package\.json: invalid JSON/);
+    assert.strictEqual(result.error.code, ADAPTER_ERROR_CODES.PARSE_ERROR);
+    assert.strictEqual(
+      result.error.message,
+      "Dependency data could not be parsed. Check the dependency files and rescan."
+    );
   });
 
   test("surfaces a malformed Composer manifest paired with a valid lockfile", async () => {
@@ -242,8 +397,11 @@ suite("dependencyAdapterRegistry", () => {
 
     assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.ERROR);
     assert.deepStrictEqual(result.dependencies, []);
-    assert.strictEqual(result.error.code, "parse-error");
-    assert.match(result.error.message, /Malformed composer\.json: invalid JSON/);
+    assert.strictEqual(result.error.code, ADAPTER_ERROR_CODES.PARSE_ERROR);
+    assert.strictEqual(
+      result.error.message,
+      "Dependency data could not be parsed. Check the dependency files and rescan."
+    );
   });
 
   test("retains distinct provenance for same-ecosystem manifests", async () => {
@@ -604,6 +762,13 @@ suite("dependencyAdapterRegistry", () => {
       workspaceFolder: otherWorkspace,
     });
     assert.strictEqual(rejected.status, ADAPTER_RESULT_STATUSES.ERROR);
-    assert.match(rejected.error.message, /workspace folder/);
+    assert.strictEqual(
+      rejected.error.code,
+      ADAPTER_ERROR_CODES.DEPENDENCY_FILE_OUTSIDE_WORKSPACE
+    );
+    assert.strictEqual(
+      rejected.error.message,
+      "A dependency file is outside the selected workspace. Check the dependency paths and rescan."
+    );
   });
 });

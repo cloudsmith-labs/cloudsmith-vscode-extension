@@ -1,14 +1,13 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const path = require("path");
 const {
-  buildTree,
   createDependency,
-  deduplicateDeps,
   flattenDependencies,
   getSourceFileName,
   getWorkspacePath,
   pathExists,
   readUtf8,
+  throwIfTraversalCancelled,
 } = require("./shared");
 
 const TREE_FILE_CANDIDATES = [
@@ -60,29 +59,33 @@ const mavenParser = {
     }];
   },
 
-  async resolve({ lockfilePath, manifestPath, workspaceFolder }) {
+  async resolve({ lockfilePath, manifestPath, workspaceFolder, options = {} }) {
+    const cancellationToken = options.cancellationToken;
+    throwIfTraversalCancelled(cancellationToken);
     const sourceFile = getSourceFileName(manifestPath);
-    const manifestResult = parsePomManifest(await readUtf8(manifestPath, workspaceFolder));
-    const directDependencies = manifestResult.dependencies.map((dependency) => createMavenDependency({
-      ...dependency,
-      isDirect: true,
-      parent: null,
-      parentChain: [],
-      transitives: [],
-      sourceFile,
-    }));
+    const manifestResult = parsePomManifest(await readUtf8(manifestPath, workspaceFolder, options));
+    const directDependencies = manifestResult.dependencies.map((dependency) => {
+      throwIfTraversalCancelled(cancellationToken);
+      return createMavenDependency({
+        ...dependency,
+        isDirect: true,
+        parent: null,
+        parentChain: [],
+        transitives: [],
+        sourceFile,
+      });
+    });
 
     if (!lockfilePath) {
-      return buildTree(
-        "maven",
+      return buildMavenTree(
         sourceFile,
         directDependencies,
         manifestResult.warnings.concat(buildUnresolvedVersionWarnings(directDependencies))
       );
     }
 
-    const treeContent = await readUtf8(lockfilePath, workspaceFolder);
-    const treeRoots = parseDependencyTree(treeContent);
+    const treeContent = await readUtf8(lockfilePath, workspaceFolder, options);
+    const treeRoots = parseDependencyTree(treeContent, cancellationToken);
     const warnings = manifestResult.warnings.slice();
     if (treeRoots.length === 0) {
       warnings.push(
@@ -90,11 +93,12 @@ const mavenParser = {
         + "manifest dependency versions were not treated as package-manager resolutions."
       );
       warnings.push(...buildUnresolvedVersionWarnings(directDependencies));
-      return buildTree("maven", sourceFile, directDependencies, warnings);
+      return buildMavenTree(sourceFile, directDependencies, warnings);
     }
 
     const availableRoots = treeRoots.slice();
     const hydratedDirectDependencies = directDependencies.map((dependency) => {
+      throwIfTraversalCancelled(cancellationToken);
       const matchingTreeNode = takeMatchingTreeRoot(dependency, availableRoots);
       if (!matchingTreeNode) {
         return dependency;
@@ -113,13 +117,16 @@ const mavenParser = {
     });
 
     const matchedRoots = new Set(treeRoots.filter((root) => !availableRoots.includes(root)));
-    const dependencies = deduplicateDeps(flattenDependencies(hydratedDirectDependencies));
+    const dependencies = deduplicateMavenDependencies(flattenDependencies(hydratedDirectDependencies, {
+      cancellationToken,
+    }));
     warnings.push(...buildUnresolvedVersionWarnings(hydratedDirectDependencies));
     for (const rootNode of treeRoots) {
+      throwIfTraversalCancelled(cancellationToken);
       appendTreeNodeIfMissing(rootNode, dependencies, sourceFile, matchedRoots.has(rootNode));
     }
 
-    return buildTree("maven", sourceFile, dependencies, warnings);
+    return buildMavenTree(sourceFile, dependencies, warnings);
   },
 };
 
@@ -323,6 +330,11 @@ function parseManifestDependency(dependencyElement, properties, dependencyManage
     versionOrigin: fields.declaredConstraint ? "dependency" : managed ? "dependency-management" : null,
     mavenType: fields.type,
     mavenClassifier: fields.classifier,
+    mavenScope: fields.scope,
+    mavenSystemPath: fields.systemPath,
+    packageSource: fields.scope === "system"
+      ? { kind: "system", ...(fields.systemPath ? { location: fields.systemPath } : {}) }
+      : { kind: "registry" },
     mavenIdentity: fields.identity,
     isDevelopmentDependency: fields.scope === "test",
   };
@@ -335,11 +347,13 @@ function parseDependencyFields(dependencyElement, properties) {
   const rawType = findElementText(elements, "type") || "jar";
   const rawClassifier = findElementText(elements, "classifier");
   const rawScope = findElementText(elements, "scope") || "compile";
+  const rawSystemPath = findElementText(elements, "systemPath");
   const groupId = resolveMavenValue(rawGroupId, properties);
   const artifactId = resolveMavenValue(rawArtifactId, properties);
   const type = resolveMavenValue(rawType, properties);
   const classifier = resolveMavenValue(rawClassifier, properties);
   const scope = resolveMavenValue(rawScope, properties);
+  const systemPath = resolveMavenValue(rawSystemPath, properties);
 
   if (
     !groupId.complete
@@ -358,6 +372,7 @@ function parseDependencyFields(dependencyElement, properties) {
     type: resolvedType,
     classifier: resolvedClassifier,
     scope: scope.complete && scope.value ? scope.value : "compile",
+    systemPath: systemPath.complete && systemPath.value ? systemPath.value : null,
     identity: createMavenIdentity(groupId.value, artifactId.value, resolvedType, resolvedClassifier),
   };
 }
@@ -462,21 +477,35 @@ function createMavenDependency(values) {
     versionOrigin: values.versionOrigin || null,
     mavenType: values.mavenType || "jar",
     mavenClassifier: values.mavenClassifier || "",
+    mavenScope: values.mavenScope || "compile",
+    mavenSystemPath: values.mavenSystemPath || null,
     mavenIdentity: values.mavenIdentity || createMavenIdentityFromName(
       values.name,
       values.mavenType,
       values.mavenClassifier
     ),
     hasResolutionEvidence: Boolean(values.hasResolutionEvidence),
+    qualifiers: {
+      scope: values.mavenScope || "compile",
+      type: values.mavenType || "jar",
+      classifier: values.mavenClassifier || "",
+    },
+    packageSource: values.packageSource || ((values.mavenScope || "compile") === "system"
+      ? {
+        kind: "system",
+        ...(values.mavenSystemPath ? { location: values.mavenSystemPath } : {}),
+      }
+      : { kind: "registry" }),
   };
 }
 
-function parseDependencyTree(content) {
+function parseDependencyTree(content, cancellationToken) {
   const roots = [];
   const stack = [];
   let nodeCount = 0;
 
   for (const rawLine of String(content || "").split(/\r?\n/)) {
+    throwIfTraversalCancelled(cancellationToken);
     const body = rawLine.replace(/^\[INFO]\s*/, "");
     if (!body.trim() || /\(omitted for (?:conflict|duplicate)/i.test(body)) {
       continue;
@@ -489,7 +518,7 @@ function parseDependencyTree(content) {
 
     const depth = Math.floor(markerIndex / 3);
     if (depth > MAX_TREE_DEPTH) {
-      throw new Error(`Maven dependency tree exceeds depth ${MAX_TREE_DEPTH}`);
+      throw new Error("Maven dependency tree is too deeply nested to scan safely.");
     }
     const coordinates = body.slice(markerIndex + 2).trim().replace(/\s+\(\*\)$/, "");
     const node = parseMavenCoordinate(coordinates);
@@ -498,7 +527,7 @@ function parseDependencyTree(content) {
     }
     nodeCount += 1;
     if (nodeCount > MAX_TREE_NODES) {
-      throw new Error(`Maven dependency tree exceeds ${MAX_TREE_NODES} nodes`);
+      throw new Error("Maven dependency tree contains too many entries to scan safely.");
     }
 
     while (stack.length > depth) {
@@ -549,7 +578,10 @@ function parseMavenCoordinate(coordinates) {
 }
 
 function takeMatchingTreeRoot(dependency, availableRoots) {
-  const identityIndex = availableRoots.findIndex((node) => node.identity === dependency.mavenIdentity);
+  const identityIndex = availableRoots.findIndex((node) => (
+    node.identity === dependency.mavenIdentity
+    && node.scope === dependency.mavenScope
+  ));
   if (identityIndex === -1) {
     return null;
   }
@@ -567,13 +599,15 @@ function toMavenDependency(node, parentChain, sourceFile) {
     isDirect: parentChain.length === 0,
     parent: parentChain[parentChain.length - 1] || null,
     parentChain,
-    transitives: deduplicateDeps(node.children.map((child) => (
+    transitives: deduplicateMavenDependencies(node.children.map((child) => (
       toMavenDependency(child, parentChain.concat(node.name), sourceFile)
     ))),
     sourceFile,
     isDevelopmentDependency: node.scope === "test",
     mavenType: node.type,
     mavenClassifier: node.classifier,
+    mavenScope: node.scope,
+    packageSource: node.scope === "system" ? { kind: "system" } : { kind: "registry" },
     mavenIdentity: node.identity,
     hasResolutionEvidence: true,
   });
@@ -614,7 +648,8 @@ function deduplicateManifestDependencies(dependencies) {
     const key = [
       dependency.mavenIdentity,
       dependency.declaredConstraint || "",
-      dependency.isDevelopmentDependency ? "test" : "runtime",
+      dependency.mavenScope || "compile",
+      dependency.mavenSystemPath || "",
     ].join(":");
     if (seen.has(key)) {
       continue;
@@ -623,6 +658,39 @@ function deduplicateManifestDependencies(dependencies) {
     unique.push(dependency);
   }
   return unique;
+}
+
+function deduplicateMavenDependencies(dependencies) {
+  const unique = [];
+  const seen = new Set();
+  for (const dependency of dependencies) {
+    const key = JSON.stringify([
+      dependency.mavenIdentity || createMavenIdentityFromName(
+        dependency.name,
+        dependency.mavenType,
+        dependency.mavenClassifier
+      ),
+      dependency.version || "",
+      dependency.mavenScope || "compile",
+      dependency.parentChain || [],
+      dependency.mavenSystemPath || "",
+    ]);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(dependency);
+  }
+  return unique;
+}
+
+function buildMavenTree(sourceFile, dependencies, warnings = []) {
+  return {
+    ecosystem: "maven",
+    sourceFile,
+    dependencies: deduplicateMavenDependencies(dependencies),
+    warnings: Array.isArray(warnings) ? warnings.slice() : [],
+  };
 }
 
 function buildUnresolvedVersionWarnings(dependencies) {
