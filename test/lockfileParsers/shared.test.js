@@ -571,4 +571,146 @@ suite("Lockfile parser safety Test Suite", () => {
       }
     }
   });
+
+  test("rejects a regular child replaced by a symlink before it is opened", async () => {
+    const workspace = await createWorkspace("cloudsmith-directory-child-race-");
+    const outsideWorkspace = await createWorkspace("cloudsmith-directory-child-target-");
+    const controlledDirectory = path.join(workspace, "controlled");
+    const controlledChild = path.join(controlledDirectory, "inside.txt");
+    const movedChild = path.join(controlledDirectory, "inside-original.txt");
+    const outsideChild = path.join(outsideWorkspace, "outside.txt");
+    await writeTextFile(controlledChild, "inside\n");
+    await writeTextFile(outsideChild, "outside\n");
+    const safeControlledChild = path.join(
+      await fs.promises.realpath(controlledDirectory),
+      "inside.txt"
+    );
+
+    const originalOpen = fs.promises.open;
+    let swapped = false;
+    fs.promises.open = async (openedPath, ...args) => {
+      if (!swapped && openedPath === safeControlledChild) {
+        await fs.promises.rename(controlledChild, movedChild);
+        await fs.promises.symlink(outsideChild, controlledChild, "file");
+        swapped = true;
+      }
+      return originalOpen(openedPath, ...args);
+    };
+
+    try {
+      await assert.rejects(
+        () => readBoundedDirectoryEntries(controlledDirectory, 10, {
+          workspaceFolder: workspace,
+        }),
+        (error) => error.code === DEPENDENCY_FILE_ERROR_CODES.CHANGED
+      );
+    } finally {
+      fs.promises.open = originalOpen;
+      if (await fs.promises.lstat(controlledChild).then(
+        (stats) => stats.isSymbolicLink(),
+        () => false
+      )) {
+        await fs.promises.unlink(controlledChild);
+      }
+      if (await fs.promises.access(movedChild).then(() => true, () => false)) {
+        await fs.promises.rename(movedChild, controlledChild);
+      }
+    }
+  });
+
+  test("opens regular children before checking their path identity", async () => {
+    const workspace = await createWorkspace("cloudsmith-directory-child-order-");
+    const controlledChild = path.join(workspace, "inside.txt");
+    await writeTextFile(controlledChild, "inside\n");
+    const safeControlledChild = path.join(
+      await fs.promises.realpath(workspace),
+      "inside.txt"
+    );
+    const calls = [];
+    let openedFlags = null;
+    const originalOpen = fs.promises.open;
+    const originalLstat = fs.promises.lstat;
+    fs.promises.open = async (openedPath, flags, ...args) => {
+      const handle = await originalOpen(openedPath, flags, ...args);
+      if (openedPath !== safeControlledChild) return handle;
+      calls.push("open");
+      openedFlags = flags;
+      return {
+        stat: async (...statArgs) => {
+          calls.push("fstat");
+          return handle.stat(...statArgs);
+        },
+        close: (...closeArgs) => handle.close(...closeArgs),
+      };
+    };
+    fs.promises.lstat = async (targetPath, ...args) => {
+      if (targetPath === safeControlledChild) calls.push("lstat");
+      return originalLstat(targetPath, ...args);
+    };
+
+    try {
+      const result = await readBoundedDirectoryEntries(workspace, 10, {
+        workspaceFolder: workspace,
+      });
+      assert.strictEqual(result.entries.length, 1);
+      assert.deepStrictEqual(calls, ["open", "fstat", "lstat"]);
+      if (Number.isInteger(fs.constants.O_NOFOLLOW) && fs.constants.O_NOFOLLOW !== 0) {
+        assert.strictEqual(openedFlags & fs.constants.O_NOFOLLOW, fs.constants.O_NOFOLLOW);
+      }
+      if (Number.isInteger(fs.constants.O_NONBLOCK) && fs.constants.O_NONBLOCK !== 0) {
+        assert.strictEqual(openedFlags & fs.constants.O_NONBLOCK, fs.constants.O_NONBLOCK);
+      }
+    } finally {
+      fs.promises.open = originalOpen;
+      fs.promises.lstat = originalLstat;
+    }
+  });
+
+  test("rejects a regular child replaced after its handle is opened", async () => {
+    const workspace = await createWorkspace("cloudsmith-directory-child-post-open-");
+    const outsideWorkspace = await createWorkspace(
+      "cloudsmith-directory-child-post-open-target-"
+    );
+    const controlledChild = path.join(workspace, "inside.txt");
+    const movedChild = path.join(workspace, "inside-original.txt");
+    const outsideChild = path.join(outsideWorkspace, "outside.txt");
+    await writeTextFile(controlledChild, "inside\n");
+    await writeTextFile(outsideChild, "outside\n");
+    const safeControlledChild = path.join(
+      await fs.promises.realpath(workspace),
+      "inside.txt"
+    );
+
+    const originalOpen = fs.promises.open;
+    let swapped = false;
+    fs.promises.open = async (openedPath, ...args) => {
+      const handle = await originalOpen(openedPath, ...args);
+      if (!swapped && openedPath === safeControlledChild) {
+        await fs.promises.rename(controlledChild, movedChild);
+        await fs.promises.symlink(outsideChild, controlledChild, "file");
+        swapped = true;
+      }
+      return handle;
+    };
+
+    try {
+      await assert.rejects(
+        () => readBoundedDirectoryEntries(workspace, 10, {
+          workspaceFolder: workspace,
+        }),
+        (error) => error.code === DEPENDENCY_FILE_ERROR_CODES.CHANGED
+      );
+    } finally {
+      fs.promises.open = originalOpen;
+      if (await fs.promises.lstat(controlledChild).then(
+        (stats) => stats.isSymbolicLink(),
+        () => false
+      )) {
+        await fs.promises.unlink(controlledChild);
+      }
+      if (await fs.promises.access(movedChild).then(() => true, () => false)) {
+        await fs.promises.rename(movedChild, controlledChild);
+      }
+    }
+  });
 });

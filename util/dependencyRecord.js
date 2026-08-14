@@ -432,21 +432,15 @@ function getDependencyPackageSourceDisplayLocation(packageSource) {
     || isLocalSourceScheme(display)
     || isAbsoluteDisplayPath(display)
   ) {
-    display = basenameForDisplay(decodeLocalSourceLocator(display));
+    display = basenameForDisplay(display);
   } else {
     try {
       const parsed = new URL(display);
       if (parsed.protocol === "file:") {
         // A malformed percent escape must never fall back to displaying the
-        // complete file URL. Decode only when valid and always reduce it to a
-        // basename.
-        let filePath = parsed.pathname;
-        try {
-          filePath = decodeURIComponent(filePath);
-        } catch {
-          // The encoded basename is still safe to display.
-        }
-        display = basenameForDisplay(filePath);
+        // complete file URL. The boundary already performed its only decode;
+        // always reduce the remaining pathname to a basename.
+        display = basenameForDisplay(parsed.pathname);
       } else {
         parsed.username = "";
         parsed.password = "";
@@ -485,12 +479,10 @@ function stripSourceLocatorUserInfo(value) {
   // pattern requires text before `@`, so scoped path segments such as
   // `/@scope/package` remain intact.
   let previous;
-  // Decode only structural locator separators before scrubbing. This catches
-  // encoded userinfo without decoding arbitrary path content into display.
-  let stripped = input
-    .replace(/%2f/ig, "/")
-    .replace(/%5c/ig, "\\")
-    .replace(/%40/ig, "@");
+  // Structural escapes are decoded once at the source-location boundary.
+  // Never decode them again here: repeated unescaping can turn inert display
+  // text into credentials, path separators, or query/fragment delimiters.
+  let stripped = input;
   do {
     previous = stripped;
     stripped = stripped.replace(/(^|[\\/])[^\\/?#@]+@/g, "$1");
@@ -512,47 +504,23 @@ function isLocalPackageSourceKind(kind) {
 }
 
 function decodeSourceLocatorForDisplay(value) {
-  let current = String(value || "");
-  // Resolve repeated encoding only for customer presentation and with a hard
-  // iteration bound. This exposes encoded schemes, path separators, userinfo,
-  // query, and fragment delimiters to the ordinary fail-closed sanitizer.
-  for (let index = 0; index < 4; index += 1) {
-    let decoded;
-    try {
-      decoded = decodeURIComponent(current);
-    } catch {
-      decoded = current
-        .replace(/%25/ig, "%")
-        .replace(/%2f/ig, "/")
-        .replace(/%5c/ig, "\\")
-        .replace(/%3a/ig, ":")
-        .replace(/%40/ig, "@")
-        .replace(/%3f/ig, "?")
-        .replace(/%23/ig, "#");
-    }
-    if (decoded === current) break;
-    current = decoded;
+  const input = String(value || "");
+  let decoded;
+  try {
+    decoded = decodeURIComponent(input);
+  } catch {
+    // A malformed non-structural escape can remain recognizable (for example
+    // an encoded filename). If structural escapes are present, fail closed:
+    // partially decoding them would require a second unescape pass.
+    return /%(?:25|2f|5c|3a|40|3f|23)/i.test(input) ? null : input;
   }
-  // More encoding layers than the bounded presentation decoder can safely
-  // inspect must not be echoed. Structural delimiters could still conceal
-  // userinfo, an absolute path, query credentials, or a fragment.
-  if (/%(?:25|2f|5c|3a|40|3f|23)/i.test(current)) {
+  // A second encoding layer can conceal userinfo, absolute paths, queries, or
+  // fragments. Do not recursively unescape display data; return a generic
+  // label instead.
+  if (/%(?:25|2f|5c|3a|40|3f|23)/i.test(decoded)) {
     return null;
   }
-  return current;
-}
-
-function decodeLocalSourceLocator(value) {
-  try {
-    return decodeURIComponent(String(value || ""));
-  } catch {
-    // Even with another malformed escape, structural path separators must be
-    // decoded so basename reduction cannot expose an encoded absolute path.
-    return String(value || "")
-      .replace(/%2f/ig, "/")
-      .replace(/%5c/ig, "\\")
-      .replace(/%3a/ig, ":");
-  }
+  return decoded;
 }
 
 function getDependencyPackageSourceDisplayRef(value) {

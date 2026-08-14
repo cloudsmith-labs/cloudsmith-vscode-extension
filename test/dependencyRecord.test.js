@@ -523,13 +523,42 @@ suite("dependencyRecord", () => {
       ["path", "file:%2FC:%5CUsers%5Cprivate-user%5Cprivate%5Csecret.jar"],
       ["path", "file%3A%2F%2F%2FUsers%2Fprivate-user%2Fprivate%2Fsecret.jar"],
       ["path", "path%3A%2F%2F%2FUsers%2Fprivate-user%2Fprivate%2Fsecret.jar"],
-      ["path", "file%253A%252F%252F%252FUsers%252Fprivate-user%252Fprivate%252Fsecret.jar"],
     ]) {
       assert.strictEqual(
         getDependencyPackageSourceDisplayLocation({ kind, location: unsafeLocation }),
         "secret.jar"
       );
     }
+    assert.strictEqual(
+      getDependencyPackageSourceDisplayLocation({
+        kind: "path",
+        location: "file%253A%252F%252F%252FUsers%252Fprivate-user%252Fprivate%252Fsecret.jar",
+      }),
+      "local source"
+    );
+    assert.strictEqual(
+      getDependencyPackageSourceDisplayLocation({
+        kind: "git",
+        location: encodeURIComponent(encodeURIComponent(
+          "https://user:secret@example.com/repo.git?token=hidden#main"
+        )),
+      }),
+      "source"
+    );
+    assert.strictEqual(
+      getDependencyPackageSourceDisplayLocation({
+        kind: "git",
+        location: "https%3A%2F%2Fexample.com%2Frepo.git%3Ftoken%3Dhidden%ZZ",
+      }),
+      "source"
+    );
+    assert.strictEqual(
+      getDependencyPackageSourceDisplayLocation({
+        kind: "git",
+        location: "https://example.com/team/my%20repo.git?token=hidden",
+      }),
+      "https://example.com/team/my%20repo.git"
+    );
     for (const unsafeLocation of [
       "ssh://user:secret@host:path",
       "https://user:secret@example.com:bad/path",

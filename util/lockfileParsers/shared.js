@@ -521,52 +521,56 @@ async function validateBoundedDirectoryEntry(
     expectedDirectoryStats
   );
   const childPath = path.join(safeDirectoryPath, name);
-  let initialChildStats;
-  try {
-    initialChildStats = await fs.promises.lstat(childPath, { bigint: true });
-  } catch (error) {
-    throw createDependencyFileChangedError(error);
-  }
+  const reportsFile = typeof entry.isFile === "function" && entry.isFile();
+  const reportsDirectory = typeof entry.isDirectory === "function"
+    && entry.isDirectory();
+  const reportsSymlink = typeof entry.isSymbolicLink === "function"
+    && entry.isSymbolicLink();
 
-  // Never follow a symlink merely to recover a Dirent type. Consumers already
-  // skip symbolic-link entries, and the parent identity checks ensure this
-  // snapshot refers to the verified workspace directory.
-  if (initialChildStats.isSymbolicLink()) {
+  // Symlink and special entries are never opened. Validate their type against
+  // the current path and return a frozen snapshot so callers can skip them.
+  // If an untrusted/replaced directory handle reports the wrong type, fail
+  // closed instead of following or reclassifying the entry.
+  if (reportsSymlink || (!reportsFile && !reportsDirectory)) {
+    let currentChildStats;
+    try {
+      currentChildStats = await fs.promises.lstat(childPath, { bigint: true });
+    } catch (error) {
+      throw createDependencyFileChangedError(error);
+    }
+    if (!doesDirectoryEntryTypeMatchStats(entry, currentChildStats)) {
+      throw createDependencyFileChangedError();
+    }
     await validateCurrentDirectoryIdentity(
       safeDirectoryPath,
       workspaceRoot,
       expectedDirectoryStats
     );
-    return createDirectoryEntrySnapshot(name, initialChildStats);
-  }
-
-  if (!initialChildStats.isFile() && !initialChildStats.isDirectory()) {
-    await validateCurrentDirectoryIdentity(
-      safeDirectoryPath,
-      workspaceRoot,
-      expectedDirectoryStats
-    );
-    return createDirectoryEntrySnapshot(name, initialChildStats);
+    return createDirectoryEntrySnapshot(name, currentChildStats);
   }
 
   const noFollowFlag = Number.isInteger(fs.constants.O_NOFOLLOW)
     ? fs.constants.O_NOFOLLOW
     : 0;
-  const directoryOnlyFlag = initialChildStats.isDirectory()
-    && Number.isInteger(fs.constants.O_DIRECTORY)
+  const nonBlockFlag = Number.isInteger(fs.constants.O_NONBLOCK)
+    ? fs.constants.O_NONBLOCK
+    : 0;
+  const directoryOnlyFlag = reportsDirectory && Number.isInteger(fs.constants.O_DIRECTORY)
     ? fs.constants.O_DIRECTORY
     : 0;
   let childHandle;
   try {
     childHandle = await fs.promises.open(
       childPath,
-      fs.constants.O_RDONLY | noFollowFlag | directoryOnlyFlag
+      fs.constants.O_RDONLY | noFollowFlag | nonBlockFlag | directoryOnlyFlag
     );
     const openedChildStats = await childHandle.stat({ bigint: true });
     const currentChildStats = await fs.promises.lstat(childPath, { bigint: true });
     if (
-      currentChildStats.isSymbolicLink()
-      || !isSameFileIdentity(initialChildStats, openedChildStats)
+      reportsFile === reportsDirectory
+      || reportsFile !== openedChildStats.isFile()
+      || reportsDirectory !== openedChildStats.isDirectory()
+      || currentChildStats.isSymbolicLink()
       || !isSameFileIdentity(openedChildStats, currentChildStats)
     ) {
       throw createDependencyFileChangedError();
@@ -584,6 +588,21 @@ async function validateBoundedDirectoryEntry(
   } finally {
     if (childHandle) await childHandle.close().catch(() => {});
   }
+}
+
+function doesDirectoryEntryTypeMatchStats(entry, stats) {
+  return [
+    "isBlockDevice",
+    "isCharacterDevice",
+    "isDirectory",
+    "isFIFO",
+    "isFile",
+    "isSocket",
+    "isSymbolicLink",
+  ].every((method) => (
+    typeof entry[method] === "function"
+    && entry[method]() === stats[method]()
+  ));
 }
 
 async function validateCurrentDirectoryIdentity(safePath, workspaceRoot, expectedStats) {
