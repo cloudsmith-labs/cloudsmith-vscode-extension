@@ -45,6 +45,9 @@ jobs:
       - name: Validate extension build inputs
         run: npm run build
 
+      - name: Verify architecture boundaries
+        run: npm run verify:architecture
+
       - name: Verify version state
         run: npm run verify:version
 

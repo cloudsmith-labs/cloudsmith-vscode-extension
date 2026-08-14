@@ -8,6 +8,8 @@ const roots = [
   "extension.js",
   ".vscode-test.mjs",
   "eslint.config.mjs",
+  "commands",
+  "domain",
   "models",
   "scripts",
   "test",

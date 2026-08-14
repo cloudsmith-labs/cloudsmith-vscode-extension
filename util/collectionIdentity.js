@@ -1,5 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
+const { exactPackageIdentity } = require("../domain/package");
+
 const MAX_COLLECTION_IDENTITY_PART_LENGTH = 512;
 const MAX_IDENTITY_UNWRAP_DEPTH = 4;
 
@@ -51,10 +53,7 @@ function repositoryCollectionIdentity(workspace, repository) {
 }
 
 function packageCollectionIdentity(pkg) {
-  return canonicalCollectionIdentity(
-    [pkg && pkg.namespace, pkg && pkg.repository, pkg && pkg.slug_perm],
-    "package"
-  );
+  return exactPackageIdentity(pkg);
 }
 
 function packageGroupCollectionIdentity(workspace, repository, group) {

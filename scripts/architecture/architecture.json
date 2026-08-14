@@ -1,0 +1,368 @@
+{
+  "schemaVersion": 1,
+  "compositionFile": "extension.js",
+  "cycleExemptions": [
+    [
+      "util/cloudsmithAPI.js",
+      "util/connectionManager.js",
+      "util/credentialManager.js"
+    ]
+  ],
+  "limits": {
+    "maxDepth": 12,
+    "maxDiagnostics": 256,
+    "maxEntries": 1024,
+    "maxFileBytes": 262144,
+    "maxFiles": 256,
+    "maxImports": 2048,
+    "maxTotalBytes": 4194304
+  },
+  "ignoredSegments": [
+    ".git",
+    ".vscode-test",
+    "build",
+    "coverage",
+    "dist",
+    "generated",
+    "node_modules",
+    "out",
+    "vendor"
+  ],
+  "adapterFiles": [
+    "domain/packageAdapters.js"
+  ],
+  "canonicalFactoryFiles": [
+    "domain/package.js"
+  ],
+  "commandRegistrationFiles": [
+    "commands/registrar.js",
+    "commands/authentication.js",
+    "commands/settingsHelp.js",
+    "commands/packages.js",
+    "commands/search.js",
+    "commands/dependencyHealth.js",
+    "commands/vulnerabilities.js",
+    "commands/promotion.js",
+    "commands/upstream.js"
+  ],
+  "runtimeRoots": [
+    "commands",
+    "domain",
+    "models",
+    "util",
+    "views"
+  ],
+  "nonJavaScriptPackageFiles": [
+    "media/icon.svg",
+    "media/logo.png",
+    "media/repo.png",
+    "media/workspace_dark.svg",
+    "media/workspace_light.svg",
+    "media/readme/*.gif",
+    "media/readme/*.jpg",
+    "media/readme/*.png",
+    "media/vscode_icons/file_type_*.svg",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "CONTRIBUTORS.md"
+  ],
+  "internalCommandIds": [
+    "cloudsmith-vsc.scanDependenciesPending",
+    "cloudsmith-vsc.scanDependenciesComplete",
+    "cloudsmith-vsc.rescanDependencies"
+  ],
+  "layers": [
+    {
+      "id": "domain-core",
+      "roots": ["domain"],
+      "files": [],
+      "excludeFiles": ["domain/packageAdapters.js"],
+      "allowedLayers": ["domain-core"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "domain-adapter",
+      "roots": [],
+      "files": ["domain/packageAdapters.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "legacy-service",
+      "roots": ["util"],
+      "files": [],
+      "excludeFiles": [
+        "util/accountLifecycle.js",
+        "util/activationOwner.js",
+        "util/dependencyScanOrchestration.js",
+        "util/searchIntent.js",
+        "util/workspaceAccess.js"
+      ],
+      "allowedLayers": ["domain-core", "domain-adapter", "legacy-service"],
+      "allowedExternals": ["crypto", "fs", "http", "os", "path", "url", "util", "vscode"],
+      "allowedResources": ["package.json"]
+    },
+    {
+      "id": "application-activation-owner",
+      "roots": [],
+      "files": ["util/activationOwner.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["application-activation-owner"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "application-account-lifecycle",
+      "roots": [],
+      "files": ["util/accountLifecycle.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["application-account-lifecycle", "legacy-service"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "application-workspace-access",
+      "roots": [],
+      "files": ["util/workspaceAccess.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["application-workspace-access"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "application-search-intent",
+      "roots": [],
+      "files": ["util/searchIntent.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["application-search-intent"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "application-dependency-scan",
+      "roots": [],
+      "files": ["util/dependencyScanOrchestration.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["application-dependency-scan"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "command-shared",
+      "roots": [],
+      "files": ["commands/registrar.js", "commands/support.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter", "application-workspace-access", "command-shared"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "command-authentication",
+      "roots": [],
+      "files": ["commands/authentication.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter", "command-shared"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "command-settings-help",
+      "roots": [],
+      "files": ["commands/settingsHelp.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter", "command-shared"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "command-packages",
+      "roots": [],
+      "files": ["commands/packages.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter", "command-shared"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "command-search",
+      "roots": [],
+      "files": ["commands/search.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter", "application-search-intent", "command-shared"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "command-dependency-health",
+      "roots": [],
+      "files": ["commands/dependencyHealth.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter", "application-dependency-scan", "command-shared"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "command-vulnerabilities",
+      "roots": [],
+      "files": ["commands/vulnerabilities.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter", "command-shared"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "command-promotion",
+      "roots": [],
+      "files": ["commands/promotion.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter", "command-shared"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "command-upstream",
+      "roots": [],
+      "files": ["commands/upstream.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter", "command-shared"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "model-presentation",
+      "roots": ["models"],
+      "files": [],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter", "legacy-service", "model-presentation"],
+      "allowedExternals": ["path", "vscode"],
+      "allowedResources": []
+    },
+    {
+      "id": "view-presentation",
+      "roots": ["views"],
+      "files": [],
+      "excludeFiles": [],
+      "allowedLayers": ["domain-core", "domain-adapter", "legacy-service", "model-presentation", "view-presentation"],
+      "allowedExternals": ["crypto", "path", "util", "vscode"],
+      "allowedResources": []
+    }
+  ],
+  "registrars": [
+    {
+      "file": "commands/authentication.js",
+      "function": "registerAuthenticationCommands",
+      "commands": [
+        "cloudsmith-vsc.clearCredentials",
+        "cloudsmith-vsc.configureCredentials",
+        "cloudsmith-vsc.connectCloudsmith",
+        "cloudsmith-vsc.ssoLogin",
+        "cloudsmith-vsc.importCLICredentials"
+      ]
+    },
+    {
+      "file": "commands/settingsHelp.js",
+      "function": "registerSettingsHelpCommands",
+      "commands": [
+        "cloudsmith-vsc.setDefaultWorkspace",
+        "cloudsmith-vsc.openSettings",
+        "cloudsmith-vscode-extension.cloudsmithDocs"
+      ]
+    },
+    {
+      "file": "commands/packages.js",
+      "function": "registerPackageCommands",
+      "commands": [
+        "cloudsmith-vsc.refreshView",
+        "cloudsmith-vsc.copySelected",
+        "cloudsmith-vsc.inspectPackage",
+        "cloudsmith-vsc.inspectPackageGroup",
+        "cloudsmith-vsc.openPackage",
+        "cloudsmith-vsc.openPackageGroup",
+        "cloudsmith-vsc.loadMoreRepositoryPackages",
+        "cloudsmith-vsc.filterPackages",
+        "cloudsmith-vsc.clearFilter",
+        "cloudsmith-vsc.changeFilter",
+        "cloudsmith-vsc.copyInstallCommand",
+        "cloudsmith-vsc.showInstallCommand",
+        "cloudsmith-vsc.openLicenseUrl",
+        "cloudsmith-vsc.copyEntitlementToken"
+      ]
+    },
+    {
+      "file": "commands/search.js",
+      "function": "registerSearchCommands",
+      "commands": [
+        "cloudsmith-vsc.searchPackages",
+        "cloudsmith-vsc.clearSearch",
+        "cloudsmith-vsc.searchNextPage",
+        "cloudsmith-vsc.searchInWorkspace",
+        "cloudsmith-vsc.guidedSearch",
+        "cloudsmith-vsc.filterVulnerable",
+        "cloudsmith-vsc.filterVulnerableWorkspace",
+        "cloudsmith-vsc.searchByLicense"
+      ]
+    },
+    {
+      "file": "commands/dependencyHealth.js",
+      "function": "registerDependencyHealthCommands",
+      "commands": [
+        "cloudsmith-vsc.scanDependencies",
+        "cloudsmith-vsc.scanDependenciesPending",
+        "cloudsmith-vsc.scanDependenciesComplete",
+        "cloudsmith-vsc.rescanDependencies",
+        "cloudsmith-vsc.changeDependencyScanScope",
+        "cloudsmith-vsc.pullDependencies",
+        "cloudsmith-vsc.pullSingleDependency",
+        "cloudsmith-vsc.cycleDepView",
+        "cloudsmith-vsc.cycleDepViewDirect",
+        "cloudsmith-vsc.cycleDepViewFlat",
+        "cloudsmith-vsc.cycleDepViewTree",
+        "cloudsmith-vsc.depViewDirect",
+        "cloudsmith-vsc.depViewFlat",
+        "cloudsmith-vsc.depViewTree",
+        "cloudsmith-vsc.depFilterVulnerable",
+        "cloudsmith-vsc.depFilterUncovered",
+        "cloudsmith-vsc.depFilterRestrictiveLicense",
+        "cloudsmith-vsc.depFilterPolicyViolation",
+        "cloudsmith-vsc.depFilterClear",
+        "cloudsmith-vsc.depSortFilter",
+        "cloudsmith-vsc.depSortFilterActive",
+        "cloudsmith-vsc.viewComplianceReport"
+      ]
+    },
+    {
+      "file": "commands/vulnerabilities.js",
+      "function": "registerVulnerabilityCommands",
+      "commands": [
+        "cloudsmith-vsc.findSafeVersion",
+        "cloudsmith-vsc.openCVE",
+        "cloudsmith-vsc.showVulnerabilities",
+        "cloudsmith-vsc.showDepVulnerabilities",
+        "cloudsmith-vsc.findDepSafeVersion",
+        "cloudsmith-vsc.filterVulnerabilities",
+        "cloudsmith-vsc.explainQuarantine"
+      ]
+    },
+    {
+      "file": "commands/promotion.js",
+      "function": "registerPromotionCommands",
+      "commands": [
+        "cloudsmith-vsc.showPromotionStatus",
+        "cloudsmith-vsc.promotePackage"
+      ]
+    },
+    {
+      "file": "commands/upstream.js",
+      "function": "registerUpstreamCommands",
+      "commands": [
+        "cloudsmith-vsc.inspectUpstreams",
+        "cloudsmith-vsc.exportTerraform",
+        "cloudsmith-vsc.previewUpstreamResolution"
+      ]
+    }
+  ]
+}

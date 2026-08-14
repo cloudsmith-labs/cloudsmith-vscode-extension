@@ -28,16 +28,22 @@ function buildLicensePatch(dependencies) {
       continue;
     }
 
-    const inspection = LicenseClassifier.inspect(dependency.cloudsmithPackage);
-    const spdx = inspection.spdxLicense || inspection.canonicalValue || inspection.displayValue || null;
+    const pkg = dependency.cloudsmithPackage;
+    const canonicalLicense = pkg.license.spdx || pkg.license.declared || pkg.license.raw;
+    const inspection = LicenseClassifier.inspect(canonicalLicense);
+    const spdx = pkg.license.spdx
+      || inspection.spdxLicense
+      || inspection.canonicalValue
+      || inspection.displayValue
+      || null;
 
     patchMap.set(key, {
       spdx,
-      display: inspection.displayValue || spdx || null,
-      url: inspection.licenseUrl || null,
+      display: pkg.license.declared || inspection.displayValue || spdx || null,
+      url: pkg.license.url || inspection.licenseUrl || null,
       classification: toLicenseClassification(inspection.tier),
       classifierTier: inspection.tier,
-      raw: inspection.rawLicense || inspection.raw || null,
+      raw: pkg.license.raw || inspection.rawLicense || inspection.raw || null,
       overrideApplied: Boolean(inspection.overrideApplied),
     });
   }

@@ -5,6 +5,10 @@
 
 const crypto = require("crypto");
 const vscode = require("vscode");
+const { assertExactPackage } = require("../domain/package");
+const {
+  fromApiPackageRecord,
+} = require("../domain/packageAdapters");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiEndpoint } = require("../util/apiEndpoint");
 const { buildPackageUrl } = require("../util/webAppUrls");
@@ -49,14 +53,16 @@ class QuarantineExplainProvider {
     this._createNonce = options.createNonce || (() => crypto.randomBytes(16).toString("hex"));
   }
 
-  async show(item) {
-    if (!item) {
+  async show(value) {
+    if (!value) {
       this._notifications.warning("No package selected.");
       return;
     }
+    let pkg;
     let locator;
     try {
-      locator = createQuarantineLocator(item);
+      pkg = assertExactPackage(value);
+      locator = createQuarantineLocator(pkg);
     } catch {
       locator = null;
     }
@@ -68,7 +74,7 @@ class QuarantineExplainProvider {
     if (!account || !isAccountCurrent(this._connectionManager, account)) return;
 
     if (this._operation) this._disposeOperation(this._operation, true);
-    const caller = this._normalizeCallerPackage(item, locator);
+    const caller = this._normalizeCallerPackage(pkg, locator);
     const panel = this._createWebviewPanel(
       "cloudsmithQuarantineExplain",
       `Quarantine details: ${caller.name || "Package"}${caller.version ? ` ${caller.version}` : ""}`,
@@ -81,7 +87,7 @@ class QuarantineExplainProvider {
       controller: new AbortController(),
       disposed: false,
       disposeSubscription: null,
-      item,
+      package: pkg,
       locator,
       messageSubscription: null,
       nonce: this._getNonce(),
@@ -99,18 +105,15 @@ class QuarantineExplainProvider {
     await this._refreshOperation(operation, this._cloudsmithAPI || new CloudsmithAPI(this.context));
   }
 
-  _normalizeCallerPackage(item, locator) {
+  _normalizeCallerPackage(pkg, locator) {
     return Object.freeze({
       confirmed: false,
-      format: displayString(unwrapOwnValue(ownData(item, "format")), 64),
-      name: displayString(unwrapOwnValue(ownData(item, "name")), 512) || "Package",
-      status: displayString(
-        unwrapOwnValue(ownData(item, "status_str_raw") ?? ownData(item, "status_str")),
-        64
-      ),
-      statusReason: normalizePolicyStatusReason(ownData(item, "status_reason")),
-      uploadedAt: dateTime(unwrapOwnValue(ownData(item, "uploaded_at"))),
-      version: displayString(unwrapOwnValue(ownData(item, "version")), 512),
+      format: pkg.format,
+      name: displayString(pkg.name, 512) || "Package",
+      status: displayString(pkg.status, 64),
+      statusReason: normalizePolicyStatusReason(pkg.statusReason),
+      uploadedAt: dateTime(pkg.uploadedAt),
+      version: displayString(pkg.version, 512),
       workspace: locator.workspace,
       repository: locator.repository,
       packageSlugPerm: locator.packageSlugPerm,
@@ -144,6 +147,7 @@ class QuarantineExplainProvider {
       this._render(operation);
       return;
     }
+    operation.package = current.package;
 
     operation.trace = {
       ...operation.trace,
@@ -286,7 +290,7 @@ class QuarantineExplainProvider {
     const parsed = parseWebviewMessage(message, QUARANTINE_MESSAGE_CONTRACTS);
     if (!parsed || !this._isOperationCurrent(operation)) return;
     if (parsed.command === "retry") {
-      await this.show(operation.item);
+      await this.show(operation.package);
       return;
     }
     const trace = operation.trace;
@@ -295,9 +299,9 @@ class QuarantineExplainProvider {
     }
     try {
       if (parsed.command === "findSafeVersion") {
-        await this._executeCommand("cloudsmith-vsc.findSafeVersion", operation.item);
+        await this._executeCommand("cloudsmith-vsc.findSafeVersion", operation.package);
       } else if (parsed.command === "showVulnerabilities") {
-        await this._executeCommand("cloudsmith-vsc.showVulnerabilities", operation.item);
+        await this._executeCommand("cloudsmith-vsc.showVulnerabilities", operation.package);
       } else if (parsed.command === "openInCloudsmith" && trace.packageUrl) {
         await this._openExternal(trace.packageUrl);
       } else if (parsed.command === "copyReport") {
@@ -486,25 +490,25 @@ class QuarantineExplainProvider {
 }
 
 function normalizeCurrentPackage(value, locator) {
-  if (!isRecord(value)) return null;
-  const workspace = displayString(ownData(value, "namespace"), 512);
-  const repository = displayString(ownData(value, "repository"), 512);
-  const packageSlugPerm = displayString(ownData(value, "slug_perm"), 512);
-  const packageSlugPermRaw = ownData(value, "slug_perm_raw") == null
-    ? null
-    : displayString(ownData(value, "slug_perm_raw"), 512);
-  const status = displayString(unwrapOwnValue(
-    ownData(value, "status_str") ?? ownData(value, "status")
-  ), 64);
-  const uploadedAt = dateTime(ownData(value, "uploaded_at"));
-  const format = displayString(ownData(value, "format"), 64);
-  const name = displayString(ownData(value, "name"), 512);
-  const version = displayString(ownData(value, "version"), 512);
+  let pkg;
+  try {
+    pkg = fromApiPackageRecord(value, {
+      expectedWorkspace: locator.workspace,
+      expectedRepository: locator.repository,
+    });
+  } catch {
+    return null;
+  }
+  const workspace = pkg.workspace;
+  const repository = pkg.repository;
+  const packageSlugPerm = pkg.packageIdentifier;
+  const status = displayString(pkg.status, 64);
+  const uploadedAt = dateTime(pkg.uploadedAt);
+  const format = displayString(pkg.format, 64);
+  const name = displayString(pkg.name, 512);
+  const version = displayString(pkg.version, 512);
   if (
-    workspace !== locator.workspace
-    || repository !== locator.repository
-    || packageSlugPerm !== locator.packageSlugPerm
-    || (packageSlugPermRaw !== null && packageSlugPermRaw !== packageSlugPerm)
+    packageSlugPerm !== locator.packageSlugPerm
     || !status
     || !format
     || !name
@@ -514,10 +518,11 @@ function normalizeCurrentPackage(value, locator) {
     confirmed: true,
     format,
     name,
+    package: pkg,
     packageSlugPerm,
     repository,
     status,
-    statusReason: normalizePolicyStatusReason(ownData(value, "status_reason")),
+    statusReason: normalizePolicyStatusReason(pkg.statusReason),
     uploadedAt,
     version,
     workspace,
@@ -581,28 +586,6 @@ function isRecord(value) {
     && typeof value === "object"
     && !Array.isArray(value)
     && Object.getPrototypeOf(value) === Object.prototype;
-}
-
-function ownData(value, key) {
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    return descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value")
-      ? descriptor.value
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function unwrapOwnValue(value) {
-  let current = value;
-  for (let depth = 0; depth < 4; depth += 1) {
-    if (!isRecord(current)) return current;
-    const descriptor = Object.getOwnPropertyDescriptor(current, "value");
-    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value")) return null;
-    current = descriptor.value;
-  }
-  return isRecord(current) ? null : current;
 }
 
 const QUARANTINE_MESSAGE_CONTRACTS = Object.freeze({

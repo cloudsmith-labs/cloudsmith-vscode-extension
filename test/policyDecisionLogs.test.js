@@ -1,4 +1,7 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const assert = require("assert");
+const { createExactPackage } = require("../domain/package");
 const {
   createQuarantineLocator,
   fetchDecisionLogDetail,
@@ -321,50 +324,22 @@ suite("Policy decision log collection", () => {
     }
   });
 
-  test("canonical locator requires exact agreement between like aliases", () => {
-    assert.deepStrictEqual(createQuarantineLocator({
-      namespace: "workspace-a",
-      cloudsmithWorkspace: "workspace-a",
+  test("canonical locator accepts only a branded exact package", () => {
+    const pkg = createExactPackage({
+      workspace: "workspace-a",
       repository: "repo-a",
-      cloudsmithRepo: "repo-a",
-      slug_perm: { value: "package-a" },
-      slug_perm_raw: "package-a",
-    }), locator);
-    assert.strictEqual(createQuarantineLocator({
-      namespace: "workspace-a",
-      cloudsmithWorkspace: "workspace-b",
-      repository: "repo-a",
-      slug_perm_raw: "package-a",
-    }), null);
-    assert.strictEqual(createQuarantineLocator({
-      namespace: "workspace-a",
-      repository: "repo-a",
-      slug_perm: { value: {} },
-      slug_perm_raw: "package-a",
-    }), null);
-
-    let reads = 0;
-    const accessor = {};
-    Object.defineProperty(accessor, "value", {
-      enumerable: true,
-      get() { reads += 1; return "package-a"; },
+      packageIdentifier: "package-a",
+      name: "artifact",
+      version: "1.0.0",
+      format: "npm",
     });
+    assert.deepStrictEqual(createQuarantineLocator(pkg), locator);
+    assert.strictEqual(createQuarantineLocator({ ...pkg }), null);
     assert.strictEqual(createQuarantineLocator({
       namespace: "workspace-a",
       repository: "repo-a",
-      slug_perm: accessor,
+      slug_perm: "package-a",
     }), null);
-    assert.strictEqual(reads, 0);
-
-    class PackageLikeNode {
-      constructor() {
-        this.namespace = "workspace-a";
-        this.repository = "repo-a";
-        this.slug_perm = { value: "package-a" };
-        this.slug_perm_raw = "package-a";
-      }
-    }
-    assert.deepStrictEqual(createQuarantineLocator(new PackageLikeNode()), locator);
   });
 
   test("bounds status reasons and extracts a canonical policy slug", () => {

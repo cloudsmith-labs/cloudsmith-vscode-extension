@@ -1,4 +1,7 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const assert = require("assert");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const {
   PromotionContractError,
   createOutcome,
@@ -47,30 +50,15 @@ suite("Promotion contracts", () => {
     };
   }
 
-  test("builds the same scalar locator from package, search, dependency, and recent shapes", () => {
-    const shapes = [
-      { namespace: "workspace", repository: "source", slug_perm: { id: "Slug", value: "source-package-id" } },
-      { namespace: "workspace", repository: "source", slug_perm_raw: "source-package-id" },
-      { cloudsmithWorkspace: "workspace", cloudsmithRepo: "source", slug_perm: "source-package-id" },
-      { cloudsmithMatch: { namespace: "workspace", repository: "source", slug_perm: "source-package-id" } },
-    ];
-    for (const shape of shapes) {
-      assert.deepStrictEqual(createSourceLocator(shape), locator);
-    }
+  test("builds a scalar locator only from a branded exact package", () => {
+    const pkg = fromApiPackageRecord(sourceRecord());
+    assert.deepStrictEqual(createSourceLocator(pkg), locator);
+    assert.throws(() => createSourceLocator({ ...pkg }), PromotionContractError);
   });
 
-  test("accepts agreeing aliases and rejects conflicting or malformed aliases", () => {
-    const matching = createSourceLocator({
-      namespace: "workspace",
-      cloudsmithWorkspace: "workspace",
-      repository: "source",
-      cloudsmithRepo: "source",
-      slug_perm: { value: "source-package-id" },
-      slug_perm_raw: "source-package-id",
-    });
-    assert.deepStrictEqual(matching, locator);
-
+  test("rejects compatibility and malformed shapes at the promotion contract", () => {
     for (const item of [
+      sourceRecord(),
       { namespace: "workspace", cloudsmithWorkspace: "other", repository: "source", slug_perm: "source-package-id" },
       { namespace: "workspace", repository: "source", slug_perm: "source-package-id", slug_perm_raw: "other-id" },
       { namespace: "workspace", repository: "source", slug_perm: { value: {} }, slug_perm_raw: "source-package-id" },
@@ -80,7 +68,7 @@ suite("Promotion contracts", () => {
     }
   });
 
-  test("rejects unsafe path identities before they can become endpoints", () => {
+  test("the canonical package factory rejects unsafe source identities before promotion", () => {
     for (const unsafe of [
       "../source",
       "a/b",
@@ -91,11 +79,7 @@ suite("Promotion contracts", () => {
       "source\u061ctarget",
       "source\u202etarget",
     ]) {
-      assert.throws(() => createSourceLocator({
-        namespace: "workspace",
-        repository: unsafe,
-        slug_perm: "source-package-id",
-      }), PromotionContractError);
+      assert.throws(() => fromApiPackageRecord(sourceRecord({ repository: unsafe })));
     }
   });
 

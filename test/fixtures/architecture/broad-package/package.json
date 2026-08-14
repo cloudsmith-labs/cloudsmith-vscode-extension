@@ -1,0 +1,15 @@
+{
+  "name": "architecture-broad-package-fixture",
+  "main": "./extension.js",
+  "files": [
+    "extension.js",
+    "commands/**/*.js",
+    "domain/**/*.js",
+    "rogue"
+  ],
+  "contributes": {
+    "commands": [
+      { "command": "cloudsmith-vsc.valid", "title": "Valid" }
+    ]
+  }
+}

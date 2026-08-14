@@ -74,9 +74,14 @@ class WorkspaceContextProjector {
     return this._queue;
   }
 
+  isDisposed() {
+    return this._disposed;
+  }
+
   dispose() {
     this._disposed = true;
     this._version += 1;
+    return this._queue;
   }
 }
 
@@ -85,7 +90,7 @@ function getWorkspaceContextProjector(context, options = {}) {
     throw new TypeError("An extension context is required for workspace projection.");
   }
   let projector = projectors.get(context);
-  if (!projector) {
+  if (!projector || projector.isDisposed()) {
     projector = new WorkspaceContextProjector(options);
     projectors.set(context, projector);
   }

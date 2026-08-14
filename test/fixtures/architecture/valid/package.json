@@ -1,0 +1,8 @@
+{
+  "name": "architecture-valid-fixture",
+  "contributes": {
+    "commands": [
+      { "command": "cloudsmith-vsc.valid", "title": "Valid" }
+    ]
+  }
+}

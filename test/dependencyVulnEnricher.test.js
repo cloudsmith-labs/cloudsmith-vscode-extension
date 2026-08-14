@@ -1,3 +1,5 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const assert = require("assert");
 const {
   clearVulnerabilityCache,
@@ -7,6 +9,7 @@ const {
 } = require("../util/dependencyVulnEnricher");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 
 suite("dependencyVulnEnricher", () => {
   let accountState;
@@ -22,21 +25,26 @@ suite("dependencyVulnEnricher", () => {
     });
   }
 
-  function createFoundDependency(slug, count = 1) {
+  function createFoundDependency(slug, count = 1, packageOverrides = {}) {
+    const name = `pkg-${slug}`;
     return {
-      name: `pkg-${slug}`,
+      name,
       version: "1.0.0",
       format: "maven",
       ecosystem: "maven",
       isDirect: false,
       cloudsmithStatus: "FOUND",
-      cloudsmithPackage: {
+      cloudsmithPackage: fromApiPackageRecord({
         namespace: "workspace-a",
         repository: "production-maven",
         slug_perm: slug,
+        name,
+        version: "1.0.0",
+        format: "maven",
         vulnerability_scan_results_count: count,
         max_severity: "High",
-      },
+        ...packageOverrides,
+      }),
     };
   }
 
@@ -202,15 +210,18 @@ suite("dependencyVulnEnricher", () => {
 
   test("does not let zero or conflicting indicator aliases silently select another count", async () => {
     let calls = 0;
-    const dependency = createFoundDependency("alias-conflict", 0);
-    dependency.cloudsmithPackage.num_vulnerabilities = 3;
+    const dependency = createFoundDependency("alias-conflict", 0, {
+      num_vulnerabilities: 3,
+    });
     const [enriched] = await enrichVulnerabilities([dependency], "workspace-a", {
       cloudsmithAPI: { async getV2() { calls += 1; return apiSuccess({ results: [] }); } },
     });
 
     assert.strictEqual(calls, 0);
-    assert.strictEqual(enriched.vulnerabilities.count, 3);
+    assert.strictEqual(enriched.vulnerabilities.count, 0);
     assert.strictEqual(enriched.vulnerabilities.countAuthoritative, false);
+    assert.strictEqual(enriched.vulnerabilities.detected, true);
+    assert.strictEqual(enriched.vulnerabilities.unknown, true);
     assert.strictEqual(enriched.vulnerabilities.detailsLoaded, false);
   });
 
@@ -220,8 +231,7 @@ suite("dependencyVulnEnricher", () => {
       { vulnerability_scan_results_count: undefined, security_scan_status: "scan detected vulnerabilities" },
     ]) {
       let calls = 0;
-      const dependency = createFoundDependency(`presence-${calls}`, 0);
-      Object.assign(dependency.cloudsmithPackage, indicator);
+      const dependency = createFoundDependency(`presence-${JSON.stringify(indicator).length}`, 0, indicator);
       const [enriched] = await enrichVulnerabilities([dependency], "workspace-a", {
         cloudsmithAPI: { async getV2() { calls += 1; return apiSuccess({ results: [] }); } },
       });
@@ -235,9 +245,11 @@ suite("dependencyVulnEnricher", () => {
 
   test("keeps malformed-only vulnerability evidence unknown without inventing a detection", async () => {
     let calls = 0;
-    const dependency = createFoundDependency("malformed-only", 0);
-    dependency.cloudsmithPackage.vulnerability_scan_results_count = undefined;
-    dependency.cloudsmithPackage.num_vulnerabilities = "0x10";
+    const dependency = createFoundDependency("malformed-only", 0, {
+      vulnerability_scan_results_count: undefined,
+      num_vulnerabilities: "0x10",
+      max_severity: undefined,
+    });
     const [enriched] = await enrichVulnerabilities([dependency], "workspace-a", {
       cloudsmithAPI: { async getV2() { calls += 1; return apiSuccess({ results: [] }); } },
     });

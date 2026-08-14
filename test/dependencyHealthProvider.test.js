@@ -1,3 +1,5 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const assert = require("assert");
 const path = require("path");
 const vscode = require("vscode");
@@ -24,6 +26,8 @@ const {
 } = require("../util/dependencyRecord");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { bindConnectionManager } = require("../util/connectionManager");
+const { createPackageCoordinate, isExactPackage } = require("../domain/package");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const {
   createCancellationSource,
   createManualClock,
@@ -99,21 +103,25 @@ suite("DependencyHealthProvider Test Suite", () => {
     };
   }
 
-  function createFoundDependency(name, version) {
+  function createFoundDependency(name, version, format = "npm") {
     return {
-      ...createDependency(name, version),
+      ...createDependency(name, version, format),
       cloudsmithStatus: "FOUND",
-      cloudsmithPackage: {
+      cloudsmithPackage: fromApiPackageRecord({
         namespace: "workspace",
         repository: "repo",
-        slug_perm: `${name}/${version}`,
-      },
+        slug_perm: `${name}-${version}`,
+        name,
+        version,
+        format,
+        status_str: "Completed",
+      }),
     };
   }
 
-  function createProblemDependency(name, version, manifestPath) {
+  function createProblemDependency(name, version, manifestPath, format = "npm") {
     return {
-      ...createDependency(name, version),
+      ...createDependency(name, version, format),
       sourceFile: path.basename(manifestPath),
       sourceManifest: createDependencySource({
         kind: RESOLUTION_SOURCE_KINDS.MANIFEST,
@@ -123,6 +131,16 @@ suite("DependencyHealthProvider Test Suite", () => {
       cloudsmithStatus: "NOT_FOUND",
       cloudsmithPackage: null,
     };
+  }
+
+  function pullCoordinate(name, version, format = "npm") {
+    return createPackageCoordinate({
+      workspace: "workspace-a",
+      repository: "repo-a",
+      name,
+      version,
+      format,
+    });
   }
 
   function cloneTrees(trees) {
@@ -281,7 +299,8 @@ suite("DependencyHealthProvider Test Suite", () => {
         const groupId = candidate.identifiers && candidate.identifiers.group_id
           ? `${candidate.identifiers.group_id}:`
           : "";
-        candidate.slug_perm = `${candidate.format || "package"}:${groupId}${candidate.name}:${candidate.version}`;
+        candidate.slug_perm = `${candidate.format || "package"}-${groupId}${candidate.name}-${candidate.version}`
+          .replace(/[^A-Za-z0-9._-]/g, "-");
       }
     }
   }
@@ -795,12 +814,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     )] }];
     connectionManager.updateEpoch(2);
 
-    await provider.pullSingleDependency({
-      name: "account-a-package",
-      version: "1.0.0",
-      format: "npm",
-      ecosystem: "npm",
-    });
+    await provider.pullSingleDependency(pullCoordinate("account-a-package", "1.0.0"));
     await provider.pullDependencies();
 
     assert.strictEqual(prepareCalls, 0);
@@ -2097,7 +2111,9 @@ suite("DependencyHealthProvider Test Suite", () => {
     });
 
     assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
-    assert.strictEqual(result.package, expectedPackage);
+    assert.strictEqual(isExactPackage(result.package), true);
+    assert.strictEqual(result.package.name, expectedPackage.name);
+    assert.strictEqual(result.package.version, expectedPackage.version);
     assert.strictEqual(result.pagesFetched, 1);
     const query = new URL(api.calls[0], "https://api.cloudsmith.io/v1/").searchParams.get("query");
     assert.ok(query.includes("name:@scope\\/pkg"));
@@ -2122,7 +2138,9 @@ suite("DependencyHealthProvider Test Suite", () => {
     });
 
     assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
-    assert.strictEqual(result.package, expectedPackage);
+    assert.strictEqual(isExactPackage(result.package), true);
+    assert.strictEqual(result.package.name, expectedPackage.name);
+    assert.strictEqual(result.package.version, expectedPackage.version);
     assert.strictEqual(result.pagesFetched, 2);
     assert.deepStrictEqual(
       api.calls.map((endpoint) => Number(new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("page"))),
@@ -2627,7 +2645,9 @@ suite("DependencyHealthProvider Test Suite", () => {
     });
 
     assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
-    assert.strictEqual(result.package, correct);
+    assert.strictEqual(isExactPackage(result.package), true);
+    assert.strictEqual(result.package.name, correct.name);
+    assert.strictEqual(result.package.version, correct.version);
     const firstQuery = new URL(
       api.calls[0],
       "https://api.cloudsmith.io/v1/"
@@ -2831,7 +2851,7 @@ suite("DependencyHealthProvider Test Suite", () => {
         format: "npm",
         namespace: "workspace",
         repository: "repository",
-        slug_perm: "express/4.18.2",
+        slug_perm: "express-4.18.2",
         status_str: "Completed",
       }
     );
@@ -2852,7 +2872,7 @@ suite("DependencyHealthProvider Test Suite", () => {
         format: "python",
         namespace: "workspace",
         repository: "repository",
-        slug_perm: "fastapi/0.111.0",
+        slug_perm: "fastapi-0.111.0",
         status_str: "Completed",
       }
     );
@@ -2872,7 +2892,7 @@ suite("DependencyHealthProvider Test Suite", () => {
         format: "maven",
         namespace: "workspace",
         repository: "repository",
-        slug_perm: "spring-boot-starter-web/3.2.0",
+        slug_perm: "spring-boot-starter-web-3.2.0",
         status_str: "Completed",
         identifiers: { group_id: "org.springframework.boot" },
       }
@@ -3061,10 +3081,10 @@ suite("DependencyHealthProvider Test Suite", () => {
     const provider = new DependencyHealthProvider(createContext(), null, {
       enrichLicenses: async (_dependencies, options = {}) => {
         options.onProgress(new Map([
-          [JSON.stringify(["workspace", "repo", "left-pad/1.0.0"]), { spdx: "MIT" }],
+          [JSON.stringify(["workspace", "repo", "left-pad-1.0.0"]), { spdx: "MIT" }],
         ]));
         options.onProgress(new Map([
-          [JSON.stringify(["workspace", "repo", "left-pad/1.0.0"]), { spdx: "Apache-2.0" }],
+          [JSON.stringify(["workspace", "repo", "left-pad-1.0.0"]), { spdx: "Apache-2.0" }],
         ]));
       },
     });
@@ -3074,8 +3094,11 @@ suite("DependencyHealthProvider Test Suite", () => {
       sourceFile: "package-lock.json",
       dependencies: [createFoundDependency("left-pad", "1.0.0")],
     }];
-    provider._fullTrees = cloneTrees(trees);
-    provider._displayTrees = cloneTrees(trees);
+    provider._fullTrees = trees;
+    provider._displayTrees = trees.map(tree => ({
+      ...tree,
+      dependencies: tree.dependencies.map(dependency => ({ ...dependency })),
+    }));
 
     let rebuildCount = 0;
     let refreshCount = 0;
@@ -3159,29 +3182,29 @@ suite("DependencyHealthProvider Test Suite", () => {
 
       provider.lastWorkspace = "workspace-a";
       provider.lastRepo = "repo-a";
+      provider._fullTrees = [{
+        ecosystem: "python",
+        sourceFile: "requirements.txt",
+        dependencies: [createProblemDependency(
+          "requests",
+          "2.31.0",
+          "/project/requirements.txt",
+          "python"
+        )],
+      }];
       provider._updateContexts = async () => {};
       provider.refresh = () => {};
       provider._refreshSingleDependencyAfterPull = async (workspace, repo, dependency) => {
         refreshArgs = { workspace, repo, dependency };
       };
 
-      await provider.pullSingleDependency({
-        name: "requests",
-        version: "2.31.0",
-        format: "python",
-        ecosystem: "python",
-      });
+      await provider.pullSingleDependency(pullCoordinate("requests", "2.31.0", "python"));
 
-      assert.deepStrictEqual(refreshArgs, {
-        workspace: "workspace-a",
-        repo: "repo-b",
-        dependency: {
-          name: "requests",
-          version: "2.31.0",
-          format: "python",
-          ecosystem: "python",
-        },
-      });
+      assert.strictEqual(refreshArgs.workspace, "workspace-a");
+      assert.strictEqual(refreshArgs.repo, "repo-b");
+      assert.strictEqual(refreshArgs.dependency.name, "requests");
+      assert.strictEqual(refreshArgs.dependency.version, "2.31.0");
+      assert.strictEqual(refreshArgs.dependency.format, "python");
       assert.ok(preparationToken);
       assert.deepStrictEqual(notifications, ["requests@2.31.0 cached in repo-b"]);
     } finally {
@@ -3314,12 +3337,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       refreshCalls += 1;
       await provider._publishDiagnostics(token);
     };
-    const item = {
-      name: "single-package",
-      version: "1.0.0",
-      format: "npm",
-      ecosystem: "npm",
-    };
+    const item = pullCoordinate("single-package", "1.0.0");
 
     const firstPull = provider.pullSingleDependency(item);
     await preparationStarted.promise;

@@ -62,7 +62,7 @@ function isApprovedSourcePath(sourcePath) {
   if (["package.json", "extension.js", ...documentMappings.keys()].includes(sourcePath)) {
     return true;
   }
-  if (/^(?:models|util|views)\/(?:[^/]+\/)*[^/]+\.js$/.test(sourcePath)) {
+  if (/^(?:commands|domain|models|util|views)\/(?:[^/]+\/)*[^/]+\.js$/.test(sourcePath)) {
     return true;
   }
   if (baseMedia.has(sourcePath)) {
@@ -291,7 +291,7 @@ function assertSourceBytes(archivePath, bytes, source, manifest, sourceSha) {
 
 function assertRelativeModuleClosure(entries, expected) {
   for (const [archivePath, bytes] of entries) {
-    if (!/^extension\/(?:extension|models\/.*|util\/.*|views\/.*)\.js$/.test(archivePath)) {
+    if (!/^extension\/(?:extension|commands\/.*|domain\/.*|models\/.*|util\/.*|views\/.*)\.js$/.test(archivePath)) {
       continue;
     }
     const sourcePath = archiveToSourcePath(archivePath);
@@ -627,6 +627,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  assertRelativeModuleClosure,
   buildExpectedInventory,
   isApprovedSourcePath,
   limits,

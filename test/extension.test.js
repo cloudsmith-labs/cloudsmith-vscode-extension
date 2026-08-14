@@ -1,7 +1,8 @@
 const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
-const { ActivationOwner, FORMAT_OPTIONS, runDependencyScan } = require("../extension");
+const { ActivationOwner } = require("../util/activationOwner");
+const { runDependencyScan } = require("../util/dependencyScanOrchestration");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
 
 suite("Extension Test Suite", () => {
@@ -23,10 +24,9 @@ suite("Extension Test Suite", () => {
   });
 
   test("uses the shared upstream format list for format picks", () => {
-    assert.strictEqual(FORMAT_OPTIONS, SUPPORTED_UPSTREAM_FORMATS);
-    assert.ok(FORMAT_OPTIONS.includes("conan"));
-    assert.ok(FORMAT_OPTIONS.includes("terraform"));
-    assert.ok(FORMAT_OPTIONS.includes("raw"));
+    assert.ok(SUPPORTED_UPSTREAM_FORMATS.includes("conan"));
+    assert.ok(SUPPORTED_UPSTREAM_FORMATS.includes("terraform"));
+    assert.ok(SUPPORTED_UPSTREAM_FORMATS.includes("raw"));
   });
 
   test("primary dependency scan command establishes scope on first use", async () => {

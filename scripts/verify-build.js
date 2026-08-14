@@ -4,7 +4,7 @@ const { spawnSync } = require("child_process");
 
 const root = path.resolve(__dirname, "..");
 const manifest = require(path.join(root, "package.json"));
-const runtimeDirectories = ["models", "util", "views"];
+const runtimeDirectories = ["commands", "domain", "models", "util", "views"];
 
 function collectJavaScriptFiles(directory) {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {

@@ -5,6 +5,7 @@ const { apiEndpoint } = require("./apiEndpoint");
 const { SearchQueryBuilder } = require("./searchQueryBuilder");
 const { PaginatedFetch } = require("./paginatedFetch");
 const { packageCollectionIdentity } = require("./collectionIdentity");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const {
   captureAccount,
   isAccountCurrent,
@@ -997,7 +998,7 @@ class UpstreamChecker {
         knownIdentities,
         query,
         descriptor,
-        canonicalIdentity: packageCollectionIdentity,
+        canonicalIdentity: candidate => localPackageIdentity(candidate, workspace, repo),
         validate: value => isLocalPackageArray(value, workspace, repo),
         retry: "never",
         signal: options.signal,
@@ -1014,7 +1015,7 @@ class UpstreamChecker {
       ));
       if (exact) return { data: exact, error: null, complete: result.complete, stale: false };
       for (const candidate of result.items) {
-        const identity = packageCollectionIdentity(candidate);
+        const identity = localPackageIdentity(candidate, workspace, repo);
         if (identity) knownIdentities.add(identity);
       }
       if (result.complete) {
@@ -1483,11 +1484,17 @@ function isLocalPackage(item, workspace, repository) {
     || item.namespace !== workspace
     || item.repository !== repository
   ) return false;
+  return Boolean(localPackageIdentity(item, workspace, repository));
+}
+
+function localPackageIdentity(item, workspace, repository) {
   try {
-    packageCollectionIdentity(item);
-    return true;
+    return packageCollectionIdentity(fromApiPackageRecord(item, {
+      expectedWorkspace: workspace,
+      expectedRepository: repository,
+    }));
   } catch {
-    return false;
+    return null;
   }
 }
 

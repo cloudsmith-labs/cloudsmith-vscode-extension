@@ -1,3 +1,5 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 // Search results tree data provider for the Package Search view.
 
 const vscode = require("vscode");
@@ -14,27 +16,15 @@ const {
 } = require("../util/connectionPresentation");
 const { formatApiError } = require("../util/errorFormatter");
 const {
-    getPackagePolicyFlags,
-    getPackageVulnerabilityState,
-} = require("../util/packageVulnerabilities");
-const {
-    MAX_COLLECTION_IDENTITY_PART_LENGTH,
     packageCollectionIdentity,
 } = require("../util/collectionIdentity");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 
 const MAX_RESULTS = 5000;
 const MAX_REPOSITORIES = 1000;
 const MAX_WORKSPACE_LENGTH = 200;
 const MAX_REPOSITORY_LENGTH = 200;
 const MAX_QUERY_LENGTH = 2048;
-const MAX_PACKAGE_NAME_LENGTH = 2048;
-const MAX_PACKAGE_FORMAT_LENGTH = 100;
-const MAX_PACKAGE_VERSION_LENGTH = 2048;
-const MAX_PACKAGE_IDENTITY_LENGTH = MAX_COLLECTION_IDENTITY_PART_LENGTH;
-const MAX_PACKAGE_OPTIONAL_STRING_LENGTH = 4096;
-const MAX_PACKAGE_URL_LENGTH = 8192;
-const MAX_PACKAGE_TAGS = 100;
-const MAX_PACKAGE_TAG_LENGTH = 500;
 const MULTI_REPO_CONCURRENCY = 4;
 const MAX_MULTI_REPO_REQUESTS = 2000;
 const MAX_MULTI_REPO_PAGES = 20;
@@ -1192,100 +1182,12 @@ function isPackageSearchArray(value) {
     return Array.isArray(value) && value.every(pkg => canonicalizeSearchPackage(pkg) !== null);
 }
 
-function requiredString(value, maxLength) {
-    return typeof value === "string" && value.length > 0 && value.length <= maxLength
-        ? value
-        : null;
-}
-
-function optionalString(value, maxLength = MAX_PACKAGE_OPTIONAL_STRING_LENGTH) {
-    return typeof value === "string" && value.length <= maxLength ? value : null;
-}
-
-function canonicalTagValue(value) {
-    if (typeof value === "string" && value.length <= MAX_PACKAGE_TAG_LENGTH) {
-        return value;
-    }
-    if (
-        Array.isArray(value)
-        && value.length <= MAX_PACKAGE_TAGS
-        && value.every(item => typeof item === "string" && item.length <= MAX_PACKAGE_TAG_LENGTH)
-    ) {
-        return [...value];
-    }
-    return null;
-}
-
-function canonicalTags(value) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-    const tags = {};
-    const info = canonicalTagValue(value.info);
-    const version = canonicalTagValue(value.version);
-    if (info !== null) tags.info = info;
-    if (version !== null) tags.version = version;
-    return tags;
-}
-
 function canonicalizeSearchPackage(pkg) {
-    if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) return null;
-    const name = requiredString(pkg.name, MAX_PACKAGE_NAME_LENGTH);
-    const format = requiredString(pkg.format, MAX_PACKAGE_FORMAT_LENGTH);
-    const version = (typeof pkg.version === "string" || typeof pkg.version === "number")
-        ? requiredString(String(pkg.version), MAX_PACKAGE_VERSION_LENGTH)
-        : null;
-    const repository = requiredString(pkg.repository, MAX_REPOSITORY_LENGTH);
-    const namespace = requiredString(pkg.namespace, MAX_WORKSPACE_LENGTH);
-    const slugPerm = requiredString(pkg.slug_perm, MAX_PACKAGE_IDENTITY_LENGTH);
-    const policyFlags = getPackagePolicyFlags(pkg);
-    if (!name || !format || !version || !repository || !namespace || !slugPerm || !policyFlags) {
+    try {
+        return fromApiPackageRecord(pkg);
+    } catch {
         return null;
     }
-
-    const downloads = Number.isSafeInteger(pkg.downloads) && pkg.downloads >= 0
-        ? pkg.downloads
-        : 0;
-    const vulnerabilityState = getPackageVulnerabilityState(pkg);
-    const numVulnerabilities = vulnerabilityState.count === null
-        ? undefined
-        : vulnerabilityState.count;
-    return {
-        name,
-        format,
-        version,
-        repository,
-        namespace,
-        slug_perm: slugPerm,
-        is_copyable: pkg.is_copyable === true
-            ? true
-            : pkg.is_copyable === false
-                ? false
-                : null,
-        status_str: optionalString(pkg.status_str),
-        slug: optionalString(pkg.slug, MAX_PACKAGE_IDENTITY_LENGTH),
-        downloads,
-        uploaded_at: optionalString(pkg.uploaded_at),
-        status_reason: optionalString(pkg.status_reason),
-        checksum_sha256: optionalString(pkg.checksum_sha256),
-        version_digest: optionalString(pkg.version_digest),
-        cdn_url: optionalString(pkg.cdn_url, MAX_PACKAGE_URL_LENGTH),
-        filename: optionalString(pkg.filename),
-        ...policyFlags,
-        num_vulnerabilities: numVulnerabilities,
-        // Canonicalize all list-response aliases through the shared indicator contract.
-        // Omitting both fields intentionally remains "unknown" to downstream nodes.
-        has_vulnerabilities: vulnerabilityState.detected ? true : undefined,
-        max_severity: optionalString(pkg.max_severity),
-        vulnerability_scan_results_url: optionalString(
-            pkg.vulnerability_scan_results_url,
-            MAX_PACKAGE_URL_LENGTH
-        ),
-        security_scan_status: optionalString(pkg.security_scan_status),
-        spdx_license: optionalString(pkg.spdx_license),
-        license: optionalString(pkg.license),
-        raw_license: optionalString(pkg.raw_license),
-        license_url: optionalString(pkg.license_url, MAX_PACKAGE_URL_LENGTH),
-        tags: canonicalTags(pkg.tags),
-    };
 }
 
 function isValidFetchedPage(result, requestedPage, requestedPageSize) {
@@ -1344,10 +1246,19 @@ function samePaginationAnchor(previous, current) {
 }
 
 function hasExactPackageScope(packages, descriptor) {
-    return Array.isArray(packages) && packages.every(pkg => (
-        pkg.namespace === descriptor.workspace
-        && (descriptor.kind !== "repository" || pkg.repository === descriptor.repository)
-    ));
+    return Array.isArray(packages) && packages.every(pkg => {
+        try {
+            fromApiPackageRecord(pkg, {
+                expectedWorkspace: descriptor.workspace,
+                expectedRepository: descriptor.kind === "repository"
+                    ? descriptor.repository
+                    : null,
+            });
+            return true;
+        } catch {
+            return false;
+        }
+    });
 }
 
 function packageKey(pkg) {
@@ -1355,11 +1266,7 @@ function packageKey(pkg) {
 }
 
 function packageKeyFromNode(node) {
-    return packageCollectionIdentity({
-        namespace: node.namespace,
-        repository: node.repository,
-        slug_perm: node.slug_perm_raw,
-    });
+    return packageCollectionIdentity(node.package);
 }
 
 function buildUniqueNodes(packages, context, seen, connectionManager, nodeOptions = {}) {
@@ -1402,12 +1309,7 @@ function freezeSearchNode(node) {
 function vulnerabilityEventIdentity(event) {
     if (typeof event === "string") return event;
     if (typeof event?.identity === "string") return event.identity;
-    const ref = event?.ref || event?.packageRef || event;
-    try {
-        return packageCollectionIdentity(ref);
-    } catch {
-        return null;
-    }
+    return null;
 }
 
 function deepFreezeOwned(value) {
@@ -1906,9 +1808,9 @@ function validateRepositoryPage(result, task, repositoryState, requestedPageSize
 
 function packageIdentitySignature(pkg) {
     return JSON.stringify([
-        pkg.namespace,
+        pkg.workspace,
         pkg.repository,
-        pkg.slug_perm,
+        pkg.packageIdentifier,
         pkg.name,
         pkg.format,
         pkg.version,

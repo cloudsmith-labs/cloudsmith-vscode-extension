@@ -1,7 +1,10 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const assert = require("assert");
 const {
   enrichPolicies,
 } = require("../util/dependencyPolicyEnricher");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 
 suite("dependencyPolicyEnricher", () => {
   test("maps package index policy fields onto dependency objects", async () => {
@@ -12,15 +15,18 @@ suite("dependencyPolicyEnricher", () => {
         format: "python",
         ecosystem: "python",
         cloudsmithStatus: "FOUND",
-        cloudsmithPackage: {
+        cloudsmithPackage: fromApiPackageRecord({
           namespace: "workspace-a",
           repository: "production-pypi",
           slug_perm: "pkg-1",
+          name: "spotipy",
+          version: "2.25.0",
+          format: "python",
           status_str: "Quarantined",
           deny_policy_violated: true,
           policy_violated: true,
           status_reason: "Blocked by policy",
-        },
+        }),
       },
       {
         name: "clean-lib",
@@ -28,13 +34,16 @@ suite("dependencyPolicyEnricher", () => {
         format: "npm",
         ecosystem: "npm",
         cloudsmithStatus: "FOUND",
-        cloudsmithPackage: {
+        cloudsmithPackage: fromApiPackageRecord({
           namespace: "workspace-a",
           repository: "production-npm",
           slug_perm: "pkg-2",
+          name: "clean-lib",
+          version: "1.0.0",
+          format: "npm",
           status_str: "Completed",
           policy_violated: false,
-        },
+        }),
       },
     ];
 

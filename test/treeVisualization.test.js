@@ -1,3 +1,5 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const assert = require("assert");
 const vscode = require("vscode");
 const {
@@ -6,6 +8,7 @@ const {
   buildDependencyHealthReport,
   buildDependencySummary,
 } = require("../views/dependencyHealthProvider");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 
 suite("tree visualization", () => {
   let originalGetConfiguration;
@@ -52,14 +55,16 @@ suite("tree visualization", () => {
   }
 
   function createFoundPackage(slug) {
-    return {
+    return fromApiPackageRecord({
       namespace: "workspace-a",
       repository: "production-npm",
       slug_perm: slug,
+      name: slug,
+      format: "npm",
       status_str: "Completed",
       version: "1.0.0",
       license: "MIT",
-    };
+    });
   }
 
   function createTree() {
