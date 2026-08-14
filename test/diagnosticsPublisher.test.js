@@ -24,6 +24,7 @@ const {
   validateDependencyDeclarationSourceContract,
 } = require("../util/dependencyDeclarationIndex");
 const { canonicalFormat } = require("../util/packageNameNormalizer");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 
 suite("DiagnosticsPublisher Test Suite", () => {
   let collection;
@@ -73,6 +74,7 @@ suite("DiagnosticsPublisher Test Suite", () => {
     isDevelopmentDependency = false,
     environmentMarker = null,
     packageSource = { kind: DEPENDENCY_PACKAGE_SOURCE_KINDS.REGISTRY },
+    cloudsmithMatch = null,
   }) {
     const dependency = createDependencyRecord({
       ecosystem,
@@ -97,9 +99,42 @@ suite("DiagnosticsPublisher Test Suite", () => {
     return createDiagnosticCandidate(dependency, {
       state,
       displayVersion: resolvedVersion || declaredConstraint || null,
-      cloudsmithMatch: null,
+      cloudsmithMatch,
     });
   }
+
+  test("snapshots canonical dependency package metadata for vulnerability diagnostics", () => {
+    const packageModel = fromApiPackageRecord({
+      namespace: "workspace-a",
+      repository: "repository-a",
+      slug_perm: "package-a",
+      name: "alpha",
+      version: "1.0.0",
+      format: "npm",
+      num_vulnerabilities: 2,
+      security_scan_status: "Scan Detected Vulnerabilities",
+    });
+    const prepared = candidate({
+      name: "alpha",
+      state: "violated",
+      cloudsmithMatch: packageModel,
+    });
+
+    assert.deepStrictEqual(prepared.cloudsmith, {
+      namespace: "workspace-a",
+      repository: "repository-a",
+      numVulnerabilities: 2,
+    });
+    assert.throws(() => candidate({
+      name: "alpha",
+      state: "violated",
+      cloudsmithMatch: {
+        namespace: "workspace-a",
+        repository: "repository-a",
+        slug_perm: "package-a",
+      },
+    }), TypeError);
+  });
 
   function createMemoryPublisher(files, options = {}) {
     const reads = [];

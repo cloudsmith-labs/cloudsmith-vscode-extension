@@ -7,6 +7,8 @@ const PackageNode = require("../models/packageNode");
 const SearchResultNode = require("../models/searchResultNode");
 const DependencyHealthNode = require("../models/dependencyHealthNode");
 const DependencySummaryNode = require("../models/dependencySummaryNode");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
+const { createPackageCoordinate } = require("../domain/package");
 
 suite("Package Metadata Flow Test Suite", () => {
   let originalGetConfiguration;
@@ -182,6 +184,304 @@ suite("Package Metadata Flow Test Suite", () => {
     });
   });
 
+  test("DependencyHealthNode preserves valid canonical and raw exact matches", () => {
+    const canonical = fromApiPackageRecord(pkg);
+    const dependency = {
+      name: "artifact",
+      version: "1.0.0",
+      format: "raw",
+      cloudsmithStatus: "FOUND",
+    };
+    const canonicalNode = new DependencyHealthNode({
+      ...dependency,
+      cloudsmithPackage: canonical,
+    }, null, {});
+    const rawNode = new DependencyHealthNode({
+      ...dependency,
+      cloudsmithPackage: pkg,
+    }, null, {});
+
+    assert.strictEqual(canonicalNode.package, canonical);
+    assert.strictEqual(canonicalNode.cloudsmithMatch, canonical);
+    assert.strictEqual(canonicalNode.cloudsmithStatus, "FOUND");
+    assert.strictEqual(canonicalNode.state, rawNode.state);
+    assert.strictEqual(canonicalNode.getTreeItem().contextValue, "dependencyHealthFound");
+    assert.match(canonicalNode.getTreeItem().description, /Vulnerability status unknown/);
+    assert.doesNotMatch(canonicalNode.getTreeItem().description, /No issues found/);
+    assert.deepStrictEqual(
+      rawNode.getChildren().map(child => child.getTreeItem().label),
+      canonicalNode.getChildren().map(child => child.getTreeItem().label)
+    );
+    assert.strictEqual(rawNode.package.workspace, canonical.workspace);
+    assert.strictEqual(rawNode.package.repository, canonical.repository);
+    assert.strictEqual(rawNode.package.packageIdentifier, canonical.packageIdentifier);
+  });
+
+  test("DependencyHealthNode contains malformed optional matches without restoring raw identity", () => {
+    let accessorCalls = 0;
+    const ownAccessor = { ...pkg };
+    Object.defineProperty(ownAccessor, "slug_perm", {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        return "unsafe-accessor";
+      },
+    });
+    const inheritedAccessor = Object.create({
+      get slug_perm() {
+        accessorCalls += 1;
+        return "unsafe-inherited";
+      },
+    });
+    for (const [key, value] of Object.entries(pkg)) {
+      if (key !== "slug_perm") {
+        Object.defineProperty(inheritedAccessor, key, {
+          configurable: true,
+          enumerable: true,
+          value,
+          writable: true,
+        });
+      }
+    }
+    const nonPlain = Object.assign(Object.create({ customPrototype: true }), pkg);
+    const malformedMatches = [
+      { ...pkg, slug_perm: undefined },
+      { ...pkg, name: undefined },
+      { ...pkg, version: undefined },
+      { ...pkg, format: undefined },
+      nonPlain,
+      ownAccessor,
+      inheritedAccessor,
+      new Proxy({}, {
+        getPrototypeOf() {
+          throw new Error("getPrototypeOf trap must be contained");
+        },
+      }),
+      new Proxy({}, {
+        ownKeys() {
+          throw new Error("ownKeys trap must be contained");
+        },
+      }),
+      { ...pkg, slug_perm_raw: "conflicting-package-id" },
+    ];
+
+    for (const malformedMatch of malformedMatches) {
+      let registeredSummaries = 0;
+      const node = new DependencyHealthNode({
+        name: "artifact",
+        version: "1.0.0",
+        format: "raw",
+        cloudsmithStatus: "FOUND",
+        cloudsmithPackage: malformedMatch,
+      }, null, {}, {
+        registerVulnerabilitySummary() {
+          registeredSummaries += 1;
+        },
+      });
+      const item = node.getTreeItem();
+
+      assert.strictEqual(node.package, null);
+      assert.strictEqual(node.cloudsmithMatch, null);
+      assert.strictEqual(node.cloudsmithStatus, "LOOKUP_FAILED");
+      assert.strictEqual(node.state, "lookup_failed");
+      assert.strictEqual(node.namespace, undefined);
+      assert.strictEqual(node.repository, undefined);
+      assert.strictEqual(node.slug_perm, undefined);
+      assert.strictEqual(node.status_str, undefined);
+      assert.strictEqual(node.num_vulnerabilities, undefined);
+      assert.strictEqual(item.contextValue, "dependencyHealthUnknown");
+      assert.strictEqual(item.collapsibleState, vscode.TreeItemCollapsibleState.None);
+      assert.match(item.description, /Cloudsmith lookup failed/);
+      assert.doesNotMatch(item.description, /Not found|No issues found|Quarantined/);
+      assert.doesNotMatch(item.tooltip, /Found in Cloudsmith|Vulnerabilities: none known|Quarantined/);
+      assert.deepStrictEqual(node.getChildren(), []);
+      assert.strictEqual(registeredSummaries, 0);
+    }
+    assert.strictEqual(accessorCalls, 0);
+  });
+
+  test("DependencyHealthNode does not turn rejected zero-vulnerability evidence into clean state", () => {
+    const node = new DependencyHealthNode({
+      name: "artifact",
+      version: "1.0.0",
+      format: "raw",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: {
+        ...pkg,
+        slug_perm: undefined,
+        num_vulnerabilities: 0,
+        security_scan_status: "Scan Detected No Vulnerabilities",
+        status_str: "Quarantined",
+      },
+    }, null, {});
+
+    assert.strictEqual(node.package, null);
+    assert.strictEqual(node.cloudsmithStatus, "LOOKUP_FAILED");
+    assert.strictEqual(node._getVulnerabilityData(), null);
+    assert.strictEqual(node._getPolicyData(), null);
+    assert.doesNotMatch(node.getTreeItem().description, /No issues found|Quarantined/);
+    assert.deepStrictEqual(node.getChildren(), []);
+  });
+
+  test("DependencyHealthNode contains malformed matches from every compatibility input", () => {
+    const malformedMatch = {
+      ...pkg,
+      name: undefined,
+      slug_perm: "untrusted-package-id",
+      repository: "untrusted-repository",
+      slug_perm_raw: "untrusted-package-id",
+    };
+    const nodes = [
+      new DependencyHealthNode({
+        name: "artifact",
+        version: "1.0.0",
+        format: "raw",
+        cloudsmithStatus: "FOUND",
+        cloudsmithPackage: malformedMatch,
+      }, null, {}),
+      new DependencyHealthNode({
+        name: "artifact",
+        version: "1.0.0",
+        format: "raw",
+        cloudsmithStatus: "FOUND",
+        cloudsmithMatch: malformedMatch,
+      }, null, {}),
+      new DependencyHealthNode({
+        name: "artifact",
+        version: "1.0.0",
+        format: "raw",
+        cloudsmithStatus: "FOUND",
+      }, malformedMatch, {}),
+    ];
+
+    for (const node of nodes) {
+      assert.strictEqual(node.package, null);
+      assert.strictEqual(node.cloudsmithMatch, null);
+      assert.strictEqual(node.cloudsmithStatus, "LOOKUP_FAILED");
+      assert.strictEqual(node.repository, undefined);
+      assert.strictEqual(node.slug_perm_raw, undefined);
+      assert.deepStrictEqual(node.getChildren(), []);
+    }
+  });
+
+  test("DependencyHealthNode requires consensus across simultaneous package evidence", () => {
+    const canonical = fromApiPackageRecord(pkg);
+    const conflicts = [
+      {
+        cloudsmithPackage: pkg,
+        cloudsmithMatch: { ...pkg, version: "9.9.9" },
+      },
+      {
+        cloudsmithPackage: "",
+        cloudsmithMatch: pkg,
+      },
+      {
+        cloudsmithPackage: pkg,
+        repository: "conflicting-repository",
+      },
+      {
+        package: createPackageCoordinate({
+          workspace: canonical.workspace,
+          repository: canonical.repository,
+          name: canonical.name,
+          version: canonical.version,
+          format: canonical.format,
+        }),
+      },
+    ];
+
+    for (const evidence of conflicts) {
+      const node = new DependencyHealthNode({
+        name: "artifact",
+        version: "1.0.0",
+        format: "raw",
+        cloudsmithStatus: "FOUND",
+        ...evidence,
+      }, null, {});
+      assert.strictEqual(node.package, null);
+      assert.strictEqual(node.cloudsmithMatch, null);
+      assert.strictEqual(node.cloudsmithStatus, "LOOKUP_FAILED");
+      assert.deepStrictEqual(node.getChildren(), []);
+    }
+
+    const explicitConflict = new DependencyHealthNode({
+      name: "artifact",
+      version: "1.0.0",
+      format: "raw",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: pkg,
+    }, { ...pkg, slug_perm: "conflicting-explicit-id" }, {});
+    assert.strictEqual(explicitConflict.package, null);
+    assert.strictEqual(explicitConflict.cloudsmithStatus, "LOOKUP_FAILED");
+  });
+
+  test("DependencyHealthNode preserves independent dependency license evidence after match rejection", () => {
+    const node = new DependencyHealthNode({
+      name: "artifact",
+      version: "1.0.0",
+      format: "raw",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: {
+        ...pkg,
+        slug_perm: undefined,
+        license: "Rejected raw license",
+      },
+      license: {
+        display: "Apache-2.0",
+        spdx: "Apache-2.0",
+        raw: "Apache-2.0",
+        url: "https://spdx.org/licenses/Apache-2.0.html",
+      },
+    }, null, {});
+
+    assert.strictEqual(node.package, null);
+    assert.strictEqual(node.cloudsmithStatus, "LOOKUP_FAILED");
+    assert.strictEqual(node.licenseInfo.displayValue, "Apache-2.0");
+    assert.notStrictEqual(node.licenseInfo.displayValue, "Rejected raw license");
+  });
+
+  test("DependencyHealthNode preserves no-match and explicit uncertainty states", () => {
+    for (const [cloudsmithStatus, expectedState] of [
+      ["LOOKUP_FAILED", "lookup_failed"],
+      ["NOT_FOUND", "not_found"],
+      [null, "unknown"],
+    ]) {
+      const node = new DependencyHealthNode({
+        name: "artifact",
+        version: "1.0.0",
+        format: "raw",
+        cloudsmithStatus,
+      }, null, {});
+      assert.strictEqual(node.cloudsmithStatus, cloudsmithStatus);
+      assert.strictEqual(node.state, expectedState);
+      assert.strictEqual(node.package, null);
+      assert.ok(node.getTreeItem());
+    }
+  });
+
+  test("DependencyHealthNode does not retain exact enrichment for non-FOUND states", () => {
+    for (const cloudsmithStatus of ["LOOKUP_FAILED", "NOT_FOUND", "CHECKING"]) {
+      const node = new DependencyHealthNode({
+        name: "artifact",
+        version: "1.0.0",
+        format: "raw",
+        cloudsmithStatus,
+        cloudsmithPackage: pkg,
+      }, null, {});
+
+      assert.strictEqual(node.cloudsmithStatus, cloudsmithStatus);
+      assert.strictEqual(node.package, null);
+      assert.strictEqual(node.cloudsmithMatch, null);
+      assert.strictEqual(node.namespace, undefined);
+      assert.strictEqual(node.repository, undefined);
+      assert.strictEqual(node.slug_perm, undefined);
+      assert.deepStrictEqual(node.getChildren(), []);
+      assert.notStrictEqual(node.getTreeItem().contextValue, "dependencyHealthFound");
+      assert.notStrictEqual(node.getTreeItem().contextValue, "dependencyHealthVulnerable");
+      assert.notStrictEqual(node.getTreeItem().contextValue, "dependencyHealthQuarantined");
+    }
+  });
+
   test("package, search, and dependency views preserve the same raw Cloudsmith license display", () => {
     const packageNode = new PackageNode(pkg, {});
     const searchNode = new SearchResultNode(pkg, {});
@@ -349,7 +649,7 @@ suite("Package Metadata Flow Test Suite", () => {
       status_str: "Quarantined",
     }, {});
 
-    assert.strictEqual(cleanNode.getTreeItem().description, "4.18.2 — No issues found");
+    assert.strictEqual(cleanNode.getTreeItem().description, "4.18.2 — Vulnerability status unknown");
     assert.strictEqual(vulnerableNode.getTreeItem().description, "4.18.2 — Vulnerabilities found (2 High)");
     assert.strictEqual(quarantinedNode.getTreeItem().description, "4.18.2 — Quarantined");
   });
@@ -395,7 +695,7 @@ suite("Package Metadata Flow Test Suite", () => {
       license_url: null,
     }, {});
 
-    assert.strictEqual(node.getTreeItem().description, "1.0.0 — No issues found");
+    assert.strictEqual(node.getTreeItem().description, "1.0.0 — Vulnerability status unknown");
     assert.match(node.getTreeItem().tooltip, /License: No license detected/);
   });
 
@@ -673,14 +973,18 @@ suite("Package Metadata Flow Test Suite", () => {
     for (const createNode of [
       () => new PackageNode({ ...pkg, is_copyable: "false" }, {}),
       () => new SearchResultNode({ ...pkg, is_copyable: "false" }, {}),
-      () => new DependencyHealthNode({
-        name: pkg.name,
-        version: pkg.version,
-        format: pkg.format,
-        cloudsmithPackage: { ...pkg, is_copyable: "false" },
-      }, null, {}),
     ]) {
       assert.throws(createNode, TypeError);
     }
+
+    const containedDependency = new DependencyHealthNode({
+      name: pkg.name,
+      version: pkg.version,
+      format: pkg.format,
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: { ...pkg, is_copyable: "false" },
+    }, null, {});
+    assert.strictEqual(containedDependency.package, null);
+    assert.strictEqual(containedDependency.cloudsmithStatus, "LOOKUP_FAILED");
   });
 });

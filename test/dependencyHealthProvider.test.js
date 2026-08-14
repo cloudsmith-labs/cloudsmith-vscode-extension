@@ -2111,7 +2111,10 @@ suite("DependencyHealthProvider Test Suite", () => {
     });
 
     assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
-    assert.strictEqual(isExactPackage(result.package), true);
+    assert.ok(isExactPackage(result.package));
+    assert.strictEqual(result.package.workspace, "workspace");
+    assert.strictEqual(result.package.repository, "repo");
+    assert.ok(result.package.packageIdentifier);
     assert.strictEqual(result.package.name, expectedPackage.name);
     assert.strictEqual(result.package.version, expectedPackage.version);
     assert.strictEqual(result.pagesFetched, 1);
@@ -2353,6 +2356,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       });
       assert.notStrictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
       assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED);
+      assert.strictEqual(result.package, null);
     }
   });
 

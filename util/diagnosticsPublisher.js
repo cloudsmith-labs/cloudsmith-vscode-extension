@@ -3,6 +3,7 @@ const crypto = require("crypto");
 const path = require("path");
 const { pathToFileURL } = require("url");
 const vscode = require("vscode");
+const { assertExactPackage } = require("../domain/package");
 const {
   createDependencyRecord,
   createDependencySource,
@@ -559,20 +560,16 @@ function snapshotCloudsmithMetadata(value) {
   if (value == null) {
     return null;
   }
-  const properties = getPlainDataProperties(value, "Cloudsmith diagnostic metadata");
-  const namespace = boundedOptionalString(
-    ownDataValue(properties, "namespace", false),
-    "Cloudsmith namespace",
-    MAX_PACKAGE_NAME_LENGTH
-  );
-  const repository = boundedOptionalString(
-    ownDataValue(properties, "repository", false),
-    "Cloudsmith repository",
-    MAX_PACKAGE_NAME_LENGTH
-  );
-  const rawCount = ownDataValue(properties, "num_vulnerabilities", false);
-  const numVulnerabilities = Number.isInteger(rawCount) && rawCount > 0 ? rawCount : 0;
-  return Object.freeze({ namespace, repository, numVulnerabilities });
+  const pkg = assertExactPackage(value);
+  const numVulnerabilities = Number.isInteger(pkg.vulnerability.count)
+    && pkg.vulnerability.count > 0
+    ? pkg.vulnerability.count
+    : 0;
+  return Object.freeze({
+    namespace: pkg.workspace,
+    repository: pkg.repository,
+    numVulnerabilities,
+  });
 }
 
 function snapshotCandidateArray(candidates, maximum) {

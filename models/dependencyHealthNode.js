@@ -10,7 +10,10 @@ const {
   getDependencySourceLabel,
   normalizeDependencyDisplayValue,
 } = require("../util/dependencyRecord");
-const { fromApiPackageRecord } = require("../domain/packageAdapters");
+const {
+  fromApiPackageRecord,
+  fromDependencyHealthNode,
+} = require("../domain/packageAdapters");
 
 class DependencyHealthNode {
   constructor(dep, cloudsmithMatchOrContext, maybeContext, maybeOptions) {
@@ -62,11 +65,18 @@ class DependencyHealthNode {
     this.parent = dep.parent || (Array.isArray(dep.parentChain) ? dep.parentChain[dep.parentChain.length - 1] : null);
     this.parentChain = Array.isArray(dep.parentChain) ? dep.parentChain.slice() : [];
     this.transitives = Array.isArray(dep.transitives) ? dep.transitives.slice() : [];
-    this.cloudsmithMatch = dep.cloudsmithPackage
-      || dep.cloudsmithMatch
-      || (hasExplicitCloudsmithMatch ? cloudsmithMatchOrContext : null);
-    this.package = canonicalMatchedPackage(this.cloudsmithMatch);
-    this.cloudsmithStatus = dep.cloudsmithStatus || (this.cloudsmithMatch ? "FOUND" : null);
+    const explicitPackageMatch = hasExplicitCloudsmithMatch ? cloudsmithMatchOrContext : null;
+    const packageMatchSupplied = hasDependencyPackageEvidence(dep)
+      || (explicitPackageMatch !== null && explicitPackageMatch !== undefined);
+    const canonicalPackage = canonicalMatchedPackage(dep, explicitPackageMatch);
+    const requestedCloudsmithStatus = dep.cloudsmithStatus || (packageMatchSupplied ? "FOUND" : null);
+    this.package = requestedCloudsmithStatus === "FOUND" ? canonicalPackage : null;
+    // Retain the compatibility projection only for trusted canonical values. A rejected
+    // optional match must not remain available as a second exact-identity authority.
+    this.cloudsmithMatch = this.package;
+    this.cloudsmithStatus = requestedCloudsmithStatus === "FOUND" && !this.package
+      ? "LOOKUP_FAILED"
+      : requestedCloudsmithStatus;
     this.vulnerabilities = dep.vulnerabilities || null;
     this.licenseData = dep.license || null;
     this.policy = dep.policy || null;
@@ -83,7 +93,7 @@ class DependencyHealthNode {
     this.licenseInfo = this._deriveLicenseInfo();
     this.state = this._deriveState();
 
-    if (this.cloudsmithMatch) {
+    if (this.package) {
       this.namespace = this.package.workspace;
       this.repository = this.package.repository;
       const packageIdentifier = this.package.packageIdentifier;
@@ -128,10 +138,6 @@ class DependencyHealthNode {
       });
     }
 
-    if (this.cloudsmithMatch) {
-      return LicenseClassifier.inspect(this.cloudsmithMatch);
-    }
-
     return LicenseClassifier.inspect(null);
   }
 
@@ -160,7 +166,7 @@ class DependencyHealthNode {
       return "lookup_incomplete";
     }
 
-    if (this.cloudsmithStatus !== "FOUND" || !this.cloudsmithMatch) {
+    if (this.cloudsmithStatus !== "FOUND" || !this.package) {
       return "unknown";
     }
 
@@ -395,7 +401,7 @@ class DependencyHealthNode {
       detail = this._buildMissingDescription();
     } else if (this._isQuarantined()) {
       detail = "Quarantined";
-    } else if (this._hasVulnerabilities()) {
+    } else if (this._hasVulnerabilities() || this._hasVulnerabilityUncertainty()) {
       detail = this._buildVulnerabilityDescription();
     } else if (this._shouldFlagRestrictiveLicenses() && this._hasRestrictiveLicense()) {
       detail = this._getLicenseLabel()
@@ -472,19 +478,19 @@ class DependencyHealthNode {
       } else {
         lines.push("This package may need to be uploaded or fetched through an upstream.");
       }
-    } else if (this.cloudsmithStatus !== "FOUND" || !this.cloudsmithMatch) {
+    } else if (this.cloudsmithStatus !== "FOUND" || !this.package) {
       lines.push(this._buildMissingDescription() + ".");
       const lookupDetail = normalizeDependencyDisplayValue(this.cloudsmithLookupDetail);
       if (lookupDetail) {
         lines.push(lookupDetail);
       }
     } else {
-      lines.push(`Found in Cloudsmith (${this.package?.repository ?? this.cloudsmithMatch.repository})`);
+      lines.push(`Found in Cloudsmith (${this.package.repository})`);
       const policy = this._getPolicyData();
       if (policy && policy.status) {
         lines.push(`Status: ${policy.status}`);
-      } else if (this.package?.status ?? this.cloudsmithMatch.status_str) {
-        lines.push(`Status: ${this.package?.status ?? this.cloudsmithMatch.status_str}`);
+      } else if (this.package.status) {
+        lines.push(`Status: ${this.package.status}`);
       }
 
       const vulnerabilities = this._getVulnerabilityData();
@@ -546,7 +552,7 @@ class DependencyHealthNode {
   }
 
   _buildDetailsChildren() {
-    if (!this.cloudsmithMatch || this.state === "checking") {
+    if (!this.package || this.state === "checking") {
       return [];
     }
 
@@ -557,12 +563,12 @@ class DependencyHealthNode {
       id: "Status",
       value: this.policy && this.policy.status
         ? this.policy.status
-        : this.package?.status ?? this.cloudsmithMatch.status_str,
+        : this.package.status,
     }, this.context));
 
     children.push(new PackageDetailsNode({
       id: "Version",
-      value: this.package?.version ?? this.cloudsmithMatch.version,
+      value: this.package.version,
     }, this.context));
 
     const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
@@ -611,7 +617,7 @@ class DependencyHealthNode {
       return this.vulnerabilities;
     }
 
-    if (!this.cloudsmithMatch) {
+    if (!this.package) {
       return null;
     }
 
@@ -650,7 +656,7 @@ class DependencyHealthNode {
       return this.policy;
     }
 
-    if (!this.cloudsmithMatch) {
+    if (!this.package) {
       return null;
     }
 
@@ -700,7 +706,7 @@ class DependencyHealthNode {
       return vscode.TreeItemCollapsibleState.Collapsed;
     }
 
-    return this.cloudsmithMatch
+    return this.package
       ? vscode.TreeItemCollapsibleState.Collapsed
       : vscode.TreeItemCollapsibleState.None;
   }
@@ -717,9 +723,51 @@ class DependencyHealthNode {
   }
 }
 
-function canonicalMatchedPackage(value) {
-  if (!value) return null;
-  return fromApiPackageRecord(value);
+function canonicalMatchedPackage(dep, explicitMatch) {
+  try {
+    const dependencyPackage = hasDependencyPackageEvidence(dep)
+      ? fromApiPackageRecord(fromDependencyHealthNode(dep))
+      : null;
+    const explicitPackage = explicitMatch === null || explicitMatch === undefined
+      ? null
+      : fromApiPackageRecord(explicitMatch);
+    if (dependencyPackage && explicitPackage) {
+      return fromDependencyHealthNode({
+        cloudsmithPackage: dependencyPackage,
+        cloudsmithMatch: explicitPackage,
+      });
+    }
+    if (dependencyPackage) return dependencyPackage;
+    if (!explicitPackage) return null;
+
+    const boundary = { package: explicitPackage };
+    for (const field of [
+      "workspace",
+      "namespace",
+      "cloudsmithWorkspace",
+      "repository",
+      "cloudsmithRepo",
+      "packageIdentifier",
+      "slug_perm",
+      "slug_perm_raw",
+    ]) {
+      const descriptor = Object.getOwnPropertyDescriptor(dep, field);
+      if (descriptor) Object.defineProperty(boundary, field, descriptor);
+    }
+    return fromDependencyHealthNode(boundary);
+  } catch {
+    return null;
+  }
+}
+
+function hasDependencyPackageEvidence(dep) {
+  return ["package", "cloudsmithPackage", "cloudsmithMatch"].some((field) => {
+    const descriptor = Object.getOwnPropertyDescriptor(dep, field);
+    return Boolean(descriptor && (
+      !Object.prototype.hasOwnProperty.call(descriptor, "value")
+      || (descriptor.value !== null && descriptor.value !== undefined)
+    ));
+  });
 }
 
 function canonicalVulnerabilityState(value) {
