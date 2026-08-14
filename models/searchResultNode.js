@@ -1,3 +1,5 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 // Search result node treeview.
 // Similar to PackageNode but includes repository context and status-based icons.
 
@@ -5,12 +7,14 @@ const vscode = require("vscode");
 const path = require("path");
 const PackageDetailsNode = require("./packageDetailsNode");
 const { LicenseClassifier } = require("../util/licenseClassifier");
-const { getPackageVulnerabilityCount } = require("../util/packageVulnerabilities");
 const { packageCollectionIdentity } = require("../util/collectionIdentity");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const VulnerabilitySummaryNode = require("./vulnerabilitySummaryNode");
 
 class SearchResultNode {
     constructor(pkg, context, options = {}) {
+        const packageModel = fromApiPackageRecord(pkg);
+        this.package = packageModel;
         this.context = context;
         this._connectionManager = options.connectionManager || null;
         this._vulnerabilityStateService = options.vulnerabilityStateService || null;
@@ -19,35 +23,31 @@ class SearchResultNode {
             : () => {};
 
         // Store fields matching PackageNode's shape so existing commands work
-        this.name = pkg.name;
-        this.format = pkg.format;
-        this.repository = pkg.repository;
-        this.namespace = pkg.namespace;
-        this.is_copyable = pkg.is_copyable === true
-            ? true
-            : pkg.is_copyable === false
-                ? false
-                : null;
-        this.status_str = { id: "Status", value: pkg.status_str };
-        this.slug = { id: "Slug", value: pkg.slug };
-        this.slug_perm = { id: "Slug", value: pkg.slug_perm };
-        this.downloads = { id: "Downloads", value: String(pkg.downloads) };
-        this.version = { id: "Version", value: pkg.version };
-        this.uploaded_at = { id: "Uploaded at", value: pkg.uploaded_at };
-        this.status_reason = pkg.status_reason || null;
-        this.checksum_sha256 = pkg.checksum_sha256 || null;
-        this.version_digest = pkg.version_digest || null;
-        this.cdn_url = pkg.cdn_url || null;
-        this.filename = pkg.filename || null;
+        this.name = packageModel.name;
+        this.format = packageModel.format;
+        this.repository = packageModel.repository;
+        this.namespace = packageModel.workspace;
+        this.is_copyable = packageModel.copyable;
+        this.status_str = { id: "Status", value: packageModel.status };
+        this.slug = { id: "Slug", value: packageModel.slug };
+        this.slug_perm = { id: "Slug", value: packageModel.packageIdentifier };
+        this.downloads = { id: "Downloads", value: String(packageModel.downloads ?? 0) };
+        this.version = { id: "Version", value: packageModel.version };
+        this.uploaded_at = { id: "Uploaded at", value: packageModel.uploadedAt };
+        this.status_reason = packageModel.statusReason;
+        this.checksum_sha256 = packageModel.checksumSha256;
+        this.version_digest = packageModel.versionDigest;
+        this.cdn_url = packageModel.cdnUrl;
+        this.filename = packageModel.filename;
 
         // Raw status for permissibility icon logic
-        this.status_str_raw = pkg.status_str;
+        this.status_str_raw = packageModel.status;
 
         // Policy fields from API response
-        this.policy_violated = pkg.policy_violated || false;
-        this.deny_policy_violated = pkg.deny_policy_violated || false;
-        this.license_policy_violated = pkg.license_policy_violated || false;
-        this.vulnerability_policy_violated = pkg.vulnerability_policy_violated || false;
+        this.policy_violated = packageModel.policy.violated;
+        this.deny_policy_violated = packageModel.policy.denyViolated;
+        this.license_policy_violated = packageModel.policy.licenseViolated;
+        this.vulnerability_policy_violated = packageModel.policy.vulnerabilityViolated;
 
         // Structured policy detail entries with human-readable labels and Yes/No values
         this.policy_violated_detail = { id: "Policy violated", value: this.policy_violated ? "Yes" : "No" };
@@ -57,26 +57,15 @@ class SearchResultNode {
 
         // Vulnerability fields from API response
         // slug_perm_raw must be a plain string for API URLs.
-        this.slug_perm_raw = (typeof pkg.slug_perm === 'object' && pkg.slug_perm !== null && pkg.slug_perm.value)
-            ? pkg.slug_perm.value
-            : pkg.slug_perm;
-        this.num_vulnerabilities = getPackageVulnerabilityCount(pkg);
-        this.max_severity = pkg.max_severity || null;
-        this.vulnerability_scan_results_url = pkg.vulnerability_scan_results_url || null;
-        this.security_scan_status = pkg.security_scan_status || null;
-        this._vulnerabilityIdentity = packageCollectionIdentity({
-            namespace: this.namespace,
-            repository: this.repository,
-            slug_perm: this.slug_perm_raw,
-        });
-        this._vulnerabilitySummary = new VulnerabilitySummaryNode({
-                namespace: this.namespace,
-                repository: this.repository,
-                slug_perm: this.slug_perm_raw,
-                num_vulnerabilities: this.num_vulnerabilities,
-                max_severity: this.max_severity,
-                security_scan_status: this.security_scan_status,
-            }, this.context, {
+        this.slug_perm_raw = packageModel.packageIdentifier;
+        this.num_vulnerabilities = packageModel.vulnerability.count !== null
+            ? packageModel.vulnerability.count
+            : packageModel.vulnerability.detected ? -1 : null;
+        this.max_severity = packageModel.vulnerability.maxSeverity;
+        this.vulnerability_scan_results_url = null;
+        this.security_scan_status = packageModel.vulnerability.scanStatus;
+        this._vulnerabilityIdentity = packageCollectionIdentity(packageModel);
+        this._vulnerabilitySummary = new VulnerabilitySummaryNode(packageModel, this.context, {
                 connectionManager: this._connectionManager,
                 vulnerabilityStateService: this._vulnerabilityStateService,
             });
@@ -87,14 +76,19 @@ class SearchResultNode {
         );
 
         // License fields from API response (may be absent in list endpoint)
-        this.licenseInfo = cloneCanonicalValue(LicenseClassifier.inspect(pkg));
+        this.licenseInfo = cloneCanonicalValue(LicenseClassifier.inspect({
+            spdx_license: packageModel.license.spdx,
+            license: packageModel.license.declared,
+            raw_license: packageModel.license.raw,
+            license_url: packageModel.license.url,
+        }));
         this.spdx_license = this.licenseInfo.spdxLicense;
         this.raw_license = this.licenseInfo.rawLicense;
         this.license = this.licenseInfo.displayValue;
         this.license_url = this.licenseInfo.licenseUrl;
 
         // Raw tags for upstream origin detection
-        this.tags_raw = cloneCanonicalValue(pkg.tags) || {};
+        this.tags_raw = legacyTags(packageModel.tags);
 
         // Determine upstream origin from tags
         this.upstreamSource = this._detectUpstreamSource();
@@ -104,14 +98,14 @@ class SearchResultNode {
         };
 
         // Tags handling (same pattern as PackageNode)
-        if (this.tags_raw.info) {
-            if (this.tags_raw.version) {
+        if (packageModel.tags.info.length > 0) {
+            if (packageModel.tags.version.length > 0) {
                 this.tags = { id: "Tags", value: String([this.tags_raw.info, this.tags_raw.version]) };
             } else {
                 this.tags = { id: "Tags", value: this.tags_raw.info };
             }
         } else {
-            if (this.tags_raw.version) {
+            if (packageModel.tags.version.length > 0) {
                 this.tags = { id: "Tags", value: this.tags_raw.version };
             } else {
                 this.tags = { id: "Tags", value: "" };
@@ -278,6 +272,13 @@ class SearchResultNode {
 
         return children;
     }
+}
+
+function legacyTags(tags) {
+    const value = {};
+    if (tags.info.length > 0) value.info = tags.info;
+    if (tags.version.length > 0) value.version = tags.version;
+    return Object.freeze(value);
 }
 
 function cloneCanonicalValue(value, depth = 0) {

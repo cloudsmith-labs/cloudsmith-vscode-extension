@@ -1,6 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const { encodeApiPathSegment } = require("./apiEndpoint");
+const { exactPackageRef } = require("../domain/package");
 const { getPackagePolicyFlags } = require("./packageVulnerabilities");
 
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
@@ -62,16 +63,6 @@ function deepFreeze(value) {
   return Object.freeze(value);
 }
 
-function unwrapLegacyValue(value) {
-  let current = value;
-  for (let depth = 0; depth < 2; depth += 1) {
-    if (!isRecord(current) || !Object.prototype.hasOwnProperty.call(current, "value")) break;
-    current = current.value;
-  }
-  if (isRecord(current)) throw new PromotionContractError("malformed_source_locator");
-  return current;
-}
-
 function scalarString(value, maximumLength, code) {
   const normalized = value;
   if (
@@ -106,43 +97,12 @@ function pathIdentity(value, maximumLength, code) {
   return normalized;
 }
 
-function collectLegacyAliases(values, normalizer, code) {
-  const normalized = [];
-  for (const value of values) {
-    if (value === undefined || value === null) continue;
-    let candidate;
-    try {
-      candidate = normalizer(unwrapLegacyValue(value));
-    } catch {
-      throw new PromotionContractError(code);
-    }
-    normalized.push(candidate);
+function createSourceLocator(value) {
+  try {
+    return exactPackageRef(value);
+  } catch {
+    throw new PromotionContractError("malformed_source_locator");
   }
-  if (normalized.length === 0 || normalized.some(value => value !== normalized[0])) {
-    throw new PromotionContractError(code);
-  }
-  return normalized[0];
-}
-
-function createSourceLocator(item) {
-  if (!isRecord(item)) throw new PromotionContractError("malformed_source_locator");
-  const match = isRecord(item.cloudsmithMatch) ? item.cloudsmithMatch : {};
-  const workspace = collectLegacyAliases(
-    [item.namespace, item.cloudsmithWorkspace, match.namespace],
-    value => pathIdentity(value, MAX_WORKSPACE_LENGTH, "malformed_source_workspace"),
-    "conflicting_source_workspace"
-  );
-  const repository = collectLegacyAliases(
-    [item.repository, item.cloudsmithRepo, match.repository],
-    value => pathIdentity(value, MAX_REPOSITORY_LENGTH, "malformed_source_repository"),
-    "conflicting_source_repository"
-  );
-  const packageIdentifier = collectLegacyAliases(
-    [item.slug_perm, item.slug_perm_raw, match.slug_perm, match.slug_perm_raw],
-    value => pathIdentity(value, MAX_PACKAGE_IDENTIFIER_LENGTH, "malformed_source_identifier"),
-    "conflicting_source_identifier"
-  );
-  return deepFreeze({ workspace, repository, packageIdentifier });
 }
 
 function freshIdentifier(record, code) {

@@ -17,6 +17,8 @@
   "icon": "media/logo.png",
   "files": [
     "extension.js",
+    "commands/**/*.js",
+    "domain/**/*.js",
     "models/**/*.js",
     "util/**/*.js",
     "views/**/*.js",
@@ -920,7 +922,8 @@
     "build": "node scripts/verify-build.js",
     "syntax": "node scripts/check-syntax.js",
     "lint": "eslint . --max-warnings 0",
-    "check": "npm run lint && npm run syntax && npm run build && npm run verify:version",
+    "check": "npm run lint && npm run syntax && npm run build && npm run verify:architecture && npm run verify:version",
+    "verify:architecture": "node scripts/architecture/verify.js",
     "verify:version": "node scripts/release/verify-version.js",
     "audit:runtime": "node scripts/release/verify-dependency-audit.js runtime",
     "audit:dev": "node scripts/release/verify-dependency-audit.js development",
@@ -933,7 +936,7 @@
     "package": "node scripts/release/package-vsix.js",
     "package:verify": "node scripts/release/verify-vsix.js --require-sidecars",
     "package:list": "node scripts/release/verify-vsix.js --require-sidecars --list",
-    "vscode:prepublish": "npm run build"
+    "vscode:prepublish": "npm run check"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",

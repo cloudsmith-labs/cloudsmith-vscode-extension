@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 
 const root = path.resolve(__dirname, "..");
-const sourceRoots = ["extension.js", "models", "views", "util"];
+const sourceRoots = ["extension.js", "commands", "domain", "models", "views", "util"];
 const MAX_SOURCE_FILES = 512;
 const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
 const MAX_TRAVERSAL_ENTRIES = 1024;

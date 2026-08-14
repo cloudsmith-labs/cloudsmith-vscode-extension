@@ -1,7 +1,11 @@
 const assert = require("assert");
 const vscode = require("vscode");
 const { CloudsmithProvider } = require("../views/cloudsmithProvider");
-const { getWorkspaces } = require("../extension");
+const { getWorkspaces } = require("../util/workspaceAccess");
+const { captureAccount, isAccountCurrent } = require("../util/accountOperation");
+const { formatApiError } = require("../util/errorFormatter");
+const { replaceCollectionItems } = require("../util/paginatedFetch");
+const { fetchWorkspaces, normalizedWorkspaceName } = require("../util/workspaceFetcher");
 const { getWorkspaceContextProjector } = require("../util/workspaceContextProjector");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
@@ -94,6 +98,41 @@ suite("CloudsmithProvider", () => {
   let commands;
   let defaultWorkspace;
   let manager;
+
+  test("same-context projection replaces a disposed projector and settles in-flight work", async () => {
+    const context = {};
+    const started = deferred();
+    const release = deferred();
+    const applied = [];
+    const first = getWorkspaceContextProjector(context, {
+      async executeCommand(_command, _key, value) {
+        applied.push(`first:${value}`);
+        started.resolve();
+        await release.promise;
+      },
+    });
+    const projection = first.project(true);
+    await started.promise;
+
+    let disposalSettled = false;
+    const disposal = first.dispose().then(() => { disposalSettled = true; });
+    await Promise.resolve();
+    assert.strictEqual(disposalSettled, false);
+
+    const second = getWorkspaceContextProjector(context, {
+      async executeCommand(_command, _key, value) {
+        applied.push(`second:${value}`);
+      },
+    });
+    assert.notStrictEqual(second, first);
+    release.resolve();
+    assert.strictEqual(await projection, false);
+    await disposal;
+    assert.strictEqual(disposalSettled, true);
+    assert.strictEqual(await second.project(false), true);
+    assert.deepStrictEqual(applied, ["first:true", "second:false"]);
+    await second.dispose();
+  });
   let context;
 
   setup(() => {
@@ -527,7 +566,7 @@ suite("CloudsmithProvider", () => {
     assert.strictEqual(treeView.message, undefined);
   });
 
-  test("shares projection ordering with extension helpers across an account change", async () => {
+  test("shares projection ordering with command helpers across an account change", async () => {
     const trueStarted = deferred();
     const releaseTrue = deferred();
     const applied = [];
@@ -542,15 +581,24 @@ suite("CloudsmithProvider", () => {
     const provider = createProvider(async () => apiSuccess([]), {
       workspaceContextProjector,
     });
-    const pending = getWorkspaces(context, {
+    const pending = getWorkspaces({
+      context,
+      vscode,
       connectionManager: manager,
       workspaceContextProjector,
+      captureAccount,
+      isAccountCurrent,
       createCloudsmithAPI: () => ({
         get: async () => apiSuccess([
           { slug: "old-a", name: "Old A" },
           { slug: "old-b", name: "Old B" },
         ]),
       }),
+      fetchWorkspaces,
+      normalizedWorkspaceName,
+      replaceCollectionItems,
+      setHasMultipleWorkspacesContext: value => workspaceContextProjector.project(value),
+      formatApiError,
     });
 
     await trueStarted.promise;

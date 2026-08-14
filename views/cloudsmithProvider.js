@@ -1,3 +1,5 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 // This class handles the main Cloudsmith view. Workspaces are generated and populated here.
 // When cloudsmith-vsc.defaultWorkspace is set, repositories load directly as root items.
 
@@ -22,7 +24,6 @@ const RepositoryNode = require("../models/repositoryNode");
 const workspaceFetcher = require("../util/workspaceFetcher");
 const workspaceRepositoryFetcher = require("../util/workspaceRepositoryFetcher");
 const { getWorkspaceContextProjector } = require("../util/workspaceContextProjector");
-const { packageCollectionIdentity } = require("../util/collectionIdentity");
 
 class CloudsmithProvider {
   constructor(context, options = {}) {
@@ -600,12 +601,7 @@ function sameAccountIdentity(left, right) {
 function vulnerabilityEventIdentity(event) {
   if (typeof event === "string") return event;
   if (typeof event?.identity === "string") return event.identity;
-  const ref = event?.ref || event?.packageRef || event;
-  try {
-    return packageCollectionIdentity(ref);
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 module.exports = { CloudsmithProvider };

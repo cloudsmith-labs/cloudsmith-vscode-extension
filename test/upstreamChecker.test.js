@@ -1,3 +1,5 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const assert = require("assert");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { CredentialManager } = require("../util/credentialManager");
@@ -1501,6 +1503,7 @@ suite("UpstreamChecker preview resolution", () => {
     const calls = [];
     const firstPage = Array.from({ length: 100 }, (_value, index) => ({
       name: `other-${index}`,
+      version: "1.0.0",
       format: "python",
       namespace: "acme",
       repository: "example-repo",
@@ -1513,6 +1516,7 @@ suite("UpstreamChecker preview resolution", () => {
           calls.push(pageNumber);
           const data = pageNumber === 1 ? firstPage : [{
             name: "flask",
+            version: "1.0.0",
             format: "python",
             namespace: "acme",
             repository: "example-repo",
@@ -1546,6 +1550,7 @@ suite("UpstreamChecker preview resolution", () => {
     const calls = [];
     const firstPage = Array.from({ length: 100 }, (_value, index) => ({
       name: index === 0 ? "flask" : `other-${index}`,
+      version: "1.0.0",
       format: "python",
       namespace: "acme",
       repository: "example-repo",

@@ -1,10 +1,19 @@
 const assert = require("assert");
 const {
+  beginAccountScopedStateReset,
+  completeAccountScopedStateReset,
+  createAuthenticationResultHandler,
   evictPersistedUpstreamCaches,
+} = require("../util/accountLifecycle");
+const {
   executeSearchIntent,
-  resetAccountScopedState,
   searchDescriptorFromRecent,
-} = require("../extension");
+} = require("../util/searchIntent");
+
+function resetAccountScopedState(context, options) {
+  const reset = beginAccountScopedStateReset(options);
+  return completeAccountScopedStateReset(context, options, reset);
+}
 
 function deferred() {
   let resolve;
@@ -143,6 +152,98 @@ suite("search intent command boundary", () => {
     assert.strictEqual(complete, true);
     assert.strictEqual(store.has("cloudsmith-upstreams:v3:stale"), false);
     assert.strictEqual(store.has("unrelated"), true);
+  });
+
+  test("authentication default offer cannot mutate settings after its account turns stale", async () => {
+    let current = true;
+    let updates = 0;
+    let contextUpdates = 0;
+    let refreshes = 0;
+    const account = Object.freeze({ activationId: "activation-a", accountEpoch: 1 });
+    const connectionManager = {
+      getState: () => ({
+        sessionConnected: true,
+        credentialPresent: true,
+        activationId: account.activationId,
+        accountEpoch: account.accountEpoch,
+      }),
+    };
+    const treeView = { title: "Workspaces", description: "" };
+    const handler = createAuthenticationResultHandler({
+      vscode: {
+        ConfigurationTarget: { Global: 1 },
+        workspace: {
+          getConfiguration: () => ({ async update() { updates += 1; } }),
+        },
+        window: {
+          async showInformationMessage() {
+            current = false;
+            return "Set as default";
+          },
+          showErrorMessage() { throw new Error("stale auth error must stay silent"); },
+          showWarningMessage() { throw new Error("stale auth error must stay silent"); },
+        },
+      },
+      connectionManager,
+      treeView,
+      cloudsmithProvider: { refresh() { refreshes += 1; } },
+      async updateDefaultWorkspaceContext() { contextUpdates += 1; },
+      getDefaultWorkspace: () => "",
+      getWorkspaces: async () => ({
+        complete: true,
+        items: [{ slug: "workspace-a", name: "Workspace A" }],
+      }),
+      captureAccount: () => account,
+      isAccountCurrent: () => current,
+    });
+
+    await handler({ ok: true }, { showSuccess: false });
+    await handler({
+      ok: false,
+      error: { kind: "stale", message: "obsolete authentication failure" },
+    });
+    assert.strictEqual(updates, 0);
+    assert.strictEqual(contextUpdates, 0);
+    assert.strictEqual(refreshes, 0);
+    assert.deepStrictEqual(treeView, { title: "Workspaces", description: "" });
+  });
+
+  test("authentication default offer preserves a newer verified default", async () => {
+    let defaultWorkspace = "";
+    let updates = 0;
+    const account = Object.freeze({ activationId: "activation-a", accountEpoch: 1 });
+    const connectionManager = {
+      getState: () => ({ sessionConnected: true, credentialPresent: true }),
+    };
+    const handler = createAuthenticationResultHandler({
+      vscode: {
+        ConfigurationTarget: { Global: 1 },
+        workspace: {
+          getConfiguration: () => ({ async update() { updates += 1; } }),
+        },
+        window: {
+          async showInformationMessage() {
+            defaultWorkspace = "newer-verified-default";
+            return "Set as default";
+          },
+        },
+      },
+      connectionManager,
+      treeView: {},
+      cloudsmithProvider: { refresh() {} },
+      async updateDefaultWorkspaceContext() {},
+      getDefaultWorkspace: () => defaultWorkspace,
+      getWorkspaces: async () => ({
+        complete: true,
+        items: [{ slug: "workspace-a", name: "Workspace A" }],
+      }),
+      captureAccount: () => account,
+      isAccountCurrent: () => true,
+    });
+
+    await handler({ ok: true }, { showSuccess: false });
+    assert.strictEqual(updates, 0);
+    assert.strictEqual(defaultWorkspace, "newer-verified-default");
   });
 
   test("owns and launches search before detached history persistence", async () => {

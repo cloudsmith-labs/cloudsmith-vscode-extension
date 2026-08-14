@@ -15,22 +15,22 @@ function buildPolicyPatch(dependencies) {
     }
 
     const pkg = dependency.cloudsmithPackage;
-    const status = String(pkg.status_str || "").trim() || null;
+    const status = pkg.status;
     const quarantined = status === "Quarantined";
-    const denied = quarantined || Boolean(pkg.deny_policy_violated);
+    const denied = quarantined || pkg.policy.denyViolated;
     const violated = denied
-      || Boolean(pkg.policy_violated)
-      || Boolean(pkg.license_policy_violated)
-      || Boolean(pkg.vulnerability_policy_violated);
+      || pkg.policy.violated
+      || pkg.policy.licenseViolated
+      || pkg.policy.vulnerabilityViolated;
 
     patchMap.set(key, {
       violated,
       denied,
       quarantined,
       status,
-      statusReason: String(pkg.status_reason || "").trim() || null,
-      vulnerabilityViolated: Boolean(pkg.vulnerability_policy_violated),
-      licenseViolated: Boolean(pkg.license_policy_violated),
+      statusReason: pkg.statusReason,
+      vulnerabilityViolated: pkg.policy.vulnerabilityViolated,
+      licenseViolated: pkg.policy.licenseViolated,
     });
   }
 

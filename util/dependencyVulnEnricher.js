@@ -55,13 +55,17 @@ function getIndicatorCount(packageModel) {
 function buildEmptySummary(packageModel) {
   return {
     count: 0,
-    maxSeverity: canonicalSeverity(packageModel && packageModel.max_severity),
+    maxSeverity: canonicalSeverity(
+      packageModel && packageModel.vulnerability && packageModel.vulnerability.maxSeverity
+    ),
     cveIds: [],
     hasFixAvailable: false,
     severityCounts: Object.create(null),
     entries: [],
     detailsLoaded: false,
-    policyViolated: Boolean(packageModel && packageModel.vulnerability_policy_violated),
+    policyViolated: Boolean(
+      packageModel && packageModel.policy && packageModel.policy.vulnerabilityViolated
+    ),
   };
 }
 
@@ -78,7 +82,9 @@ function buildIndicatorSummary(packageModel) {
     };
   }
 
-  const maxSeverity = canonicalSeverity(packageModel && packageModel.max_severity);
+  const maxSeverity = canonicalSeverity(
+    packageModel && packageModel.vulnerability && packageModel.vulnerability.maxSeverity
+  );
   const severityCounts = Object.create(null);
   if (indicator.detected && maxSeverity && maxSeverity !== "Unknown") {
     severityCounts[maxSeverity] = 1;
@@ -96,7 +102,9 @@ function buildIndicatorSummary(packageModel) {
     countKnown: indicator.authoritative,
     detected: indicator.detected,
     unknown: indicator.unknown,
-    policyViolated: Boolean(packageModel && packageModel.vulnerability_policy_violated),
+    policyViolated: Boolean(
+      packageModel && packageModel.policy && packageModel.policy.vulnerabilityViolated
+    ),
   };
 }
 
@@ -291,7 +299,7 @@ function collectPackageGroups(dependencies) {
       groups.set(packageKey, {
         key: packageKey,
         packageModel: dependency.cloudsmithPackage,
-        workspace: String(dependency.cloudsmithPackage.namespace || "").toLowerCase(),
+        workspace: dependency.cloudsmithPackage.workspace,
         repo: String(dependency.cloudsmithPackage.repository || "").toLowerCase(),
         name: String(dependency.name || "").toLowerCase(),
         priority,
@@ -400,15 +408,9 @@ async function fetchVulnerabilitySummary(
     return fallbackSummary;
   }
 
-  const workspace = String(packageModel.namespace || "").trim();
-  const repo = String(packageModel.repository || "").trim();
-  const identifier = String(
-    packageModel.slug_perm
-      || packageModel.slugPerm
-      || packageModel.slug
-      || packageModel.identifier
-      || ""
-  ).trim();
+  const workspace = packageModel.workspace;
+  const repo = packageModel.repository;
+  const identifier = packageModel.packageIdentifier;
 
   if (!workspace || !repo || !identifier) {
     return fallbackSummary;

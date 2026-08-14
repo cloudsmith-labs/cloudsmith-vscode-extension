@@ -1,6 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const { apiEndpoint, encodeApiPathSegment } = require("./apiEndpoint");
+const { assertExactPackage } = require("../domain/package");
 const {
   PaginatedFetch,
   collectionFailureResult,
@@ -20,30 +21,18 @@ const CONTROL_PATTERN = /[\u0000-\u001f\u007f\u061c\u200b-\u200f\u202a-\u202e\u2
 const DISPLAY_CONTROL_PATTERN = /[\u0000-\u001f\u007f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g;
 const ENCODED_SEPARATOR_PATTERN = /%(?:2f|5c)/i;
 
-function createQuarantineLocator(item) {
-  if (!isObjectRecord(item)) return null;
-  const nestedMatch = ownData(item, "cloudsmithMatch");
-  const match = isObjectRecord(nestedMatch) ? nestedMatch : {};
-  const workspace = canonicalAliases([
-    ownData(item, "namespace"),
-    ownData(item, "cloudsmithWorkspace"),
-    ownData(match, "namespace"),
-    ownData(match, "cloudsmithWorkspace"),
-  ]);
-  const repository = canonicalAliases([
-    ownData(item, "repository"),
-    ownData(item, "cloudsmithRepo"),
-    ownData(match, "repository"),
-    ownData(match, "cloudsmithRepo"),
-  ]);
-  const packageSlugPerm = canonicalAliases([
-    ownData(item, "slug_perm_raw"),
-    ownData(item, "slug_perm"),
-    ownData(match, "slug_perm_raw"),
-    ownData(match, "slug_perm"),
-  ]);
-  if (!workspace || !repository || !packageSlugPerm) return null;
-  return Object.freeze({ workspace, repository, packageSlugPerm });
+function createQuarantineLocator(value) {
+  let pkg;
+  try {
+    pkg = assertExactPackage(value);
+  } catch {
+    return null;
+  }
+  return Object.freeze({
+    workspace: pkg.workspace,
+    repository: pkg.repository,
+    packageSlugPerm: pkg.packageIdentifier,
+  });
 }
 
 async function fetchPackageDecisionLogs(api, locator, createdAfter, options = {}) {
@@ -277,13 +266,6 @@ function extractDecisionLogs(value) {
   return isRecord(value) && Array.isArray(value.results) ? value.results : null;
 }
 
-function canonicalAliases(values) {
-  const supplied = values.filter(value => value !== undefined && value !== null);
-  if (supplied.length === 0) return null;
-  const normalized = supplied.map(value => pathIdentity(unwrapOwnValue(value)));
-  return normalized.every(value => value && value === normalized[0]) ? normalized[0] : null;
-}
-
 function isLocator(locator) {
   return isRecord(locator)
     && pathIdentity(locator.workspace) === locator.workspace
@@ -340,10 +322,6 @@ function isRecord(value) {
     && Object.getPrototypeOf(value) === Object.prototype;
 }
 
-function isObjectRecord(value) {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 function ownData(value, key) {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
@@ -353,18 +331,6 @@ function ownData(value, key) {
   } catch {
     return undefined;
   }
-}
-
-function unwrapOwnValue(value) {
-  let current = value;
-  for (let depth = 0; depth < 4; depth += 1) {
-    if (!isRecord(current)) return current;
-    const descriptor = Object.getOwnPropertyDescriptor(current, "value");
-    if (!descriptor) return null;
-    if (!Object.prototype.hasOwnProperty.call(descriptor, "value")) return null;
-    current = descriptor.value;
-  }
-  return isRecord(current) ? null : current;
 }
 
 function failedCollection(message) {

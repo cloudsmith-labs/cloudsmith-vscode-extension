@@ -1,0 +1,9 @@
+{
+  "name": "architecture-entrypoint-mismatch-fixture",
+  "main": "./boot.js",
+  "contributes": {
+    "commands": [
+      { "command": "cloudsmith-vsc.valid", "title": "Valid" }
+    ]
+  }
+}

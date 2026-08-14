@@ -1,9 +1,12 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 // Remediation helper - finds safe alternative versions of a package
 
 const { SearchQueryBuilder } = require('./searchQueryBuilder');
 const { apiEndpoint } = require('./apiEndpoint');
 const { PaginatedFetch } = require('./paginatedFetch');
 const { packageCollectionIdentity } = require('./collectionIdentity');
+const { fromApiPackageRecord } = require('../domain/packageAdapters');
 
 const SAFE_VERSION_PREVIEW_SIZE = 10;
 
@@ -101,7 +104,10 @@ function safeVersionResult(result, workspace, repository, packageName, format) {
   const identities = new Set();
   try {
     for (const pkg of result.data) {
-      const identity = packageCollectionIdentity(pkg);
+      const identity = packageCollectionIdentity(fromApiPackageRecord(pkg, {
+        expectedWorkspace: workspace,
+        expectedRepository: repository,
+      }));
       if (identities.has(identity)) throw new TypeError("duplicate package identity");
       identities.add(identity);
     }

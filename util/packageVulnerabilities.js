@@ -1,6 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const { apiEndpoint, encodeApiPathSegment } = require("./apiEndpoint");
+const { assertExactPackage, isExactPackage } = require("../domain/package");
 const { PaginatedFetch } = require("./paginatedFetch");
 const { exactIdentityPart, unwrapIdentityValue } = require("./collectionIdentity");
 const {
@@ -71,6 +72,14 @@ function getPackageVulnerabilityCount(pkg) {
  */
 function getPackagePolicyFlags(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (isExactPackage(value)) {
+    return {
+      policy_violated: value.policy.violated,
+      deny_policy_violated: value.policy.denyViolated,
+      license_policy_violated: value.policy.licenseViolated,
+      vulnerability_policy_violated: value.policy.vulnerabilityViolated,
+    };
+  }
   const flags = {};
   for (const field of PACKAGE_POLICY_FIELDS) {
     if (
@@ -145,6 +154,14 @@ function scanReportsVulnerabilities(scan) {
 }
 
 function getPackageVulnerabilityState(value) {
+  if (isExactPackage(value)) {
+    return {
+      count: value.vulnerability.count,
+      detected: value.vulnerability.detected,
+      unknown: value.vulnerability.evidence === "unknown",
+      candidateCount: value.vulnerability.count,
+    };
+  }
   const record = value && typeof value === "object" ? value : {};
   const countAliases = [
     "num_vulnerabilities",
@@ -348,6 +365,19 @@ async function fetchPackageVulnerabilities(api, workspace, repo, packageIdentifi
     deriveMaximumVulnerabilitySeverity(results),
     results.length,
     true
+  );
+}
+
+/** Canonical package boundary for package-scoped vulnerability reads. */
+function fetchExactPackageVulnerabilities(api, pkg, expectedCount = null, options = {}) {
+  const exactPackage = assertExactPackage(pkg);
+  return fetchPackageVulnerabilities(
+    api,
+    exactPackage.workspace,
+    exactPackage.repository,
+    exactPackage.packageIdentifier,
+    expectedCount,
+    options
   );
 }
 
@@ -559,6 +589,7 @@ function isBoundedNestedVulnerabilityPayload(scans) {
 }
 
 module.exports = {
+  fetchExactPackageVulnerabilities,
   MAX_VULNERABILITY_DETAILS,
   MAX_VULNERABILITY_SCAN_PAGES,
   VULNERABILITY_SCAN_PAGE_SIZE,

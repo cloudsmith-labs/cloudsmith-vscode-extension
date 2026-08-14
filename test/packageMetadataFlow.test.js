@@ -1,3 +1,5 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const assert = require("assert");
 const path = require("path");
 const vscode = require("vscode");
@@ -654,7 +656,7 @@ suite("Package Metadata Flow Test Suite", () => {
   });
 
   test("package, search, and dependency models preserve only literal copyability booleans", () => {
-    for (const [value, expected] of [[true, true], [false, false], ["false", null], [undefined, null]]) {
+    for (const [value, expected] of [[true, true], [false, false], [undefined, null]]) {
       const packageNode = new PackageNode({ ...pkg, is_copyable: value }, {});
       const searchNode = new SearchResultNode({ ...pkg, is_copyable: value }, {});
       const dependencyNode = new DependencyHealthNode({
@@ -666,6 +668,19 @@ suite("Package Metadata Flow Test Suite", () => {
       assert.strictEqual(packageNode.is_copyable, expected);
       assert.strictEqual(searchNode.is_copyable, expected);
       assert.strictEqual(dependencyNode.is_copyable, expected);
+    }
+
+    for (const createNode of [
+      () => new PackageNode({ ...pkg, is_copyable: "false" }, {}),
+      () => new SearchResultNode({ ...pkg, is_copyable: "false" }, {}),
+      () => new DependencyHealthNode({
+        name: pkg.name,
+        version: pkg.version,
+        format: pkg.format,
+        cloudsmithPackage: { ...pkg, is_copyable: "false" },
+      }, null, {}),
+    ]) {
+      assert.throws(createNode, TypeError);
     }
   });
 });

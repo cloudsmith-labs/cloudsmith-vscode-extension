@@ -15,6 +15,7 @@ export default [{
         "no-const-assign": "error",
         "no-constant-binary-expression": "error",
         "no-dupe-else-if": "error",
+        "no-eval": "error",
         "no-global-assign": "error",
         "no-implied-eval": "error",
         "no-implicit-coercion": ["error", { allow: ["!!"] }],
@@ -38,7 +39,7 @@ export default [{
         sourceType: "commonjs",
     },
 }, {
-    files: ["extension.js", "models/**/*.js", "util/**/*.js", "views/**/*.js", "scripts/**/*.js"],
+    files: ["extension.js", "commands/**/*.js", "domain/**/*.js", "models/**/*.js", "util/**/*.js", "views/**/*.js", "scripts/**/*.js"],
     rules: {
         "no-promise-executor-return": "error",
     },

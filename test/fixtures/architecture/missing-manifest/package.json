@@ -1,0 +1,9 @@
+{
+  "name": "architecture-missing-registration-fixture",
+  "contributes": {
+    "commands": [
+      { "command": "cloudsmith-vsc.valid", "title": "Valid" },
+      { "command": "cloudsmith-vsc.missing", "title": "Missing" }
+    ]
+  }
+}

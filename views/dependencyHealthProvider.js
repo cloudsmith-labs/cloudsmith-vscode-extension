@@ -17,6 +17,7 @@ const {
   getDependencyOccurrenceKey,
   isDependencyLookupEligible,
 } = require("../util/dependencyRecord");
+const { assertWorkspacePackageCoordinate } = require("../domain/package");
 const {
   MAX_DIAGNOSTIC_OCCURRENCES,
   createDiagnosticCandidate,
@@ -62,6 +63,7 @@ const {
   connectionPresentation,
 } = require("../util/connectionPresentation");
 const { packageCollectionIdentity } = require("../util/collectionIdentity");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 
 const DEFAULT_MAX_DEPENDENCIES_TO_SCAN = 10000;
 const LOOKUP_PAGE_SIZE = 100;
@@ -1624,7 +1626,7 @@ class DependencyHealthProvider {
     }
   }
 
-  async pullSingleDependency(item) {
+  async pullSingleDependency(value) {
     if (this._disposed) return;
     if (this._pendingAccountIdentity) return;
     if (this.isScanRunning() || this._dependencyOperationRunning) {
@@ -1642,7 +1644,23 @@ class DependencyHealthProvider {
       return;
     }
 
-    const dependency = createSingleDependencyPullTarget(item);
+    let coordinate;
+    try {
+      coordinate = assertWorkspacePackageCoordinate(value);
+    } catch {
+      this._userInteraction.showWarningMessage("Could not determine the dependency details.");
+      return;
+    }
+    if (
+      coordinate.workspace !== this.lastWorkspace
+      || coordinate.repository !== this.lastRepo
+    ) {
+      this._userInteraction.showWarningMessage(
+        "The dependency selection is stale. Select it again and retry."
+      );
+      return;
+    }
+    const dependency = resolveSingleDependencyPullTarget(coordinate, this._fullTrees);
     if (!dependency) {
       this._userInteraction.showWarningMessage("Could not determine the dependency details.");
       return;
@@ -2475,9 +2493,23 @@ async function lookupExactDependency({
       pagesFetched += 1;
       const match = matchCoverageCandidates(response.data, dependency, concreteVersion);
       if (match) {
+        let canonicalMatch;
+        try {
+          canonicalMatch = fromApiPackageRecord(match, {
+            expectedWorkspace: cloudsmithWorkspace,
+            expectedRepository: cloudsmithRepo,
+          });
+        } catch {
+          return createCoverageLookupResult(
+            CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED,
+            null,
+            "Cloudsmith returned an invalid exact package match.",
+            pagesFetched
+          );
+        }
         return createCoverageLookupResult(
           CLOUDSMITH_COVERAGE_STATUS.FOUND,
-          match,
+          canonicalMatch,
           null,
           pagesFetched
         );
@@ -2764,7 +2796,7 @@ function isPackageCandidateArray(value, expectedWorkspace, expectedRepository) {
 
 function packageCandidateIdentity(candidate) {
   try {
-    return packageCollectionIdentity(candidate);
+    return packageCollectionIdentity(fromApiPackageRecord(candidate));
   } catch {
     return null;
   }
@@ -4117,27 +4149,26 @@ function normalizeUserInteraction(userInteraction) {
   return Object.freeze(normalized);
 }
 
-function createSingleDependencyPullTarget(item) {
-  if (!item || typeof item !== "object") {
-    return null;
-  }
-
-  const name = String(item.name || "").trim();
-  const format = canonicalFormat(item.format || item.ecosystem);
-  if (!name || !format) {
-    return null;
-  }
-
-  const versionValue = typeof item.declaredVersion === "string"
-    ? item.declaredVersion
-    : (typeof item.version === "string" ? item.version : "");
-
+function resolveSingleDependencyPullTarget(coordinate, trees) {
+  const matches = (Array.isArray(trees) ? trees : [])
+    .flatMap(tree => Array.isArray(tree?.dependencies) ? tree.dependencies : [])
+    .filter(dependency => (
+      dependency
+      && dependency.name === coordinate.name
+      && getConcreteDependencyVersion(dependency) === coordinate.version
+      && canonicalFormat(dependency.format || dependency.ecosystem) === coordinate.format
+      && isAbsentCoverageStatus(dependency.cloudsmithStatus)
+    ));
+  if (matches.length === 0) return null;
+  const artifactKeys = new Set(matches.map(coverageLookupKey));
+  if (artifactKeys.size !== 1 || artifactKeys.has(null)) return null;
+  const dependency = matches[0];
   return {
-    ...item,
-    name,
-    version: versionValue || "",
-    format,
-    ecosystem: item.ecosystem || format,
+    ...dependency,
+    name: coordinate.name,
+    version: coordinate.version,
+    format: coordinate.format,
+    ecosystem: dependency.ecosystem || coordinate.format,
   };
 }
 

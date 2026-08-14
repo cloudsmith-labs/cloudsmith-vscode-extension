@@ -1,11 +1,13 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const assert = require("assert");
+const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { applyAuditPolicy } = require("../scripts/release/verify-dependency-audit");
 const { resolveOutputPath } = require("../scripts/release/package-vsix");
 const { assertVersionState } = require("../scripts/release/verify-version");
 const {
+  assertRelativeModuleClosure,
   isApprovedSourcePath,
   parseCliArguments,
   scanSensitiveBytes,
@@ -72,6 +74,27 @@ function exception(overrides = {}) {
 }
 
 suite("M9 release gate helpers", () => {
+  test("Quality explicitly verifies architecture before the release gate can pass", () => {
+    const workflow = fs.readFileSync(path.join(__dirname, "../.github/workflows/main.yml"), "utf8");
+    assert.match(workflow, /- name: Verify architecture boundaries\s+run: npm run verify:architecture/);
+    assert.match(workflow, /release-gate:[\s\S]*needs: \[quality, extension-tests, package\]/);
+  });
+
+  test("local checks and package inputs include every M11 runtime root", () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "../package.json"), "utf8"));
+    assert.ok(manifest.files.includes("commands/**/*.js"));
+    assert.ok(manifest.files.includes("domain/**/*.js"));
+    assert.match(manifest.scripts.check, /npm run verify:architecture/);
+    assert.strictEqual(manifest.scripts["vscode:prepublish"], "npm run check");
+
+    const syntax = fs.readFileSync(path.join(__dirname, "../scripts/check-syntax.js"), "utf8");
+    const build = fs.readFileSync(path.join(__dirname, "../scripts/verify-build.js"), "utf8");
+    for (const runtimeRoot of ["commands", "domain"]) {
+      assert.ok(syntax.includes(`\"${runtimeRoot}\"`));
+      assert.ok(build.includes(`\"${runtimeRoot}\"`));
+    }
+  });
+
   test("archive paths reject traversal, local files, normalization drift, and case collisions", () => {
     const seen = new Set();
     assert.strictEqual(validateArchivePath("extension/extension.js", seen), "extension/extension.js");
@@ -85,11 +108,30 @@ suite("M9 release gate helpers", () => {
 
   test("package allowlist accepts runtime/media and rejects tests and local configuration", () => {
     assert.strictEqual(isApprovedSourcePath("extension.js"), true);
+    assert.strictEqual(isApprovedSourcePath("commands/packages.js"), true);
+    assert.strictEqual(isApprovedSourcePath("domain/package.js"), true);
     assert.strictEqual(isApprovedSourcePath("util/lockfileParsers/npm.js"), true);
     assert.strictEqual(isApprovedSourcePath("media/vscode_icons/file_type_npm.svg"), true);
     assert.strictEqual(isApprovedSourcePath("test/activation.test.js"), false);
     assert.strictEqual(isApprovedSourcePath("internal_docs/audit.md"), false);
     assert.strictEqual(isApprovedSourcePath(".mcp.json"), false);
+  });
+
+  test("relative runtime closure follows command and domain modules", () => {
+    const entries = new Map([
+      ["extension/commands/packages.js", Buffer.from("require('../domain/package');")],
+      ["extension/domain/package.js", Buffer.from("module.exports = {};")],
+    ]);
+    const expected = new Map([
+      ["extension/commands/packages.js", {}],
+      ["extension/domain/package.js", {}],
+    ]);
+    assert.doesNotThrow(() => assertRelativeModuleClosure(entries, expected));
+    expected.delete("extension/domain/package.js");
+    assert.throws(
+      () => assertRelativeModuleClosure(entries, expected),
+      /omits relative runtime module/,
+    );
   });
 
   test("sensitive-content failures identify only the rule and archive ordinal", () => {

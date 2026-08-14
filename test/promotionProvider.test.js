@@ -1,4 +1,5 @@
 const assert = require("assert");
+const { fromPackageSelection } = require("../domain/packageAdapters");
 const { PromotionProvider } = require("../views/promotionProvider");
 const { PaginatedFetch } = require("../util/paginatedFetch");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
@@ -273,7 +274,7 @@ suite("Safe package promotion workflow", () => {
       withProgress: window.withProgress,
       now: () => Date.parse("2026-08-09T12:00:00Z"),
     });
-    const item = {
+    const item = fromPackageSelection({
       namespace: "workspace",
       repository: "source",
       slug_perm: { id: "Slug", value: "source-package-id" },
@@ -282,7 +283,7 @@ suite("Safe package promotion workflow", () => {
       version: { value: "0.0.1" },
       format: "raw",
       is_copyable: false,
-    };
+    });
     return {
       provider,
       calls,
@@ -296,6 +297,23 @@ suite("Safe package promotion workflow", () => {
       targetQueryCount: () => targetQueryCount,
     };
   }
+
+  test("provider entry rejects raw presentation identity", async () => {
+    const harness = createHarness();
+    const outcome = await harness.provider.runPromotionWorkflow({
+      namespace: "workspace",
+      repository: "source",
+      slug_perm: "source-package-id",
+      name: "artifact",
+      version: "1.0.0",
+      format: "raw",
+    });
+
+    assert.strictEqual(outcome.overall, "failed");
+    assert.strictEqual(outcome.errorCode, "malformed_source_locator");
+    assert.deepStrictEqual(harness.calls.get, []);
+    assert.deepStrictEqual(harness.calls.post, []);
+  });
 
   test("full success uses fresh canonical identity, confirms, writes once per stage, and verifies", async () => {
     const harness = createHarness({

@@ -1,8 +1,11 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const assert = require("assert");
 const vscode = require("vscode");
 const {
   enrichLicenses,
 } = require("../util/dependencyLicenseEnricher");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 
 suite("dependencyLicenseEnricher", () => {
   let originalGetConfiguration;
@@ -28,12 +31,15 @@ suite("dependencyLicenseEnricher", () => {
         format: "npm",
         ecosystem: "npm",
         cloudsmithStatus: "FOUND",
-        cloudsmithPackage: {
+        cloudsmithPackage: fromApiPackageRecord({
           namespace: "workspace-a",
           repository: "production-npm",
           slug_perm: "pkg-1",
+          name: "express",
+          version: "4.18.2",
+          format: "npm",
           license: "MIT",
-        },
+        }),
       },
       {
         name: "copyleft-lib",
@@ -41,12 +47,15 @@ suite("dependencyLicenseEnricher", () => {
         format: "npm",
         ecosystem: "npm",
         cloudsmithStatus: "FOUND",
-        cloudsmithPackage: {
+        cloudsmithPackage: fromApiPackageRecord({
           namespace: "workspace-a",
           repository: "production-npm",
           slug_perm: "pkg-2",
+          name: "copyleft-lib",
+          version: "1.0.0",
+          format: "npm",
           spdx_license: "LGPL-2.1",
-        },
+        }),
       },
       {
         name: "missing-lib",

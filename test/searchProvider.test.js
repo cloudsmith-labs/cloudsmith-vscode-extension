@@ -1,3 +1,5 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
 const assert = require("assert");
 const { SearchProvider } = require("../views/searchProvider");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
@@ -131,14 +133,13 @@ suite("SearchProvider atomic search state", () => {
       tags: { info: ["upstream"], nested: { source: "api" } },
       license: "MIT",
       licenseInfo: { metadata: { label: "caller-owned", nested: { secret: true } } },
-      status_str: { nested: { value: "Quarantined" } },
-      slug: { nested: "caller-owned" },
-      uploaded_at: { nested: "caller-owned" },
-      status_reason: { nested: "caller-owned" },
+      status_str: "Quarantined",
+      status_reason: "Blocked by policy",
       policy_violated: true,
-      max_severity: { nested: "Critical" },
+      max_severity: "Critical",
+      num_vulnerabilities: 1,
       vulnerability_scan_results_url: { nested: "https://example.invalid" },
-      cdn_url: { nested: "https://example.invalid" },
+      callerOwnedMetadata: { nested: "caller-owned" },
     });
     const { provider } = createProvider({
       fetchPage: async () => page([responsePackage]),
@@ -153,12 +154,12 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(committedNode.tags_raw.nested, undefined);
     assert.strictEqual(Object.isFrozen(committedNode.licenseInfo.metadata), true);
     assert.strictEqual(committedNode.licenseInfo.metadata.label, "Permissive");
-    assert.strictEqual(committedNode.status_str.value, null);
-    assert.strictEqual(committedNode.slug.value, null);
-    assert.strictEqual(committedNode.uploaded_at.value, null);
-    assert.strictEqual(committedNode.status_reason, null);
+    assert.strictEqual(committedNode.status_str.value, "Quarantined");
+    assert.strictEqual(committedNode.slug.value, "artifact-slug");
+    assert.strictEqual(committedNode.uploaded_at.value, "2026-03-25T00:00:00Z");
+    assert.strictEqual(committedNode.status_reason, "Blocked by policy");
     assert.strictEqual(committedNode.policy_violated, true);
-    assert.strictEqual(committedNode.max_severity, null);
+    assert.strictEqual(committedNode.max_severity, "Critical");
     assert.strictEqual(committedNode.vulnerability_scan_results_url, null);
     assert.strictEqual(committedNode.cdn_url, null);
     assert.strictEqual(committedNode.is_copyable, true);
@@ -166,12 +167,12 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(Object.isFrozen(responsePackage.tags), false);
     assert.strictEqual(Object.isFrozen(responsePackage.tags.info), false);
     assert.strictEqual(Object.isFrozen(responsePackage.licenseInfo), false);
-    assert.strictEqual(Object.isFrozen(responsePackage.status_str.nested), false);
+    assert.strictEqual(Object.isFrozen(responsePackage.callerOwnedMetadata), false);
     responsePackage.tags.info.push("caller-remains-mutable");
     responsePackage.licenseInfo.metadata.label = "mutated";
-    responsePackage.status_str.nested.value = "mutated";
+    responsePackage.callerOwnedMetadata.nested = "mutated";
     assert.deepStrictEqual(committedNode.tags_raw.info, ["upstream"]);
-    assert.strictEqual(committedNode.status_str.value, null);
+    assert.strictEqual(committedNode.status_str.value, "Quarantined");
   });
 
   test("uses the shared vulnerability indicator contract for retained packages", async () => {

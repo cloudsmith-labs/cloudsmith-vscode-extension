@@ -2,6 +2,7 @@ const assert = require("assert");
 const DependencyHealthNode = require("../models/dependencyHealthNode");
 const PackageNode = require("../models/packageNode");
 const SearchResultNode = require("../models/searchResultNode");
+const { fromPackageSelection } = require("../domain/packageAdapters");
 const { QuarantineExplainProvider } = require("../views/quarantineExplainProvider");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { createWebviewPanelHarness } = require("./helpers/webviewPanelHarness");
@@ -131,7 +132,7 @@ suite("QuarantineExplainProvider", () => {
       },
     });
 
-    const pending = provider.show(packageItem());
+    const pending = provider.show(exactPackage());
     await tick();
     await tick();
     assert.match(panelHarness.panel.webview.html, /Dependency rule matched/);
@@ -154,7 +155,7 @@ suite("QuarantineExplainProvider", () => {
           : emptyDecisionPage();
       },
     });
-    await provider.show(packageItem());
+    await provider.show(exactPackage());
     const html = panelHarness.panel.webview.html;
     assert.match(html, /Dependency rule matched/);
     assert.doesNotMatch(html, /permission|403|incomplete|Could not load/);
@@ -176,7 +177,7 @@ suite("QuarantineExplainProvider", () => {
         return apiSuccess({ slug_perm: "policy-a", description: "Blocks unsafe dependencies." });
       },
     });
-    await provider.show(packageItem({ status_reason: null }));
+    await provider.show(exactPackage({ status_reason: null }));
     const html = panelHarness.panel.webview.html;
     assert.match(html, /Quarantine policy/);
     assert.match(html, /Dependency rule matched/);
@@ -198,7 +199,7 @@ suite("QuarantineExplainProvider", () => {
         return apiFailure("not_found", { status: 404 });
       },
     });
-    await provider.show(packageItem({ status_reason: "Quarantined" }));
+    await provider.show(exactPackage({ status_reason: "Quarantined" }));
     assert.strictEqual(decisionCalls, 1);
     assert.match(panelHarness.panel.webview.html, /Dependency rule matched/);
   });
@@ -217,7 +218,7 @@ suite("QuarantineExplainProvider", () => {
           : emptyDecisionPage();
       },
     });
-    await provider.show(packageItem({
+    await provider.show(exactPackage({
       status_reason: "Quarantined by Stale policy. Stale rule matched. (Policy: stale-policy)",
     }));
     const html = panelHarness.panel.webview.html;
@@ -236,7 +237,7 @@ suite("QuarantineExplainProvider", () => {
           : emptyDecisionPage();
       },
     });
-    await provider.show(packageItem());
+    await provider.show(exactPackage());
     assert.doesNotMatch(panelHarness.panel.webview.html, /Wrong workspace policy/);
   });
 
@@ -255,7 +256,23 @@ suite("QuarantineExplainProvider", () => {
     assert.strictEqual(warnings.length, 2);
   });
 
-  test("production entry normalizes package, search, dependency, and legacy callers", async () => {
+  test("provider entry rejects raw presentation identity before panel and API work", async () => {
+    const panelHarness = createWebviewPanelHarness();
+    let calls = 0;
+    const warnings = [];
+    const provider = providerWith(panelHarness, {
+      async get() { calls += 1; throw new Error("must not dispatch"); },
+      async getV2() { calls += 1; throw new Error("must not dispatch"); },
+    }, { warning: async value => { warnings.push(value); } });
+
+    await provider.show(packageItem());
+
+    assert.strictEqual(calls, 0);
+    assert.strictEqual(panelHarness.panelCalls.length, 0);
+    assert.strictEqual(warnings.length, 1);
+  });
+
+  test("explicit boundaries adapt package, search, dependency, and legacy callers", async () => {
     const payload = nodePackagePayload();
     const nodeCases = [
       new PackageNode(payload, {}),
@@ -276,7 +293,7 @@ suite("QuarantineExplainProvider", () => {
       }),
     ];
 
-    for (const item of nodeCases) {
+    for (const item of nodeCases.map(fromPackageSelection)) {
       const panelHarness = createWebviewPanelHarness();
       const packageEndpoints = [];
       let resolveCurrent;
@@ -316,7 +333,7 @@ suite("QuarantineExplainProvider", () => {
       async get() { return apiSuccess(freshPackage({ repository: "repo-b" })); },
       async getV2() { throw new Error("must not dispatch"); },
     }, {}, { executeCommand: async (...args) => { effects.push(args); } });
-    await provider.show(packageItem());
+    await provider.show(exactPackage());
     assert.match(panelHarness.panel.webview.html, /Could not load quarantine details/);
     await panelHarness.send({ command: "findSafeVersion" });
     assert.deepStrictEqual(effects, []);
@@ -329,7 +346,7 @@ suite("QuarantineExplainProvider", () => {
       async get() { return apiFailure("not_found", { status: 404 }); },
       async getV2() { v2Calls += 1; throw new Error("must not dispatch"); },
     });
-    await provider.show(packageItem());
+    await provider.show(exactPackage());
     assert.match(panelHarness.panel.webview.html, /no longer available/);
     assert.doesNotMatch(panelHarness.panel.webview.html, /Quarantined|Find safe version/);
     assert.strictEqual(v2Calls, 0);
@@ -353,7 +370,7 @@ suite("QuarantineExplainProvider", () => {
       openExternal: async value => { effects.external.push(value); },
       writeClipboard: async value => { effects.clipboard.push(value); },
     });
-    await provider.show(packageItem());
+    await provider.show(exactPackage());
 
     for (const command of ["findSafeVersion", "showVulnerabilities", "openInCloudsmith", "copyReport"]) {
       await panelHarness.send({ command });
@@ -412,7 +429,7 @@ suite("QuarantineExplainProvider", () => {
       },
       async getV2() { throw new Error("must not dispatch"); },
     }, {}, { connectionManager: { getState() { return { ...state }; } } });
-    const pending = provider.show(packageItem());
+    const pending = provider.show(exactPackage());
     await tick();
     state = { ...state, activationId: "account-b", accountEpoch: 2 };
     provider.resetForAccountChange();
@@ -454,9 +471,9 @@ suite("QuarantineExplainProvider", () => {
       createWebviewPanel: (...args) => harnesses[panelIndex++].createWebviewPanel(...args),
       notifications: { information: async () => {}, warning: async () => {} },
     });
-    const first = provider.show(packageItem());
+    const first = provider.show(exactPackage());
     await tick();
-    const second = provider.show(packageItem({
+    const second = provider.show(exactPackage({
       name: "artifact-b",
       slug_perm: "package-b",
       slug_perm_raw: "package-b",
@@ -483,7 +500,7 @@ suite("QuarantineExplainProvider", () => {
           : emptyDecisionPage();
       },
     }, {}, { executeCommand: async (...args) => { commands.push(args); } });
-    const pending = provider.show(packageItem());
+    const pending = provider.show(exactPackage());
     await tick();
     await panelHarness.send({ command: "findSafeVersion" });
     assert.deepStrictEqual(commands, []);
@@ -612,6 +629,10 @@ function packageItem(overrides = {}) {
     uploaded_at: "2026-08-13T10:00:00.000Z",
     ...overrides,
   };
+}
+
+function exactPackage(overrides = {}) {
+  return fromPackageSelection(packageItem(overrides));
 }
 
 function nodePackagePayload() {

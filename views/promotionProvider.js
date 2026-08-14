@@ -1,6 +1,10 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const vscode = require("vscode");
+const { assertExactPackage } = require("../domain/package");
+const {
+  fromApiPackageRecord,
+} = require("../domain/packageAdapters");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiEndpoint } = require("../util/apiEndpoint");
 const { CredentialManager } = require("../util/credentialManager");
@@ -124,7 +128,15 @@ class PromotionProvider {
       maxRequests: MAX_EXACT_PACKAGE_PAGES,
       maxItems: MAX_EXACT_PACKAGE_ITEMS,
       query: buildExactPackageQuery(identity.name, identity.version, identity.format),
-      canonicalIdentity: packageCollectionIdentity,
+      canonicalIdentity: candidate => {
+        try {
+          return packageCollectionIdentity(fromApiPackageRecord(candidate, {
+            expectedWorkspace: identity.workspace,
+          }));
+        } catch {
+          return null;
+        }
+      },
       descriptor: `exact-package-locations:${identity.workspace}:${identity.format}`,
       responseType: "array",
       validate: isPackageLocationArray,
@@ -202,10 +214,12 @@ class PromotionProvider {
     };
   }
 
-  async runPromotionWorkflow(item, options = {}) {
+  async runPromotionWorkflow(value, options = {}) {
+    let pkg;
     let locator;
     try {
-      locator = createSourceLocator(item);
+      pkg = assertExactPackage(value);
+      locator = createSourceLocator(pkg);
     } catch (error) {
       const outcome = failureOutcome(errorCode(error, "malformed_source_locator"));
       await this._showFailure(outcome);
@@ -936,6 +950,16 @@ class PromotionProvider {
     }
     const packages = [];
     const knownIdentities = new Set();
+    const canonicalIdentity = candidate => {
+      try {
+        return packageCollectionIdentity(fromApiPackageRecord(candidate, {
+          expectedWorkspace: target.workspace,
+          expectedRepository: target.repository,
+        }));
+      } catch {
+        return null;
+      }
+    };
     let resume = null;
     while (true) {
       let collection;
@@ -948,7 +972,7 @@ class PromotionProvider {
           pageBatchLimit: 1,
           query,
           descriptor: `promotion-target:${target.workspace}:${target.repository}:${source.format}`,
-          canonicalIdentity: packageCollectionIdentity,
+          canonicalIdentity,
           validate: value => isPackageLocationArray(value) && value.every(candidate => (
             candidate.namespace === target.workspace
             && candidate.repository === target.repository
@@ -966,7 +990,16 @@ class PromotionProvider {
         return { ok: false, complete: false, packages: [], errorCode: "account_changed" };
       }
       for (const candidate of collection.items) {
-        knownIdentities.add(packageCollectionIdentity(candidate));
+        const identity = canonicalIdentity(candidate);
+        if (!identity) {
+          return {
+            ok: false,
+            complete: false,
+            packages: [],
+            errorCode: "malformed_target_package",
+          };
+        }
+        knownIdentities.add(identity);
         if (!packageMatchesExactIdentity(candidate, source)) continue;
         try {
           packages.push(normalizeTargetPackage(candidate, source, target));
@@ -1021,7 +1054,15 @@ class PromotionProvider {
         maxItems: MAX_EXACT_PACKAGE_ITEMS,
         query,
         descriptor: `promotion-presence-hints:${source.workspace}:${source.format}`,
-        canonicalIdentity: packageCollectionIdentity,
+        canonicalIdentity: candidate => {
+          try {
+            return packageCollectionIdentity(fromApiPackageRecord(candidate, {
+              expectedWorkspace: source.workspace,
+            }));
+          } catch {
+            return null;
+          }
+        },
         validate: value => isPackageLocationArray(value) && value.every(candidate => (
           candidate.namespace === source.workspace
         )),

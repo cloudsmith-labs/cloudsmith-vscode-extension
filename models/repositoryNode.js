@@ -7,10 +7,7 @@ const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiEndpoint } = require("../util/apiEndpoint");
 const { PaginatedFetch, replaceCollectionItems } = require("../util/paginatedFetch");
 const { formatApiError } = require("../util/errorFormatter");
-const {
-  getPackagePolicyFlags,
-  getPackageVulnerabilityState,
-} = require("../util/packageVulnerabilities");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const {
   entitlementCollectionIdentity,
   packageCollectionIdentity,
@@ -34,13 +31,8 @@ const MAX_COLLECTION_ITEMS = 600;
 const ENTITLEMENT_PAGE_SIZE = 50;
 const MAX_NAME_LENGTH = 2048;
 const MAX_FORMAT_LENGTH = 100;
-const MAX_VERSION_LENGTH = 2048;
 const MAX_IDENTITY_LENGTH = 512;
-const MAX_SCOPE_LENGTH = 256;
 const MAX_OPTIONAL_STRING_LENGTH = 4096;
-const MAX_URL_LENGTH = 8192;
-const MAX_TAGS = 100;
-const MAX_TAG_LENGTH = 500;
 const COLLECTION_TERMINATIONS = new Set([
   "cancelled",
   "duplicate_or_invalid_identity",
@@ -341,7 +333,10 @@ class RepositoryNode {
       } else {
         Object.assign(collectionOptions, {
           validate: value => isPackageArray(value, this.workspace, this.slug),
-          canonicalIdentity: packageCollectionIdentity,
+          canonicalIdentity: pkg => {
+            const canonical = canonicalizeRepositoryPackage(pkg, this.workspace, this.slug);
+            return canonical ? packageCollectionIdentity(canonical) : null;
+          },
         });
       }
       result = await paginatedFetch.fetchCollection(endpoint, collectionOptions);
@@ -981,112 +976,15 @@ function optionalString(value, maxLength = MAX_OPTIONAL_STRING_LENGTH) {
     : null;
 }
 
-function canonicalTags(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  const tags = {};
-  for (const field of ["info", "version"]) {
-    if (value[field] == null) continue;
-    const raw = Array.isArray(value[field]) ? value[field] : [value[field]];
-    if (
-      raw.length > MAX_TAGS
-      || !raw.every(tag => typeof tag === "string" && tag.length <= MAX_TAG_LENGTH)
-    ) return null;
-    tags[field] = [...raw];
-  }
-  return tags;
-}
-
 function canonicalizeRepositoryPackage(pkg, workspace, repository) {
-  if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) return null;
-  const name = boundedString(pkg.name, MAX_NAME_LENGTH, { trimmed: false });
-  const format = boundedString(pkg.format, MAX_FORMAT_LENGTH);
-  const version = typeof pkg.version === "string" || typeof pkg.version === "number"
-    ? boundedString(String(pkg.version), MAX_VERSION_LENGTH, { trimmed: false })
-    : null;
-  const namespace = boundedString(pkg.namespace, MAX_SCOPE_LENGTH);
-  const returnedRepository = boundedString(pkg.repository, MAX_SCOPE_LENGTH);
-  const slugPerm = boundedString(pkg.slug_perm, MAX_IDENTITY_LENGTH);
-  const tags = canonicalTags(pkg.tags);
-  const policyFlags = getPackagePolicyFlags(pkg);
-  if (
-    !name || !format || !version || !namespace || !returnedRepository || !slugPerm || !tags
-    || !policyFlags
-    || namespace !== workspace || returnedRepository !== repository
-  ) return null;
-  const vulnerability = canonicalVulnerabilityFields(pkg);
-  return {
-    name,
-    format,
-    version,
-    namespace,
-    repository: returnedRepository,
-    slug_perm: slugPerm,
-    slug: optionalString(pkg.slug, MAX_IDENTITY_LENGTH),
-    is_copyable: pkg.is_copyable === true ? true : pkg.is_copyable === false ? false : null,
-    status_str: optionalString(pkg.status_str),
-    downloads: Number.isSafeInteger(pkg.downloads) && pkg.downloads >= 0 ? pkg.downloads : 0,
-    uploaded_at: optionalString(pkg.uploaded_at),
-    status_reason: optionalString(pkg.status_reason),
-    checksum_sha256: optionalString(pkg.checksum_sha256),
-    version_digest: optionalString(pkg.version_digest),
-    cdn_url: optionalString(pkg.cdn_url, MAX_URL_LENGTH),
-    filename: optionalString(pkg.filename),
-    ...policyFlags,
-    num_vulnerabilities: vulnerability.numVulnerabilities,
-    has_vulnerabilities: vulnerability.hasVulnerabilities,
-    max_severity: optionalString(pkg.max_severity),
-    vulnerability_scan_results_url: optionalString(pkg.vulnerability_scan_results_url, MAX_URL_LENGTH),
-    security_scan_status: vulnerability.securityScanStatus,
-    spdx_license: optionalString(pkg.spdx_license),
-    license: optionalString(pkg.license),
-    raw_license: optionalString(pkg.raw_license),
-    license_url: optionalString(pkg.license_url, MAX_URL_LENGTH),
-    tags,
-  };
-}
-
-function canonicalVulnerabilityFields(pkg) {
-  const evidenceFields = [
-    "num_vulnerabilities",
-    "vulnerability_scan_results_count",
-    "vulnerabilityCount",
-    "has_vulnerabilities",
-    "security_scan_status",
-  ];
-  const hasEvidence = evidenceFields.some(field => (
-    Object.prototype.hasOwnProperty.call(pkg, field)
-    && pkg[field] !== undefined
-    && pkg[field] !== null
-    && pkg[field] !== ""
-  ));
-  const state = getPackageVulnerabilityState(pkg);
-  if (!hasEvidence || state.unknown) {
-    return {
-      numVulnerabilities: undefined,
-      hasVulnerabilities: undefined,
-      securityScanStatus: null,
-    };
+  try {
+    return fromApiPackageRecord(pkg, {
+      expectedWorkspace: workspace,
+      expectedRepository: repository,
+    });
+  } catch {
+    return null;
   }
-  const securityScanStatus = optionalString(pkg.security_scan_status, 256);
-  if (state.count !== null) {
-    return {
-      numVulnerabilities: state.count,
-      hasVulnerabilities: state.count > 0,
-      securityScanStatus,
-    };
-  }
-  if (state.detected) {
-    return {
-      numVulnerabilities: undefined,
-      hasVulnerabilities: true,
-      securityScanStatus,
-    };
-  }
-  return {
-    numVulnerabilities: undefined,
-    hasVulnerabilities: undefined,
-    securityScanStatus: null,
-  };
 }
 
 function isPackageArray(value, workspace, repository) {

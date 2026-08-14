@@ -1,6 +1,8 @@
 const STANDALONE_NODE_TESTS = Object.freeze([
   "test/accountOperation.test.js",
   "test/apiEndpoint.test.js",
+  "test/architectureGate.test.js",
+  "test/commandRegistrars.test.js",
   "test/collectionIdentity.test.js",
   "test/connectionPresentation.test.js",
   "test/dependencyAdapterRegistry.test.js",
@@ -10,6 +12,7 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/foundDependencyKey.test.js",
   "test/installCommandBuilder.test.js",
   "test/manifestParser.test.js",
+  "test/packageDomain.test.js",
   "test/packageQuery.test.js",
   "test/packageVulnerabilities.test.js",
   "test/vulnerabilityStateService.test.js",
