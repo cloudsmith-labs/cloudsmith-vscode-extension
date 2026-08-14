@@ -90,6 +90,120 @@ suite("Canonical package domain", () => {
     assert.ok(isExactPackage(pkg));
   });
 
+  test("normalizes reflection failures into trusted adapter errors", () => {
+    let hostileThrownValue;
+    hostileThrownValue = new Proxy({}, {
+      getPrototypeOf() {
+        throw hostileThrownValue;
+      },
+      ownKeys() {
+        throw hostileThrownValue;
+      },
+    });
+    for (const hostile of [
+      new Proxy({}, {
+        getPrototypeOf() {
+          throw new Error("untrusted getPrototypeOf trap");
+        },
+      }),
+      new Proxy({}, {
+        ownKeys() {
+          throw new Error("untrusted ownKeys trap");
+        },
+      }),
+      new Proxy({}, {
+        getPrototypeOf() {
+          throw hostileThrownValue;
+        },
+      }),
+    ]) {
+      assert.throws(() => fromApiPackageRecord(hostile), error => (
+        error instanceof PackageAdapterError
+        && !Object.prototype.hasOwnProperty.call(error, "cause")
+      ));
+      assert.throws(() => fromDependencyHealthNode({
+        cloudsmithPackage: hostile,
+      }), error => (
+        error instanceof PackageAdapterError
+        && !Object.prototype.hasOwnProperty.call(error, "cause")
+      ));
+    }
+
+    const unstableTarget = apiRecord();
+    const targetPropertyCount = Reflect.ownKeys(unstableTarget).length;
+    let descriptorReads = 0;
+    const falsyThrow = new Proxy(unstableTarget, {
+      getOwnPropertyDescriptor(target, field) {
+        descriptorReads += 1;
+        if (descriptorReads > targetPropertyCount) throw undefined;
+        return Reflect.getOwnPropertyDescriptor(target, field);
+      },
+    });
+    assert.throws(() => fromApiPackageRecord(falsyThrow), error => (
+      error instanceof PackageAdapterError
+      && error.unexpected === true
+      && !Object.prototype.hasOwnProperty.call(error, "cause")
+    ));
+
+    const forgedDomainError = Object.create(PackageDomainError.prototype);
+    Object.defineProperties(forgedDomainError, {
+      code: { value: "forged" },
+      field: { value: "forged" },
+      message: { value: "secret-bearing forged domain failure" },
+    });
+    const forgedTarget = apiRecord();
+    const forgedTargetPropertyCount = Reflect.ownKeys(forgedTarget).length;
+    let forgedDescriptorReads = 0;
+    const forgedThrow = new Proxy(forgedTarget, {
+      getOwnPropertyDescriptor(target, field) {
+        forgedDescriptorReads += 1;
+        if (forgedDescriptorReads > forgedTargetPropertyCount) throw forgedDomainError;
+        return Reflect.getOwnPropertyDescriptor(target, field);
+      },
+    });
+    assert.throws(() => fromApiPackageRecord(forgedThrow), error => (
+      error instanceof PackageAdapterError
+      && error.unexpected === true
+      && error.code === "invalid_api_package"
+      && !error.message.includes("secret-bearing")
+    ));
+
+    const unexpectedSelectionTarget = apiRecord();
+    let ownKeysCalls = 0;
+    let innerDescriptorReadsRemaining = null;
+    const unexpectedSelection = new Proxy(unexpectedSelectionTarget, {
+      ownKeys(target) {
+        ownKeysCalls += 1;
+        const keys = Reflect.ownKeys(target);
+        if (ownKeysCalls === 4) innerDescriptorReadsRemaining = keys.length;
+        return keys;
+      },
+      getOwnPropertyDescriptor(target, field) {
+        if (innerDescriptorReadsRemaining === 0) throw undefined;
+        if (innerDescriptorReadsRemaining !== null) innerDescriptorReadsRemaining -= 1;
+        return Reflect.getOwnPropertyDescriptor(target, field);
+      },
+    });
+    assert.throws(() => fromPackageSelection(unexpectedSelection), error => (
+      error instanceof PackageAdapterError
+      && error.code === "malformed_applicable_adapter"
+      && error.unexpected === true
+    ));
+
+    const exact = fromApiPackageRecord(apiRecord());
+    const hostileOptions = new Proxy({}, {
+      getOwnPropertyDescriptor() {
+        throw undefined;
+      },
+    });
+    assert.throws(() => fromApiPackageRecord(exact, hostileOptions), error => (
+      error instanceof PackageAdapterError
+      && error.code === "invalid_api_package"
+      && error.unexpected === true
+      && !Object.prototype.hasOwnProperty.call(error, "cause")
+    ));
+  });
+
   test("uses one exact, case-sensitive, delimiter-safe identity and immutable ref", () => {
     const upper = fromApiPackageRecord(apiRecord());
     const lower = fromApiPackageRecord(apiRecord({
@@ -371,7 +485,7 @@ suite("Canonical package domain", () => {
   test("requires exact identity and rejects unsafe encoded path identities", () => {
     assert.throws(
       () => fromApiPackageRecord(apiRecord({ slug_perm: undefined })),
-      PackageAdapterError
+      error => error instanceof PackageAdapterError && error.unexpected === false
     );
     for (const packageIdentifier of [
       "../package",

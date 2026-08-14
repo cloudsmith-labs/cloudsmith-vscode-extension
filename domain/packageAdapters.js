@@ -12,6 +12,7 @@ const {
 } = require("./package");
 
 const MAX_WRAPPER_DEPTH = 2;
+const PACKAGE_ADAPTER_ERRORS = new WeakSet();
 const DETECTED_STATUS = "scan detected vulnerabilities";
 const CLEAN_STATUS = "scan detected no vulnerabilities";
 const SEMANTIC_FIELDS = Object.freeze([
@@ -77,12 +78,17 @@ const SEMANTIC_FIELDS = Object.freeze([
 ]);
 
 class PackageAdapterError extends TypeError {
-  constructor(code, field, message, cause = null) {
+  constructor(code, field, message, unexpected = false) {
     super(message);
     this.name = "PackageAdapterError";
     this.code = code;
     this.field = field;
-    if (cause) this.cause = cause;
+    this.unexpected = unexpected === true;
+    PACKAGE_ADAPTER_ERRORS.add(this);
+  }
+
+  static isTrusted(value) {
+    return PACKAGE_ADAPTER_ERRORS.has(value);
   }
 }
 
@@ -320,12 +326,12 @@ function fromExactPackageSelectionIfPresent(value) {
 }
 
 function fromApiPackageRecord(record, options = {}) {
-  if (isExactPackage(record)) {
-    validateExpectedScope(record, options);
-    return record;
-  }
-  requireRecord(record, "API package", { plain: true });
   try {
+    if (isExactPackage(record)) {
+      validateExpectedScope(record, options);
+      return record;
+    }
+    requireRecord(record, "API package", { plain: true });
     const result = adaptFlatExactRecord(record, {
       allowNumericVersion: true,
       allowWrappers: false,
@@ -349,9 +355,9 @@ function fromSearchResultNode(node) {
 }
 
 function fromDependencyHealthNode(node, options = {}) {
-  requireRecord(node, "dependency health node");
-  requireRecord(options, "dependency package adapter options", { plain: true });
   try {
+    requireRecord(node, "dependency health node");
+    requireRecord(options, "dependency package adapter options", { plain: true });
     if (isExactPackage(node) || isPackageCoordinate(node)) {
       for (const field of ["workspace", "repository"]) {
         const expected = consensusString(options, [field], field, {
@@ -516,7 +522,7 @@ function fromPackageSelection(value) {
           "malformed_applicable_adapter",
           "package selection",
           `The ${adapter} selection is malformed.`,
-          error
+          isUnexpectedPackageAdapterError(error)
         );
       }
     }
@@ -1356,15 +1362,22 @@ function requireRecord(value, field, options = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw adapterError("invalid_record", field, `The ${field} value is invalid.`);
   }
-  if (options.plain) {
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      throw adapterError("invalid_record", field, `The ${field} value is invalid.`);
+  try {
+    if (options.plain) {
+      const prototype = Object.getPrototypeOf(value);
+      if (prototype !== Object.prototype && prototype !== null) {
+        throw adapterError("invalid_record", field, `The ${field} value is invalid.`);
+      }
     }
+    assertNoSymbolProperties(value, field);
+    assertNoOwnAccessors(value, field);
+    assertNoInheritedSemanticProperties(value, field);
+  } catch (error) {
+    if (PACKAGE_ADAPTER_ERRORS.has(error)) throw error;
+    // Reflection traps are part of the untrusted record boundary. Normalize them
+    // without retaining or inspecting the adversarial thrown value.
+    throw adapterError("invalid_record", field, `The ${field} value is invalid.`);
   }
-  assertNoSymbolProperties(value, field);
-  assertNoOwnAccessors(value, field);
-  assertNoInheritedSemanticProperties(value, field);
   return value;
 }
 
@@ -1449,16 +1462,41 @@ function boundaryPathPart(value, field, maxLength) {
   return validated;
 }
 
-function adapterError(code, field, message, cause = null) {
-  return new PackageAdapterError(code, field, message, cause);
+function adapterError(code, field, message, unexpected = false) {
+  return new PackageAdapterError(code, field, message, unexpected);
 }
 
 function asAdapterError(error, code, field) {
-  if (error instanceof PackageAdapterError) return error;
-  if (error instanceof PackageDomainError) {
-    return adapterError(error.code, error.field, error.message, error);
+  if (PACKAGE_ADAPTER_ERRORS.has(error)) return error;
+  const domainError = snapshotPackageDomainError(error);
+  if (domainError) {
+    return adapterError(domainError.code, domainError.field, domainError.message);
   }
-  return adapterError(code, field, `The ${field} value is invalid.`, error);
+  return adapterError(code, field, `The ${field} value is invalid.`, true);
+}
+
+function isUnexpectedPackageAdapterError(error) {
+  if (!PACKAGE_ADAPTER_ERRORS.has(error)) return true;
+  try {
+    const unexpected = Object.getOwnPropertyDescriptor(error, "unexpected");
+    return Boolean(unexpected && "value" in unexpected && unexpected.value === true);
+  } catch {
+    return true;
+  }
+}
+
+function snapshotPackageDomainError(error) {
+  try {
+    if (!PackageDomainError.isTrusted(error)) return null;
+    const properties = Object.getOwnPropertyDescriptors(error);
+    const code = properties.code?.value;
+    const errorField = properties.field?.value;
+    const message = properties.message?.value;
+    if (![code, errorField, message].every(value => typeof value === "string")) return null;
+    return { code, field: errorField, message };
+  } catch {
+    return null;
+  }
 }
 
 module.exports = {

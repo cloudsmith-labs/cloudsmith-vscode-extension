@@ -24,6 +24,7 @@ const {
   validateDependencyDeclarationSourceContract,
 } = require("../util/dependencyDeclarationIndex");
 const { canonicalFormat } = require("../util/packageNameNormalizer");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 
 suite("DiagnosticsPublisher Test Suite", () => {
   let collection;
@@ -73,6 +74,7 @@ suite("DiagnosticsPublisher Test Suite", () => {
     isDevelopmentDependency = false,
     environmentMarker = null,
     packageSource = { kind: DEPENDENCY_PACKAGE_SOURCE_KINDS.REGISTRY },
+    cloudsmithPackage = null,
   }) {
     const dependency = createDependencyRecord({
       ecosystem,
@@ -97,9 +99,143 @@ suite("DiagnosticsPublisher Test Suite", () => {
     return createDiagnosticCandidate(dependency, {
       state,
       displayVersion: resolvedVersion || declaredConstraint || null,
-      cloudsmithMatch: null,
+      cloudsmithPackage,
     });
   }
+
+  test("snapshots canonical dependency package metadata for vulnerability diagnostics", () => {
+    const packageModel = fromApiPackageRecord({
+      namespace: "workspace-a",
+      repository: "repository-a",
+      slug_perm: "package-a",
+      name: "alpha",
+      version: "1.0.0",
+      format: "npm",
+      num_vulnerabilities: 2,
+      security_scan_status: "Scan Detected Vulnerabilities",
+    });
+    const prepared = candidate({
+      name: "alpha",
+      state: "violated",
+      cloudsmithPackage: packageModel,
+    });
+
+    assert.deepStrictEqual(prepared.cloudsmith, {
+      workspace: "workspace-a",
+      repository: "repository-a",
+      vulnerabilityEvidence: "detected",
+      vulnerabilitiesDetected: true,
+      vulnerabilityCount: 2,
+    });
+    assert.throws(() => candidate({
+      name: "alpha",
+      state: "violated",
+      cloudsmithPackage: {
+        namespace: "workspace-a",
+        repository: "repository-a",
+        slug_perm: "package-a",
+      },
+    }), TypeError);
+  });
+
+  test("requires branded canonical diagnostic packages and preserves vulnerability evidence", () => {
+    const rawBase = {
+      namespace: "workspace-a",
+      repository: "repository-a",
+      slug_perm: "package-a",
+      name: "alpha",
+      version: "1.0.0",
+      format: "npm",
+    };
+    const detected = fromApiPackageRecord({
+      ...rawBase,
+      num_vulnerabilities: 2,
+      security_scan_status: "Scan Detected Vulnerabilities",
+    });
+    const clean = fromApiPackageRecord({
+      ...rawBase,
+      num_vulnerabilities: 0,
+      security_scan_status: "Scan Detected No Vulnerabilities",
+    });
+    const unknown = fromApiPackageRecord(rawBase);
+    const detectedWithoutCount = fromApiPackageRecord({
+      ...rawBase,
+      has_vulnerabilities: true,
+      security_scan_status: "Scan Detected Vulnerabilities",
+    });
+
+    const detectedCandidate = candidate({
+      name: "alpha",
+      state: "violated",
+      cloudsmithPackage: detected,
+    });
+    const cleanCandidate = candidate({
+      name: "alpha",
+      state: "violated",
+      cloudsmithPackage: clean,
+    });
+    const unknownCandidate = candidate({
+      name: "alpha",
+      state: "violated",
+      cloudsmithPackage: unknown,
+    });
+    const detectedWithoutCountCandidate = candidate({
+      name: "alpha",
+      state: "violated",
+      cloudsmithPackage: detectedWithoutCount,
+    });
+    assert.strictEqual(detectedCandidate.cloudsmith.vulnerabilityCount, 2);
+    assert.strictEqual(cleanCandidate.cloudsmith.vulnerabilityCount, 0);
+    assert.strictEqual(unknownCandidate.cloudsmith.vulnerabilityCount, null);
+    assert.deepStrictEqual(detectedWithoutCountCandidate.cloudsmith, {
+      workspace: "workspace-a",
+      repository: "repository-a",
+      vulnerabilityEvidence: "detected",
+      vulnerabilitiesDetected: true,
+      vulnerabilityCount: null,
+    });
+    assert.strictEqual(candidate({
+      name: "alpha",
+      state: "not_found",
+      cloudsmithPackage: null,
+    }).cloudsmith, null);
+
+    const publisher = new DiagnosticsPublisher({ createDiagnosticCollection });
+    const range = {
+      start: { line: 0, character: 0 },
+      end: { line: 0, character: 5 },
+    };
+    assert.strictEqual(publisher._createDiagnostic(unknownCandidate, range).code, undefined);
+    assert.strictEqual(publisher._createDiagnostic(cleanCandidate, range).code, undefined);
+    assert.strictEqual(
+      publisher._createDiagnostic(detectedCandidate, range).code.value,
+      "2 vulnerabilities"
+    );
+    assert.match(publisher._getMessage(unknownCandidate), /unknown vulnerability status/);
+    assert.match(
+      publisher._getMessage(detectedWithoutCountCandidate),
+      /vulnerabilities detected/
+    );
+    assert.doesNotMatch(publisher._getMessage(unknownCandidate), /policy violations/);
+
+    for (const untrusted of [rawBase, { ...detected }]) {
+      assert.throws(() => candidate({
+        name: "alpha",
+        state: "violated",
+        cloudsmithPackage: untrusted,
+      }), TypeError);
+    }
+    const occurrence = candidate({
+      name: "alpha",
+      state: "not_found",
+      cloudsmithPackage: null,
+    }).occurrence;
+    assert.throws(() => createDiagnosticCandidate(occurrence, {
+      state: "violated",
+      displayVersion: "1.0.0",
+      cloudsmithMatch: detected,
+    }), /must use cloudsmithPackage/);
+  });
 
   function createMemoryPublisher(files, options = {}) {
     const reads = [];
@@ -160,7 +296,7 @@ suite("DiagnosticsPublisher Test Suite", () => {
       candidates: [createDiagnosticCandidate(healthOccurrence, {
         state: healthNode.state,
         displayVersion: healthNode.declaredVersion,
-        cloudsmithMatch: healthNode.cloudsmithMatch,
+        cloudsmithPackage: healthNode.package,
       })],
     });
     return { occurrence, prepared };
@@ -1157,7 +1293,7 @@ suite("DiagnosticsPublisher Test Suite", () => {
       () => createDiagnosticCandidate(dependency, {
         state: "not_found",
         displayVersion: "1.0.0",
-        cloudsmithMatch: null,
+        cloudsmithPackage: null,
       }),
       /must not contain accessors/
     );
@@ -1185,7 +1321,7 @@ suite("DiagnosticsPublisher Test Suite", () => {
       () => createDiagnosticCandidate(forgedDependency, {
         state: "not_found",
         displayVersion: "1.0.0",
-        cloudsmithMatch: null,
+        cloudsmithPackage: null,
       }),
       /URI and path must identify the same file/
     );

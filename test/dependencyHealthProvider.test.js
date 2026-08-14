@@ -1021,6 +1021,45 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.match(provider._warnings[0], /reached its safety limit/);
   });
 
+  test("diagnostic preparation snapshots only the canonical found package", async () => {
+    let capturedCandidates = null;
+    const diagnostics = {
+      async prepare({ candidates }) {
+        capturedCandidates = candidates;
+        return { entries: [], warnings: [], stats: null };
+      },
+      replace() {},
+    };
+    const dependency = createFoundDependency("left-pad", "1.0.0");
+    dependency.cloudsmithPackage = fromApiPackageRecord({
+      namespace: "workspace",
+      repository: "repo",
+      slug_perm: "left-pad-1.0.0",
+      name: "left-pad",
+      version: "1.0.0",
+      format: "npm",
+      num_vulnerabilities: 2,
+      security_scan_status: "Scan Detected Vulnerabilities",
+    });
+    const provider = new DependencyHealthProvider(createContext(), diagnostics);
+    const scanWorker = {
+      _warnings: [],
+      _projectFolderPath: "/project",
+      _fullTrees: [{ ecosystem: "npm", sourceFile: "package.json", dependencies: [dependency] }],
+    };
+
+    await provider._prepareDiagnostics(scanWorker, { isCancellationRequested: false });
+
+    assert.strictEqual(capturedCandidates.length, 1);
+    assert.deepStrictEqual(capturedCandidates[0].cloudsmith, {
+      workspace: "workspace",
+      repository: "repo",
+      vulnerabilityEvidence: "detected",
+      vulnerabilitiesDetected: true,
+      vulnerabilityCount: 2,
+    });
+  });
+
   test("scope change can select a different project folder without mutating successful scope", async () => {
     const originalShowQuickPick = vscode.window.showQuickPick;
     const originalShowOpenDialog = vscode.window.showOpenDialog;
@@ -2111,7 +2150,10 @@ suite("DependencyHealthProvider Test Suite", () => {
     });
 
     assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
-    assert.strictEqual(isExactPackage(result.package), true);
+    assert.ok(isExactPackage(result.package));
+    assert.strictEqual(result.package.workspace, "workspace");
+    assert.strictEqual(result.package.repository, "repo");
+    assert.ok(result.package.packageIdentifier);
     assert.strictEqual(result.package.name, expectedPackage.name);
     assert.strictEqual(result.package.version, expectedPackage.version);
     assert.strictEqual(result.pagesFetched, 1);
@@ -2353,6 +2395,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       });
       assert.notStrictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
       assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED);
+      assert.strictEqual(result.package, null);
     }
   });
 
