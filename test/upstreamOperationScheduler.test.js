@@ -77,6 +77,70 @@ suite("UpstreamOperationScheduler", () => {
     assert.strictEqual(scheduler.requestCount, 1);
   });
 
+  test("abort retires non-cooperative active and queued work and observes late rejection", async () => {
+    const scheduler = new UpstreamOperationScheduler({ concurrency: 1, maxRequests: 10 });
+    const controller = new AbortController();
+    let rejectLate;
+    let queuedDispatched = false;
+    const unhandled = [];
+    const onUnhandled = reason => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      const active = scheduler.run(() => new Promise((_resolve, reject) => {
+        rejectLate = reject;
+      }), { signal: controller.signal });
+      const queued = scheduler.run(async () => {
+        queuedDispatched = true;
+        return "must-not-run";
+      }, { signal: controller.signal });
+      assert.strictEqual(scheduler.activeCount, 1);
+      assert.strictEqual(scheduler.queuedCount, 1);
+
+      controller.abort();
+      const results = await Promise.allSettled([active, queued]);
+      assert.ok(results.every(result => (
+        result.status === "rejected" && result.reason.kind === "cancelled"
+      )));
+      assert.strictEqual(queuedDispatched, false);
+      assert.strictEqual(scheduler.activeCount, 0);
+      assert.strictEqual(scheduler.queuedCount, 0);
+
+      rejectLate(new Error("late scheduler transport failure"));
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepStrictEqual(unhandled, []);
+      assert.strictEqual(scheduler.activeCount, 0);
+      assert.strictEqual(scheduler.queuedCount, 0);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
+  });
+
+  test("contains a token that invokes its cancellation callback during registration", async () => {
+    const scheduler = new UpstreamOperationScheduler({ concurrency: 1, maxRequests: 10 });
+    let disposed = 0;
+    let dispatched = false;
+    const token = {
+      isCancellationRequested: false,
+      onCancellationRequested(listener) {
+        listener();
+        return { dispose() { disposed += 1; } };
+      },
+    };
+
+    await assert.rejects(
+      scheduler.run(async () => {
+        dispatched = true;
+      }, { cancellationToken: token }),
+      error => error.kind === "cancelled"
+    );
+    assert.strictEqual(dispatched, false);
+    assert.strictEqual(disposed, 1);
+    assert.strictEqual(scheduler.activeCount, 0);
+    assert.strictEqual(scheduler.queuedCount, 0);
+  });
+
   test("rejects accepted work beyond the operation request budget", async () => {
     const scheduler = new UpstreamOperationScheduler({ concurrency: 1, maxRequests: 2 });
     assert.strictEqual(await scheduler.run(async () => "first"), "first");

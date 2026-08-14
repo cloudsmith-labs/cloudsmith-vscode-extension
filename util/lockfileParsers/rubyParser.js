@@ -4,14 +4,16 @@ const {
   buildTree,
   countIndent,
   createDependency,
-  deduplicateDeps,
-  flattenDependencies,
   getSourceFileName,
   getWorkspacePath,
   pathExists,
   readUtf8,
 } = require("./shared");
 const { parseGemfileManifest } = require("./manifestHelpers");
+
+const MAX_RUBY_INVENTORY = 50000;
+const MAX_RUBY_RELATIONSHIP_EDGES = 500000;
+const MAX_RUBY_RELATIONSHIP_DEPTH = 128;
 
 const rubyParser = {
   name: "rubyParser",
@@ -31,9 +33,7 @@ const rubyParser = {
     const manifestPath = await pathExists(path.join(rootPath, "Gemfile"), workspaceFolder)
       ? path.join(rootPath, "Gemfile")
       : null;
-    if (!lockfilePath && !manifestPath) {
-      return [];
-    }
+    if (!lockfilePath && !manifestPath) return [];
     return [{
       resolverName: this.name,
       ecosystem: this.ecosystem,
@@ -43,91 +43,94 @@ const rubyParser = {
     }];
   },
 
-  async resolve({ lockfilePath, manifestPath, workspaceFolder }) {
+  async resolve({ lockfilePath, manifestPath, workspaceFolder, options = {} }) {
+    const cancellationToken = options.cancellationToken;
+    throwIfRubyCancelled(cancellationToken);
     const sourceFile = getSourceFileName(lockfilePath || manifestPath);
+    const manifestDependencies = manifestPath && await pathExists(manifestPath, workspaceFolder)
+      ? parseGemfileManifest(await readUtf8(manifestPath, workspaceFolder, options))
+      : [];
     if (!lockfilePath) {
-      const dependencies = parseGemfileManifest(await readUtf8(manifestPath, workspaceFolder)).map((dependency) => createDependency({
-        name: dependency.name,
-        version: dependency.version,
-        ecosystem: "ruby",
-        isDirect: true,
-        parent: null,
-        parentChain: [],
-        transitives: [],
-        sourceFile,
-        isDevelopmentDependency: dependency.isDevelopmentDependency,
-      }));
-      return buildTree("ruby", sourceFile, dependencies);
+      return buildTree("ruby", sourceFile, manifestDependencies.map((dependency) => ({
+        ...createDependency({
+          name: dependency.name,
+          version: dependency.version,
+          ecosystem: "ruby",
+          isDirect: true,
+          parent: null,
+          parentChain: [],
+          transitives: [],
+          sourceFile,
+          isDevelopmentDependency: dependency.isDevelopmentDependency,
+          packageSource: dependency.packageSource,
+        }),
+        declaredConstraint: dependency.version || null,
+      })));
     }
 
-    const directNames = manifestPath && await pathExists(manifestPath, workspaceFolder)
-      ? new Set(parseGemfileManifest(await readUtf8(manifestPath, workspaceFolder)).map((dependency) => dependency.name.toLowerCase()))
-      : null;
-    const records = parseGemfileLock(await readUtf8(lockfilePath, workspaceFolder));
-    const recordsByName = new Map();
-    const incomingCounts = new Map();
-
-    for (const record of records) {
-      recordsByName.set(record.name.toLowerCase(), record);
-      for (const dependencyName of record.dependencies) {
-        incomingCounts.set(dependencyName.toLowerCase(), (incomingCounts.get(dependencyName.toLowerCase()) || 0) + 1);
-      }
+    const parsed = parseGemfileLock(
+      await readUtf8(lockfilePath, workspaceFolder, options),
+      cancellationToken
+    );
+    if (parsed.records.length === 0) {
+      throw new Error("The Ruby lockfile did not contain package records.");
+    }
+    if (parsed.records.length > MAX_RUBY_INVENTORY) {
+      throw new Error("The Ruby lockfile inventory is too large to scan completely.");
     }
 
-    const rootRecords = directNames && directNames.size > 0
-      ? [...directNames].map((name) => recordsByName.get(name)).filter(Boolean)
-      : records.filter((record) => !incomingCounts.get(record.name.toLowerCase()));
-
-    const directRoots = deduplicateDeps(rootRecords.map((record) => buildRubyDependency(
-      record,
-      [],
-      recordsByName,
-      new Set(),
-      sourceFile,
-      directNames || new Set()
-    )));
-
-    let dependencies = deduplicateDeps(flattenDependencies(directRoots));
-    for (const record of records) {
-      const key = `${record.name.toLowerCase()}@${record.version.toLowerCase()}`;
-      if (dependencies.some((dependency) => `${dependency.name.toLowerCase()}@${dependency.version.toLowerCase()}` === key)) {
-        continue;
-      }
-      dependencies.push(createDependency({
-        name: record.name,
-        version: record.version,
-        ecosystem: "ruby",
-        isDirect: directNames ? directNames.has(record.name.toLowerCase()) : false,
-        parent: null,
-        parentChain: [],
-        transitives: [],
-        sourceFile,
+    const declarations = manifestDependencies.length > 0
+      ? manifestDependencies
+      : parsed.directNames.map((name) => ({
+        name,
+        version: "",
         isDevelopmentDependency: false,
+        packageSource: { kind: "registry" },
       }));
+    const directByName = new Map();
+    for (const declaration of declarations) {
+      const key = declaration.name.toLowerCase();
+      const previous = directByName.get(key);
+      directByName.set(key, {
+        ...declaration,
+        isDevelopmentDependency: previous
+          ? previous.isDevelopmentDependency && declaration.isDevelopmentDependency
+          : declaration.isDevelopmentDependency,
+      });
     }
 
-    return buildTree("ruby", sourceFile, dependencies);
+    const graph = buildRubyGraph(parsed.records, directByName, cancellationToken);
+    const dependencies = materializeRubyInventory({
+      records: parsed.records,
+      directByName,
+      graph,
+      sourceFile,
+      cancellationToken,
+    });
+    const warnings = graph.truncated
+      ? ["Some Ruby dependency relationships were omitted to keep the scan responsive. Package inventory remains complete."]
+      : [];
+    return buildTree("ruby", sourceFile, dependencies, warnings);
   },
 };
 
-function parseGemfileLock(content) {
+function parseGemfileLock(content, cancellationToken) {
   const records = [];
+  const directNames = [];
   let section = "";
   let inSpecs = false;
   let current = null;
+  let currentSource = { kind: "registry" };
 
   const flushCurrent = () => {
-    if (current && current.name && current.version) {
-      records.push(current);
-    }
+    if (current && current.name && current.version) records.push(current);
     current = null;
   };
 
   for (const rawLine of String(content || "").split(/\r?\n/)) {
+    throwIfRubyCancelled(cancellationToken);
     const trimmed = rawLine.trimEnd();
-    if (!trimmed) {
-      continue;
-    }
+    if (!trimmed) continue;
     const indent = countIndent(rawLine);
     const line = trimmed.trim();
 
@@ -135,83 +138,262 @@ function parseGemfileLock(content) {
       flushCurrent();
       section = line;
       inSpecs = false;
+      currentSource = rubySourceForSection(section, "");
       continue;
     }
-    if (section === "GEM" && indent === 2 && line === "specs:") {
+    if (section === "DEPENDENCIES" && indent === 2) {
+      const name = line.split(/[\s(!]/, 1)[0].replace(/!$/, "").trim();
+      if (name) directNames.push(name);
+      continue;
+    }
+    if (!["GEM", "GIT", "PATH"].includes(section)) continue;
+    if (indent === 2 && line.startsWith("remote:")) {
+      currentSource = rubySourceForSection(section, line.slice("remote:".length).trim());
+      continue;
+    }
+    if (indent === 2 && line === "specs:") {
       inSpecs = true;
       continue;
     }
-    if (!inSpecs) {
-      continue;
-    }
+    if (!inSpecs) continue;
     if (indent === 4) {
       flushCurrent();
       const match = line.match(/^([^\s(]+) \(([^)]+)\)/);
-      if (!match) {
-        continue;
-      }
-      current = { name: match[1], version: match[2], dependencies: [] };
+      if (!match) continue;
+      const parsedVersion = splitRubyVersionAndPlatform(match[2]);
+      current = {
+        name: match[1],
+        version: parsedVersion.version,
+        platform: parsedVersion.platform,
+        packageSource: currentSource,
+        dependencies: [],
+      };
       continue;
     }
     if (indent >= 6 && current) {
-      const dependencyName = line.split(" ", 1)[0].split("(", 1)[0].replace(/!$/, "").trim();
-      if (dependencyName) {
-        current.dependencies.push(dependencyName);
+      const match = line.match(/^([^\s(]+)(?: \(([^)]+)\))?/);
+      if (match) {
+        current.dependencies.push({
+          name: match[1].replace(/!$/, ""),
+          version: exactRubyDependencyVersion(match[2]),
+        });
+      }
+    }
+  }
+  flushCurrent();
+  return { records: dedupeRubyRecords(records), directNames: [...new Set(directNames)] };
+}
+
+function buildRubyGraph(records, directByName, cancellationToken) {
+  const byName = new Map();
+  const byKey = new Map();
+  for (const record of records) {
+    const key = rubyRecordKey(record);
+    byKey.set(key, record);
+    const name = record.name.toLowerCase();
+    if (!byName.has(name)) byName.set(name, []);
+    byName.get(name).push(record);
+  }
+
+  const runtimeReachable = new Set();
+  const developmentReachable = new Set();
+  const parentByKey = new Map();
+  const depthByKey = new Map();
+  const childrenByKey = new Map();
+  let edgeCount = 0;
+  let truncated = false;
+  const queue = [];
+  for (const [name, declaration] of directByName) {
+    for (const record of byName.get(name) || []) {
+      const key = rubyRecordKey(record);
+      const reachability = declaration.isDevelopmentDependency
+        ? developmentReachable
+        : runtimeReachable;
+      if (!reachability.has(key)) {
+        reachability.add(key);
+        queue.push({ record, key, depth: 0, development: declaration.isDevelopmentDependency });
+      }
+      if (!depthByKey.has(key)) depthByKey.set(key, 0);
+    }
+  }
+
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    throwIfRubyCancelled(cancellationToken);
+    const item = queue[cursor];
+    if (item.depth >= MAX_RUBY_RELATIONSHIP_DEPTH) {
+      if (item.record.dependencies.length > 0) truncated = true;
+      continue;
+    }
+    for (const reference of item.record.dependencies) {
+      if (edgeCount >= MAX_RUBY_RELATIONSHIP_EDGES) {
+        truncated = true;
+        break;
+      }
+      edgeCount += 1;
+      for (const child of selectRubyChildren(byName, reference, item.record.platform)) {
+        const childKey = rubyRecordKey(child);
+        const reachability = item.development ? developmentReachable : runtimeReachable;
+        if (!parentByKey.has(childKey) && childKey !== item.key) {
+          parentByKey.set(childKey, item.key);
+          if (!childrenByKey.has(item.key)) childrenByKey.set(item.key, []);
+          childrenByKey.get(item.key).push(childKey);
+          depthByKey.set(childKey, item.depth + 1);
+        }
+        if (!reachability.has(childKey)) {
+          reachability.add(childKey);
+          queue.push({
+            record: child,
+            key: childKey,
+            depth: item.depth + 1,
+            development: item.development,
+          });
+        }
       }
     }
   }
 
-  flushCurrent();
-  return records;
+  return {
+    byKey,
+    parentByKey,
+    childrenByKey,
+    depthByKey,
+    runtimeReachable,
+    developmentReachable,
+    truncated,
+  };
 }
 
-function buildRubyDependency(record, parentChain, recordsByName, visiting, sourceFile, directNames) {
-  const key = `${record.name.toLowerCase()}@${record.version.toLowerCase()}`;
-  if (visiting.has(key)) {
-    return createDependency({
+function materializeRubyInventory({
+  records,
+  directByName,
+  graph,
+  sourceFile,
+  cancellationToken,
+}) {
+  const materialized = new Map();
+  const parentChainMemo = new Map();
+  const ordered = records.slice().sort((left, right) => (
+    (graph.depthByKey.get(rubyRecordKey(right)) || 0)
+      - (graph.depthByKey.get(rubyRecordKey(left)) || 0)
+  ));
+  for (const record of ordered) {
+    throwIfRubyCancelled(cancellationToken);
+    const key = rubyRecordKey(record);
+    const declaration = directByName.get(record.name.toLowerCase()) || null;
+    const parentKey = declaration ? null : graph.parentByKey.get(key) || null;
+    const parentRecord = parentKey ? graph.byKey.get(parentKey) : null;
+    const parentChain = parentKey
+      ? rubyParentChain(parentKey, graph, parentChainMemo)
+      : [];
+    const isDevelopmentDependency = graph.developmentReachable.has(key)
+      && !graph.runtimeReachable.has(key);
+    const dependency = createDependency({
       name: record.name,
       version: record.version,
       ecosystem: "ruby",
-      isDirect: parentChain.length === 0 || directNames.has(record.name.toLowerCase()),
-      parent: parentChain[parentChain.length - 1] || null,
+      isDirect: Boolean(declaration),
+      parent: parentRecord && parentRecord.name || null,
       parentChain,
-      transitives: [],
+      transitives: (graph.childrenByKey.get(key) || []).map((childKey) => materialized.get(childKey)).filter(Boolean),
       sourceFile,
-      isDevelopmentDependency: false,
+      isDevelopmentDependency,
+      platform: record.platform,
+      packageSource: record.packageSource,
+    });
+    materialized.set(key, {
+      ...dependency,
+      declaredConstraint: declaration && declaration.version || null,
+      hasResolutionEvidence: Boolean(record.version),
     });
   }
+  return records.map((record) => materialized.get(rubyRecordKey(record)));
+}
 
+function rubyParentChain(key, graph, memo, visiting = new Set()) {
+  if (memo.has(key)) return memo.get(key);
+  if (visiting.has(key)) return [];
   const nextVisiting = new Set(visiting);
   nextVisiting.add(key);
-  const nextParentChain = parentChain.concat(record.name);
-  const transitives = [];
+  const parentKey = graph.parentByKey.get(key);
+  if (!parentKey) return [];
+  const parent = graph.byKey.get(parentKey);
+  const chain = rubyParentChain(parentKey, graph, memo, nextVisiting).concat(parent ? parent.name : []);
+  memo.set(key, chain);
+  return chain;
+}
 
-  for (const dependencyName of record.dependencies) {
-    const childRecord = recordsByName.get(dependencyName.toLowerCase());
-    if (!childRecord) {
-      continue;
-    }
-    transitives.push(buildRubyDependency(
-      childRecord,
-      nextParentChain,
-      recordsByName,
-      nextVisiting,
-      sourceFile,
-      directNames
-    ));
+function selectRubyChildren(byName, reference, parentPlatform) {
+  let candidates = byName.get(reference.name.toLowerCase()) || [];
+  if (reference.version) candidates = candidates.filter((record) => record.version === reference.version);
+  if (candidates.length <= 1 || !parentPlatform) return candidates;
+  const samePlatform = candidates.filter((record) => record.platform === parentPlatform);
+  return samePlatform.length > 0 ? samePlatform : candidates;
+}
+
+function splitRubyVersionAndPlatform(value) {
+  const version = String(value || "").trim();
+  const match = version.match(/^(\d+(?:\.[0-9A-Za-z]+)*?)-(java|ruby|(?:arm64|aarch64|x86_64|x86|x64|universal|wasm32|powerpc|sparc|mswin|mingw)[A-Za-z0-9_.-]*|[A-Za-z0-9_.-]*(?:linux|darwin|freebsd|mingw|mswin)[A-Za-z0-9_.-]*)$/i);
+  return match
+    ? { version: match[1], platform: match[2] }
+    : { version, platform: "ruby" };
+}
+
+function exactRubyDependencyVersion(constraint) {
+  const match = String(constraint || "").trim().match(/^=\s*([^,\s]+)$/);
+  return match ? match[1] : "";
+}
+
+function rubySourceForSection(section, location) {
+  const kind = section === "GIT" ? "git" : section === "PATH" ? "path" : "registry";
+  const safeLocation = sanitizeRubyLocation(location);
+  return {
+    kind,
+    ...(safeLocation ? { location: safeLocation } : {}),
+  };
+}
+
+function sanitizeRubyLocation(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (path.isAbsolute(raw)) return path.basename(raw).slice(0, 4096);
+  try {
+    const url = new URL(raw);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().slice(0, 4096);
+  } catch {
+    return raw.replace(/[?#].*$/, "").slice(0, 4096);
   }
+}
 
-  return createDependency({
-    name: record.name,
-    version: record.version,
-    ecosystem: "ruby",
-    isDirect: parentChain.length === 0 || directNames.has(record.name.toLowerCase()),
-    parent: parentChain[parentChain.length - 1] || null,
-    parentChain,
-    transitives: deduplicateDeps(transitives),
-    sourceFile,
-    isDevelopmentDependency: false,
+function rubyRecordKey(record) {
+  return JSON.stringify([
+    record.name.toLowerCase(),
+    record.version,
+    record.platform,
+    record.packageSource.kind,
+    record.packageSource.location || "",
+  ]);
+}
+
+function dedupeRubyRecords(records) {
+  const seen = new Set();
+  return records.filter((record) => {
+    const key = rubyRecordKey(record);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
   });
+}
+
+function throwIfRubyCancelled(cancellationToken) {
+  if (cancellationToken && cancellationToken.isCancellationRequested) {
+    const error = new Error("Dependency traversal was cancelled.");
+    error.code = "ERR_DEPENDENCY_TRAVERSAL_CANCELLED";
+    throw error;
+  }
 }
 
 module.exports = rubyParser;

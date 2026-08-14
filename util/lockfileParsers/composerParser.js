@@ -3,15 +3,17 @@ const path = require("path");
 const {
   buildTree,
   createDependency,
-  deduplicateDeps,
-  flattenDependencies,
   getSourceFileName,
   getWorkspacePath,
-  readJson,
   pathExists,
+  readJson,
   readUtf8,
 } = require("./shared");
 const { parseComposerManifest } = require("./manifestHelpers");
+
+const MAX_COMPOSER_INVENTORY = 50000;
+const MAX_COMPOSER_EDGES = 500000;
+const MAX_COMPOSER_DEPTH = 128;
 
 const composerParser = {
   name: "composerParser",
@@ -26,14 +28,10 @@ const composerParser = {
   async detect(workspaceFolder) {
     const rootPath = getWorkspacePath(workspaceFolder);
     const lockfilePath = await pathExists(path.join(rootPath, "composer.lock"), workspaceFolder)
-      ? path.join(rootPath, "composer.lock")
-      : null;
+      ? path.join(rootPath, "composer.lock") : null;
     const manifestPath = await pathExists(path.join(rootPath, "composer.json"), workspaceFolder)
-      ? path.join(rootPath, "composer.json")
-      : null;
-    if (!lockfilePath && !manifestPath) {
-      return [];
-    }
+      ? path.join(rootPath, "composer.json") : null;
+    if (!lockfilePath && !manifestPath) return [];
     return [{
       resolverName: this.name,
       ecosystem: this.ecosystem,
@@ -43,15 +41,17 @@ const composerParser = {
     }];
   },
 
-  async resolve({ lockfilePath, manifestPath, workspaceFolder }) {
+  async resolve({ lockfilePath, manifestPath, workspaceFolder, options = {} }) {
+    const cancellationToken = options.cancellationToken;
+    throwIfComposerCancelled(cancellationToken);
     const sourceFile = getSourceFileName(lockfilePath || manifestPath);
     let manifestDependencies = [];
     if (manifestPath && await pathExists(manifestPath, workspaceFolder)) {
-      const content = await readUtf8(manifestPath, workspaceFolder);
+      const content = await readUtf8(manifestPath, workspaceFolder, options);
       try {
         JSON.parse(content);
       } catch {
-        throw new Error("Malformed composer.json: invalid JSON");
+        throw new Error("The Composer manifest is not valid JSON.");
       }
       manifestDependencies = parseComposerManifest(content);
     }
@@ -67,115 +67,232 @@ const composerParser = {
         transitives: [],
         sourceFile,
         isDevelopmentDependency: dependency.isDevelopmentDependency,
+        packageSource: dependency.packageSource,
+        section: dependency.isDevelopmentDependency ? "require-dev" : "require",
       })));
     }
 
-    const root = await readJson(lockfilePath, workspaceFolder);
-    const records = [];
-
-    for (const record of [...(root.packages || []), ...(root["packages-dev"] || [])]) {
-      if (!record || !record.name) {
-        continue;
-      }
-      records.push({
-        name: record.name,
-        version: record.version || "",
-        dependencies: Object.keys(record.require || {}).filter((name) => name.includes("/") && !name.startsWith("ext-") && !name.startsWith("lib-") && name !== "php"),
-      });
+    const root = await readJson(lockfilePath, workspaceFolder, options);
+    const records = parseComposerLockRecords(root, cancellationToken);
+    if (records.length === 0) throw new Error("The Composer lockfile did not contain package records.");
+    if (records.length > MAX_COMPOSER_INVENTORY) {
+      throw new Error("The Composer lockfile inventory is too large to scan completely.");
     }
 
-    const directNames = new Set(manifestDependencies.map((dependency) => dependency.name.toLowerCase()));
-    const recordsByName = new Map(records.map((record) => [record.name.toLowerCase(), record]));
-    const incomingCounts = new Map();
-    for (const record of records) {
-      for (const dependencyName of record.dependencies) {
-        incomingCounts.set(dependencyName.toLowerCase(), (incomingCounts.get(dependencyName.toLowerCase()) || 0) + 1);
-      }
-    }
-
-    const rootRecords = directNames.size > 0
-      ? [...directNames].map((name) => recordsByName.get(name)).filter(Boolean)
-      : records.filter((record) => !incomingCounts.get(record.name.toLowerCase()));
-
-    const directRoots = deduplicateDeps(rootRecords.map((record) => buildComposerDependency(
-      record,
-      [],
-      recordsByName,
-      new Set(),
+    const directByName = new Map(manifestDependencies.map((dependency) => [
+      dependency.name.toLowerCase(), dependency,
+    ]));
+    const graph = buildComposerGraph(records, directByName, cancellationToken);
+    const dependencies = materializeComposerInventory({
+      records,
+      directByName,
+      graph,
       sourceFile,
-      directNames
-    )));
-    let dependencies = deduplicateDeps(flattenDependencies(directRoots));
-
-    for (const record of records) {
-      const key = `${record.name.toLowerCase()}@${record.version.toLowerCase()}`;
-      if (dependencies.some((dependency) => `${dependency.name.toLowerCase()}@${dependency.version.toLowerCase()}` === key)) {
-        continue;
-      }
-      dependencies.push(createDependency({
-        name: record.name,
-        version: record.version,
-        ecosystem: "composer",
-        isDirect: directNames.has(record.name.toLowerCase()),
-        parent: null,
-        parentChain: [],
-        transitives: [],
-        sourceFile,
-        isDevelopmentDependency: false,
-      }));
-    }
-
-    return buildTree("composer", sourceFile, dependencies);
+      cancellationToken,
+    });
+    const warnings = graph.truncated
+      ? ["Some Composer dependency relationships were omitted to keep the scan responsive. Package inventory remains complete."]
+      : [];
+    return buildTree("composer", sourceFile, dependencies, warnings);
   },
 };
 
-function buildComposerDependency(record, parentChain, recordsByName, visiting, sourceFile, directNames) {
-  const key = `${record.name.toLowerCase()}@${record.version.toLowerCase()}`;
-  if (visiting.has(key)) {
-    return createDependency({
+function parseComposerLockRecords(root, cancellationToken) {
+  const records = [];
+  for (const [section, sectionRecords] of [
+    ["packages", root && root.packages],
+    ["packages-dev", root && root["packages-dev"]],
+  ]) {
+    for (const record of Array.isArray(sectionRecords) ? sectionRecords : []) {
+      throwIfComposerCancelled(cancellationToken);
+      if (!record || typeof record.name !== "string" || !record.name.includes("/")) continue;
+      records.push({
+        name: record.name,
+        version: String(record.version || ""),
+        section,
+        packageSource: composerPackageSource(record),
+        dependencies: Object.keys(record.require || {}).filter(isComposerPackageName),
+      });
+    }
+  }
+  const seen = new Set();
+  return records.filter((record) => {
+    const key = composerRecordKey(record);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildComposerGraph(records, directByName, cancellationToken) {
+  const byName = new Map(records.map((record) => [record.name.toLowerCase(), record]));
+  const byKey = new Map(records.map((record) => [composerRecordKey(record), record]));
+  const runtimeReachable = new Set();
+  const developmentReachable = new Set();
+  const parentByKey = new Map();
+  const childrenByKey = new Map();
+  const depthByKey = new Map();
+  const queue = [];
+  let edges = 0;
+  let truncated = false;
+
+  const declarations = directByName.size > 0
+    ? directByName
+    : new Map(records.filter((record) => record.section === "packages")
+      .map((record) => [record.name.toLowerCase(), { isDevelopmentDependency: false }]));
+  for (const [name, declaration] of declarations) {
+    const record = byName.get(name);
+    if (!record) continue;
+    const key = composerRecordKey(record);
+    const reachability = declaration.isDevelopmentDependency ? developmentReachable : runtimeReachable;
+    reachability.add(key);
+    depthByKey.set(key, 0);
+    queue.push({ record, key, depth: 0, development: declaration.isDevelopmentDependency });
+  }
+
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    throwIfComposerCancelled(cancellationToken);
+    const current = queue[cursor];
+    if (current.depth >= MAX_COMPOSER_DEPTH) {
+      if (current.record.dependencies.length > 0) truncated = true;
+      continue;
+    }
+    for (const dependencyName of current.record.dependencies) {
+      if (edges >= MAX_COMPOSER_EDGES) {
+        truncated = true;
+        break;
+      }
+      edges += 1;
+      const child = byName.get(dependencyName.toLowerCase());
+      if (!child) continue;
+      const childKey = composerRecordKey(child);
+      const reachability = current.development ? developmentReachable : runtimeReachable;
+      if (!parentByKey.has(childKey) && childKey !== current.key) {
+        parentByKey.set(childKey, current.key);
+        if (!childrenByKey.has(current.key)) childrenByKey.set(current.key, []);
+        childrenByKey.get(current.key).push(childKey);
+        depthByKey.set(childKey, current.depth + 1);
+      }
+      if (!reachability.has(childKey)) {
+        reachability.add(childKey);
+        queue.push({ record: child, key: childKey, depth: current.depth + 1, development: current.development });
+      }
+    }
+  }
+  return {
+    byKey,
+    runtimeReachable,
+    developmentReachable,
+    parentByKey,
+    childrenByKey,
+    depthByKey,
+    truncated,
+  };
+}
+
+function materializeComposerInventory({ records, directByName, graph, sourceFile, cancellationToken }) {
+  const materialized = new Map();
+  const ordered = records.slice().sort((left, right) => (
+    (graph.depthByKey.get(composerRecordKey(right)) || 0)
+      - (graph.depthByKey.get(composerRecordKey(left)) || 0)
+  ));
+  for (const record of ordered) {
+    throwIfComposerCancelled(cancellationToken);
+    const key = composerRecordKey(record);
+    const declaration = directByName.get(record.name.toLowerCase()) || null;
+    const parentKey = declaration ? null : graph.parentByKey.get(key) || null;
+    const parentRecord = parentKey ? graph.byKey.get(parentKey) : null;
+    const isDevelopmentDependency = graph.developmentReachable.has(key)
+      && !graph.runtimeReachable.has(key);
+    const parentChain = composerParentChain(parentKey, graph);
+    const dependency = createDependency({
       name: record.name,
       version: record.version,
       ecosystem: "composer",
-      isDirect: parentChain.length === 0 || directNames.has(record.name.toLowerCase()),
-      parent: parentChain[parentChain.length - 1] || null,
+      isDirect: Boolean(declaration),
+      parent: parentRecord && parentRecord.name || null,
       parentChain,
-      transitives: [],
+      transitives: (graph.childrenByKey.get(key) || []).map((childKey) => materialized.get(childKey)).filter(Boolean),
       sourceFile,
-      isDevelopmentDependency: false,
+      isDevelopmentDependency,
+      packageSource: record.packageSource,
+      section: record.section,
+    });
+    materialized.set(key, {
+      ...dependency,
+      declaredConstraint: declaration && declaration.version || null,
+      hasResolutionEvidence: Boolean(record.version),
     });
   }
+  return records.map((record) => materialized.get(composerRecordKey(record)));
+}
 
-  const nextVisiting = new Set(visiting);
-  nextVisiting.add(key);
-  const nextParentChain = parentChain.concat(record.name);
-  const transitives = [];
-
-  for (const dependencyName of record.dependencies) {
-    const childRecord = recordsByName.get(dependencyName.toLowerCase());
-    if (!childRecord) {
-      continue;
-    }
-    transitives.push(buildComposerDependency(
-      childRecord,
-      nextParentChain,
-      recordsByName,
-      nextVisiting,
-      sourceFile,
-      directNames
-    ));
+function composerParentChain(parentKey, graph) {
+  const names = [];
+  const seen = new Set();
+  let key = parentKey;
+  while (key && !seen.has(key) && names.length < MAX_COMPOSER_DEPTH) {
+    seen.add(key);
+    const record = graph.byKey.get(key);
+    if (record) names.unshift(record.name);
+    key = graph.parentByKey.get(key);
   }
+  return names;
+}
 
-  return createDependency({
-    name: record.name,
-    version: record.version,
-    ecosystem: "composer",
-    isDirect: parentChain.length === 0 || directNames.has(record.name.toLowerCase()),
-    parent: parentChain[parentChain.length - 1] || null,
-    parentChain,
-    transitives: deduplicateDeps(transitives),
-    sourceFile,
-    isDevelopmentDependency: false,
-  });
+function composerPackageSource(record) {
+  const distType = String(record.dist && record.dist.type || "").toLowerCase();
+  const distUrl = record.dist && record.dist.url;
+  const sourceType = String(record.source && record.source.type || "").toLowerCase();
+  const sourceUrl = record.source && record.source.url;
+  if (distType === "path" || sourceType === "path") {
+    return { kind: "path", ...(sanitizeComposerLocation(distUrl || sourceUrl) ? { location: sanitizeComposerLocation(distUrl || sourceUrl) } : {}) };
+  }
+  if (["git", "hg", "svn", "fossil"].includes(sourceType)) {
+    return { kind: "git", ...(sanitizeComposerLocation(sourceUrl) ? { location: sanitizeComposerLocation(sourceUrl) } : {}) };
+  }
+  return { kind: "registry" };
+}
+
+function sanitizeComposerLocation(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (path.isAbsolute(raw)) return path.basename(raw).slice(0, 4096);
+  try {
+    const url = new URL(raw);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().slice(0, 4096);
+  } catch {
+    return raw.replace(/[?#].*$/, "").slice(0, 4096);
+  }
+}
+
+function composerRecordKey(record) {
+  return JSON.stringify([
+    record.name.toLowerCase(),
+    record.version,
+    record.packageSource.kind,
+    record.packageSource.location || "",
+  ]);
+}
+
+function isComposerPackageName(name) {
+  return typeof name === "string"
+    && name.includes("/")
+    && !name.startsWith("ext-")
+    && !name.startsWith("lib-")
+    && name !== "php";
+}
+
+function throwIfComposerCancelled(cancellationToken) {
+  if (cancellationToken && cancellationToken.isCancellationRequested) {
+    const error = new Error("Dependency traversal was cancelled.");
+    error.code = "ERR_DEPENDENCY_TRAVERSAL_CANCELLED";
+    throw error;
+  }
 }
 
 module.exports = composerParser;

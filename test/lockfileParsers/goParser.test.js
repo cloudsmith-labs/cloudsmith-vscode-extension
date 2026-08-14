@@ -42,9 +42,10 @@ suite("goParser Test Suite", () => {
     const indirect = tree.dependencies.find((dependency) => dependency.name.endsWith("/indirect"));
 
     assert.ok(indirect);
-    assert.strictEqual(indirect.version, "2.3.4");
+    assert.strictEqual(indirect.version, "v2.3.4");
     assert.strictEqual(indirect.isDirect, false);
     assert.strictEqual(indirect.isDevelopmentDependency, false);
+    assert.deepStrictEqual(indirect.packageSource, { kind: "registry" });
   });
 
   test("keeps locally replaced modules unresolved instead of trusting the required version", async () => {
@@ -69,6 +70,10 @@ suite("goParser Test Suite", () => {
     assert.strictEqual(dependency.declaredConstraint, "path:../local-original");
     assert.strictEqual(dependency.versionState, "incomplete");
     assert.strictEqual(dependency.hasResolutionEvidence, false);
+    assert.deepStrictEqual(dependency.packageSource, {
+      kind: "path",
+      location: "../local-original",
+    });
   });
 
   test("uses an exact module replacement identity and version", async () => {
@@ -89,11 +94,12 @@ suite("goParser Test Suite", () => {
 
     assert.strictEqual(dependency.name, "example.com/fork");
     assert.strictEqual(dependency.declarationName, "example.com/original");
-    assert.strictEqual(dependency.version, "1.9.4");
+    assert.strictEqual(dependency.version, "v1.9.4");
     assert.strictEqual(dependency.declaredConstraint, "v1.9.4");
     assert.strictEqual(dependency.versionState, "exact-declaration");
     assert.strictEqual(dependency.requiredVersion, "v1.2.3");
     assert.strictEqual(dependency.replacementFor, "example.com/original");
+    assert.deepStrictEqual(dependency.packageSource, { kind: "registry" });
   });
 
   test("applies replacement blocks and prefers version-specific replacement evidence", async () => {
@@ -123,9 +129,9 @@ suite("goParser Test Suite", () => {
     );
 
     assert.strictEqual(byDeclaration.get("example.com/first").name, "example.com/first-fork");
-    assert.strictEqual(byDeclaration.get("example.com/first").version, "1.4.0");
+    assert.strictEqual(byDeclaration.get("example.com/first").version, "v1.4.0");
     assert.strictEqual(byDeclaration.get("example.com/second").name, "example.com/specific-fork");
-    assert.strictEqual(byDeclaration.get("example.com/second").version, "2.2.0");
+    assert.strictEqual(byDeclaration.get("example.com/second").version, "v2.2.0");
   });
 
   test("keeps unsupported and duplicate replacement declarations unresolved", async () => {
@@ -180,5 +186,30 @@ suite("goParser Test Suite", () => {
       new Set(tree.dependencies.map((dependency) => dependency.name)),
       new Set(["example.com/Org/library", "example.com/org/library"])
     );
+    assert.ok(tree.dependencies.every((dependency) => dependency.version === "v1.2.3"));
+  });
+
+  test("retains exactly one leading v for semantic and pseudo versions", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "go.mod");
+    await writeTextFile(manifestPath, [
+      "module example.com/fixture",
+      "",
+      "go 1.21",
+      "",
+      "require (",
+      "  example.com/semantic v1.2.3",
+      "  example.com/pseudo v0.0.0-20240102123456-abcdef123456",
+      ")",
+      "",
+    ].join("\n"));
+
+    const tree = await goParser.resolve({ manifestPath, workspaceFolder: workspace });
+
+    assert.deepStrictEqual(
+      tree.dependencies.map((dependency) => dependency.version),
+      ["v1.2.3", "v0.0.0-20240102123456-abcdef123456"]
+    );
+    assert.ok(tree.dependencies.every((dependency) => /^v[^v]/.test(dependency.version)));
   });
 });

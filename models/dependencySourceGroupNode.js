@@ -1,5 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const vscode = require("vscode");
+const { getDependencyArtifactKey } = require("../util/dependencyRecord");
 
 class DependencySourceGroupNode {
   constructor(tree, provider) {
@@ -10,15 +11,17 @@ class DependencySourceGroupNode {
   getTreeItem() {
     const directCount = this.tree.dependencies.filter((dependency) => dependency.isDirect).length;
     const transitiveCount = this.tree.dependencies.length - directCount;
+    const artifactCount = new Set(this.tree.dependencies.map(getDependencyArtifactKey)).size;
     const item = new vscode.TreeItem(
       this.tree.sourceFile,
       vscode.TreeItemCollapsibleState.Collapsed
     );
-    item.description = `${this.tree.dependencies.length} dependencies `
+    item.description = `${this.tree.dependencies.length} occurrences, ${artifactCount} artifacts `
       + `(${directCount} direct, ${transitiveCount} transitive)`;
     item.tooltip = [
       this.tree.sourceFile,
-      `${this.tree.dependencies.length} dependencies`,
+      `${this.tree.dependencies.length} dependency occurrences`,
+      `${artifactCount} unique artifacts`,
       `${directCount} direct`,
       `${transitiveCount} transitive`,
     ].join("\n");

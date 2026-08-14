@@ -1,4 +1,5 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
+const path = require("path");
 const {
   escapeRegExp,
   normalizeVersion,
@@ -137,7 +138,9 @@ function parsePyprojectManifest(content) {
         continue;
       }
 
-      const name = parts.key;
+      // TOML permits quoted dotted keys (for example, "ruamel.yaml"). The
+      // quotes are syntax, not part of the package identity.
+      const name = unquote(parts.key);
       if (!name || name.toLowerCase() === "python") {
         continue;
       }
@@ -300,11 +303,18 @@ function parseCargoTomlManifest(content) {
     const version = rawValue.startsWith("{")
       ? normalizeVersion(parseInlineTomlValue(rawValue, "version"))
       : normalizeVersion(unquote(rawValue));
+    const localPath = parseInlineTomlValue(rawValue, "path");
+    const gitUrl = parseInlineTomlValue(rawValue, "git");
 
     dependencies.push({
       name: actualName,
       version,
       isDevelopmentDependency: section !== "[dependencies]" && section !== "[workspace.dependencies]",
+      packageSource: localPath
+        ? { kind: "path", location: localPath }
+        : gitUrl
+          ? { kind: "git", location: sanitizeSourceLocation(gitUrl) }
+          : { kind: "registry" },
     });
   }
 
@@ -312,23 +322,54 @@ function parseCargoTomlManifest(content) {
 }
 
 function parseGemfileManifest(content) {
-  const dependencies = [];
+  const dependenciesByName = new Map();
   const pattern = /^\s*gem\s+["']([^"']+)["'](?:\s*,\s*["']([^"']+)["'])?/;
+  const blockStack = [];
 
   for (const rawLine of String(content || "").split(/\r?\n/)) {
     const line = stripRubyComment(rawLine).trim();
+    if (!line) {
+      continue;
+    }
+
+    const groupMatch = line.match(/^group\s*(?:\((.*?)\)|(.*?))\s+do\b/);
+    if (groupMatch) {
+      const groups = (groupMatch[1] || groupMatch[2] || "").match(/:[A-Za-z0-9_]+/g) || [];
+      blockStack.push(groups.some((group) => [":development", ":test"].includes(group.toLowerCase())));
+      continue;
+    }
+
+    if (/^end\b/.test(line)) {
+      blockStack.pop();
+      continue;
+    }
+
+    if (/\bdo\b(?:\s*\|[^|]*\|)?\s*$/.test(line)) {
+      blockStack.push(false);
+    }
+
     const match = line.match(pattern);
     if (!match) {
       continue;
     }
-    dependencies.push({
+
+    const inlineGroups = line.match(/\b(?:group|groups)\s*:\s*(?:\[[^\]]*]|:[A-Za-z0-9_]+)/g) || [];
+    const isDevelopmentDependency = blockStack.includes(true)
+      || inlineGroups.some((value) => /:(?:development|test)\b/i.test(value));
+    const dependency = {
       name: match[1],
       version: normalizeVersion(match[2] || ""),
-      isDevelopmentDependency: false,
-    });
+      isDevelopmentDependency,
+      packageSource: { kind: "registry" },
+    };
+    const key = dependency.name.toLowerCase();
+    const existing = dependenciesByName.get(key);
+    if (!existing || (existing.isDevelopmentDependency && !isDevelopmentDependency)) {
+      dependenciesByName.set(key, dependency);
+    }
   }
 
-  return dependencies;
+  return [...dependenciesByName.values()];
 }
 
 function parseBuildGradleManifest(content) {
@@ -384,6 +425,8 @@ function parseGradleDependencyLine(line) {
     name: `${coordinates[0]}:${coordinates[1]}`,
     version: coordinates[2] ? normalizeVersion(coordinates[2]) : "",
     isDevelopmentDependency: configuration.includes("test"),
+    qualifiers: { configurations: [configuration] },
+    packageSource: { kind: "registry" },
   };
 }
 
@@ -413,6 +456,7 @@ function parseCsprojManifest(content) {
       name: includeMatch[1].trim(),
       version: normalizeVersion(version),
       isDevelopmentDependency: false,
+      packageSource: { kind: "registry" },
     });
   };
 
@@ -430,6 +474,30 @@ function parseCsprojManifest(content) {
 function parsePubspecManifest(content) {
   const dependencies = [];
   let section = "";
+  let current = null;
+
+  const flushCurrent = () => {
+    if (!current || !current.name) {
+      current = null;
+      return;
+    }
+    const source = current.source || "registry";
+    dependencies.push({
+      name: current.name,
+      version: normalizeVersion(current.version),
+      isDevelopmentDependency: current.isDevelopmentDependency,
+      packageSource: source === "hosted" || source === "registry"
+        ? { kind: "registry" }
+        : source === "path"
+          ? { kind: "path", ...(current.location ? { location: current.location } : {}) }
+          : source === "git"
+            ? { kind: "git", ...(current.location ? { location: sanitizeSourceLocation(current.location) } : {}) }
+            : source === "sdk"
+              ? { kind: "sdk" }
+              : { kind: "unknown" },
+    });
+    current = null;
+  };
 
   for (const rawLine of String(content || "").split(/\r?\n/)) {
     const lineWithoutComment = stripYamlComment(rawLine);
@@ -440,35 +508,56 @@ function parsePubspecManifest(content) {
 
     const indent = rawLine.search(/\S/);
     if (indent === 0 && line.endsWith(":")) {
+      flushCurrent();
       section = line.slice(0, -1);
       continue;
     }
 
-    if (!["dependencies", "dev_dependencies"].includes(section) || indent !== 2) {
+    if (!["dependencies", "dev_dependencies"].includes(section)) {
       continue;
     }
 
-    if (line.startsWith("-")) {
+    if (indent === 2 && line.startsWith("-")) {
       continue;
     }
 
-    const name = line.split(":", 1)[0].trim();
-    const rawValue = line.includes(":") ? line.split(":").slice(1).join(":").trim() : "";
-    const version = rawValue.startsWith("{")
-      ? normalizeVersion(parseYamlInlineValue(rawValue, "version"))
-      : normalizeVersion(unquote(rawValue));
-
-    if (!name) {
+    if (indent === 2 && line.includes(":")) {
+      flushCurrent();
+      const name = line.split(":", 1)[0].trim();
+      const rawValue = line.split(":").slice(1).join(":").trim();
+      if (!name) {
+        continue;
+      }
+      current = {
+        name,
+        version: rawValue.startsWith("{")
+          ? parseYamlInlineValue(rawValue, "version")
+          : unquote(rawValue),
+        isDevelopmentDependency: section === "dev_dependencies",
+        source: rawValue.includes("path:") ? "path"
+          : rawValue.includes("git:") ? "git"
+            : rawValue.includes("sdk:") ? "sdk" : "registry",
+        location: parseYamlInlineValue(rawValue, "path") || parseYamlInlineValue(rawValue, "url"),
+      };
       continue;
     }
 
-    dependencies.push({
-      name,
-      version,
-      isDevelopmentDependency: section === "dev_dependencies",
-    });
+    if (!current || indent < 4 || !line.includes(":")) {
+      continue;
+    }
+    const key = line.split(":", 1)[0].trim().toLowerCase();
+    const value = unquote(line.split(":").slice(1).join(":").trim());
+    if (["path", "git", "sdk", "hosted"].includes(key)) {
+      current.source = key;
+      if (key === "path") current.location = value;
+    } else if (key === "url") {
+      current.location = value;
+    } else if (key === "version") {
+      current.version = value;
+    }
   }
 
+  flushCurrent();
   return dedupeManifestDeps(dependencies);
 }
 
@@ -481,17 +570,28 @@ function parseComposerManifest(content) {
   }
 
   const dependencies = [];
+  const sourceKinds = composerManifestSourceKinds(parsed.repositories);
   for (const [name, version] of Object.entries(parsed.require || {})) {
     if (!isComposerPackageName(name)) {
       continue;
     }
-    dependencies.push({ name, version: normalizeVersion(version), isDevelopmentDependency: false });
+    dependencies.push({
+      name,
+      version: normalizeVersion(version),
+      isDevelopmentDependency: false,
+      packageSource: sourceKinds.get(name.toLowerCase()) || { kind: "registry" },
+    });
   }
   for (const [name, version] of Object.entries(parsed["require-dev"] || {})) {
     if (!isComposerPackageName(name)) {
       continue;
     }
-    dependencies.push({ name, version: normalizeVersion(version), isDevelopmentDependency: true });
+    dependencies.push({
+      name,
+      version: normalizeVersion(version),
+      isDevelopmentDependency: true,
+      packageSource: sourceKinds.get(name.toLowerCase()) || { kind: "registry" },
+    });
   }
   return dedupeManifestDeps(dependencies);
 }
@@ -508,29 +608,66 @@ function parsePackageSwiftManifest(content) {
     const declaration = match[1];
     const identityMatch = declaration.match(/\b(?:name|id|identity)\s*:\s*"([^"]+)"/);
     const urlMatch = declaration.match(/\burl\s*:\s*"([^"]+)"/);
-    const versionMatch = declaration.match(/\b(?:from|exact|branch|revision)\s*:\s*"([^"]+)"/);
-    const name = normalizeSwiftIdentity(identityMatch ? identityMatch[1] : urlMatch ? urlMatch[1] : "");
+    const pathMatch = declaration.match(/\bpath\s*:\s*"([^"]+)"/);
+    const registryIdentityMatch = declaration.match(/\b(?:id|identity)\s*:\s*"([^"]+)"/);
+    const semanticVersionMatch = declaration.match(/\b(?:from|exact)\s*:\s*"([^"]+)"/);
+    const branchMatch = declaration.match(/\bbranch\s*:\s*"([^"]+)"/);
+    const revisionMatch = declaration.match(/\brevision\s*:\s*"([^"]+)"/);
+    const rawIdentity = registryIdentityMatch
+      ? registryIdentityMatch[1]
+      : identityMatch ? identityMatch[1]
+        : urlMatch ? urlMatch[1]
+          : pathMatch ? pathMatch[1] : "";
+    const name = normalizeSwiftIdentity(rawIdentity);
     if (!name) {
       continue;
     }
+    const isRegistry = Boolean(registryIdentityMatch && !urlMatch && !pathMatch);
+    const packageSource = isRegistry
+      ? { kind: "registry" }
+      : pathMatch
+        ? { kind: "path", location: pathMatch[1] }
+        : {
+          kind: "scm",
+          ...(urlMatch ? { location: sanitizeSourceLocation(urlMatch[1]) } : {}),
+          ...(branchMatch ? { branch: branchMatch[1] } : {}),
+          ...(revisionMatch ? { revision: revisionMatch[1] } : {}),
+        };
+    const scope = isRegistry && name.includes(".") ? name.split(".", 1)[0] : "";
     dependencies.push({
       name,
-      version: normalizeVersion(versionMatch ? versionMatch[1] : ""),
+      version: normalizeVersion(semanticVersionMatch ? semanticVersionMatch[1] : ""),
       isDevelopmentDependency: false,
+      packageSource,
+      ...(scope ? { qualifiers: { scope } } : {}),
     });
   }
 
-  return dedupeManifestDeps(dependencies);
+  const seen = new Set();
+  return dependencies.filter((dependency) => {
+    const source = dependency.packageSource || {};
+    const key = JSON.stringify([
+      dependency.name,
+      dependency.version,
+      source.kind || "unknown",
+      source.location || "",
+      source.branch || "",
+      source.revision || "",
+    ]);
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 function normalizeSwiftIdentity(name) {
-  return String(name || "")
-    .trim()
-    .split("/")
-    .filter(Boolean)
-    .pop()
-    ?.replace(/\.git$/i, "")
-    .toLowerCase() || "";
+  const value = String(name || "").trim();
+  if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+$/.test(value) && !value.includes("/") && !value.includes("://")) {
+    return value.toLocaleLowerCase("en-US");
+  }
+  return value.split("/").filter(Boolean).pop()?.replace(/\.git$/i, "").toLocaleLowerCase("en-US") || "";
 }
 
 function parseMixExsManifest(content) {
@@ -540,15 +677,67 @@ function parseMixExsManifest(content) {
     return [];
   }
 
-  const pattern = /\{\s*:([A-Za-z0-9_]+)\s*,\s*"([^"]*)"/g;
-  for (const match of depsBlockMatch[1].matchAll(pattern)) {
+  for (const tuple of extractBalancedDelimitedValues(depsBlockMatch[1], "{", "}")) {
+    const match = tuple.match(/^\{\s*:([A-Za-z0-9_]+)\s*,([\s\S]*)}$/);
+    if (!match) continue;
+    const options = match[2] || "";
+    const constraintMatch = options.match(/^\s*"([^"]*)"/);
+    const pathMatch = options.match(/\bpath\s*:\s*"([^"]+)"/);
+    const gitMatch = options.match(/\bgit\s*:\s*"([^"]+)"/);
+    const environments = (options.match(/:(?:dev|test|prod)\b/g) || [])
+      .map((value) => value.slice(1));
+    const isDevelopmentDependency = environments.length > 0
+      && environments.every((environment) => environment === "dev" || environment === "test");
     dependencies.push({
       name: match[1],
-      version: normalizeVersion(match[2]),
-      isDevelopmentDependency: false,
+      version: normalizeVersion(constraintMatch ? constraintMatch[1] : ""),
+      isDevelopmentDependency,
+      packageSource: pathMatch
+        ? { kind: "path", location: pathMatch[1] }
+        : gitMatch
+          ? { kind: "git", location: sanitizeSourceLocation(gitMatch[1]) }
+          : { kind: "registry" },
+      ...(environments.length > 0 ? { qualifiers: { environment: environments.join(",") } } : {}),
     });
   }
   return dedupeManifestDeps(dependencies);
+}
+
+function extractBalancedDelimitedValues(content, openCharacter, closeCharacter) {
+  const values = [];
+  let depth = 0;
+  let start = -1;
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < String(content || "").length; index += 1) {
+    const character = content[index];
+    if (quote) {
+      if (character === "\\" && !escaped) {
+        escaped = true;
+        continue;
+      }
+      if (character === quote && !escaped) quote = "";
+      escaped = false;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === openCharacter) {
+      if (depth === 0) start = index;
+      depth += 1;
+      continue;
+    }
+    if (character === closeCharacter && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        values.push(content.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+  return values;
 }
 
 function parsePomManifest(content) {
@@ -559,6 +748,9 @@ function parsePomManifest(content) {
     const groupId = matchXmlValue(block, "groupId");
     const artifactId = matchXmlValue(block, "artifactId");
     const scope = matchXmlValue(block, "scope");
+    const type = matchXmlValue(block, "type") || "jar";
+    const classifier = matchXmlValue(block, "classifier");
+    const systemPath = matchXmlValue(block, "systemPath");
     if (!groupId || !artifactId) {
       continue;
     }
@@ -572,6 +764,13 @@ function parsePomManifest(content) {
       name: `${groupId}:${artifactId}`,
       version: normalizeVersion(version),
       isDevelopmentDependency: scope === "test",
+      qualifiers: {
+        type,
+        ...(classifier ? { classifier } : {}),
+      },
+      packageSource: scope === "system"
+        ? { kind: "system", ...(systemPath ? { location: systemPath } : {}) }
+        : { kind: "registry" },
     });
   }
 
@@ -581,19 +780,33 @@ function parsePomManifest(content) {
 function parseSimpleYamlDependencyList(content, sectionName) {
   const dependencies = [];
   let inSection = false;
+  let sectionIndent = -1;
   let currentDependency = null;
+  let itemIndent = -1;
 
   const flushCurrent = () => {
     if (!currentDependency || !currentDependency.name) {
       currentDependency = null;
       return;
     }
+    const repository = currentDependency.repository
+      ? unquote(currentDependency.repository)
+      : "";
+    const packageSource = repository && /^(?:file:|\.?\.?\/)/i.test(repository)
+      ? { kind: "path", location: repository }
+      : repository && /^(?:git\+|git:|ssh:)|\.git(?:#|$)/i.test(repository)
+        ? { kind: "git", location: repository }
+        : { kind: "registry" };
     dependencies.push({
-      name: currentDependency.name,
+      name: unquote(currentDependency.name),
       version: normalizeVersion(currentDependency.version),
       isDevelopmentDependency: false,
+      repository: repository || undefined,
+      alias: currentDependency.alias ? unquote(currentDependency.alias) : undefined,
+      packageSource,
     });
     currentDependency = null;
+    itemIndent = -1;
   };
 
   for (const rawLine of String(content || "").split(/\r?\n/)) {
@@ -604,22 +817,17 @@ function parseSimpleYamlDependencyList(content, sectionName) {
     }
 
     const indent = rawLine.search(/\S/);
-    if (indent === 0 && line === `${sectionName}:`) {
-      inSection = true;
-      continue;
-    }
-    if (indent === 0 && line.endsWith(":") && line !== `${sectionName}:`) {
-      inSection = false;
+    if (line === `${sectionName}:`) {
       flushCurrent();
-      continue;
-    }
-    if (!inSection) {
+      inSection = true;
+      sectionIndent = indent;
       continue;
     }
 
-    if (indent === 2 && line.startsWith("- ")) {
+    if (inSection && line.startsWith("- ") && indent >= sectionIndent) {
       flushCurrent();
-      currentDependency = { name: "", version: "" };
+      currentDependency = { name: "", version: "", repository: "", alias: "" };
+      itemIndent = indent;
       const remainder = line.slice(2).trim();
       if (remainder.startsWith("name:")) {
         currentDependency.name = remainder.slice("name:".length).trim();
@@ -627,15 +835,29 @@ function parseSimpleYamlDependencyList(content, sectionName) {
       continue;
     }
 
-    if (!currentDependency) {
+    if (inSection && indent <= sectionIndent) {
+      inSection = false;
+      flushCurrent();
+    }
+    if (!inSection) {
       continue;
     }
 
-    if (indent >= 4 && line.startsWith("name:")) {
+    if (!currentDependency || indent <= itemIndent) {
+      continue;
+    }
+
+    if (line.startsWith("name:")) {
       currentDependency.name = line.slice("name:".length).trim();
     }
-    if (indent >= 4 && line.startsWith("version:")) {
+    if (line.startsWith("version:")) {
       currentDependency.version = line.slice("version:".length).trim();
+    }
+    if (line.startsWith("repository:")) {
+      currentDependency.repository = line.slice("repository:".length).trim();
+    }
+    if (line.startsWith("alias:")) {
+      currentDependency.alias = line.slice("alias:".length).trim();
     }
   }
 
@@ -691,6 +913,63 @@ function stripRubyComment(line) {
 
 function stripJavaLikeComment(line) {
   return String(line || "").replace(/\/\/.*$/, "").trimEnd();
+}
+
+function composerManifestSourceKinds(repositories) {
+  const sources = new Map();
+  const entries = Array.isArray(repositories)
+    ? repositories
+    : repositories && typeof repositories === "object"
+      ? Object.values(repositories)
+      : [];
+  for (const repository of entries) {
+    if (!repository || typeof repository !== "object" || Array.isArray(repository)) {
+      continue;
+    }
+    const descriptor = repository.package && typeof repository.package === "object"
+      ? repository.package
+      : repository;
+    const name = String(descriptor.name || repository.name || "").trim().toLowerCase();
+    if (!name || !isComposerPackageName(name)) {
+      continue;
+    }
+    const type = String(repository.type || descriptor.type || "").toLowerCase();
+    const location = repository.url
+      || descriptor.dist && descriptor.dist.url
+      || descriptor.source && descriptor.source.url
+      || "";
+    const kind = type === "path" ? "path"
+      : ["git", "github", "gitlab", "bitbucket", "vcs"].includes(type) ? "git"
+        : "registry";
+    sources.set(name, {
+      kind,
+      ...(location ? { location: sanitizeSourceLocation(location) } : {}),
+    });
+  }
+  return sources;
+}
+
+function sanitizeSourceLocation(value) {
+  const raw = String(value || "").trim().replace(/[\u0000-\u001f\u007f]/g, "");
+  if (!raw) {
+    return "";
+  }
+  if (path.isAbsolute(raw)) {
+    return path.basename(raw).slice(0, 4096);
+  }
+  try {
+    const parsed = new URL(raw);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().slice(0, 4096);
+  } catch {
+    return raw
+      .replace(/^[^/@\s]+@(?=[^/:\s]+[:/])/, "")
+      .replace(/[?#].*$/, "")
+      .slice(0, 4096);
+  }
 }
 
 function countBraces(line) {

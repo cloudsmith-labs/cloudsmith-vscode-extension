@@ -4,6 +4,7 @@ const vscode = require("vscode");
 const PackageNode = require("../models/packageNode");
 const SearchResultNode = require("../models/searchResultNode");
 const DependencyHealthNode = require("../models/dependencyHealthNode");
+const DependencySummaryNode = require("../models/dependencySummaryNode");
 
 suite("Package Metadata Flow Test Suite", () => {
   let originalGetConfiguration;
@@ -394,6 +395,189 @@ suite("Package Metadata Flow Test Suite", () => {
 
     assert.strictEqual(node.getTreeItem().description, "1.0.0 — No issues found");
     assert.match(node.getTreeItem().tooltip, /License: No license detected/);
+  });
+
+  test("dependency health tooltips do not expose source credentials or absolute paths", () => {
+    const remoteNode = new DependencyHealthNode({
+      name: "remote-artifact",
+      version: "1.0.0",
+      format: "cargo",
+      cloudsmithStatus: "NOT_APPLICABLE",
+      packageSource: {
+        kind: "git",
+        location: "https://user:secret@example.com/team/repo.git?token=hidden#main",
+        branch: "https://branch-user:branch-secret@example.com/release?token=hidden",
+        revision: "/Users/private-user/workspace/private-revision.txt",
+      },
+      qualifiers: {
+        repository: "https://repo-user:repo-secret@example.com/index?api_key=hidden",
+      },
+    }, {});
+    const localNode = new DependencyHealthNode({
+      name: "local-artifact",
+      version: "1.0.0",
+      format: "maven",
+      cloudsmithStatus: "NOT_APPLICABLE",
+      packageSource: {
+        kind: "path",
+        location: "/Users/private-user/workspace/libs/local-artifact.jar",
+      },
+    }, {});
+
+    const remoteTooltip = remoteNode.getTreeItem().tooltip;
+    const localTooltip = localNode.getTreeItem().tooltip;
+    assert.match(remoteTooltip, /Source location: https:\/\/example\.com\/team\/repo\.git/);
+    assert.match(remoteTooltip, /Source branch: https:\/\/example\.com\/release/);
+    assert.match(remoteTooltip, /Source revision: private-revision\.txt/);
+    assert.match(remoteTooltip, /Repository: https:\/\/example\.com\/index/);
+    assert.doesNotMatch(
+      remoteTooltip,
+      /user:secret|branch-user|branch-secret|repo-user|repo-secret|private-user|\/Users\/|token=|api_key=|#main/
+    );
+    assert.match(localTooltip, /Source location: local-artifact\.jar/);
+    assert.doesNotMatch(localTooltip, /private-user|\/Users\//);
+  });
+
+  test("dependency qualifier presentation omits absent and non-display values", () => {
+    const node = new DependencyHealthNode({
+      name: "qualified-artifact",
+      version: "1.0.0",
+      format: "docker",
+      cloudsmithStatus: "NOT_APPLICABLE",
+      packageSource: { kind: "registry" },
+      qualifiers: {
+        platform: "linux-x64",
+        configurations: ["runtime", "test"],
+        repository: "https://user:secret@example.com/index?token=hidden#private",
+        tag: 0,
+        classifier: undefined,
+        alias: "",
+        scope: { unsafe: "raw-object" },
+      },
+    }, {});
+    const unsafeNode = new DependencyHealthNode({
+      name: "legacy-artifact",
+      version: "1.0.0",
+      format: "maven",
+      cloudsmithStatus: "NOT_APPLICABLE",
+      qualifiers: {
+        repository: { unsafe: "https://user:secret@example.com/?token=hidden" },
+        configurations: [{ unsafe: "raw-object" }],
+      },
+    }, {});
+    const emptyNode = new DependencyHealthNode({
+      name: "plain-artifact",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "NOT_APPLICABLE",
+      qualifiers: {},
+    }, {});
+    const unsafeLookupNode = new DependencyHealthNode({
+      name: "local-artifact",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "NOT_APPLICABLE",
+      cloudsmithLookupDetail: { unsafe: "raw-lookup-detail" },
+      qualifiers: {},
+    }, {});
+    const unsafeUpstreamNode = new DependencyHealthNode({
+      name: "missing-artifact",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "NOT_FOUND",
+      upstreamDetail: { unsafe: "raw-upstream-detail" },
+      qualifiers: {},
+    }, {});
+
+    const item = node.getTreeItem();
+    const tooltip = item.tooltip;
+    assert.match(item.description, /\[linux-x64\]/);
+    assert.match(tooltip, /Platform: linux-x64/);
+    assert.match(tooltip, /Configurations: runtime, test/);
+    assert.match(tooltip, /Repository: https:\/\/example\.com\/index/);
+    assert.match(tooltip, /Tag: 0/);
+    assert.doesNotMatch(tooltip, /Classifier:|Alias:|Scope:/);
+    assert.doesNotMatch(
+      tooltip,
+      /null|undefined|\[object Object\]|user:secret|token=|#private|raw-object/
+    );
+    assert.doesNotMatch(
+      unsafeNode.getTreeItem().tooltip,
+      /Repository:|Configurations:|null|undefined|\[object Object\]|user:secret|token=|raw-object/
+    );
+    assert.doesNotMatch(
+      emptyNode.getTreeItem().tooltip,
+      /Platform:|Configurations:|Repository:|Tag:|Classifier:|Alias:|Scope:/
+    );
+    assert.doesNotMatch(
+      `${unsafeLookupNode.getTreeItem().tooltip}\n${unsafeUpstreamNode.getTreeItem().tooltip}`,
+      /\[object Object\]|raw-lookup-detail|raw-upstream-detail/
+    );
+  });
+
+  test("dependency tooltip renders qualifier-bearing ecosystem values", () => {
+    const fixtures = [
+      ["maven", { classifier: "tests", type: "test-jar" }, ["Classifier: tests", "Type: test-jar"]],
+      ["gradle", { configurations: ["runtimeClasspath", "testRuntimeClasspath"] }, ["Configurations: runtimeClasspath, testRuntimeClasspath"]],
+      ["ruby", { platform: "arm64-darwin" }, ["Platform: arm64-darwin"]],
+      ["docker", { stage: "builder", service: "api", pullPolicy: "always", tag: "1.2.3", digest: "sha256:abc" }, ["Stage: builder", "Service: api", "Pull policy: always", "Tag: 1.2.3", "Digest: sha256:abc"]],
+      ["nuget", { targetFramework: "net8.0" }, ["Target framework: net8.0"]],
+      ["helm", { repository: "https://charts.example.com/private?token=hidden", alias: "cache" }, ["Repository: https://charts.example.com/private", "Alias: cache"]],
+      ["swift", { scope: "acme" }, ["Scope: acme"]],
+      ["hex", { environment: "dev" }, ["Environment: dev"]],
+    ];
+
+    for (const [format, qualifiers, expectedLines] of fixtures) {
+      const tooltip = new DependencyHealthNode({
+        name: `${format}-artifact`,
+        version: "1.0.0",
+        format,
+        cloudsmithStatus: "NOT_APPLICABLE",
+        packageSource: { kind: "registry" },
+        qualifiers,
+      }, {}).getTreeItem().tooltip;
+
+      for (const line of expectedLines) assert.match(tooltip, new RegExp(line));
+      assert.doesNotMatch(tooltip, /null|undefined|\[object Object\]|token=hidden/);
+    }
+  });
+
+  test("dependency source labels never expose legacy absolute paths", () => {
+    const tooltip = new DependencyHealthNode({
+      name: "legacy-source",
+      version: "1.0.0",
+      format: "maven",
+      cloudsmithStatus: "NOT_APPLICABLE",
+      sourceManifest: {
+        label: "/Users/private-user/workspace/pom.xml",
+      },
+      qualifiers: {},
+    }, {}).getTreeItem().tooltip;
+
+    assert.match(tooltip, /Source: pom\.xml/);
+    assert.doesNotMatch(tooltip, /private-user|\/Users\//);
+  });
+
+  test("dependency summary omits a zero not-applicable detail", () => {
+    const zeroTooltip = new DependencySummaryNode({
+      total: 5,
+      artifacts: 5,
+      applicableArtifacts: 5,
+      found: 3,
+      coveragePercent: 60,
+      notApplicable: 0,
+    }).getTreeItem().tooltip;
+    const positiveTooltip = new DependencySummaryNode({
+      total: 5,
+      artifacts: 5,
+      applicableArtifacts: 4,
+      found: 3,
+      coveragePercent: 75,
+      notApplicable: 1,
+    }).getTreeItem().tooltip;
+
+    assert.doesNotMatch(zeroTooltip, /0 not applicable/);
+    assert.match(positiveTooltip, /1 not applicable/);
   });
 
   test("dependency health missing nodes use format icons and upstream-aware context values", () => {

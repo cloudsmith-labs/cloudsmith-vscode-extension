@@ -7,6 +7,7 @@ const {
   getWorkspacePath,
   pathExists,
   readUtf8,
+  throwIfTraversalCancelled,
 } = require("./shared");
 
 const goParser = {
@@ -32,14 +33,17 @@ const goParser = {
     }];
   },
 
-  async resolve({ manifestPath, workspaceFolder }) {
+  async resolve({ manifestPath, workspaceFolder, options = {} }) {
+    const cancellationToken = options.cancellationToken;
+    throwIfTraversalCancelled(cancellationToken);
     const sourceFile = getSourceFileName(manifestPath);
-    const content = String(await readUtf8(manifestPath, workspaceFolder));
+    const content = String(await readUtf8(manifestPath, workspaceFolder, options));
     const replacements = parseGoReplacements(content);
     const dependencies = [];
     let inRequireBlock = false;
 
     for (const rawLine of content.split(/\r?\n/)) {
+      throwIfTraversalCancelled(cancellationToken);
       const line = rawLine.trim();
       if (!line || line.startsWith("//")) {
         continue;
@@ -193,6 +197,7 @@ function createGoDependency(values) {
     : hasUnresolvedReplacement
       ? getUnresolvedGoReplacementConstraint(replacement)
       : values.requiredVersion;
+  const packageSource = goPackageSource(replacement, supportedReplacement);
 
   return {
     ...createDependency({
@@ -213,6 +218,7 @@ function createGoDependency(values) {
     requiredVersion: values.requiredVersion,
     replacementFor: replacement ? values.requiredModule : null,
     replacementTarget: replacement ? replacement.target || null : null,
+    packageSource,
   };
 }
 
@@ -270,7 +276,18 @@ function isConcreteGoVersion(version) {
 }
 
 function normalizeGoVersion(version) {
-  return String(version || "").trim().replace(/^v/, "");
+  const value = String(version || "").trim().replace(/^v+/, "");
+  return value ? `v${value}` : "";
+}
+
+function goPackageSource(replacement, supportedReplacement) {
+  if (!replacement || supportedReplacement) {
+    return { kind: "registry" };
+  }
+  if (isLocalGoReplacementTarget(replacement.target)) {
+    return { kind: "path", location: replacement.target };
+  }
+  return { kind: "unknown" };
 }
 
 function goReplacementKey(moduleName, version) {

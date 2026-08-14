@@ -4,6 +4,8 @@ const path = require("path");
 const {
   DEPENDENCY_FILE_ERROR_CODES,
   MAX_DEPENDENCY_FILE_BYTES,
+  createDependency,
+  deduplicateDeps,
   readBoundedDirectoryEntries,
   readJson,
   readUtf8,
@@ -33,6 +35,30 @@ suite("Lockfile parser safety Test Suite", () => {
     await writeTextFile(lockfilePath, '{"lockfileVersion":3}\n');
 
     assert.strictEqual(await readUtf8(lockfilePath, workspace), '{"lockfileVersion":3}\n');
+  });
+
+  test("keeps Docker stage and service occurrences while retaining legacy artifact dedupe", () => {
+    const createDocker = (qualifiers) => createDependency({
+      name: "alpine",
+      version: "3.20",
+      ecosystem: "docker",
+      qualifiers: { tag: "3.20", ...qualifiers },
+      packageSource: { kind: "registry" },
+    });
+    const dependencies = deduplicateDeps([
+      createDocker({ stage: "builder" }),
+      createDocker({ stage: "runtime" }),
+      createDocker({ service: "api", pullPolicy: "always" }),
+      createDocker({ service: "api", pullPolicy: "never" }),
+      createDocker({ stage: "builder" }),
+    ]);
+    assert.strictEqual(dependencies.length, 4);
+    assert.deepStrictEqual(dependencies.map((dependency) => dependency.qualifiers), [
+      { tag: "3.20", stage: "builder" },
+      { tag: "3.20", stage: "runtime" },
+      { tag: "3.20", service: "api", pullPolicy: "always" },
+      { tag: "3.20", service: "api", pullPolicy: "never" },
+    ]);
   });
 
   test("distinguishes a missing dependency file", async () => {
@@ -142,6 +168,41 @@ suite("Lockfile parser safety Test Suite", () => {
     }
   });
 
+  test("checks cancellation between bounded file-read chunks", async () => {
+    const workspace = await createWorkspace("cloudsmith-read-cancellation-");
+    const lockfilePath = path.join(workspace, "package-lock.json");
+    await writeTextFile(lockfilePath, "x".repeat((64 * 1024) + 1));
+    const safeLockfilePath = await fs.promises.realpath(lockfilePath);
+    const originalOpen = fs.promises.open;
+    const token = { isCancellationRequested: false };
+    let readCalls = 0;
+
+    fs.promises.open = async (openedPath, flags) => {
+      const actualHandle = await originalOpen(openedPath, flags);
+      if (openedPath !== safeLockfilePath) return actualHandle;
+      return {
+        stat: (...args) => actualHandle.stat(...args),
+        async read(...args) {
+          const result = await actualHandle.read(...args);
+          readCalls += 1;
+          if (readCalls === 1) token.isCancellationRequested = true;
+          return result;
+        },
+        close: (...args) => actualHandle.close(...args),
+      };
+    };
+
+    try {
+      await assert.rejects(
+        () => readUtf8(lockfilePath, workspace, { cancellationToken: token }),
+        (error) => error.code === "ERR_DEPENDENCY_TRAVERSAL_CANCELLED"
+      );
+      assert.strictEqual(readCalls, 1);
+    } finally {
+      fs.promises.open = originalOpen;
+    }
+  });
+
   test("rejects an ancestor replaced with an outside symlink during open", async () => {
     const workspace = await createWorkspace("cloudsmith-ancestor-race-");
     const outsideWorkspace = await createWorkspace("cloudsmith-ancestor-race-target-");
@@ -181,6 +242,41 @@ suite("Lockfile parser safety Test Suite", () => {
     }
   });
 
+  test("rejects an ancestor redirected to a different in-workspace file during open", async () => {
+    const workspace = await createWorkspace("cloudsmith-inside-ancestor-race-");
+    const controlledDirectory = path.join(workspace, "controlled");
+    const movedDirectory = path.join(workspace, "controlled-original");
+    const replacementDirectory = path.join(workspace, "replacement");
+    const lockfilePath = path.join(controlledDirectory, "package-lock.json");
+    await writeTextFile(lockfilePath, "original\n");
+    await writeTextFile(path.join(replacementDirectory, "package-lock.json"), "replacement\n");
+    const safeLockfilePath = await fs.promises.realpath(lockfilePath);
+
+    const originalOpen = fs.promises.open;
+    let moved = false;
+    let symlinkCreated = false;
+    fs.promises.open = async (openedPath, flags) => {
+      if (!moved && openedPath === safeLockfilePath) {
+        await fs.promises.rename(controlledDirectory, movedDirectory);
+        moved = true;
+        await fs.promises.symlink(replacementDirectory, controlledDirectory, "dir");
+        symlinkCreated = true;
+      }
+      return originalOpen(openedPath, flags);
+    };
+
+    try {
+      await assert.rejects(
+        () => readUtf8(lockfilePath, workspace),
+        (error) => error.code === DEPENDENCY_FILE_ERROR_CODES.CHANGED
+      );
+    } finally {
+      fs.promises.open = originalOpen;
+      if (symlinkCreated) await fs.promises.unlink(controlledDirectory);
+      if (moved) await fs.promises.rename(movedDirectory, controlledDirectory);
+    }
+  });
+
   test("rejects a final file replaced with a symlink during open", async () => {
     const workspace = await createWorkspace("cloudsmith-final-race-");
     const outsideWorkspace = await createWorkspace("cloudsmith-final-race-target-");
@@ -216,6 +312,40 @@ suite("Lockfile parser safety Test Suite", () => {
       }
       if (moved) {
         await fs.promises.rename(movedLockfilePath, lockfilePath);
+      }
+    }
+  });
+
+  test("rejects a regular file replaced immediately after canonical path resolution", async () => {
+    const workspace = await createWorkspace("cloudsmith-realpath-file-race-");
+    const lockfilePath = path.join(workspace, "package-lock.json");
+    const originalPath = path.join(workspace, "package-lock.original.json");
+    const replacementPath = path.join(workspace, "package-lock.replacement.json");
+    await writeTextFile(lockfilePath, "original\n");
+    await writeTextFile(replacementPath, "replacement\n");
+
+    const originalRealpath = fs.promises.realpath;
+    let replaced = false;
+    fs.promises.realpath = async (targetPath, ...args) => {
+      const resolved = await originalRealpath(targetPath, ...args);
+      if (!replaced && path.resolve(targetPath) === lockfilePath) {
+        await fs.promises.rename(lockfilePath, originalPath);
+        await fs.promises.rename(replacementPath, lockfilePath);
+        replaced = true;
+      }
+      return resolved;
+    };
+
+    try {
+      await assert.rejects(
+        () => readUtf8(lockfilePath, workspace),
+        (error) => error.code === DEPENDENCY_FILE_ERROR_CODES.CHANGED
+      );
+    } finally {
+      fs.promises.realpath = originalRealpath;
+      if (replaced) {
+        await fs.promises.rename(lockfilePath, replacementPath);
+        await fs.promises.rename(originalPath, lockfilePath);
       }
     }
   });
@@ -330,7 +460,7 @@ suite("Lockfile parser safety Test Suite", () => {
 
     await assert.rejects(
       () => readUtf8(lockfilePath, workspace),
-      new RegExp(`exceeds the ${MAX_DEPENDENCY_FILE_BYTES} byte parsing limit`)
+      /exceeds the supported parsing size/
     );
   });
 
@@ -347,5 +477,240 @@ suite("Lockfile parser safety Test Suite", () => {
 
     assert.strictEqual(result.entries.length, 2);
     assert.strictEqual(result.truncated, true);
+  });
+
+  test("cancels bounded directory enumeration before consuming entries", async () => {
+    const workspace = await createWorkspace("cloudsmith-directory-cancellation-");
+    await writeTextFile(path.join(workspace, "a.txt"), "a\n");
+
+    await assert.rejects(
+      () => readBoundedDirectoryEntries(workspace, 2, {
+        cancellationToken: { isCancellationRequested: true },
+      }),
+      (error) => error.code === "ERR_DEPENDENCY_TRAVERSAL_CANCELLED"
+    );
+  });
+
+  test("rejects a directory replaced with an outside symlink during open", async () => {
+    const workspace = await createWorkspace("cloudsmith-directory-race-");
+    const outsideWorkspace = await createWorkspace("cloudsmith-directory-race-target-");
+    const controlledDirectory = path.join(workspace, "controlled");
+    const movedDirectory = path.join(workspace, "controlled-original");
+    await writeTextFile(path.join(controlledDirectory, "inside.txt"), "inside\n");
+    await writeTextFile(path.join(outsideWorkspace, "outside.txt"), "outside\n");
+    const safeDirectoryPath = await fs.promises.realpath(controlledDirectory);
+
+    const originalOpendir = fs.promises.opendir;
+    let moved = false;
+    let symlinkCreated = false;
+    fs.promises.opendir = async (openedPath, ...args) => {
+      if (!moved && openedPath === safeDirectoryPath) {
+        await fs.promises.rename(controlledDirectory, movedDirectory);
+        moved = true;
+        await fs.promises.symlink(outsideWorkspace, controlledDirectory, "dir");
+        symlinkCreated = true;
+      }
+      return originalOpendir(openedPath, ...args);
+    };
+
+    try {
+      await assert.rejects(
+        () => readBoundedDirectoryEntries(controlledDirectory, 10, { workspaceFolder: workspace }),
+        (error) => error.code === DEPENDENCY_FILE_ERROR_CODES.CHANGED
+      );
+    } finally {
+      fs.promises.opendir = originalOpendir;
+      if (symlinkCreated) await fs.promises.unlink(controlledDirectory);
+      if (moved) await fs.promises.rename(movedDirectory, controlledDirectory);
+    }
+  });
+
+  test("rejects entries from a reversible directory swap during opendir", async () => {
+    const workspace = await createWorkspace("cloudsmith-directory-reversible-race-");
+    const outsideWorkspace = await createWorkspace(
+      "cloudsmith-directory-reversible-race-target-"
+    );
+    const controlledDirectory = path.join(workspace, "controlled");
+    const movedDirectory = path.join(workspace, "controlled-original");
+    await writeTextFile(path.join(controlledDirectory, "inside.csproj"), "inside\n");
+    await writeTextFile(path.join(outsideWorkspace, "outside-only.csproj"), "outside\n");
+    const safeDirectoryPath = await fs.promises.realpath(controlledDirectory);
+
+    const originalOpendir = fs.promises.opendir;
+    let swapped = false;
+    fs.promises.opendir = async (openedPath, ...args) => {
+      if (!swapped && openedPath === safeDirectoryPath) {
+        await fs.promises.rename(controlledDirectory, movedDirectory);
+        await fs.promises.symlink(outsideWorkspace, controlledDirectory, "dir");
+        const outsideDirectoryHandle = await originalOpendir(openedPath, ...args);
+        await fs.promises.unlink(controlledDirectory);
+        await fs.promises.rename(movedDirectory, controlledDirectory);
+        swapped = true;
+        return outsideDirectoryHandle;
+      }
+      return originalOpendir(openedPath, ...args);
+    };
+
+    try {
+      await assert.rejects(
+        () => readBoundedDirectoryEntries(controlledDirectory, 10, {
+          workspaceFolder: workspace,
+        }),
+        (error) => error.code === DEPENDENCY_FILE_ERROR_CODES.CHANGED
+      );
+    } finally {
+      fs.promises.opendir = originalOpendir;
+      if (await fs.promises.lstat(controlledDirectory).then(
+        (stats) => stats.isSymbolicLink(),
+        () => false
+      )) {
+        await fs.promises.unlink(controlledDirectory);
+      }
+      if (await fs.promises.access(movedDirectory).then(() => true, () => false)) {
+        await fs.promises.rename(movedDirectory, controlledDirectory);
+      }
+    }
+  });
+
+  test("rejects a regular child replaced by a symlink before it is opened", async () => {
+    const workspace = await createWorkspace("cloudsmith-directory-child-race-");
+    const outsideWorkspace = await createWorkspace("cloudsmith-directory-child-target-");
+    const controlledDirectory = path.join(workspace, "controlled");
+    const controlledChild = path.join(controlledDirectory, "inside.txt");
+    const movedChild = path.join(controlledDirectory, "inside-original.txt");
+    const outsideChild = path.join(outsideWorkspace, "outside.txt");
+    await writeTextFile(controlledChild, "inside\n");
+    await writeTextFile(outsideChild, "outside\n");
+    const safeControlledChild = path.join(
+      await fs.promises.realpath(controlledDirectory),
+      "inside.txt"
+    );
+
+    const originalOpen = fs.promises.open;
+    let swapped = false;
+    fs.promises.open = async (openedPath, ...args) => {
+      if (!swapped && openedPath === safeControlledChild) {
+        await fs.promises.rename(controlledChild, movedChild);
+        await fs.promises.symlink(outsideChild, controlledChild, "file");
+        swapped = true;
+      }
+      return originalOpen(openedPath, ...args);
+    };
+
+    try {
+      await assert.rejects(
+        () => readBoundedDirectoryEntries(controlledDirectory, 10, {
+          workspaceFolder: workspace,
+        }),
+        (error) => error.code === DEPENDENCY_FILE_ERROR_CODES.CHANGED
+      );
+    } finally {
+      fs.promises.open = originalOpen;
+      if (await fs.promises.lstat(controlledChild).then(
+        (stats) => stats.isSymbolicLink(),
+        () => false
+      )) {
+        await fs.promises.unlink(controlledChild);
+      }
+      if (await fs.promises.access(movedChild).then(() => true, () => false)) {
+        await fs.promises.rename(movedChild, controlledChild);
+      }
+    }
+  });
+
+  test("opens regular children before checking their path identity", async () => {
+    const workspace = await createWorkspace("cloudsmith-directory-child-order-");
+    const controlledChild = path.join(workspace, "inside.txt");
+    await writeTextFile(controlledChild, "inside\n");
+    const safeControlledChild = path.join(
+      await fs.promises.realpath(workspace),
+      "inside.txt"
+    );
+    const calls = [];
+    let openedFlags = null;
+    const originalOpen = fs.promises.open;
+    const originalLstat = fs.promises.lstat;
+    fs.promises.open = async (openedPath, flags, ...args) => {
+      const handle = await originalOpen(openedPath, flags, ...args);
+      if (openedPath !== safeControlledChild) return handle;
+      calls.push("open");
+      openedFlags = flags;
+      return {
+        stat: async (...statArgs) => {
+          calls.push("fstat");
+          return handle.stat(...statArgs);
+        },
+        close: (...closeArgs) => handle.close(...closeArgs),
+      };
+    };
+    fs.promises.lstat = async (targetPath, ...args) => {
+      if (targetPath === safeControlledChild) calls.push("lstat");
+      return originalLstat(targetPath, ...args);
+    };
+
+    try {
+      const result = await readBoundedDirectoryEntries(workspace, 10, {
+        workspaceFolder: workspace,
+      });
+      assert.strictEqual(result.entries.length, 1);
+      assert.deepStrictEqual(calls, ["open", "fstat", "lstat"]);
+      if (Number.isInteger(fs.constants.O_NOFOLLOW) && fs.constants.O_NOFOLLOW !== 0) {
+        assert.strictEqual(openedFlags & fs.constants.O_NOFOLLOW, fs.constants.O_NOFOLLOW);
+      }
+      if (Number.isInteger(fs.constants.O_NONBLOCK) && fs.constants.O_NONBLOCK !== 0) {
+        assert.strictEqual(openedFlags & fs.constants.O_NONBLOCK, fs.constants.O_NONBLOCK);
+      }
+    } finally {
+      fs.promises.open = originalOpen;
+      fs.promises.lstat = originalLstat;
+    }
+  });
+
+  test("rejects a regular child replaced after its handle is opened", async () => {
+    const workspace = await createWorkspace("cloudsmith-directory-child-post-open-");
+    const outsideWorkspace = await createWorkspace(
+      "cloudsmith-directory-child-post-open-target-"
+    );
+    const controlledChild = path.join(workspace, "inside.txt");
+    const movedChild = path.join(workspace, "inside-original.txt");
+    const outsideChild = path.join(outsideWorkspace, "outside.txt");
+    await writeTextFile(controlledChild, "inside\n");
+    await writeTextFile(outsideChild, "outside\n");
+    const safeControlledChild = path.join(
+      await fs.promises.realpath(workspace),
+      "inside.txt"
+    );
+
+    const originalOpen = fs.promises.open;
+    let swapped = false;
+    fs.promises.open = async (openedPath, ...args) => {
+      const handle = await originalOpen(openedPath, ...args);
+      if (!swapped && openedPath === safeControlledChild) {
+        await fs.promises.rename(controlledChild, movedChild);
+        await fs.promises.symlink(outsideChild, controlledChild, "file");
+        swapped = true;
+      }
+      return handle;
+    };
+
+    try {
+      await assert.rejects(
+        () => readBoundedDirectoryEntries(workspace, 10, {
+          workspaceFolder: workspace,
+        }),
+        (error) => error.code === DEPENDENCY_FILE_ERROR_CODES.CHANGED
+      );
+    } finally {
+      fs.promises.open = originalOpen;
+      if (await fs.promises.lstat(controlledChild).then(
+        (stats) => stats.isSymbolicLink(),
+        () => false
+      )) {
+        await fs.promises.unlink(controlledChild);
+      }
+      if (await fs.promises.access(movedChild).then(() => true, () => false)) {
+        await fs.promises.rename(movedChild, controlledChild);
+      }
+    }
   });
 });

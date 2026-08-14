@@ -8,7 +8,6 @@ const {
   getSourceFileName,
   getWorkspacePath,
   normalizeVersion,
-  readJson,
   pathExists,
   readUtf8,
   stripYamlComment,
@@ -24,14 +23,15 @@ const npmParser = {
   name: "npmParser",
   ecosystem: "npm",
 
-  async canResolve(workspaceFolder) {
-    const matches = await this.detect(workspaceFolder);
+  async canResolve(workspaceFolder, options = {}) {
+    const matches = await this.detect(workspaceFolder, options);
     return matches.length > 0;
   },
 
-  async detect(workspaceFolder) {
+  async detect(workspaceFolder, options = {}) {
     const rootPath = getWorkspacePath(workspaceFolder);
     for (const fileName of LOCKFILE_NAMES) {
+      throwIfNpmCancelled(options);
       const lockfilePath = path.join(rootPath, fileName);
       if (await pathExists(lockfilePath, workspaceFolder)) {
         const manifestPath = await pathExists(path.join(rootPath, "package.json"), workspaceFolder)
@@ -50,10 +50,11 @@ const npmParser = {
   },
 
   async resolve({ lockfilePath, manifestPath, workspaceFolder, options = {} }) {
+    throwIfNpmCancelled(options);
     const sourceFile = getSourceFileName(lockfilePath);
     let manifest = { dependencies: [], directNames: new Set(), devNames: new Set() };
     if (manifestPath && await pathExists(manifestPath, workspaceFolder)) {
-      const content = await readUtf8(manifestPath, workspaceFolder);
+      const content = await readUtf8(manifestPath, workspaceFolder, options);
       try {
         JSON.parse(content);
       } catch {
@@ -80,8 +81,9 @@ const npmParser = {
 
 async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options) {
   const warnings = [];
+  throwIfNpmCancelled(options);
 
-  const root = await readJson(lockfilePath, workspaceFolder);
+  const root = JSON.parse(await readUtf8(lockfilePath, workspaceFolder, options));
   const packages = root && typeof root === "object" && root.packages && typeof root.packages === "object"
     ? root.packages
     : null;
@@ -99,8 +101,10 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
 
   const entriesByPath = new Map();
   const uniqueEntries = new Map();
+  const developmentEvidenceByIdentity = new Map();
 
   for (const [packagePath, packageInfo] of Object.entries(packages)) {
+    throwIfNpmCancelled(options);
     if (packagePath === "" || !packageInfo || typeof packageInfo !== "object") {
       continue;
     }
@@ -121,6 +125,10 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
       ...(packageInfo.dependencies || {}),
       ...(packageInfo.optionalDependencies || {}),
     };
+    const sourceHints = createNpmSourceHints({
+      resolutions: [packageInfo.resolved],
+    });
+    const packageSource = classifyNpmPackageSource(sourceHints);
     const entry = {
       key: occurrenceKey,
       packagePath,
@@ -129,8 +137,16 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
       version,
       dependencies,
       isDevelopmentDependency: packageInfo.dev === true,
+      sourceHints,
+      packageSource,
+      hasResolutionEvidence: packageSource.kind === "registry",
     };
     entriesByPath.set(packagePath, entry);
+    recordPackageLockDevelopmentEvidence(
+      developmentEvidenceByIdentity,
+      identityKey,
+      entry.isDevelopmentDependency
+    );
     if (!uniqueEntries.has(identityKey)) {
       uniqueEntries.set(identityKey, entry);
     }
@@ -146,13 +162,23 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
   const dependencyGraph = buildPackageLockGraph(entriesByPath, directNames, manifest, traversalState);
 
   for (const directName of directNames) {
+    const manifestReference = manifest.dependencies.find((dependency) => (
+      dependency.name === directName
+    ));
+    const directSourceHints = {
+      specifiers: [
+        rootDependencyMap[directName],
+        manifestReference && (manifestReference.declaredConstraint || manifestReference.version),
+      ],
+    };
     const entry = selectPackageLockEntry(entriesByPath, "", directName);
-    const dependency = buildNpmDependency(entry, directName, [], entriesByPath, new Set(), {
+    const directEntry = applyNpmSourceHints(entry, directSourceHints);
+    const dependency = buildNpmDependency(directEntry, directName, [], entriesByPath, new Set(), {
       sourceFile: getSourceFileName(lockfilePath),
       devNames: manifest.devNames,
     }, manifest.devNames.has(directName), traversalState, true) || createNpmDependency({
-      name: entry ? entry.name : directName,
-      version: entry ? entry.version : "",
+      name: directEntry ? directEntry.name : directName,
+      version: directEntry ? directEntry.version : "",
       ecosystem: "npm",
       isDirect: true,
       parent: null,
@@ -160,8 +186,12 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
       transitives: [],
       sourceFile: getSourceFileName(lockfilePath),
       isDevelopmentDependency: manifest.devNames.has(directName)
-        || Boolean(entry && entry.isDevelopmentDependency),
-    }, entry ? entry.installedName : directName);
+        || Boolean(directEntry && directEntry.isDevelopmentDependency),
+      packageSource: directEntry
+        ? directEntry.packageSource
+        : classifyNpmPackageSource(directSourceHints),
+      hasResolutionEvidence: Boolean(directEntry && directEntry.hasResolutionEvidence),
+    }, directEntry ? directEntry.installedName : directName);
     const key = npmPackageVersionKey(dependency.name, dependency.version);
     if (!seenDirectKeys.has(key)) {
       seenDirectKeys.add(key);
@@ -169,7 +199,9 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
     }
   }
 
-  let dependencies = deduplicateDeps(flattenDependencies(directRoots));
+  let dependencies = deduplicateDeps(flattenDependencies(directRoots, {
+    cancellationToken: options.cancellationToken,
+  }));
   const addedKeys = new Set();
   collectDependencyKeys(dependencies, addedKeys);
   for (const entry of uniqueEntries.values()) {
@@ -188,14 +220,17 @@ async function parsePackageLock(lockfilePath, manifest, workspaceFolder, options
       transitives: [],
       sourceFile: getSourceFileName(lockfilePath),
       isDevelopmentDependency: entry.isDevelopmentDependency,
+      packageSource: entry.packageSource,
+      hasResolutionEvidence: entry.hasResolutionEvidence,
     }, entry.installedName));
   }
+  dependencies = normalizePackageLockArtifactDevelopment(
+    dependencies,
+    developmentEvidenceByIdentity
+  );
 
   if (options.maxDependenciesToScan && dependencies.length > options.maxDependenciesToScan) {
-    warnings.push(
-      `Large npm dependency tree (${dependencies.length} unique packages). ` +
-      `Display is capped at ${options.maxDependenciesToScan} dependencies.`
-    );
+    warnings.push("Some dependencies are hidden by the configured display setting. Package inventory remains complete.");
   }
   appendGraphLimitWarning(warnings, traversalState);
   publishGraphMetrics(options, traversalState, entriesByPath.size, uniqueEntries.size);
@@ -212,6 +247,7 @@ function buildPackageLockGraph(entriesByPath, directNames, manifest, traversalSt
   let edgeCount = 0;
 
   for (const entry of entriesByPath.values()) {
+    throwIfNpmCancelled(traversalState.options);
     if (graphEntries.length >= traversalState.maxNodes) {
       traversalState.nodeLimitReached = true;
       traversalState.truncated = true;
@@ -305,6 +341,7 @@ function buildNpmDependency(
   traversalState,
   forceExpand = false
 ) {
+  throwIfNpmCancelled(traversalState && traversalState.options);
   if (!reserveMaterializedNode(parentChain, traversalState)) {
     return null;
   }
@@ -318,7 +355,10 @@ function buildNpmDependency(
       parentChain,
       transitives: [],
       sourceFile: context.sourceFile,
-      isDevelopmentDependency: inheritedDevelopment || context.devNames.has(fallbackName),
+      isDevelopmentDependency: inheritedDevelopment
+        || (parentChain.length === 0 && context.devNames.has(fallbackName)),
+      packageSource: classifyNpmPackageSource(),
+      hasResolutionEvidence: false,
     }, fallbackName);
   }
 
@@ -334,6 +374,8 @@ function buildNpmDependency(
       transitives: [],
       sourceFile: context.sourceFile,
       isDevelopmentDependency: inheritedDevelopment || entry.isDevelopmentDependency,
+      packageSource: entry.packageSource,
+      hasResolutionEvidence: entry.hasResolutionEvidence,
     }, entry.installedName);
   }
 
@@ -342,8 +384,7 @@ function buildNpmDependency(
   const nextParentChain = parentChain.concat(entry.name);
   const transitives = [];
   const isDevelopmentDependency = inheritedDevelopment
-    || entry.isDevelopmentDependency
-    || context.devNames.has(entry.installedName);
+    || entry.isDevelopmentDependency;
 
   if (!canExpandGraphNode(parentChain, entry.key, traversalState, forceExpand)) {
     return createNpmDependency({
@@ -356,11 +397,16 @@ function buildNpmDependency(
       transitives: [],
       sourceFile: context.sourceFile,
       isDevelopmentDependency,
+      packageSource: entry.packageSource,
+      hasResolutionEvidence: entry.hasResolutionEvidence,
     }, entry.installedName);
   }
 
   for (const dependencyName of Object.keys(entry.dependencies || {})) {
-    const childEntry = selectPackageLockEntry(entriesByPath, entry.packagePath, dependencyName);
+    const childEntry = applyNpmSourceHints(
+      selectPackageLockEntry(entriesByPath, entry.packagePath, dependencyName),
+      { specifiers: [entry.dependencies[dependencyName]] }
+    );
     if (childEntry && nextVisiting.has(childEntry.key)) {
       traversalState.cycleEdgesSkipped += 1;
       continue;
@@ -391,7 +437,41 @@ function buildNpmDependency(
     transitives: deduplicateDeps(transitives),
     sourceFile: context.sourceFile,
     isDevelopmentDependency,
+    packageSource: entry.packageSource,
+    hasResolutionEvidence: entry.hasResolutionEvidence,
   }, entry.installedName);
+}
+
+function recordPackageLockDevelopmentEvidence(evidenceByIdentity, identityKey, isDevelopment) {
+  const evidence = evidenceByIdentity.get(identityKey) || {
+    hasDevelopmentOccurrence: false,
+    hasProductionOccurrence: false,
+  };
+  if (isDevelopment) {
+    evidence.hasDevelopmentOccurrence = true;
+  } else {
+    evidence.hasProductionOccurrence = true;
+  }
+  evidenceByIdentity.set(identityKey, evidence);
+}
+
+function normalizePackageLockArtifactDevelopment(dependencies, evidenceByIdentity) {
+  return (Array.isArray(dependencies) ? dependencies : []).map((dependency) => {
+    const identityKey = npmPackageVersionKey(dependency.name, dependency.version);
+    const evidence = evidenceByIdentity.get(identityKey);
+    if (!evidence) {
+      return dependency;
+    }
+    const isDevelopmentDependency = evidence.hasDevelopmentOccurrence
+      && !evidence.hasProductionOccurrence;
+    if (dependency.isDevelopmentDependency === isDevelopmentDependency) {
+      return dependency;
+    }
+    return {
+      ...dependency,
+      isDevelopmentDependency,
+    };
+  });
 }
 
 function selectPackageLockEntry(entriesByPath, parentPackagePath, dependencyName) {
@@ -435,8 +515,9 @@ function extractPackageLockName(packagePath) {
 }
 
 async function parseYarnLock(lockfilePath, manifest, workspaceFolder, options) {
-  const content = await readUtf8(lockfilePath, workspaceFolder);
-  const parsed = parseYarnEntries(content);
+  throwIfNpmCancelled(options);
+  const content = await readUtf8(lockfilePath, workspaceFolder, options);
+  const parsed = parseYarnEntries(content, options);
   if (parsed.entries.size === 0) {
     throw new Error("Malformed yarn.lock: no package entries found");
   }
@@ -454,9 +535,13 @@ async function parseYarnLock(lockfilePath, manifest, workspaceFolder, options) {
     : new Set([...parsed.entries.values()].map((entry) => entry.name));
 
   const directRoots = [];
-  const traversalState = createGraphTraversalState();
+  const traversalState = createGraphTraversalState(options);
   for (const directName of directNames) {
-    const entry = selectYarnEntry(parsed, directName, manifestVersionHints.get(directName));
+    throwIfNpmCancelled(options);
+    const entry = applyNpmSourceHints(
+      selectYarnEntry(parsed, directName, manifestVersionHints.get(directName)),
+      { specifiers: [manifestVersionHints.get(directName)] }
+    );
     directRoots.push(buildYarnDependency(
       entry,
       directName,
@@ -466,11 +551,14 @@ async function parseYarnLock(lockfilePath, manifest, workspaceFolder, options) {
       sourceFile,
       manifest.devNames,
       false,
-      traversalState
+      traversalState,
+      true
     ));
   }
 
-  let dependencies = deduplicateDeps(flattenDependencies(directRoots));
+  let dependencies = deduplicateDeps(flattenDependencies(directRoots, {
+    cancellationToken: options.cancellationToken,
+  }));
   for (const entry of parsed.entries.values()) {
     const key = npmPackageVersionKey(entry.name, entry.version);
     if (dependencies.some((dependency) => npmPackageVersionKey(
@@ -489,17 +577,17 @@ async function parseYarnLock(lockfilePath, manifest, workspaceFolder, options) {
       transitives: [],
       sourceFile,
       isDevelopmentDependency: manifest.devNames.has(entry.installedName || entry.name),
+      packageSource: entry.packageSource,
+      hasResolutionEvidence: entry.hasResolutionEvidence,
     }, entry.installedName || entry.name));
   }
 
   const warnings = [];
   if (options.maxDependenciesToScan && dependencies.length > options.maxDependenciesToScan) {
-    warnings.push(
-      `Large npm dependency tree (${dependencies.length} unique packages). ` +
-      `Display is capped at ${options.maxDependenciesToScan} dependencies.`
-    );
+    warnings.push("Some dependencies are hidden by the configured display setting. Package inventory remains complete.");
   }
   appendGraphLimitWarning(warnings, traversalState);
+  publishGraphMetrics(options, traversalState, parsed.entries.size, countUniqueNpmIdentities(parsed.entries.values()));
 
   return buildTree("npm", sourceFile, dependencies, warnings);
 }
@@ -513,8 +601,10 @@ function buildYarnDependency(
   sourceFile,
   devNames,
   inheritedDevelopment = false,
-  traversalState
+  traversalState,
+  forceExpand = false
 ) {
+  throwIfNpmCancelled(traversalState && traversalState.options);
   if (!entry) {
     return createNpmDependency({
       name: fallbackName,
@@ -526,11 +616,14 @@ function buildYarnDependency(
       transitives: [],
       sourceFile,
       isDevelopmentDependency: inheritedDevelopment || devNames.has(fallbackName),
+      packageSource: classifyNpmPackageSource(),
+      hasResolutionEvidence: false,
     }, fallbackName);
   }
 
   const key = entry.key || npmPackageVersionKey(entry.name, entry.version);
   if (visiting.has(key)) {
+    traversalState.cycleEdgesSkipped += 1;
     return createNpmDependency({
       name: entry.name,
       version: entry.version,
@@ -541,6 +634,8 @@ function buildYarnDependency(
       transitives: [],
       sourceFile,
       isDevelopmentDependency: inheritedDevelopment || devNames.has(entry.installedName || entry.name),
+      packageSource: entry.packageSource,
+      hasResolutionEvidence: entry.hasResolutionEvidence,
     }, entry.installedName || entry.name);
   }
 
@@ -551,7 +646,7 @@ function buildYarnDependency(
   const isDevelopmentDependency = inheritedDevelopment
     || devNames.has(entry.installedName || entry.name);
 
-  if (!canExpandGraphNode(parentChain, traversalState)) {
+  if (!canExpandGraphNode(parentChain, key, traversalState, forceExpand)) {
     return createNpmDependency({
       name: entry.name,
       version: entry.version,
@@ -562,13 +657,27 @@ function buildYarnDependency(
       transitives: [],
       sourceFile,
       isDevelopmentDependency,
+      packageSource: entry.packageSource,
+      hasResolutionEvidence: entry.hasResolutionEvidence,
     }, entry.installedName || entry.name);
   }
 
   for (const dependencyName of Object.keys(entry.dependencies || {})) {
+    if (!reserveNpmRelationshipEdge(traversalState)) {
+      break;
+    }
     const versionHint = entry.dependencies[dependencyName];
-    transitives.push(buildYarnDependency(
+    const childEntry = applyNpmSourceHints(
       selectYarnEntry(parsedEntries, dependencyName, versionHint),
+      { specifiers: [versionHint] }
+    );
+    if (childEntry) {
+      traversalState.resolvedEdges += 1;
+    } else {
+      traversalState.unresolvedEdges += 1;
+    }
+    transitives.push(buildYarnDependency(
+      childEntry,
       dependencyName,
       nextParentChain,
       parsedEntries,
@@ -576,7 +685,8 @@ function buildYarnDependency(
       sourceFile,
       devNames,
       isDevelopmentDependency,
-      traversalState
+      traversalState,
+      false
     ));
   }
 
@@ -590,10 +700,12 @@ function buildYarnDependency(
     transitives: deduplicateDeps(transitives),
     sourceFile,
     isDevelopmentDependency,
+    packageSource: entry.packageSource,
+    hasResolutionEvidence: entry.hasResolutionEvidence,
   }, entry.installedName || entry.name);
 }
 
-function parseYarnEntries(content) {
+function parseYarnEntries(content, options = {}) {
   const entries = new Map();
   const entriesByName = new Map();
   const selectorIndex = new Map();
@@ -603,11 +715,13 @@ function parseYarnEntries(content) {
 
   const flushCurrent = () => {
     if (currentEntry && currentEntry.name && currentEntry.version) {
-      const key = [
-        currentEntry.installedName.toLowerCase(),
-        currentEntry.name.toLowerCase(),
-        currentEntry.version,
-      ].join("@");
+      const key = JSON.stringify((currentEntry.selectors || []).slice().sort());
+      currentEntry.sourceHints = createNpmSourceHints({
+        specifiers: currentEntry.selectors || [],
+        resolutions: [currentEntry.resolution],
+      });
+      currentEntry.packageSource = classifyNpmPackageSource(currentEntry.sourceHints);
+      currentEntry.hasResolutionEvidence = currentEntry.packageSource.kind === "registry";
       const existing = entries.get(key);
       if (existing) {
         Object.assign(existing.dependencies, currentEntry.dependencies);
@@ -634,6 +748,7 @@ function parseYarnEntries(content) {
   };
 
   for (const rawLine of lines) {
+    throwIfNpmCancelled(options);
     const line = rawLine.replace(/\r$/, "");
     const trimmed = line.trim();
     if (!trimmed) {
@@ -661,6 +776,7 @@ function parseYarnEntries(content) {
         version: "",
         dependencies: {},
         selectors,
+        resolution: "",
       };
       continue;
     }
@@ -681,8 +797,15 @@ function parseYarnEntries(content) {
       continue;
     }
 
+    const resolutionMatch = trimmed.match(/^resolution(?:\s+|:\s*)["']?(.+?)["']?$/);
+    if (resolutionMatch) {
+      currentEntry.resolution = resolutionMatch[1].replace(/^['"]|['"]$/g, "");
+      inDependencies = false;
+      continue;
+    }
+
     if (inDependencies) {
-      const dependencyMatch = trimmed.match(/^("?[^"\s]+"?)\s+"([^"]+)"/);
+      const dependencyMatch = trimmed.match(/^("[^"]+"|'[^']+'|[^:\s]+)(?:\s*:\s*|\s+)["']?([^"'\s]+)["']?/);
       if (!dependencyMatch) {
         continue;
       }
@@ -752,10 +875,96 @@ function parseNpmAliasSpecifier(specifier) {
 }
 
 function createNpmDependency(values, declaredName) {
-  return {
+  const dependency = {
     ...createDependency(values),
     declaredName: String(declaredName || values.name || "").trim(),
   };
+  if (values && values.packageSource) {
+    dependency.packageSource = { ...values.packageSource };
+  }
+  if (values && Object.prototype.hasOwnProperty.call(values, "hasResolutionEvidence")) {
+    dependency.hasResolutionEvidence = values.hasResolutionEvidence === true;
+  }
+  return dependency;
+}
+
+function classifyNpmPackageSource(hints = {}) {
+  const sourceHints = createNpmSourceHints(hints);
+  const signals = [...sourceHints.specifiers, ...sourceHints.resolutions];
+  const value = signals.join(" ");
+  if (/\b(?:workspace|link):/i.test(value)) {
+    return { kind: "local", ...(value ? { location: boundedSourceLocation(value) } : {}) };
+  }
+  if (/\bfile:/i.test(value)) {
+    return { kind: "path", location: boundedSourceLocation(value) };
+  }
+  if (/(?:^|\s)(?:git\+|git:|github:|gitlab:|bitbucket:)|\.git(?:#|\s|$)/i.test(value)) {
+    return { kind: "git", location: boundedSourceLocation(value) };
+  }
+  // A URL in a declaration/selector is a direct artifact dependency and must
+  // not become registry lookup evidence. In contrast, lockfile `resolved` or
+  // `tarball` URLs are transport metadata: private npm registries may use any
+  // hostname, so those URLs remain registry evidence when the selector itself
+  // is an ordinary npm version/range.
+  if (hasHttpNpmSpecifier(sourceHints.specifiers)) {
+    return {
+      kind: "unknown",
+      location: boundedSourceLocation(sourceHints.specifiers.join(" ")),
+    };
+  }
+  return { kind: "registry" };
+}
+
+function createNpmSourceHints(hints = {}) {
+  const value = hints && typeof hints === "object" && !Array.isArray(hints)
+    ? hints
+    : { specifiers: [hints] };
+  return {
+    specifiers: normalizeNpmSourceSignals(value.specifiers),
+    resolutions: normalizeNpmSourceSignals(value.resolutions),
+  };
+}
+
+function normalizeNpmSourceSignals(signals) {
+  const values = Array.isArray(signals) ? signals : [signals];
+  return values
+    .map((signal) => String(signal || "").trim())
+    .filter(Boolean);
+}
+
+function applyNpmSourceHints(entry, hints = {}) {
+  if (!entry) {
+    return null;
+  }
+  const existingHints = createNpmSourceHints(entry.sourceHints);
+  const additionalHints = createNpmSourceHints(hints);
+  const sourceHints = createNpmSourceHints({
+    specifiers: [...existingHints.specifiers, ...additionalHints.specifiers],
+    resolutions: [...existingHints.resolutions, ...additionalHints.resolutions],
+  });
+  const packageSource = classifyNpmPackageSource(sourceHints);
+  return {
+    ...entry,
+    sourceHints,
+    packageSource,
+    hasResolutionEvidence: packageSource.kind === "registry",
+  };
+}
+
+function hasHttpNpmSpecifier(specifiers) {
+  return specifiers.some((specifier) => /https?:\/\//i.test(specifier));
+}
+
+function boundedSourceLocation(value) {
+  return String(value || "").trim().slice(0, 4096);
+}
+
+function countUniqueNpmIdentities(entries) {
+  const identities = new Set();
+  for (const entry of entries || []) {
+    identities.add(npmPackageVersionKey(entry && entry.name, entry && entry.version));
+  }
+  return identities.size;
 }
 
 function npmPackageVersionKey(name, version) {
@@ -781,7 +990,8 @@ function parseYarnSelectorName(selector) {
 }
 
 async function parsePnpmLock(lockfilePath, manifest, workspaceFolder, options) {
-  const parsed = parsePnpmEntries(await readUtf8(lockfilePath, workspaceFolder));
+  throwIfNpmCancelled(options);
+  const parsed = parsePnpmEntries(await readUtf8(lockfilePath, workspaceFolder, options), options);
   if (parsed.packageEntries.size === 0) {
     throw new Error("Malformed pnpm-lock.yaml: no package entries found");
   }
@@ -789,25 +999,52 @@ async function parsePnpmLock(lockfilePath, manifest, workspaceFolder, options) {
   const sourceFile = getSourceFileName(lockfilePath);
   const directNames = manifest.directNames.size > 0 || manifest.devNames.size > 0
     ? new Set([...manifest.directNames, ...manifest.devNames])
-    : new Set(parsed.directVersions.keys());
+    : new Set(parsed.directReferences.keys());
+  const devNames = new Set([...manifest.devNames, ...parsed.directDevNames]);
   const directRoots = [];
-  const traversalState = createGraphTraversalState();
+  const traversalState = createGraphTraversalState(options);
 
   for (const directName of directNames) {
-    const entry = selectPnpmEntry(parsed.packageEntries, directName, parsed.directVersions.get(directName));
+    throwIfNpmCancelled(options);
+    const directReference = parsed.directReferences.get(directName);
+    const directSpecifier = parsed.directSpecifiers.get(directName);
+    const manifestReference = manifest.dependencies.find((dependency) => (
+      dependency.name === directName
+    ));
+    const entry = applyNpmSourceHints(
+      selectPnpmEntry(parsed, directName, directReference),
+      {
+        specifiers: [
+          directSpecifier,
+          manifestReference && (manifestReference.declaredConstraint || manifestReference.version),
+        ],
+        resolutions: [directReference],
+      }
+    );
     directRoots.push(buildPnpmDependency(
       entry,
       directName,
       [],
-      parsed.packageEntries,
+      parsed,
       new Set(),
       sourceFile,
-      manifest.devNames,
-      traversalState
+      devNames,
+      traversalState,
+      devNames.has(directName),
+      true,
+      {
+        specifiers: [
+          directSpecifier,
+          manifestReference && (manifestReference.declaredConstraint || manifestReference.version),
+        ],
+        resolutions: [directReference],
+      }
     ));
   }
 
-  let dependencies = deduplicateDeps(flattenDependencies(directRoots));
+  let dependencies = deduplicateDeps(flattenDependencies(directRoots, {
+    cancellationToken: options.cancellationToken,
+  }));
   for (const entry of parsed.packageEntries.values()) {
     const key = npmPackageVersionKey(entry.name, entry.version);
     if (dependencies.some((dependency) => npmPackageVersionKey(
@@ -825,18 +1062,18 @@ async function parsePnpmLock(lockfilePath, manifest, workspaceFolder, options) {
       parentChain: [],
       transitives: [],
       sourceFile,
-      isDevelopmentDependency: manifest.devNames.has(entry.name),
-    }, entry.name));
+      isDevelopmentDependency: devNames.has(entry.installedName || entry.name),
+      packageSource: entry.packageSource,
+      hasResolutionEvidence: entry.hasResolutionEvidence,
+    }, entry.installedName || entry.name));
   }
 
   const warnings = [];
   if (options.maxDependenciesToScan && dependencies.length > options.maxDependenciesToScan) {
-    warnings.push(
-      `Large npm dependency tree (${dependencies.length} unique packages). ` +
-      `Display is capped at ${options.maxDependenciesToScan} dependencies.`
-    );
+    warnings.push("Some dependencies are hidden by the configured display setting. Package inventory remains complete.");
   }
   appendGraphLimitWarning(warnings, traversalState);
+  publishGraphMetrics(options, traversalState, parsed.packageEntries.size, countUniqueNpmIdentities(parsed.packageEntries.values()));
 
   return buildTree("npm", sourceFile, dependencies, warnings);
 }
@@ -845,13 +1082,18 @@ function buildPnpmDependency(
   entry,
   fallbackName,
   parentChain,
-  packageEntries,
+  parsedEntries,
   visiting,
   sourceFile,
   devNames,
-  traversalState
+  traversalState,
+  inheritedDevelopment = false,
+  forceExpand = false,
+  fallbackSourceHints = {}
 ) {
+  throwIfNpmCancelled(traversalState && traversalState.options);
   if (!entry) {
+    const packageSource = classifyNpmPackageSource(fallbackSourceHints);
     return createNpmDependency({
       name: fallbackName,
       version: "",
@@ -861,12 +1103,15 @@ function buildPnpmDependency(
       parentChain,
       transitives: [],
       sourceFile,
-      isDevelopmentDependency: devNames.has(fallbackName),
+      isDevelopmentDependency: inheritedDevelopment || devNames.has(fallbackName),
+      packageSource,
+      hasResolutionEvidence: false,
     }, fallbackName);
   }
 
-  const key = npmPackageVersionKey(entry.name, entry.version);
+  const key = entry.key;
   if (visiting.has(key)) {
+    traversalState.cycleEdgesSkipped += 1;
     return createNpmDependency({
       name: entry.name,
       version: entry.version,
@@ -876,7 +1121,9 @@ function buildPnpmDependency(
       parentChain,
       transitives: [],
       sourceFile,
-      isDevelopmentDependency: devNames.has(entry.installedName || entry.name),
+      isDevelopmentDependency: inheritedDevelopment || devNames.has(entry.installedName || entry.name),
+      packageSource: entry.packageSource,
+      hasResolutionEvidence: entry.hasResolutionEvidence,
     }, entry.installedName || entry.name);
   }
 
@@ -884,8 +1131,10 @@ function buildPnpmDependency(
   nextVisiting.add(key);
   const nextParentChain = parentChain.concat(entry.name);
   const transitives = [];
+  const isDevelopmentDependency = inheritedDevelopment
+    || devNames.has(entry.installedName || entry.name);
 
-  if (!canExpandGraphNode(parentChain, traversalState)) {
+  if (!canExpandGraphNode(parentChain, key, traversalState, forceExpand)) {
     return createNpmDependency({
       name: entry.name,
       version: entry.version,
@@ -895,20 +1144,37 @@ function buildPnpmDependency(
       parentChain,
       transitives: [],
       sourceFile,
-      isDevelopmentDependency: devNames.has(entry.installedName || entry.name),
+      isDevelopmentDependency,
+      packageSource: entry.packageSource,
+      hasResolutionEvidence: entry.hasResolutionEvidence,
     }, entry.installedName || entry.name);
   }
 
   for (const [dependencyName, versionHint] of Object.entries(entry.dependencies || {})) {
+    if (!reserveNpmRelationshipEdge(traversalState)) {
+      break;
+    }
+    const childEntry = applyNpmSourceHints(
+      selectPnpmEntry(parsedEntries, dependencyName, versionHint),
+      { specifiers: [versionHint] }
+    );
+    if (childEntry) {
+      traversalState.resolvedEdges += 1;
+    } else {
+      traversalState.unresolvedEdges += 1;
+    }
     transitives.push(buildPnpmDependency(
-      selectPnpmEntry(packageEntries, dependencyName, versionHint),
+      childEntry,
       dependencyName,
       nextParentChain,
-      packageEntries,
+      parsedEntries,
       nextVisiting,
       sourceFile,
       devNames,
-      traversalState
+      traversalState,
+      isDevelopmentDependency,
+      false,
+      versionHint
     ));
   }
 
@@ -921,12 +1187,15 @@ function buildPnpmDependency(
     parentChain,
     transitives: deduplicateDeps(transitives),
     sourceFile,
-    isDevelopmentDependency: devNames.has(entry.installedName || entry.name),
+    isDevelopmentDependency,
+    packageSource: entry.packageSource,
+    hasResolutionEvidence: entry.hasResolutionEvidence,
   }, entry.installedName || entry.name);
 }
 
 function createGraphTraversalState(options = {}) {
   return {
+    options,
     expandedNodes: 0,
     materializedNodes: 0,
     repeatedOccurrenceEncounters: 0,
@@ -993,6 +1262,16 @@ function canExpandGraphNode(parentChain, entryKey, state, forceExpand) {
   return true;
 }
 
+function reserveNpmRelationshipEdge(state) {
+  if (state.structuralEdgesExamined >= state.maxEdges) {
+    state.edgeLimitReached = true;
+    state.truncated = true;
+    return false;
+  }
+  state.structuralEdgesExamined += 1;
+  return true;
+}
+
 function appendGraphLimitWarning(warnings, state) {
   if (state && state.truncated) {
     warnings.push("Some dependency relationships could not be fully analyzed.");
@@ -1024,12 +1303,18 @@ function publishGraphMetrics(options, state, indexedOccurrences, uniquePackageId
   }));
 }
 
-function selectPnpmEntry(packageEntries, dependencyName, versionHint) {
+function selectPnpmEntry(parsedEntries, dependencyName, versionHint) {
   const reference = parsePnpmReference(dependencyName, versionHint);
   if (reference.local) {
     return null;
   }
-  const entries = [...packageEntries.values()].filter((entry) => entry.name === reference.name);
+  const packageEntries = parsedEntries && parsedEntries.packageEntries || new Map();
+  if (reference.entryKey && packageEntries.has(reference.entryKey)) {
+    return { ...packageEntries.get(reference.entryKey), installedName: dependencyName };
+  }
+  const entries = parsedEntries && parsedEntries.entriesByName
+    ? parsedEntries.entriesByName.get(reference.name) || []
+    : [...packageEntries.values()].filter((entry) => entry.name === reference.name);
   if (entries.length === 0) {
     return null;
   }
@@ -1043,10 +1328,8 @@ function selectPnpmEntry(packageEntries, dependencyName, versionHint) {
 }
 
 function parsePnpmReference(dependencyName, versionHint) {
-  let value = String(versionHint || "")
+  let value = unquoteYamlScalar(versionHint)
     .trim()
-    .replace(/^['"]|['"]$/g, "")
-    .split("(")[0]
     .trim();
   if (/^(?:link|workspace|file):/i.test(value)) {
     return { name: dependencyName, version: "", local: true };
@@ -1055,24 +1338,34 @@ function parsePnpmReference(dependencyName, versionHint) {
     value = value.slice("npm:".length);
   }
 
-  const separator = value.lastIndexOf("@");
+  const withoutPeerSuffix = value.split("(")[0].trim();
+  const separator = withoutPeerSuffix.lastIndexOf("@");
   if (separator > 0) {
+    const name = withoutPeerSuffix.slice(0, separator);
+    const version = normalizeVersion(withoutPeerSuffix.slice(separator + 1));
     return {
-      name: value.slice(0, separator),
-      version: normalizeVersion(value.slice(separator + 1)),
+      name,
+      version,
+      entryKey: normalizePnpmEntryKey(value),
       local: false,
     };
   }
+  const version = normalizeVersion(withoutPeerSuffix);
   return {
     name: dependencyName,
-    version: normalizeVersion(value),
+    version,
+    entryKey: value ? normalizePnpmEntryKey(`${dependencyName}@${value}`) : "",
     local: false,
   };
 }
 
-function parsePnpmEntries(content) {
+function parsePnpmEntries(content, options = {}) {
   const packageEntries = new Map();
-  const directVersions = new Map();
+  const entriesByName = new Map();
+  const directReferences = new Map();
+  const directSpecifiers = new Map();
+  const directDevNames = new Set();
+  const snapshotDependencies = new Map();
   const lines = String(content || "").split(/\r?\n/);
   let section = "";
   let currentPackage = null;
@@ -1080,6 +1373,8 @@ function parsePnpmEntries(content) {
   let inImporter = false;
   let importerSection = "";
   let currentImporterPackage = "";
+  let currentSnapshotKey = "";
+  let currentSnapshotSubsection = "";
 
   const flushPackage = () => {
     if (!currentPackage || !currentPackage.name || !currentPackage.version) {
@@ -1087,12 +1382,19 @@ function parsePnpmEntries(content) {
       currentPackageSubsection = "";
       return;
     }
-    packageEntries.set(npmPackageVersionKey(currentPackage.name, currentPackage.version), currentPackage);
+    const existing = packageEntries.get(currentPackage.key);
+    if (existing) {
+      Object.assign(existing.dependencies, currentPackage.dependencies);
+      existing.sourceSignal ||= currentPackage.sourceSignal;
+    } else {
+      packageEntries.set(currentPackage.key, currentPackage);
+    }
     currentPackage = null;
     currentPackageSubsection = "";
   };
 
   for (const rawLine of lines) {
+    throwIfNpmCancelled(options);
     const lineWithoutComment = stripYamlComment(rawLine);
     const line = lineWithoutComment.trimEnd();
     const trimmed = line.trim();
@@ -1112,7 +1414,14 @@ function parsePnpmEntries(content) {
       section = "packages";
       continue;
     }
-    if (indent === 0 && trimmed.endsWith(":") && !["importers:", "packages:"].includes(trimmed)) {
+    if (indent === 0 && trimmed === "snapshots:") {
+      flushPackage();
+      section = "snapshots";
+      currentSnapshotKey = "";
+      currentSnapshotSubsection = "";
+      continue;
+    }
+    if (indent === 0 && trimmed.endsWith(":") && !["importers:", "packages:", "snapshots:"].includes(trimmed)) {
       flushPackage();
       section = "";
       continue;
@@ -1136,29 +1445,51 @@ function parsePnpmEntries(content) {
       if (!["dependencies", "devDependencies", "optionalDependencies"].includes(importerSection)) {
         continue;
       }
-      if (indent === 6 && trimmed.endsWith(":")) {
-        currentImporterPackage = trimmed.slice(0, -1).replace(/^["']|["']$/g, "");
+      if (indent === 6) {
+        const mapping = parseYamlMappingLine(trimmed);
+        if (!mapping) {
+          continue;
+        }
+        currentImporterPackage = mapping.key;
+        if (mapping.value) {
+          const shortReference = unquoteYamlScalar(mapping.value);
+          directReferences.set(currentImporterPackage, shortReference);
+          directSpecifiers.set(currentImporterPackage, shortReference);
+          if (importerSection === "devDependencies") {
+            directDevNames.add(currentImporterPackage);
+          }
+          currentImporterPackage = "";
+        }
+        continue;
+      }
+      if (indent === 8 && trimmed.startsWith("specifier:") && currentImporterPackage) {
+        directSpecifiers.set(
+          currentImporterPackage,
+          unquoteYamlScalar(trimmed.slice("specifier:".length))
+        );
         continue;
       }
       if (indent === 8 && trimmed.startsWith("version:") && currentImporterPackage) {
-        directVersions.set(
-          currentImporterPackage,
-          normalizeVersion(trimmed.slice("version:".length).trim()).split("(")[0].trim()
-        );
+        directReferences.set(currentImporterPackage, unquoteYamlScalar(trimmed.slice("version:".length)));
+        if (importerSection === "devDependencies") {
+          directDevNames.add(currentImporterPackage);
+        }
       }
       continue;
     }
 
     if (section === "packages") {
-      if (indent === 2 && trimmed.endsWith(":")) {
+      if (indent === 2) {
         flushPackage();
-        const parsedKey = parsePnpmPackageKey(trimmed.slice(0, -1));
+        const mapping = parseYamlMappingLine(trimmed);
+        const parsedKey = mapping && parsePnpmPackageKey(mapping.key);
         if (!parsedKey) {
           continue;
         }
         currentPackage = {
           ...parsedKey,
           dependencies: {},
+          sourceSignal: "",
         };
         continue;
       }
@@ -1169,25 +1500,97 @@ function parsePnpmEntries(content) {
         currentPackageSubsection = trimmed.slice(0, -1);
         continue;
       }
+      if (indent === 4 && trimmed.startsWith("resolution:")) {
+        currentPackage.sourceSignal = trimmed.slice("resolution:".length).trim();
+        currentPackageSubsection = "resolution";
+        continue;
+      }
+      if (currentPackageSubsection === "resolution" && indent === 6 && trimmed.startsWith("tarball:")) {
+        currentPackage.sourceSignal = trimmed.slice("tarball:".length).trim();
+        continue;
+      }
       if (!["dependencies", "optionalDependencies"].includes(currentPackageSubsection)) {
         continue;
       }
       if (indent === 6 && trimmed.includes(":")) {
-        const parts = trimmed.split(":", 2);
-        currentPackage.dependencies[parts[0].trim()] = normalizeVersion(parts[1].trim()).split("(")[0].trim();
+        const mapping = parseYamlMappingLine(trimmed);
+        if (mapping) {
+          currentPackage.dependencies[mapping.key] = unquoteYamlScalar(mapping.value);
+        }
+      }
+      continue;
+    }
+
+    if (section === "snapshots") {
+      if (indent === 2) {
+        const mapping = parseYamlMappingLine(trimmed);
+        if (!mapping) {
+          currentSnapshotKey = "";
+          currentSnapshotSubsection = "";
+          continue;
+        }
+        currentSnapshotKey = normalizePnpmEntryKey(mapping.key);
+        currentSnapshotSubsection = "";
+        if (!snapshotDependencies.has(currentSnapshotKey)) {
+          snapshotDependencies.set(currentSnapshotKey, {});
+        }
+        continue;
+      }
+      if (!currentSnapshotKey) {
+        continue;
+      }
+      if (indent === 4 && trimmed.endsWith(":")) {
+        currentSnapshotSubsection = trimmed.slice(0, -1);
+        continue;
+      }
+      if (
+        indent === 6
+        && ["dependencies", "optionalDependencies"].includes(currentSnapshotSubsection)
+      ) {
+        const mapping = parseYamlMappingLine(trimmed);
+        if (mapping) {
+          snapshotDependencies.get(currentSnapshotKey)[mapping.key] = unquoteYamlScalar(mapping.value);
+        }
       }
     }
   }
 
   flushPackage();
+  for (const [snapshotKey, dependencies] of snapshotDependencies) {
+    let entry = packageEntries.get(snapshotKey);
+    if (!entry) {
+      const parsedKey = parsePnpmPackageKey(snapshotKey);
+      if (!parsedKey) {
+        continue;
+      }
+      entry = { ...parsedKey, dependencies: {}, sourceSignal: "" };
+      packageEntries.set(entry.key, entry);
+    }
+    Object.assign(entry.dependencies, dependencies);
+  }
+  for (const entry of packageEntries.values()) {
+    entry.sourceHints = createNpmSourceHints({
+      specifiers: [entry.key],
+      resolutions: [entry.sourceSignal],
+    });
+    entry.packageSource = classifyNpmPackageSource(entry.sourceHints);
+    entry.hasResolutionEvidence = entry.packageSource.kind === "registry";
+    if (!entriesByName.has(entry.name)) {
+      entriesByName.set(entry.name, []);
+    }
+    entriesByName.get(entry.name).push(entry);
+  }
   return {
     packageEntries,
-    directVersions,
+    entriesByName,
+    directReferences,
+    directSpecifiers,
+    directDevNames,
   };
 }
 
 function parsePnpmPackageKey(rawKey) {
-  const cleaned = rawKey.replace(/^\/+/, "").trim().replace(/^["']|["']$/g, "");
+  const cleaned = normalizePnpmEntryKey(rawKey);
   if (!cleaned) {
     return null;
   }
@@ -1199,9 +1602,72 @@ function parsePnpmPackageKey(rawKey) {
   }
 
   return {
+    key: cleaned,
     name: withoutPeerSuffix.slice(0, atIndex),
     version: withoutPeerSuffix.slice(atIndex + 1),
   };
+}
+
+function normalizePnpmEntryKey(rawKey) {
+  return unquoteYamlScalar(String(rawKey || "").replace(/^\/+/, "").trim());
+}
+
+function unquoteYamlScalar(value) {
+  const normalized = String(value || "").trim();
+  if (
+    normalized.length >= 2
+    && ((normalized.startsWith('"') && normalized.endsWith('"'))
+      || (normalized.startsWith("'") && normalized.endsWith("'")))
+  ) {
+    return normalized.slice(1, -1);
+  }
+  return normalized;
+}
+
+function parseYamlMappingLine(line) {
+  const text = String(line || "").trim();
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (quote) {
+      if (quote === '"' && character === "\\" && !escaped) {
+        escaped = true;
+        continue;
+      }
+      if (character === quote && !escaped) {
+        quote = "";
+      }
+      escaped = false;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character !== ":") {
+      continue;
+    }
+    const key = unquoteYamlScalar(text.slice(0, index));
+    return key ? { key, value: text.slice(index + 1).trim() } : null;
+  }
+  return null;
+}
+
+function throwIfNpmCancelled(options) {
+  const cancelled = Boolean(
+    options
+    && (
+      options.cancellationToken && options.cancellationToken.isCancellationRequested
+      || typeof options.shouldCancel === "function" && options.shouldCancel()
+    )
+  );
+  if (!cancelled) {
+    return;
+  }
+  const error = new Error("Dependency parsing was canceled.");
+  error.code = "ERR_DEPENDENCY_PARSING_CANCELLED";
+  throw error;
 }
 
 module.exports = npmParser;

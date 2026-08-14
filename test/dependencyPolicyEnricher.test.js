@@ -48,4 +48,11 @@ suite("dependencyPolicyEnricher", () => {
     assert.strictEqual(enriched[1].policy.violated, false);
     assert.strictEqual(enriched[1].policy.denied, false);
   });
+
+  test("honors cancellation before policy enrichment", async () => {
+    await assert.rejects(
+      () => enrichPolicies([], { cancellationToken: { isCancellationRequested: true } }),
+      (error) => error.code === "ERR_DEPENDENCY_ENRICHMENT_CANCELLED"
+    );
+  });
 });

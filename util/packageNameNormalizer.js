@@ -21,11 +21,16 @@ const ECOSYSTEM_TO_FORMAT = {
 };
 
 function sanitizePackageNameInput(name) {
-  const normalized = String(name == null ? "" : name)
-    .replace(/\0/g, "")
-    .trim();
+  if (typeof name !== "string") {
+    return "";
+  }
+  const normalized = name.trim();
 
-  if (!normalized || normalized.length > MAX_PACKAGE_NAME_LENGTH) {
+  if (
+    !normalized
+    || normalized.length > MAX_PACKAGE_NAME_LENGTH
+    || /[\u0000-\u001f\u007f]/.test(normalized)
+  ) {
     return "";
   }
 
@@ -78,6 +83,11 @@ function getPackageLookupKeys(name, ecosystemOrFormat, identifiers) {
     return buildDockerLookupKeys(rawName);
   }
 
+  if (format === "swift") {
+    const scope = sanitizePackageNameInput(identifiers && identifiers.scope);
+    return [normalizeSwiftIdentity(rawName, scope)].filter(Boolean);
+  }
+
   return [normalizePackageName(rawName, format)];
 }
 
@@ -87,6 +97,14 @@ function getCloudsmithPackageLookupKeys(pkg, ecosystemOrFormat) {
   }
 
   const format = canonicalFormat(ecosystemOrFormat || pkg.format);
+  if (format === "swift") {
+    const identifiers = pkg.identifiers && typeof pkg.identifiers === "object"
+      ? pkg.identifiers
+      : {};
+    const scope = sanitizePackageNameInput(pkg.scope || identifiers.scope);
+    return [normalizeSwiftIdentity(pkg.name, scope)].filter(Boolean);
+  }
+
   if (format !== "maven") {
     return getPackageLookupKeys(pkg.name, format);
   }
@@ -97,6 +115,23 @@ function getCloudsmithPackageLookupKeys(pkg, ecosystemOrFormat) {
     keys.push(normalizePackageName(`${identifiers.group_id}:${pkg.name}`, format));
   }
   return [...new Set(keys.filter(Boolean))];
+}
+
+function normalizeSwiftIdentity(name, scope) {
+  const rawName = sanitizePackageNameInput(name);
+  const rawScope = sanitizePackageNameInput(scope);
+  if (!rawName) return "";
+  const normalizedName = rawName.toLowerCase().replace(/^\/+|\/+$/g, "");
+  if (!rawScope) return normalizedName;
+  const normalizedScope = rawScope.toLowerCase().replace(/^\/+|\/+$/g, "");
+  if (!normalizedScope) return normalizedName;
+  if (
+    normalizedName.startsWith(`${normalizedScope}/`)
+    || normalizedName.startsWith(`${normalizedScope}.`)
+  ) {
+    return `${normalizedScope}/${normalizedName.slice(normalizedScope.length + 1)}`;
+  }
+  return `${normalizedScope}/${normalizedName}`;
 }
 
 function buildDockerLookupKeys(name) {
@@ -143,5 +178,6 @@ module.exports = {
   getCloudsmithPackageLookupKeys,
   getPackageLookupKeys,
   normalizePackageName,
+  normalizeSwiftIdentity,
   sanitizePackageNameInput,
 };

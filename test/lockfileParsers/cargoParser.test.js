@@ -43,8 +43,12 @@ suite("cargoParser Test Suite", () => {
     assert.strictEqual(bytes.isDirect, false);
     assert.strictEqual(serde.isDevelopmentDependency, false);
     assert.strictEqual(tokio.isDevelopmentDependency, true);
-    assert.strictEqual(bytes.isDevelopmentDependency, true);
+    assert.strictEqual(bytes.isDevelopmentDependency, false);
     assert.deepStrictEqual(bytes.parentChain, ["tokio"]);
+    assert.deepStrictEqual(serde.packageSource, {
+      kind: "registry",
+      location: "https://github.com/rust-lang/crates.io-index",
+    });
   });
 
   test("preserves Cargo constraints without treating default caret requirements as exact", async () => {
@@ -72,6 +76,10 @@ suite("cargoParser Test Suite", () => {
     assert.strictEqual(byName.get("local-package").version, "");
     assert.strictEqual(byName.get("local-package").declaredConstraint, "path:../local-package");
     assert.strictEqual(byName.get("local-package").versionState, "incomplete");
+    assert.deepStrictEqual(byName.get("local-package").packageSource, {
+      kind: "path",
+      location: "../local-package",
+    });
   });
 
   test("uses Cargo.lock root edges to join the correct direct version and preserves another version", async () => {
@@ -266,7 +274,69 @@ suite("cargoParser Test Suite", () => {
       new Set(tree.dependencies.map((dependency) => `${dependency.name}@${dependency.version}`)).size,
       packageCount
     );
-    assert.match(tree.warnings[0], /maximum depth of 128/);
+    assert.strictEqual(
+      tree.warnings[0],
+      "Some Cargo dependency relationships were omitted to keep the scan responsive. Package inventory remains complete."
+    );
+  });
+
+  test("retains the canonical 653 package, 59 direct, and seven development inventory contract", async () => {
+    const workspace = await createWorkspace();
+    const lockfilePath = path.join(workspace, "Cargo.lock");
+    const manifestPath = path.join(workspace, "Cargo.toml");
+    const registrySource = "registry+https://github.com/rust-lang/crates.io-index";
+    const packageCount = 653;
+    const directCount = 59;
+    const developmentCount = 7;
+    const names = Array.from(
+      { length: packageCount },
+      (_, index) => `crate-${String(index).padStart(3, "0")}`
+    );
+    const directNames = names.slice(0, directCount);
+    const transitiveNames = names.slice(directCount);
+    await writeTextFile(manifestPath, [
+      "[package]",
+      'name = "fixture-cargo"',
+      'version = "0.1.0"',
+      "",
+      "[dependencies]",
+      ...directNames.slice(0, directCount - developmentCount).map((name) => `${name} = "1"`),
+      "",
+      "[dev-dependencies]",
+      ...directNames.slice(directCount - developmentCount).map((name) => `${name} = "1"`),
+      "",
+    ].join("\n"));
+    const sharedReferences = transitiveNames.map((name) => `"${name} 1.0.0"`).join(", ");
+    await writeTextFile(lockfilePath, [
+      "[[package]]",
+      'name = "fixture-cargo"',
+      'version = "0.1.0"',
+      `dependencies = [${directNames.map((name) => `"${name} 1.0.0"`).join(", ")}]`,
+      "",
+      ...names.flatMap((name, index) => [
+        "[[package]]",
+        `name = "${name}"`,
+        'version = "1.0.0"',
+        `source = "${registrySource}"`,
+        index < directCount ? `dependencies = [${sharedReferences}]` : "",
+        "",
+      ]),
+    ].join("\n"));
+
+    const tree = await cargoParser.resolve({
+      lockfilePath,
+      manifestPath,
+      workspaceFolder: workspace,
+    });
+
+    assert.strictEqual(tree.dependencies.length, 653);
+    assert.strictEqual(tree.dependencies.filter((dependency) => dependency.isDirect).length, 59);
+    assert.strictEqual(tree.dependencies.filter((dependency) => !dependency.isDirect).length, 594);
+    assert.strictEqual(
+      tree.dependencies.filter((dependency) => dependency.isDevelopmentDependency).length,
+      7
+    );
+    assert.deepStrictEqual(tree.warnings, []);
   });
 
   test("bounds Cargo graph depth and reports partial traversal structurally", async () => {
@@ -301,7 +371,8 @@ suite("cargoParser Test Suite", () => {
       options: { cargoGraphMaxDepth: 8 },
     });
 
-    assert.match(tree.warnings[0], /maximum depth of 8/);
+    assert.match(tree.warnings[0], /Package inventory remains complete/);
+    assert.doesNotMatch(tree.warnings[0], /\b8\b|maximum|limit/i);
     const pending = tree.dependencies.slice();
     let deepestParentChain = 0;
     while (pending.length > 0) {
@@ -312,7 +383,7 @@ suite("cargoParser Test Suite", () => {
     assert.strictEqual(deepestParentChain, 8);
   });
 
-  test("bounds Cargo graph node expansion and reports incomplete results", async () => {
+  test("does not apply relationship bounds to Cargo package inventory", async () => {
     const workspace = await createWorkspace();
     const lockfilePath = path.join(workspace, "Cargo.lock");
     const manifestPath = path.join(workspace, "Cargo.toml");
@@ -357,7 +428,105 @@ suite("cargoParser Test Suite", () => {
       options: { cargoGraphMaxNodes: 10 },
     });
 
-    assert.strictEqual(tree.dependencies.length, 10);
-    assert.match(tree.warnings[0], /maximum expansion of 10 nodes/);
+    assert.strictEqual(tree.dependencies.length, packageCount);
+    assert.deepStrictEqual(tree.warnings, []);
+  });
+
+  test("keeps every direct and development root when a shared graph exceeds relationship bounds", async () => {
+    const workspace = await createWorkspace();
+    const lockfilePath = path.join(workspace, "Cargo.lock");
+    const manifestPath = path.join(workspace, "Cargo.toml");
+    const registrySource = "registry+https://github.com/rust-lang/crates.io-index";
+    const directCount = 12;
+    const directNames = Array.from(
+      { length: directCount },
+      (_, index) => `root-${String(index).padStart(2, "0")}`
+    );
+    await writeTextFile(manifestPath, [
+      "[package]",
+      'name = "fixture-cargo"',
+      'version = "0.1.0"',
+      "",
+      "[dependencies]",
+      ...directNames.slice(0, -1).map((name) => `${name} = "1"`),
+      "",
+      "[dev-dependencies]",
+      `${directNames[directNames.length - 1]} = "1"`,
+      "",
+    ].join("\n"));
+    await writeTextFile(lockfilePath, [
+      "[[package]]",
+      'name = "fixture-cargo"',
+      'version = "0.1.0"',
+      `dependencies = [${directNames.map((name) => `"${name} 1.0.0"`).join(", ")}]`,
+      "",
+      ...directNames.flatMap((name) => [
+        "[[package]]",
+        `name = "${name}"`,
+        'version = "1.0.0"',
+        `source = "${registrySource}"`,
+        'dependencies = ["shared 1.0.0"]',
+        "",
+      ]),
+      "[[package]]",
+      'name = "shared"',
+      'version = "1.0.0"',
+      `source = "${registrySource}"`,
+      "",
+    ].join("\n"));
+
+    const tree = await cargoParser.resolve({
+      lockfilePath,
+      manifestPath,
+      workspaceFolder: workspace,
+      options: { cargoGraphMaxNodes: 5, cargoGraphMaxEdges: 5 },
+    });
+
+    assert.strictEqual(tree.dependencies.length, directCount + 1);
+    assert.strictEqual(tree.dependencies.filter((dependency) => dependency.isDirect).length, directCount);
+    assert.strictEqual(
+      tree.dependencies.filter((dependency) => dependency.isDevelopmentDependency).length,
+      1
+    );
+    assert.strictEqual(tree.dependencies.find((dependency) => dependency.name === "shared").isDirect, false);
+    assert.match(tree.warnings[0], /Package inventory remains complete/);
+  });
+
+  test("honors cancellation while building bounded Cargo relationships", async () => {
+    const workspace = await createWorkspace();
+    const lockfilePath = path.join(workspace, "Cargo.lock");
+    const manifestPath = path.join(workspace, "Cargo.toml");
+    const registrySource = "registry+https://github.com/rust-lang/crates.io-index";
+    const packageCount = 30;
+    await writeTextFile(manifestPath, '[dependencies]\ncrate-00 = "1"\n');
+    await writeTextFile(lockfilePath, Array.from({ length: packageCount }, (_, index) => [
+      "[[package]]",
+      `name = "crate-${String(index).padStart(2, "0")}"`,
+      'version = "1.0.0"',
+      `source = "${registrySource}"`,
+      index + 1 < packageCount
+        ? `dependencies = ["crate-${String(index + 1).padStart(2, "0")} 1.0.0"]`
+        : "",
+      "",
+    ].filter(Boolean).join("\n")).join("\n"));
+    let checks = 0;
+    const cancellationToken = {
+      get isCancellationRequested() {
+        checks += 1;
+        return checks > 40;
+      },
+    };
+
+    await assert.rejects(
+      () => cargoParser.resolve({
+        lockfilePath,
+        manifestPath,
+        workspaceFolder: workspace,
+        options: { cancellationToken },
+      }),
+      (error) => error.code === "dependency-scan-cancelled"
+        && error.message === "Cargo dependency parsing was canceled."
+    );
+    assert.ok(checks > 40);
   });
 });

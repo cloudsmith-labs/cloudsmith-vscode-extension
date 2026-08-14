@@ -3,6 +3,13 @@ const vscode = require("vscode");
 const { LicenseClassifier } = require("../util/licenseClassifier");
 const { getFormatIconPath } = require("../util/formatIcons");
 const { canonicalFormat } = require("../util/packageNameNormalizer");
+const {
+  getDependencyPackageSourceDisplayLocation,
+  getDependencyPackageSourceDisplayRef,
+  getDependencyQualifierDisplayValue,
+  getDependencySourceLabel,
+  normalizeDependencyDisplayValue,
+} = require("../util/dependencyRecord");
 const { getPackageVulnerabilityState } = require("../util/packageVulnerabilities");
 
 class DependencyHealthNode {
@@ -28,6 +35,13 @@ class DependencyHealthNode {
     this.versionState = dep.versionState || null;
     this.resolutionSource = dep.resolutionSource || null;
     this.sourceManifest = dep.sourceManifest || null;
+    this.packageSource = dep.packageSource || null;
+    this.lookupEligibility = dep.lookupEligibility || null;
+    this.qualifiers = dep.qualifiers
+      && typeof dep.qualifiers === "object"
+      && !Array.isArray(dep.qualifiers)
+      ? dep.qualifiers
+      : {};
     this.environmentMarker = dep.environmentMarker || null;
     this.normalizedName = dep.normalizedName || null;
     this.cloudsmithLookupDetail = dep.cloudsmithLookupDetail || null;
@@ -125,6 +139,10 @@ class DependencyHealthNode {
 
     if (this.cloudsmithStatus === "UNRESOLVED") {
       return "unresolved";
+    }
+
+    if (this.cloudsmithStatus === "NOT_APPLICABLE") {
+      return "not_applicable";
     }
 
     if (this.cloudsmithStatus === "LOOKUP_FAILED") {
@@ -226,6 +244,10 @@ class DependencyHealthNode {
       return "dependencyHealthSyncing";
     }
 
+    if (this.cloudsmithStatus === "NOT_APPLICABLE") {
+      return "dependencyHealthNotApplicable";
+    }
+
     if (this.cloudsmithStatus === "ABSENT" || this.cloudsmithStatus === "NOT_FOUND") {
       if (this.upstreamStatus === "reachable") {
         return "dependencyHealthUpstreamReachable";
@@ -256,6 +278,12 @@ class DependencyHealthNode {
   _getStateIcon() {
     if (this.cloudsmithStatus === "CHECKING") {
       return new vscode.ThemeIcon("loading~spin");
+    }
+
+    if (this.cloudsmithStatus === "NOT_APPLICABLE") {
+      return getFormatIconPath(this.format, this.context && this.context.extensionPath, {
+        fallbackIcon: new vscode.ThemeIcon("circle-slash", new vscode.ThemeColor("descriptionForeground")),
+      });
     }
 
     if (this.cloudsmithStatus !== "FOUND") {
@@ -341,6 +369,8 @@ class DependencyHealthNode {
         return "Cloudsmith lookup incomplete";
       case "RATE_LIMITED":
         return "Cloudsmith lookup rate limited";
+      case "NOT_APPLICABLE":
+        return "Cloudsmith lookup not applicable";
       default:
         return "Cloudsmith status unknown";
     }
@@ -378,13 +408,47 @@ class DependencyHealthNode {
       detail += " · context";
     }
 
-    return `${this._buildVersionPrefix()} — ${detail}`;
+    return `${this._buildVersionPrefix()}${this._buildQualifierSuffix()} — ${detail}`;
+  }
+
+  _buildQualifierSuffix() {
+    const values = ["targetFramework", "platform", "classifier", "stage"]
+      .map((key) => normalizeDependencyDisplayValue(
+        getDependencyQualifierDisplayValue(key, this.qualifiers[key])
+      ))
+      .filter((value) => value != null);
+    return values.length > 0 ? ` [${values.join(", ")}]` : "";
   }
 
   _buildTooltip() {
     const lines = [`${this.name} ${this._buildVersionPrefix()}`.trim()];
     lines.push(`Format: ${this.format}`);
     lines.push(`Relationship: ${this._getRelationshipLabel()}`);
+    const sourceLabel = normalizeDependencyDisplayValue(getDependencySourceLabel(this));
+    if (sourceLabel) {
+      lines.push(`Source: ${sourceLabel}`);
+    }
+    for (const [key, value] of Object.entries(this.qualifiers)) {
+      const displayLabel = normalizeDependencyDisplayValue(formatQualifierLabel(key));
+      const displayValue = normalizeDependencyDisplayValue(
+        getDependencyQualifierDisplayValue(key, value)
+      );
+      if (displayLabel && displayValue != null) {
+        lines.push(`${displayLabel}: ${displayValue}`);
+      }
+    }
+    const packageSourceKind = normalizeDependencyDisplayValue(
+      this.packageSource && this.packageSource.kind
+    );
+    if (packageSourceKind) {
+      lines.push(`Package source: ${packageSourceKind}`);
+      const displayLocation = getDependencyPackageSourceDisplayLocation(this.packageSource);
+      if (displayLocation) lines.push(`Source location: ${displayLocation}`);
+      const displayBranch = getDependencyPackageSourceDisplayRef(this.packageSource.branch);
+      const displayRevision = getDependencyPackageSourceDisplayRef(this.packageSource.revision);
+      if (displayBranch) lines.push(`Source branch: ${displayBranch}`);
+      if (displayRevision) lines.push(`Source revision: ${displayRevision}`);
+    }
     if (this.isDev) {
       lines.push("Development dependency");
     }
@@ -395,15 +459,17 @@ class DependencyHealthNode {
       lines.push("Coverage check in progress.");
     } else if (this.cloudsmithStatus === "ABSENT" || this.cloudsmithStatus === "NOT_FOUND") {
       lines.push("Not found in the configured Cloudsmith workspace.");
-      if (this.upstreamDetail) {
-        lines.push(this.upstreamDetail);
+      const upstreamDetail = normalizeDependencyDisplayValue(this.upstreamDetail);
+      if (upstreamDetail) {
+        lines.push(upstreamDetail);
       } else {
         lines.push("This package may need to be uploaded or fetched through an upstream.");
       }
     } else if (this.cloudsmithStatus !== "FOUND" || !this.cloudsmithMatch) {
       lines.push(this._buildMissingDescription() + ".");
-      if (this.cloudsmithLookupDetail) {
-        lines.push(this.cloudsmithLookupDetail);
+      const lookupDetail = normalizeDependencyDisplayValue(this.cloudsmithLookupDetail);
+      if (lookupDetail) {
+        lines.push(lookupDetail);
       }
     } else {
       lines.push(`Found in Cloudsmith (${this.cloudsmithMatch.repository})`);
@@ -672,6 +738,13 @@ function classificationFromTier(tier) {
     default:
       return "unknown";
   }
+}
+
+function formatQualifierLabel(key) {
+  const words = String(key || "").replace(/([a-z])([A-Z])/g, "$1 $2");
+  return words
+    ? `${words[0].toUpperCase()}${words.slice(1).toLowerCase()}`
+    : "";
 }
 
 module.exports = DependencyHealthNode;

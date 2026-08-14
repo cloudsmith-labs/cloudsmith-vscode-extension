@@ -62,8 +62,12 @@ suite("gradleParser Test Suite", () => {
 
     assert.strictEqual(byName.get("org.example:exact").version, "4.0.0");
     assert.strictEqual(byName.get("org.example:exact").isDevelopmentDependency, true);
+    assert.deepStrictEqual(byName.get("org.example:exact").qualifiers, {
+      configurations: ["testCompileClasspath"],
+    });
     assert.strictEqual(byName.get("org.example:transitive").isDirect, false);
     assert.strictEqual(byName.get("org.example:transitive").hasResolutionEvidence, true);
+    assert.deepStrictEqual(byName.get("org.example:transitive").packageSource, { kind: "registry" });
   });
 
   test("keeps a manifest-only dynamic Gradle version as a range", async () => {
@@ -140,5 +144,46 @@ suite("gradleParser Test Suite", () => {
       dependency.versionState === "exact-declaration"
       && dependency.hasResolutionEvidence === false
     )));
+  });
+
+  test("preserves lock configuration membership and marks only test-only records development", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "build.gradle.kts");
+    const lockfilePath = path.join(workspace, "gradle.lockfile");
+    await writeTextFile(manifestPath, [
+      "dependencies {",
+      '    implementation("org.example:shared:1.0.0")',
+      '    testImplementation("org.example:shared:1.0.0")',
+      "}",
+      "",
+    ].join("\n"));
+    await writeTextFile(lockfilePath, [
+      "org.example:shared:1.0.0=compileClasspath,testCompileClasspath",
+      "org.example:test-only:2.0.0=testCompileClasspath,testRuntimeClasspath",
+      "org.example:mixed:3.0.0=compileClasspath,testRuntimeClasspath",
+      "",
+    ].join("\n"));
+
+    const tree = await gradleParser.resolve({
+      lockfilePath,
+      manifestPath,
+      workspaceFolder: workspace,
+    });
+    const shared = tree.dependencies.filter((dependency) => dependency.name === "org.example:shared");
+    const testOnly = tree.dependencies.find((dependency) => dependency.name === "org.example:test-only");
+    const mixed = tree.dependencies.find((dependency) => dependency.name === "org.example:mixed");
+
+    assert.strictEqual(shared.length, 2);
+    assert.strictEqual(shared.filter((dependency) => dependency.isDevelopmentDependency).length, 1);
+    assert.deepStrictEqual(shared[0].gradleConfigurations, [
+      "compileClasspath",
+      "testCompileClasspath",
+    ]);
+    assert.strictEqual(testOnly.isDirect, false);
+    assert.strictEqual(testOnly.isDevelopmentDependency, true);
+    assert.deepStrictEqual(testOnly.qualifiers, {
+      configurations: ["testCompileClasspath", "testRuntimeClasspath"],
+    });
+    assert.strictEqual(mixed.isDevelopmentDependency, false);
   });
 });

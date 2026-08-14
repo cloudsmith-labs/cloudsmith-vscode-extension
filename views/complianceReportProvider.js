@@ -1,5 +1,10 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const vscode = require("vscode");
+const {
+  getDependencyPackageSourceDisplayLocation,
+  getDependencyQualifierDisplayValue,
+  normalizeDependencyDisplayValue,
+} = require("../util/dependencyRecord");
 
 class ComplianceReportProvider {
   constructor(context) {
@@ -43,6 +48,17 @@ class ComplianceReportProvider {
 
   _getHtml(reportData) {
     const summary = reportData.summary || {};
+    const total = normalizeSummaryCount(summary.total);
+    const occurrences = summary.occurrences == null
+      ? total
+      : normalizeSummaryCount(summary.occurrences);
+    const direct = normalizeSummaryCount(summary.direct);
+    const found = normalizeSummaryCount(summary.found);
+    const notFound = normalizeSummaryCount(summary.notFound);
+    const notApplicable = normalizeSummaryCount(summary.notApplicable);
+    const vulnCount = normalizeSummaryCount(summary.vulnCount);
+    const restrictiveLicenseCount = normalizeSummaryCount(summary.restrictiveLicenseCount);
+    const coveragePct = clampPercent(summary.coveragePct);
     const licenseIds = uniqueLicenseIds(reportData.restrictiveLicenseDeps || []);
     const sections = [];
 
@@ -62,8 +78,15 @@ class ComplianceReportProvider {
       sections.push(renderPolicySection(reportData.policyViolationDeps));
     }
 
-    if ((summary.notFound || 0) > 0) {
+    if (notFound > 0) {
       sections.push(renderUncoveredSection(reportData.uncoveredDeps || []));
+    }
+
+    const notApplicableDeps = Array.isArray(reportData.notApplicableDeps)
+      ? reportData.notApplicableDeps
+      : [];
+    if (notApplicable > 0 && notApplicableDeps.length > 0) {
+      sections.push(renderNotApplicableSection(notApplicableDeps));
     }
 
     const incompleteCount = [
@@ -212,6 +235,12 @@ class ComplianceReportProvider {
     .summary-detail {
       font-size: 13px;
       color: var(--cs-text-secondary);
+    }
+
+    .package-detail {
+      margin-top: 3px;
+      color: var(--cs-text-secondary);
+      font-size: 12px;
     }
 
     .coverage-panel {
@@ -378,10 +407,10 @@ class ComplianceReportProvider {
     </div>
 
     <div class="summary-grid">
-      ${renderSummaryCard("dependencies", summary.total || 0, "Dependencies", `${summary.direct || 0} direct · ${summary.transitive || 0} transitive`)}
-      ${renderSummaryCard("vulnerabilities", summary.vulnCount || 0, "Vulnerable", formatSeverityBreakdown(summary))}
-      ${renderSummaryCard("licenses", summary.restrictiveLicenseCount || 0, "Restrictive licenses", formatLicenseBreakdown(licenseIds))}
-      ${renderSummaryCard("coverage", summary.found || 0, "Cloudsmith coverage", `${summary.coveragePct || 0}% coverage`)}
+      ${renderSummaryCard("dependencies", total, "Artifacts", `${occurrences} occurrences · ${direct} direct`)}
+      ${renderSummaryCard("vulnerabilities", vulnCount, "Vulnerable", formatSeverityBreakdown(summary))}
+      ${renderSummaryCard("licenses", restrictiveLicenseCount, "Restrictive licenses", formatLicenseBreakdown(licenseIds))}
+      ${renderSummaryCard("coverage", found, "Cloudsmith coverage", `${coveragePct}% coverage`)}
     </div>
 
     <div class="card coverage-panel">
@@ -389,7 +418,7 @@ class ComplianceReportProvider {
         <strong>Coverage overview</strong>
       </div>
       <div class="coverage-bar" aria-hidden="true">
-        <div class="coverage-fill" style="width: ${clampPercent(summary.coveragePct || 0)}%"></div>
+        <div class="coverage-fill" style="width: ${coveragePct}%"></div>
       </div>
       <p class="coverage-label">${escapeHtml(formatCoverageLabel(summary))}</p>
     </div>
@@ -456,7 +485,7 @@ function renderVulnerabilitySection(vulnerableDeps) {
       : boundedVulnerabilityStatus(dependency.vulnerabilityStatus);
     return `
       <tr>
-        <td>${escapeHtml(dependency.name)}</td>
+        <td>${renderPackageCell(dependency)}</td>
         <td>${escapeHtml(displayValue(dependency.version))}</td>
         <td>${escapeHtml(dependency.isDirect ? "Direct" : "Transitive")}</td>
         <td><span class="badge ${severityClass}">${escapeHtml(dependency.maxSeverity || "Unknown")}</span></td>
@@ -490,7 +519,7 @@ function boundedVulnerabilityStatus(value) {
 function renderLicenseSection(restrictiveLicenseDeps) {
   const rows = restrictiveLicenseDeps.map((dependency) => `
     <tr>
-      <td>${escapeHtml(dependency.name)}</td>
+      <td>${renderPackageCell(dependency)}</td>
       <td>${escapeHtml(displayValue(dependency.version))}</td>
       <td>${escapeHtml(displayValue(dependency.spdx))}</td>
       <td><span class="badge ${licenseClassName(dependency.classification)}">${escapeHtml(dependency.classification)}</span></td>
@@ -515,7 +544,7 @@ function renderLicenseSection(restrictiveLicenseDeps) {
 function renderPolicySection(policyViolationDeps) {
   const rows = policyViolationDeps.map((dependency) => `
     <tr>
-      <td>${escapeHtml(dependency.name)}</td>
+      <td>${renderPackageCell(dependency)}</td>
       <td>${escapeHtml(displayValue(dependency.version))}</td>
       <td><span class="badge ${policyClassName(dependency.status)}">${escapeHtml(dependency.status)}</span></td>
       <td>${escapeHtml(displayValue(dependency.detail))}</td>
@@ -565,7 +594,7 @@ function renderUncoveredSection(uncoveredDeps) {
           <tbody>
             ${reachable.map((dependency) => `
               <tr>
-                <td>${escapeHtml(dependency.name)}</td>
+                <td>${renderPackageCell(dependency)}</td>
                 <td>${escapeHtml(displayValue(dependency.version))}</td>
                 <td>${escapeHtml(displayValue(dependency.ecosystem))}</td>
                 <td>${escapeHtml(displayValue(dependency.upstreamDetail))}</td>
@@ -593,7 +622,7 @@ function renderUncoveredSection(uncoveredDeps) {
           <tbody>
             ${notReachable.map((dependency) => `
               <tr>
-                <td>${escapeHtml(dependency.name)}</td>
+                <td>${renderPackageCell(dependency)}</td>
                 <td>${escapeHtml(displayValue(dependency.version))}</td>
                 <td>${escapeHtml(displayValue(dependency.ecosystem))}</td>
                 <td>${escapeHtml(displayValue(dependency.upstreamDetail))}</td>
@@ -621,7 +650,7 @@ function renderUncoveredSection(uncoveredDeps) {
           <tbody>
             ${unknown.map((dependency) => `
               <tr>
-                <td>${escapeHtml(dependency.name)}</td>
+                <td>${renderPackageCell(dependency)}</td>
                 <td>${escapeHtml(displayValue(dependency.version))}</td>
                 <td>${escapeHtml(displayValue(dependency.ecosystem))}</td>
                 <td>${escapeHtml(displayValue(dependency.upstreamDetail))}</td>
@@ -634,6 +663,87 @@ function renderUncoveredSection(uncoveredDeps) {
   }
 
   return renderSection("Uncovered Dependencies", groups.join(""));
+}
+
+function renderNotApplicableSection(dependencies) {
+  const rows = dependencies.map((dependency) => `
+    <tr>
+      <td>${renderPackageCell(dependency)}</td>
+      <td>${escapeHtml(displayValue(dependency.version))}</td>
+      <td>${escapeHtml(displayValue(dependency.sourceKind))}</td>
+      <td>${escapeHtml(displayValue(dependency.detail))}</td>
+    </tr>
+  `).join("");
+  return renderSection("Registry lookup not applicable", `
+    <table>
+      <thead>
+        <tr>
+          <th>Package</th>
+          <th>Version</th>
+          <th>Source kind</th>
+          <th>Detail</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `);
+}
+
+function renderPackageCell(dependency) {
+  const detailParts = [];
+  const qualifierVariants = new Set();
+  const provenance = Array.isArray(dependency && dependency.provenance)
+    ? dependency.provenance
+    : [];
+  const qualifierSources = [
+    dependency && dependency.qualifiers || {},
+    ...provenance.map((entry) => entry && entry.qualifiers || {}),
+  ];
+  for (const qualifiers of qualifierSources) {
+    if (!qualifiers || typeof qualifiers !== "object" || Array.isArray(qualifiers)) continue;
+    for (const [key, value] of Object.entries(qualifiers)) {
+      const displayLabel = normalizeDependencyDisplayValue(formatQualifierLabel(key));
+      const displayValue = normalizeDependencyDisplayValue(
+        getDependencyQualifierDisplayValue(key, value)
+      );
+      if (displayLabel && displayValue != null) {
+        qualifierVariants.add(`${displayLabel}: ${displayValue}`);
+      }
+    }
+  }
+  detailParts.push(...qualifierVariants);
+  const packageSourceLocations = new Set();
+  for (const packageSource of [
+    dependency && dependency.packageSource,
+    ...provenance.map((entry) => entry && entry.packageSource),
+  ]) {
+    const displayLocation = getDependencyPackageSourceDisplayLocation(packageSource);
+    if (displayLocation) packageSourceLocations.add(displayLocation);
+  }
+  if (packageSourceLocations.size > 0) {
+    detailParts.push(`Package source: ${[...packageSourceLocations].join(", ")}`);
+  }
+  const sources = [...new Set(provenance
+    .map((entry) => getDependencyPackageSourceDisplayLocation({
+      kind: "path",
+      location: entry && entry.source,
+    }))
+    .filter((display) => display != null))];
+  if (sources.length > 0) detailParts.push(`Source: ${sources.join(", ")}`);
+  if (dependency && dependency.occurrenceCount > 1) {
+    detailParts.push(`${dependency.occurrenceCount} occurrences`);
+  }
+  const detail = detailParts.length > 0
+    ? `<div class="package-detail">${escapeHtml(detailParts.join(" · "))}</div>`
+    : "";
+  return `<strong>${escapeHtml(dependency && dependency.name || "")}</strong>${detail}`;
+}
+
+function formatQualifierLabel(key) {
+  const words = String(key || "").replace(/([a-z])([A-Z])/g, "$1 $2");
+  return words
+    ? `${words[0].toUpperCase()}${words.slice(1).toLowerCase()}`
+    : "";
 }
 
 function formatScanDate(scanDate) {
@@ -650,20 +760,15 @@ function formatScanDate(scanDate) {
 
 function formatSeverityBreakdown(summary) {
   const parts = [];
-  if (summary.criticalCount) {
-    parts.push(`${summary.criticalCount} Critical`);
-  }
-  if (summary.highCount) {
-    parts.push(`${summary.highCount} High`);
-  }
-  if (summary.mediumCount) {
-    parts.push(`${summary.mediumCount} Medium`);
-  }
-  if (summary.lowCount) {
-    parts.push(`${summary.lowCount} Low`);
-  }
-  if (summary.vulnUnknownCount) {
-    parts.push(`${summary.vulnUnknownCount} Unknown`);
+  for (const [key, label] of [
+    ["criticalCount", "Critical"],
+    ["highCount", "High"],
+    ["mediumCount", "Medium"],
+    ["lowCount", "Low"],
+    ["vulnUnknownCount", "Unknown"],
+  ]) {
+    const count = normalizeSummaryCount(summary && summary[key]);
+    if (count > 0) parts.push(`${count} ${label}`);
   }
   return parts.length > 0 ? parts.join(", ") : "No known vulnerabilities";
 }
@@ -676,7 +781,13 @@ function formatLicenseBreakdown(licenseIds) {
 }
 
 function formatCoverageLabel(summary) {
-  return `${summary.found || 0} of ${summary.total || 0} dependencies served by Cloudsmith (${summary.coveragePct || 0}%)`;
+  const total = normalizeSummaryCount(summary && summary.total);
+  const found = normalizeSummaryCount(summary && summary.found);
+  const notApplicable = normalizeSummaryCount(summary && summary.notApplicable);
+  const applicable = Math.max(total - notApplicable, 0);
+  const coveragePct = clampPercent(summary && summary.coveragePct);
+  const label = `${found} of ${applicable} applicable artifacts served by Cloudsmith (${coveragePct}%)`;
+  return notApplicable > 0 ? `${label}; ${notApplicable} not applicable` : label;
 }
 
 function uniqueLicenseIds(restrictiveLicenseDeps) {
@@ -688,11 +799,21 @@ function uniqueLicenseIds(restrictiveLicenseDeps) {
 }
 
 function clampPercent(value) {
-  return Math.max(0, Math.min(100, Number(value) || 0));
+  const number = typeof value === "number" || typeof value === "string"
+    ? Number(value)
+    : 0;
+  return Math.max(0, Math.min(100, Number.isFinite(number) ? number : 0));
 }
 
 function displayValue(value) {
-  return value || "—";
+  return normalizeDependencyDisplayValue(value) || "—";
+}
+
+function normalizeSummaryCount(value) {
+  const number = typeof value === "number" || typeof value === "string"
+    ? Number(value)
+    : 0;
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
 }
 
 function severityClassName(severity) {

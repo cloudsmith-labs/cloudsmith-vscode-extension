@@ -7,6 +7,7 @@ const {
   createDependencyRecord,
   createDependencySource,
   getDependencyOccurrenceKey,
+  isDependencyLookupEligible,
 } = require("./dependencyRecord");
 const {
   buildDependencyDeclarationIndex,
@@ -107,6 +108,8 @@ function createDiagnosticCandidate(dependency, values = {}) {
     ownDataValue(dependencyProperties, "resolutionSource", false),
     "dependency resolution source"
   );
+  const packageSource = ownDataValue(dependencyProperties, "packageSource", false);
+  const qualifiers = ownDataValue(dependencyProperties, "qualifiers", false);
 
   const occurrence = createDependencyRecord({
     ecosystem,
@@ -118,6 +121,8 @@ function createDiagnosticCandidate(dependency, values = {}) {
     versionState,
     resolutionSource,
     sourceManifest,
+    packageSource,
+    qualifiers,
     environmentMarker,
     isDirect: ownDataValue(dependencyProperties, "isDirect", true) === true,
     isDevelopmentDependency: ownDataValue(
@@ -192,6 +197,9 @@ class DiagnosticsPublisher {
       if (!candidate.occurrence.isDirect) {
         continue;
       }
+      if (!isDependencyLookupEligible(candidate.occurrence)) {
+        continue;
+      }
       if (!candidate.occurrence.sourceManifest) {
         missingProvenance += 1;
         continue;
@@ -251,7 +259,9 @@ class DiagnosticsPublisher {
         break;
       }
       throwIfCancelled(isCancelled);
-      const content = await this._readSource(group.source.filePath, workspaceFolder);
+      const content = await this._readSource(group.source.filePath, workspaceFolder, {
+        cancellationToken,
+      });
       sourceReads += 1;
       throwIfCancelled(isCancelled);
       if (typeof content !== "string") {
@@ -356,7 +366,7 @@ class DiagnosticsPublisher {
     }
     if (diagnosticOutputTruncated) {
       warnings.push(
-        `Dependency diagnostics were capped at ${this._maxDiagnostics} occurrences; dependency health results remain complete.`
+        "Dependency diagnostics reached their safety limit; dependency health results remain complete."
       );
     }
 
@@ -484,7 +494,12 @@ function snapshotSource(source, label) {
     throw new TypeError("Dependency source URI and path must identify the same file.");
   }
   const range = snapshotRange(ownDataValue(properties, "range", false), `${label} range`);
-  return createDependencySource({ kind, filePath, type, range });
+  const sourceLabel = boundedOptionalString(
+    ownDataValue(properties, "label", false),
+    `${label} display label`,
+    MAX_PATH_LENGTH
+  );
+  return createDependencySource({ kind, filePath, type, range, label: sourceLabel || undefined });
 }
 
 function snapshotRange(range, label) {

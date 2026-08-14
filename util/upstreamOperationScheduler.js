@@ -20,6 +20,7 @@ class UpstreamOperationScheduler {
     this.activeCount = 0;
     this.maxActiveCount = 0;
     this._queue = [];
+    this._activeEntries = new Set();
     this._circuitError = null;
     this._cancelled = false;
   }
@@ -44,7 +45,19 @@ class UpstreamOperationScheduler {
     this.acceptedCount += 1;
 
     return new Promise((resolve, reject) => {
-      this._queue.push({ task, options, resolve, reject });
+      const entry = {
+        task,
+        options,
+        resolve,
+        reject,
+        state: "queued",
+        retired: false,
+        abortListener: null,
+        cancellationDisposable: null,
+        completion: null,
+      };
+      this._queue.push(entry);
+      this._watchCancellation(entry);
       this._drain();
     });
   }
@@ -52,7 +65,9 @@ class UpstreamOperationScheduler {
   cancel() {
     if (this._cancelled) return;
     this._cancelled = true;
-    this._rejectQueued(schedulerError("cancelled", "The upstream operation was cancelled."));
+    const error = schedulerError("cancelled", "The upstream operation was cancelled.");
+    this._rejectQueued(error);
+    for (const entry of [...this._activeEntries]) this._retireActive(entry, false, error);
   }
 
   get queuedCount() {
@@ -72,31 +87,129 @@ class UpstreamOperationScheduler {
     ) {
       const entry = this._queue.shift();
       if (isCancelled(entry.options)) {
-        entry.reject(schedulerError("cancelled", "The upstream operation was cancelled."));
+        this._retireQueued(
+          entry,
+          schedulerError("cancelled", "The upstream operation was cancelled.")
+        );
         continue;
       }
       this._dispatch(entry);
     }
   }
 
-  async _dispatch(entry) {
+  _dispatch(entry) {
+    if (entry.retired) return;
+    entry.state = "active";
+    this._activeEntries.add(entry);
     this.activeCount += 1;
     this.requestCount += 1;
     this.maxActiveCount = Math.max(this.maxActiveCount, this.activeCount);
+    let pending;
     try {
       if (this._cancelled || isCancelled(entry.options)) {
         throw schedulerError("cancelled", "The upstream operation was cancelled.");
       }
-      const value = await entry.task();
-      if (isRateLimited(value)) this._openRateLimitCircuit(value.error);
-      entry.resolve(value);
+      pending = Promise.resolve(entry.task());
     } catch (error) {
-      if (isRateLimited(error)) this._openRateLimitCircuit(error);
-      entry.reject(error);
-    } finally {
-      this.activeCount -= 1;
-      this._drain();
+      this._completeActive(entry, false, error);
+      return;
     }
+    if (entry.retired) {
+      pending.then(() => undefined, () => undefined);
+      return;
+    }
+    // Observe both branches even after cancellation retires the scheduler-visible
+    // entry. A non-cooperative transport cannot retain a slot or create a late
+    // unhandled rejection.
+    const completion = { scheduler: this, entry };
+    entry.completion = completion;
+    pending.then(
+      value => completeDispatchedEntry(completion, true, value),
+      error => completeDispatchedEntry(completion, false, error)
+    );
+  }
+
+  _completeActive(entry, fulfilled, value) {
+    if (entry.retired) return;
+    if (isRateLimited(value)) {
+      this._openRateLimitCircuit(fulfilled ? value.error : value);
+    }
+    this._retireActive(entry, fulfilled, value);
+  }
+
+  _watchCancellation(entry) {
+    const options = entry.options;
+    const cancelEntry = () => this._cancelEntry(entry);
+    if (typeof options.signal?.addEventListener === "function") {
+      entry.abortListener = cancelEntry;
+      options.signal.addEventListener("abort", cancelEntry, { once: true });
+    }
+    if (typeof options.cancellationToken?.onCancellationRequested === "function") {
+      const disposable = options.cancellationToken.onCancellationRequested(cancelEntry);
+      if (entry.retired) disposable?.dispose?.();
+      else entry.cancellationDisposable = disposable;
+    }
+    if (!entry.retired && isCancelled(options)) cancelEntry();
+  }
+
+  _cancelEntry(entry) {
+    if (entry.retired) return;
+    const error = schedulerError("cancelled", "The upstream operation was cancelled.");
+    if (entry.state === "active") {
+      this._retireActive(entry, false, error);
+      return;
+    }
+    const index = this._queue.indexOf(entry);
+    if (index !== -1) this._queue.splice(index, 1);
+    this._retireQueued(entry, error);
+    this._drain();
+  }
+
+  _retireQueued(entry, error) {
+    if (entry.retired) return;
+    const reject = entry.reject;
+    entry.retired = true;
+    entry.state = "retired";
+    this._disposeCancellation(entry);
+    this._clearEntry(entry);
+    reject(error);
+  }
+
+  _retireActive(entry, fulfilled, value) {
+    if (entry.retired) return;
+    const settle = fulfilled ? entry.resolve : entry.reject;
+    entry.retired = true;
+    entry.state = "retired";
+    this._activeEntries.delete(entry);
+    this.activeCount -= 1;
+    this._disposeCancellation(entry);
+    this._detachCompletion(entry);
+    this._clearEntry(entry);
+    settle(value);
+    this._drain();
+  }
+
+  _disposeCancellation(entry) {
+    if (entry.abortListener) {
+      entry.options.signal?.removeEventListener?.("abort", entry.abortListener);
+      entry.abortListener = null;
+    }
+    entry.cancellationDisposable?.dispose?.();
+    entry.cancellationDisposable = null;
+  }
+
+  _detachCompletion(entry) {
+    if (!entry.completion) return;
+    entry.completion.scheduler = null;
+    entry.completion.entry = null;
+    entry.completion = null;
+  }
+
+  _clearEntry(entry) {
+    entry.task = null;
+    entry.options = null;
+    entry.resolve = null;
+    entry.reject = null;
   }
 
   _openRateLimitCircuit(cause) {
@@ -111,11 +224,18 @@ class UpstreamOperationScheduler {
 
   _rejectQueued(error) {
     const queued = this._queue.splice(0);
-    for (const entry of queued) entry.reject(error);
+    for (const entry of queued) this._retireQueued(entry, error);
   }
 }
 
-function isCancelled(options) {
+function completeDispatchedEntry(completion, fulfilled, value) {
+  const scheduler = completion.scheduler;
+  const entry = completion.entry;
+  if (!scheduler || !entry) return;
+  scheduler._completeActive(entry, fulfilled, value);
+}
+
+function isCancelled(options = {}) {
   return Boolean(options.signal?.aborted || options.cancellationToken?.isCancellationRequested);
 }
 

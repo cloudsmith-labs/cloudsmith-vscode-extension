@@ -370,6 +370,400 @@ suite("npmParser Test Suite", () => {
     assert.strictEqual(direct.declaredName, "legacy-pad");
   });
 
+  test("reads pnpm v9 snapshot edges and inherits development state", async () => {
+    const workspace = await createWorkspace();
+    const lockfilePath = path.join(workspace, "pnpm-lock.yaml");
+    const manifestPath = path.join(workspace, "package.json");
+    await writeTextFile(manifestPath, JSON.stringify({
+      dependencies: { express: "^4.18.2" },
+      devDependencies: { mocha: "^10.0.0" },
+    }));
+    await writeTextFile(lockfilePath, [
+      "lockfileVersion: '9.0'",
+      "importers:",
+      "  .:",
+      "    dependencies:",
+      "      express:",
+      "        specifier: ^4.18.2",
+      "        version: 4.18.2",
+      "    devDependencies:",
+      "      mocha:",
+      "        specifier: ^10.0.0",
+      "        version: 10.0.0",
+      "packages:",
+      "  express@4.18.2:",
+      "    resolution: {integrity: sha512-express}",
+      "  accepts@1.3.8:",
+      "    resolution: {integrity: sha512-accepts}",
+      "  mocha@10.0.0:",
+      "    resolution: {integrity: sha512-mocha}",
+      "  he@1.2.0:",
+      "    resolution: {integrity: sha512-he}",
+      "snapshots:",
+      "  express@4.18.2:",
+      "    dependencies:",
+      "      accepts: 1.3.8",
+      "  accepts@1.3.8: {}",
+      "  mocha@10.0.0:",
+      "    dependencies:",
+      "      he: 1.2.0",
+      "  he@1.2.0: {}",
+    ].join("\n"));
+
+    const tree = await npmParser.resolve({
+      lockfilePath,
+      manifestPath,
+      workspaceFolder: workspace,
+      options: {},
+    });
+    const express = tree.dependencies.find((dependency) => dependency.name === "express");
+    const accepts = tree.dependencies.find((dependency) => dependency.name === "accepts");
+    const mocha = tree.dependencies.find((dependency) => dependency.name === "mocha");
+    const he = tree.dependencies.find((dependency) => dependency.name === "he");
+
+    assert.strictEqual(tree.dependencies.length, 4);
+    assert.deepStrictEqual(express.transitives.map((dependency) => dependency.name), ["accepts"]);
+    assert.deepStrictEqual(accepts.parentChain, ["express"]);
+    assert.strictEqual(mocha.isDirect, true);
+    assert.strictEqual(mocha.isDevelopmentDependency, true);
+    assert.deepStrictEqual(mocha.transitives.map((dependency) => dependency.name), ["he"]);
+    assert.strictEqual(he.isDevelopmentDependency, true);
+    assert.deepStrictEqual(he.parentChain, ["mocha"]);
+  });
+
+  test("keeps complete Yarn and pnpm inventories when relationship bounds are reached", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "package.json");
+    await writeTextFile(manifestPath, JSON.stringify({ dependencies: { root: "1.0.0" } }));
+
+    const yarnPath = path.join(workspace, "yarn.lock");
+    await writeTextFile(yarnPath, [
+      "root@1.0.0:",
+      '  version "1.0.0"',
+      "  dependencies:",
+      '    child "1.0.0"',
+      "",
+      "child@1.0.0:",
+      '  version "1.0.0"',
+      "  dependencies:",
+      '    leaf "1.0.0"',
+      "",
+      "leaf@1.0.0:",
+      '  version "1.0.0"',
+    ].join("\n"));
+    const yarnTree = await npmParser.resolve({
+      lockfilePath: yarnPath,
+      manifestPath,
+      workspaceFolder: workspace,
+      options: { npmGraphMaxDepth: 1 },
+    });
+    assert.deepStrictEqual(new Set(dependencyKeys(yarnTree)), new Set([
+      "root@1.0.0", "child@1.0.0", "leaf@1.0.0",
+    ]));
+    assert.match(yarnTree.warnings[0], /relationships could not be fully analyzed/i);
+
+    const pnpmPath = path.join(workspace, "pnpm-lock.yaml");
+    await writeTextFile(pnpmPath, [
+      "lockfileVersion: '9.0'",
+      "importers:",
+      "  .:",
+      "    dependencies:",
+      "      root:",
+      "        specifier: 1.0.0",
+      "        version: 1.0.0",
+      "packages:",
+      "  root@1.0.0: {}",
+      "  child@1.0.0: {}",
+      "  leaf@1.0.0: {}",
+      "snapshots:",
+      "  root@1.0.0:",
+      "    dependencies:",
+      "      child: 1.0.0",
+      "  child@1.0.0:",
+      "    dependencies:",
+      "      leaf: 1.0.0",
+      "  leaf@1.0.0: {}",
+    ].join("\n"));
+    const pnpmTree = await npmParser.resolve({
+      lockfilePath: pnpmPath,
+      manifestPath,
+      workspaceFolder: workspace,
+      options: { npmGraphMaxDepth: 1 },
+    });
+    assert.deepStrictEqual(new Set(dependencyKeys(pnpmTree)), new Set([
+      "root@1.0.0", "child@1.0.0", "leaf@1.0.0",
+    ]));
+    assert.match(pnpmTree.warnings[0], /relationships could not be fully analyzed/i);
+  });
+
+  test("honors parser cancellation before traversing npm lock data", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "package.json");
+    const lockfilePath = path.join(workspace, "pnpm-lock.yaml");
+    await writeTextFile(manifestPath, JSON.stringify({ dependencies: { root: "1.0.0" } }));
+    await writeTextFile(lockfilePath, [
+      "lockfileVersion: '9.0'",
+      "packages:",
+      "  root@1.0.0: {}",
+    ].join("\n"));
+
+    await assert.rejects(
+      () => npmParser.resolve({
+        lockfilePath,
+        manifestPath,
+        workspaceFolder: workspace,
+        options: { cancellationToken: { isCancellationRequested: true } },
+      }),
+      (error) => error && error.code === "ERR_DEPENDENCY_PARSING_CANCELLED"
+    );
+  });
+
+  test("marks local, file, and git npm resolutions as non-registry sources", async () => {
+    const workspace = await createWorkspace();
+    const manifestPath = path.join(workspace, "package.json");
+    const lockfilePath = path.join(workspace, "package-lock.json");
+    await writeTextFile(manifestPath, JSON.stringify({
+      dependencies: {
+        "file-package": "file:../file-package",
+        "git-package": "git+https://example.invalid/repo.git#abc123",
+      },
+    }));
+    await writeTextFile(lockfilePath, JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        "": {
+          dependencies: {
+            "file-package": "file:../file-package",
+            "git-package": "git+https://example.invalid/repo.git#abc123",
+          },
+        },
+        "node_modules/file-package": {
+          version: "1.0.0",
+          resolved: "file:../file-package",
+        },
+        "node_modules/git-package": {
+          version: "2.0.0",
+          resolved: "git+https://example.invalid/repo.git#abc123",
+        },
+      },
+    }));
+
+    const result = await createDefaultDependencyAdapterRegistry().parse({
+      adapterId: "npmParser",
+      workspaceFolder: workspace,
+      lockfilePath,
+      manifestPath,
+    });
+    const filePackage = result.dependencies.find((dependency) => dependency.name === "file-package");
+    const gitPackage = result.dependencies.find((dependency) => dependency.name === "git-package");
+
+    assert.strictEqual(filePackage.packageSource.kind, "path");
+    assert.strictEqual(filePackage.resolvedVersion, null);
+    assert.strictEqual(filePackage.lookupEligibility.state, "not-applicable");
+    assert.strictEqual(gitPackage.packageSource.kind, "git");
+    assert.strictEqual(gitPackage.resolvedVersion, null);
+    assert.strictEqual(gitPackage.lookupEligibility.state, "not-applicable");
+  });
+
+  test("never treats arbitrary npm tarball URLs as registry lookup evidence", async () => {
+    const cases = [
+      {
+        name: "package-lock",
+        lockfile: "package-lock.json",
+        content: JSON.stringify({
+          lockfileVersion: 3,
+          packages: {
+            "": { dependencies: { foo: "https://private.example/foo.tgz" } },
+            "node_modules/foo": {
+              version: "1.0.0",
+              resolved: "https://private.example/foo.tgz",
+            },
+          },
+        }),
+      },
+      {
+        name: "Yarn",
+        lockfile: "yarn.lock",
+        content: [
+          'foo@https://private.example/foo.tgz:',
+          '  version "1.0.0"',
+          '  resolved "https://private.example/foo.tgz"',
+        ].join("\n"),
+      },
+      {
+        name: "pnpm",
+        lockfile: "pnpm-lock.yaml",
+        content: [
+          "lockfileVersion: '9.0'",
+          "importers:",
+          "  .:",
+          "    dependencies:",
+          "      foo:",
+          "        specifier: https://private.example/foo.tgz",
+          "        version: https://private.example/foo.tgz",
+          "packages:",
+          "  foo@1.0.0:",
+          "    resolution:",
+          "      tarball: https://private.example/foo.tgz",
+        ].join("\n"),
+      },
+    ];
+
+    for (const fixture of cases) {
+      const workspace = await createWorkspace();
+      const manifestPath = path.join(workspace, "package.json");
+      const lockfilePath = path.join(workspace, fixture.lockfile);
+      await writeTextFile(manifestPath, JSON.stringify({
+        dependencies: { foo: "https://private.example/foo.tgz" },
+      }));
+      await writeTextFile(lockfilePath, fixture.content);
+
+      const result = await createDefaultDependencyAdapterRegistry().parse({
+        adapterId: "npmParser",
+        workspaceFolder: workspace,
+        lockfilePath,
+        manifestPath,
+      });
+      const foo = result.dependencies.find((dependency) => dependency.name === "foo");
+
+      assert.ok(foo, `${fixture.name} should retain foo in its dependency inventory`);
+      assert.notStrictEqual(foo.packageSource.kind, "registry", fixture.name);
+      assert.strictEqual(foo.resolvedVersion, null, fixture.name);
+      assert.strictEqual(foo.lookupEligibility.state, "not-applicable", fixture.name);
+    }
+  });
+
+  test("keeps direct manifest URLs non-registry when lock metadata looks registry-resolved", async () => {
+    const directUrl = "https://private.example/foo.tgz";
+    const cases = [
+      {
+        name: "package-lock",
+        lockfile: "package-lock.json",
+        content: JSON.stringify({
+          lockfileVersion: 3,
+          packages: {
+            "": { dependencies: { foo: "^1.0.0" } },
+            "node_modules/foo": { version: "1.0.0", resolved: directUrl },
+          },
+        }),
+      },
+      {
+        name: "Yarn",
+        lockfile: "yarn.lock",
+        content: [
+          "foo@^1.0.0:",
+          '  version "1.0.0"',
+          `  resolved "${directUrl}"`,
+        ].join("\n"),
+      },
+      {
+        name: "pnpm",
+        lockfile: "pnpm-lock.yaml",
+        content: [
+          "lockfileVersion: '9.0'",
+          "importers:",
+          "  .:",
+          "    dependencies:",
+          "      foo:",
+          "        specifier: ^1.0.0",
+          "        version: 1.0.0",
+          "packages:",
+          "  foo@1.0.0:",
+          "    resolution:",
+          `      tarball: ${directUrl}`,
+        ].join("\n"),
+      },
+    ];
+
+    for (const fixture of cases) {
+      const workspace = await createWorkspace();
+      const manifestPath = path.join(workspace, "package.json");
+      const lockfilePath = path.join(workspace, fixture.lockfile);
+      await writeTextFile(manifestPath, JSON.stringify({ dependencies: { foo: directUrl } }));
+      await writeTextFile(lockfilePath, fixture.content);
+
+      const result = await createDefaultDependencyAdapterRegistry().parse({
+        adapterId: "npmParser",
+        workspaceFolder: workspace,
+        lockfilePath,
+        manifestPath,
+      });
+      const foo = result.dependencies.find((dependency) => dependency.name === "foo");
+
+      assert.ok(foo, `${fixture.name} should retain foo in its dependency inventory`);
+      assert.notStrictEqual(foo.packageSource.kind, "registry", fixture.name);
+      assert.strictEqual(foo.resolvedVersion, null, fixture.name);
+      assert.strictEqual(foo.lookupEligibility.state, "not-applicable", fixture.name);
+    }
+  });
+
+  test("retains private-registry tarball resolutions as registry evidence", async () => {
+    const privateTarball = "https://npm.cloudsmith.io/acme/repository/foo/-/foo-1.0.0.tgz";
+    const cases = [
+      {
+        name: "package-lock",
+        lockfile: "package-lock.json",
+        content: JSON.stringify({
+          lockfileVersion: 3,
+          packages: {
+            "": { dependencies: { foo: "^1.0.0" } },
+            "node_modules/foo": {
+              version: "1.0.0",
+              resolved: privateTarball,
+            },
+          },
+        }),
+      },
+      {
+        name: "Yarn",
+        lockfile: "yarn.lock",
+        content: [
+          "foo@^1.0.0:",
+          '  version "1.0.0"',
+          `  resolved "${privateTarball}"`,
+        ].join("\n"),
+      },
+      {
+        name: "pnpm",
+        lockfile: "pnpm-lock.yaml",
+        content: [
+          "lockfileVersion: '9.0'",
+          "importers:",
+          "  .:",
+          "    dependencies:",
+          "      foo:",
+          "        specifier: ^1.0.0",
+          "        version: 1.0.0",
+          "packages:",
+          "  foo@1.0.0:",
+          "    resolution:",
+          `      tarball: ${privateTarball}`,
+        ].join("\n"),
+      },
+    ];
+
+    for (const fixture of cases) {
+      const workspace = await createWorkspace();
+      const manifestPath = path.join(workspace, "package.json");
+      const lockfilePath = path.join(workspace, fixture.lockfile);
+      await writeTextFile(manifestPath, JSON.stringify({ dependencies: { foo: "^1.0.0" } }));
+      await writeTextFile(lockfilePath, fixture.content);
+
+      const result = await createDefaultDependencyAdapterRegistry().parse({
+        adapterId: "npmParser",
+        workspaceFolder: workspace,
+        lockfilePath,
+        manifestPath,
+      });
+      const foo = result.dependencies.find((dependency) => dependency.name === "foo");
+
+      assert.ok(foo, `${fixture.name} should retain foo in its dependency inventory`);
+      assert.strictEqual(foo.packageSource.kind, "registry", fixture.name);
+      assert.strictEqual(foo.resolvedVersion, "1.0.0", fixture.name);
+      assert.strictEqual(foo.lookupEligibility.state, "eligible", fixture.name);
+    }
+  });
+
   test("detect returns no matches when npm lockfiles are missing", async () => {
     const workspace = await createWorkspace();
 
@@ -456,7 +850,7 @@ suite("npmParser Test Suite", () => {
     );
   });
 
-  test("adds a warning when the unique dependency count exceeds the scan cap", async () => {
+  test("adds a customer-safe warning when the configured display setting hides dependencies", async () => {
     const tree = await npmParser.resolve({
       lockfilePath: path.join(fixtureDir, "package-lock.json"),
       manifestPath: path.join(fixtureDir, "package.json"),
@@ -464,7 +858,11 @@ suite("npmParser Test Suite", () => {
     });
 
     assert.strictEqual(tree.warnings.length, 1);
-    assert.match(tree.warnings[0], /Display is capped at 2 dependencies/);
+    assert.strictEqual(
+      tree.warnings[0],
+      "Some dependencies are hidden by the configured display setting. Package inventory remains complete."
+    );
+    assert.strictEqual(tree.warnings[0].includes("2"), false);
   });
 
   test("includes orphaned package-lock entries once even when duplicate package records share a key", async () => {
@@ -639,6 +1037,69 @@ suite("npmParser Test Suite", () => {
     assert.deepStrictEqual(shared.parentChain, ["prod"]);
     assert.strictEqual(metrics.structuralOccurrencesExpanded, 4);
     assert.strictEqual(metrics.repeatedOccurrenceEncounters, 1);
+  });
+
+  test("classifies package-lock artifacts from occurrence evidence independent of name collisions and entry order", async () => {
+    const manifest = {
+      dependencies: { runtime: "1.0.0" },
+      devDependencies: { types: "2.0.0" },
+    };
+    const rootEntry = {
+      dependencies: { runtime: "1.0.0" },
+      devDependencies: { types: "2.0.0" },
+    };
+    const entries = [
+      ["node_modules/runtime", {
+        version: "1.0.0",
+        dependencies: { types: "1.0.0", shared: "1.0.0" },
+      }],
+      ["node_modules/runtime/node_modules/types", {
+        version: "1.0.0",
+        dependencies: { "prod-child": "1.0.0" },
+      }],
+      ["node_modules/prod-child", { version: "1.0.0" }],
+      ["node_modules/types", {
+        version: "2.0.0",
+        dev: true,
+        dependencies: { "dev-child": "1.0.0", shared: "1.0.0" },
+      }],
+      ["node_modules/dev-child", { version: "1.0.0", dev: true }],
+      ["node_modules/shared", { version: "1.0.0" }],
+    ];
+    const classifications = [];
+
+    for (const orderedEntries of [entries, entries.slice().reverse()]) {
+      const { tree } = await resolveGeneratedPackageLock(manifest, {
+        "": rootEntry,
+        ...Object.fromEntries(orderedEntries),
+      });
+      const byKey = new Map(tree.dependencies.map((dependency) => [
+        `${dependency.name}@${dependency.version}`,
+        dependency,
+      ]));
+      classifications.push(Object.fromEntries([...byKey].map(([key, dependency]) => [
+        key,
+        dependency.isDevelopmentDependency,
+      ])));
+
+      assert.strictEqual(byKey.get("runtime@1.0.0").isDevelopmentDependency, false);
+      assert.strictEqual(byKey.get("types@1.0.0").isDevelopmentDependency, false);
+      assert.strictEqual(byKey.get("prod-child@1.0.0").isDevelopmentDependency, false);
+      assert.strictEqual(byKey.get("types@2.0.0").isDevelopmentDependency, true);
+      assert.strictEqual(byKey.get("dev-child@1.0.0").isDevelopmentDependency, true);
+      assert.strictEqual(byKey.get("shared@1.0.0").isDevelopmentDependency, false);
+
+      const runtime = byKey.get("runtime@1.0.0");
+      const productionTypes = runtime.transitives.find((dependency) => dependency.name === "types");
+      const developmentTypes = byKey.get("types@2.0.0");
+      assert.strictEqual(productionTypes.isDevelopmentDependency, false);
+      assert.strictEqual(productionTypes.transitives[0].isDevelopmentDependency, false);
+      assert.strictEqual(developmentTypes.transitives.find(
+        (dependency) => dependency.name === "shared"
+      ).isDevelopmentDependency, true);
+    }
+
+    assert.deepStrictEqual(classifications[0], classifications[1]);
   });
 
   test("terminates package-lock cycles without dropping acyclic siblings", async () => {
