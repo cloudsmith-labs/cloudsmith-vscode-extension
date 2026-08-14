@@ -8,6 +8,7 @@ const {
   getDependencyPackageSourceDisplayRef,
   getDependencyQualifierDisplayValue,
   getDependencySourceLabel,
+  normalizeDependencyDisplayValue,
 } = require("../util/dependencyRecord");
 const { getPackageVulnerabilityState } = require("../util/packageVulnerabilities");
 
@@ -36,7 +37,11 @@ class DependencyHealthNode {
     this.sourceManifest = dep.sourceManifest || null;
     this.packageSource = dep.packageSource || null;
     this.lookupEligibility = dep.lookupEligibility || null;
-    this.qualifiers = dep.qualifiers || {};
+    this.qualifiers = dep.qualifiers
+      && typeof dep.qualifiers === "object"
+      && !Array.isArray(dep.qualifiers)
+      ? dep.qualifiers
+      : {};
     this.environmentMarker = dep.environmentMarker || null;
     this.normalizedName = dep.normalizedName || null;
     this.cloudsmithLookupDetail = dep.cloudsmithLookupDetail || null;
@@ -407,12 +412,11 @@ class DependencyHealthNode {
   }
 
   _buildQualifierSuffix() {
-    const values = [
-      this.qualifiers.targetFramework,
-      this.qualifiers.platform,
-      this.qualifiers.classifier,
-      this.qualifiers.stage,
-    ].filter(Boolean);
+    const values = ["targetFramework", "platform", "classifier", "stage"]
+      .map((key) => normalizeDependencyDisplayValue(
+        getDependencyQualifierDisplayValue(key, this.qualifiers[key])
+      ))
+      .filter((value) => value != null);
     return values.length > 0 ? ` [${values.join(", ")}]` : "";
   }
 
@@ -420,16 +424,24 @@ class DependencyHealthNode {
     const lines = [`${this.name} ${this._buildVersionPrefix()}`.trim()];
     lines.push(`Format: ${this.format}`);
     lines.push(`Relationship: ${this._getRelationshipLabel()}`);
-    const sourceLabel = getDependencySourceLabel(this);
+    const sourceLabel = normalizeDependencyDisplayValue(getDependencySourceLabel(this));
     if (sourceLabel) {
       lines.push(`Source: ${sourceLabel}`);
     }
     for (const [key, value] of Object.entries(this.qualifiers)) {
-      const displayValue = getDependencyQualifierDisplayValue(key, value);
-      lines.push(`${formatQualifierLabel(key)}: ${displayValue}`);
+      const displayLabel = normalizeDependencyDisplayValue(formatQualifierLabel(key));
+      const displayValue = normalizeDependencyDisplayValue(
+        getDependencyQualifierDisplayValue(key, value)
+      );
+      if (displayLabel && displayValue != null) {
+        lines.push(`${displayLabel}: ${displayValue}`);
+      }
     }
-    if (this.packageSource && this.packageSource.kind) {
-      lines.push(`Package source: ${this.packageSource.kind}`);
+    const packageSourceKind = normalizeDependencyDisplayValue(
+      this.packageSource && this.packageSource.kind
+    );
+    if (packageSourceKind) {
+      lines.push(`Package source: ${packageSourceKind}`);
       const displayLocation = getDependencyPackageSourceDisplayLocation(this.packageSource);
       if (displayLocation) lines.push(`Source location: ${displayLocation}`);
       const displayBranch = getDependencyPackageSourceDisplayRef(this.packageSource.branch);
@@ -447,15 +459,17 @@ class DependencyHealthNode {
       lines.push("Coverage check in progress.");
     } else if (this.cloudsmithStatus === "ABSENT" || this.cloudsmithStatus === "NOT_FOUND") {
       lines.push("Not found in the configured Cloudsmith workspace.");
-      if (this.upstreamDetail) {
-        lines.push(this.upstreamDetail);
+      const upstreamDetail = normalizeDependencyDisplayValue(this.upstreamDetail);
+      if (upstreamDetail) {
+        lines.push(upstreamDetail);
       } else {
         lines.push("This package may need to be uploaded or fetched through an upstream.");
       }
     } else if (this.cloudsmithStatus !== "FOUND" || !this.cloudsmithMatch) {
       lines.push(this._buildMissingDescription() + ".");
-      if (this.cloudsmithLookupDetail) {
-        lines.push(this.cloudsmithLookupDetail);
+      const lookupDetail = normalizeDependencyDisplayValue(this.cloudsmithLookupDetail);
+      if (lookupDetail) {
+        lines.push(lookupDetail);
       }
     } else {
       lines.push(`Found in Cloudsmith (${this.cloudsmithMatch.repository})`);
@@ -727,9 +741,10 @@ function classificationFromTier(tier) {
 }
 
 function formatQualifierLabel(key) {
-  return String(key || "")
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/^./, (character) => character.toUpperCase());
+  const words = String(key || "").replace(/([a-z])([A-Z])/g, "$1 $2");
+  return words
+    ? `${words[0].toUpperCase()}${words.slice(1).toLowerCase()}`
+    : "";
 }
 
 module.exports = DependencyHealthNode;

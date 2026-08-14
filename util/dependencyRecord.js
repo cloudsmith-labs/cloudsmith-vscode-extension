@@ -399,13 +399,35 @@ function isDependencyLookupEligible(dependency) {
   );
 }
 
+function normalizeDependencyDisplayValue(value) {
+  if (value == null) return null;
+  if (!["string", "number", "bigint"].includes(typeof value)) return null;
+  const display = String(value).trim();
+  if (
+    !display
+    || display.length > MAX_CANONICAL_VALUE_LENGTH
+    || CONTROL_CHARACTER_PATTERN.test(display)
+  ) {
+    return null;
+  }
+  return display;
+}
+
 function getDependencySourceLabel(dependency) {
   const source = dependency && (dependency.sourceManifest || dependency.resolutionSource);
-  if (source && source.label) {
-    return source.label;
+  const sourceLabel = normalizeDependencyDisplayValue(source && source.label);
+  if (sourceLabel) {
+    return getDependencyPackageSourceDisplayLocation({
+      kind: DEPENDENCY_PACKAGE_SOURCE_KINDS.UNKNOWN,
+      location: sourceLabel,
+    });
   }
-  const sourceFile = String(dependency && dependency.sourceFile || "").trim();
-  return sourceFile && !path.isAbsolute(sourceFile) ? sourceFile : path.basename(sourceFile);
+  const sourceFile = normalizeDependencyDisplayValue(dependency && dependency.sourceFile);
+  if (!sourceFile) return null;
+  return getDependencyPackageSourceDisplayLocation({
+    kind: DEPENDENCY_PACKAGE_SOURCE_KINDS.UNKNOWN,
+    location: sourceFile,
+  });
 }
 
 /**
@@ -415,9 +437,9 @@ function getDependencySourceLabel(dependency) {
  * expose usernames or machine layout, so only their basename is displayed.
  */
 function getDependencyPackageSourceDisplayLocation(packageSource) {
-  const location = String(packageSource && packageSource.location || "").trim();
+  const location = normalizeDependencyDisplayValue(packageSource && packageSource.location);
   if (!location) return null;
-  const kind = String(packageSource && packageSource.kind || "").trim();
+  const kind = normalizeDependencyDisplayValue(packageSource && packageSource.kind) || "";
   const decodedLocation = decodeSourceLocatorForDisplay(location);
   if (decodedLocation == null) {
     return isLocalPackageSourceKind(kind) ? "local source" : "source";
@@ -543,7 +565,12 @@ function getDependencyQualifierDisplayValue(key, value) {
       location: value,
     });
   }
-  return Array.isArray(value) ? value.join(", ") : value;
+  if (!Array.isArray(value)) return value;
+  const displayValues = value.map(normalizeDependencyDisplayValue);
+  if (displayValues.length === 0 || displayValues.some((display) => display == null)) {
+    return null;
+  }
+  return displayValues.join(", ");
 }
 
 function isAbsoluteDisplayPath(value) {
@@ -985,4 +1012,5 @@ module.exports = {
   getDependencyQualifierDisplayValue,
   getDependencySourceLabel,
   isDependencyLookupEligible,
+  normalizeDependencyDisplayValue,
 };

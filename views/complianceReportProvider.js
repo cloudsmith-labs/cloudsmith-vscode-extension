@@ -3,6 +3,7 @@ const vscode = require("vscode");
 const {
   getDependencyPackageSourceDisplayLocation,
   getDependencyQualifierDisplayValue,
+  normalizeDependencyDisplayValue,
 } = require("../util/dependencyRecord");
 
 class ComplianceReportProvider {
@@ -47,6 +48,17 @@ class ComplianceReportProvider {
 
   _getHtml(reportData) {
     const summary = reportData.summary || {};
+    const total = normalizeSummaryCount(summary.total);
+    const occurrences = summary.occurrences == null
+      ? total
+      : normalizeSummaryCount(summary.occurrences);
+    const direct = normalizeSummaryCount(summary.direct);
+    const found = normalizeSummaryCount(summary.found);
+    const notFound = normalizeSummaryCount(summary.notFound);
+    const notApplicable = normalizeSummaryCount(summary.notApplicable);
+    const vulnCount = normalizeSummaryCount(summary.vulnCount);
+    const restrictiveLicenseCount = normalizeSummaryCount(summary.restrictiveLicenseCount);
+    const coveragePct = clampPercent(summary.coveragePct);
     const licenseIds = uniqueLicenseIds(reportData.restrictiveLicenseDeps || []);
     const sections = [];
 
@@ -66,12 +78,15 @@ class ComplianceReportProvider {
       sections.push(renderPolicySection(reportData.policyViolationDeps));
     }
 
-    if ((summary.notFound || 0) > 0) {
+    if (notFound > 0) {
       sections.push(renderUncoveredSection(reportData.uncoveredDeps || []));
     }
 
-    if ((summary.notApplicable || 0) > 0) {
-      sections.push(renderNotApplicableSection(reportData.notApplicableDeps || []));
+    const notApplicableDeps = Array.isArray(reportData.notApplicableDeps)
+      ? reportData.notApplicableDeps
+      : [];
+    if (notApplicable > 0 && notApplicableDeps.length > 0) {
+      sections.push(renderNotApplicableSection(notApplicableDeps));
     }
 
     const incompleteCount = [
@@ -392,10 +407,10 @@ class ComplianceReportProvider {
     </div>
 
     <div class="summary-grid">
-      ${renderSummaryCard("dependencies", summary.total || 0, "Artifacts", `${summary.occurrences || summary.total || 0} occurrences · ${summary.direct || 0} direct`)}
-      ${renderSummaryCard("vulnerabilities", summary.vulnCount || 0, "Vulnerable", formatSeverityBreakdown(summary))}
-      ${renderSummaryCard("licenses", summary.restrictiveLicenseCount || 0, "Restrictive licenses", formatLicenseBreakdown(licenseIds))}
-      ${renderSummaryCard("coverage", summary.found || 0, "Cloudsmith coverage", `${summary.coveragePct || 0}% coverage`)}
+      ${renderSummaryCard("dependencies", total, "Artifacts", `${occurrences} occurrences · ${direct} direct`)}
+      ${renderSummaryCard("vulnerabilities", vulnCount, "Vulnerable", formatSeverityBreakdown(summary))}
+      ${renderSummaryCard("licenses", restrictiveLicenseCount, "Restrictive licenses", formatLicenseBreakdown(licenseIds))}
+      ${renderSummaryCard("coverage", found, "Cloudsmith coverage", `${coveragePct}% coverage`)}
     </div>
 
     <div class="card coverage-panel">
@@ -403,7 +418,7 @@ class ComplianceReportProvider {
         <strong>Coverage overview</strong>
       </div>
       <div class="coverage-bar" aria-hidden="true">
-        <div class="coverage-fill" style="width: ${clampPercent(summary.coveragePct || 0)}%"></div>
+        <div class="coverage-fill" style="width: ${coveragePct}%"></div>
       </div>
       <p class="coverage-label">${escapeHtml(formatCoverageLabel(summary))}</p>
     </div>
@@ -659,13 +674,13 @@ function renderNotApplicableSection(dependencies) {
       <td>${escapeHtml(displayValue(dependency.detail))}</td>
     </tr>
   `).join("");
-  return renderSection("Registry Lookup Not Applicable", `
+  return renderSection("Registry lookup not applicable", `
     <table>
       <thead>
         <tr>
           <th>Package</th>
           <th>Version</th>
-          <th>Source Kind</th>
+          <th>Source kind</th>
           <th>Detail</th>
         </tr>
       </thead>
@@ -677,21 +692,30 @@ function renderNotApplicableSection(dependencies) {
 function renderPackageCell(dependency) {
   const detailParts = [];
   const qualifierVariants = new Set();
+  const provenance = Array.isArray(dependency && dependency.provenance)
+    ? dependency.provenance
+    : [];
   const qualifierSources = [
     dependency && dependency.qualifiers || {},
-    ...(dependency && dependency.provenance || []).map((entry) => entry && entry.qualifiers || {}),
+    ...provenance.map((entry) => entry && entry.qualifiers || {}),
   ];
   for (const qualifiers of qualifierSources) {
+    if (!qualifiers || typeof qualifiers !== "object" || Array.isArray(qualifiers)) continue;
     for (const [key, value] of Object.entries(qualifiers)) {
-      const display = getDependencyQualifierDisplayValue(key, value);
-      if (display) qualifierVariants.add(`${formatQualifierLabel(key)}: ${display}`);
+      const displayLabel = normalizeDependencyDisplayValue(formatQualifierLabel(key));
+      const displayValue = normalizeDependencyDisplayValue(
+        getDependencyQualifierDisplayValue(key, value)
+      );
+      if (displayLabel && displayValue != null) {
+        qualifierVariants.add(`${displayLabel}: ${displayValue}`);
+      }
     }
   }
   detailParts.push(...qualifierVariants);
   const packageSourceLocations = new Set();
   for (const packageSource of [
     dependency && dependency.packageSource,
-    ...(dependency && dependency.provenance || []).map((entry) => entry && entry.packageSource),
+    ...provenance.map((entry) => entry && entry.packageSource),
   ]) {
     const displayLocation = getDependencyPackageSourceDisplayLocation(packageSource);
     if (displayLocation) packageSourceLocations.add(displayLocation);
@@ -699,9 +723,12 @@ function renderPackageCell(dependency) {
   if (packageSourceLocations.size > 0) {
     detailParts.push(`Package source: ${[...packageSourceLocations].join(", ")}`);
   }
-  const sources = [...new Set((dependency && dependency.provenance || [])
-    .map((entry) => entry && entry.source)
-    .filter(Boolean))];
+  const sources = [...new Set(provenance
+    .map((entry) => getDependencyPackageSourceDisplayLocation({
+      kind: "path",
+      location: entry && entry.source,
+    }))
+    .filter((display) => display != null))];
   if (sources.length > 0) detailParts.push(`Source: ${sources.join(", ")}`);
   if (dependency && dependency.occurrenceCount > 1) {
     detailParts.push(`${dependency.occurrenceCount} occurrences`);
@@ -713,9 +740,10 @@ function renderPackageCell(dependency) {
 }
 
 function formatQualifierLabel(key) {
-  return String(key || "")
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/^./, (character) => character.toUpperCase());
+  const words = String(key || "").replace(/([a-z])([A-Z])/g, "$1 $2");
+  return words
+    ? `${words[0].toUpperCase()}${words.slice(1).toLowerCase()}`
+    : "";
 }
 
 function formatScanDate(scanDate) {
@@ -732,20 +760,15 @@ function formatScanDate(scanDate) {
 
 function formatSeverityBreakdown(summary) {
   const parts = [];
-  if (summary.criticalCount) {
-    parts.push(`${summary.criticalCount} Critical`);
-  }
-  if (summary.highCount) {
-    parts.push(`${summary.highCount} High`);
-  }
-  if (summary.mediumCount) {
-    parts.push(`${summary.mediumCount} Medium`);
-  }
-  if (summary.lowCount) {
-    parts.push(`${summary.lowCount} Low`);
-  }
-  if (summary.vulnUnknownCount) {
-    parts.push(`${summary.vulnUnknownCount} Unknown`);
+  for (const [key, label] of [
+    ["criticalCount", "Critical"],
+    ["highCount", "High"],
+    ["mediumCount", "Medium"],
+    ["lowCount", "Low"],
+    ["vulnUnknownCount", "Unknown"],
+  ]) {
+    const count = normalizeSummaryCount(summary && summary[key]);
+    if (count > 0) parts.push(`${count} ${label}`);
   }
   return parts.length > 0 ? parts.join(", ") : "No known vulnerabilities";
 }
@@ -758,8 +781,13 @@ function formatLicenseBreakdown(licenseIds) {
 }
 
 function formatCoverageLabel(summary) {
-  const applicable = Math.max((summary.total || 0) - (summary.notApplicable || 0), 0);
-  return `${summary.found || 0} of ${applicable} applicable artifacts served by Cloudsmith (${summary.coveragePct || 0}%); ${summary.notApplicable || 0} not applicable`;
+  const total = normalizeSummaryCount(summary && summary.total);
+  const found = normalizeSummaryCount(summary && summary.found);
+  const notApplicable = normalizeSummaryCount(summary && summary.notApplicable);
+  const applicable = Math.max(total - notApplicable, 0);
+  const coveragePct = clampPercent(summary && summary.coveragePct);
+  const label = `${found} of ${applicable} applicable artifacts served by Cloudsmith (${coveragePct}%)`;
+  return notApplicable > 0 ? `${label}; ${notApplicable} not applicable` : label;
 }
 
 function uniqueLicenseIds(restrictiveLicenseDeps) {
@@ -771,11 +799,21 @@ function uniqueLicenseIds(restrictiveLicenseDeps) {
 }
 
 function clampPercent(value) {
-  return Math.max(0, Math.min(100, Number(value) || 0));
+  const number = typeof value === "number" || typeof value === "string"
+    ? Number(value)
+    : 0;
+  return Math.max(0, Math.min(100, Number.isFinite(number) ? number : 0));
 }
 
 function displayValue(value) {
-  return value || "—";
+  return normalizeDependencyDisplayValue(value) || "—";
+}
+
+function normalizeSummaryCount(value) {
+  const number = typeof value === "number" || typeof value === "string"
+    ? Number(value)
+    : 0;
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
 }
 
 function severityClassName(severity) {

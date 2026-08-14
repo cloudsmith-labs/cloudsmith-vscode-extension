@@ -148,9 +148,12 @@ function buildTooltip(summary) {
     `${summary.unresolved} unresolved`,
     `${summary.lookupFailed} lookup failures`,
     `${summary.lookupIncomplete} incomplete lookups`,
-    `${summary.notApplicable} not applicable`,
     `${summary.coveragePercent}% coverage`,
   ];
+
+  if (summary.notApplicable > 0) {
+    lines.splice(lines.length - 1, 0, `${summary.notApplicable} not applicable`);
+  }
 
   if (summary.vulnerable > 0) {
     lines.push(`${summary.vulnerable} vulnerable`);

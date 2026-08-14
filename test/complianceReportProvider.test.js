@@ -196,6 +196,111 @@ suite("ComplianceReportProvider", () => {
     assert.doesNotMatch(upstreamHtml, /<h3>Not reachable<\/h3>/);
   });
 
+  test("coverage label omits missing and zero not-applicable counts", () => {
+    const provider = new ComplianceReportProvider({});
+    for (const summary of [
+      { total: 5, found: 3, coveragePct: 60 },
+      { total: 5, found: 3, coveragePct: 60, notApplicable: 0 },
+    ]) {
+      const html = provider._getHtml({ projectName: "fixture", summary });
+      assert.match(
+        html,
+        /3 of 5 applicable artifacts served by Cloudsmith \(60%\)/
+      );
+      assert.doesNotMatch(html, /0 not applicable/);
+      assert.doesNotMatch(html, /Registry lookup not applicable/);
+    }
+  });
+
+  test("coverage label and section retain positive not-applicable context", () => {
+    const dependencies = [
+      ...["one", "two", "three"].map((name) => ({
+        name,
+        version: "1.0.0",
+        format: "npm",
+        ecosystem: "npm",
+        cloudsmithStatus: "FOUND",
+        packageSource: { kind: "registry" },
+        qualifiers: {},
+      })),
+      {
+        name: "missing",
+        version: "1.0.0",
+        format: "npm",
+        ecosystem: "npm",
+        cloudsmithStatus: "NOT_FOUND",
+        packageSource: { kind: "registry" },
+        qualifiers: {},
+      },
+      {
+        name: "local-package",
+        version: "1.0.0",
+        format: "npm",
+        ecosystem: "npm",
+        cloudsmithStatus: "NOT_APPLICABLE",
+        cloudsmithLookupDetail: "Path dependency; Cloudsmith package lookup is not applicable.",
+        packageSource: { kind: "path", location: "/Users/private-user/libs/local-package" },
+        qualifiers: {},
+      },
+    ];
+    const reportData = buildComplianceReportData("fixture", dependencies);
+    const html = new ComplianceReportProvider({})._getHtml(reportData);
+
+    assert.strictEqual(reportData.summary.total, 5);
+    assert.strictEqual(reportData.summary.notApplicable, 1);
+    assert.strictEqual(reportData.summary.coveragePct, 75);
+    assert.match(
+      html,
+      /3 of 4 applicable artifacts served by Cloudsmith \(75%\); 1 not applicable/
+    );
+    assert.strictEqual((html.match(/1 not applicable/g) || []).length, 1);
+    assert.match(html, /<summary>Registry lookup not applicable<\/summary>/);
+    assert.match(html, /local-package/);
+    assert.match(html, />path<\/td>/);
+    assert.doesNotMatch(html, /private-user|\/Users\//);
+  });
+
+  test("coverage remains truthful when every artifact is not applicable", () => {
+    const dependencies = Array.from({ length: 5 }, (_value, index) => ({
+      name: `local-${index}`,
+      version: "1.0.0",
+      format: "npm",
+      ecosystem: "npm",
+      cloudsmithStatus: "NOT_APPLICABLE",
+      packageSource: { kind: "path", location: `../local-${index}` },
+      qualifiers: {},
+    }));
+    const reportData = buildComplianceReportData("fixture", dependencies);
+    const html = new ComplianceReportProvider({})._getHtml(reportData);
+
+    assert.strictEqual(reportData.summary.coveragePct, 0);
+    assert.match(
+      html,
+      /0 of 0 applicable artifacts served by Cloudsmith \(0%\); 5 not applicable/
+    );
+    assert.match(html, /<summary>Registry lookup not applicable<\/summary>/);
+  });
+
+  test("malformed optional summary values do not leak into report copy", () => {
+    const html = new ComplianceReportProvider({})._getHtml({
+      projectName: "fixture",
+      summary: {
+        total: 5,
+        found: 3,
+        coveragePct: 60,
+        vulnCount: { unsafe: true },
+        restrictiveLicenseCount: { unsafe: true },
+        criticalCount: { unsafe: true },
+        highCount: "0",
+        mediumCount: undefined,
+      },
+    });
+
+    assert.match(html, /3 of 5 applicable artifacts served by Cloudsmith \(60%\)/);
+    assert.match(html, /No known vulnerabilities/);
+    assert.doesNotMatch(html, /\[object Object\]|undefined|0 Critical|0 High/);
+  });
+
   test("report provenance does not expose source credentials or absolute paths", () => {
     const reportData = buildComplianceReportData("fixture", [{
       name: "local-package",
@@ -210,14 +315,21 @@ suite("ComplianceReportProvider", () => {
         kind: "path",
         location: "/Users/private-user/workspace/libs/local-package.jar",
       },
+      sourceFile: "/Users/private-user/workspace/pom.xml",
       qualifiers: {
         repository: "https://user:secret@example.com/index?token=hidden#private",
+        classifier: undefined,
+        scope: { unsafe: "raw-object" },
       },
     }]);
 
     const html = new ComplianceReportProvider({})._getHtml(reportData);
     assert.match(html, /Package source: local-package\.jar/);
     assert.match(html, /Repository: https:\/\/example\.com\/index/);
-    assert.doesNotMatch(html, /private-user|\/Users\/|user:secret|token=|#private/);
+    assert.match(html, /Source: pom\.xml/);
+    assert.doesNotMatch(
+      html,
+      /private-user|\/Users\/|user:secret|token=|#private|null|undefined|\[object Object\]|raw-object/
+    );
   });
 });
