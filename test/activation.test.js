@@ -5,6 +5,7 @@ const vscode = require("vscode");
 const filterState = require("../util/filterState");
 const recentPackages = require("../util/recentPackages");
 const { createExactPackage } = require("../domain/package");
+const { UpstreamRuntime } = require("../util/upstreamRuntime");
 
 function createMemento() {
   const values = new Map();
@@ -106,6 +107,62 @@ suite("Extension activation smoke", () => {
       !(await vscode.commands.getCommands(true)).includes("cloudsmith-vsc.refreshView"),
       "Deactivation must dispose command registrations owned by activation"
     );
+  });
+
+  test("owns one runtime and settles its initial cache purge before credential access", async () => {
+    const extension = vscode.extensions.getExtension("Cloudsmith.cloudsmith-vsc");
+    const extensionModule = require("../extension");
+    await extensionModule.deactivate();
+
+    const cacheKey = "cloudsmith-upstreams:v5:activation-order";
+    const events = [];
+    const initialized = [];
+    const disposed = [];
+    let cacheAtCredentialRead = "unread";
+    let resolveCredentialRead;
+    const credentialRead = new Promise(resolve => { resolveCredentialRead = resolve; });
+    let context;
+    context = createActivationContext(extension.extensionPath, () => {
+      cacheAtCredentialRead = context.globalState.get(cacheKey);
+      events.push("credential-read");
+      resolveCredentialRead();
+    });
+    await context.globalState.update(cacheKey, { accountEpoch: 1 });
+
+    const originalInitialize = UpstreamRuntime.prototype.initialize;
+    const originalDispose = UpstreamRuntime.prototype.dispose;
+    UpstreamRuntime.prototype.initialize = async function (...args) {
+      initialized.push(this);
+      events.push("runtime-initialize-start");
+      const result = await originalInitialize.apply(this, args);
+      events.push("runtime-initialize-settled");
+      return result;
+    };
+    UpstreamRuntime.prototype.dispose = function (...args) {
+      disposed.push(this);
+      events.push("runtime-dispose");
+      return originalDispose.apply(this, args);
+    };
+
+    try {
+      await extensionModule.activate(context);
+      await credentialRead;
+
+      assert.strictEqual(initialized.length, 1);
+      assert.strictEqual(cacheAtCredentialRead, undefined);
+      assert.ok(
+        events.indexOf("runtime-initialize-settled") < events.indexOf("credential-read"),
+        "Runtime initialization must settle before ConnectionManager reads SecretStorage"
+      );
+
+      await extensionModule.deactivate();
+      await extensionModule.deactivate();
+      assert.deepStrictEqual(disposed, initialized);
+    } finally {
+      await extensionModule.deactivate();
+      UpstreamRuntime.prototype.initialize = originalInitialize;
+      UpstreamRuntime.prototype.dispose = originalDispose;
+    }
   });
 
   test("same-context reactivation owns exactly 64 callbacks and rolls back late failure", async () => {

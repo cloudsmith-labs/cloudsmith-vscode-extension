@@ -4,11 +4,14 @@ const vscode = require("vscode");
 const crypto = require("crypto");
 const { types: { isProxy } } = require("util");
 const {
-  getAllUpstreamData,
-  getUpstreamDataForFormats,
   isSafeInventoryUpstream,
   sanitizeSafeInventoryUpstream,
 } = require("../util/upstreamChecker");
+const {
+  captureAccount,
+  isAccountCurrent,
+  resolveConnectionManager,
+} = require("../util/accountOperation");
 const {
   getUpstreamFormatDescriptor,
   INSPECTABLE_UPSTREAM_FORMATS,
@@ -41,30 +44,54 @@ const OUTCOME_FAILURE_KEYS = new Set([
 
 class UpstreamDetailProvider {
   constructor(context, options = {}) {
+    const inventory = options.upstreamInventory;
+    if (
+      typeof options.loadUpstreams !== "function"
+      && (
+        !inventory
+        || typeof inventory.getAllUpstreamData !== "function"
+        || typeof inventory.getUpstreamDataForFormats !== "function"
+      )
+    ) {
+      throw new TypeError("UpstreamDetailProvider requires a safe upstream inventory facade.");
+    }
     this.context = context;
-    this._loadUpstreams = options.loadUpstreams || ((workspace, repoSlug, requestOptions) => (
-      Array.isArray(requestOptions.formats)
-        ? getUpstreamDataForFormats(
-          this.context, workspace, repoSlug, requestOptions.formats, requestOptions
-        )
-        : getAllUpstreamData(this.context, workspace, repoSlug, requestOptions)
-    ));
+    this._connectionManager = resolveConnectionManager(context, options.connectionManager);
+    if (typeof options.loadUpstreams === "function") {
+      this._loadUpstreams = options.loadUpstreams;
+    } else {
+      this._loadUpstreams = (workspace, repoSlug, requestOptions) => (
+        Array.isArray(requestOptions.formats)
+          ? inventory.getUpstreamDataForFormats(
+            workspace, repoSlug, requestOptions.formats, requestOptions
+          )
+          : inventory.getAllUpstreamData(workspace, repoSlug, requestOptions)
+      );
+    }
     this._panel = null;
     this._abortController = null;
     this._requestId = 0;
     this._loadPromise = null;
     this._lastSettled = null;
     this._scope = null;
+    this._account = null;
     this._messageDisposable = null;
   }
 
-  async show(workspace, repoSlug, repoName) {
+  async show(workspace, repoSlug, repoName, options = {}) {
     if (!workspace || !repoSlug || !repoName) {
       vscode.window.showWarningMessage("Could not determine repository details for upstream inspection.");
       return;
     }
 
-    const scope = JSON.stringify([workspace, repoSlug]);
+    const account = options.account || captureAccount(this._connectionManager);
+    if (this._connectionManager && !account) return;
+    const scope = JSON.stringify([
+      account?.activationId || null,
+      account?.accountEpoch || null,
+      workspace,
+      repoSlug,
+    ]);
     if (this._loadPromise && this._scope === scope) {
       this._panel?.reveal(vscode.ViewColumn.One);
       return this._loadPromise;
@@ -72,6 +99,7 @@ class UpstreamDetailProvider {
     this._abortInFlightRequest();
     if (this._scope !== scope) this._lastSettled = null;
     this._scope = scope;
+    this._account = account;
     const requestId = ++this._requestId;
     const abortController = new AbortController();
     this._abortController = abortController;
@@ -89,7 +117,7 @@ class UpstreamDetailProvider {
         : this._getLoadingHtml(workspace, repoSlug, repoName);
 
       loadPromise = this._fetchGroupedUpstreams(
-        workspace, repoSlug, abortController.signal, { bypassCache: false }
+        workspace, repoSlug, abortController.signal, { bypassCache: false, account }
       );
       this._loadPromise = loadPromise;
       let fetchState;
@@ -129,7 +157,7 @@ class UpstreamDetailProvider {
 
   retry() {
     if (!this._scope || this._loadPromise) return this._loadPromise;
-    const [workspace, repoSlug] = JSON.parse(this._scope);
+    const [, , workspace, repoSlug] = JSON.parse(this._scope);
     const repoName = this._panel?.title?.replace(/^Upstreams:\s*/, "") || repoSlug;
     return this._reload(workspace, repoSlug, repoName);
   }
@@ -149,6 +177,7 @@ class UpstreamDetailProvider {
     const promise = this._fetchGroupedUpstreams(workspace, repoSlug, abortController.signal, {
       bypassCache: true,
       formats: retryFormats,
+      account: this._account,
     });
     this._loadPromise = promise;
     try {
@@ -227,8 +256,17 @@ class UpstreamDetailProvider {
       signal,
       bypassCache: options.bypassCache === true,
       formats: options.formats,
+      account: options.account,
     });
-    if (upstreamData === null || signal.aborted) {
+    if (
+      upstreamData === null
+      || signal.aborted
+      || (
+        this._connectionManager
+        && options.account
+        && !isAccountCurrent(this._connectionManager, options.account)
+      )
+    ) {
       return null;
     }
     const aggregate = snapshotAggregateContract(upstreamData);
@@ -763,6 +801,7 @@ class UpstreamDetailProvider {
     this._messageDisposable = null;
     this._lastSettled = null;
     this._scope = null;
+    this._account = null;
   }
 
 

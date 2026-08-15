@@ -3,7 +3,7 @@
 const assert = require("assert");
 const vscode = require("vscode");
 const {
-  DependencyHealthProvider,
+  DependencyHealthProvider: DependencyHealthProviderImplementation,
   FILTER_MODES,
   buildDependencyHealthReport,
   buildDependencySummary,
@@ -12,6 +12,29 @@ const { fromApiPackageRecord } = require("../domain/packageAdapters");
 
 suite("tree visualization", () => {
   let originalGetConfiguration;
+
+  class DependencyHealthProvider extends DependencyHealthProviderImplementation {
+    constructor(context, diagnosticsPublisher = null, options = {}) {
+      super(context, diagnosticsPublisher, {
+        upstreamGapRuntime: {
+          createOperationScope() {
+            const controller = new AbortController();
+            return {
+              signal: controller.signal,
+              dispose() { controller.abort(); },
+            };
+          },
+          async getRepositoryUpstreamStateForFormats() { return null; },
+        },
+        upstreamPullService: {
+          async run() { return null; },
+          async prepareSingle() { return null; },
+          async execute() { return null; },
+        },
+        ...options,
+      });
+    }
+  }
 
   setup(() => {
     originalGetConfiguration = vscode.workspace.getConfiguration;

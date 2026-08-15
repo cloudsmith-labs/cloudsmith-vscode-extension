@@ -1,6 +1,9 @@
 const assert = require("assert");
 const vscode = require("vscode");
-const { UpstreamDetailProvider, SUPPORTED_FORMATS } = require("../views/upstreamDetailProvider");
+const {
+  UpstreamDetailProvider: UpstreamDetailProviderImplementation,
+  SUPPORTED_FORMATS,
+} = require("../views/upstreamDetailProvider");
 const { UpstreamChecker } = require("../util/upstreamChecker");
 const {
   getUpstreamFormatDescriptor,
@@ -13,6 +16,21 @@ suite("UpstreamDetailProvider Test Suite", () => {
   const NON_INSPECTABLE_FORMATS = SUPPORTED_UPSTREAM_FORMATS.filter(format => (
     !getUpstreamFormatDescriptor(format)?.inspectable
   ));
+  class UpstreamDetailProvider extends UpstreamDetailProviderImplementation {
+    constructor(context, options = {}) {
+      super(context, {
+        loadUpstreams: async () => aggregate(),
+        ...options,
+      });
+    }
+  }
+
+  test("requires a safe upstream inventory facade", () => {
+    assert.throws(
+      () => new UpstreamDetailProviderImplementation({}),
+      /safe upstream inventory facade/
+    );
+  });
 
   function aggregate(overrides = {}) {
     const requestedFormats = Array.isArray(overrides.requestedFormats)

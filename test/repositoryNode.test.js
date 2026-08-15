@@ -8,6 +8,7 @@ const {
   unbindConnectionManager,
 } = require("../util/connectionManager");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
+const { UpstreamChecker } = require("../util/upstreamChecker");
 
 function makePackage(slug, overrides = {}) {
   return {
@@ -94,6 +95,16 @@ function completeUpstreamState(upstreams = []) {
   };
 }
 
+function safeUpstream(format, name, isActive = true, origin = "") {
+  return {
+    name,
+    _format: format,
+    format,
+    origin,
+    is_active: isActive,
+  };
+}
+
 function deferred() {
   let resolve;
   const promise = new Promise(res => { resolve = res; });
@@ -102,16 +113,13 @@ function deferred() {
 
 suite("RepositoryNode Test Suite", () => {
   const repositoryNodePath = require.resolve("../models/repositoryNode");
-  const upstreamCheckerPath = require.resolve("../util/upstreamChecker");
   let originalGetConfiguration;
   let RepositoryNode;
-  let upstreamChecker;
-  let originalGetAllUpstreamData;
-  let originalGetUpstreamDataForFormats;
+  let RepositoryNodeImplementation;
+  let upstreamInventory;
   let originalApiGet;
   let managerBinding;
   let accountState;
-  const terraformExporterPath = require.resolve("../util/terraformExporter");
 
   const context = {
     globalState: {
@@ -129,15 +137,28 @@ suite("RepositoryNode Test Suite", () => {
     setState(next) { accountState = { ...accountState, ...next }; },
   };
 
+  function createProductionUpstreamInventory() {
+    const checker = new UpstreamChecker(context, { connectionManager });
+    return Object.freeze({
+      getAllUpstreamData: (...args) => checker.getAllUpstreamData(...args),
+    });
+  }
+
   setup(() => {
     originalGetConfiguration = vscode.workspace.getConfiguration;
-    delete require.cache[terraformExporterPath];
     delete require.cache[repositoryNodePath];
-    delete require.cache[upstreamCheckerPath];
-    upstreamChecker = require(upstreamCheckerPath);
-    RepositoryNode = require(repositoryNodePath);
-    originalGetAllUpstreamData = upstreamChecker.getAllUpstreamData;
-    originalGetUpstreamDataForFormats = upstreamChecker.getUpstreamDataForFormats;
+    RepositoryNodeImplementation = require(repositoryNodePath);
+    upstreamInventory = {
+      getAllUpstreamData: async () => completeUpstreamState(),
+    };
+    RepositoryNode = class extends RepositoryNodeImplementation {
+      constructor(repo, workspace, nodeContext, options = {}) {
+        super(repo, workspace, nodeContext, {
+          upstreamInventory,
+          ...options,
+        });
+      }
+    };
     originalApiGet = CloudsmithAPI.prototype.get;
     accountState = {
       activationId: connectionManager.activationId,
@@ -160,34 +181,68 @@ suite("RepositoryNode Test Suite", () => {
     });
   });
 
+  test("requires a narrow upstream inventory facade", () => {
+    assert.throws(
+      () => new RepositoryNodeImplementation(
+        { slug: "repo", slug_perm: "repo", name: "Repo" },
+        "acme",
+        context,
+        { connectionManager }
+      ),
+      /upstream inventory facade/
+    );
+  });
+
+  test("rejects privileged-shaped upstream records before retaining tree state", async () => {
+    const repositoryNode = new RepositoryNodeImplementation(
+      { slug: "repo", slug_perm: "repo", name: "Repo" },
+      "acme",
+      context,
+      {
+        connectionManager,
+        upstreamInventory: {
+          async getAllUpstreamData() {
+            return completeUpstreamState([{
+              name: "private",
+              _format: "npm",
+              format: "npm",
+              origin: "https://registry.example",
+              upstream_url: "https://token@example.invalid/private",
+            }]);
+          },
+        },
+      }
+    );
+
+    const state = await repositoryNode.getUpstreamState();
+    assert.strictEqual(state.complete, false);
+    assert.deepStrictEqual(state.upstreams, []);
+  });
+
   teardown(() => {
     vscode.workspace.getConfiguration = originalGetConfiguration;
-    upstreamChecker.getAllUpstreamData = originalGetAllUpstreamData;
-    upstreamChecker.getUpstreamDataForFormats = originalGetUpstreamDataForFormats;
     CloudsmithAPI.prototype.get = originalApiGet;
     managerBinding.dispose();
     unbindConnectionManager(context, connectionManager);
-    delete require.cache[terraformExporterPath];
     delete require.cache[repositoryNodePath];
-    delete require.cache[upstreamCheckerPath];
   });
 
   test("uses one repository-wide upstream fetch for configured totals", async () => {
     let allFormatCalls = 0;
     const targetedCalls = [];
     const partialUpstreams = [
-      { name: "Docker Hub", _format: "docker", upstream_url: "https://index.docker.io/", is_active: true },
-      { name: "PyPI", _format: "python", upstream_url: "https://pypi.org/", is_active: true },
-      { name: "RubyGems", _format: "ruby", upstream_url: "https://rubygems.org/", is_active: false },
+      safeUpstream("docker", "Docker Hub", true, "https://index.docker.io"),
+      safeUpstream("python", "PyPI", true, "https://pypi.org"),
+      safeUpstream("ruby", "RubyGems", false, "https://rubygems.org"),
     ];
     const fullUpstreams = [
       ...partialUpstreams,
-      { name: "Maven Central", _format: "maven", upstream_url: "https://repo.maven.apache.org/", is_active: true },
-      { name: "NuGet", _format: "nuget", upstream_url: "https://api.nuget.org/", is_active: true },
-      { name: "npmjs", _format: "npm", upstream_url: "https://registry.npmjs.org/", is_active: true },
+      safeUpstream("maven", "Maven Central", true, "https://repo.maven.apache.org"),
+      safeUpstream("nuget", "NuGet", true, "https://api.nuget.org"),
+      safeUpstream("npm", "npmjs", true, "https://registry.npmjs.org"),
     ];
 
-    upstreamChecker.getAllUpstreamData = async () => {
+    upstreamInventory.getAllUpstreamData = async () => {
       allFormatCalls += 1;
       return {
         upstreams: fullUpstreams,
@@ -199,7 +254,7 @@ suite("RepositoryNode Test Suite", () => {
         complete: true,
       };
     };
-    upstreamChecker.getUpstreamDataForFormats = async (_context, workspace, repo, formats) => {
+    upstreamInventory.getUpstreamDataForFormats = async (workspace, repo, formats) => {
       targetedCalls.push({ workspace, repo, formats });
       return {
         upstreams: partialUpstreams,
@@ -234,25 +289,20 @@ suite("RepositoryNode Test Suite", () => {
     assert.strictEqual(children[0].upstreams.length, 6);
     assert.strictEqual(children[0].getTreeItem().label, "Upstreams: 5 active of 6 configured");
 
-    const { fetchRepositoryUpstreams } = require(terraformExporterPath);
-    const exportResult = await fetchRepositoryUpstreams(context, "acme", "example-repo");
-    assert.strictEqual(exportResult.active, 5);
-    assert.strictEqual(exportResult.total, 6);
-    assert.strictEqual(children[0].upstreams.length, exportResult.data.length);
   });
 
   test("falls back to the all-format fetch when no inferred formats are available", async () => {
     let allFormatCalls = 0;
     let targetedCalls = 0;
 
-    upstreamChecker.getAllUpstreamData = async () => {
+    upstreamInventory.getAllUpstreamData = async () => {
       allFormatCalls += 1;
       return {
-        upstreams: [{ name: "Docker Hub", _format: "docker", upstream_url: "https://index.docker.io/" }],
+        upstreams: [safeUpstream("docker", "Docker Hub", true, "https://index.docker.io")],
         failedFormats: [], uninspectedFormats: [], complete: true,
       };
     };
-    upstreamChecker.getUpstreamDataForFormats = async () => {
+    upstreamInventory.getUpstreamDataForFormats = async () => {
       targetedCalls += 1;
       return completeUpstreamState();
     };
@@ -276,14 +326,14 @@ suite("RepositoryNode Test Suite", () => {
     let allFormatCalls = 0;
     const targetedCalls = [];
 
-    upstreamChecker.getAllUpstreamData = async () => {
+    upstreamInventory.getAllUpstreamData = async () => {
       allFormatCalls += 1;
       return completeUpstreamState();
     };
-    upstreamChecker.getUpstreamDataForFormats = async (_context, workspace, repo, formats) => {
+    upstreamInventory.getUpstreamDataForFormats = async (workspace, repo, formats) => {
       targetedCalls.push({ workspace, repo, formats });
       return {
-        upstreams: [{ name: "PyPI", _format: "python", upstream_url: "https://pypi.org/" }],
+        upstreams: [safeUpstream("python", "PyPI", true, "https://pypi.org")],
         failedFormats: [], uninspectedFormats: [], complete: true,
       };
     };
@@ -345,7 +395,7 @@ suite("RepositoryNode Test Suite", () => {
       { slug: "production-repo", slug_perm: "production-repo", name: "Production Repo" },
       "acme",
       context,
-      { connectionManager }
+      { connectionManager, upstreamInventory: createProductionUpstreamInventory() }
     );
     repositoryNode.getPackages = async () => [{ format: "python" }];
     repositoryNode._packageState = { ...repositoryNode._packageState, pageCount: 1 };
@@ -379,7 +429,7 @@ suite("RepositoryNode Test Suite", () => {
       { slug: "partial-repo", slug_perm: "partial-repo", name: "Partial Repo" },
       "acme",
       context,
-      { connectionManager }
+      { connectionManager, upstreamInventory: createProductionUpstreamInventory() }
     );
     repositoryNode.getPackages = async () => [{ format: "python" }];
     repositoryNode._packageState = { ...repositoryNode._packageState, pageCount: 1 };
@@ -681,9 +731,8 @@ suite("RepositoryNode Test Suite", () => {
       {
         connectionManager,
         createPaginatedFetch: () => fake,
-        upstreamChecker: {
+        upstreamInventory: {
           getAllUpstreamData: async () => completeUpstreamState(),
-          getUpstreamDataForFormats: async () => completeUpstreamState(),
         },
         requestRefresh: node => refreshes.push(node),
         withProgress: async (_options, task) => task({ report() {} }, { isCancellationRequested: false }),
@@ -1045,9 +1094,8 @@ suite("RepositoryNode Test Suite", () => {
       {
         connectionManager,
         createPaginatedFetch: () => fake,
-        upstreamChecker: {
+        upstreamInventory: {
           getAllUpstreamData: async () => completeUpstreamState(),
-          getUpstreamDataForFormats: async () => completeUpstreamState(),
         },
         withProgress: async (_options, task) => task({}, { isCancellationRequested: false }),
       }

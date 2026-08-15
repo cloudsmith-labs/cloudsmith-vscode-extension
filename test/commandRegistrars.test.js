@@ -19,6 +19,12 @@ const INTERNAL_COMMANDS = [
   "cloudsmith-vsc.rescanDependencies",
 ];
 
+function deferred() {
+  let resolve;
+  const promise = new Promise(resolvePromise => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
 function recordingRegistration(effects = {}) {
   const handlers = new Map();
   const disposed = [];
@@ -45,6 +51,10 @@ function baseDependencies(recorder) {
     vscode: {},
     LicenseClassifier: { buildRestrictiveQuery: () => "license:restrictive" },
     FORMAT_OPTIONS: [],
+    upstreamPreview: { async previewResolution() { return null; } },
+    upstreamExport: {
+      async getPrivilegedRepositoryUpstreamsForExport() { return null; },
+    },
   };
 }
 
@@ -1646,13 +1656,11 @@ suite("Command registrars", () => {
     const recorder = recordingRegistration();
     let workspaceReads = 0;
     let repositoryReads = 0;
-    let checkerCreations = 0;
     let previews = 0;
     let shown = 0;
-    class UpstreamChecker {
-      constructor() { checkerCreations += 1; }
+    const upstreamPreview = {
       async previewResolution() { previews += 1; }
-    }
+    };
     registerUpstreamCommands({
       ...baseDependencies(recorder),
       context: {},
@@ -1671,14 +1679,13 @@ suite("Command registrars", () => {
           return { items: [], complete: true };
         },
       }),
-      UpstreamChecker,
+      upstreamPreview,
       upstreamPreviewProvider: { show() { shown += 1; } },
     });
 
     await recorder.handlers.get("cloudsmith-vsc.previewUpstreamResolution")();
     assert.strictEqual(workspaceReads, 0);
     assert.strictEqual(repositoryReads, 0);
-    assert.strictEqual(checkerCreations, 0);
     assert.strictEqual(previews, 0);
     assert.strictEqual(shown, 0);
   });
@@ -1688,6 +1695,7 @@ suite("Command registrars", () => {
     const signals = [];
     let cancellationSubscriptionDisposals = 0;
     let documents = 0;
+    let exportOptions = null;
     const resolveOnAbort = (signal, value) => new Promise(resolve => {
       signals.push(signal);
       if (signal.aborted) {
@@ -1734,9 +1742,16 @@ suite("Command registrars", () => {
       },
       CloudsmithAPI,
       apiEndpoint: parts => `/${parts.join("/")}`,
-      fetchRepositoryUpstreams: async (_context, _workspace, _repository, options) => (
-        resolveOnAbort(options.signal, null)
-      ),
+      upstreamExport: {
+        getPrivilegedRepositoryUpstreamsForExport: async (
+          _workspace,
+          _repository,
+          options
+        ) => {
+          exportOptions = options;
+          return resolveOnAbort(options.signal, null);
+        },
+      },
       formatApiError: error => error.message,
     });
 
@@ -1746,7 +1761,70 @@ suite("Command registrars", () => {
     disposable.dispose();
     await pending;
     assert.ok(signals.every(signal => signal.aborted));
+    assert.deepStrictEqual(exportOptions.account, {
+      activationId: "activation-a",
+      accountEpoch: 1,
+    });
     assert.strictEqual(cancellationSubscriptionDisposals, 1);
+    assert.strictEqual(documents, 0);
+  });
+
+  test("Terraform export cannot publish after its captured account changes", async () => {
+    const recorder = recordingRegistration();
+    const harness = accountAccessHarness();
+    const upstream = deferred();
+    let documents = 0;
+    let capturedOptions = null;
+    registerUpstreamCommands({
+      ...baseDependencies(recorder),
+      context: {},
+      vscode: {
+        ProgressLocation: { Notification: 1 },
+        languages: { getLanguages: async () => ["terraform"] },
+        workspace: {
+          async openTextDocument() { documents += 1; return {}; },
+        },
+        window: {
+          async withProgress(_options, task) {
+            return task(null, { onCancellationRequested: () => ({ dispose() {} }) });
+          },
+          async showTextDocument() { documents += 1; },
+          showErrorMessage() {},
+          showWarningMessage() {},
+        },
+      },
+      workspaceAccess: harness.access,
+      packageAdapters: {
+        fromRepositoryNode: () => ({
+          workspace: "workspace-a",
+          repository: "repo-a",
+          name: "Repo A",
+        }),
+      },
+      CloudsmithAPI: class {
+        async get() { return { ok: true, data: {} }; }
+      },
+      apiEndpoint: parts => `/${parts.join("/")}`,
+      upstreamExport: {
+        getPrivilegedRepositoryUpstreamsForExport(_workspace, _repository, options) {
+          capturedOptions = options;
+          return upstream.promise;
+        },
+      },
+      generateTerraformConfig: () => "resource {}",
+    });
+
+    const pending = recorder.handlers.get("cloudsmith-vsc.exportTerraform")({});
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepStrictEqual(capturedOptions.account, {
+      activationId: "activation-a",
+      accountEpoch: 1,
+    });
+    assert.ok(capturedOptions.signal instanceof AbortSignal);
+    harness.stale();
+    upstream.resolve({ data: [], complete: true });
+    await pending;
     assert.strictEqual(documents, 0);
   });
 
@@ -1756,12 +1834,12 @@ suite("Command registrars", () => {
     const factoryInputs = [];
     const previewCalls = [];
     const shown = [];
-    class UpstreamChecker {
+    const upstreamPreview = {
       async previewResolution(...args) {
         previewCalls.push(args);
         return args[2] === "service-error" ? null : { resolved: true };
       }
-    }
+    };
     registerUpstreamCommands({
       ...baseDependencies(recorder),
       context: {},
@@ -1797,7 +1875,7 @@ suite("Command registrars", () => {
           return Object.freeze({ ...input });
         },
       },
-      UpstreamChecker,
+      upstreamPreview,
       upstreamPreviewProvider: { show: value => shown.push(value) },
     });
 
@@ -1825,12 +1903,71 @@ suite("Command registrars", () => {
         format: "python",
       },
     ]);
-    assert.deepStrictEqual(previewCalls, [
+    assert.deepStrictEqual(previewCalls.map(args => args.slice(0, 4)), [
       ["workspace-a", "repo-a", "widget", "python"],
       ["workspace-a", "repo-a", "service-error", "python"],
     ]);
+    assert.ok(previewCalls.every(args => (
+      args[4].account.activationId === "activation-a"
+      && args[4].account.accountEpoch === 1
+      && args[4].signal instanceof AbortSignal
+    )));
     assert.deepStrictEqual(shown, [{ resolved: true }]);
     assert.deepStrictEqual(warnings, ["Could not determine package details."]);
+  });
+
+  test("upstream preview is latest-wins within the same account", async () => {
+    const recorder = recordingRegistration();
+    const first = deferred();
+    const second = deferred();
+    const calls = [];
+    const shown = [];
+    registerUpstreamCommands({
+      ...baseDependencies(recorder),
+      vscode: {
+        ProgressLocation: { Notification: 1 },
+        workspace: {
+          getConfiguration: () => ({ get: () => "workspace-a" }),
+        },
+        window: {
+          async showQuickPick(items) { return items[0]; },
+          async withProgress(_options, task) {
+            return task(null, { onCancellationRequested: () => ({ dispose() {} }) });
+          },
+          showWarningMessage() {},
+        },
+      },
+      workspaceAccess: currentAccountAccess({
+        fetchWorkspaceRepositories: async () => ({
+          items: [{ name: "Repo A", slug: "repo-a" }],
+          complete: true,
+        }),
+      }),
+      packageDomain: {
+        createPackageResolutionInput: input => Object.freeze({ ...input }),
+      },
+      upstreamPreview: {
+        previewResolution(...args) {
+          calls.push(args);
+          return calls.length === 1 ? first.promise : second.promise;
+        },
+      },
+      upstreamPreviewProvider: { show: value => shown.push(value) },
+    });
+    const handler = recorder.handlers.get("cloudsmith-vsc.previewUpstreamResolution");
+    const firstRun = handler({ name: "first", format: "python" });
+    await new Promise(resolve => setImmediate(resolve));
+    const secondRun = handler({ name: "second", format: "python" });
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.strictEqual(calls.length, 2);
+    assert.strictEqual(calls[0][4].signal.aborted, true);
+    assert.strictEqual(calls[1][4].signal.aborted, false);
+    second.resolve({ name: "second" });
+    await secondRun;
+    first.resolve({ name: "first" });
+    await firstRun;
+    assert.deepStrictEqual(shown, [{ name: "second" }]);
   });
 
   test("license command rejects credentials, controls, unsafe protocols, and overlong URLs", async () => {

@@ -4,9 +4,10 @@ const {
   findPythonDistributionUrl,
 } = require("../util/registryEndpoints");
 const {
-  UpstreamPullService,
+  UpstreamPullService: UpstreamPullServiceImplementation,
 } = require("../util/upstreamPullService");
 const { UpstreamChecker } = require("../util/upstreamChecker");
+const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
 const { apiSuccess } = require("./apiResultHelpers");
 
 function createResponse(status, body, headers = {}) {
@@ -63,6 +64,63 @@ function completeRepositoryState(entriesByFormat) {
 }
 
 suite("UpstreamPullService", () => {
+  function createRuntime(reader = null) {
+    const upstreamReader = reader || {
+      async getRepositoryUpstreamStateForFormats() {
+        return completeRepositoryState({});
+      },
+    };
+    return {
+      createOperationScope(options = {}) {
+        const controller = new AbortController();
+        const scheduler = options.scheduler || new UpstreamOperationScheduler();
+        const cancellationDisposable = typeof options.cancellationToken?.onCancellationRequested
+          === "function"
+          ? options.cancellationToken.onCancellationRequested(() => controller.abort())
+          : null;
+        return Object.freeze({
+          scheduler,
+          signal: controller.signal,
+          account: options.account,
+          dispose() {
+            controller.abort();
+            scheduler.cancel();
+            cancellationDisposable?.dispose?.();
+          },
+        });
+      },
+      getRepositoryUpstreamStateForFormats(workspace, repo, formats, options = {}) {
+        return upstreamReader.getRepositoryUpstreamStateForFormats(
+          workspace,
+          repo,
+          formats,
+          {
+            ...options,
+            signal: options.operationScope.signal,
+            scheduler: options.operationScope.scheduler,
+          }
+        );
+      },
+    };
+  }
+
+  class UpstreamPullService extends UpstreamPullServiceImplementation {
+    constructor(context, options = {}) {
+      const upstreamRuntime = options.upstreamRuntime
+        && typeof options.upstreamRuntime.createOperationScope === "function"
+        ? options.upstreamRuntime
+        : createRuntime(options.upstreamRuntime);
+      super(context, { ...options, upstreamRuntime });
+    }
+  }
+
+  test("requires an injected safe upstream runtime facade", () => {
+    assert.throws(
+      () => new UpstreamPullServiceImplementation({}, {}),
+      /safe upstream runtime facade/
+    );
+  });
+
   test("builds canonical registry trigger URLs for supported formats", () => {
     const mavenPlan = buildRegistryTriggerPlan("workspace", "repo", {
       name: "com.example:demo-app",
@@ -161,8 +219,8 @@ suite("UpstreamPullService", () => {
         items: [{ slug: "repo", name: "Repo" }],
         complete: true,
       }),
-      upstreamChecker: {
-        async getRepositoryUpstreamState() {
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
           return completeRepositoryState({
             maven: [safeUpstream("maven", "Maven Central", { is_active: true })],
             python: [],
@@ -215,8 +273,8 @@ suite("UpstreamPullService", () => {
         items: [{ slug: "repo", name: "Repo" }],
         complete: true,
       }),
-      upstreamChecker: {
-        async getRepositoryUpstreamState() {
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
           return completeRepositoryState({
             npm: [safeUpstream("npm", "npm", { is_active: true })],
           });
@@ -779,6 +837,119 @@ suite("UpstreamPullService", () => {
     assert.strictEqual(calls.length, 1);
   });
 
+  test("prepare and prepareSingle contain runtime scope supersession without UI publication", async () => {
+    const cases = [
+      { method: "prepare", kind: "stale", transitionAccount: true },
+      { method: "prepareSingle", kind: "stale", transitionAccount: true },
+      { method: "prepare", kind: "disposed", transitionAccount: false },
+      { method: "prepareSingle", kind: "disposed", transitionAccount: false },
+    ];
+
+    for (const testCase of cases) {
+      let state = {
+        activationId: "account-a",
+        accountEpoch: 1,
+        sessionConnected: true,
+      };
+      let scopeCalls = 0;
+      let inspectionCalls = 0;
+      const uiCalls = [];
+      const service = new UpstreamPullService({}, {
+        connectionManager: { getState() { return { ...state }; } },
+        fetchRepositories: async () => ({
+          items: [{ slug: "repo", name: "Repo" }],
+          complete: true,
+        }),
+        upstreamRuntime: {
+          createOperationScope(options) {
+            scopeCalls += 1;
+            assert.deepStrictEqual(options.account, {
+              activationId: "account-a",
+              accountEpoch: 1,
+            });
+            if (testCase.transitionAccount) {
+              state = {
+                activationId: "account-b",
+                accountEpoch: 2,
+                sessionConnected: true,
+              };
+            }
+            const error = new Error(`runtime ${testCase.kind}`);
+            error.name = "UpstreamRuntimeError";
+            error.kind = testCase.kind;
+            throw error;
+          },
+          async getRepositoryUpstreamStateForFormats() {
+            inspectionCalls += 1;
+            throw new Error("inspection must not start");
+          },
+        },
+        showQuickPick: async () => { uiCalls.push("quick-pick"); return null; },
+        showErrorMessage: async () => { uiCalls.push("error"); },
+        showInformationMessage: async () => { uiCalls.push("information"); },
+        showWarningMessage: async () => { uiCalls.push("warning"); },
+      });
+      const dependency = {
+        name: "requests",
+        version: "2.31.0",
+        format: "python",
+        cloudsmithStatus: "NOT_FOUND",
+      };
+      const prepared = testCase.method === "prepare"
+        ? await service.prepare({ workspace: "workspace", dependencies: [dependency] })
+        : await service.prepareSingle({ workspace: "workspace", dependency });
+
+      assert.strictEqual(prepared, null, `${testCase.method}:${testCase.kind}`);
+      assert.strictEqual(scopeCalls, 1, `${testCase.method}:${testCase.kind}`);
+      assert.strictEqual(inspectionCalls, 0, `${testCase.method}:${testCase.kind}`);
+      assert.deepStrictEqual(uiCalls, [], `${testCase.method}:${testCase.kind}`);
+    }
+  });
+
+  test("scope acquisition still rejects programming and unrelated runtime errors", async () => {
+    const programmingError = new TypeError("invalid scope contract");
+    programmingError.name = "UpstreamRuntimeError";
+    programmingError.kind = "stale";
+    const unrelatedError = new Error("unrelated runtime failure");
+    unrelatedError.name = "UpstreamRuntimeError";
+    unrelatedError.kind = "failed";
+    const foreignStaleError = new Error("foreign stale failure");
+    foreignStaleError.kind = "stale";
+
+    for (const expectedError of [programmingError, unrelatedError, foreignStaleError]) {
+      const uiCalls = [];
+      const service = new UpstreamPullService({}, {
+        fetchRepositories: async () => ({ items: [{ slug: "repo" }], complete: true }),
+        upstreamRuntime: {
+          createOperationScope() {
+            throw expectedError;
+          },
+          async getRepositoryUpstreamStateForFormats() {
+            throw new Error("inspection must not start");
+          },
+        },
+        showQuickPick: async () => { uiCalls.push("quick-pick"); return null; },
+        showErrorMessage: async () => { uiCalls.push("error"); },
+        showInformationMessage: async () => { uiCalls.push("information"); },
+        showWarningMessage: async () => { uiCalls.push("warning"); },
+      });
+
+      await assert.rejects(
+        service.prepareSingle({
+          workspace: "workspace",
+          dependency: {
+            name: "requests",
+            version: "2.31.0",
+            format: "python",
+            cloudsmithStatus: "NOT_FOUND",
+          },
+        }),
+        error => error === expectedError
+      );
+      assert.deepStrictEqual(uiCalls, []);
+    }
+  });
+
   test("prepareSingle only offers repositories with a matching upstream", async () => {
     const quickPickCalls = [];
     let warningCalls = 0;
@@ -790,8 +961,8 @@ suite("UpstreamPullService", () => {
         ],
         complete: true,
       }),
-      upstreamChecker: {
-        async getRepositoryUpstreamState(_workspace, repo) {
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats(_workspace, repo) {
           return completeRepositoryState({
             python: repo === "repo-b"
               ? [safeUpstream("python", "PyPI", { is_active: true })]
@@ -870,10 +1041,10 @@ suite("UpstreamPullService", () => {
           complete: true,
         };
       },
-      upstreamChecker: {
+      upstreamRuntime: {
         async getRepositoryUpstreamStateForFormats(_workspace, _repo, _formats, options) {
           inspectionCalls += 1;
-          assert.strictEqual(options.cancellationToken, token);
+          assert.strictEqual(options.signal.aborted, false);
           await gate.promise;
           return {
             groupedUpstreams: new Map(),
@@ -933,7 +1104,7 @@ suite("UpstreamPullService", () => {
         });
         return repositories.promise;
       },
-      upstreamChecker: {
+      upstreamRuntime: {
         async getRepositoryUpstreamStateForFormats() {
           inspectionCalls += 1;
           return { groupedUpstreams: new Map(), complete: true };
@@ -1010,7 +1181,7 @@ suite("UpstreamPullService", () => {
     });
     const service = new UpstreamPullService({}, {
       connectionManager: account,
-      upstreamChecker: checker,
+      upstreamRuntime: checker,
       fetchRepositories: async () => {
         repositoryFetches += 1;
         return { items: [{ slug: "repo", name: "Repo" }], complete: true };
@@ -1218,7 +1389,7 @@ suite("UpstreamPullService", () => {
 
     for (const testCase of cases) {
       const service = new UpstreamPullService({}, {
-        upstreamChecker: {
+        upstreamRuntime: {
           async getRepositoryUpstreamStateForFormats() { return testCase.state; },
         },
       });
@@ -1246,7 +1417,7 @@ suite("UpstreamPullService", () => {
       const state = completeRepositoryState({ npm: [] });
       state.groupedUpstreams.set("npm", groupedValue);
       const service = new UpstreamPullService({}, {
-        upstreamChecker: {
+        upstreamRuntime: {
           async getRepositoryUpstreamStateForFormats() { return state; },
         },
       });
@@ -1270,7 +1441,7 @@ suite("UpstreamPullService", () => {
       const state = completeRepositoryState({ npm: [] });
       state.groupedUpstreams = groupedUpstreams;
       const service = new UpstreamPullService({}, {
-        upstreamChecker: {
+        upstreamRuntime: {
           async getRepositoryUpstreamStateForFormats() { return state; },
         },
       });

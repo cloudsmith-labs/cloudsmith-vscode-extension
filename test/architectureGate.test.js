@@ -23,7 +23,7 @@ suite("M11 architecture gate", () => {
 
   test("controlled valid, boundary, parity, and scanner fixtures prove stable rules", () => {
     assert.deepStrictEqual(runArchitectureSelfTests(), {
-      invalidFixtures: 61,
+      invalidFixtures: 66,
       validFixtures: 1,
     });
   });

@@ -1,6 +1,5 @@
 // Copyright 2026 Cloudsmith Ltd.
 
-const { getAllUpstreamData } = require("./upstreamChecker");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("./upstreamFormats");
 const {
   formatUpstreamText,
@@ -199,47 +198,6 @@ function buildVariableBlock(name, description) {
     "  sensitive   = true",
     "}",
   ].join("\n");
-}
-
-async function fetchRepositoryUpstreams(context, workspace, repoSlug, options = {}) {
-  const upstreamData = await getAllUpstreamData(context, workspace, repoSlug, {
-    ...options,
-    bypassCache: true,
-    projection: "privileged",
-  });
-  if (upstreamData === null) {
-    return null;
-  }
-
-  const upstreams = Array.isArray(upstreamData.upstreams) ? upstreamData.upstreams : [];
-  const failedFormats = Array.isArray(upstreamData.failedFormats) ? upstreamData.failedFormats : [];
-  const uninspectedFormats = Array.isArray(upstreamData.uninspectedFormats)
-    ? upstreamData.uninspectedFormats
-    : [];
-  const unavailableFormats = [...new Set([...failedFormats, ...uninspectedFormats])];
-  const hasUsableUpstreams = upstreams.length > 0;
-
-  if (unavailableFormats.length > 0 && !hasUsableUpstreams) {
-    return {
-      data: upstreams,
-      error: `Could not load upstream data for: ${unavailableFormats.join(", ")}`,
-      failedFormats,
-      uninspectedFormats,
-      complete: false,
-      partial: false,
-    };
-  }
-
-  return {
-    data: upstreams,
-    error: null,
-    active: upstreamData.active,
-    total: upstreamData.total,
-    failedFormats,
-    uninspectedFormats,
-    complete: upstreamData.complete === true,
-    partial: upstreamData.complete !== true && hasUsableUpstreams,
-  };
 }
 
 function buildRepositoryBlock(repo, repoResourceLabel) {
@@ -510,7 +468,5 @@ function generateTerraformConfig(options) {
 }
 
 module.exports = {
-  fetchRepositoryUpstreams,
   generateTerraformConfig,
-  sanitizeIdentifier,
 };

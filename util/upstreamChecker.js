@@ -18,6 +18,7 @@ const {
   SUPPORTED_UPSTREAM_FORMATS,
 } = require("./upstreamFormats");
 const { UpstreamOperationScheduler } = require("./upstreamOperationScheduler");
+const { UpstreamCacheLifecycle } = require("./upstreamCacheLifecycle");
 const {
   formatUpstreamError,
   formatUpstreamOrigin,
@@ -29,11 +30,8 @@ const UPSTREAM_CACHE_TTL_MS = 10 * 60 * 1000;
 // Four active page requests is conservative enough for the API rate limit while
 // avoiding the latency-amplifying batch barriers used by the previous path.
 const UPSTREAM_REQUEST_CONCURRENCY = 4;
-// Compatibility export for callers that referenced the former batching name.
-const UPSTREAM_FETCH_BATCH_SIZE = UPSTREAM_REQUEST_CONCURRENCY;
 const UPSTREAM_CACHE_KEY_PREFIX = "cloudsmith-upstreams:v5";
 const MAX_PERSISTED_UPSTREAMS = 5000;
-const MAX_PERSISTED_UPSTREAMS_PER_FORMAT = 500;
 const MAX_PERSISTED_STRING_LENGTH = 2048;
 const MAX_PERSISTED_NAME_LENGTH = 500;
 const MAX_PERSISTED_DISTRO_VERSIONS = 100;
@@ -81,8 +79,6 @@ const persistedStringFieldLimits = new Map([
   ["upstream_distribution", MAX_PERSISTED_STRING_LENGTH],
   ["origin", MAX_PERSISTED_STRING_LENGTH],
 ]);
-const cacheOperations = new WeakMap();
-const cacheWriteQueues = new WeakMap();
 
 function isObjectRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -106,52 +102,6 @@ function getUpstreamCacheKey(workspace, repo, formats = SUPPORTED_UPSTREAM_FORMA
   return `${UPSTREAM_CACHE_KEY_PREFIX}:${encodeURIComponent(JSON.stringify(tuple))}`;
 }
 
-function getCacheMap(registry, globalState) {
-  let cacheMap = registry.get(globalState);
-  if (!cacheMap) {
-    cacheMap = new Map();
-    registry.set(globalState, cacheMap);
-  }
-  return cacheMap;
-}
-
-function beginCacheOperation(globalState, cacheKey) {
-  if (!globalState || !isObjectRecord(globalState)) return null;
-  const operations = getCacheMap(cacheOperations, globalState);
-  const operationToken = Symbol(cacheKey);
-  operations.set(cacheKey, operationToken);
-  return operationToken;
-}
-
-function isCacheOperationCurrent(globalState, cacheKey, operationToken) {
-  return Boolean(operationToken)
-    && getCacheMap(cacheOperations, globalState).get(cacheKey) === operationToken;
-}
-
-function finishCacheOperation(globalState, cacheKey, operationToken) {
-  if (!globalState || !operationToken) return;
-  const operations = cacheOperations.get(globalState);
-  if (!operations || operations.get(cacheKey) !== operationToken) return;
-  operations.delete(cacheKey);
-  if (operations.size === 0) cacheOperations.delete(globalState);
-}
-
-function getActiveUpstreamCacheOperationCount(globalState) {
-  return cacheOperations.get(globalState)?.size || 0;
-}
-
-function queueCacheWrite(globalState, cacheKey, write) {
-  const queues = getCacheMap(cacheWriteQueues, globalState);
-  const previous = queues.get(cacheKey) || Promise.resolve();
-  const pending = previous.then(write, write);
-  const settled = pending.then(() => undefined, () => undefined);
-  queues.set(cacheKey, settled);
-  settled.finally(() => {
-    if (queues.get(cacheKey) === settled) queues.delete(cacheKey);
-  });
-  return pending;
-}
-
 function cacheErrorMessage(action) {
   const safeAction = action === "persist" || action === "evict invalid entry from"
     ? action
@@ -163,14 +113,10 @@ function logCacheError(action) {
   console.warn(cacheErrorMessage(action));
 }
 
-function evictCacheEntry(globalState, cacheKey, workspace, repo) {
-  if (!globalState || typeof globalState.update !== "function") return;
-  queueCacheWrite(globalState, cacheKey, async () => {
-    try {
-      await globalState.update(cacheKey, undefined);
-    } catch (error) {
-      logCacheError("evict invalid entry from", workspace, repo, error);
-    }
+function evictCacheEntry(cacheLifecycle, cacheKey, workspace, repo) {
+  if (!cacheLifecycle) return;
+  cacheLifecycle.evict(cacheKey).catch((error) => {
+    logCacheError("evict invalid entry from", workspace, repo, error);
   });
 }
 
@@ -428,7 +374,7 @@ function isFresh(timestamp, now) {
 }
 
 function getCachedFlatResponse(
-  globalState,
+  cacheLifecycle,
   cacheKey,
   workspace,
   repo,
@@ -436,8 +382,8 @@ function getCachedFlatResponse(
   account,
   now
 ) {
-  if (!globalState || typeof globalState.get !== "function") return null;
-  const cachedValue = globalState.get(cacheKey);
+  if (!cacheLifecycle) return null;
+  const cachedValue = cacheLifecycle.read(cacheKey);
   if (cachedValue === undefined) return null;
   const cached = snapshotOwnDataRecord(cachedValue);
   const cachedValues = cached
@@ -474,7 +420,7 @@ function getCachedFlatResponse(
     })).size
       === cachedUpstreams.length;
   if (!valid) {
-    evictCacheEntry(globalState, cacheKey, workspace, repo);
+    evictCacheEntry(cacheLifecycle, cacheKey, workspace, repo);
     return null;
   }
   const outcomes = getUniqueRequestedDescriptors(requestedFormats).map((descriptor) => {
@@ -495,7 +441,7 @@ function getCachedFlatResponse(
 }
 
 async function persistFlatResponse(
-  globalState,
+  cacheLifecycle,
   cacheKey,
   workspace,
   repo,
@@ -506,7 +452,7 @@ async function persistFlatResponse(
   requestedFormats,
   now
 ) {
-  if (!globalState || typeof globalState.update !== "function") return;
+  if (!cacheLifecycle) return;
   const serializedUpstreams = serializeUpstreamArray(response.upstreams);
   if (
     !serializedUpstreams
@@ -521,13 +467,10 @@ async function persistFlatResponse(
       return requestedFormats.includes(format);
     })
   ) return;
-  await queueCacheWrite(globalState, cacheKey, async () => {
-    if (
-      !isAccountCurrent(connectionManager, account)
-      || !isCacheOperationCurrent(globalState, cacheKey, operationId)
-    ) return;
-    try {
-      await globalState.update(cacheKey, {
+  try {
+    await cacheLifecycle.persist(
+      cacheKey,
+      {
         version: UPSTREAM_CACHE_SCHEMA_VERSION,
         activationId: account.activationId,
         accountEpoch: account.accountEpoch,
@@ -537,13 +480,13 @@ async function persistFlatResponse(
         total: response.total,
         failedFormats: [],
         successfulFormats: response.successfulFormats,
-      });
-    } catch {
-      if (isCacheOperationCurrent(globalState, cacheKey, operationId)) {
-        logCacheError("persist");
-      }
-    }
-  });
+      },
+      operationId,
+      () => isAccountCurrent(connectionManager, account)
+    );
+  } catch {
+    if (cacheLifecycle.isCurrent(cacheKey, operationId)) logCacheError("persist");
+  }
 }
 
 async function waitForOptionalCacheWrite(cacheWritePromise, timeoutMs) {
@@ -569,20 +512,6 @@ function boundedCacheWriteWaitMs(value) {
     : DEFAULT_UPSTREAM_CACHE_WRITE_WAIT_MS;
 }
 
-// Retained for compatibility with callers outside the inventory path. HTTP
-// status alone can never prove that a format is unsupported or empty.
-function isBenignUpstreamFormatError() {
-  return false;
-}
-
-function isWarningWorthyUpstreamFormatError() {
-  return true;
-}
-
-function isAbortError(error) {
-  return error && (error.name === "AbortError" || error.code === "ABORT_ERR");
-}
-
 function isCancelled(options = {}) {
   return Boolean(options.signal?.aborted || options.cancellationToken?.isCancellationRequested);
 }
@@ -593,15 +522,6 @@ function isCanonicalRepositoryIdentity(value) {
     && value.length <= MAX_REPOSITORY_IDENTITY_LENGTH
     && value === value.trim()
     && !/[\u0000-\u001f\u007f]/u.test(value);
-}
-
-function getActiveUpstreamsFromRepositoryState(state, format) {
-  const upstreams = state && state.groupedUpstreams instanceof Map
-    ? state.groupedUpstreams.get(format)
-    : null;
-  return Array.isArray(upstreams)
-    ? upstreams.filter(upstream => upstream && upstream.is_active !== false)
-    : [];
 }
 
 function sortUpstreams(left, right) {
@@ -955,21 +875,15 @@ class UpstreamChecker {
     this.api = options.cloudsmithAPI || new CloudsmithAPI(context);
     this.now = options.now || Date.now;
     this._cacheWriteWaitMs = boundedCacheWriteWaitMs(options.cacheWriteWaitMs);
+    this.cacheLifecycle = options.cacheLifecycle || new UpstreamCacheLifecycle(
+      context?.globalState,
+      { persistenceWaitMs: options.persistenceWaitMs }
+    );
   }
 
   _captureAccount(options = {}) {
     const account = options.account || captureAccount(this.connectionManager);
     return isAccountCurrent(this.connectionManager, account) ? account : null;
-  }
-
-  _emptyRepositoryState() {
-    return this._buildRepositoryUpstreamState(
-      new Map(),
-      [],
-      0,
-      SUPPORTED_UPSTREAM_FORMATS,
-      { cancelled: true }
-    );
   }
 
   async existsLocally(workspace, repo, name, format, options = {}) {
@@ -1065,15 +979,17 @@ class UpstreamChecker {
       return buildAggregateResult([], 0);
     }
     const cacheKey = getUpstreamCacheKey(workspace, repo, requestedFormats);
-    const globalState = this.context && this.context.globalState;
-    const operationToken = globalState && options.projection !== "privileged"
-      ? beginCacheOperation(globalState, cacheKey)
+    const cacheLifecycle = options.projection !== "privileged"
+      ? this.cacheLifecycle
+      : null;
+    const operationToken = cacheLifecycle
+      ? cacheLifecycle.begin(cacheKey)
       : null;
     try {
       const cached = options.bypassCache === true || options.projection === "privileged"
         ? null
         : getCachedFlatResponse(
-          globalState,
+          cacheLifecycle,
           cacheKey,
           workspace,
           repo,
@@ -1141,11 +1057,11 @@ class UpstreamChecker {
         !isCancelled(options)
         && options.projection !== "privileged"
         && response.complete
-        && globalState
+        && cacheLifecycle
       ) {
         await waitForOptionalCacheWrite(
           persistFlatResponse(
-            globalState,
+            cacheLifecycle,
             cacheKey,
             workspace,
             repo,
@@ -1161,7 +1077,7 @@ class UpstreamChecker {
       }
       return isAccountCurrent(this.connectionManager, account) ? response : null;
     } finally {
-      finishCacheOperation(globalState, cacheKey, operationToken);
+      cacheLifecycle?.finish(cacheKey, operationToken);
     }
   }
 
@@ -1169,37 +1085,12 @@ class UpstreamChecker {
     return this.getUpstreamDataForFormats(workspace, repo, SUPPORTED_UPSTREAM_FORMATS, options);
   }
 
-  async getAllUpstreams(workspace, repo, options = {}) {
-    const result = await this.getAllUpstreamData(workspace, repo, options);
-    if (result === null) return { data: [], error: null, aborted: true };
-    const failedFormats = Array.isArray(result.failedFormats) ? result.failedFormats : [];
-    const uninspectedFormats = Array.isArray(result.uninspectedFormats)
-      ? result.uninspectedFormats
-      : [];
-    const unavailableFormats = [...failedFormats, ...uninspectedFormats];
-    if (unavailableFormats.length > 0 && result.upstreams.length === 0) {
-      return {
-        data: [],
-        error: `Could not load upstream data for: ${unavailableFormats.join(", ")}`,
-        complete: false,
-        partial: false,
-        failedFormats,
-        uninspectedFormats,
-      };
-    }
-    return {
-      data: result.upstreams,
-      error: null,
-      complete: result.complete,
-      partial: result.partial,
-      failedFormats,
-      uninspectedFormats,
-    };
-  }
-
-  async getRepositoryUpstreamState(workspace, repo, options = {}) {
+  getRepositoryUpstreamState(workspace, repo, options = {}) {
     return this.getRepositoryUpstreamStateForFormats(
-      workspace, repo, SUPPORTED_UPSTREAM_FORMATS, options
+      workspace,
+      repo,
+      SUPPORTED_UPSTREAM_FORMATS,
+      options
     );
   }
 
@@ -1207,13 +1098,20 @@ class UpstreamChecker {
     const result = await this.getUpstreamDataForFormats(workspace, repo, formats, options);
     const requestedFormats = getSupportedUpstreamFormats(formats);
     if (result === null) {
-      return this._buildRepositoryUpstreamState(
-        new Map(),
-        [],
-        0,
-        requestedFormats,
-        { cancelled: true }
-      );
+      return {
+        groupedUpstreams: new Map(),
+        failedFormats: [],
+        uninspectedFormats: requestedFormats,
+        successfulFormats: 0,
+        upstreams: [],
+        active: 0,
+        total: 0,
+        complete: false,
+        incomplete: true,
+        partial: false,
+        cancelled: true,
+        requestCount: 0,
+      };
     }
     const grouped = new Map();
     for (const upstream of result.upstreams) {
@@ -1227,15 +1125,6 @@ class UpstreamChecker {
       ...result,
       groupedUpstreams: grouped,
     };
-  }
-
-  async getRepositoryUpstreams(workspace, repo, options = {}) {
-    return (await this.getRepositoryUpstreamState(workspace, repo, options)).upstreams;
-  }
-
-  async getActiveRepositoryUpstreamsForFormat(workspace, repo, format, options = {}) {
-    const state = await this.getRepositoryUpstreamState(workspace, repo, options);
-    return getActiveUpstreamsFromRepositoryState(state, format);
   }
 
   async previewResolution(workspace, repo, name, format, options = {}) {
@@ -1286,188 +1175,6 @@ class UpstreamChecker {
     };
   }
 
-  _getRepositoryUpstreamCacheKey(workspace, repo) {
-    const tuple = ["repository", workspace, repo];
-    return `${UPSTREAM_CACHE_KEY_PREFIX}:${encodeURIComponent(JSON.stringify(tuple))}`;
-  }
-
-  _logRepositoryUpstreamCacheError(action, workspace, repo, error) {
-    logCacheError(action, workspace, repo, error);
-  }
-
-  _evictInvalidRepositoryUpstreamCacheEntry(workspace, repo, globalState) {
-    evictCacheEntry(globalState, this._getRepositoryUpstreamCacheKey(workspace, repo), workspace, repo);
-  }
-
-  _getCachedRepositoryUpstreamState(workspace, repo, suppliedAccount = null) {
-    const account = suppliedAccount || captureAccount(this.connectionManager);
-    if (!account || !isAccountCurrent(this.connectionManager, account)) return null;
-    const globalState = this.context && this.context.globalState;
-    if (!globalState || typeof globalState.get !== "function") return null;
-    const cachedValue = globalState.get(this._getRepositoryUpstreamCacheKey(workspace, repo));
-    if (cachedValue === undefined) return null;
-    const cached = snapshotOwnDataRecord(cachedValue);
-    const groupedValue = cached ? snapshotOwnDataRecord(cached.groupedUpstreams) : null;
-    const formats = groupedValue ? Object.keys(groupedValue) : [];
-    const safeGrouped = new Map();
-    let groupedValid = groupedValue !== null;
-    for (const format of formats) {
-      const values = snapshotOwnDataArray(
-        groupedValue[format],
-        MAX_PERSISTED_UPSTREAMS_PER_FORMAT
-      );
-      const safeValues = values?.map(upstream => (
-        sanitizeSafeInventoryUpstream(upstream, format)
-      ));
-      if (!safeValues || safeValues.some(value => value === null)) {
-        groupedValid = false;
-        break;
-      }
-      safeGrouped.set(format, safeValues);
-    }
-    const valid = groupedValid && isAccountEnvelope(cached, account, [
-      "accountEpoch", "activationId", "groupedUpstreams", "successfulFormats",
-      "timestamp", "version",
-    ])
-      && isFresh(cached.timestamp, this.now())
-      && formats.every(format => SUPPORTED_UPSTREAM_FORMATS.includes(format))
-      && formats.every(format => (
-        safeGrouped.get(format).every(upstream => (
-          upstream._format === format && upstream.format === format
-        ))
-        && new Set(safeGrouped.get(format).map((upstream) => (
-          upstream.slug_perm ? `slug:${upstream.slug_perm}` : `name:${upstream.name}`
-        ))).size
-          === safeGrouped.get(format).length
-      ))
-      && formats.reduce((total, format) => (
-        total + safeGrouped.get(format).length
-      ), 0) <= MAX_PERSISTED_UPSTREAMS
-      && Number.isInteger(cached.successfulFormats)
-      && cached.successfulFormats === SUPPORTED_UPSTREAM_FORMATS.length;
-    if (!valid) {
-      this._evictInvalidRepositoryUpstreamCacheEntry(workspace, repo, globalState);
-      return null;
-    }
-    return this._buildRepositoryUpstreamState(
-      safeGrouped,
-      [],
-      cached.successfulFormats,
-      []
-    );
-  }
-
-  async _cacheRepositoryUpstreamState(workspace, repo, state, account, operationId) {
-    const globalState = this.context && this.context.globalState;
-    if (!globalState || typeof globalState.update !== "function") return;
-    const cacheKey = this._getRepositoryUpstreamCacheKey(workspace, repo);
-    const groupedUpstreams = {};
-    let persistedCount = 0;
-    for (const format of SUPPORTED_UPSTREAM_FORMATS) {
-      const upstreams = state.groupedUpstreams.get(format);
-      if (Array.isArray(upstreams) && upstreams.length > 0) {
-        const serialized = serializeUpstreamArray(
-          upstreams,
-          MAX_PERSISTED_UPSTREAMS_PER_FORMAT
-        );
-        if (!serialized || persistedCount + serialized.length > MAX_PERSISTED_UPSTREAMS) return;
-        groupedUpstreams[format] = serialized;
-        persistedCount += serialized.length;
-      }
-    }
-    await queueCacheWrite(globalState, cacheKey, async () => {
-      if (
-        !isAccountCurrent(this.connectionManager, account)
-        || !isCacheOperationCurrent(globalState, cacheKey, operationId)
-      ) return;
-      try {
-        await globalState.update(cacheKey, {
-          version: UPSTREAM_CACHE_SCHEMA_VERSION,
-          activationId: account.activationId,
-          accountEpoch: account.accountEpoch,
-          timestamp: this.now(),
-          successfulFormats: state.successfulFormats,
-          groupedUpstreams,
-        });
-      } catch (error) {
-        this._logRepositoryUpstreamCacheError("persist", workspace, repo, error);
-      }
-    });
-  }
-
-  async _fetchRepositoryUpstreamState(workspace, repo, options = {}) {
-    return this.getRepositoryUpstreamStateForFormats(
-      workspace,
-      repo,
-      SUPPORTED_UPSTREAM_FORMATS,
-      options
-    );
-  }
-
-  _buildRepositoryUpstreamState(
-    groupedUpstreams,
-    failedFormats,
-    successfulFormats,
-    uninspectedFormats = [],
-    options = {}
-  ) {
-    const normalizedGrouped = new Map();
-    const upstreams = [];
-    let active = 0;
-    for (const format of SUPPORTED_UPSTREAM_FORMATS) {
-      const values = Array.isArray(groupedUpstreams.get(format))
-        ? groupedUpstreams.get(format).slice().sort(sortUpstreams)
-        : [];
-      if (values.length === 0) continue;
-      const tagged = values.map(upstream => ({
-        ...upstream,
-        format: typeof upstream.format === "string" && upstream.format ? upstream.format : format,
-      }));
-      normalizedGrouped.set(format, tagged);
-      upstreams.push(...tagged);
-      active += tagged.filter(upstream => upstream.is_active !== false).length;
-    }
-    const normalizedFailedFormats = [...new Set(Array.isArray(failedFormats) ? failedFormats : [])];
-    const normalizedUninspectedFormats = [
-      ...new Set(Array.isArray(uninspectedFormats) ? uninspectedFormats : []),
-    ];
-    const complete = normalizedFailedFormats.length === 0 && normalizedUninspectedFormats.length === 0;
-    return {
-      groupedUpstreams: normalizedGrouped,
-      failedFormats: normalizedFailedFormats,
-      uninspectedFormats: normalizedUninspectedFormats,
-      successfulFormats,
-      upstreams,
-      active,
-      total: upstreams.length,
-      complete,
-      incomplete: !complete,
-      partial: !complete && successfulFormats > 0,
-      cancelled: options.cancelled === true,
-      requestCount: Number.isSafeInteger(options.requestCount) ? options.requestCount : 0,
-    };
-  }
-
-  _deserializeGroupedUpstreams(groupedUpstreams) {
-    const grouped = new Map();
-    for (const format of SUPPORTED_UPSTREAM_FORMATS) {
-      if (Array.isArray(groupedUpstreams[format])) {
-        const upstreams = groupedUpstreams[format]
-          .map(upstream => sanitizeSafeInventoryUpstream(upstream, format))
-          .filter(Boolean);
-        grouped.set(format, upstreams);
-      }
-    }
-    return grouped;
-  }
-
-  _isAbortError(error) {
-    return isAbortError(error);
-  }
-
-  _isWarningWorthyFormatError(error) {
-    return isWarningWorthyUpstreamFormatError(error);
-  }
 }
 
 function isLocalPackageArray(value, workspace, repository) {
@@ -1510,33 +1217,8 @@ function incompleteLocalPackageError() {
   });
 }
 
-async function getAllUpstreamData(context, workspace, repo, options = {}) {
-  const checker = new UpstreamChecker(context, options);
-  return checker.getAllUpstreamData(workspace, repo, options);
-}
-
-async function getUpstreamDataForFormats(context, workspace, repo, formats, options = {}) {
-  const checker = new UpstreamChecker(context, options);
-  return checker.getUpstreamDataForFormats(workspace, repo, formats, options);
-}
-
 module.exports = {
-  cacheErrorMessage,
-  getAllUpstreamData,
-  getUpstreamDataForFormats,
-  getActiveUpstreamsFromRepositoryState,
-  getActiveUpstreamCacheOperationCount,
-  isBenignUpstreamFormatError,
   isSafeInventoryUpstream,
   sanitizeSafeInventoryUpstream,
-  getUpstreamCacheKey,
-  MAX_PERSISTED_UPSTREAMS,
-  MAX_RUNTIME_UPSTREAMS_PER_FORMAT,
-  PERSISTED_UPSTREAM_KEYS,
-  SUPPORTED_UPSTREAM_FORMATS,
   UpstreamChecker,
-  UPSTREAM_CACHE_SCHEMA_VERSION,
-  UPSTREAM_FETCH_BATCH_SIZE,
-  UPSTREAM_REQUEST_CONCURRENCY,
-  UPSTREAM_CACHE_TTL_MS,
 };

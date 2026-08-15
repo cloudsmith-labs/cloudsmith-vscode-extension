@@ -1,8 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const { canonicalFormat, normalizePackageName } = require("./packageNameNormalizer");
 const { getUpstreamFormatDescriptor, normalizeUpstreamFormat } = require("./upstreamFormats");
-const { UpstreamChecker } = require("./upstreamChecker");
-const { UpstreamOperationScheduler } = require("./upstreamOperationScheduler");
+const { sanitizeSafeInventoryUpstream } = require("./upstreamChecker");
 
 const UPSTREAM_REPO_CONCURRENCY = 4;
 
@@ -145,12 +144,10 @@ function applyGapPatch(dependencies, patchMap) {
 async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositories, options = {}) {
   const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
   const cancellationToken = options.cancellationToken || null;
-  const upstreamChecker = options.upstreamChecker || new UpstreamChecker(options.context);
   const repositoriesToInspect = Array.isArray(repositories)
     ? [...new Set(repositories.map((repo) => String(repo || "").trim()).filter(Boolean))]
     : [];
   const repositoriesComplete = options.repositoriesComplete !== false;
-  const scheduler = options.scheduler || new UpstreamOperationScheduler();
   const formatsToInspect = [...new Set((Array.isArray(uncoveredDependencies)
     ? uncoveredDependencies
     : []).map(dependency => normalizeUpstreamFormat(canonicalFormat(
@@ -170,78 +167,132 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
     return applyGapPatch(uncoveredDependencies, emptyPatch);
   }
 
+  const upstreamRuntime = options.upstreamRuntime;
+  if (
+    !upstreamRuntime
+    || typeof upstreamRuntime.getRepositoryUpstreamStateForFormats !== "function"
+    || typeof upstreamRuntime.createOperationScope !== "function"
+  ) {
+    throw new TypeError("Upstream gap analysis requires a safe upstream runtime facade.");
+  }
+  const operationScope = upstreamRuntime.createOperationScope({
+    kind: "gap-analysis",
+    account: options.account,
+    cancellationToken,
+    scheduler: options.scheduler,
+    workspace,
+    formats: formatsToInspect,
+  });
+
   const repoUpstreamStates = new Map();
   let completed = 0;
 
-  await runPromisePool(repositoriesToInspect, UPSTREAM_REPO_CONCURRENCY, async (repo) => {
-    if (isCancelled(cancellationToken) || scheduler.stopped) return false;
+  try {
+    await runPromisePool(repositoriesToInspect, UPSTREAM_REPO_CONCURRENCY, async (repo) => {
+      if (
+        isCancelled(cancellationToken)
+        || operationScope.signal?.aborted
+        || operationScope.scheduler?.stopped
+      ) return false;
 
-    let state;
-    try {
-      const requestOptions = {
-        cancellationToken,
-        scheduler,
-        operationTimeoutMs: options.operationTimeoutMs,
-      };
-      state = typeof upstreamChecker.getRepositoryUpstreamStateForFormats === "function"
-        ? await upstreamChecker.getRepositoryUpstreamStateForFormats(
+      let state;
+      try {
+        state = await upstreamRuntime.getRepositoryUpstreamStateForFormats(
           workspace,
           repo,
           formatsToInspect,
-          requestOptions
-        )
-        : await upstreamChecker.getRepositoryUpstreamState(workspace, repo, requestOptions);
-    } catch {
-      state = null;
-    }
-    if (cancellationToken && cancellationToken.isCancellationRequested) {
-      return false;
-    }
-    repoUpstreamStates.set(repo, {
-      repo,
-      groupedUpstreams: state && state.groupedUpstreams instanceof Map
-        ? state.groupedUpstreams
-        : new Map(),
-      complete: state?.complete === true,
-      failedFormats: Array.isArray(state?.failedFormats) ? state.failedFormats : [],
-      uninspectedFormats: Array.isArray(state?.uninspectedFormats)
-        ? state.uninspectedFormats
-        : [],
-      unsupportedFormats: Array.isArray(state?.unsupportedFormats)
-        ? state.unsupportedFormats
-        : [],
+          {
+            account: options.account,
+            operationScope,
+            operationTimeoutMs: options.operationTimeoutMs,
+          }
+        );
+      } catch {
+        state = null;
+      }
+      if (
+        isCancelled(cancellationToken)
+        || operationScope.signal?.aborted
+        || operationScope.scheduler?.stopped
+      ) return false;
+      const safeState = snapshotSafeRepositoryState(state, formatsToInspect);
+      repoUpstreamStates.set(repo, {
+        repo,
+        ...safeState,
+      });
+
+      completed += 1;
+      if (onProgress) {
+        publishProgress(onProgress, new Map(), {
+          completed,
+          total: repositoriesToInspect.length,
+          workspace,
+          stage: "upstream",
+        });
+      }
+      return true;
     });
 
-    completed += 1;
-    if (onProgress) {
-      publishProgress(onProgress, new Map(), {
+    const snapshots = repositoriesToInspect
+      .filter((repo) => repoUpstreamStates.has(repo))
+      .map((repo) => repoUpstreamStates.get(repo));
+
+    const patchMap = buildGapPatch(uncoveredDependencies, snapshots, {
+      repositoriesComplete: repositoriesComplete
+        && snapshots.length === repositoriesToInspect.length
+        && !isCancelled(cancellationToken)
+        && !operationScope.signal?.aborted,
+    });
+    if (onProgress && patchMap.size > 0) {
+      publishProgress(onProgress, new Map(patchMap), {
         completed,
         total: repositoriesToInspect.length,
         workspace,
         stage: "upstream",
       });
     }
-    return true;
-  });
-
-  const snapshots = repositoriesToInspect
-    .filter((repo) => repoUpstreamStates.has(repo))
-    .map((repo) => repoUpstreamStates.get(repo));
-
-  const patchMap = buildGapPatch(uncoveredDependencies, snapshots, {
-    repositoriesComplete: repositoriesComplete
-      && snapshots.length === repositoriesToInspect.length
-      && !isCancelled(cancellationToken),
-  });
-  if (onProgress && patchMap.size > 0) {
-    publishProgress(onProgress, new Map(patchMap), {
-      completed,
-      total: repositoriesToInspect.length,
-      workspace,
-      stage: "upstream",
-    });
+    return applyGapPatch(uncoveredDependencies, patchMap);
+  } finally {
+    operationScope.dispose();
   }
-  return applyGapPatch(uncoveredDependencies, patchMap);
+}
+
+function snapshotSafeRepositoryState(state, requestedFormats) {
+  const groupedUpstreams = new Map();
+  let safe = Boolean(state && state.groupedUpstreams instanceof Map);
+  for (const format of requestedFormats) {
+    const candidates = state?.groupedUpstreams instanceof Map
+      ? state.groupedUpstreams.get(format)
+      : null;
+    if (candidates === undefined) continue;
+    if (!Array.isArray(candidates)) {
+      safe = false;
+      continue;
+    }
+    const upstreams = candidates.map(candidate => sanitizeSafeInventoryUpstream(candidate, format));
+    if (upstreams.some(upstream => upstream === null)) {
+      safe = false;
+      continue;
+    }
+    groupedUpstreams.set(format, Object.freeze(upstreams));
+  }
+  const uninspectedFormats = Array.isArray(state?.uninspectedFormats)
+    ? [...state.uninspectedFormats]
+    : [];
+  if (!safe) {
+    for (const format of requestedFormats) {
+      if (!uninspectedFormats.includes(format)) uninspectedFormats.push(format);
+    }
+  }
+  return {
+    groupedUpstreams,
+    complete: safe && state?.complete === true,
+    failedFormats: Array.isArray(state?.failedFormats) ? [...state.failedFormats] : [],
+    uninspectedFormats,
+    unsupportedFormats: Array.isArray(state?.unsupportedFormats)
+      ? [...state.unsupportedFormats]
+      : [],
+  };
 }
 
 function isCancelled(cancellationToken) {

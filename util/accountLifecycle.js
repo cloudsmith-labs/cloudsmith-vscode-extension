@@ -87,20 +87,6 @@ function createAuthenticationResultHandler(deps) {
   };
 }
 
-async function evictPersistedUpstreamCaches(context) {
-  const keys = typeof context?.globalState?.keys === "function"
-    ? context.globalState.keys().filter(key => key.startsWith("cloudsmith-upstreams:"))
-    : [];
-  const results = await Promise.allSettled(
-    keys.map(key => context.globalState.update(key, undefined))
-  );
-  const complete = results.every(result => result.status === "fulfilled");
-  if (!complete) {
-    console.warn("[Cloudsmith] Some stale account cache entries could not be evicted.");
-  }
-  return complete;
-}
-
 function beginAccountScopedStateReset(options = {}) {
   const invalidators = [
     () => options.workspaceCache?.clear?.(),
@@ -130,7 +116,6 @@ async function completeAccountScopedStateReset(context, options, reset) {
   const invalidators = [
     () => options.dependencyHealthProvider?.resetForAccountChange?.(options.accountState),
     () => options.projectHasMultipleWorkspaces?.(false),
-    () => (options.evictPersistedUpstreamCaches || evictPersistedUpstreamCaches)(context),
   ];
   const pending = invalidators.map(invalidate => {
     try {
@@ -155,5 +140,4 @@ module.exports = {
   beginAccountScopedStateReset,
   completeAccountScopedStateReset,
   createAuthenticationResultHandler,
-  evictPersistedUpstreamCaches,
 };

@@ -3,7 +3,6 @@ const {
   beginAccountScopedStateReset,
   completeAccountScopedStateReset,
   createAuthenticationResultHandler,
-  evictPersistedUpstreamCaches,
 } = require("../util/accountLifecycle");
 const {
   executeSearchIntent,
@@ -26,7 +25,7 @@ function deferred() {
 }
 
 suite("search intent command boundary", () => {
-  test("account reset invalidates every cache before independently settled projections", async () => {
+  test("account reset invalidates UI state before independently settled projections", async () => {
     const order = [];
     const cleared = new Set();
     const clear = name => () => {
@@ -55,10 +54,6 @@ suite("search intent command boundary", () => {
         order.push(`projection:${value}`);
         throw new Error("setContext failed");
       },
-      async evictPersistedUpstreamCaches() {
-        order.push("upstream");
-        cleared.add("upstream");
-      },
     });
 
     assert.deepStrictEqual(order.slice(0, 10), [
@@ -78,7 +73,6 @@ suite("search intent command boundary", () => {
       "quarantine-panel",
       "recent",
       "search",
-      "upstream",
       "upstream-detail-panel",
       "upstream-preview-panel",
       "vulnerability",
@@ -86,11 +80,10 @@ suite("search intent command boundary", () => {
       "vulnerability-state",
       "workspace",
     ]);
-    assert.deepStrictEqual(order.slice(10), ["dependency", "projection:false", "upstream"]);
+    assert.deepStrictEqual(order.slice(10), ["dependency", "projection:false"]);
     assert.deepStrictEqual(outcome.asyncResults.map(result => result.status), [
       "rejected",
       "rejected",
-      "fulfilled",
     ]);
   });
 
@@ -113,9 +106,6 @@ suite("search intent command boundary", () => {
       async projectHasMultipleWorkspaces() {
         order.push("workspace-context");
       },
-      async evictPersistedUpstreamCaches() {
-        order.push("persisted-cache");
-      },
       cloudsmithProvider: {
         completeAccountReset(state) {
           assert.strictEqual(state, accountState);
@@ -132,26 +122,6 @@ suite("search intent command boundary", () => {
     assert.ok(order.indexOf("workspace-clear") < order.indexOf("cloudsmith-refresh"));
     assert.ok(order.indexOf("dependency-complete") < order.indexOf("cloudsmith-refresh"));
     assert.ok(order.indexOf("workspace-context") < order.indexOf("cloudsmith-refresh"));
-    assert.ok(order.indexOf("persisted-cache") < order.indexOf("cloudsmith-refresh"));
-  });
-
-  test("evicts persisted upstream state before account availability is known", async () => {
-    const store = new Map([
-      ["cloudsmith-upstreams:v3:stale", { version: 3 }],
-      ["unrelated", { keep: true }],
-    ]);
-    const complete = await evictPersistedUpstreamCaches({
-      globalState: {
-        keys: () => [...store.keys()],
-        async update(key, value) {
-          if (value === undefined) store.delete(key);
-        },
-      },
-    });
-
-    assert.strictEqual(complete, true);
-    assert.strictEqual(store.has("cloudsmith-upstreams:v3:stale"), false);
-    assert.strictEqual(store.has("unrelated"), true);
   });
 
   test("authentication default offer cannot mutate settings after its account turns stale", async () => {

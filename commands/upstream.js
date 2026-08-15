@@ -18,22 +18,58 @@ function registerUpstreamCommands(deps) {
     upstreamPreviewProvider,
     CloudsmithAPI,
     apiEndpoint,
-    fetchRepositoryUpstreams,
+    upstreamPreview,
+    upstreamExport,
     generateTerraformConfig,
-    UpstreamChecker,
     FORMAT_OPTIONS,
     packageAdapters,
     packageDomain,
   } = deps;
+  if (!upstreamPreview || typeof upstreamPreview.previewResolution !== "function") {
+    throw new TypeError("Upstream commands require an upstream preview facade.");
+  }
+  if (
+    !upstreamExport
+    || typeof upstreamExport.getPrivilegedRepositoryUpstreamsForExport !== "function"
+  ) {
+    throw new TypeError("Upstream commands require an upstream export facade.");
+  }
   let exportAbortController = null;
+  let previewOperation = null;
+  let previewOperationId = 0;
   const cancellation = Object.freeze({
     dispose() {
       if (exportAbortController) {
         exportAbortController.abort();
         exportAbortController = null;
       }
+      if (previewOperation) {
+        previewOperation.controller.abort();
+        previewOperation = null;
+      }
+      previewOperationId += 1;
     },
   });
+
+  function beginPreviewOperation(account) {
+    previewOperation?.controller.abort();
+    const operation = Object.freeze({
+      id: ++previewOperationId,
+      account,
+      controller: new AbortController(),
+    });
+    previewOperation = operation;
+    return operation;
+  }
+
+  function isPreviewCurrent(operation) {
+    return Boolean(
+      previewOperation === operation
+      && operation.id === previewOperationId
+      && !operation.controller.signal.aborted
+      && operation.account.isCurrent()
+    );
+  }
 
   async function inspectUpstreams(item) {
     const account = captureCommandAccount(deps.workspaceAccess);
@@ -49,7 +85,8 @@ function registerUpstreamCommands(deps) {
     await upstreamDetailProvider.show(
       repository.workspace,
       repository.repository,
-      repository.name
+      repository.name,
+      { account: account.account }
     );
   }
 
@@ -95,13 +132,19 @@ function registerUpstreamCommands(deps) {
       return;
     }
 
-    if (!account.isCurrent()) return;
+    if (!account.isCurrent()) {
+      abortController.abort();
+      if (exportAbortController === abortController) exportAbortController = null;
+      return;
+    }
     await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
       title: "Generating Terraform configuration...",
       cancellable: true,
     }, async (_progress, token) => {
-      const subscription = token.onCancellationRequested(() => abortController.abort());
+      const subscription = typeof token?.onCancellationRequested === "function"
+        ? token.onCancellationRequested(() => abortController.abort())
+        : { dispose() {} };
       try {
         const [repoResult, retentionResult, upstreamResult] = await Promise.all([
           cloudsmithAPI.get(repoEndpoint, {
@@ -116,11 +159,10 @@ function registerUpstreamCommands(deps) {
             retry: "safe-read",
             signal: abortController.signal,
           }),
-          fetchRepositoryUpstreams(
-            context,
+          upstreamExport.getPrivilegedRepositoryUpstreamsForExport(
             repository.workspace,
             repository.repository,
-            { signal: abortController.signal }
+            { account: account.account, signal: abortController.signal }
           ),
         ]);
         if (!account.isCurrent()) {
@@ -177,98 +219,114 @@ function registerUpstreamCommands(deps) {
   async function previewUpstreamResolution(item) {
     const account = captureCommandAccount(deps.workspaceAccess);
     if (!account) return;
-    let packageName;
-    let packageFormat;
-    if (
-      item
-      && typeof item.name === "string"
-      && item.name
-      && typeof item.format === "string"
-      && item.format
-    ) {
-      packageName = item.name;
-      packageFormat = item.format;
-    } else {
-      packageName = await vscode.window.showInputBox({
-        placeHolder: "flask",
-        prompt: "Enter the package name",
-      });
-      if (!account.isCurrent()) return;
-      if (!packageName) return;
-      const formatPick = await vscode.window.showQuickPick(
-        FORMAT_OPTIONS.map(format => ({ label: format })),
-        { placeHolder: "Select a package format" }
-      );
-      if (!account.isCurrent()) return;
-      if (!formatPick) return;
-      packageFormat = formatPick.label;
-    }
+    const operation = beginPreviewOperation(account);
+    try {
+      let packageName;
+      let packageFormat;
+      if (
+        item
+        && typeof item.name === "string"
+        && item.name
+        && typeof item.format === "string"
+        && item.format
+      ) {
+        packageName = item.name;
+        packageFormat = item.format;
+      } else {
+        packageName = await vscode.window.showInputBox({
+          placeHolder: "flask",
+          prompt: "Enter the package name",
+        });
+        if (!isPreviewCurrent(operation)) return;
+        if (!packageName) return;
+        const formatPick = await vscode.window.showQuickPick(
+          FORMAT_OPTIONS.map(format => ({ label: format })),
+          { placeHolder: "Select a package format" }
+        );
+        if (!isPreviewCurrent(operation)) return;
+        if (!formatPick) return;
+        packageFormat = formatPick.label;
+      }
 
-    let workspace = getDefaultWorkspace(vscode);
-    if (!workspace) {
-      const workspaces = await getWorkspaces(deps.workspaceAccess);
-      if (!account.isCurrent()) return;
-      if (!workspaces) return;
-      if (workspaces.items.length === 0) {
-        if (workspaces.complete) vscode.window.showErrorMessage("No workspaces found.");
+      let workspace = getDefaultWorkspace(vscode);
+      if (!workspace) {
+        const workspaces = await getWorkspaces(deps.workspaceAccess);
+        if (!isPreviewCurrent(operation)) return;
+        if (!workspaces) return;
+        if (workspaces.items.length === 0) {
+          if (workspaces.complete) vscode.window.showErrorMessage("No workspaces found.");
+          return;
+        }
+        const selected = await vscode.window.showQuickPick(
+          collectionQuickPickItems(
+            vscode,
+            workspaces,
+            entry => ({ label: entry.name, description: entry.slug }),
+            "Workspace list incomplete"
+          ),
+          { placeHolder: "Select a workspace" }
+        );
+        if (!isPreviewCurrent(operation)) return;
+        if (!selected) return;
+        workspace = selected.description;
+      }
+      const repositories = await getWorkspaceRepositories(deps.workspaceAccess, workspace);
+      if (!isPreviewCurrent(operation)) return;
+      if (!repositories) return;
+      if (repositories.items.length === 0) {
+        if (repositories.complete) vscode.window.showErrorMessage("No repositories found.");
         return;
       }
-      const selected = await vscode.window.showQuickPick(
+      const selectedRepo = await vscode.window.showQuickPick(
         collectionQuickPickItems(
           vscode,
-          workspaces,
+          repositories,
           entry => ({ label: entry.name, description: entry.slug }),
-          "Workspace list incomplete"
+          "Repository list incomplete"
         ),
-        { placeHolder: "Select a workspace" }
+        { placeHolder: "Select target repository" }
       );
-      if (!account.isCurrent()) return;
-      if (!selected) return;
-      workspace = selected.description;
-    }
-    const repositories = await getWorkspaceRepositories(deps.workspaceAccess, workspace);
-    if (!account.isCurrent()) return;
-    if (!repositories) return;
-    if (repositories.items.length === 0) {
-      if (repositories.complete) vscode.window.showErrorMessage("No repositories found.");
-      return;
-    }
-    const selectedRepo = await vscode.window.showQuickPick(
-      collectionQuickPickItems(
-        vscode,
-        repositories,
-        entry => ({ label: entry.name, description: entry.slug }),
-        "Repository list incomplete"
-      ),
-      { placeHolder: "Select target repository" }
-    );
-    if (!account.isCurrent()) return;
-    if (!selectedRepo) return;
-    let resolution;
-    try {
-      resolution = packageDomain.createPackageResolutionInput({
-        workspace,
-        repository: selectedRepo.description,
-        name: packageName,
-        format: packageFormat,
+      if (!isPreviewCurrent(operation)) return;
+      if (!selectedRepo) return;
+      let resolution;
+      try {
+        resolution = packageDomain.createPackageResolutionInput({
+          workspace,
+          repository: selectedRepo.description,
+          name: packageName,
+          format: packageFormat,
+        });
+      } catch {
+        vscode.window.showWarningMessage("Could not determine package details.");
+        return;
+      }
+      if (!isPreviewCurrent(operation)) return;
+      const result = await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: "Checking upstream resolution...",
+        cancellable: true,
+      }, async (_progress, token) => {
+        const subscription = typeof token?.onCancellationRequested === "function"
+          ? token.onCancellationRequested(() => operation.controller.abort())
+          : { dispose() {} };
+        try {
+          return await upstreamPreview.previewResolution(
+            resolution.workspace,
+            resolution.repository,
+            resolution.name,
+            resolution.format,
+            { account: account.account, signal: operation.controller.signal }
+          );
+        } finally {
+          subscription.dispose();
+        }
       });
-    } catch {
-      vscode.window.showWarningMessage("Could not determine package details.");
-      return;
+      if (!isPreviewCurrent(operation)) return;
+      if (result) upstreamPreviewProvider.show(result);
+    } finally {
+      operation.controller.abort();
+      if (previewOperation === operation) previewOperation = null;
     }
-    const checker = new UpstreamChecker(context);
-    if (!account.isCurrent()) return;
-    const result = await vscode.window.withProgress({
-      location: vscode.ProgressLocation.Notification,
-      title: "Checking upstream resolution...",
-    }, () => checker.previewResolution(
-      resolution.workspace,
-      resolution.repository,
-      resolution.name,
-      resolution.format
-    ));
-    if (!account.isCurrent()) return;
-    if (result) upstreamPreviewProvider.show(result);
   }
 
   let commands;

@@ -22,7 +22,7 @@ class UpstreamPreviewProvider {
 
   /**
    * Show the upstream preview panel for a resolution result.
-   * @param {Object} result - Output from UpstreamChecker.previewResolution()
+   * @param {Object} result - Output from the upstream preview runtime facade.
    */
   show(result) {
     if (!result || typeof result !== "object") return;
