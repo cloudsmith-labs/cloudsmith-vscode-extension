@@ -871,6 +871,34 @@ suite("UpstreamChecker shared helper and format handling", () => {
     assert.strictEqual(proxyReads, 0);
   });
 
+  test("validates canonical embedded formats without inventing an expected-format hint", () => {
+    const canonical = {
+      name: "npmjs",
+      _format: "npm",
+      format: "npm",
+      origin: "https://registry.npmjs.org",
+    };
+
+    assert.deepStrictEqual(
+      sanitizeSafeInventoryUpstream(canonical),
+      canonical
+    );
+    for (const candidate of [
+      { name: "mixed", _format: "npm", format: "python", origin: "" },
+      { name: "mixed", _format: "python", format: "npm", origin: "" },
+      { name: "missing internal format", format: "npm", origin: "" },
+      { name: "missing public format", _format: "npm", origin: "" },
+      { name: "unsupported", _format: "terraform", format: "terraform", origin: "" },
+      { name: "unknown", _format: "not-a-format", format: "not-a-format", origin: "" },
+    ]) {
+      assert.strictEqual(sanitizeSafeInventoryUpstream(candidate), null, candidate.name);
+    }
+    assert.strictEqual(
+      sanitizeSafeInventoryUpstream({ ...canonical, origin: "" }, "python"),
+      null
+    );
+  });
+
   test("rejects inherited, accessor, and format-conflicting API upstream records", async () => {
     const inherited = Object.create({
       name: "Inherited",

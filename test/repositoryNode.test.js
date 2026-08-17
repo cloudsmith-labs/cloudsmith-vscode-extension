@@ -219,6 +219,92 @@ suite("RepositoryNode Test Suite", () => {
     assert.deepStrictEqual(state.upstreams, []);
   });
 
+  test("rejects embedded format disagreement without deriving a hint from the record", async () => {
+    const mismatched = {
+      name: "mixed",
+      _format: "npm",
+      format: "python",
+      origin: "",
+      is_active: true,
+    };
+    const repositoryNode = new RepositoryNodeImplementation(
+      { slug: "repo", slug_perm: "repo", name: "Repo" },
+      "acme",
+      context,
+      {
+        connectionManager,
+        upstreamInventory: {
+          async getAllUpstreamData() {
+            return completeUpstreamState([mismatched]);
+          },
+        },
+      }
+    );
+    repositoryNode.getPackages = async () => [];
+    repositoryNode._packageState = { ...repositoryNode._packageState, pageCount: 1 };
+
+    const state = await repositoryNode.getUpstreamState();
+    assert.strictEqual(state.complete, false);
+    assert.deepStrictEqual(state.upstreams, []);
+
+    const children = await repositoryNode.getChildren();
+    const indicator = children.find(child => child instanceof UpstreamIndicatorNode);
+    assert.ok(indicator);
+    assert.deepStrictEqual(indicator.upstreams, []);
+    assert.strictEqual(indicator.getTreeItem().label.includes("configured"), false);
+  });
+
+  test("does not execute raw format accessors or Proxy traps before sanitization", async () => {
+    let accessorReads = 0;
+    const accessor = {
+      name: "accessor",
+      format: "npm",
+      origin: "",
+    };
+    Object.defineProperty(accessor, "_format", {
+      enumerable: true,
+      get() {
+        accessorReads += 1;
+        return "npm";
+      },
+    });
+
+    let proxyReads = 0;
+    const proxy = new Proxy({
+      name: "proxy",
+      _format: "npm",
+      format: "npm",
+      origin: "",
+    }, {
+      get(target, property, receiver) {
+        proxyReads += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    for (const candidate of [accessor, proxy]) {
+      const repositoryNode = new RepositoryNodeImplementation(
+        { slug: "repo", slug_perm: "repo", name: "Repo" },
+        "acme",
+        context,
+        {
+          connectionManager,
+          upstreamInventory: {
+            async getAllUpstreamData() {
+              return completeUpstreamState([candidate]);
+            },
+          },
+        }
+      );
+      const state = await repositoryNode.getUpstreamState();
+      assert.strictEqual(state.complete, false);
+      assert.deepStrictEqual(state.upstreams, []);
+    }
+
+    assert.strictEqual(accessorReads, 0);
+    assert.strictEqual(proxyReads, 0);
+  });
+
   teardown(() => {
     vscode.workspace.getConfiguration = originalGetConfiguration;
     CloudsmithAPI.prototype.get = originalApiGet;
@@ -287,6 +373,10 @@ suite("RepositoryNode Test Suite", () => {
     assert.strictEqual(targetedCalls.length, 0);
     assert.ok(children[0] instanceof UpstreamIndicatorNode);
     assert.strictEqual(children[0].upstreams.length, 6);
+    assert.deepStrictEqual(
+      new Set(children[0].upstreams.map(upstream => upstream.format)),
+      new Set(["docker", "python", "ruby", "maven", "nuget", "npm"])
+    );
     assert.strictEqual(children[0].getTreeItem().label, "Upstreams: 5 active of 6 configured");
 
   });

@@ -904,7 +904,7 @@ function mergeRetryState(previous, replacement, retriedFormats) {
 function snapshotAggregateContract(value) {
   const root = snapshotOwnDataRecord(value);
   if (!root) return null;
-  const upstreams = snapshotOwnDataArray(root.upstreams, MAX_VALIDATED_UPSTREAMS);
+  const rawUpstreams = snapshotOwnDataArray(root.upstreams, MAX_VALIDATED_UPSTREAMS);
   const failedFormats = snapshotOwnDataArray(root.failedFormats, SUPPORTED_UPSTREAM_FORMATS.length);
   const uninspectedFormats = snapshotOwnDataArray(
     root.uninspectedFormats, SUPPORTED_UPSTREAM_FORMATS.length
@@ -914,8 +914,11 @@ function snapshotAggregateContract(value) {
   );
   const rawFailures = snapshotOwnDataArray(root.failures, INSPECTABLE_UPSTREAM_FORMATS.length);
   const rawOutcomes = snapshotOwnDataArray(root.outcomes, SUPPORTED_UPSTREAM_FORMATS.length);
-  if (!upstreams || !failedFormats || !uninspectedFormats || !unsupportedFormats
+  if (!rawUpstreams || !failedFormats || !uninspectedFormats || !unsupportedFormats
     || !rawFailures || !rawOutcomes) return null;
+
+  const upstreams = rawUpstreams.map(upstream => sanitizeSafeInventoryUpstream(upstream));
+  if (upstreams.some(upstream => upstream === null)) return null;
 
   const failures = [];
   for (const value of rawFailures) {
@@ -948,7 +951,7 @@ function snapshotAggregateContract(value) {
   }
   return Object.freeze({
     ...root,
-    upstreams,
+    upstreams: Object.freeze(upstreams),
     failedFormats,
     uninspectedFormats,
     unsupportedFormats,

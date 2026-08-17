@@ -800,6 +800,37 @@ suite("UpstreamDetailProvider Test Suite", () => {
     assert.strictEqual(outcomeReads, 0);
   });
 
+  test("rejects hostile flat aggregate entries without executing Proxy traps", async () => {
+    const source = aggregate({
+      requestedFormats: ["python"],
+      upstreams: [{
+        name: "PyPI",
+        _format: "python",
+        format: "python",
+        origin: "https://pypi.org",
+      }],
+      successfulFormats: 1,
+      configuredTotal: 1,
+      complete: true,
+      state: "complete",
+    });
+    let reads = 0;
+    source.upstreams[0] = new Proxy({ ...source.upstreams[0] }, {
+      get(target, property, receiver) {
+        reads += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const provider = new UpstreamDetailProvider({}, { loadUpstreams: async () => source });
+
+    const result = await provider._fetchGroupedUpstreams(
+      "acme", "repo", new AbortController().signal, { formats: ["python"] }
+    );
+
+    assert.strictEqual(result.state, "failed");
+    assert.strictEqual(reads, 0);
+  });
+
   test("renders a real producer aggregate with a redacted origin without losing the card", async () => {
     const endpoints = [];
     const connectionManager = {
