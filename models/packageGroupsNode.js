@@ -42,7 +42,7 @@ class PackageGroupsNode {
     const PackageDetailsNodes = [];
     if (pkgDetails) {
       for (const id of pkgDetails) {
-        const packageDetailsNodeInst = new PackageDetailsNode(id, this.context);
+        const packageDetailsNodeInst = new PackageDetailsNode(id, this.context, this);
         PackageDetailsNodes.push(packageDetailsNodeInst);
       }
     }

@@ -1,6 +1,11 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const assert = require("assert");
 const { captureAccount, isAccountCurrent } = require("../util/accountOperation");
+const {
+  inheritSelection,
+  isSelectionCurrent,
+  markSelection,
+} = require("../util/selectionProvenance");
 
 suite("account operation boundary", () => {
   function manager(initial) {
@@ -65,5 +70,24 @@ suite("account operation boundary", () => {
     ]) {
       assert.strictEqual(captureAccount({ getState: () => state }), null);
     }
+  });
+
+  test("selection provenance fails closed and expires across account changes", () => {
+    const connectionManager = manager({
+      activationId: "activation-a",
+      accountEpoch: 1,
+      sessionConnected: true,
+      status: "connected",
+    });
+    const owner = markSelection({}, connectionManager);
+    const child = inheritSelection({}, owner);
+
+    assert.strictEqual(isSelectionCurrent(owner), true);
+    assert.strictEqual(isSelectionCurrent(child), true);
+    assert.strictEqual(isSelectionCurrent({}), false);
+
+    connectionManager.update({ activationId: "activation-b", accountEpoch: 2 });
+    assert.strictEqual(isSelectionCurrent(owner), false);
+    assert.strictEqual(isSelectionCurrent(child), false);
   });
 });

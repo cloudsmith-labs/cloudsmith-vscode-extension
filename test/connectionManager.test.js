@@ -919,25 +919,78 @@ suite("ConnectionManager Test Suite", () => {
   });
 
   test("context projection retries and reports partial success without changing authority", async () => {
-    let attempts = 0;
+    const projections = [];
     const secrets = new FakeSecretStorage({}, { primaryKey: AUTH_TOKEN_KEY });
     const manager = new ConnectionManager({ secrets }, {
       activationId: "projection-test",
       createCloudsmithAPI: () => ({ get: async () => apiSuccess({ authenticated: true }) }),
-      executeCommand: async () => {
-        attempts += 1;
+      executeCommand: async (...args) => {
+        projections.push(args);
         throw new Error("projection unavailable");
       },
     });
     await manager.initialize();
-    attempts = 0;
+    projections.length = 0;
 
     const result = await manager.replaceCredential("new-key");
 
     assert.strictEqual(result.ok, true);
     assert.strictEqual(result.partial, true);
-    assert.strictEqual(attempts, 2);
+    assert.deepStrictEqual(
+      { kind: result.error.kind, message: result.error.message },
+      {
+        kind: "unexpected",
+        message: "Could not update the Cloudsmith connection indicator.",
+      },
+    );
+    assert.ok(Object.isFrozen(result.error));
+    assert.deepStrictEqual(projections, [
+      ["setContext", "cloudsmith.connected", true],
+      ["setContext", "cloudsmith.connected", true],
+      ["setContext", "cloudsmith.connected", false],
+      ["setContext", "cloudsmith.connected", false],
+      ["setContext", "cloudsmith.connected", false],
+      ["setContext", "cloudsmith.connected", false],
+    ]);
+    assert.strictEqual(manager.getState().status, CONNECTION_STATUSES.CONNECTED);
     assert.strictEqual(manager.getState().sessionConnected, true);
+  });
+
+  test("disposal settles pending projection work and resets the connected context", async () => {
+    const projectionStarted = deferred();
+    const releaseProjection = deferred();
+    const projections = [];
+    const secrets = new FakeSecretStorage(
+      { [AUTH_TOKEN_KEY]: "stored-key" },
+      { primaryKey: AUTH_TOKEN_KEY }
+    );
+    let calls = 0;
+    const manager = new ConnectionManager({ secrets }, {
+      activationId: "projection-disposal",
+      createCloudsmithAPI: () => ({ get: async () => apiSuccess({ authenticated: true }) }),
+      executeCommand: async (...args) => {
+        calls += 1;
+        projections.push(args);
+        if (calls === 1) {
+          projectionStarted.resolve();
+          await releaseProjection.promise;
+        }
+      },
+    });
+
+    const initialization = manager.initialize();
+    await projectionStarted.promise;
+    const disposal = manager.dispose();
+    releaseProjection.resolve();
+    await initialization;
+    await disposal;
+
+    assert.strictEqual(manager.getState().status, CONNECTION_STATUSES.DISPOSED);
+    assert.deepStrictEqual(projections.at(-1), [
+      "setContext",
+      "cloudsmith.connected",
+      false,
+    ]);
   });
 
   test("an explicit API candidate bypasses stored credential lookup", async () => {

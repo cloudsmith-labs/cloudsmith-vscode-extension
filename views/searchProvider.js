@@ -19,6 +19,7 @@ const {
     packageCollectionIdentity,
 } = require("../util/collectionIdentity");
 const { fromApiPackageRecord } = require("../domain/packageAdapters");
+const { ContextKeyProjector } = require("../util/contextKeyProjector");
 
 const MAX_RESULTS = 5000;
 const MAX_REPOSITORIES = 1000;
@@ -72,6 +73,15 @@ class SearchProvider {
         this._activeRoot = null;
         this._activePage = null;
         this._disposed = false;
+        this._selectionGeneration = 0;
+        this._packageSelections = new WeakMap();
+        this._contextProjector = options.contextKeyProjector || new ContextKeyProjector({
+            defaults: {
+                "cloudsmith.searchActive": false,
+                "cloudsmith.searchCanLoadMore": false,
+            },
+            executeCommand: options.executeCommand,
+        });
         this._account = this._readConnectedAccount();
         this._connectionPresentation = connectionPresentation(
             this.connectionManager.getState?.()
@@ -89,6 +99,7 @@ class SearchProvider {
             }
             if (presentationChanged) this.refresh();
         });
+        void this._updateContexts();
     }
 
     get state() {
@@ -522,6 +533,7 @@ class SearchProvider {
             .finally(() => {
                 if (this._activePage?.operation === operation) {
                     this._activePage = null;
+                    if (!this._disposed) void this._updateContexts();
                 }
             });
         this._activePage = Object.freeze({ operation, promise });
@@ -909,9 +921,10 @@ class SearchProvider {
 
     dispose() {
         if (this._disposed) {
-            return;
+            return this._contextProjector.dispose();
         }
         this._disposed = true;
+        this._selectionGeneration += 1;
         this._invalidateOperations();
         this._connectionSubscription?.dispose?.();
         this._vulnerabilityStateSubscription?.dispose?.();
@@ -919,6 +932,7 @@ class SearchProvider {
         this._vulnerabilitySummaries.clear();
         this._clearVulnerabilityRefreshTimers();
         this._onDidChangeTreeData.dispose();
+        return this._contextProjector.dispose();
     }
 
     getTreeItem(element) {
@@ -955,7 +969,15 @@ class SearchProvider {
             return node ? [node] : [];
         }
 
-        if (element) return element.getChildren();
+        if (element) {
+            const children = await element.getChildren();
+            if (Array.isArray(children)) {
+                for (const child of children) {
+                    if (child && typeof child === "object") this._treeParents.set(child, element);
+                }
+            }
+            return children;
+        }
 
         const account = normalizeConnectedAccount(connectionState);
         if (!account) {
@@ -1009,14 +1031,85 @@ class SearchProvider {
                 committed.results.length
             ));
         }
+        this._ownPackageSelections(committed.results, account);
         return children;
     }
 
     refresh() {
         if (!this._disposed) {
+            this._selectionGeneration += 1;
             this._pruneVulnerabilitySummaries(this._currentCommitted()?.results || []);
+            void this._updateContexts();
             this._onDidChangeTreeData.fire();
         }
+    }
+
+    refreshNode(element) {
+        if (this._disposed || !element) return false;
+        if (!this.ownsSelection(element)) return false;
+        this._onDidChangeTreeData.fire(element);
+        return true;
+    }
+
+    ownsSelection(selection) {
+        if (this._disposed || !selection || typeof selection !== "object") return false;
+        let candidate = selection;
+        const visited = new Set();
+        while (candidate && !visited.has(candidate) && visited.size < 24) {
+            visited.add(candidate);
+            if (this.ownsPackageSelection(candidate)) return true;
+            candidate = this._treeParents.get(candidate) || null;
+        }
+        return false;
+    }
+
+    ownsPackageSelection(selection) {
+        if (this._disposed || !selection || typeof selection !== "object") return false;
+        const ownership = this._packageSelections.get(selection);
+        return Boolean(
+            ownership
+            && ownership.generation === this._selectionGeneration
+            && this._isAccountCurrent(ownership.account)
+        );
+    }
+
+    _ownPackageSelections(selections, account) {
+        if (!account || !Array.isArray(selections)) return;
+        for (const selection of selections) {
+            if (!selection || typeof selection !== "object") continue;
+            this._packageSelections.set(selection, Object.freeze({
+                generation: this._selectionGeneration,
+                account,
+            }));
+        }
+    }
+
+    _contextSnapshot() {
+        const account = this._readConnectedAccount();
+        const committed = this._currentCommitted(account);
+        const pending = sameAccount(account, this._state.pending) ? this._state.pending : null;
+        const failure = sameAccount(account, this._state.failure) ? this._state.failure : null;
+        const searchActive = Boolean(account && (committed || pending || failure));
+        const searchCanLoadMore = Boolean(
+            account
+            && committed
+            && !pending
+            && !this._activeRoot
+            && !this._activePage
+            && committed.pageable
+            && committed.pagination
+            && committed.descriptor.kind !== "repositories"
+        );
+        return {
+            "cloudsmith.searchActive": searchActive,
+            "cloudsmith.searchCanLoadMore": searchCanLoadMore,
+        };
+    }
+
+    async _updateContexts() {
+        if (this._disposed) return false;
+        const result = await this._contextProjector.project(this._contextSnapshot());
+        return result.applied;
     }
 
     _vulnerabilityNodeOptions() {

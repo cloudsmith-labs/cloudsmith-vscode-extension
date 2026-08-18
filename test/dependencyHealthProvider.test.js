@@ -245,6 +245,23 @@ suite("DependencyHealthProvider Test Suite", () => {
     };
   }
 
+  function createOpenWorkspace(folderPath) {
+    return {
+      workspaceFolders: [{
+        name: path.basename(folderPath),
+        uri: { fsPath: folderPath },
+      }],
+      getConfiguration: () => ({ get: () => null }),
+    };
+  }
+
+  function currentProjectOptions(folderPath = "/project-a") {
+    return {
+      workspace: createOpenWorkspace(folderPath),
+      projectFolderExists: async candidate => candidate === folderPath,
+    };
+  }
+
   function installScanSteps(provider, steps) {
     let nextStep = 0;
     provider._performScan = async function () {
@@ -571,14 +588,15 @@ suite("DependencyHealthProvider Test Suite", () => {
     const pending = provider.scan("workspace-a", "repo-a", "/project-a");
     await started.promise;
     commands.length = 0;
-    provider.dispose();
+    const disposal = provider.dispose();
     const disposedState = provider.getScanState();
     gate.resolve();
     const result = await pending;
+    await disposal;
 
     assert.strictEqual(result.status, "superseded");
     assert.deepStrictEqual(provider.getScanState(), disposedState);
-    assert.deepStrictEqual(commands, []);
+    assert.strictEqual(commands.some(([, , value]) => value === true), false);
     assert.deepStrictEqual(notifications, []);
     assert.strictEqual(disposedState.status, SCAN_STATES.CANCELLED);
     assert.strictEqual(disposedState.completedAt, 7000);
@@ -599,12 +617,22 @@ suite("DependencyHealthProvider Test Suite", () => {
     });
 
     await firstCommandStarted.promise;
-    provider.dispose();
+    const disposal = provider.dispose();
     firstCommandGate.resolve();
-    await waitForTurn();
-    await waitForTurn();
+    await disposal;
 
-    assert.deepStrictEqual(commands, [["setContext", "cloudsmith.depView", "flat"]]);
+    const finalValues = new Map(commands.map(([, key, value]) => [key, value]));
+    assert.deepStrictEqual([...finalValues], [
+      ["cloudsmith.depView", "flat"],
+      ["cloudsmith.depViewMode", "flat"],
+      ["cloudsmith.depFilterActive", false],
+      ["cloudsmith.depScanComplete", false],
+      ["cloudsmith.depScanSucceeded", false],
+      ["cloudsmith.depScanRunning", false],
+      ["cloudsmith.depOperationRunning", false],
+      ["cloudsmith.depRepoSelected", false],
+      ["cloudsmith.depReportAvailable", false],
+    ]);
   });
 
   test("first successful scan atomically commits results, scope, report data, and diagnostics", async () => {
@@ -648,7 +676,12 @@ suite("DependencyHealthProvider Test Suite", () => {
 
   test("first scan cancellation publishes neither partial results nor diagnostics", async () => {
     const diagnostics = createDiagnosticsPublisher();
-    const provider = new DependencyHealthProvider(createContext(), diagnostics);
+    const notifications = [];
+    const provider = new DependencyHealthProvider(createContext(), diagnostics, {
+      userInteraction: createUserInteraction({
+        showInformationMessage: async message => { notifications.push(message); },
+      }),
+    });
     installScanSteps(provider, [{ name: "partial-result", canceled: true }]);
 
     const result = await provider.scan("workspace-a", null, "/project-a");
@@ -659,6 +692,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.deepStrictEqual(diagnostics.current, ["existing-diagnostic"]);
     const nodes = await provider.getChildren();
     assert.strictEqual(nodes[0].getTreeItem().label, "Dependency scan canceled");
+    assert.deepStrictEqual(notifications, []);
   });
 
   test("account epoch change cancels in-flight work and prevents old-account publication", async () => {
@@ -880,7 +914,11 @@ suite("DependencyHealthProvider Test Suite", () => {
 
   test("successful rescan leaves prior results visible while running and replaces them on commit", async () => {
     const diagnostics = createDiagnosticsPublisher();
-    const provider = new DependencyHealthProvider(createContext(), diagnostics);
+    const provider = new DependencyHealthProvider(
+      createContext(),
+      diagnostics,
+      currentProjectOptions()
+    );
     const refreshStarted = deferred();
     const refreshGate = deferred();
     installScanSteps(provider, [
@@ -977,7 +1015,11 @@ suite("DependencyHealthProvider Test Suite", () => {
       }
       return prepare(options);
     };
-    const provider = new DependencyHealthProvider(createContext(), diagnostics);
+    const provider = new DependencyHealthProvider(
+      createContext(),
+      diagnostics,
+      currentProjectOptions()
+    );
     installScanSteps(provider, [
       { name: "known-good" },
       { name: "cancelled-replacement" },
@@ -1138,9 +1180,51 @@ suite("DependencyHealthProvider Test Suite", () => {
     }
   });
 
+  test("rescan rejects deleted and non-open last-successful project paths", async () => {
+    const cases = [
+      {
+        name: "deleted open folder",
+        workspaceFolder: "/project-a",
+        exists: false,
+      },
+      {
+        name: "no longer open folder",
+        workspaceFolder: "/different-project",
+        exists: true,
+      },
+    ];
+
+    for (const testCase of cases) {
+      let fallbackCalls = 0;
+      const provider = new DependencyHealthProvider(createContext(), null, {
+        workspace: createOpenWorkspace(testCase.workspaceFolder),
+        projectFolderExists: async () => testCase.exists,
+      });
+      installScanSteps(provider, [{ name: "known-good" }]);
+      await provider.scan("workspace-a", "repo-a", "/project-a");
+
+      const result = await provider.rescan(async () => {
+        fallbackCalls += 1;
+        return { status: "fresh-project-required" };
+      });
+
+      assert.deepStrictEqual(result, { status: "fresh-project-required" }, testCase.name);
+      assert.strictEqual(fallbackCalls, 1, testCase.name);
+      assert.deepStrictEqual(provider.getLastSuccessfulScope(), {
+        workspace: "workspace-a",
+        repository: "repo-a",
+        projectFolder: "/project-a",
+      });
+    }
+  });
+
   test("cancelled rescan preserves prior results and diagnostics", async () => {
     const diagnostics = createDiagnosticsPublisher();
-    const provider = new DependencyHealthProvider(createContext(), diagnostics);
+    const provider = new DependencyHealthProvider(
+      createContext(),
+      diagnostics,
+      currentProjectOptions()
+    );
     installScanSteps(provider, [
       { name: "known-good" },
       { name: "partial-replacement", canceled: true },
@@ -1181,6 +1265,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     };
 
     const provider = new DependencyHealthProvider(createContext(), diagnostics, {
+      ...currentProjectOptions(),
       async enrichVulnerabilities(_dependencies, _workspace, { cancellationToken }) {
         vulnerabilityStarted.resolve();
         if (cancellationToken.isCancellationRequested) return;
@@ -1367,6 +1452,69 @@ suite("DependencyHealthProvider Test Suite", () => {
     } finally {
       vscode.commands.executeCommand = originalExecuteCommand;
     }
+  });
+
+  test("projects report availability and owns only current rendered dependency selections", async () => {
+    let state = Object.freeze({
+      activationId: "dependency-selection",
+      accountEpoch: 1,
+      credentialPresent: true,
+      sessionConnected: true,
+      status: "connected",
+    });
+    const listeners = new Set();
+    const connectionManager = {
+      getState: () => state,
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      update(next) {
+        state = Object.freeze({ ...state, ...next });
+        for (const listener of [...listeners]) listener(state);
+      },
+    };
+    const contextValues = new Map();
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      connectionManager,
+      executeCommand: async (command, key, value) => {
+        if (command === "setContext") contextValues.set(key, value);
+      },
+    });
+    provider.lastWorkspace = "workspace";
+    provider.lastRepo = "repo";
+    provider._hasSuccessfulScan = true;
+    provider._reportData = { generated: true };
+    await provider._updateContexts();
+    assert.strictEqual(contextValues.get("cloudsmith.depReportAvailable"), true);
+    assert.strictEqual(contextValues.get("cloudsmith.depScanSucceeded"), true);
+
+    const tree = {
+      ecosystem: "npm",
+      sourceFile: "package-lock.json",
+      dependencies: [createFoundDependency("left-pad", "1.0.0")],
+    };
+    const firstNode = provider.buildDependencyNodesForTree(tree)[0];
+    assert.strictEqual(provider.ownsDependencySelection(firstNode), true);
+    const events = [];
+    provider.onDidChangeTreeData(element => events.push(element));
+    assert.strictEqual(provider.refreshNode(firstNode), true);
+    assert.deepStrictEqual(events, [firstNode]);
+
+    provider.refresh();
+    assert.strictEqual(provider.ownsDependencySelection(firstNode), false);
+    const secondNode = provider.buildDependencyNodesForTree(tree)[0];
+    assert.strictEqual(provider.ownsDependencySelection(secondNode), true);
+
+    connectionManager.update({ accountEpoch: 2 });
+    await waitForTurn();
+    await waitForTurn();
+    assert.strictEqual(provider.ownsDependencySelection(secondNode), false);
+    assert.strictEqual(contextValues.get("cloudsmith.depReportAvailable"), false);
+    assert.strictEqual(contextValues.get("cloudsmith.depScanSucceeded"), false);
+
+    await provider.dispose();
+    assert.strictEqual(contextValues.get("cloudsmith.depReportAvailable"), false);
   });
 
   test("getChildren() shows the signed-out state when disconnected before the first scan", async () => {
@@ -3239,6 +3387,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     vscode.window.showErrorMessage = async (message) => {
       notifications.push(`error:${message}`);
     };
+    vscode.window.showWarningMessage = async (_message, _options, action) => action;
 
     try {
       const provider = new DependencyHealthProvider(createContext(), null, {
@@ -3282,6 +3431,8 @@ suite("DependencyHealthProvider Test Suite", () => {
 
       provider.lastWorkspace = "workspace-a";
       provider.lastRepo = "repo-a";
+      provider._projectFolderPath = "/project";
+      provider._hasSuccessfulScan = true;
       provider._fullTrees = [{
         ecosystem: "python",
         sourceFile: "requirements.txt",
@@ -3306,12 +3457,64 @@ suite("DependencyHealthProvider Test Suite", () => {
       assert.strictEqual(refreshArgs.dependency.version, "2.31.0");
       assert.strictEqual(refreshArgs.dependency.format, "python");
       assert.ok(preparationToken);
+      assert.strictEqual(provider.lastRepo, "repo-a");
       assert.deepStrictEqual(notifications, ["requests@2.31.0 cached in repo-b"]);
     } finally {
       vscode.window.withProgress = originalWithProgress;
       vscode.window.showInformationMessage = originalShowInformationMessage;
       vscode.window.showErrorMessage = originalShowErrorMessage;
     }
+  });
+
+  test("single pull confirms the prepared exact target and rechecks selection before execution", async () => {
+    const events = [];
+    let selectionCurrent = true;
+    let confirmationMessage = null;
+    const dependency = createProblemDependency(
+      "target-package",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      userInteraction: createUserInteraction({
+        showWarningMessage: async (message, options, action) => {
+          events.push("confirm");
+          confirmationMessage = message;
+          assert.deepStrictEqual(options, { modal: true });
+          selectionCurrent = false;
+          return action;
+        },
+      }),
+      upstreamPullService: {
+        async prepareSingle() {
+          events.push("prepare");
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-b" },
+            dependency,
+            plan: { pullableDependencies: [dependency], skippedDependencies: [] },
+          };
+        },
+        async execute() {
+          events.push("execute");
+          return null;
+        },
+      },
+    });
+    provider.lastWorkspace = "workspace-a";
+    provider.lastRepo = "repo-a";
+    provider._projectFolderPath = "/project";
+    provider._hasSuccessfulScan = true;
+    provider._fullTrees = [{ dependencies: [dependency] }];
+
+    await provider.pullSingleDependency(
+      pullCoordinate("target-package", "1.0.0"),
+      { isCurrent: () => selectionCurrent }
+    );
+
+    assert.deepStrictEqual(events, ["prepare", "confirm"]);
+    assert.match(confirmationMessage, /target-package@1\.0\.0/);
+    assert.match(confirmationMessage, /workspace-a\/repo-b/);
   });
 
   test("coverage refresh waits for every enrichment sibling after one rejects", async () => {
@@ -3378,8 +3581,10 @@ suite("DependencyHealthProvider Test Suite", () => {
     let executionCalls = 0;
     let refreshCalls = 0;
     let diagnosticReplacements = 0;
-    vscode.window.showWarningMessage = async (message) => {
+    vscode.window.showWarningMessage = async (message, _options, action) => {
+      if (action === "Pull dependency") return action;
       warnings.push(message);
+      return undefined;
     };
     const diagnostics = {
       async prepare() {
@@ -3425,6 +3630,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     provider.lastWorkspace = "workspace-a";
     provider.lastRepo = "repo-a";
     provider._projectFolderPath = "/project";
+    provider._hasSuccessfulScan = true;
     provider._warnings = [];
     provider._fullTrees = [{
       ecosystem: "npm",
@@ -3507,6 +3713,8 @@ suite("DependencyHealthProvider Test Suite", () => {
     const installProject = (name) => {
       provider.lastWorkspace = "workspace-a";
       provider.lastRepo = "repo-a";
+      provider._projectFolderPath = "/project";
+      provider._hasSuccessfulScan = true;
       provider._fullTrees = [{ dependencies: [createProblemDependency(
         name,
         "1.0.0",

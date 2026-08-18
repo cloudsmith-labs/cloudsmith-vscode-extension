@@ -1,7 +1,11 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const { registerCommands } = require("./registrar");
-const { captureCommandAccount, getWorkspaces } = require("./support");
+const {
+  captureCommandAccount,
+  isCommandAccountCurrent,
+  resolveCommandWorkspace,
+} = require("./support");
 
 function registerSettingsHelpCommands(deps) {
   const { registerCommand, vscode, treeView, cloudsmithProvider } = deps;
@@ -9,55 +13,38 @@ function registerSettingsHelpCommands(deps) {
   async function setDefaultWorkspace() {
     const account = captureCommandAccount(deps.workspaceAccess);
     if (!account) return;
-    const workspaces = await getWorkspaces(deps.workspaceAccess);
-    if (!account.isCurrent()) return;
-    if (!workspaces) return;
-    if (workspaces.items.length === 0) {
-      if (workspaces.complete) {
-        vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
-      }
-      return;
-    }
-
-    const items = [
-      { label: "$(close) Clear default workspace", description: "Show all workspaces", clear: true },
-    ];
-    if (!workspaces.complete) {
-      items.push({ label: "Workspace list incomplete", kind: vscode.QuickPickItemKind.Separator });
-    }
-    for (const workspace of workspaces.items) {
-      items.push({ label: workspace.name, description: workspace.slug, clear: false });
-    }
-
-    const selected = await vscode.window.showQuickPick(items, {
+    const selected = await resolveCommandWorkspace(deps, account, {
+      allowClear: true,
+      forcePrompt: true,
+      ignoreDefault: true,
       placeHolder: "Select a default workspace",
     });
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     if (!selected) return;
 
     const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
     if (selected.clear) {
-      if (!account.isCurrent()) return;
+      if (!isCommandAccountCurrent(account)) return;
       await config.update("defaultWorkspace", "", vscode.ConfigurationTarget.Global);
-      if (!account.isCurrent()) return;
+      if (!isCommandAccountCurrent(account)) return;
       await deps.updateDefaultWorkspaceContext();
-      if (!account.isCurrent()) return;
+      if (!isCommandAccountCurrent(account)) return;
       treeView.title = "Workspaces";
       treeView.description = "";
     } else {
-      if (!account.isCurrent()) return;
+      if (!isCommandAccountCurrent(account)) return;
       await config.update(
         "defaultWorkspace",
-        selected.description,
+        selected.slug,
         vscode.ConfigurationTarget.Global
       );
-      if (!account.isCurrent()) return;
+      if (!isCommandAccountCurrent(account)) return;
       await deps.updateDefaultWorkspaceContext();
-      if (!account.isCurrent()) return;
+      if (!isCommandAccountCurrent(account)) return;
       treeView.title = "Repositories";
-      treeView.description = selected.description;
+      treeView.description = selected.slug;
     }
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     cloudsmithProvider.refresh();
   }
 

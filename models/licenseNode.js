@@ -2,6 +2,7 @@
 
 const vscode = require("vscode");
 const { LicenseClassifier } = require("../util/licenseClassifier");
+const { inheritSelection } = require("../util/selectionProvenance");
 
 class LicenseNode {
   /**
@@ -9,7 +10,7 @@ class LicenseNode {
    * @param   {string|vscode.ExtensionContext|null} licenseUrlOrContext  License URL when using the legacy signature, or context when using metadata.
    * @param   {vscode.ExtensionContext} context
    */
-  constructor(licenseSource, licenseUrlOrContext, context) {
+  constructor(licenseSource, licenseUrlOrContext, context, owner = null) {
     if (context === undefined && licenseSource && typeof licenseSource === "object" && !Array.isArray(licenseSource)) {
       this.context = licenseUrlOrContext;
       this.licenseInfo = LicenseClassifier.inspect(licenseSource);
@@ -24,6 +25,7 @@ class LicenseNode {
     this.license = this.licenseInfo.displayValue;
     this.licenseUrl = this.licenseInfo.licenseUrl || null;
     this.classification = this.licenseInfo;
+    inheritSelection(this, owner);
   }
 
   _getIcon() {
@@ -60,7 +62,7 @@ class LicenseNode {
       description: this._getDescription(),
       tooltip: this._buildTooltip(),
       collapsibleState: vscode.TreeItemCollapsibleState.None,
-      contextValue: "licenseDetail",
+      contextValue: this.licenseUrl ? "licenseDetailWithUrl" : "licenseDetail",
       iconPath: this._getIcon(),
     };
 

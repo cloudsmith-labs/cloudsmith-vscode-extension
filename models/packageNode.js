@@ -8,6 +8,7 @@ const { getFormatIconPath } = require("../util/formatIcons");
 const { packageCollectionIdentity } = require("../util/collectionIdentity");
 const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const VulnerabilitySummaryNode = require("./vulnerabilitySummaryNode");
+const { markSelection } = require("../util/selectionProvenance");
 
 class PackageNode {
   constructor(pkg, context, options = {}) {
@@ -15,6 +16,7 @@ class PackageNode {
     this.package = packageModel;
     this.context = context;
     this._connectionManager = options.connectionManager || null;
+    markSelection(this, this._connectionManager);
     this._vulnerabilityStateService = options.vulnerabilityStateService || null;
     this._registerVulnerabilitySummary = typeof options.registerVulnerabilitySummary === "function"
       ? options.registerVulnerabilitySummary
@@ -67,6 +69,7 @@ class PackageNode {
         connectionManager: this._connectionManager,
         vulnerabilityStateService: this._vulnerabilityStateService,
         lifecycleSignal: this._lifecycleSignal,
+        selectionOwner: this,
       });
     this._registerVulnerabilitySummary(
       this._vulnerabilityIdentity,
@@ -207,7 +210,9 @@ class PackageNode {
       description: description,
       tooltip: this._buildTooltip(),
       collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
-      contextValue: status === "Quarantined" ? "packageQuarantined" : "package",
+      contextValue: status === "Quarantined"
+        ? "packageQuarantined"
+        : this.is_copyable === true ? "package" : "packageNotCopyable",
       iconPath: iconPath,
     };
   }
@@ -220,17 +225,17 @@ class PackageNode {
     // --- Primary details (always visible on expand) ---
 
     // 1. Status
-    children.push(new PackageDetailsNode(this.status_str, this.context));
+    children.push(new PackageDetailsNode(this.status_str, this.context, this));
 
     // 2. Version
-    children.push(new PackageDetailsNode(this.version, this.context));
+    children.push(new PackageDetailsNode(this.version, this.context, this));
 
     // 3. License
     const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
     const showLicense = config.get("showLicenseIndicators") !== false;
     if (showLicense) {
       const LicenseNode = require("./licenseNode");
-      children.push(new LicenseNode(this.licenseInfo, this.context));
+      children.push(new LicenseNode(this.licenseInfo, this.context, undefined, this));
     }
 
     // 4. Vulnerability summary (expandable)
@@ -241,22 +246,22 @@ class PackageNode {
       const truncated = this.status_reason.length > 80
         ? this.status_reason.substring(0, 80) + "..."
         : this.status_reason;
-      children.push(new PackageDetailsNode({ id: "Quarantine reason", value: truncated }, this.context));
+      children.push(new PackageDetailsNode({ id: "Quarantine reason", value: truncated }, this.context, this));
     }
 
     // 6. Policy Violated
-    children.push(new PackageDetailsNode(this.policy_violated_detail, this.context));
+    children.push(new PackageDetailsNode(this.policy_violated_detail, this.context, this));
 
     // Legacy policy fields (optional)
     const legacyConfig = vscode.workspace.getConfiguration("cloudsmith-vsc");
     if (legacyConfig.get("showLegacyPolicies")) {
-      children.push(new PackageDetailsNode(this.deny_policy_violated_detail, this.context));
-      children.push(new PackageDetailsNode(this.license_policy_violated_detail, this.context));
-      children.push(new PackageDetailsNode(this.vulnerability_policy_violated_detail, this.context));
+      children.push(new PackageDetailsNode(this.deny_policy_violated_detail, this.context, this));
+      children.push(new PackageDetailsNode(this.license_policy_violated_detail, this.context, this));
+      children.push(new PackageDetailsNode(this.vulnerability_policy_violated_detail, this.context, this));
     }
 
     // 6. Origin
-    children.push(new PackageDetailsNode(this.origin_detail, this.context));
+    children.push(new PackageDetailsNode(this.origin_detail, this.context, this));
 
     // 7. "More Details" (collapsible sub-group)
     const secondaryDetails = [
@@ -272,7 +277,8 @@ class PackageNode {
       "More Details",
       new vscode.ThemeIcon("ellipsis"),
       secondaryDetails,
-      this.context
+      this.context,
+      this
     ));
 
     return children;

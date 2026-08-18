@@ -2,7 +2,10 @@
 const vscode = require("vscode");
 const { CloudsmithAPI } = require("./cloudsmithAPI");
 const { CredentialManager } = require("./credentialManager");
+const { apiEndpoint } = require("./apiEndpoint");
 const { fetchWorkspaceRepositories } = require("./workspaceRepositoryFetcher");
+const { PaginatedFetch } = require("./paginatedFetch");
+const { SearchQueryBuilder } = require("./searchQueryBuilder");
 const {
   buildRegistryTriggerPlan,
   findPythonDistributionUrl,
@@ -13,9 +16,16 @@ const {
   parseDartArchiveUrl,
   resolveAndValidateRegistryUrl,
 } = require("./registryEndpoints");
-const { canonicalFormat, normalizePackageName } = require("./packageNameNormalizer");
+const {
+  canonicalFormat,
+  getCloudsmithPackageLookupKeys,
+  getPackageLookupKeys,
+  normalizePackageName,
+  normalizeSwiftIdentity,
+} = require("./packageNameNormalizer");
 const { sanitizeSafeInventoryUpstream } = require("./upstreamChecker");
 const { getUpstreamFormatDescriptor, normalizeUpstreamFormat } = require("./upstreamFormats");
+const { formatUpstreamText } = require("./upstreamPresentation");
 const {
   captureAccount,
   isAccountCurrent,
@@ -27,6 +37,12 @@ const INITIAL_AUTH_PROBE_CONCURRENCY = 3;
 const MAX_REGISTRY_REDIRECTS = 5;
 const REQUEST_TIMEOUT_MS = 30 * 1000;
 const MAX_REGISTRY_METADATA_BYTES = 1024 * 1024;
+const ABSENCE_LOOKUP_PAGE_SIZE = 100;
+const ABSENCE_LOOKUP_MAX_PAGES = 100;
+const ABSENCE_LOOKUP_MAX_ITEMS = ABSENCE_LOOKUP_PAGE_SIZE * ABSENCE_LOOKUP_MAX_PAGES;
+const ABSENCE_LOOKUP_MAX_FIELD_LENGTH = 2048;
+const REPOSITORY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
+const REPOSITORY_DISPLAY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/gu;
 const SAFE_REGISTRY_ERROR_MESSAGES = new Set([
   "Refused to send Cloudsmith credentials to an untrusted registry host.",
   "Registry metadata response exceeded the size limit.",
@@ -74,6 +90,9 @@ class UpstreamPullService {
     this._showWarningMessage = options.showWarningMessage || vscode.window.showWarningMessage.bind(vscode.window);
     this._upstreamRuntime = options.upstreamRuntime;
     this._connectionManager = resolveConnectionManager(context, options.connectionManager);
+    this._checkPackageAbsence = typeof options.checkPackageAbsence === "function"
+      ? options.checkPackageAbsence
+      : this._checkExactPackageAbsence.bind(this);
   }
 
   async run(options) {
@@ -171,18 +190,21 @@ class UpstreamPullService {
       );
     }
     const orderedMatches = sortRepositoryMatches(repositorySearch.matches, repositoryHint);
-    const selected = await this._showQuickPick(
+    const selected = await this._showRepositoryQuickPick(
       orderedMatches.map((match) => ({
-        label: match.repo.slug || match.repo.name,
-        description: match.repo.name && match.repo.name !== match.repo.slug ? match.repo.name : "",
-        detail: `${formatListLabel(match.activeFormats)} upstream${match.activeFormats.length === 1 ? "" : "s"} configured`,
+        ...repositoryQuickPickPresentation(match.repo),
+        detail: safeRepositoryDisplayName(
+          `${formatListLabel(match.activeFormats)} upstream${match.activeFormats.length === 1 ? "" : "s"} configured`,
+          "Upstreams configured"
+        ),
         _match: match,
       })),
       {
         placeHolder: "Select a repository to pull dependencies through",
         matchOnDescription: true,
         matchOnDetail: true,
-      }
+      },
+      operation
     );
 
     if (!this._isPreparationCurrent(operation) || !selected || !selected._match) {
@@ -199,6 +221,22 @@ class UpstreamPullService {
 
     if (plan.pullableDependencies.length === 0) {
       await this._showInformationMessage(buildPullPlanErrorMessage(repository.slug, plan));
+      return null;
+    }
+
+    const absence = await this._verifyTargetAbsence(
+      workspace,
+      repository.slug,
+      plan.pullableDependencies,
+      operation
+    );
+    if (!absence || !this._isPreparationCurrent(operation)) return null;
+    if (!absence.ok) {
+      await this._showWarningMessage(buildAbsenceVerificationFailureMessage(
+        absence,
+        workspace,
+        repository.slug
+      ));
       return null;
     }
 
@@ -296,10 +334,9 @@ class UpstreamPullService {
       );
     }
     const orderedMatches = sortRepositoryMatches(repositorySearch.matches, repositoryHint);
-    const selected = await this._showQuickPick(
+    const selected = await this._showRepositoryQuickPick(
       orderedMatches.map((match) => ({
-        label: match.repo.slug || match.repo.name,
-        description: match.repo.name && match.repo.name !== match.repo.slug ? match.repo.name : "",
+        ...repositoryQuickPickPresentation(match.repo),
         detail: buildSingleDependencyRepositoryDetail(match, dependencyFormat),
         _match: match,
       })),
@@ -307,7 +344,8 @@ class UpstreamPullService {
         placeHolder: `Select a repository to pull ${buildDependencyLabel(normalizedDependency)} through`,
         matchOnDescription: true,
         matchOnDetail: true,
-      }
+      },
+      operation
     );
 
     if (!this._isPreparationCurrent(operation) || !selected || !selected._match) {
@@ -327,6 +365,22 @@ class UpstreamPullService {
       return null;
     }
 
+    const absence = await this._verifyTargetAbsence(
+      workspace,
+      repository.slug,
+      plan.pullableDependencies,
+      operation
+    );
+    if (!absence || !this._isPreparationCurrent(operation)) return null;
+    if (!absence.ok) {
+      await this._showWarningMessage(buildAbsenceVerificationFailureMessage(
+        absence,
+        workspace,
+        repository.slug
+      ));
+      return null;
+    }
+
     return {
       workspace,
       repository,
@@ -338,6 +392,31 @@ class UpstreamPullService {
   }
 
   async execute(prepared, options = {}) {
+    if (!this._isPreparedAccountCurrent(prepared)) {
+      return { canceled: true, stale: true };
+    }
+    const executionOperation = this._createPreparationOperation(
+      options.token || null,
+      options.signal || null,
+      prepared?.account || null
+    );
+    const absence = await this._verifyTargetAbsence(
+      prepared?.workspace,
+      prepared?.repository?.slug,
+      prepared?.plan?.pullableDependencies,
+      executionOperation
+    );
+    if (!absence || !this._isPreparedAccountCurrent(prepared)) {
+      return { canceled: true, stale: true };
+    }
+    if (!absence.ok) {
+      await this._showWarningMessage(buildAbsenceVerificationFailureMessage(
+        absence,
+        prepared.workspace,
+        prepared.repository.slug
+      ));
+      return { canceled: true, absenceUnverified: true };
+    }
     if (!this._isPreparedAccountCurrent(prepared)) {
       return { canceled: true, stale: true };
     }
@@ -681,6 +760,207 @@ class UpstreamPullService {
     return { matches: sortedMatches, complete };
   }
 
+  async _showRepositoryQuickPick(items, options, operation) {
+    if (!this._isPreparationCurrent(operation)) return null;
+    const cancellationSource = new vscode.CancellationTokenSource();
+    const disposables = [];
+    let finishCancellation;
+    const cancelled = new Promise(resolve => {
+      finishCancellation = () => resolve({ canceled: true });
+    });
+    const cancel = () => {
+      try {
+        cancellationSource.cancel();
+      } finally {
+        finishCancellation();
+      }
+    };
+    if (typeof this._connectionManager?.onDidChange === "function") {
+      disposables.push(this._connectionManager.onDidChange(() => {
+        if (!this._isPreparationCurrent(operation)) cancel();
+      }));
+    }
+    if (typeof operation.cancellationToken?.onCancellationRequested === "function") {
+      disposables.push(operation.cancellationToken.onCancellationRequested(cancel));
+    }
+    if (operation.signal) {
+      operation.signal.addEventListener("abort", cancel, { once: true });
+      disposables.push({
+        dispose: () => operation.signal.removeEventListener("abort", cancel),
+      });
+    }
+
+    const selection = Promise.resolve()
+      .then(() => this._showQuickPick(items, options, cancellationSource.token))
+      .then(value => ({ value }), error => ({ error }));
+    try {
+      const result = await Promise.race([selection, cancelled]);
+      if (result.canceled || !this._isPreparationCurrent(operation)) return null;
+      if (result.error) throw result.error;
+      return result.value || null;
+    } finally {
+      for (const disposable of disposables.reverse()) disposable?.dispose?.();
+      cancellationSource.dispose();
+    }
+  }
+
+  async _verifyTargetAbsence(workspace, repository, dependencies, operation) {
+    if (
+      !this._isPreparationCurrent(operation)
+      || !isBoundedIdentity(workspace)
+      || !isBoundedIdentity(repository)
+      || !Array.isArray(dependencies)
+      || dependencies.length === 0
+    ) return null;
+
+    for (const dependency of dependencies) {
+      if (!this._isPreparationCurrent(operation)) return null;
+      let result;
+      try {
+        result = await this._checkPackageAbsence({
+          workspace,
+          repository,
+          dependency,
+          cancellationToken: operation.cancellationToken,
+          signal: operation.signal,
+          account: operation.account,
+        });
+      } catch {
+        result = null;
+      }
+      if (!this._isPreparationCurrent(operation)) return null;
+      const scoped = result
+        && result.workspace === workspace
+        && result.repository === repository
+        && result.stale !== true;
+      if (
+        !scoped
+        || result.complete !== true
+        || result.absent !== true
+        || result.present !== false
+      ) {
+        return {
+          ok: false,
+          reason: scoped && result?.present === true ? "present" : "unverified",
+          dependency,
+        };
+      }
+    }
+    return { ok: true };
+  }
+
+  async _checkExactPackageAbsence({
+    workspace,
+    repository,
+    dependency,
+    cancellationToken,
+    signal,
+    account,
+  }) {
+    const format = canonicalFormat(dependency?.format || dependency?.ecosystem);
+    const version = String(dependency?.version || "").trim();
+    const lookupNames = getPackageLookupKeys(
+      dependency?.name,
+      format,
+      dependency?.identifiers || dependency?.qualifiers
+    ).filter(value => isBoundedLookupField(value));
+    if (
+      !isBoundedIdentity(workspace)
+      || !isBoundedIdentity(repository)
+      || !isBoundedLookupField(format)
+      || !isBoundedLookupField(version)
+      || lookupNames.length === 0
+      || !this._isAbsenceAccountCurrent(account)
+    ) {
+      return incompleteAbsenceResult(workspace, repository);
+    }
+
+    let endpoint;
+    try {
+      endpoint = apiEndpoint(["packages", workspace, repository]);
+    } catch {
+      return incompleteAbsenceResult(workspace, repository);
+    }
+    const paginatedFetch = new PaginatedFetch(this._api);
+
+    for (const lookupName of lookupNames) {
+      const query = new SearchQueryBuilder()
+        .name(lookupName)
+        .format(format)
+        .version(version)
+        .build();
+      let resume = null;
+      const knownIdentities = new Set();
+      while (true) {
+        if (
+          isCancellationRequested(cancellationToken)
+          || signal?.aborted
+          || !this._isAbsenceAccountCurrent(account)
+        ) {
+          return incompleteAbsenceResult(workspace, repository, true);
+        }
+        const result = await paginatedFetch.fetchCollection(endpoint, {
+          pageSize: ABSENCE_LOOKUP_PAGE_SIZE,
+          maxPages: ABSENCE_LOOKUP_MAX_PAGES,
+          maxRequests: ABSENCE_LOOKUP_MAX_PAGES,
+          maxItems: ABSENCE_LOOKUP_MAX_ITEMS,
+          pageBatchLimit: 1,
+          resume,
+          knownIdentities,
+          query,
+          descriptor: `upstream-pull-absence:${workspace}:${repository}:${format}`,
+          canonicalIdentity: exactPackageCandidateIdentity,
+          validate: value => isExactPackageCandidateArray(value, workspace, repository),
+          retry: "never",
+          cancellationToken,
+          signal,
+        });
+        if (
+          isCancellationRequested(cancellationToken)
+          || signal?.aborted
+          || !this._isAbsenceAccountCurrent(account)
+        ) {
+          return incompleteAbsenceResult(workspace, repository, true);
+        }
+        const present = result.items.some(candidate => (
+          exactPackageCandidateMatches(candidate, dependency, format, version)
+        ));
+        if (present) {
+          return {
+            workspace,
+            repository,
+            absent: false,
+            present: true,
+            complete: result.complete === true,
+            stale: false,
+          };
+        }
+        for (const candidate of result.items) {
+          knownIdentities.add(exactPackageCandidateIdentity(candidate));
+        }
+        if (result.complete === true) break;
+        if (!result.continuation) {
+          return incompleteAbsenceResult(workspace, repository);
+        }
+        resume = result.continuation;
+      }
+    }
+
+    return {
+      workspace,
+      repository,
+      absent: true,
+      present: false,
+      complete: true,
+      stale: false,
+    };
+  }
+
+  _isAbsenceAccountCurrent(account) {
+    return !this._connectionManager
+      || Boolean(account && isAccountCurrent(this._connectionManager, account));
+  }
+
   async _fetchWorkspaceRepositories(workspace, operation = {}) {
     return fetchWorkspaceRepositories(this.context, workspace, {
       cloudsmithAPI: this._api,
@@ -974,12 +1254,176 @@ class UpstreamPullService {
   }
 }
 
+function isBoundedIdentity(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 512
+    && value.trim() === value
+    && !/[\u0000-\u001f\u007f\\/?#]/u.test(value)
+    && !REPOSITORY_CONTROL_OR_BIDI.test(value)
+    && value !== "."
+    && value !== "..";
+}
+
+function isBoundedLookupField(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= ABSENCE_LOOKUP_MAX_FIELD_LENGTH
+    && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function isExactPackageCandidateArray(value, workspace, repository) {
+  return Array.isArray(value)
+    && value.length <= ABSENCE_LOOKUP_PAGE_SIZE
+    && value.every(candidate => (
+      candidate
+      && typeof candidate === "object"
+      && !Array.isArray(candidate)
+      && candidate.namespace === workspace
+      && candidate.repository === repository
+      && isBoundedLookupField(candidate.name)
+      && isBoundedLookupField(candidate.version)
+      && isBoundedLookupField(candidate.format)
+      && Boolean(exactPackageCandidateIdentity(candidate))
+    ));
+}
+
+function exactPackageCandidateIdentity(candidate) {
+  if (!candidate || typeof candidate !== "object") return null;
+  const stableIdentifier = [
+    candidate.namespace,
+    candidate.repository,
+    candidate.format,
+    candidate.name,
+    candidate.version,
+    candidate.slug_perm || candidate.identifier || "",
+  ];
+  return stableIdentifier.every(value => typeof value === "string")
+    ? JSON.stringify(stableIdentifier)
+    : null;
+}
+
+function exactPackageCandidateMatches(candidate, dependency, format, version) {
+  if (
+    candidate.version !== version
+    || canonicalFormat(candidate.format) !== format
+  ) return false;
+  const dependencyName = String(dependency?.name || "").trim();
+  if (!dependencyName) return false;
+
+  if (format === "maven" && dependencyName.includes(":")) {
+    const expectedName = normalizePackageName(dependencyName, format);
+    return getCloudsmithPackageLookupKeys(candidate, format)
+      .some(key => key.includes(":") && key === expectedName);
+  }
+  if (format === "swift") {
+    const candidateIdentifiers = candidate.identifiers
+      && typeof candidate.identifiers === "object"
+      ? candidate.identifiers
+      : {};
+    const expected = normalizeSwiftIdentity(
+      dependencyName,
+      dependency?.qualifiers?.scope
+    );
+    const observed = normalizeSwiftIdentity(
+      candidate.name,
+      candidate.scope || candidateIdentifiers.scope
+    );
+    return Boolean(expected && observed && expected === observed);
+  }
+  if (format === "ruby" && dependency?.qualifiers?.platform) {
+    const candidateIdentifiers = candidate.identifiers
+      && typeof candidate.identifiers === "object"
+      ? candidate.identifiers
+      : {};
+    const observedPlatform = String(
+      candidate.platform
+      || candidate.architecture
+      || candidateIdentifiers.platform
+      || candidateIdentifiers.architecture
+      || ""
+    ).trim();
+    if (
+      observedPlatform
+      && observedPlatform.toLowerCase() !== String(dependency.qualifiers.platform).toLowerCase()
+    ) return false;
+  }
+
+  const expectedKeys = getPackageLookupKeys(
+    dependencyName,
+    format,
+    dependency?.identifiers || dependency?.qualifiers
+  );
+  const observedKeys = new Set(getCloudsmithPackageLookupKeys(candidate, format));
+  return expectedKeys.some(key => observedKeys.has(key));
+}
+
+function incompleteAbsenceResult(workspace, repository, stale = false) {
+  return {
+    workspace,
+    repository,
+    absent: false,
+    present: false,
+    complete: false,
+    stale,
+  };
+}
+
+function buildAbsenceVerificationFailureMessage(result, workspace, repository) {
+  const target = `${workspace}/${repository}`;
+  if (result?.reason === "present") {
+    return `${buildDependencyLabel(result.dependency)} is already present in ${target}. Refresh the dependency scan before retrying.`;
+  }
+  return `Cloudsmith could not conclusively verify package absence in ${target}. No dependencies were pulled.`;
+}
+
 function normalizeRepositoryCollection(value) {
   if (!value || typeof value !== "object") return { items: [], complete: false };
-  const items = Array.isArray(value.items) ? value.items : [];
+  const sourceItems = Array.isArray(value.items) ? value.items : [];
+  const items = [];
+  const repositorySlugs = new Set();
+  let canonical = true;
+  for (const sourceItem of sourceItems) {
+    const repository = canonicalPullRepository(sourceItem);
+    if (!repository || repositorySlugs.has(repository.slug)) {
+      canonical = false;
+      continue;
+    }
+    repositorySlugs.add(repository.slug);
+    items.push(repository);
+  }
   return {
     items,
-    complete: value.complete === true && value.stale !== true,
+    complete: value.complete === true && value.stale !== true && canonical,
+  };
+}
+
+function canonicalPullRepository(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const slug = value.slug;
+  if (!isBoundedIdentity(slug)) return null;
+  return Object.freeze({
+    slug,
+    name: safeRepositoryDisplayName(value.name, slug),
+  });
+}
+
+function safeRepositoryDisplayName(value, fallback) {
+  const bounded = formatUpstreamText(value, "");
+  return bounded
+    .replace(REPOSITORY_DISPLAY_CONTROL_OR_BIDI, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    || fallback;
+}
+
+function repositoryQuickPickPresentation(repository) {
+  const label = safeRepositoryDisplayName(repository?.slug, "Repository");
+  const name = safeRepositoryDisplayName(repository?.name, label);
+  return {
+    label,
+    description: name !== repository?.slug ? name : "",
   };
 }
 
@@ -1728,12 +2172,17 @@ function buildSingleDependencyRepositoryDetail(match, format) {
     ? match.activeUpstreamsByFormat.get(format)
     : [];
   const activeUpstream = Array.isArray(upstreams) ? upstreams[0] : null;
-  const configuredName = String(activeUpstream && activeUpstream.name || "").trim();
+  const configuredName = safeRepositoryDisplayName(activeUpstream?.name, "");
+  const formatLabel = formatDisplayName(format);
+  const fallbackDetail = `${formatLabel} upstream configured`;
   const sourceLabel = configuredName || defaultUpstreamSourceLabel(format);
   if (!sourceLabel) {
-    return `${formatDisplayName(format)} upstream configured`;
+    return fallbackDetail;
   }
-  return `${formatDisplayName(format)} upstream (${sourceLabel})`;
+  return safeRepositoryDisplayName(
+    `${formatLabel} upstream (${sourceLabel})`,
+    fallbackDetail
+  );
 }
 
 function defaultUpstreamSourceLabel(format) {

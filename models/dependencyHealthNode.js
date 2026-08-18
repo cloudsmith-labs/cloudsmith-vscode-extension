@@ -16,6 +16,7 @@ const {
   fromDependencyHealthNode,
 } = require("../domain/packageAdapters");
 const { PackageDomainError } = require("../domain/package");
+const { markSelection } = require("../util/selectionProvenance");
 
 const UNEXPECTED_PACKAGE_MATCH_WARNING =
   "[Cloudsmith] Unexpected dependency package match validation failure.";
@@ -35,6 +36,7 @@ class DependencyHealthNode {
 
     this.context = hasExplicitCloudsmithMatch ? maybeContext : cloudsmithMatchOrContext;
     this.options = hasExplicitCloudsmithMatch ? (maybeOptions || {}) : (maybeContext || {});
+    markSelection(this, this.options.connectionManager || null);
     this._vulnerabilitySummary = null;
     this.name = dep.name;
     this.declarationName = dep.declarationName || dep.name;
@@ -574,18 +576,18 @@ class DependencyHealthNode {
       children.push(new PackageDetailsNode({
         id: "Status",
         value: status,
-      }, this.context));
+      }, this.context, this));
     }
 
     children.push(new PackageDetailsNode({
       id: "Version",
       value: this.package.version,
-    }, this.context));
+    }, this.context, this));
 
     const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
     if (config.get("showLicenseIndicators") !== false && this.licenseInfo && this.licenseInfo.displayValue) {
       const LicenseNode = require("./licenseNode");
-      children.push(new LicenseNode(this.licenseInfo, this.context));
+      children.push(new LicenseNode(this.licenseInfo, this.context, undefined, this));
     }
 
     const vulnerabilities = this._getVulnerabilityData();
@@ -595,6 +597,7 @@ class DependencyHealthNode {
         this._vulnerabilitySummary = new VulnerabilitySummaryNode(this.package, this.context, {
           connectionManager: this.options.connectionManager,
           vulnerabilityStateService: this.options.vulnerabilityStateService,
+          selectionOwner: this,
         });
         this.options.registerVulnerabilitySummary?.(
           this._vulnerabilitySummary.identity,
@@ -610,13 +613,13 @@ class DependencyHealthNode {
       children.push(new PackageDetailsNode({
         id: "Policy violated",
         value: policy.violated ? "Yes" : "No",
-      }, this.context));
+      }, this.context, this));
 
       if (policy.statusReason) {
         children.push(new PackageDetailsNode({
           id: "Policy reason",
           value: policy.statusReason,
-        }, this.context));
+        }, this.context, this));
       }
     }
 

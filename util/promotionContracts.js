@@ -14,6 +14,7 @@ const MAX_PACKAGE_IDENTIFIER_LENGTH = 512;
 const MAX_PACKAGE_NAME_LENGTH = 512;
 const MAX_PACKAGE_VERSION_LENGTH = 512;
 const MAX_PACKAGE_FORMAT_LENGTH = 64;
+const MAX_PACKAGE_STATUS_LENGTH = 512;
 const MAX_FINGERPRINT_LENGTH = 1024;
 const MAX_PIPELINE_STAGES = 50;
 const MAX_TAGS_PER_STAGE = 20;
@@ -145,6 +146,21 @@ function immutableFingerprint(record) {
   return deepFreeze({ checksum, versionDigest });
 }
 
+function freshSourceStatus(record) {
+  const values = ["status_str", "status_str_raw"]
+    .filter(field => Object.prototype.hasOwnProperty.call(record, field) && record[field] != null)
+    .map(field => scalarString(
+      record[field],
+      MAX_PACKAGE_STATUS_LENGTH,
+      "malformed_source_status"
+    ));
+  if (values.length === 0) return null;
+  if (new Set(values).size !== 1) {
+    throw new PromotionContractError("malformed_source_status");
+  }
+  return values[0];
+}
+
 function normalizeFreshSource(record, locator) {
   if (!isRecord(record) || !locator) throw new PromotionContractError("malformed_source_package");
   const packageIdentifier = freshIdentifier(record, "malformed_source_identifier");
@@ -160,6 +176,7 @@ function normalizeFreshSource(record, locator) {
   if (typeof record.is_copyable !== "boolean") {
     throw new PromotionContractError("malformed_copyability");
   }
+  const status = freshSourceStatus(record);
   return deepFreeze({
     workspace,
     repository,
@@ -172,6 +189,8 @@ function normalizeFreshSource(record, locator) {
     ),
     format: scalarString(record.format, MAX_PACKAGE_FORMAT_LENGTH, "malformed_source_package"),
     copyable: record.is_copyable,
+    status,
+    quarantined: status?.toLowerCase() === "quarantined",
     fingerprint: immutableFingerprint(record),
     tags: canonicalTags(record.tags),
   });
@@ -476,6 +495,7 @@ function validateOutcomeAggregation(outcome) {
   const validAttemptedCopy = !outcome.copy.attempted || (
     hasWriteIdentity
     && outcome.source.copyable === true
+    && outcome.source.quarantined !== true
     && outcome.source.workspace === outcome.target.workspace
     && outcome.source.repository !== outcome.target.repository
     && outcome.copy.required
@@ -549,6 +569,8 @@ function preflightFingerprint(preflight, account, tagPlan) {
     preflight.source.version,
     preflight.source.format,
     preflight.source.copyable,
+    preflight.source.status,
+    preflight.source.quarantined,
     preflight.source.fingerprint.checksum,
     preflight.source.fingerprint.versionDigest,
     preflight.target.workspace,

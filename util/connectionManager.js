@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const vscode = require("vscode");
+const { ContextKeyProjector } = require("./contextKeyProjector");
 
 const AUTH_TOKEN_KEY = "cloudsmith-vsc.authToken";
 const LEGACY_CONNECTION_KEY = "cloudsmith-vsc.isConnected";
@@ -146,6 +147,11 @@ class ConnectionManager {
       return new CloudsmithAPI(apiContext);
     });
     this._executeCommand = options.executeCommand || vscode.commands.executeCommand;
+    this._connectionContextProjector = options.contextKeyProjector || new ContextKeyProjector({
+      defaults: { [CONNECTION_CONTEXT_KEY]: false },
+      executeCommand: this._executeCommand,
+      attempts: 2,
+    });
     this._stateEmitter = new vscode.EventEmitter();
     this.onDidChange = this._stateEmitter.event;
     this._state = freezeState({
@@ -163,7 +169,7 @@ class ConnectionManager {
     this._currentOperation = null;
     this._operationPublicationSequence = new WeakMap();
     this._mutationQueue = Promise.resolve();
-    this._projectionQueue = Promise.resolve();
+    this._disposal = null;
     this._secretEventSequence = 0;
     this._secretEventChain = Promise.resolve();
     this._expectedSecretIntent = null;
@@ -305,7 +311,7 @@ class ConnectionManager {
   }
 
   dispose() {
-    if (this._disposed) return;
+    if (this._disposed) return this._disposal || Promise.resolve();
     this._disposed = true;
     if (this._currentOperation) this._currentOperation.controller.abort();
     this._currentOperation = null;
@@ -320,6 +326,8 @@ class ConnectionManager {
       error: null,
     });
     this._stateEmitter.dispose();
+    this._disposal = this._connectionContextProjector.dispose();
+    return this._disposal;
   }
 
   _beginOperation(publish) {
@@ -1190,22 +1198,13 @@ class ConnectionManager {
     );
   }
 
-  _projectConnection(connected) {
-    const project = async () => {
-      let lastError = null;
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        try {
-          await this._executeCommand("setContext", CONNECTION_CONTEXT_KEY, connected);
-          return null;
-        } catch (error) {
-          lastError = error;
-        }
-      }
-      return publicError(lastError, "Could not update the Cloudsmith connection indicator.");
-    };
-    const run = this._projectionQueue.then(project, project);
-    this._projectionQueue = run.then(() => undefined, () => undefined);
-    return run;
+  async _projectConnection(connected) {
+    const result = await this._connectionContextProjector.project({
+      [CONNECTION_CONTEXT_KEY]: Boolean(connected),
+    });
+    return result.error
+      ? publicError(result.error, "Could not update the Cloudsmith connection indicator.")
+      : null;
   }
 
   async _deleteLegacyStatus() {

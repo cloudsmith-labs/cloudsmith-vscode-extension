@@ -275,7 +275,7 @@ suite("SSOAuthManager Test Suite", () => {
     const { manager: connectionManager } = createConnectionHarness();
     const sso = createManager(connectionManager);
 
-    assert.strictEqual(sso._isValidWorkspaceSlug("w".repeat(128)), true);
+    assert.strictEqual(sso.isValidWorkspaceSlug("w".repeat(128)), true);
   });
 
   test("over-limit workspace slugs are rejected before terminal or browser resources start", async () => {

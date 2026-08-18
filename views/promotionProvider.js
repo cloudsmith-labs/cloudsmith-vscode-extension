@@ -250,8 +250,9 @@ class PromotionProvider {
         const outcome = failureOutcome(sourceRead.errorCode);
         return await this._publish(outcome, operation, account, options);
       }
-      if (!sourceRead.source.copyable) {
-        const outcome = failureOutcome("package_not_copyable", { source: sourceRead.source });
+      const sourceEligibilityError = promotionSourceEligibilityError(sourceRead.source);
+      if (sourceEligibilityError) {
+        const outcome = failureOutcome(sourceEligibilityError, { source: sourceRead.source });
         return await this._publish(outcome, operation, account, options);
       }
 
@@ -288,6 +289,7 @@ class PromotionProvider {
         presenceHints,
         account
       );
+      if (!this._isCurrent(operation, account)) return this._staleOutcome();
       if (!selectedTarget) {
         return createOutcome({
           source: sourceRead.source,
@@ -450,9 +452,8 @@ class PromotionProvider {
     if (!this._isAccountCurrent(account)) return preflightFailure("account_changed");
     const sourceRead = await this._readSource(locator, apiKey, cancellationToken, account);
     if (!sourceRead.ok) return preflightFailure(sourceRead.errorCode, sourceRead.source);
-    if (!sourceRead.source.copyable) {
-      return preflightFailure("package_not_copyable", sourceRead.source);
-    }
+    const sourceEligibilityError = promotionSourceEligibilityError(sourceRead.source);
+    if (sourceEligibilityError) return preflightFailure(sourceEligibilityError, sourceRead.source);
     if (sourceRead.source.repository === selectedTarget.repository) {
       return preflightFailure("invalid_target", sourceRead.source);
     }
@@ -507,6 +508,23 @@ class PromotionProvider {
       return createOutcome({ ...base, overall: "failed", errorCode: "account_changed" });
     }
 
+    const copySourceRead = await this._verifySourceEligibleForWrite(
+      preflight.source,
+      apiKey,
+      account
+    );
+    if (!copySourceRead.ok) {
+      return createOutcome({
+        ...base,
+        source: copySourceRead.source || preflight.source,
+        overall: "failed",
+        errorCode: copySourceRead.errorCode,
+      });
+    }
+    if (!this._isCurrent(operation, account)) {
+      return createOutcome({ ...base, overall: "failed", errorCode: "account_changed" });
+    }
+
     reportProgress(progress, "Copying package...");
     let copyResult;
     const copyEndpoint = apiEndpoint([
@@ -517,6 +535,9 @@ class PromotionProvider {
       "copy",
     ]);
     try {
+      if (!this._isCurrent(operation, account)) {
+        return createOutcome({ ...base, overall: "failed", errorCode: "account_changed" });
+      }
       executionState.writeIssued = true;
       copyResult = await this.api.post(
         copyEndpoint,
@@ -739,6 +760,10 @@ class PromotionProvider {
       null,
       account
     );
+    const eligibilityError = fresh.ok ? promotionSourceEligibilityError(fresh.source) : null;
+    if (eligibilityError) {
+      return createStage("failed", { required: true, errorCode: eligibilityError });
+    }
     if (!fresh.ok || !sameSource(source, fresh.source)) {
       return createStage("failed", { required: true, errorCode: "source_tag_state_unverified" });
     }
@@ -783,6 +808,11 @@ class PromotionProvider {
     const missing = missingTags(fresh.packages[0].tags, requiredTags);
     if (missing.length === 0) {
       return createStage("not_required", { required: true, evidence: "fresh_read" });
+    }
+    if (!this._isCurrent(operation, account)) return createStage("not_attempted", { required: true });
+    const sourceRead = await this._verifySourceEligibleForWrite(source, apiKey, account);
+    if (!sourceRead.ok) {
+      return createStage("failed", { required: true, errorCode: sourceRead.errorCode });
     }
     if (!this._isCurrent(operation, account)) return createStage("not_attempted", { required: true });
     return this._postTags(
@@ -911,6 +941,28 @@ class PromotionProvider {
     } catch (error) {
       return { ok: false, errorCode: errorCode(error, "malformed_source_package") };
     }
+  }
+
+  async _verifySourceEligibleForWrite(source, apiKey, account) {
+    const fresh = await this._readSource(
+      {
+        workspace: source.workspace,
+        repository: source.repository,
+        packageIdentifier: source.packageIdentifier,
+      },
+      apiKey,
+      null,
+      account
+    );
+    if (!fresh.ok) return fresh;
+    const eligibilityError = promotionSourceEligibilityError(fresh.source);
+    if (eligibilityError) {
+      return { ok: false, source: fresh.source, errorCode: eligibilityError };
+    }
+    if (!sameSource(source, fresh.source)) {
+      return { ok: false, source: fresh.source, errorCode: "preflight_changed" };
+    }
+    return fresh;
   }
 
   async _readTargetRepository(target, apiKey, cancellationToken, account) {
@@ -1148,12 +1200,24 @@ class PromotionProvider {
         _target: target,
       };
     });
-    const picked = await this._window.showQuickPick(items, {
-      placeHolder: `Select a target repository for ${source.name} ${source.version}`,
-      matchOnDescription: true,
-      matchOnDetail: true,
-    });
-    return picked?._target || null;
+    const cancellation = typeof vscode.CancellationTokenSource === "function"
+      ? new vscode.CancellationTokenSource()
+      : null;
+    const subscription = this._connectionManager?.onDidChange?.(() => {
+      if (!this._isAccountCurrent(account)) cancellation?.cancel();
+    }) || null;
+    try {
+      const picked = await this._window.showQuickPick(items, {
+        placeHolder: `Select a target repository for ${source.name} ${source.version}`,
+        matchOnDescription: true,
+        matchOnDetail: true,
+      }, cancellation?.token);
+      if (!this._isAccountCurrent(account)) return null;
+      return picked?._target || null;
+    } finally {
+      subscription?.dispose?.();
+      cancellation?.dispose?.();
+    }
   }
 
   async _confirm(preflight, tagPlan) {
@@ -1286,10 +1350,13 @@ class PromotionProvider {
   }
 
   async _suppressStalePublication(outcome) {
-    if (!this._disposed) {
+    if (
+      !this._disposed
+      && ["changed", "possibly_changed", "present"].includes(outcome?.remoteState)
+    ) {
       try {
         await this._window.showWarningMessage(
-          "The active Cloudsmith account changed. Promotion results were not applied to the current view."
+          "The promotion may have changed remote state, but its final outcome could not be shown safely. Verify the target before retrying."
         );
       } catch {
         // Notification failures must not change the remote outcome.
@@ -1358,10 +1425,12 @@ class PromotionProvider {
         "conflicting_source_repository",
         "conflicting_source_identifier",
         "malformed_copyability",
+        "malformed_source_status",
         "malformed_source_package",
         "missing_package_fingerprint",
         "source_identity_changed",
         "package_not_copyable",
+        "package_quarantined",
         "target_package_exists",
         "preflight_changed",
         "malformed_pipeline",
@@ -1483,6 +1552,8 @@ function sameSource(expected, actual) {
     && expected.version === actual.version
     && expected.format === actual.format
     && expected.copyable === actual.copyable
+    && expected.status === actual.status
+    && expected.quarantined === actual.quarantined
     && expected.fingerprint.checksum === actual.fingerprint.checksum
     && expected.fingerprint.versionDigest === actual.fingerprint.versionDigest;
 }
@@ -1527,6 +1598,7 @@ function failureMessage(code) {
     conflicting_source_workspace: "Package workspace details disagree. Refresh the package list and try again.",
     copy_failed: "Cloudsmith did not copy the package. No tags were attempted.",
     malformed_copyability: "Cloudsmith returned incomplete copyability information. No changes were made.",
+    malformed_source_status: "Cloudsmith returned invalid package status information. No changes were made.",
     malformed_pipeline: "The promotion pipeline setting is invalid. Fix it before promoting a package.",
     malformed_source_locator: "Package details are incomplete. Refresh the package list and try again.",
     malformed_source_package: "Cloudsmith returned incomplete package details. No changes were made.",
@@ -1534,6 +1606,7 @@ function failureMessage(code) {
     missing_package_fingerprint: "The package cannot be verified strongly enough for a safe promotion. No changes were made.",
     no_target_repositories: "No valid target repositories are available for this package.",
     package_not_copyable: "This package is not copyable. No changes were made.",
+    package_quarantined: "This package is quarantined. No changes were made.",
     pipeline_repository_missing: "A configured promotion repository is unavailable. Check the pipeline and repository access.",
     preflight_changed: "Package or target state changed before promotion. No changes were made. Select the target again.",
     repository_list_incomplete: "The complete repository list could not be verified. No changes were made.",
@@ -1549,6 +1622,12 @@ function failureMessage(code) {
     unexpected_error: "Promotion stopped because of an unexpected error. No further changes were attempted.",
   };
   return messages[code] || "Promotion requirements could not be verified. No changes were made.";
+}
+
+function promotionSourceEligibilityError(source) {
+  if (source?.quarantined === true) return "package_quarantined";
+  if (source?.copyable !== true) return "package_not_copyable";
+  return null;
 }
 
 function isRecord(value) {

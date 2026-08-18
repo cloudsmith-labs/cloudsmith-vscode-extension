@@ -12,11 +12,20 @@ const { registerUpstreamCommands } = require("../commands/upstream");
 const { registerCommands } = require("../commands/registrar");
 const packageDomain = require("../domain/package");
 const packageAdapters = require("../domain/packageAdapters");
+const {
+  serializePackageCollectionInspection,
+  serializePackageInspection,
+} = require("../util/packageInspection");
+const { normalizeCvssScore } = require("../util/vulnerabilitySeverity");
 
 const INTERNAL_COMMANDS = [
   "cloudsmith-vsc.scanDependenciesPending",
   "cloudsmith-vsc.scanDependenciesComplete",
   "cloudsmith-vsc.rescanDependencies",
+  "cloudsmith-vsc.cycleDepViewDirect",
+  "cloudsmith-vsc.cycleDepViewFlat",
+  "cloudsmith-vsc.cycleDepViewTree",
+  "cloudsmith-vsc.depSortFilterActive",
 ];
 
 function deferred() {
@@ -55,6 +64,17 @@ function baseDependencies(recorder) {
     upstreamExport: {
       async getPrivilegedRepositoryUpstreamsForExport() { return null; },
     },
+    isCurrentSelection: () => true,
+    isCurrentPackageSelection: () => true,
+    isCurrentPackageGroupSelection: () => true,
+    isCurrentRepositorySelection: () => true,
+    isCurrentWorkspaceSelection: () => true,
+    isCurrentDependencySelection: () => true,
+    isCurrentEntitlementSelection: () => true,
+    workspaceAccess: currentAccountAccess(),
+    serializePackageCollectionInspection,
+    serializePackageInspection,
+    normalizeCvssScore,
   };
 }
 
@@ -203,7 +223,7 @@ suite("Command registrars", () => {
     assert.strictEqual(packageRecorder.disposed[13], "cloudsmith-vsc.refreshView");
   });
 
-  test("compatibility aliases share their local primary handlers", () => {
+  test("compatibility aliases preserve primary behavior while dependency aliases stay scoped", () => {
     const dependencyRecorder = recordingRegistration();
     registerDependencyHealthCommands(baseDependencies(dependencyRecorder));
     const dependencyHandlers = dependencyRecorder.handlers;
@@ -234,13 +254,21 @@ suite("Command registrars", () => {
 
     const vulnerabilityRecorder = recordingRegistration();
     registerVulnerabilityCommands(baseDependencies(vulnerabilityRecorder));
-    assert.strictEqual(
+    assert.notStrictEqual(
       vulnerabilityRecorder.handlers.get("cloudsmith-vsc.showDepVulnerabilities"),
       vulnerabilityRecorder.handlers.get("cloudsmith-vsc.showVulnerabilities")
     );
-    assert.strictEqual(
+    assert.notStrictEqual(
       vulnerabilityRecorder.handlers.get("cloudsmith-vsc.findDepSafeVersion"),
       vulnerabilityRecorder.handlers.get("cloudsmith-vsc.findSafeVersion")
+    );
+    assert.strictEqual(
+      typeof vulnerabilityRecorder.handlers.get("cloudsmith-vsc.showDepVulnerabilities"),
+      "function"
+    );
+    assert.strictEqual(
+      typeof vulnerabilityRecorder.handlers.get("cloudsmith-vsc.findDepSafeVersion"),
+      "function"
     );
 
     const packageRecorder = recordingRegistration();
@@ -321,7 +349,10 @@ suite("Command registrars", () => {
           },
         },
       },
-      connectionManager: { isOperationCurrent: () => current },
+      connectionManager: {
+        isOperationCurrent: () => current,
+        async cancelCredentialOperation() {},
+      },
       ssoManager: {
         async loginViaTerminal() { terminalLogins += 1; },
         async loginViaBrowser() { browserLogins += 1; },
@@ -344,6 +375,7 @@ suite("Command registrars", () => {
       vscode: { window: { showQuickPick: async () => null } },
       connectionManager: {
         beginCredentialOperation: () => operation,
+        isOperationCurrent: () => true,
         async cancelCredentialOperation(value) { cancelled.push(value); },
       },
       credentialManager: { async storeApiKey() { stored += 1; } },
@@ -353,6 +385,65 @@ suite("Command registrars", () => {
     await recorder.handlers.get("cloudsmith-vsc.configureCredentials")();
     assert.deepStrictEqual(cancelled, [operation]);
     assert.strictEqual(stored, 0);
+  });
+
+  test("API-key input is cancelled when its credential operation is superseded", async () => {
+    const recorder = recordingRegistration();
+    const operation = Object.freeze({ id: 1 });
+    const input = deferred();
+    const sources = [];
+    let current = true;
+    let changeListener = null;
+    let promptToken = null;
+    let scopedValue = "unset";
+    class CancellationTokenSource {
+      constructor() {
+        this.token = { isCancellationRequested: false };
+        sources.push(this);
+      }
+      cancel() { this.token.isCancellationRequested = true; }
+      dispose() {}
+    }
+    registerAuthenticationCommands({
+      ...baseDependencies(recorder),
+      vscode: {
+        CancellationTokenSource,
+        window: {
+          async showQuickPick() { return { method: "apikey" }; },
+          async showInputBox(_options, token) {
+            promptToken = token;
+            return input.promise;
+          },
+        },
+      },
+      connectionManager: {
+        beginCredentialOperation: () => operation,
+        isOperationCurrent: () => current,
+        onDidChange(listener) {
+          changeListener = listener;
+          return { dispose() {} };
+        },
+      },
+      credentialManager: {
+        async storeApiKey(_operation, options) {
+          scopedValue = await options.showInputBox({ password: true });
+          return { ok: false, status: "stale" };
+        },
+      },
+      handleAuthenticationResult() {},
+    });
+
+    const pending = recorder.handlers.get("cloudsmith-vsc.configureCredentials")();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(typeof changeListener, "function");
+    assert.strictEqual(promptToken.isCancellationRequested, false);
+    current = false;
+    changeListener();
+    assert.strictEqual(promptToken.isCancellationRequested, true);
+    input.resolve("secret-that-must-not-be-used");
+    await pending;
+    assert.strictEqual(scopedValue, null);
+    assert.strictEqual(sources.length, 2);
   });
 
   test("settings/help callbacks invoke only their injected platform services", async () => {
@@ -425,13 +516,13 @@ suite("Command registrars", () => {
     assert.strictEqual(quickPicks[0][0].clear, true);
   });
 
-  test("settings empty workspace state reports an error without opening selection", async () => {
+  test("settings empty workspace state offers only the clear-default recovery action", async () => {
     const recorder = recordingRegistration();
     const harness = workspaceCollectionHarness({
       fetchWorkspaces: async () => ({ items: [], complete: true }),
     });
     const errors = [];
-    let quickPicks = 0;
+    const quickPicks = [];
     let updates = 0;
     registerSettingsHelpCommands({
       ...baseDependencies(recorder),
@@ -442,7 +533,7 @@ suite("Command registrars", () => {
           getConfiguration: () => ({ async update() { updates += 1; } }),
         },
         window: {
-          async showQuickPick() { quickPicks += 1; },
+          async showQuickPick(items) { quickPicks.push(items); },
           showErrorMessage(message) { errors.push(message); },
         },
       },
@@ -453,8 +544,15 @@ suite("Command registrars", () => {
     });
 
     await recorder.handlers.get("cloudsmith-vsc.setDefaultWorkspace")();
-    assert.deepStrictEqual(errors, ["No workspaces found. Connect to Cloudsmith first."]);
-    assert.strictEqual(quickPicks, 0);
+    assert.deepStrictEqual(errors, []);
+    assert.strictEqual(quickPicks.length, 1);
+    assert.deepStrictEqual(quickPicks[0].map(item => ({
+      clear: item.clear === true,
+      label: item.label,
+    })), [{
+      clear: true,
+      label: "$(close) Clear default workspace",
+    }]);
     assert.strictEqual(updates, 0);
   });
 
@@ -529,11 +627,7 @@ suite("Command registrars", () => {
           }),
         },
         window: {
-          showQuickPick: async () => ({
-            label: "Workspace A",
-            description: "workspace-a",
-            clear: false,
-          }),
+          showQuickPick: async items => items.find(item => item.workspace),
           showErrorMessage() {},
         },
       },
@@ -550,12 +644,15 @@ suite("Command registrars", () => {
     assert.strictEqual(refreshes, 0);
   });
 
-  test("package callbacks reject invalid selections and copy adapted detail values", async () => {
+  test("programmatic detail copy requires a current provider-owned selection", async () => {
     const recorder = recordingRegistration();
     const warnings = [];
     const copied = [];
+    const current = Object.freeze({ value: "1.2.3" });
+    const forged = Object.freeze({ value: "forged-secret" });
     registerPackageCommands({
       ...baseDependencies(recorder),
+      isCurrentSelection: item => item === current,
       vscode: {
         env: {
           clipboard: { async writeText(value) { copied.push(value); } },
@@ -567,27 +664,33 @@ suite("Command registrars", () => {
       },
       packageAdapters: {
         fromPackageDetailNode(item) {
-          if (item !== "valid") throw new TypeError("invalid detail");
-          return Object.freeze({ id: "Version", value: "1.2.3" });
+          return Object.freeze({ id: "Version", value: item.value });
         },
       },
     });
 
     const handler = recorder.handlers.get("cloudsmith-vsc.copySelected");
     await handler(null);
-    await handler("valid");
+    await handler(forged);
+    await handler(current);
     assert.deepStrictEqual(copied, ["1.2.3"]);
-    assert.deepStrictEqual(warnings, ["Run this command from a package context menu."]);
+    assert.deepStrictEqual(warnings, []);
   });
 
-  test("package entitlement cancellation never copies the sensitive token", async () => {
+  test("package entitlement cancellation neither copies nor echoes the sensitive token", async () => {
     const recorder = recordingRegistration();
     let writes = 0;
+    const prompts = [];
     registerPackageCommands({
       ...baseDependencies(recorder),
       vscode: {
         env: { clipboard: { async writeText() { writes += 1; } } },
-        window: { showWarningMessage: async () => "Cancel" },
+        window: {
+          async showWarningMessage(...args) {
+            prompts.push(args);
+            return "Cancel";
+          },
+        },
       },
     });
 
@@ -596,9 +699,12 @@ suite("Command registrars", () => {
       tokenName: "read-only",
     });
     assert.strictEqual(writes, 0);
+    assert.strictEqual(prompts.length, 1);
+    assert.deepStrictEqual(prompts[0].slice(1), [{ modal: true }, "Copy"]);
+    assert.strictEqual(JSON.stringify(prompts).includes("secret-token"), false);
   });
 
-  test("install commands canonicalize versionless repository input and default latest", async () => {
+  test("install commands reject non-exact and ambiguous package selections", async () => {
     const recorder = recordingRegistration();
     const builds = [];
     const copied = [];
@@ -634,12 +740,14 @@ suite("Command registrars", () => {
       repository: "repo-a",
       name: "widget",
       format: "npm",
+      copyable: true,
     });
     await recorder.handlers.get("cloudsmith-vsc.copyInstallCommand")({
       cloudsmithWorkspace: "workspace-b",
       cloudsmithRepo: "repo-b",
       name: "other-widget",
       format: "python",
+      copyable: true,
     });
     await recorder.handlers.get("cloudsmith-vsc.copyInstallCommand")({
       namespace: "workspace-a",
@@ -665,28 +773,12 @@ suite("Command registrars", () => {
       format: "npm",
       slug_perm: "",
     });
-    assert.deepStrictEqual(builds, [
-      {
-        format: "npm",
-        name: "widget",
-        version: "latest",
-        workspace: "workspace-a",
-        repository: "repo-a",
-      },
-      {
-        format: "python",
-        name: "other-widget",
-        version: "latest",
-        workspace: "workspace-b",
-        repository: "repo-b",
-      },
-    ]);
-    assert.deepStrictEqual(copied, [
-      "install widget@latest",
-      "install other-widget@latest",
-    ]);
+    assert.deepStrictEqual(builds, []);
+    assert.deepStrictEqual(copied, []);
     assert.deepStrictEqual(recent, []);
     assert.deepStrictEqual(warnings, [
+      "Could not determine package details for install command.",
+      "Could not determine package details for install command.",
       "Could not determine package details for install command.",
       "Could not determine package details for install command.",
       "Could not determine package details for install command.",
@@ -725,7 +817,7 @@ suite("Command registrars", () => {
 
     await recorder.handlers.get("cloudsmith-vsc.inspectPackage")(pkg);
     assert.strictEqual(apiCalls, 1);
-    assert.deepStrictEqual(errors, ["package service unavailable"]);
+    assert.deepStrictEqual(errors, ["Could not inspect package. package service unavailable"]);
   });
 
   test("package-group inspection scopes canonical identity and rejects mixed formats", async () => {
@@ -799,13 +891,16 @@ suite("Command registrars", () => {
         expectedRepository: "repo-a",
       });
     }
-    assert.deepStrictEqual(errors, [" mixed format response"]);
+    assert.deepStrictEqual(errors, ["Could not inspect package group. mixed format response"]);
   });
 
-  test("search callbacks invoke the provider and fail closed without workspace context", async () => {
+  test("strict workspace-search command is silent without a current workspace selection", async () => {
     const recorder = recordingRegistration();
     const warnings = [];
+    const information = [];
     let clearCalls = 0;
+    let searchCalls = 0;
+    let workspaceReads = 0;
     registerSearchCommands({
       ...baseDependencies(recorder),
       vscode: {
@@ -814,20 +909,59 @@ suite("Command registrars", () => {
         },
         window: {
           showWarningMessage(message) { warnings.push(message); },
+          showInformationMessage(message) { information.push(message); },
         },
       },
       searchProvider: {
         clear() { clearCalls += 1; },
+        search() { searchCalls += 1; },
       },
-      workspaceAccess: currentAccountAccess(),
+      workspaceAccess: workspaceCollectionHarness({
+        async fetchWorkspaces() {
+          workspaceReads += 1;
+          return { items: [], complete: true };
+        },
+      }).access,
     });
 
     await recorder.handlers.get("cloudsmith-vsc.clearSearch")();
     await recorder.handlers.get("cloudsmith-vsc.searchInWorkspace")();
+    await recorder.handlers.get("cloudsmith-vsc.filterVulnerableWorkspace")();
     assert.strictEqual(clearCalls, 1);
-    assert.deepStrictEqual(warnings, [
-      "Could not determine the workspace. Set a default workspace in settings.",
-    ]);
+    assert.strictEqual(searchCalls, 0);
+    assert.strictEqual(workspaceReads, 0);
+    assert.deepStrictEqual(warnings, []);
+    assert.deepStrictEqual(information, []);
+  });
+
+  test("workspace vulnerability shortcut rejects a stale item before recovery or search", async () => {
+    const recorder = recordingRegistration();
+    let workspaceReads = 0;
+    let searches = 0;
+    let focusCalls = 0;
+    registerSearchCommands({
+      ...baseDependencies(recorder),
+      isCurrentWorkspaceSelection: () => false,
+      vscode: {
+        commands: { executeCommand() { focusCalls += 1; } },
+        window: {},
+      },
+      workspaceAccess: workspaceCollectionHarness({
+        async fetchWorkspaces() {
+          workspaceReads += 1;
+          return { items: [], complete: true };
+        },
+      }).access,
+      searchProvider: { search() { searches += 1; } },
+    });
+
+    await recorder.handlers.get("cloudsmith-vsc.filterVulnerableWorkspace")({
+      slug: "workspace-a",
+      name: "Workspace A",
+    });
+    assert.strictEqual(workspaceReads, 0);
+    assert.strictEqual(searches, 0);
+    assert.strictEqual(focusCalls, 0);
   });
 
   test("search intent delegates one provider-contained service failure", async () => {
@@ -856,7 +990,7 @@ suite("Command registrars", () => {
           return serviceFailure;
         },
       },
-      workspaceAccess: currentAccountAccess(),
+      workspaceAccess: workspaceCollectionHarness().access,
     });
 
     await recorder.handlers.get("cloudsmith-vsc.searchInWorkspace")({ slug: "workspace-a" });
@@ -870,7 +1004,7 @@ suite("Command registrars", () => {
 
   test("search prompt cannot execute against a stale captured account", async () => {
     const recorder = recordingRegistration();
-    const harness = accountAccessHarness();
+    const harness = workspaceCollectionHarness();
     let beginCalls = 0;
     registerSearchCommands({
       ...baseDependencies(recorder),
@@ -905,7 +1039,7 @@ suite("Command registrars", () => {
       ...baseDependencies(recorder),
       context: {},
       vscode: { window: { showInputBox: async () => null } },
-      workspaceAccess: currentAccountAccess(),
+      workspaceAccess: workspaceCollectionHarness().access,
       RecentSearches: class {},
       searchProvider: { beginSearch() { beginCalls += 1; } },
     });
@@ -937,7 +1071,7 @@ suite("Command registrars", () => {
           async showQuickPick(items) { return items.find(item => item.recent); },
         },
       },
-      workspaceAccess: currentAccountAccess(),
+      workspaceAccess: workspaceCollectionHarness().access,
       RecentSearches,
       searchProvider: {
         beginSearch(descriptor) { return { descriptor }; },
@@ -971,12 +1105,12 @@ suite("Command registrars", () => {
         },
         window: { showQuickPick: async () => null },
       },
-      workspaceAccess: currentAccountAccess({
+      workspaceAccess: workspaceCollectionHarness({
         async fetchWorkspaceRepositories() {
           repositoryReads += 1;
           return { items: [], complete: true };
         },
-      }),
+      }).access,
       RecentSearches,
       searchProvider: { beginSearch() { beginCalls += 1; } },
     });
@@ -984,6 +1118,154 @@ suite("Command registrars", () => {
     await recorder.handlers.get("cloudsmith-vsc.guidedSearch")();
     assert.strictEqual(repositoryReads, 0);
     assert.strictEqual(beginCalls, 0);
+  });
+
+  test("guided search shows only safe verified repository identities", async () => {
+    const recorder = recordingRegistration();
+    let repositoryItems = null;
+    class RecentSearches {
+      async getAll() { return []; }
+    }
+    registerSearchCommands({
+      ...baseDependencies(recorder),
+      context: {},
+      vscode: {
+        QuickPickItemKind: { Separator: 1 },
+        workspace: {
+          getConfiguration: () => ({ get: () => "workspace-a" }),
+        },
+        window: {
+          async showQuickPick(items, options) {
+            if (options.placeHolder === "Step 2: Select a search scope") {
+              return items.find(item => item.scope === "repositories");
+            }
+            if (options.placeHolder === "Select repositories to search") {
+              repositoryItems = items;
+              return null;
+            }
+            throw new Error(`Unexpected picker: ${options.placeHolder}`);
+          },
+          showInformationMessage() {},
+        },
+      },
+      workspaceAccess: workspaceCollectionHarness({
+        async fetchWorkspaceRepositories() {
+          return {
+            items: [
+              { slug: "repo-hostile\u202e", name: "Hostile" },
+              { slug: "repo-safe", name: "Visible\u2066\nRepo" },
+            ],
+            complete: true,
+            stale: false,
+          };
+        },
+      }).access,
+      RecentSearches,
+      searchProvider: { beginSearch() { throw new Error("must not search"); } },
+    });
+
+    await recorder.handlers.get("cloudsmith-vsc.guidedSearch")();
+    assert.ok(repositoryItems);
+    assert.strictEqual(repositoryItems[0].kind, 1);
+    assert.ok(repositoryItems.some(item => item.label === "Visible Repo"));
+    assert.strictEqual(JSON.stringify(repositoryItems).includes("repo-hostile"), false);
+    assert.strictEqual(JSON.stringify(repositoryItems).includes("\u202e"), false);
+    assert.strictEqual(JSON.stringify(repositoryItems).includes("\u2066"), false);
+  });
+
+  test("workspace search shortcuts recheck provider ownership after recovery prompts", async () => {
+    const recorder = recordingRegistration();
+    let current = true;
+    let searchCalls = 0;
+    class RecentSearches {}
+    registerSearchCommands({
+      ...baseDependencies(recorder),
+      context: {},
+      isCurrentWorkspaceSelection: () => current,
+      vscode: {
+        QuickPickItemKind: { Separator: 1 },
+        workspace: { getConfiguration: () => ({ get: () => "" }) },
+        window: {
+          async showInputBox() {
+            current = false;
+            return "name:widget";
+          },
+        },
+      },
+      workspaceAccess: workspaceCollectionHarness().access,
+      RecentSearches,
+      SearchQueryBuilder: class {
+        raw() { return this; }
+        build() { return "name:widget"; }
+      },
+      searchProvider: {
+        beginSearch() { searchCalls += 1; return {}; },
+        async executeSearch() {},
+        async search() { searchCalls += 1; },
+      },
+    });
+
+    const workspaceNode = { slug: "workspace-a", name: "Workspace A" };
+    await recorder.handlers.get("cloudsmith-vsc.searchInWorkspace")(workspaceNode);
+    assert.strictEqual(searchCalls, 0);
+
+    current = true;
+    const access = workspaceCollectionHarness({
+      async fetchWorkspaces() {
+        current = false;
+        return {
+          items: [{ slug: "workspace-a", name: "Workspace A" }],
+          complete: true,
+        };
+      },
+    });
+    const filterRecorder = recordingRegistration();
+    registerSearchCommands({
+      ...baseDependencies(filterRecorder),
+      context: {},
+      isCurrentWorkspaceSelection: () => current,
+      vscode: { workspace: { getConfiguration: () => ({ get: () => "" }) } },
+      workspaceAccess: access.access,
+      searchProvider: { async search() { searchCalls += 1; } },
+    });
+    await filterRecorder.handlers.get("cloudsmith-vsc.filterVulnerableWorkspace")(
+      workspaceNode
+    );
+    assert.strictEqual(searchCalls, 0);
+  });
+
+  test("repository search shortcut rechecks ownership after authoritative recovery", async () => {
+    const recorder = recordingRegistration();
+    let current = true;
+    let searchCalls = 0;
+    const access = workspaceCollectionHarness({
+      async fetchWorkspaceRepositories() {
+        current = false;
+        return {
+          items: [{ slug: "repo-a", name: "Repo A" }],
+          complete: true,
+          stale: false,
+        };
+      },
+    });
+    registerSearchCommands({
+      ...baseDependencies(recorder),
+      context: {},
+      isCurrentRepositorySelection: () => current,
+      packageAdapters: {
+        fromRepositoryNode: () => ({
+          workspace: "workspace-a",
+          repository: "repo-a",
+          name: "Repo A",
+        }),
+      },
+      vscode: { workspace: { getConfiguration: () => ({ get: () => "" }) } },
+      workspaceAccess: access.access,
+      searchProvider: { async search() { searchCalls += 1; } },
+    });
+
+    await recorder.handlers.get("cloudsmith-vsc.filterVulnerable")({});
+    assert.strictEqual(searchCalls, 0);
   });
 
   test("specific-repository scope cancellation never falls through to an all-repository scan", async () => {
@@ -1085,6 +1367,7 @@ suite("Command registrars", () => {
       ...baseDependencies(recorder),
       vscode: {
         workspace: {
+          workspaceFolders: [{ name: "Project", uri: { fsPath: "/project" } }],
           getConfiguration: () => ({
             get(key) {
               if (key === "defaultWorkspace") return "workspace-a";
@@ -1094,25 +1377,32 @@ suite("Command registrars", () => {
           }),
         },
       },
-      workspaceAccess: currentAccountAccess(),
+      workspaceAccess: workspaceCollectionHarness().access,
       dependencyHealthProvider: {
         hasSuccessfulScan: () => false,
-        async scan(workspace, repository) { scans.push({ workspace, repository }); },
+        async scan(workspace, repository, projectFolder) {
+          scans.push({ workspace, repository, projectFolder });
+        },
       },
     });
 
     await recorder.handlers.get("cloudsmith-vsc.scanDependencies")();
-    assert.deepStrictEqual(scans, [{ workspace: "workspace-a", repository: null }]);
+    assert.deepStrictEqual(scans, [{
+      workspace: "workspace-a",
+      repository: null,
+      projectFolder: "/project",
+    }]);
   });
 
   test("primary scan rechecks account ownership after resolving its target", async () => {
     const recorder = recordingRegistration();
-    const harness = accountAccessHarness();
+    const harness = workspaceCollectionHarness();
     let scanCalls = 0;
     registerDependencyHealthCommands({
       ...baseDependencies(recorder),
       vscode: {
         workspace: {
+          workspaceFolders: [{ name: "Project", uri: { fsPath: "/project" } }],
           getConfiguration: () => ({
             get: key => (key === "dependencyScanWorkspace" ? "workspace-a" : null),
           }),
@@ -1133,15 +1423,27 @@ suite("Command registrars", () => {
   test("dependency callbacks contain scan failures and pass only canonical pull coordinates", async () => {
     const recorder = recordingRegistration();
     const scanFailure = Object.freeze({ ok: false, error: "scan unavailable" });
-    const coordinate = Object.freeze({ identityState: "coordinate", name: "left-pad" });
-    const exact = Object.freeze({ identityState: "exact", name: "left-pad" });
+    const coordinate = Object.freeze({
+      identityState: "coordinate",
+      workspace: "workspace-a",
+      repository: "repo-a",
+      name: "left-pad",
+    });
+    const exact = Object.freeze({
+      identityState: "exact",
+      workspace: "workspace-a",
+      repository: "repo-a",
+      name: "left-pad",
+    });
     const adapterOptions = [];
     const pulled = [];
     const warnings = [];
+    let successful = false;
     registerDependencyHealthCommands({
       ...baseDependencies(recorder),
       vscode: {
         workspace: {
+          workspaceFolders: [{ name: "Project", uri: { fsPath: "/project" } }],
           getConfiguration: () => ({
             get(key) {
               if (key === "dependencyScanWorkspace") return "workspace-a";
@@ -1150,7 +1452,13 @@ suite("Command registrars", () => {
             },
           }),
         },
-        window: { showWarningMessage: message => warnings.push(message) },
+        window: {
+          showWarningMessage(message, options) {
+            if (options?.modal) return "Pull dependency";
+            warnings.push(message);
+            return undefined;
+          },
+        },
       },
       packageAdapters: {
         fromDependencyHealthNode(item, options) {
@@ -1161,7 +1469,9 @@ suite("Command registrars", () => {
         },
       },
       dependencyHealthProvider: {
-        hasSuccessfulScan: () => false,
+        hasSuccessfulScan: () => successful,
+        isScanRunning: () => false,
+        isDependencyOperationRunning: () => false,
         async scan() { return scanFailure; },
         getLastSuccessfulScope: () => ({
           workspace: "workspace-a",
@@ -1169,10 +1479,11 @@ suite("Command registrars", () => {
         }),
         async pullSingleDependency(value) { pulled.push(value); },
       },
-      workspaceAccess: currentAccountAccess(),
+      workspaceAccess: workspaceCollectionHarness().access,
     });
 
     const scanResult = await recorder.handlers.get("cloudsmith-vsc.scanDependencies")();
+    successful = true;
     const pull = recorder.handlers.get("cloudsmith-vsc.pullSingleDependency");
     await pull("coordinate");
     await pull("exact");
@@ -1230,6 +1541,9 @@ suite("Command registrars", () => {
       },
       workspaceAccess: currentAccountAccess({ connectionManager }),
       dependencyHealthProvider: {
+        hasSuccessfulScan: () => true,
+        isScanRunning: () => false,
+        isDependencyOperationRunning: () => false,
         getSortMode: () => "alphabetical",
         getFilterMode: () => null,
       },
@@ -1257,12 +1571,13 @@ suite("Command registrars", () => {
     assert.strictEqual(recorder.handlers.has("cloudsmith-vsc.depSortFilter"), false);
   });
 
-  test("CVE command opens only bounded CVE and GHSA identifiers", async () => {
+  test("programmatic CVE command requires ownership and bounded CVE or GHSA identifiers", async () => {
     const recorder = recordingRegistration();
     const opened = [];
     const warnings = [];
     registerVulnerabilityCommands({
       ...baseDependencies(recorder),
+      isCurrentSelection: item => item?.current === true,
       vscode: {
         Uri: { parse: value => value },
         env: { openExternal: async value => opened.push(value) },
@@ -1270,8 +1585,9 @@ suite("Command registrars", () => {
       },
     });
     const handler = recorder.handlers.get("cloudsmith-vsc.openCVE");
-    await handler({ cveId: "CVE-2026-12345" });
-    await handler({ cveId: "GHSA-abcd-1234-wxyz" });
+    await handler({ current: true, cveId: "CVE-2026-12345" });
+    await handler({ current: true, cveId: "GHSA-abcd-1234-wxyz" });
+    await handler({ cveId: "CVE-2026-99999" });
     for (const cveId of [
       "CVE-2026-12345/../../secret",
       "CVE-2026-12345?query=1",
@@ -1281,7 +1597,7 @@ suite("Command registrars", () => {
       "GHSA-abcd-1234",
       "not-a-cve",
     ]) {
-      await handler({ cveId });
+      await handler({ current: true, cveId });
     }
     assert.deepStrictEqual(opened, [
       "https://nvd.nist.gov/vuln/detail/CVE-2026-12345",
@@ -1316,7 +1632,7 @@ suite("Command registrars", () => {
     await recorder.handlers.get("cloudsmith-vsc.explainQuarantine")();
     assert.deepStrictEqual(shown, []);
     assert.deepStrictEqual(information, [
-      "No recent packages. Run this command from a package context menu.",
+      "No recent packages are available. Open or inspect a package, then try again.",
     ]);
   });
 
@@ -1339,7 +1655,7 @@ suite("Command registrars", () => {
     assert.deepStrictEqual(recent, [canonical]);
   });
 
-  test("dependency vulnerability commands preserve matched and unmatched source semantics", async () => {
+  test("dependency vulnerability commands accept exact matches and reject unmatched nodes", async () => {
     const recorder = recordingRegistration();
     const exactPackage = packageDomain.createExactPackage({
       workspace: "workspace-a",
@@ -1351,6 +1667,7 @@ suite("Command registrars", () => {
       status: "Completed",
     });
     const matchedNode = {
+      getTreeItem: () => ({ contextValue: "dependencyHealthVulnerable" }),
       package: exactPackage,
       cloudsmithMatch: exactPackage,
       declarationName: "declared-widget",
@@ -1366,6 +1683,7 @@ suite("Command registrars", () => {
       slug_perm_raw: exactPackage.packageIdentifier,
     };
     const unmatchedNode = {
+      getTreeItem: () => ({ contextValue: "dependencyHealthVulnerable" }),
       declarationName: "declared-other",
       name: "normalized-other",
       declaredVersion: "^3.0.0",
@@ -1414,11 +1732,9 @@ suite("Command registrars", () => {
     assert.deepStrictEqual(shown, [exactPackage]);
     assert.deepStrictEqual(safeCalls, [
       ["workspace-a", "repo-a", "canonical-widget", "npm"],
-      ["workspace-a", "repo-a", "normalized-other", "python"],
     ]);
-    assert.deepStrictEqual(recent, [exactPackage, exactPackage]);
+    assert.deepStrictEqual(recent, [exactPackage]);
     assert.deepStrictEqual(errors, [
-      "Could not find safe versions. remediation unavailable",
       "Could not find safe versions. remediation unavailable",
     ]);
   });
@@ -1521,6 +1837,8 @@ suite("Command registrars", () => {
       version: "1.2.3",
       format: "python",
       packageIdentifier: "pkg-1",
+      copyable: true,
+      status: "Completed",
     });
     registerPromotionCommands({
       ...baseDependencies(recorder),
@@ -1566,6 +1884,8 @@ suite("Command registrars", () => {
       name: "widget",
       version: "1.2.3",
       repository: "repo-a",
+      copyable: true,
+      status: "Completed",
     });
     let workflows = 0;
     registerPromotionCommands({
@@ -1620,9 +1940,87 @@ suite("Command registrars", () => {
     ]);
   });
 
-  test("upstream repository selection cannot cross an account change", async () => {
+  test("incomplete promotion status uses warning severity", async () => {
+    const pkg = Object.freeze({
+      identityState: "exact",
+      workspace: "workspace-a",
+      repository: "repo-a",
+      name: "widget",
+      version: "1.2.3",
+      format: "python",
+      status: "Completed",
+      policy: Object.freeze({ violated: false }),
+    });
+    for (const pipeline of [true, false]) {
+      const recorder = recordingRegistration();
+      const information = [];
+      const warnings = [];
+      registerPromotionCommands({
+        ...baseDependencies(recorder),
+        vscode: {
+          window: {
+            showErrorMessage() {},
+            showInformationMessage: message => information.push(message),
+            showWarningMessage: message => warnings.push(message),
+          },
+        },
+        packageAdapters: {
+          fromPackageSelection: value => value,
+          fromApiPackageRecord: value => value,
+        },
+        packageDomain: { assertExactPackage: value => value },
+        recentPackages: { getAll: () => [], add() {} },
+        normalizePackageQueryIdentity: (workspaceSlug, name, version, format) => ({
+          workspace: workspaceSlug,
+          name,
+          version,
+          format,
+        }),
+        promotionProvider: {
+          getPipeline: () => (pipeline ? ["repo-a"] : []),
+          async getPromotionStatus() {
+            return {
+              error: null,
+              complete: false,
+              items: [{
+                repo: "repo-a",
+                status: "Completed",
+                found: true,
+                quarantined: false,
+                policyViolated: false,
+              }],
+            };
+          },
+          async getPackageLocations() {
+            return {
+              items: [pkg],
+              complete: false,
+              failureCount: 1,
+              pageCount: 1,
+            };
+          },
+        },
+      });
+
+      await recorder.handlers.get("cloudsmith-vsc.showPromotionStatus")(pkg);
+      assert.strictEqual(information.length, 0);
+      assert.strictEqual(warnings.length, 1);
+      assert.ok(warnings[0].includes("incomplete") || warnings[0].includes("unavailable"));
+    }
+  });
+
+  test("upstream dependency target selection cannot cross an account change", async () => {
     const recorder = recordingRegistration();
-    const harness = workspaceCollectionHarness();
+    const harness = workspaceCollectionHarness({
+      fetchWorkspaceRepositories: async () => ({
+        items: [
+          { slug: "repo-a", name: "Repo A" },
+          { slug: "repo-b", name: "Repo B" },
+        ],
+        complete: true,
+        stale: false,
+      }),
+    });
     let factoryCalls = 0;
     registerUpstreamCommands({
       ...baseDependencies(recorder),
@@ -1636,10 +2034,18 @@ suite("Command registrars", () => {
             harness.stale();
             return items[0];
           },
+          showInformationMessage() {},
+          showWarningMessage() {},
         },
       },
       workspaceAccess: harness.access,
-      packageAdapters: { fromRepositoryNode: value => value },
+      FORMAT_OPTIONS: ["python"],
+      packageAdapters: {
+        fromDependencyHealthNode: item => ({ name: item.name, format: item.format }),
+      },
+      dependencyHealthProvider: {
+        getLastSuccessfulScope: () => ({ workspace: "workspace-a", repository: null }),
+      },
       packageDomain: {
         createPackageResolutionInput() { factoryCalls += 1; },
       },
@@ -1648,6 +2054,7 @@ suite("Command registrars", () => {
     await recorder.handlers.get("cloudsmith-vsc.previewUpstreamResolution")({
       name: "widget",
       format: "python",
+      getTreeItem: () => ({ contextValue: "dependencyHealthMissing" }),
     });
     assert.strictEqual(factoryCalls, 0);
   });
@@ -1732,7 +2139,7 @@ suite("Command registrars", () => {
           async openTextDocument() { documents += 1; },
         },
       },
-      workspaceAccess: currentAccountAccess(),
+      workspaceAccess: workspaceCollectionHarness().access,
       packageAdapters: {
         fromRepositoryNode: () => Object.freeze({
           workspace: "workspace-a",
@@ -1756,7 +2163,7 @@ suite("Command registrars", () => {
     });
 
     const pending = recorder.handlers.get("cloudsmith-vsc.exportTerraform")({});
-    await Promise.resolve();
+    await new Promise(resolve => setImmediate(resolve));
     assert.strictEqual(signals.length, 3);
     disposable.dispose();
     await pending;
@@ -1771,7 +2178,7 @@ suite("Command registrars", () => {
 
   test("Terraform export cannot publish after its captured account changes", async () => {
     const recorder = recordingRegistration();
-    const harness = accountAccessHarness();
+    const harness = workspaceCollectionHarness();
     const upstream = deferred();
     let documents = 0;
     let capturedOptions = null;
@@ -1815,8 +2222,7 @@ suite("Command registrars", () => {
     });
 
     const pending = recorder.handlers.get("cloudsmith-vsc.exportTerraform")({});
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise(resolve => setImmediate(resolve));
     assert.deepStrictEqual(capturedOptions.account, {
       activationId: "activation-a",
       accountEpoch: 1,
@@ -1828,12 +2234,88 @@ suite("Command registrars", () => {
     assert.strictEqual(documents, 0);
   });
 
+  test("Terraform export fails closed on retention failure and treats cancellation silently", async () => {
+    for (const scenario of [
+      {
+        error: { kind: "service", message: "retention unavailable" },
+        expectedErrors: [
+          "Could not export repository retention settings. retention unavailable",
+        ],
+      },
+      {
+        error: { kind: "cancelled", message: "cancelled" },
+        expectedErrors: [],
+      },
+    ]) {
+      const recorder = recordingRegistration();
+      const errors = [];
+      let generated = 0;
+      let documents = 0;
+      registerUpstreamCommands({
+        ...baseDependencies(recorder),
+        context: {},
+        vscode: {
+          ProgressLocation: { Notification: 1 },
+          window: {
+            async withProgress(_options, task) {
+              return task(null, { onCancellationRequested: () => ({ dispose() {} }) });
+            },
+            showErrorMessage(message) { errors.push(message); },
+            showWarningMessage() {},
+            async showTextDocument() { documents += 1; },
+          },
+          workspace: {
+            async openTextDocument() { documents += 1; return {}; },
+          },
+        },
+        workspaceAccess: workspaceCollectionHarness().access,
+        packageAdapters: {
+          fromRepositoryNode: () => ({
+            workspace: "workspace-a",
+            repository: "repo-a",
+            name: "Repo A",
+          }),
+        },
+        CloudsmithAPI: class {
+          async get(endpoint) {
+            return endpoint.endsWith("/retention")
+              ? { ok: false, error: scenario.error }
+              : { ok: true, data: {} };
+          }
+        },
+        apiEndpoint: parts => `/${parts.join("/")}`,
+        upstreamExport: {
+          async getPrivilegedRepositoryUpstreamsForExport() {
+            return {
+              data: [],
+              complete: true,
+              error: null,
+              failedFormats: [],
+              uninspectedFormats: [],
+            };
+          },
+        },
+        generateTerraformConfig() {
+          generated += 1;
+          return "resource {}";
+        },
+        formatApiError: error => error.message,
+      });
+
+      await recorder.handlers.get("cloudsmith-vsc.exportTerraform")({});
+      assert.deepStrictEqual(errors, scenario.expectedErrors);
+      assert.strictEqual(generated, 0);
+      assert.strictEqual(documents, 0);
+    }
+  });
+
   test("upstream preview validates input and contains a null service result", async () => {
     const recorder = recordingRegistration();
     const warnings = [];
     const factoryInputs = [];
     const previewCalls = [];
     const shown = [];
+    const names = ["widget", "../escape", "service-error"];
     const upstreamPreview = {
       async previewResolution(...args) {
         previewCalls.push(args);
@@ -1851,23 +2333,20 @@ suite("Command registrars", () => {
           ) }),
         },
         window: {
+          async showInputBox() { return names.shift(); },
           async showQuickPick(items) { return items[0]; },
           showWarningMessage(message) { warnings.push(message); },
           async withProgress(_options, task) { return task(); },
         },
       },
-      workspaceAccess: currentAccountAccess({
-        context: {},
+      workspaceAccess: workspaceCollectionHarness({
         fetchWorkspaceRepositories: async () => ({
           items: [{ name: "Repo A", slug: "repo-a" }],
           complete: true,
+          stale: false,
         }),
-        formatApiError: error => error.message,
-        vscode: { window: { showErrorMessage() {}, showWarningMessage() {} } },
-      }),
-      packageAdapters: {
-        fromRepositoryNode: value => value,
-      },
+      }).access,
+      FORMAT_OPTIONS: ["python"],
       packageDomain: {
         createPackageResolutionInput(input) {
           factoryInputs.push(input);
@@ -1880,9 +2359,9 @@ suite("Command registrars", () => {
     });
 
     const handler = recorder.handlers.get("cloudsmith-vsc.previewUpstreamResolution");
-    await handler({ name: "widget", format: "python" });
-    await handler({ name: "../escape", format: "python" });
-    await handler({ name: "service-error", format: "python" });
+    await handler();
+    await handler();
+    await handler();
     assert.deepStrictEqual(factoryInputs, [
       {
         workspace: "workspace-a",
@@ -1937,12 +2416,17 @@ suite("Command registrars", () => {
           showWarningMessage() {},
         },
       },
-      workspaceAccess: currentAccountAccess({
-        fetchWorkspaceRepositories: async () => ({
-          items: [{ name: "Repo A", slug: "repo-a" }],
-          complete: true,
+      workspaceAccess: currentAccountAccess(),
+      FORMAT_OPTIONS: ["python"],
+      packageAdapters: {
+        fromDependencyHealthNode: item => ({ name: item.name, format: item.format }),
+      },
+      dependencyHealthProvider: {
+        getLastSuccessfulScope: () => ({
+          workspace: "workspace-a",
+          repository: "repo-a",
         }),
-      }),
+      },
       packageDomain: {
         createPackageResolutionInput: input => Object.freeze({ ...input }),
       },
@@ -1955,9 +2439,17 @@ suite("Command registrars", () => {
       upstreamPreviewProvider: { show: value => shown.push(value) },
     });
     const handler = recorder.handlers.get("cloudsmith-vsc.previewUpstreamResolution");
-    const firstRun = handler({ name: "first", format: "python" });
+    const firstRun = handler({
+      name: "first",
+      format: "python",
+      getTreeItem: () => ({ contextValue: "dependencyHealthMissing" }),
+    });
     await new Promise(resolve => setImmediate(resolve));
-    const secondRun = handler({ name: "second", format: "python" });
+    const secondRun = handler({
+      name: "second",
+      format: "python",
+      getTreeItem: () => ({ contextValue: "dependencyHealthMissing" }),
+    });
     await new Promise(resolve => setImmediate(resolve));
 
     assert.strictEqual(calls.length, 2);

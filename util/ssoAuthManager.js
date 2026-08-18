@@ -202,7 +202,7 @@ class SSOAuthManager {
     const manager = this._getConnectionManager();
     if (!manager) return unavailableResult();
     const token = operation || manager.beginCredentialOperation();
-    if (!this._isValidWorkspaceSlug(workspaceSlug)) {
+    if (!this.isValidWorkspaceSlug(workspaceSlug)) {
       await manager.cancelCredentialOperation(token);
       this._showErrorMessage("Enter a valid Cloudsmith workspace slug.");
       return failedResult("invalid_workspace", "The Cloudsmith workspace slug is invalid.");
@@ -262,7 +262,7 @@ class SSOAuthManager {
     const manager = this._getConnectionManager();
     if (!manager) return unavailableResult();
     const token = operation || manager.beginCredentialOperation();
-    if (!this._isValidWorkspaceSlug(workspaceSlug)) {
+    if (!this.isValidWorkspaceSlug(workspaceSlug)) {
       await manager.cancelCredentialOperation(token);
       this._showErrorMessage("Enter a valid Cloudsmith workspace slug.");
       return failedResult("invalid_workspace", "The Cloudsmith workspace slug is invalid.");
@@ -401,7 +401,7 @@ class SSOAuthManager {
     }
   }
 
-  _isValidWorkspaceSlug(workspaceSlug) {
+  isValidWorkspaceSlug(workspaceSlug) {
     return typeof workspaceSlug === "string"
       && workspaceSlug.length > 0
       && workspaceSlug.length <= MAX_WORKSPACE_SLUG_LENGTH

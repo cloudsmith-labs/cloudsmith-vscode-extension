@@ -16,15 +16,33 @@ const root = path.resolve(__dirname, "..");
 suite("M11 architecture gate", () => {
   test("production architecture, ownership, and executable registration parity pass", () => {
     const result = verifyArchitecture({ root });
+    const manifest = require("../package.json");
     assert.strictEqual(result.diagnostics.length, 0);
     assert.strictEqual(result.observed.length, 64);
     assert.strictEqual(new Set(result.observed.map((entry) => entry.command)).size, 64);
+    assert.strictEqual(manifest.contributes.commands.length, 57);
+    const contributed = new Set(manifest.contributes.commands.map(entry => entry.command));
+    assert.deepStrictEqual(
+      result.observed
+        .map(entry => entry.command)
+        .filter(command => !contributed.has(command))
+        .sort(),
+      [
+        "cloudsmith-vsc.cycleDepViewDirect",
+        "cloudsmith-vsc.cycleDepViewFlat",
+        "cloudsmith-vsc.cycleDepViewTree",
+        "cloudsmith-vsc.depSortFilterActive",
+        "cloudsmith-vsc.rescanDependencies",
+        "cloudsmith-vsc.scanDependenciesComplete",
+        "cloudsmith-vsc.scanDependenciesPending",
+      ],
+    );
   });
 
   test("controlled valid, boundary, parity, and scanner fixtures prove stable rules", () => {
     assert.deepStrictEqual(runArchitectureSelfTests(), {
-      invalidFixtures: 66,
-      validFixtures: 1,
+      invalidFixtures: 79,
+      validFixtures: 2,
     });
   });
 

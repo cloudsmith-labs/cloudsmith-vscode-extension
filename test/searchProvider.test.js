@@ -79,6 +79,52 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(connectionManager.additionalCallerState, "still mutable");
   });
 
+  test("projects search state and owns only selections rendered in the current generation", async () => {
+    const contextValues = new Map();
+    const { provider, connectionManager } = createProvider({
+      executeCommand: async (command, key, value) => {
+        if (command === "setContext") contextValues.set(key, value);
+      },
+      fetchPage: async () => page([pkg("artifact")], {
+        pageSize: 1,
+        pageTotal: 2,
+        count: 2,
+      }),
+    });
+
+    await provider.search("workspace-a", "artifact");
+    await nextTurn();
+    assert.strictEqual(contextValues.get("cloudsmith.searchActive"), true);
+    assert.strictEqual(contextValues.get("cloudsmith.searchCanLoadMore"), true);
+
+    const packageNode = provider.searchResults[0];
+    const roots = await provider.getChildren();
+    assert(roots.includes(packageNode));
+    assert.strictEqual(provider.ownsPackageSelection(packageNode), true);
+    const summary = packageNode.getChildren().find(
+      child => child.getTreeItem().contextValue === "vulnerabilitySummary"
+    );
+    const events = [];
+    provider.onDidChangeTreeData(element => events.push(element));
+    assert.strictEqual(provider.refreshNode(summary), true);
+    assert.deepStrictEqual(events, [summary]);
+
+    provider.refresh();
+    assert.strictEqual(provider.ownsPackageSelection(packageNode), false);
+    await provider.getChildren();
+    assert.strictEqual(provider.ownsPackageSelection(packageNode), true);
+
+    connectionManager.update({ accountEpoch: 2 });
+    await nextTurn();
+    assert.strictEqual(provider.ownsPackageSelection(packageNode), false);
+    assert.strictEqual(contextValues.get("cloudsmith.searchActive"), false);
+    assert.strictEqual(contextValues.get("cloudsmith.searchCanLoadMore"), false);
+
+    await provider.dispose();
+    assert.strictEqual(contextValues.get("cloudsmith.searchActive"), false);
+    assert.strictEqual(contextValues.get("cloudsmith.searchCanLoadMore"), false);
+  });
+
   test("vulnerability publication targets the stable summary and ignores replaced search owners", async () => {
     const vulnerabilityStateService = createVulnerabilityStateService();
     const { provider } = createProvider({
@@ -1869,6 +1915,7 @@ suite("SearchProvider atomic search state", () => {
         },
         getAggregationPageSize: () => options.pageSize || 50,
         vulnerabilityStateService: options.vulnerabilityStateService,
+        executeCommand: options.executeCommand,
       }
     );
     providers.push(provider);

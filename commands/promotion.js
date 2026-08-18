@@ -3,8 +3,11 @@
 const { registerCommands } = require("./registrar");
 const {
   adaptPackageSelection,
+  captureCommandAccount,
   firstCollectionFailureMessage,
   pickRecentPackage,
+  isCommandAccountCurrent,
+  isQuarantinedPackage,
 } = require("./support");
 
 function registerPromotionCommands(deps) {
@@ -18,15 +21,37 @@ function registerPromotionCommands(deps) {
     normalizePackageQueryIdentity,
     cloudsmithProvider,
   } = deps;
-  const recentSupport = { recentPackages, packageAdapters, vscode };
+  const recentSupport = { ...deps, recentPackages, packageAdapters, vscode };
 
-  async function selectedPackage(item) {
-    const pkg = item
-      ? adaptPackageSelection(packageAdapters, item)
-      : await pickRecentPackage(recentSupport);
+  async function selectedPackage(item, accountScope, options = {}) {
+    let pkg;
+    if (item) {
+      try {
+        pkg = adaptPackageSelection(packageAdapters, item);
+      } catch {
+        vscode.window.showWarningMessage("Could not determine package details.");
+        return null;
+      }
+      if (
+        typeof deps.isCurrentPackageSelection !== "function"
+        || !deps.isCurrentPackageSelection(item)
+      ) return null;
+    } else {
+      pkg = await pickRecentPackage(recentSupport, {
+        ...options,
+        accountScope,
+        currentSelection: candidate => deps.isCurrentPackageSelection?.(candidate) === true,
+      });
+    }
     if (!pkg && !item) return null;
+    if (!isCommandAccountCurrent(accountScope)) return null;
     try {
-      return packageDomain.assertExactPackage(pkg);
+      const exact = packageDomain.assertExactPackage(pkg);
+      if (options.predicate && !options.predicate(exact)) {
+        vscode.window.showWarningMessage(options.invalidStateMessage || "This package is not eligible for promotion.");
+        return null;
+      }
+      return exact;
     } catch {
       vscode.window.showWarningMessage("Could not determine package details.");
       return null;
@@ -34,8 +59,11 @@ function registerPromotionCommands(deps) {
   }
 
   async function showPromotionStatus(item) {
-    const pkg = await selectedPackage(item);
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope) return;
+    const pkg = await selectedPackage(item, accountScope);
     if (!pkg) return;
+    if (!isCommandAccountCurrent(accountScope)) return;
     recentPackages.add(pkg);
     let identity;
     try {
@@ -52,12 +80,14 @@ function registerPromotionCommands(deps) {
 
     const pipeline = promotionProvider.getPipeline();
     if (pipeline.length > 0) {
+      if (!isCommandAccountCurrent(accountScope)) return;
       const statusResult = await promotionProvider.getPromotionStatus(
         identity.workspace,
         identity.name,
         identity.version,
         identity.format
       );
+      if (!isCommandAccountCurrent(accountScope)) return;
       if (statusResult.error) {
         vscode.window.showErrorMessage(
           `Could not load promotion status. ${deps.formatApiError(statusResult.error)}`
@@ -79,18 +109,23 @@ function registerPromotionCommands(deps) {
       const completeness = statusResult.complete
         ? ""
         : " (package-location search incomplete)";
-      vscode.window.showInformationMessage(
-        `Pipeline for ${identity.name} ${identity.version}: ${lines.join(" → ")}${completeness}`
-      );
+      const message = `Pipeline for ${identity.name} ${identity.version}: ${lines.join(" → ")}${completeness}`;
+      if (statusResult.complete) {
+        vscode.window.showInformationMessage(message);
+      } else {
+        vscode.window.showWarningMessage(message);
+      }
       return;
     }
 
+    if (!isCommandAccountCurrent(accountScope)) return;
     const results = await promotionProvider.getPackageLocations(
       identity.workspace,
       identity.name,
       identity.version,
       identity.format
     );
+    if (!isCommandAccountCurrent(accountScope)) return;
     if (results.items.length === 0 && results.failureCount > 0 && results.pageCount === 0) {
       vscode.window.showErrorMessage(
         `Could not load package locations.${firstCollectionFailureMessage(results, deps.formatApiError)}`
@@ -125,14 +160,24 @@ function registerPromotionCommands(deps) {
       return `${icon} ${location.repository}: ${location.status || "Unknown"}`;
     });
     const completeness = results.complete ? "" : " (additional locations may be unavailable)";
-    vscode.window.showInformationMessage(
-      `${identity.name} ${identity.version} found in: ${lines.join(", ")}${completeness}`
-    );
+    const message = `${identity.name} ${identity.version} found in: ${lines.join(", ")}${completeness}`;
+    if (results.complete) {
+      vscode.window.showInformationMessage(message);
+    } else {
+      vscode.window.showWarningMessage(message);
+    }
   }
 
   async function promotePackage(item) {
-    const pkg = await selectedPackage(item);
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope) return;
+    const pkg = await selectedPackage(item, accountScope, {
+      predicate: pkg => pkg.copyable === true && !isQuarantinedPackage(pkg),
+      emptyMessage: "No recent promotable packages. Open or search for an eligible package, then try again.",
+      invalidStateMessage: "This package is not eligible for promotion.",
+    });
     if (!pkg) return;
+    if (!isCommandAccountCurrent(accountScope)) return;
     await promotionProvider.runPromotionWorkflow(pkg, {
       refresh: () => cloudsmithProvider.refresh(),
     });

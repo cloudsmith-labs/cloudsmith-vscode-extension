@@ -14,11 +14,13 @@ const {
   isAccountCurrent,
   resolveConnectionManager,
 } = require("../util/accountOperation");
+const { markSelection } = require("../util/selectionProvenance");
 
 class WorkspaceNode {
   constructor(item, context, options = {}) {
     this.context = context;
     this._connectionManager = resolveConnectionManager(context, options.connectionManager);
+    markSelection(this, this._connectionManager);
     this._createCloudsmithAPI = options.createCloudsmithAPI
       || (() => new CloudsmithAPI(this.context));
     this._fetchWorkspaceRepositories = options.fetchWorkspaceRepositories

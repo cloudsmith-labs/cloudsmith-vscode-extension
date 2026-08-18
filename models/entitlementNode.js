@@ -3,6 +3,7 @@
 
 const vscode = require("vscode");
 const InfoNode = require("./infoNode");
+const { inheritSelection } = require("../util/selectionProvenance");
 
 /**
  * Summary header node with an authoritative total only for complete collections.
@@ -20,6 +21,10 @@ class EntitlementSummaryNode {
       ? options.failureCount
       : 0;
     this.termination = typeof options.termination === "string" ? options.termination : null;
+    this._registerEntitlement = typeof options.registerEntitlement === "function"
+      ? options.registerEntitlement
+      : () => {};
+    inheritSelection(this, options.selectionOwner || null);
   }
 
   getTreeItem() {
@@ -42,7 +47,11 @@ class EntitlementSummaryNode {
   }
 
   getChildren() {
-    const children = this.entitlements.map(e => new EntitlementNode(e, this.context));
+    const children = this.entitlements.map((entitlement) => {
+      const node = new EntitlementNode(entitlement, this.context, this);
+      this._registerEntitlement(node);
+      return node;
+    });
     if (!this.complete) {
       children.unshift(new InfoNode(
         "Entitlement list is incomplete",
@@ -61,8 +70,9 @@ class EntitlementSummaryNode {
  * Individual entitlement token node.
  */
 class EntitlementNode {
-  constructor(entitlement, context) {
+  constructor(entitlement, context, owner = null) {
     this.context = context;
+    inheritSelection(this, owner);
     this.entitlement = entitlement;
     this.tokenName = entitlement.name || "Unnamed token";
     this.isActive = entitlement.is_active !== false;
@@ -95,7 +105,7 @@ class EntitlementNode {
       description: descParts.join(" \u2014 "),
       tooltip: this._buildTooltip(),
       collapsibleState: vscode.TreeItemCollapsibleState.None,
-      contextValue: "entitlement",
+      contextValue: this.token ? "entitlementWithToken" : "entitlement",
       iconPath: new vscode.ThemeIcon("key", iconColor),
     };
   }
