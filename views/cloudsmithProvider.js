@@ -28,6 +28,12 @@ const { getWorkspaceContextProjector } = require("../util/workspaceContextProjec
 class CloudsmithProvider {
   constructor(context, options = {}) {
     this.context = context;
+    if (
+      !options.upstreamInventory
+      || typeof options.upstreamInventory.getAllUpstreamData !== "function"
+    ) {
+      throw new TypeError("CloudsmithProvider requires an upstream inventory facade.");
+    }
     this._connectionManager = resolveConnectionManager(context, options.connectionManager);
     this._workspaceCache = options.workspaceCache
       || new WorkspaceCache(this._connectionManager, options.workspaceCacheOptions);
@@ -40,7 +46,7 @@ class CloudsmithProvider {
       || getWorkspaceContextProjector(context);
     this._repositoryNodeOptions = Object.freeze({
       createPaginatedFetch: options.createPaginatedFetch,
-      upstreamChecker: options.upstreamChecker,
+      upstreamInventory: options.upstreamInventory,
       withProgress: options.withProgress,
     });
     this._vulnerabilityStateService = options.vulnerabilityStateService || null;

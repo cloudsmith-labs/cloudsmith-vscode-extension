@@ -32,6 +32,7 @@ suite("WorkspaceNode", () => {
       connectionManager: manager,
       createCloudsmithAPI: () => ({ get: apiGet }),
       fetchWorkspaceRepositories,
+      createRepositoryNode: repo => ({ ...repo }),
     });
   }
 

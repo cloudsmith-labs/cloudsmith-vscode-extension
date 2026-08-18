@@ -14,8 +14,7 @@ const {
   resolveAndValidateRegistryUrl,
 } = require("./registryEndpoints");
 const { canonicalFormat, normalizePackageName } = require("./packageNameNormalizer");
-const { sanitizeSafeInventoryUpstream, UpstreamChecker } = require("./upstreamChecker");
-const { UpstreamOperationScheduler } = require("./upstreamOperationScheduler");
+const { sanitizeSafeInventoryUpstream } = require("./upstreamChecker");
 const { getUpstreamFormatDescriptor, normalizeUpstreamFormat } = require("./upstreamFormats");
 const {
   captureAccount,
@@ -55,6 +54,13 @@ const PULL_SKIP_REASON = Object.freeze({
 
 class UpstreamPullService {
   constructor(context, options = {}) {
+    if (
+      !options.upstreamRuntime
+      || typeof options.upstreamRuntime.getRepositoryUpstreamStateForFormats !== "function"
+      || typeof options.upstreamRuntime.createOperationScope !== "function"
+    ) {
+      throw new TypeError("UpstreamPullService requires a safe upstream runtime facade.");
+    }
     this.context = context;
     this._api = options.api || new CloudsmithAPI(context);
     this._credentialManager = options.credentialManager || new CredentialManager(context);
@@ -66,7 +72,7 @@ class UpstreamPullService {
     this._showErrorMessage = options.showErrorMessage || vscode.window.showErrorMessage.bind(vscode.window);
     this._showInformationMessage = options.showInformationMessage || vscode.window.showInformationMessage.bind(vscode.window);
     this._showWarningMessage = options.showWarningMessage || vscode.window.showWarningMessage.bind(vscode.window);
-    this._upstreamChecker = options.upstreamChecker || new UpstreamChecker(context);
+    this._upstreamRuntime = options.upstreamRuntime;
     this._connectionManager = resolveConnectionManager(context, options.connectionManager);
   }
 
@@ -94,8 +100,13 @@ class UpstreamPullService {
     token = null,
     cancellationToken = null,
     signal = null,
+    account = null,
   }) {
-    const operation = this._createPreparationOperation(cancellationToken || token, signal);
+    const operation = this._createPreparationOperation(
+      cancellationToken || token,
+      signal,
+      account
+    );
     if (!this._isPreparationCurrent(operation)) return null;
     const uncoveredDependencies = dedupePullDependencies(
       (Array.isArray(dependencies) ? dependencies : [])
@@ -144,7 +155,7 @@ class UpstreamPullService {
       inspectionFormats,
       operation
     );
-    if (!this._isPreparationCurrent(operation)) return null;
+    if (!repositorySearch || !this._isPreparationCurrent(operation)) return null;
     if (repositorySearch.matches.length === 0) {
       const incomplete = !repositoryCollection.complete || !repositorySearch.complete;
       const message = incomplete
@@ -217,8 +228,13 @@ class UpstreamPullService {
     token = null,
     cancellationToken = null,
     signal = null,
+    account = null,
   }) {
-    const operation = this._createPreparationOperation(cancellationToken || token, signal);
+    const operation = this._createPreparationOperation(
+      cancellationToken || token,
+      signal,
+      account
+    );
     if (!this._isPreparationCurrent(operation)) return null;
     const normalizedDependency = normalizeSingleDependency(dependency);
     if (!workspace) {
@@ -264,7 +280,7 @@ class UpstreamPullService {
       [dependencyFormat],
       operation
     );
-    if (!this._isPreparationCurrent(operation)) return null;
+    if (!repositorySearch || !this._isPreparationCurrent(operation)) return null;
     if (repositorySearch.matches.length === 0) {
       const incomplete = !repositoryCollection.complete || !repositorySearch.complete;
       const message = incomplete
@@ -572,21 +588,30 @@ class UpstreamPullService {
   ) {
     const matches = [];
     let complete = true;
-    const scheduler = new UpstreamOperationScheduler();
     const cancellationToken = operation && operation.cancellationToken;
     const signal = operation && operation.signal;
-    const cancellationDisposable = cancellationToken
-      && typeof cancellationToken.onCancellationRequested === "function"
-      ? cancellationToken.onCancellationRequested(() => scheduler.cancel())
-      : null;
-    const abortListener = () => scheduler.cancel();
-    if (signal && typeof signal.addEventListener === "function") {
-      signal.addEventListener("abort", abortListener, { once: true });
+    let operationScope;
+    try {
+      operationScope = this._upstreamRuntime.createOperationScope({
+        kind: "pull-preparation",
+        account: operation.account,
+        cancellationToken,
+        signal,
+        workspace,
+        formats: projectFormats,
+      });
+    } catch (error) {
+      if (isRuntimeScopeCancellation(error)) return null;
+      throw error;
     }
 
     try {
       await runPromisePool(repositories, 4, async (repo) => {
-        if (!this._isPreparationCurrent(operation) || scheduler.stopped) {
+        if (
+          !this._isPreparationCurrent(operation)
+          || operationScope.signal?.aborted
+          || operationScope.scheduler?.stopped
+        ) {
           complete = false;
           return false;
         }
@@ -598,27 +623,20 @@ class UpstreamPullService {
 
         let state;
         try {
-          const requestOptions = {
-            scheduler,
-            cancellationToken,
-            signal,
-            account: operation.account,
-          };
-          state = typeof this._upstreamChecker.getRepositoryUpstreamStateForFormats === "function"
-            ? await this._upstreamChecker.getRepositoryUpstreamStateForFormats(
-              workspace,
-              repoSlug,
-              projectFormats,
-              requestOptions
-            )
-            : await this._upstreamChecker.getRepositoryUpstreamState(
-              workspace,
-              repoSlug,
-              requestOptions
-            );
+          state = await this._upstreamRuntime.getRepositoryUpstreamStateForFormats(
+            workspace,
+            repoSlug,
+            projectFormats,
+            {
+              account: operation.account,
+              operationScope,
+            }
+          );
         } catch {
           complete = false;
-          return this._isPreparationCurrent(operation) && !scheduler.stopped;
+          return this._isPreparationCurrent(operation)
+            && !operationScope.signal?.aborted
+            && !operationScope.scheduler?.stopped;
         }
         if (!isRepositoryInspectionCompleteForFormats(state, projectFormats)) complete = false;
         const activeUpstreamsByFormat = new Map();
@@ -626,10 +644,12 @@ class UpstreamPullService {
           const upstreams = state && state.groupedUpstreams instanceof Map
             ? state.groupedUpstreams.get(format)
             : [];
-          const activeUpstreams = Array.isArray(upstreams)
+          const sanitizedUpstreams = Array.isArray(upstreams)
             ? upstreams.map(upstream => sanitizeSafeInventoryUpstream(upstream, format))
-              .filter(upstream => upstream && upstream.is_active !== false)
             : [];
+          if (sanitizedUpstreams.some(upstream => upstream === null)) complete = false;
+          const activeUpstreams = sanitizedUpstreams
+            .filter(upstream => upstream && upstream.is_active !== false);
           if (activeUpstreams.length > 0) {
             activeUpstreamsByFormat.set(format, activeUpstreams);
             return true;
@@ -649,11 +669,7 @@ class UpstreamPullService {
         return true;
       });
     } finally {
-      if (!this._isPreparationCurrent(operation)) scheduler.cancel();
-      if (cancellationDisposable) cancellationDisposable.dispose();
-      if (signal && typeof signal.removeEventListener === "function") {
-        signal.removeEventListener("abort", abortListener);
-      }
+      operationScope.dispose();
     }
     if (!this._isPreparationCurrent(operation)) complete = false;
 
@@ -676,9 +692,10 @@ class UpstreamPullService {
     });
   }
 
-  _createPreparationOperation(cancellationToken, signal) {
-    const account = this._connectionManager ? captureAccount(this._connectionManager) : null;
-    return { cancellationToken, signal, account };
+  _createPreparationOperation(cancellationToken, signal, account = null) {
+    const capturedAccount = account
+      || (this._connectionManager ? captureAccount(this._connectionManager) : null);
+    return { cancellationToken, signal, account: capturedAccount };
   }
 
   _isPreparationCurrent(operation) {
@@ -1791,6 +1808,16 @@ async function runPromisePool(items, concurrency, worker) {
   }
 
   await Promise.allSettled(workers);
+}
+
+function isRuntimeScopeCancellation(error) {
+  return Boolean(
+    error
+    && typeof error === "object"
+    && !(error instanceof TypeError)
+    && error.name === "UpstreamRuntimeError"
+    && (error.kind === "stale" || error.kind === "disposed")
+  );
 }
 
 function isCancellationRequested(token) {

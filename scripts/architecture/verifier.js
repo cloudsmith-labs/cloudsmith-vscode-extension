@@ -17,6 +17,7 @@ const METADATA_KEYS = Object.freeze([
   "registrars",
   "runtimeRoots",
   "schemaVersion",
+  "upstreamOwnership",
 ]);
 const LIMIT_KEYS = Object.freeze([
   "maxDepth",
@@ -63,6 +64,16 @@ const LAYER_KEYS = Object.freeze([
   "roots",
 ]);
 const REGISTRAR_KEYS = Object.freeze(["commands", "file", "function"]);
+const UPSTREAM_OWNERSHIP_KEYS = Object.freeze([
+  "authorityExport",
+  "authorityModule",
+  "checkerModule",
+  "compositionFile",
+  "constructorExport",
+  "deprecatedAcquisitionExports",
+  "safeConsumerExports",
+]);
+const JAVASCRIPT_IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const LEGACY_PACKAGE_NAMES = new Set([
   "cdn_url",
   "cloudsmithWorkspace",
@@ -224,6 +235,15 @@ function validateMetadata(root, metadata) {
   if (!Array.isArray(metadata.registrars) || metadata.registrars.length === 0 || metadata.registrars.length > 32) {
     diagnostics.push(diagnostic("ARCH_METADATA_SCHEMA", "architecture.json", "registrars must contain between 1 and 32 entries"));
   }
+  const upstreamOwnership = metadata.upstreamOwnership;
+  const hasUpstreamOwnershipShape = sameKeys(upstreamOwnership, UPSTREAM_OWNERSHIP_KEYS);
+  if (!hasUpstreamOwnershipShape) {
+    diagnostics.push(diagnostic(
+      "ARCH_METADATA_SCHEMA",
+      "architecture.json",
+      "upstreamOwnership has unsupported or missing keys",
+    ));
+  }
 
   const normalized = {
     ...metadata,
@@ -236,6 +256,7 @@ function validateMetadata(root, metadata) {
     nonJavaScriptPackageFiles: [],
     registrars: [],
     runtimeRoots: [],
+    upstreamOwnership: null,
   };
   for (const key of [
     "adapterFiles",
@@ -252,6 +273,97 @@ function validateMetadata(root, metadata) {
   for (const runtimeRoot of metadata.runtimeRoots || []) {
     const normalizedPath = normalizeMetadataPath(root, runtimeRoot, diagnostics);
     if (normalizedPath) normalized.runtimeRoots.push(normalizedPath);
+  }
+  if (hasUpstreamOwnershipShape) {
+    const checkerModule = normalizeMetadataPath(
+      root,
+      upstreamOwnership.checkerModule,
+      diagnostics,
+    );
+    const authorityModule = normalizeMetadataPath(
+      root,
+      upstreamOwnership.authorityModule,
+      diagnostics,
+    );
+    const ownershipCompositionFile = normalizeMetadataPath(
+      root,
+      upstreamOwnership.compositionFile,
+      diagnostics,
+    );
+    const safeConsumerExports = upstreamOwnership.safeConsumerExports;
+    const deprecatedAcquisitionExports = upstreamOwnership.deprecatedAcquisitionExports;
+    for (const [field, value] of [
+      ["safeConsumerExports", safeConsumerExports],
+      ["deprecatedAcquisitionExports", deprecatedAcquisitionExports],
+    ]) {
+      if (
+        !isPlainStringArray(value)
+        || value.length === 0
+        || value.length > 16
+        || hasDuplicates(value)
+        || value.some(entry => !JAVASCRIPT_IDENTIFIER.test(entry))
+      ) {
+        diagnostics.push(diagnostic(
+          "ARCH_METADATA_SCHEMA",
+          "architecture.json",
+          `upstreamOwnership.${field} must be a bounded unique identifier array`,
+        ));
+      }
+    }
+    for (const [field, value] of [
+      ["constructorExport", upstreamOwnership.constructorExport],
+      ["authorityExport", upstreamOwnership.authorityExport],
+    ]) {
+      if (typeof value !== "string" || !JAVASCRIPT_IDENTIFIER.test(value)) {
+        diagnostics.push(diagnostic(
+          "ARCH_METADATA_SCHEMA",
+          "architecture.json",
+          `upstreamOwnership.${field} must be a JavaScript identifier`,
+        ));
+      }
+    }
+    const allExports = [
+      upstreamOwnership.constructorExport,
+      upstreamOwnership.authorityExport,
+      ...(Array.isArray(safeConsumerExports) ? safeConsumerExports : []),
+      ...(Array.isArray(deprecatedAcquisitionExports) ? deprecatedAcquisitionExports : []),
+    ];
+    if (new Set(allExports).size !== allExports.length) {
+      diagnostics.push(diagnostic(
+        "ARCH_METADATA_DUPLICATE",
+        "architecture.json",
+        "upstreamOwnership export capabilities must be disjoint",
+      ));
+    }
+    if (
+      !checkerModule?.endsWith(".js")
+      || !authorityModule?.endsWith(".js")
+      || !ownershipCompositionFile?.endsWith(".js")
+      || new Set([checkerModule, authorityModule, ownershipCompositionFile]).size !== 3
+    ) {
+      diagnostics.push(diagnostic(
+        "ARCH_METADATA_UPSTREAM_OWNERSHIP",
+        "architecture.json",
+        "Upstream ownership paths must be three distinct JavaScript files",
+      ));
+    }
+    if (ownershipCompositionFile !== normalized.compositionFile) {
+      diagnostics.push(diagnostic(
+        "ARCH_METADATA_UPSTREAM_OWNERSHIP",
+        "architecture.json",
+        "upstreamOwnership.compositionFile must match the governed compositionFile",
+      ));
+    }
+    normalized.upstreamOwnership = {
+      ...upstreamOwnership,
+      checkerModule,
+      authorityModule,
+      compositionFile: ownershipCompositionFile,
+      safeConsumerExports: Array.isArray(safeConsumerExports) ? [...safeConsumerExports] : [],
+      deprecatedAcquisitionExports: Array.isArray(deprecatedAcquisitionExports)
+        ? [...deprecatedAcquisitionExports]
+        : [],
+    };
   }
   for (const entry of metadata.nonJavaScriptPackageFiles || []) {
     const hasGlob = typeof entry === "string" && /[*?\[]/.test(entry);
@@ -554,6 +666,40 @@ function validateMetadata(root, metadata) {
           "ARCH_METADATA_RUNTIME_ROOT",
           "architecture.json",
           `${layer.id} source ${sourcePath} is outside the packaged runtime roots`,
+        ));
+      }
+    }
+  }
+  if (normalized.upstreamOwnership) {
+    const ownership = normalized.upstreamOwnership;
+    const checkerLayer = ownership.checkerModule
+      ? layerForFile(normalized, ownership.checkerModule)
+      : null;
+    const authorityLayer = ownership.authorityModule
+      ? layerForFile(normalized, ownership.authorityModule)
+      : null;
+    if (!checkerLayer || checkerLayer.id !== "legacy-service") {
+      diagnostics.push(diagnostic(
+        "ARCH_METADATA_UPSTREAM_OWNERSHIP",
+        "architecture.json",
+        "The upstream checker module must be classified in legacy-service",
+      ));
+    }
+    if (!authorityLayer || authorityLayer.id !== "application-upstream-runtime") {
+      diagnostics.push(diagnostic(
+        "ARCH_METADATA_UPSTREAM_OWNERSHIP",
+        "architecture.json",
+        "The upstream authority must be the exact application-upstream-runtime file",
+      ));
+    }
+    for (const sourcePath of [ownership.checkerModule, ownership.authorityModule]) {
+      if (!normalized.runtimeRoots.some(runtimeRoot => (
+        sourcePath === runtimeRoot || sourcePath?.startsWith(`${runtimeRoot}/`)
+      ))) {
+        diagnostics.push(diagnostic(
+          "ARCH_METADATA_UPSTREAM_OWNERSHIP",
+          "architecture.json",
+          `Upstream ownership source is outside the scanned runtime roots: ${String(sourcePath)}`,
         ));
       }
     }
@@ -1017,7 +1163,21 @@ function taintSourceNodes(node) {
   return identifiers;
 }
 
-function collectAstFacts(source, relativePath, maxFacts = 512) {
+function collectAstFacts(source, relativePath, maxFacts = 512, upstreamOwnership = null) {
+  const collectCheckerLocalBindings = relativePath === upstreamOwnership?.checkerModule;
+  const upstreamImportTargets = new Set([
+    upstreamOwnership?.checkerModule,
+    upstreamOwnership?.authorityModule,
+  ].filter(Boolean));
+  const isUpstreamImportCandidate = specifier => {
+    if (typeof specifier !== "string" || !specifier.startsWith(".") || specifier.includes("\\")) {
+      return false;
+    }
+    const base = path.posix.normalize(path.posix.join(path.posix.dirname(relativePath), specifier));
+    return [base, `${base}.js`, `${base}/index.js`].some(candidate => (
+      upstreamImportTargets.has(candidate)
+    ));
+  };
   const facts = {
     alternateRegistrationNodes: [],
     commandApiNodes: [],
@@ -1025,6 +1185,10 @@ function collectAstFacts(source, relativePath, maxFacts = 512) {
     deferredCommandNodes: [],
     dynamicCodeNodes: [],
     imports: [],
+    classDeclarationNodes: [],
+    constructions: [],
+    moduleImportCapabilities: [],
+    newExpressionNodes: [],
     registerCommandIdentifiers: [],
     registerCommandNodes: [],
     registerInventoryCalls: [],
@@ -1199,9 +1363,15 @@ function collectAstFacts(source, relativePath, maxFacts = 512) {
           record(facts.violations, diagnostic("ARCH_DYNAMIC_IMPORT", relativePath, "Dynamic import() is prohibited in gated layers", node));
         },
         NewExpression(node) {
+          if (collectCheckerLocalBindings) record(facts.newExpressionNodes, node);
           const calleeName = node.callee?.type === "Identifier" ? node.callee.name : propertyName(node.callee);
           if (DYNAMIC_CODE_CONSTRUCTORS.has(calleeName)) {
             record(facts.dynamicCodeNodes, node);
+          }
+        },
+        ClassDeclaration(node) {
+          if (collectCheckerLocalBindings && node.id?.type === "Identifier") {
+            record(facts.classDeclarationNodes, node.id);
           }
         },
         AssignmentExpression(node) {
@@ -1377,6 +1547,13 @@ function collectAstFacts(source, relativePath, maxFacts = 512) {
           }
         },
         VariableDeclarator(node) {
+          if (
+            collectCheckerLocalBindings
+            && node.id?.type === "Identifier"
+            && node.init?.type === "ClassExpression"
+          ) {
+            record(facts.classDeclarationNodes, node.id);
+          }
           const targets = patternIdentifierNodes(node.id);
           if (targets.length > 0 && node.init) {
             recordTaint(facts.taintRelations, {
@@ -1458,6 +1635,161 @@ function collectAstFacts(source, relativePath, maxFacts = 512) {
   const rootBindings = (...names) => names.flatMap(name => (
     [...(globalBindingsByName.get(name) || [`global:${name}`])]
   ));
+  const bindingReferences = binding => (
+    binding && typeof binding === "object" && Array.isArray(binding.references)
+      ? binding.references
+        .filter(reference => typeof reference.isRead !== "function" || reference.isRead())
+        .map(reference => reference.identifier)
+        .filter(Boolean)
+      : []
+  );
+  const recordNamedModuleCapability = (imported, importedName, local, node) => {
+    const binding = bindingFor(local);
+    record(facts.moduleImportCapabilities, {
+      binding,
+      importNode: imported.node,
+      importedName,
+      kind: "named",
+      local,
+      node,
+      references: bindingReferences(binding),
+      specifier: imported.specifier,
+    });
+  };
+  const recordPatternCapabilities = (imported, pattern) => {
+    if (pattern?.type !== "ObjectPattern") {
+      const local = pattern?.type === "Identifier" ? pattern : null;
+      const binding = local ? bindingFor(local) : null;
+      record(facts.moduleImportCapabilities, {
+        binding,
+        importNode: imported.node,
+        importedName: null,
+        kind: "namespace",
+        local,
+        node: pattern || imported.node,
+        references: bindingReferences(binding),
+        specifier: imported.specifier,
+      });
+      return;
+    }
+    for (const property of pattern.properties) {
+      if (property?.type === "RestElement") {
+        const local = property.argument?.type === "Identifier" ? property.argument : null;
+        const binding = local ? bindingFor(local) : null;
+        record(facts.moduleImportCapabilities, {
+          binding,
+          importNode: imported.node,
+          importedName: null,
+          kind: "rest",
+          local,
+          node: property,
+          references: bindingReferences(binding),
+          specifier: imported.specifier,
+        });
+        continue;
+      }
+      const importedName = propertyName(property);
+      const locals = patternIdentifierNodes(property?.value);
+      if (!importedName || locals.length !== 1) {
+        const local = locals.length === 1 ? locals[0] : null;
+        const binding = local ? bindingFor(local) : null;
+        record(facts.moduleImportCapabilities, {
+          binding,
+          importNode: imported.node,
+          importedName,
+          kind: "computed",
+          local,
+          node: property || pattern,
+          references: bindingReferences(binding),
+          specifier: imported.specifier,
+        });
+        continue;
+      }
+      recordNamedModuleCapability(imported, importedName, locals[0], property);
+    }
+  };
+  for (const imported of facts.imports) {
+    if (!isUpstreamImportCandidate(imported.specifier)) continue;
+    const importNode = imported.node;
+    if (importNode?.type === "ImportDeclaration") {
+      for (const specifier of importNode.specifiers || []) {
+        if (specifier.type === "ImportSpecifier" && specifier.imported?.type === "Identifier") {
+          recordNamedModuleCapability(
+            imported,
+            specifier.imported.name,
+            specifier.local,
+            specifier,
+          );
+        } else {
+          const binding = specifier.local ? bindingFor(specifier.local) : null;
+          record(facts.moduleImportCapabilities, {
+            binding,
+            importNode,
+            importedName: null,
+            kind: "namespace",
+            local: specifier.local || null,
+            node: specifier,
+            references: bindingReferences(binding),
+            specifier: imported.specifier,
+          });
+        }
+      }
+      continue;
+    }
+    if (importNode?.type !== "CallExpression") continue;
+    const parent = importNode.parent;
+    if (parent?.type === "VariableDeclarator" && parent.init === importNode) {
+      recordPatternCapabilities(imported, parent.id);
+      continue;
+    }
+    if (parent?.type === "AssignmentExpression" && parent.right === importNode) {
+      recordPatternCapabilities(imported, parent.left);
+      continue;
+    }
+    if (parent?.type === "MemberExpression" && parent.object === importNode) {
+      const assigned = parent.parent;
+      const local = assigned?.type === "VariableDeclarator"
+        && assigned.init === parent
+        && assigned.id?.type === "Identifier"
+        ? assigned.id
+        : assigned?.type === "AssignmentExpression"
+          && assigned.right === parent
+          && assigned.left?.type === "Identifier"
+          ? assigned.left
+          : null;
+      const binding = local ? bindingFor(local) : null;
+      record(facts.moduleImportCapabilities, {
+        binding,
+        importNode,
+        importedName: propertyName(parent),
+        kind: parent.computed && propertyName(parent) === null ? "computed" : "direct",
+        local,
+        node: parent,
+        references: bindingReferences(binding),
+        specifier: imported.specifier,
+      });
+      continue;
+    }
+    record(facts.moduleImportCapabilities, {
+      binding: null,
+      importNode,
+      importedName: null,
+      kind: "reexport",
+      local: null,
+      node: importNode,
+      references: [],
+      specifier: imported.specifier,
+    });
+  }
+  facts.constructions = facts.newExpressionNodes.map(node => ({
+    binding: node.callee?.type === "Identifier" ? bindingFor(node.callee) : null,
+    callee: node.callee,
+    node,
+  }));
+  facts.classDeclarations = facts.classDeclarationNodes.map(node => ({
+    binding: bindingFor(node),
+    node,
+  }));
   const functionParameters = new Map(
     facts.taintFunctionParameters.map(entry => [
       bindingFor(entry.name),
@@ -1902,9 +2234,290 @@ function findCycles(graph, included) {
   return cycles;
 }
 
+function isCommonJsExportTarget(node) {
+  if (node?.type !== "MemberExpression") return false;
+  if (node.object?.type === "Identifier" && node.object.name === "exports") return true;
+  if (
+    node.object?.type === "Identifier"
+    && node.object.name === "module"
+    && propertyName(node) === "exports"
+  ) {
+    return true;
+  }
+  return node.object?.type === "MemberExpression"
+    && node.object.object?.type === "Identifier"
+    && node.object.object.name === "module"
+    && propertyName(node.object) === "exports";
+}
+
+function isReexportReference(node) {
+  let current = node;
+  for (let depth = 0; current?.parent && depth < 8; depth += 1) {
+    const parent = current.parent;
+    if (
+      parent.type === "AssignmentExpression"
+      && parent.right === current
+      && isCommonJsExportTarget(parent.left)
+    ) {
+      return true;
+    }
+    if (
+      parent.type === "AssignmentExpression"
+      && isCommonJsExportTarget(parent.left)
+      && current !== parent.left
+    ) {
+      return true;
+    }
+    if (["ExportDefaultDeclaration", "ExportNamedDeclaration"].includes(parent.type)) {
+      return true;
+    }
+    current = parent;
+  }
+  return false;
+}
+
+function directConstructionSites(capability, exportName) {
+  const sites = [];
+  if (capability.kind === "named" && capability.importedName === exportName) {
+    for (const reference of capability.references) {
+      if (reference.parent?.type === "NewExpression" && reference.parent.callee === reference) {
+        sites.push(reference.parent);
+      }
+    }
+  }
+  if (["computed", "direct"].includes(capability.kind) && capability.importedName === exportName) {
+    if (capability.node.parent?.type === "NewExpression" && capability.node.parent.callee === capability.node) {
+      sites.push(capability.node.parent);
+    }
+    for (const reference of capability.references) {
+      if (reference.parent?.type === "NewExpression" && reference.parent.callee === reference) {
+        sites.push(reference.parent);
+      }
+    }
+  }
+  if (["namespace", "rest"].includes(capability.kind)) {
+    for (const reference of capability.references) {
+      const member = reference.parent;
+      if (
+        member?.type === "MemberExpression"
+        && member.object === reference
+        && propertyName(member) === exportName
+        && member.parent?.type === "NewExpression"
+        && member.parent.callee === member
+      ) {
+        sites.push(member.parent);
+      }
+    }
+  }
+  return sites;
+}
+
+function moduleMemberUses(capability) {
+  if (!["namespace", "rest"].includes(capability.kind)) return [];
+  return capability.references.flatMap(reference => {
+    const member = reference.parent;
+    if (member?.type !== "MemberExpression" || member.object !== reference) return [];
+    return [{ member, name: propertyName(member) }];
+  });
+}
+
+function validateExactConstructorAuthority({
+  capabilities,
+  exportName,
+  ownerPath,
+  ownershipState,
+  siteBucket,
+  addDiagnostic,
+}) {
+  const named = capabilities.filter(capability => (
+    capability.kind === "named" && capability.importedName === exportName
+  ));
+  const directSites = named.flatMap(capability => directConstructionSites(capability, exportName));
+  for (const site of directSites) ownershipState[siteBucket].push({ node: site, path: ownerPath });
+  const references = named.flatMap(capability => capability.references);
+  const exact = named.length === 1
+    && directSites.length === 1
+    && references.length === 1
+    && !references.some(isReexportReference);
+  if (!exact) {
+    addDiagnostic(diagnostic(
+      "ARCH_UPSTREAM_CONSTRUCTION",
+      ownerPath,
+      `The upstream ownership boundary must import ${exportName} once and use it only in one direct construction`,
+      references.find(reference => (
+        reference.parent?.type !== "NewExpression" || reference.parent.callee !== reference
+      )) || named[0]?.node,
+    ));
+  }
+}
+
+function validateUpstreamOwnershipFile(
+  metadata,
+  relativePath,
+  facts,
+  targetByImportNode,
+  ownershipState,
+  addDiagnostic,
+) {
+  const ownership = metadata.upstreamOwnership;
+  if (!ownership) return;
+  const capabilitiesFor = target => facts.moduleImportCapabilities.filter(capability => (
+    targetByImportNode.get(capability.importNode) === target
+  ));
+  const checkerCapabilities = capabilitiesFor(ownership.checkerModule);
+  const safeExports = new Set(ownership.safeConsumerExports);
+  const deprecatedExports = new Set(ownership.deprecatedAcquisitionExports);
+
+  for (const capability of checkerCapabilities) {
+    const constructorSites = directConstructionSites(capability, ownership.constructorExport);
+    const memberUses = moduleMemberUses(capability);
+    const accessesConstructor = capability.importedName === ownership.constructorExport
+      || memberUses.some(use => use.name === ownership.constructorExport);
+    const deprecatedUse = [capability.importedName, ...memberUses.map(use => use.name)]
+      .find(name => deprecatedExports.has(name));
+    if (relativePath !== ownership.authorityModule) {
+      for (const site of constructorSites) {
+        ownershipState.checkerConstructionSites.push({ node: site, path: relativePath });
+      }
+    }
+    if (capability.kind !== "named") {
+      addDiagnostic(diagnostic(
+        "ARCH_UPSTREAM_MODULE_ACCESS",
+        relativePath,
+        "The upstream checker module may only be consumed through reviewed static named imports",
+        capability.node,
+      ));
+      if (accessesConstructor || constructorSites.length > 0) {
+        addDiagnostic(diagnostic(
+          "ARCH_UPSTREAM_CONSTRUCTION",
+          relativePath,
+          "Only the upstream runtime authority may acquire or construct UpstreamChecker",
+          constructorSites[0] || capability.node,
+        ));
+      }
+      if (deprecatedUse) {
+        addDiagnostic(diagnostic(
+          "ARCH_UPSTREAM_WRAPPER",
+          relativePath,
+          `Deprecated upstream acquisition wrapper is prohibited: ${deprecatedUse}`,
+          memberUses.find(use => use.name === deprecatedUse)?.member || capability.node,
+        ));
+      }
+      continue;
+    }
+    if (capability.importedName === ownership.constructorExport) {
+      if (relativePath !== ownership.authorityModule) {
+        addDiagnostic(diagnostic(
+          "ARCH_UPSTREAM_CONSTRUCTION",
+          relativePath,
+          "Only the upstream runtime authority may import or construct UpstreamChecker",
+          capability.node,
+        ));
+      }
+      continue;
+    }
+    if (deprecatedExports.has(capability.importedName)) {
+      addDiagnostic(diagnostic(
+        "ARCH_UPSTREAM_WRAPPER",
+        relativePath,
+        `Deprecated upstream acquisition wrapper is prohibited: ${capability.importedName}`,
+        capability.node,
+      ));
+      continue;
+    }
+    if (!safeExports.has(capability.importedName) || capability.references.some(isReexportReference)) {
+      addDiagnostic(diagnostic(
+        "ARCH_UPSTREAM_MODULE_ACCESS",
+        relativePath,
+        `Unreviewed upstream checker capability is prohibited: ${String(capability.importedName)}`,
+        capability.node,
+      ));
+    }
+  }
+
+  if (relativePath === ownership.authorityModule) {
+    validateExactConstructorAuthority({
+      capabilities: checkerCapabilities,
+      exportName: ownership.constructorExport,
+      ownerPath: relativePath,
+      ownershipState,
+      siteBucket: "checkerConstructionSites",
+      addDiagnostic,
+    });
+  }
+
+  if (relativePath === ownership.checkerModule) {
+    const checkerBindings = new Set(facts.classDeclarations
+      .filter(declaration => declaration.node.name === ownership.constructorExport)
+      .map(declaration => declaration.binding));
+    for (const construction of facts.constructions) {
+      if (!checkerBindings.has(construction.binding)) continue;
+      ownershipState.checkerConstructionSites.push({ node: construction.node, path: relativePath });
+      addDiagnostic(diagnostic(
+        "ARCH_UPSTREAM_CONSTRUCTION",
+        relativePath,
+        "The checker module may define UpstreamChecker but may not construct its own runtime instances",
+        construction.node,
+      ));
+    }
+  }
+
+  const authorityCapabilities = capabilitiesFor(ownership.authorityModule);
+  for (const capability of authorityCapabilities) {
+    const sites = directConstructionSites(capability, ownership.authorityExport);
+    if (relativePath !== ownership.compositionFile) {
+      for (const site of sites) {
+        ownershipState.authorityConstructionSites.push({ node: site, path: relativePath });
+      }
+    }
+    if (
+      capability.kind !== "named"
+      || capability.importedName !== ownership.authorityExport
+    ) {
+      addDiagnostic(diagnostic(
+        "ARCH_UPSTREAM_MODULE_ACCESS",
+        relativePath,
+        "The upstream runtime authority may only be acquired by the composition root through its named export",
+        capability.node,
+      ));
+      if (relativePath !== ownership.compositionFile) {
+        addDiagnostic(diagnostic(
+          "ARCH_UPSTREAM_CONSTRUCTION",
+          relativePath,
+          "Only the composition root may acquire, pass, re-export, or construct UpstreamRuntime",
+          sites[0] || capability.node,
+        ));
+      }
+      continue;
+    }
+    if (relativePath !== ownership.compositionFile) {
+      addDiagnostic(diagnostic(
+        "ARCH_UPSTREAM_CONSTRUCTION",
+        relativePath,
+        "Only the composition root may import or construct UpstreamRuntime",
+        capability.node,
+      ));
+    }
+  }
+  if (relativePath === ownership.compositionFile) {
+    validateExactConstructorAuthority({
+      capabilities: authorityCapabilities,
+      exportName: ownership.authorityExport,
+      ownerPath: relativePath,
+      ownershipState,
+      siteBucket: "authorityConstructionSites",
+      addDiagnostic,
+    });
+  }
+}
+
 function analyzeStaticArchitecture(root, metadata, files) {
   const diagnostics = [];
   const graph = new Map();
+  const ownershipState = {
+    checkerConstructionSites: [],
+    authorityConstructionSites: [],
+  };
   let importCount = 0;
   let diagnosticLimitReached = false;
   const addDiagnostic = (entry) => {
@@ -1925,7 +2538,12 @@ function analyzeStaticArchitecture(root, metadata, files) {
   for (const [relativePath, source] of files) {
     if (diagnosticLimitReached) break;
     const layer = layerForFile(metadata, relativePath);
-    const facts = collectAstFacts(source, relativePath, metadata.limits.maxDiagnostics);
+    const facts = collectAstFacts(
+      source,
+      relativePath,
+      metadata.limits.maxDiagnostics,
+      metadata.upstreamOwnership,
+    );
     if (facts.truncated) {
       addDiagnostic(diagnostic(
         "ARCH_AST_FACT_LIMIT",
@@ -2095,6 +2713,7 @@ function analyzeStaticArchitecture(root, metadata, files) {
       }
     }
     const targets = new Set();
+    const targetByImportNode = new Map();
     graph.set(relativePath, targets);
     for (const imported of facts.imports) {
       importCount += 1;
@@ -2112,6 +2731,7 @@ function analyzeStaticArchitecture(root, metadata, files) {
             addDiagnostic,
             imported.node,
           );
+          if (targetPath) targetByImportNode.set(imported.node, targetPath);
           const allowedCommandFiles = new Set([
             "commands/registrar.js",
             ...metadata.registrars.map((registrar) => registrar.file),
@@ -2148,6 +2768,7 @@ function analyzeStaticArchitecture(root, metadata, files) {
       if (!targetPath) {
         continue;
       }
+      targetByImportNode.set(imported.node, targetPath);
       targets.add(targetPath);
       const targetLayer = layerForFile(metadata, targetPath);
       if (targetLayer && !files.has(targetPath)) {
@@ -2167,6 +2788,28 @@ function analyzeStaticArchitecture(root, metadata, files) {
         addDiagnostic(diagnostic("ARCH_LAYER_EDGE", relativePath, `Layer ${layer.id} may not import layer ${targetLayer.id} (${targetPath})`, imported.node));
       }
     }
+    validateUpstreamOwnershipFile(
+      metadata,
+      relativePath,
+      facts,
+      targetByImportNode,
+      ownershipState,
+      addDiagnostic,
+    );
+  }
+  if (metadata.upstreamOwnership && ownershipState.checkerConstructionSites.length !== 1) {
+    addDiagnostic(diagnostic(
+      "ARCH_UPSTREAM_CONSTRUCTION",
+      metadata.upstreamOwnership.authorityModule,
+      `Exactly one direct ${metadata.upstreamOwnership.constructorExport} construction must exist in the upstream runtime authority; found ${ownershipState.checkerConstructionSites.length}`,
+    ));
+  }
+  if (metadata.upstreamOwnership && ownershipState.authorityConstructionSites.length !== 1) {
+    addDiagnostic(diagnostic(
+      "ARCH_UPSTREAM_CONSTRUCTION",
+      metadata.upstreamOwnership.compositionFile,
+      `Exactly one direct ${metadata.upstreamOwnership.authorityExport} construction must exist in the composition root; found ${ownershipState.authorityConstructionSites.length}`,
+    ));
   }
   const cycleFiles = new Set([...files.keys()].filter(file => layerForFile(metadata, file)));
   const exemptCycles = new Set(metadata.cycleExemptions.map(exemption => JSON.stringify(exemption)));

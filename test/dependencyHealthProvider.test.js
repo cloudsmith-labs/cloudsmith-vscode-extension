@@ -5,7 +5,7 @@ const path = require("path");
 const vscode = require("vscode");
 const {
   CLOUDSMITH_COVERAGE_STATUS,
-  DependencyHealthProvider,
+  DependencyHealthProvider: DependencyHealthProviderImplementation,
   SCAN_STATES,
   buildComplianceReportData,
   getConcreteDependencyVersion,
@@ -39,6 +39,50 @@ suite("DependencyHealthProvider Test Suite", () => {
   let originalShowInformationMessage;
   let originalShowWarningMessage;
   let originalShowErrorMessage;
+
+  function defaultUpstreamGapRuntime() {
+    return {
+      createOperationScope(options = {}) {
+        const controller = new AbortController();
+        return Object.freeze({
+          signal: controller.signal,
+          account: options.account,
+          scheduler: { stopped: false, cancel() { this.stopped = true; } },
+          dispose() { controller.abort(); },
+        });
+      },
+      async getRepositoryUpstreamStateForFormats() {
+        return {
+          groupedUpstreams: new Map(),
+          complete: true,
+          failedFormats: [],
+          uninspectedFormats: [],
+          unsupportedFormats: [],
+        };
+      },
+    };
+  }
+
+  function defaultUpstreamPullService() {
+    return {
+      async run() { return null; },
+      async prepareSingle() { return null; },
+      async execute() { return null; },
+    };
+  }
+
+  class DependencyHealthProvider extends DependencyHealthProviderImplementation {
+    constructor(context, diagnosticsPublisher = null, options = {}) {
+      super(context, diagnosticsPublisher, {
+        upstreamGapRuntime: defaultUpstreamGapRuntime(),
+        ...options,
+        upstreamPullService: {
+          ...defaultUpstreamPullService(),
+          ...options.upstreamPullService,
+        },
+      });
+    }
+  }
 
   function createContext(isConnected = "true") {
     const context = {
@@ -247,6 +291,19 @@ suite("DependencyHealthProvider Test Suite", () => {
       return { canceled: false };
     };
   }
+
+  test("requires composed upstream gap and pull dependencies", () => {
+    assert.throws(
+      () => new DependencyHealthProviderImplementation(createContext()),
+      /upstream gap facade/
+    );
+    assert.throws(
+      () => new DependencyHealthProviderImplementation(createContext(), null, {
+        upstreamGapRuntime: defaultUpstreamGapRuntime(),
+      }),
+      /upstream pull service/
+    );
+  });
 
   function createLookupApi(handler) {
     return {
@@ -3397,5 +3454,87 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(executionCalls, 1);
     assert.strictEqual(refreshCalls, 1);
     assert.strictEqual(diagnosticReplacements, 1);
+  });
+
+  test("account reset detaches hung dependency work without letting its finally clear newer work", async () => {
+    let state = {
+      activationId: "activation-a",
+      accountEpoch: 1,
+      credentialPresent: true,
+      sessionConnected: true,
+      status: "connected",
+    };
+    const listeners = new Set();
+    const connectionManager = {
+      getState: () => Object.freeze({ ...state }),
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      switchAccount() {
+        state = { ...state, activationId: "activation-b", accountEpoch: 2 };
+        for (const listener of listeners) listener(this.getState());
+      },
+    };
+    const accountA = deferred();
+    const accountB = deferred();
+    const startedA = deferred();
+    const startedB = deferred();
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      connectionManager,
+      accountResetOrchestrated: true,
+      executeCommand: async () => {},
+      userInteraction: {
+        ...createUserInteraction(),
+        withProgress: async (_options, task) => task(
+          { report() {} },
+          createCancellationSource().token
+        ),
+      },
+      upstreamPullService: {
+        async prepareSingle({ account }) {
+          if (account.accountEpoch === 1) {
+            startedA.resolve();
+            await accountA.promise;
+          } else {
+            startedB.resolve();
+            await accountB.promise;
+          }
+          return null;
+        },
+      },
+    });
+    const installProject = (name) => {
+      provider.lastWorkspace = "workspace-a";
+      provider.lastRepo = "repo-a";
+      provider._fullTrees = [{ dependencies: [createProblemDependency(
+        name,
+        "1.0.0",
+        "/project/package.json"
+      )] }];
+    };
+
+    installProject("account-a-package");
+    const oldWork = provider.pullSingleDependency(
+      pullCoordinate("account-a-package", "1.0.0")
+    );
+    await startedA.promise;
+    connectionManager.switchAccount();
+    await provider.resetForAccountChange(connectionManager.getState());
+
+    installProject("account-b-package");
+    const newWork = provider.pullSingleDependency(
+      pullCoordinate("account-b-package", "1.0.0")
+    );
+    await startedB.promise;
+    const activeB = provider._activeDependencyOperation;
+    accountA.resolve();
+    await oldWork;
+
+    assert.strictEqual(provider._activeDependencyOperation, activeB);
+    assert.strictEqual(provider._isDependencyOperationRunning(), true);
+    accountB.resolve();
+    await newWork;
+    assert.strictEqual(provider._isDependencyOperationRunning(), false);
   });
 });

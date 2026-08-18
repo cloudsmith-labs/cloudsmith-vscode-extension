@@ -7,9 +7,45 @@ const { UpstreamOperationScheduler } = require("../util/upstreamOperationSchedul
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
 suite("upstreamGapAnalyzer", () => {
+  const TEST_ACCOUNT = Object.freeze({ activationId: "activation-a", accountEpoch: 1 });
+
+  function createRuntime(reader) {
+    return {
+      createOperationScope(options = {}) {
+        const controller = new AbortController();
+        const scheduler = options.scheduler || new UpstreamOperationScheduler();
+        return Object.freeze({
+          scheduler,
+          signal: controller.signal,
+          account: options.account || TEST_ACCOUNT,
+          dispose() {
+            controller.abort();
+            scheduler.cancel();
+          },
+        });
+      },
+      getRepositoryUpstreamStateForFormats(workspace, repo, formats, options = {}) {
+        return reader.getRepositoryUpstreamStateForFormats(
+          workspace,
+          repo,
+          formats,
+          { ...options, scheduler: options.operationScope.scheduler }
+        );
+      },
+    };
+  }
+
   function createState(entries = {}) {
     return {
-      groupedUpstreams: new Map(Object.entries(entries)),
+      groupedUpstreams: new Map(Object.entries(entries).map(([format, upstreams]) => [
+        format,
+        upstreams.map(upstream => ({
+          ...upstream,
+          _format: format,
+          format,
+          origin: "",
+        })),
+      ])),
       complete: true,
       failedFormats: [],
       uninspectedFormats: [],
@@ -28,15 +64,16 @@ suite("upstreamGapAnalyzer", () => {
     ];
 
     const enriched = await analyzeUpstreamGaps(dependencies, "workspace-a", ["production"], {
-      upstreamChecker: {
-        async getRepositoryUpstreamState() {
+      account: TEST_ACCOUNT,
+      upstreamRuntime: createRuntime({
+        async getRepositoryUpstreamStateForFormats() {
           return createState({
             npm: [
               { name: "npm", is_active: true },
             ],
           });
         },
-      },
+      }),
     });
 
     assert.strictEqual(enriched[0].upstreamStatus, "reachable");
@@ -55,11 +92,12 @@ suite("upstreamGapAnalyzer", () => {
     ];
 
     const enriched = await analyzeUpstreamGaps(dependencies, "workspace-a", ["production"], {
-      upstreamChecker: {
-        async getRepositoryUpstreamState() {
+      account: TEST_ACCOUNT,
+      upstreamRuntime: createRuntime({
+        async getRepositoryUpstreamStateForFormats() {
           return createState();
         },
-      },
+      }),
     });
 
     assert.strictEqual(enriched[0].upstreamStatus, "no_proxy");
@@ -78,11 +116,11 @@ suite("upstreamGapAnalyzer", () => {
     ];
 
     const enriched = await analyzeUpstreamGaps(dependencies, "workspace-a", ["production"], {
-      upstreamChecker: {
-        async getRepositoryUpstreamState() {
+      upstreamRuntime: createRuntime({
+        async getRepositoryUpstreamStateForFormats() {
           return createState();
         },
-      },
+      }),
     });
 
     assert.strictEqual(enriched[0].upstreamStatus, "unreachable");
@@ -98,12 +136,12 @@ suite("upstreamGapAnalyzer", () => {
       ecosystem: "raw",
       cloudsmithStatus: "NOT_FOUND",
     }], "workspace-a", ["production"], {
-      upstreamChecker: {
+      upstreamRuntime: createRuntime({
         async getRepositoryUpstreamStateForFormats() {
           calls += 1;
           return createState();
         },
-      },
+      }),
     });
     assert.strictEqual(calls, 0);
     assert.strictEqual(enriched[0].upstreamStatus, "unreachable");
@@ -132,8 +170,9 @@ suite("upstreamGapAnalyzer", () => {
           total: meta.total,
         });
       },
-      upstreamChecker: {
-        async getRepositoryUpstreamState(_workspace, repo) {
+      account: TEST_ACCOUNT,
+      upstreamRuntime: createRuntime({
+        async getRepositoryUpstreamStateForFormats(_workspace, repo) {
           inFlight += 1;
           maxInFlight = Math.max(maxInFlight, inFlight);
           await new Promise((resolve) => setTimeout(resolve, 5));
@@ -149,7 +188,7 @@ suite("upstreamGapAnalyzer", () => {
 
           return createState();
         },
-      },
+      }),
     });
 
     assert.ok(maxInFlight <= 4);
@@ -174,12 +213,13 @@ suite("upstreamGapAnalyzer", () => {
       Array.from({ length: 12 }, (_value, index) => `repo-${index}`),
       {
         onProgress() { throw new Error("observer failure"); },
-        upstreamChecker: {
-          async getRepositoryUpstreamState() {
+        account: TEST_ACCOUNT,
+        upstreamRuntime: createRuntime({
+          async getRepositoryUpstreamStateForFormats() {
             completed += 1;
             return createState();
           },
-        },
+        }),
       }
     );
 
@@ -217,8 +257,9 @@ suite("upstreamGapAnalyzer", () => {
       cloudsmithStatus: "ABSENT",
     }];
     const unknown = await analyzeUpstreamGaps(dependencies, "workspace-a", ["repo-a"], {
-      upstreamChecker: {
-        async getRepositoryUpstreamState() {
+      account: TEST_ACCOUNT,
+      upstreamRuntime: createRuntime({
+        async getRepositoryUpstreamStateForFormats() {
           return {
             groupedUpstreams: new Map(),
             complete: false,
@@ -226,7 +267,7 @@ suite("upstreamGapAnalyzer", () => {
             uninspectedFormats: [],
           };
         },
-      },
+      }),
     });
     assert.strictEqual(unknown[0].upstreamStatus, "unknown");
 
@@ -235,8 +276,9 @@ suite("upstreamGapAnalyzer", () => {
       "workspace-a",
       ["repo-a"],
       {
-        upstreamChecker: {
-          async getRepositoryUpstreamState() {
+        account: TEST_ACCOUNT,
+        upstreamRuntime: createRuntime({
+          async getRepositoryUpstreamStateForFormats() {
             return {
               groupedUpstreams: new Map(),
               complete: false,
@@ -244,23 +286,30 @@ suite("upstreamGapAnalyzer", () => {
               uninspectedFormats: [],
             };
           },
-        },
+        }),
       }
     );
     assert.strictEqual(unrelatedFailure[0].upstreamStatus, "no_proxy");
 
     const positive = await analyzeUpstreamGaps(dependencies, "workspace-a", ["repo-a"], {
       repositoriesComplete: false,
-      upstreamChecker: {
-        async getRepositoryUpstreamState() {
+      account: TEST_ACCOUNT,
+      upstreamRuntime: createRuntime({
+        async getRepositoryUpstreamStateForFormats() {
           return {
-            groupedUpstreams: new Map([["npm", [{ name: "npm", is_active: true }]]]),
+            groupedUpstreams: new Map([["npm", [{
+              name: "npm",
+              _format: "npm",
+              format: "npm",
+              origin: "",
+              is_active: true,
+            }]]]),
             complete: false,
             failedFormats: [],
             uninspectedFormats: ["python"],
           };
         },
-      },
+      }),
     });
     assert.strictEqual(positive[0].upstreamStatus, "reachable");
   });
@@ -317,7 +366,8 @@ suite("upstreamGapAnalyzer", () => {
         "workspace-a",
         ["repo-positive", "repo-incomplete"],
         {
-          upstreamChecker: checker,
+          account: TEST_ACCOUNT,
+          upstreamRuntime: createRuntime(checker),
           onProgress(_patchMap, meta) {
             progressEvents.push({ completed: meta.completed, total: meta.total });
           },
@@ -377,7 +427,8 @@ suite("upstreamGapAnalyzer", () => {
           {
             operationTimeoutMs: 5,
             scheduler,
-            upstreamChecker: checker,
+            account: TEST_ACCOUNT,
+            upstreamRuntime: createRuntime(checker),
             onProgress(_patchMap, meta) {
               progressEvents.push({ completed: meta.completed, total: meta.total });
             },
@@ -391,7 +442,7 @@ suite("upstreamGapAnalyzer", () => {
       assert.ok(progressEvents.some(event => event.completed === 10 && event.total === 11));
       assert.deepStrictEqual(progressEvents.at(-1), { completed: 11, total: 11 });
       assert.strictEqual(enriched[0].upstreamStatus, "unknown");
-      assert.strictEqual(scheduler.stopped, false);
+      assert.strictEqual(scheduler.stopped, true);
       assert.strictEqual(scheduler.activeCount, 0);
       assert.strictEqual(scheduler.queuedCount, 0);
 
@@ -418,13 +469,14 @@ suite("upstreamGapAnalyzer", () => {
       cloudsmithStatus: "ABSENT",
     }], "workspace-a", Array.from({ length: 1000 }, (_, index) => `repo-${index}`), {
       scheduler,
-      upstreamChecker: {
-        async getRepositoryUpstreamState(_workspace, _repo, options) {
+      account: TEST_ACCOUNT,
+      upstreamRuntime: createRuntime({
+        async getRepositoryUpstreamStateForFormats(_workspace, _repo, _formats, options) {
           repositoryCalls += 1;
           await options.scheduler.run(async () => ({ ok: true }));
           return createState();
         },
-      },
+      }),
     });
 
     assert.strictEqual(repositoryCalls, 1);

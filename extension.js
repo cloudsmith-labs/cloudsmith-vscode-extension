@@ -25,7 +25,8 @@ const { ComplianceReportProvider } = require("./views/complianceReportProvider")
 const { QuarantineExplainProvider } = require("./views/quarantineExplainProvider");
 const { DiagnosticsPublisher } = require("./util/diagnosticsPublisher");
 const { SSOAuthManager } = require("./util/ssoAuthManager");
-const { UpstreamChecker } = require("./util/upstreamChecker");
+const { UpstreamRuntime } = require("./util/upstreamRuntime");
+const { UpstreamPullService } = require("./util/upstreamPullService");
 const { UpstreamPreviewProvider } = require("./views/upstreamPreviewProvider");
 const { UpstreamDetailProvider } = require("./views/upstreamDetailProvider");
 const { PromotionProvider } = require("./views/promotionProvider");
@@ -33,7 +34,7 @@ const { normalizePackageQueryIdentity } = require("./util/promotionContracts");
 const { SearchQueryBuilder } = require("./util/searchQueryBuilder");
 const { formatApiError } = require("./util/errorFormatter");
 const { LicenseClassifier } = require("./util/licenseClassifier");
-const { fetchRepositoryUpstreams, generateTerraformConfig } = require("./util/terraformExporter");
+const { generateTerraformConfig } = require("./util/terraformExporter");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("./util/upstreamFormats");
 const { buildPackageGroupUrl, buildPackageUrl } = require("./util/webAppUrls");
 const recentPackages = require("./util/recentPackages");
@@ -66,7 +67,6 @@ const {
   beginAccountScopedStateReset,
   completeAccountScopedStateReset,
   createAuthenticationResultHandler,
-  evictPersistedUpstreamCaches,
 } = require("./util/accountLifecycle");
 
 let activeActivationOwner = null;
@@ -120,12 +120,32 @@ async function activateOwned(context, own) {
   const connectionManager = new ConnectionManager(context);
   const connectionBinding = bindConnectionManager(context, connectionManager);
   own(connectionBinding, connectionManager);
+  const upstreamRuntime = new UpstreamRuntime(context, { connectionManager });
+  own(upstreamRuntime);
+  const repositoryUpstreamInventory = Object.freeze({
+    getAllUpstreamData: (...args) => upstreamRuntime.getAllUpstreamData(...args),
+  });
+  const detailUpstreamInventory = Object.freeze({
+    getAllUpstreamData: (...args) => upstreamRuntime.getAllUpstreamData(...args),
+    getUpstreamDataForFormats: (...args) => upstreamRuntime.getUpstreamDataForFormats(...args),
+  });
+  const upstreamPreview = Object.freeze({
+    previewResolution: (...args) => upstreamRuntime.previewResolution(...args),
+  });
+  const gapAndPullUpstream = Object.freeze({
+    getRepositoryUpstreamStateForFormats: (...args) => (
+      upstreamRuntime.getRepositoryUpstreamStateForFormats(...args)
+    ),
+    createOperationScope: (...args) => upstreamRuntime.createOperationScope(...args),
+  });
+  const exportUpstream = Object.freeze({
+    getPrivilegedRepositoryUpstreamsForExport: (...args) => (
+      upstreamRuntime.getPrivilegedRepositoryUpstreamsForExport(...args)
+    ),
+  });
+  await upstreamRuntime.initialize();
   const inspectOutputChannel = vscode.window.createOutputChannel("Cloudsmith");
   own(inspectOutputChannel);
-  // Persisted upstream summaries are account-bound. Purge them before the
-  // initial SecretStorage read so an indeterminate startup cannot retain data
-  // from a prior activation or account.
-  await evictPersistedUpstreamCaches(context);
   const workspaceContextProjector = getWorkspaceContextProjector(context);
   own(workspaceContextProjector);
   await setHasMultipleWorkspacesContext(context, false, { workspaceContextProjector });
@@ -142,6 +162,7 @@ async function activateOwned(context, own) {
     workspaceCache,
     workspaceContextProjector,
     vulnerabilityStateService,
+    upstreamInventory: repositoryUpstreamInventory,
     accountResetOrchestrated: true,
   });
   own({ dispose: () => cloudsmithProvider.dispose() });
@@ -198,9 +219,15 @@ async function activateOwned(context, own) {
   // Set Dependency Health view with diagnostics publisher.
   const diagnosticsPublisher = new DiagnosticsPublisher();
   own(diagnosticsPublisher);
+  const upstreamPullService = new UpstreamPullService(context, {
+    connectionManager,
+    upstreamRuntime: gapAndPullUpstream,
+  });
   const dependencyHealthProvider = new DependencyHealthProvider(context, diagnosticsPublisher, {
     connectionManager,
     vulnerabilityStateService,
+    upstreamGapRuntime: gapAndPullUpstream,
+    upstreamPullService,
     accountResetOrchestrated: true,
   });
   own(
@@ -302,7 +329,10 @@ async function activateOwned(context, own) {
   own({ dispose: () => upstreamPreviewProvider.dispose() });
 
   // Create upstream detail WebView provider
-  upstreamDetailProvider = new UpstreamDetailProvider(context);
+  upstreamDetailProvider = new UpstreamDetailProvider(context, {
+    connectionManager,
+    upstreamInventory: detailUpstreamInventory,
+  });
   own({ dispose: () => upstreamDetailProvider.dispose() });
 
   const credentialManager = new CredentialManager(context, { connectionManager });
@@ -455,9 +485,9 @@ async function activateOwned(context, own) {
     ...sharedCommandDependencies,
     upstreamDetailProvider,
     upstreamPreviewProvider,
-    fetchRepositoryUpstreams,
+    upstreamPreview,
+    upstreamExport: exportUpstream,
     generateTerraformConfig,
-    UpstreamChecker,
     FORMAT_OPTIONS,
   }));
 }

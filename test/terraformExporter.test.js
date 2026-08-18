@@ -1,5 +1,5 @@
 const assert = require("assert");
-const { generateTerraformConfig, sanitizeIdentifier } = require("../util/terraformExporter");
+const { generateTerraformConfig } = require("../util/terraformExporter");
 
 suite("TerraformExporter Test Suite", () => {
   const exportedAt = "2026-03-27T12:00:00.000Z";
@@ -285,7 +285,6 @@ suite("TerraformExporter Test Suite", () => {
       exportedAt,
     });
 
-    assert.strictEqual(sanitizeIdentifier("1.a-b c!"), "_1_a_b_c");
     assert.ok(output.includes('resource "cloudsmith_repository" "_123_repo_name" {'));
     assert.ok(output.includes('resource "cloudsmith_repository_upstream" "_123_repo_name_vendor_registry_io" {'));
   });

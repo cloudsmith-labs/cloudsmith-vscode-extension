@@ -165,9 +165,25 @@ suite("CloudsmithProvider", () => {
     return new CloudsmithProvider(context, {
       connectionManager: manager,
       createCloudsmithAPI: () => ({ get: apiGet }),
+      upstreamInventory: { getAllUpstreamData: async () => null },
       ...options,
     });
   }
+
+  test("requires and shares one narrow upstream inventory facade", () => {
+    assert.throws(
+      () => new CloudsmithProvider(context, { connectionManager: manager }),
+      /upstream inventory facade/
+    );
+    const upstreamInventory = { getAllUpstreamData: async () => null };
+    const provider = createProvider(async () => apiSuccess([]), { upstreamInventory });
+    const node = provider._createRepositoryNode(
+      { slug: "repo", slug_perm: "repo", name: "Repo" },
+      "workspace"
+    );
+    assert.strictEqual(node._upstreamInventory, upstreamInventory);
+    provider.dispose();
+  });
 
   test("fails closed to the signed-out root without making an API request", async () => {
     manager.setState({

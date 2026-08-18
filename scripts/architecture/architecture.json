@@ -52,6 +52,21 @@
     "util",
     "views"
   ],
+  "upstreamOwnership": {
+    "checkerModule": "util/upstreamChecker.js",
+    "constructorExport": "UpstreamChecker",
+    "authorityModule": "util/upstreamRuntime.js",
+    "authorityExport": "UpstreamRuntime",
+    "compositionFile": "extension.js",
+    "safeConsumerExports": [
+      "isSafeInventoryUpstream",
+      "sanitizeSafeInventoryUpstream"
+    ],
+    "deprecatedAcquisitionExports": [
+      "getAllUpstreamData",
+      "getUpstreamDataForFormats"
+    ]
+  },
   "nonJavaScriptPackageFiles": [
     "media/icon.svg",
     "media/logo.png",
@@ -100,6 +115,7 @@
         "util/activationOwner.js",
         "util/dependencyScanOrchestration.js",
         "util/searchIntent.js",
+        "util/upstreamRuntime.js",
         "util/workspaceAccess.js"
       ],
       "allowedLayers": ["domain-core", "domain-adapter", "legacy-service"],
@@ -121,6 +137,15 @@
       "files": ["util/accountLifecycle.js"],
       "excludeFiles": [],
       "allowedLayers": ["application-account-lifecycle", "legacy-service"],
+      "allowedExternals": [],
+      "allowedResources": []
+    },
+    {
+      "id": "application-upstream-runtime",
+      "roots": [],
+      "files": ["util/upstreamRuntime.js"],
+      "excludeFiles": [],
+      "allowedLayers": ["application-upstream-runtime", "legacy-service"],
       "allowedExternals": [],
       "allowedResources": []
     },

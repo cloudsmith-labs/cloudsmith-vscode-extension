@@ -34,6 +34,15 @@ function fixtureMetadata(root) {
     internalCommandIds: [],
     nonJavaScriptPackageFiles: [],
     runtimeRoots,
+    upstreamOwnership: {
+      checkerModule: "util/upstreamChecker.js",
+      constructorExport: "UpstreamChecker",
+      authorityModule: "util/upstreamRuntime.js",
+      authorityExport: "UpstreamRuntime",
+      compositionFile: "extension.js",
+      safeConsumerExports: ["isSafeInventoryUpstream", "sanitizeSafeInventoryUpstream"],
+      deprecatedAcquisitionExports: ["getAllUpstreamData", "getUpstreamDataForFormats"],
+    },
     layers: [
       {
         id: "domain-core",
@@ -57,9 +66,17 @@ function fixtureMetadata(root) {
         id: "legacy-service",
         roots: ["util"],
         files: [],
-        excludeFiles: [],
+        excludeFiles: ["util/upstreamRuntime.js"],
         allowedLayers: ["domain-core", "legacy-service"],
         allowedExternals: ["vscode"],
+        allowedResources: [],
+      }, {
+        id: "application-upstream-runtime",
+        roots: [],
+        files: ["util/upstreamRuntime.js"],
+        excludeFiles: [],
+        allowedLayers: ["application-upstream-runtime", "legacy-service"],
+        allowedExternals: [],
         allowedResources: [],
       }] : []),
       {
@@ -177,6 +194,45 @@ function runArchitectureSelfTests() {
   assertDiagnostic(resultFor("computed-module-loader"), "ARCH_DYNAMIC_IMPORT", "util/rogue.js");
   assertDiagnostic(resultFor("pure-module-loader"), "ARCH_DYNAMIC_IMPORT", "domain/bad.js");
   assertDiagnostic(resultFor("pure-process-loader"), "ARCH_DYNAMIC_IMPORT", "domain/bad.js");
+  assertDiagnostic(
+    resultFor("upstream-command-construction"),
+    "ARCH_UPSTREAM_CONSTRUCTION",
+    "commands/general.js",
+  );
+  assertDiagnostic(
+    resultFor("upstream-provider-construction"),
+    "ARCH_UPSTREAM_CONSTRUCTION",
+    "models/bad.js",
+  );
+  assertDiagnostic(
+    resultFor("upstream-wrapper-usage"),
+    "ARCH_UPSTREAM_WRAPPER",
+    "models/bad.js",
+  );
+
+  const hiddenUpstreamConstruction = resultFor("upstream-hidden-helper");
+  assertDiagnostic(
+    hiddenUpstreamConstruction,
+    "ARCH_UPSTREAM_MODULE_ACCESS",
+    "util/hiddenCheckerFactory.js",
+  );
+  assertDiagnostic(
+    hiddenUpstreamConstruction,
+    "ARCH_UPSTREAM_CONSTRUCTION",
+    "util/upstreamRuntime.js",
+  );
+
+  const secondUpstreamAuthority = resultFor("upstream-second-authority");
+  assertDiagnostic(
+    secondUpstreamAuthority,
+    "ARCH_UPSTREAM_CONSTRUCTION",
+    "commands/general.js",
+  );
+  assertDiagnostic(
+    secondUpstreamAuthority,
+    "ARCH_UPSTREAM_CONSTRUCTION",
+    "extension.js",
+  );
 
   assertDiagnostic(resultFor("nonjs-directory", (root, metadata) => {
     metadata.nonJavaScriptPackageFiles.push("rogue");
@@ -311,7 +367,7 @@ function runArchitectureSelfTests() {
     fs.rmSync(symlinkRoot, { force: true, recursive: true });
   }
 
-  return { invalidFixtures: 61, validFixtures: 1 };
+  return { invalidFixtures: 66, validFixtures: 1 };
 }
 
 module.exports = {

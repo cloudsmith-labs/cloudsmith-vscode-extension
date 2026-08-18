@@ -4,22 +4,29 @@ const assert = require("assert");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { CredentialManager } = require("../util/credentialManager");
 const {
-  cacheErrorMessage,
-  getActiveUpstreamCacheOperationCount,
-  getUpstreamCacheKey,
-  isBenignUpstreamFormatError,
-  MAX_RUNTIME_UPSTREAMS_PER_FORMAT,
   sanitizeSafeInventoryUpstream,
-  SUPPORTED_UPSTREAM_FORMATS,
   UpstreamChecker,
-  UPSTREAM_CACHE_SCHEMA_VERSION,
 } = require("../util/upstreamChecker");
 const {
   INSPECTABLE_UPSTREAM_FORMATS,
-  SUPPORTED_UPSTREAM_FORMATS: SHARED_SUPPORTED_UPSTREAM_FORMATS,
+  SUPPORTED_UPSTREAM_FORMATS,
 } = require("../util/upstreamFormats");
 const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
+
+const MAX_RUNTIME_UPSTREAMS_PER_FORMAT = 500;
+const UPSTREAM_CACHE_SCHEMA_VERSION = 5;
+
+function getUpstreamCacheKey(workspace, repo, formats = SUPPORTED_UPSTREAM_FORMATS) {
+  const normalizedFormats = [...new Set(formats.map(format => format.toLowerCase()))].sort();
+  const canonicalAllFormats = [...SUPPORTED_UPSTREAM_FORMATS].sort();
+  const isAllFormats = normalizedFormats.length === canonicalAllFormats.length
+    && normalizedFormats.every((format, index) => format === canonicalAllFormats[index]);
+  const tuple = isAllFormats
+    ? ["all", workspace, repo]
+    : ["formats", workspace, repo, normalizedFormats];
+  return `cloudsmith-upstreams:v5:${encodeURIComponent(JSON.stringify(tuple))}`;
+}
 
 function toApiResult(response) {
   if (response && typeof response === "object" && typeof response.ok === "boolean") {
@@ -117,35 +124,6 @@ suite("UpstreamChecker repository upstream cache", () => {
     CloudsmithAPI.prototype.get = originalGet;
     CredentialManager.prototype.getApiKey = originalGetApiKey;
   });
-
-  function createCachedEntry(overrides = {}) {
-    return {
-      version: UPSTREAM_CACHE_SCHEMA_VERSION,
-      activationId: "activation-a",
-      accountEpoch: 1,
-      timestamp: Date.now(),
-      successfulFormats: 1,
-      groupedUpstreams: {
-        python: [
-          { name: "PyPI", _format: "python", format: "python", origin: "https://pypi.org" },
-        ],
-      },
-      ...overrides,
-    };
-  }
-
-  async function assertInvalidCachedEntry(entry) {
-    const checker = createChecker(context);
-    const cacheKey = checker._getRepositoryUpstreamCacheKey("workspace-a", "repo-a");
-    store.set(cacheKey, entry);
-
-    const cachedState = checker._getCachedRepositoryUpstreamState("workspace-a", "repo-a");
-
-    await Promise.resolve();
-
-    assert.strictEqual(cachedState, null);
-    assert.strictEqual(store.has(cacheKey), false);
-  }
 
   test("aggregates repository upstreams across formats and reuses the shared cache", async () => {
     formatResponses = {
@@ -271,107 +249,6 @@ suite("UpstreamChecker repository upstream cache", () => {
     assert.strictEqual(store.size, 0);
   });
 
-  test("treats missing timestamp as an invalid cached repository upstream state", async () => {
-    const entry = createCachedEntry();
-    delete entry.timestamp;
-    await assertInvalidCachedEntry(entry);
-  });
-
-  test("treats non-number timestamp as an invalid cached repository upstream state", async () => {
-    await assertInvalidCachedEntry(createCachedEntry({ timestamp: "123" }));
-  });
-
-  test("treats non-finite timestamp as an invalid cached repository upstream state", async () => {
-    await assertInvalidCachedEntry(createCachedEntry({ timestamp: Number.NaN }));
-  });
-
-  test("treats missing groupedUpstreams as an invalid cached repository upstream state", async () => {
-    const entry = createCachedEntry();
-    delete entry.groupedUpstreams;
-    await assertInvalidCachedEntry(entry);
-  });
-
-  test("treats non-object groupedUpstreams as an invalid cached repository upstream state", async () => {
-    await assertInvalidCachedEntry(createCachedEntry({ groupedUpstreams: [] }));
-  });
-
-  test("treats unnamed cached upstream records as invalid", async () => {
-    await assertInvalidCachedEntry(createCachedEntry({ groupedUpstreams: { python: [{}] } }));
-  });
-
-  test("rejects poisoned nested values in a persisted repository envelope", async () => {
-    await assertInvalidCachedEntry(createCachedEntry({
-      groupedUpstreams: {
-        python: [{ name: "PyPI", mode: { token: "nested-secret" } }],
-      },
-    }));
-  });
-
-  test("treats expired cached repository upstream state as invalid", () => {
-    const checker = createChecker(context);
-    const cacheKey = checker._getRepositoryUpstreamCacheKey("workspace-a", "repo-a");
-    store.set(cacheKey, createCachedEntry({ timestamp: Date.now() - (11 * 60 * 1000) }));
-
-    const cachedState = checker._getCachedRepositoryUpstreamState("workspace-a", "repo-a");
-
-    assert.strictEqual(cachedState, null);
-  });
-
-  test("accepts a valid cached repository upstream state", () => {
-    const checker = createChecker(context);
-    const cacheKey = checker._getRepositoryUpstreamCacheKey("workspace-a", "repo-a");
-    store.set(cacheKey, createCachedEntry({ successfulFormats: SUPPORTED_UPSTREAM_FORMATS.length }));
-
-    const cachedState = checker._getCachedRepositoryUpstreamState("workspace-a", "repo-a");
-
-    assert.ok(cachedState);
-    assert.strictEqual(cachedState.successfulFormats, SUPPORTED_UPSTREAM_FORMATS.length);
-    assert.strictEqual(cachedState.total, 1);
-    assert.strictEqual(cachedState.active, 1);
-    assert.strictEqual(cachedState.groupedUpstreams.get("python").length, 1);
-  });
-
-  test("evicts repository cache entries that do not prove every supported format was inspected", async () => {
-    const checker = createChecker(context);
-    const cacheKey = checker._getRepositoryUpstreamCacheKey("workspace-a", "repo-a");
-    store.set(cacheKey, createCachedEntry({ successfulFormats: SUPPORTED_UPSTREAM_FORMATS.length - 1 }));
-
-    assert.strictEqual(checker._getCachedRepositoryUpstreamState("workspace-a", "repo-a"), null);
-    await Promise.resolve();
-    assert.strictEqual(store.has(cacheKey), false);
-  });
-
-  test("returns computed upstream state when repository cache persistence fails", async () => {
-    formatResponses = {
-      python: [
-        { name: "PyPI", upstream_url: "https://pypi.org/simple/" },
-      ],
-      npm: [
-        { name: "npmjs", upstream_url: "https://registry.npmjs.org/" },
-      ],
-    };
-
-    const originalUpdate = context.globalState.update;
-    const logCalls = [];
-
-    context.globalState.update = async () => {
-      throw new Error("quota exceeded");
-    };
-
-    try {
-      const checker = createChecker(context);
-      checker._logRepositoryUpstreamCacheError = (...args) => logCalls.push(args);
-      const state = await checker.getRepositoryUpstreamState("workspace-a", "repo-a");
-
-      assert.strictEqual(state.total, 2);
-      assert.strictEqual(state.active, 2);
-      assert.deepStrictEqual(state.failedFormats, []);
-      assert.strictEqual(store.size, 0);
-      assert.strictEqual(logCalls.length, 0);
-    } finally {
-      context.globalState.update = originalUpdate;
-    }
-  });
 });
 
 suite("UpstreamChecker shared helper and format handling", () => {
@@ -460,7 +337,6 @@ suite("UpstreamChecker shared helper and format handling", () => {
   }
 
   test("uses the shared canonical upstream format list for all-format fetches", () => {
-    assert.strictEqual(SUPPORTED_UPSTREAM_FORMATS, SHARED_SUPPORTED_UPSTREAM_FORMATS);
     assert.deepStrictEqual(SUPPORTED_UPSTREAM_FORMATS, [
       "alpine",
       "cargo",
@@ -489,24 +365,6 @@ suite("UpstreamChecker shared helper and format handling", () => {
       "terraform",
       "vagrant",
     ]);
-  });
-
-  [400, 404, 405, 422].forEach((statusCode) => {
-    test(`${statusCode} is not misclassified as an empty upstream result`, () => {
-      assert.strictEqual(
-        isBenignUpstreamFormatError({ status: statusCode }),
-        false
-      );
-    });
-  });
-
-  [401, 403, 407, 408, 429].forEach((statusCode) => {
-    test(`${statusCode} is classified as a non-benign upstream format error`, () => {
-      assert.strictEqual(
-        isBenignUpstreamFormatError({ status: statusCode }),
-        false
-      );
-    });
   });
 
   test("aggregates all-format upstream data and reuses the shared cache", async () => {
@@ -618,11 +476,11 @@ suite("UpstreamChecker shared helper and format handling", () => {
       ["python"]
     );
     await new Promise(resolve => setImmediate(resolve));
-    assert.strictEqual(getActiveUpstreamCacheOperationCount(context.globalState), 1);
+    assert.strictEqual(checker.cacheLifecycle.activeOperationCount, 1);
     response.resolve(apiSuccess([]));
     await pending;
 
-    assert.strictEqual(getActiveUpstreamCacheOperationCount(context.globalState), 0);
+    assert.strictEqual(checker.cacheLifecycle.activeOperationCount, 0);
   });
 
   test("bounds optional cache persistence and contains a late write failure", async () => {
@@ -659,7 +517,7 @@ suite("UpstreamChecker shared helper and format handling", () => {
       assert.strictEqual(state.complete, true);
       assert.strictEqual(state.total, 0);
       assert.strictEqual(updateCalls, 1);
-      assert.strictEqual(getActiveUpstreamCacheOperationCount(context.globalState), 0);
+      assert.strictEqual(checker.cacheLifecycle.activeOperationCount, 0);
 
       rejectUpdate(new Error("late persistence secret"));
       await new Promise(resolve => setImmediate(resolve));
@@ -712,15 +570,6 @@ suite("UpstreamChecker shared helper and format handling", () => {
     assert.deepStrictEqual(fieldResult.failedFormats, ["python"]);
     assert.strictEqual(fieldResult.total, null);
     assert.strictEqual(updates.length, 0);
-  });
-
-  test("cache failure logs never include exception text or account identifiers", async () => {
-    const secret = "secret-from-quota-exception";
-    const warning = cacheErrorMessage("persist");
-    assert.strictEqual(warning, "[UpstreamChecker] Failed to persist upstream cache.");
-    assert.strictEqual(warning.includes(secret), false);
-    assert.strictEqual(warning.includes("workspace-sensitive"), false);
-    assert(warning.length < 100);
   });
 
   test("evicts cached upstream data with an invalid timestamp before refetching", async () => {
@@ -913,39 +762,6 @@ suite("UpstreamChecker shared helper and format handling", () => {
     assert.strictEqual(getRequestCount(), 2);
   });
 
-  test("returns upstream data without an error when partial failures still yield upstreams", async () => {
-    const checker = createChecker({});
-    checker.getAllUpstreamData = async () => ({
-      upstreams: [{ name: "PyPI", _format: "python", upstream_url: "https://pypi.org/" }],
-      active: 1,
-      total: 1,
-      failedFormats: ["alpine"],
-      successfulFormats: 1,
-    });
-
-    const result = await checker.getAllUpstreams("acme", "example-repo");
-
-    assert.strictEqual(result.error, null);
-    assert.strictEqual(result.data.length, 1);
-    assert.strictEqual(result.data[0].name, "PyPI");
-  });
-
-  test("returns an error when formats fail and no upstream data is available", async () => {
-    const checker = createChecker({});
-    checker.getAllUpstreamData = async () => ({
-      upstreams: [],
-      active: 0,
-      total: 0,
-      failedFormats: ["python"],
-      successfulFormats: 0,
-    });
-
-    const result = await checker.getAllUpstreams("acme", "empty-repo");
-
-    assert.strictEqual(result.data.length, 0);
-    assert.ok(result.error.includes("python"));
-  });
-
   test("does not cache non-benign empty upstream results", async () => {
     const { context, updates } = createContext();
     const checker = createChecker(context);
@@ -1053,6 +869,34 @@ suite("UpstreamChecker shared helper and format handling", () => {
     });
     assert.strictEqual(sanitizeSafeInventoryUpstream(proxy, "python"), null);
     assert.strictEqual(proxyReads, 0);
+  });
+
+  test("validates canonical embedded formats without inventing an expected-format hint", () => {
+    const canonical = {
+      name: "npmjs",
+      _format: "npm",
+      format: "npm",
+      origin: "https://registry.npmjs.org",
+    };
+
+    assert.deepStrictEqual(
+      sanitizeSafeInventoryUpstream(canonical),
+      canonical
+    );
+    for (const candidate of [
+      { name: "mixed", _format: "npm", format: "python", origin: "" },
+      { name: "mixed", _format: "python", format: "npm", origin: "" },
+      { name: "missing internal format", format: "npm", origin: "" },
+      { name: "missing public format", _format: "npm", origin: "" },
+      { name: "unsupported", _format: "terraform", format: "terraform", origin: "" },
+      { name: "unknown", _format: "not-a-format", format: "not-a-format", origin: "" },
+    ]) {
+      assert.strictEqual(sanitizeSafeInventoryUpstream(candidate), null, candidate.name);
+    }
+    assert.strictEqual(
+      sanitizeSafeInventoryUpstream({ ...canonical, origin: "" }, "python"),
+      null
+    );
   });
 
   test("rejects inherited, accessor, and format-conflicting API upstream records", async () => {

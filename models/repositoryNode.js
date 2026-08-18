@@ -13,7 +13,7 @@ const {
   packageCollectionIdentity,
   packageGroupCollectionIdentity,
 } = require("../util/collectionIdentity");
-const upstreamChecker = require("../util/upstreamChecker");
+const { sanitizeSafeInventoryUpstream } = require("../util/upstreamChecker");
 const UpstreamIndicatorNode = require("./upstreamIndicatorNode");
 const { activeFilters } = require("../util/filterState");
 const InfoNode = require("./infoNode");
@@ -49,13 +49,19 @@ const COLLECTION_TERMINATIONS = new Set([
 
 class RepositoryNode {
   constructor(repo, workspace, context, options = {}) {
+    if (
+      !options.upstreamInventory
+      || typeof options.upstreamInventory.getAllUpstreamData !== "function"
+    ) {
+      throw new TypeError("RepositoryNode requires an upstream inventory facade.");
+    }
     this.context = context;
     this._connectionManager = resolveConnectionManager(context, options.connectionManager);
     this._createCloudsmithAPI = options.createCloudsmithAPI
       || (() => new CloudsmithAPI(this.context));
     this._createPaginatedFetch = options.createPaginatedFetch
       || (api => new PaginatedFetch(api));
-    this._upstreamChecker = options.upstreamChecker || upstreamChecker;
+    this._upstreamInventory = options.upstreamInventory;
     this._requestRefresh = typeof options.requestRefresh === "function"
       ? options.requestRefresh
       : () => {};
@@ -511,8 +517,7 @@ class RepositoryNode {
       connectionManager: this._connectionManager,
       signal: this._lifecycleController.signal,
     };
-    const result = await this._upstreamChecker.getAllUpstreamData(
-      this.context,
+    const result = await this._upstreamInventory.getAllUpstreamData(
       this.workspace,
       this.slug,
       requestOptions
@@ -1097,6 +1102,8 @@ function optionalNonNegativeNumber(value) {
 
 function normalizeUpstreamState(result) {
   if (!result || !Array.isArray(result.upstreams)) return emptyUpstreamState();
+  const upstreams = result.upstreams.map(upstream => sanitizeSafeInventoryUpstream(upstream));
+  if (upstreams.some(upstream => upstream === null)) return emptyUpstreamState();
   const failedFormats = Array.isArray(result.failedFormats) ? [...result.failedFormats] : [];
   const uninspectedFormats = Array.isArray(result.uninspectedFormats)
     ? [...result.uninspectedFormats]
@@ -1106,7 +1113,7 @@ function normalizeUpstreamState(result) {
     ? [...result.unsupportedFormats]
     : [];
   return Object.freeze({
-    upstreams: Object.freeze([...result.upstreams]),
+    upstreams: Object.freeze(upstreams),
     failedFormats: Object.freeze(failedFormats),
     failures: Object.freeze(failures),
     unsupportedFormats: Object.freeze(unsupportedFormats),
@@ -1114,7 +1121,7 @@ function normalizeUpstreamState(result) {
     configuredTotal: Number.isSafeInteger(result.configuredTotal)
       ? result.configuredTotal
       : null,
-    loadedCount: result.upstreams.length,
+    loadedCount: upstreams.length,
     state: typeof result.state === "string" ? result.state : "failed",
     complete: result.complete === true
       && failedFormats.length === 0
