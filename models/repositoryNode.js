@@ -654,7 +654,7 @@ class RepositoryNode {
         placeholderNode = new InfoNode(
           "No packages match filter",
           filterLabel,
-          "Click to change or clear the filter",
+          "Select to change or clear the filter",
           "filter",
           undefined,
           { command: "cloudsmith-vsc.changeFilter", title: "Change Filter", arguments: [this] }

@@ -290,7 +290,7 @@ class QuarantineExplainProvider {
     const parsed = parseWebviewMessage(message, QUARANTINE_MESSAGE_CONTRACTS);
     if (!parsed || !this._isOperationCurrent(operation)) return;
     if (parsed.command === "retry") {
-      await this.show(operation.package);
+      await this._retry(operation);
       return;
     }
     const trace = operation.trace;
@@ -317,12 +317,29 @@ class QuarantineExplainProvider {
     }
   }
 
-  _render(operation) {
+  async _retry(operation) {
     if (!this._isOperationCurrent(operation)) return;
-    operation.panel.webview.html = this._getHtmlContent(operation.nonce, operation.trace);
+    const caller = this._normalizeCallerPackage(operation.package, operation.locator);
+    operation.trace = this._initialTrace(caller, operation.locator);
+    operation.retryFocus = "pending";
+    this._render(operation);
+    await this._refreshOperation(operation, this._cloudsmithAPI || new CloudsmithAPI(this.context));
+    if (!this._isOperationCurrent(operation)) return;
+    operation.retryFocus = "settled";
+    this._render(operation);
+    operation.retryFocus = null;
   }
 
-  _getHtmlContent(nonce, trace) {
+  _render(operation) {
+    if (!this._isOperationCurrent(operation)) return;
+    operation.panel.webview.html = this._getHtmlContent(
+      operation.nonce,
+      operation.trace,
+      { retryFocus: operation.retryFocus }
+    );
+  }
+
+  _getHtmlContent(nonce, trace, presentation = {}) {
     const current = trace.current;
     const name = current?.name || "Package";
     const version = current?.version;
@@ -334,13 +351,13 @@ class QuarantineExplainProvider {
       !trace.refreshed
       && (current?.status !== STATUS_QUARANTINED || !customerReason(trace))
     ) {
-      body = `<p class="loading" role="status" aria-live="polite">Loading quarantine details...</p>`;
+      body = `<p class="loading" data-retry-progress role="status" aria-live="polite" tabindex="-1">Loading quarantine details...</p>`;
     } else if (trace.error === "missing") {
-      body = `<div class="state"><p>This package is no longer available.</p></div>`;
+      body = `<div class="state" role="status"><p>This package is no longer available.</p></div>`;
     } else if (trace.error === "load") {
-      body = `<div class="state" role="alert"><p>Could not load quarantine details.</p><button type="button" data-command="retry">Retry</button></div>`;
+      body = `<div class="state" role="alert"><p>Could not load quarantine details.</p><button type="button" data-command="retry">Retry</button><span id="retry-status" class="sr-only" role="status" aria-live="polite" tabindex="-1"></span></div>`;
     } else if (trace.error === "stale") {
-      body = `<div class="state"><p>This package is no longer quarantined.</p></div>`;
+      body = `<div class="state" role="status"><p>This package is no longer quarantined.</p></div>`;
     } else {
       const reason = customerReason(trace);
       const policyName = trace.parsedReason?.policyName || trace.decision?.policyName || null;
@@ -352,7 +369,7 @@ class QuarantineExplainProvider {
         recorded ? `<div><dt>Decision recorded</dt><dd>${this._esc(formatTimestamp(recorded))}</dd></div>` : "",
       ].join("");
       const description = trace.policyDescription
-        ? `<section><h3>About this policy</h3><p>${this._esc(trace.policyDescription)}</p></section>`
+        ? `<section><h2>About this policy</h2><p>${this._esc(trace.policyDescription)}</p></section>`
         : "";
       const actions = trace.refreshed
         ? `<section><h2>Next steps</h2><div class="actions">
@@ -370,10 +387,13 @@ class QuarantineExplainProvider {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src 'none';">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none';">
+  <title>Quarantine details for ${this._esc(heading)}</title>
   <style>
     body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 16px 24px; line-height: 1.5; }
-    h1 { margin: 0 0 2px; font-size: 1.65em; } h2 { margin: 22px 0 8px; } h3 { margin: 16px 0 6px; }
+    h1 { margin: 0 0 2px; font-size: 1.65em; } h2 { margin: 22px 0 8px; }
     .meta { color: var(--vscode-descriptionForeground); margin-bottom: 14px; }
     .badge { display: inline-block; padding: 3px 10px; border-radius: 3px; font-weight: 600; color: var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, rgba(255,0,0,.1)); }
     dl { border: 1px solid var(--vscode-panel-border); border-radius: 4px; margin: 0; }
@@ -384,17 +404,39 @@ class QuarantineExplainProvider {
     button:hover { background: var(--vscode-button-hoverBackground); } button:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 2px; }
     button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
     .loading, .meta { color: var(--vscode-descriptionForeground); } .state { margin-top: 20px; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    [tabindex="-1"]:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 2px; }
+    @media (max-width: 480px) { body { padding: 12px; } dl div { grid-template-columns: 1fr; gap: 2px; } }
   </style>
 </head>
 <body>
-  <h1>${this._esc(heading)}</h1>
+<main${!trace.refreshed ? ' aria-busy="true"' : ""}>
+  <h1 data-result-summary tabindex="-1">${this._esc(heading)}</h1>
   ${metadata ? `<div class="meta">${this._esc(metadata)}</div>` : ""}
   ${body}
+  </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     document.querySelectorAll("[data-command]").forEach((button) => {
-      button.addEventListener("click", () => vscode.postMessage({ command: button.dataset.command }));
+      button.addEventListener("click", () => {
+        if (button.dataset.command === "retry") {
+          const status = document.getElementById("retry-status");
+          if (status) {
+            status.textContent = "Loading quarantine details...";
+            status.focus();
+          }
+        }
+        vscode.postMessage({ command: button.dataset.command });
+      });
     });
+    const retryFocus = ${JSON.stringify(presentation.retryFocus || null)};
+    if (retryFocus) {
+      const target = retryFocus === "pending"
+        ? document.querySelector("[data-retry-progress]")
+        : document.querySelector('[data-command="retry"]')
+          || document.querySelector("[data-result-summary]");
+      if (target) target.focus();
+    }
   </script>
 </body>
 </html>`;

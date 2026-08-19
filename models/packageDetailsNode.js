@@ -90,15 +90,16 @@ class PackageDetailsNode {
 		}
 
 		return {
-			label: String(value),
-			tooltip: `${id}: ${String(value)}\nClick to copy to clipboard`,
+			label: String(id),
+			description: String(value),
+			tooltip: `${id}: ${String(value)}\nSelect to copy`,
 			collapsibleState: vscode.TreeItemCollapsibleState.None,
 			contextValue: "packageDetail",
 			iconPath: iconPath,
 			// Store id and value for the copy command
 			command: {
 				command: 'cloudsmith-vsc.copySelected',
-				title: 'Copy Label',
+				title: 'Copy value',
 				arguments: [this]
 			}
 		};

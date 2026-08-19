@@ -11,9 +11,12 @@ const {
 } = require("./support");
 
 function createDependencyPickerItem(label, description, action, value, active) {
+  const state = active
+    ? action === "sort" ? "Current sort" : "Current filter"
+    : "";
   return {
     label: `${active ? "$(check)" : "$(circle-large-outline)"} ${label}`,
-    description,
+    description: state ? `${state} · ${description}` : description,
     action,
     value,
   };
@@ -55,7 +58,10 @@ function buildDependencySortFilterItems(vscode, provider, filterModes, sortModes
       currentFilter === filterModes.POLICY_VIOLATION
     ),
     createDependencyPickerItem(
-      "Show all dependencies", "Clear active dependency filters", "filter", null,
+      "Show all dependencies",
+      currentFilter === null ? "No filter applied" : "Clear active dependency filters",
+      "filter",
+      null,
       currentFilter === null
     ),
   ];

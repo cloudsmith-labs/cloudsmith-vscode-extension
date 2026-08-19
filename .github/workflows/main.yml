@@ -48,6 +48,9 @@ jobs:
       - name: Verify architecture boundaries
         run: npm run verify:architecture
 
+      - name: Verify documentation, accessibility, and packaged assets
+        run: npm run verify:polish
+
       - name: Verify version state
         run: npm run verify:version
 

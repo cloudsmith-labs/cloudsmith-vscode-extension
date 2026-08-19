@@ -11,6 +11,7 @@ const {
 } = require("../util/upstreamFormats");
 const { formatUpstreamFailureCategory } = require("../util/upstreamPresentation");
 const { apiSuccess } = require("./apiResultHelpers");
+const { assertWebviewDocument } = require("./helpers/webviewSemanticContract");
 
 suite("UpstreamDetailProvider Test Suite", () => {
   const NON_INSPECTABLE_FORMATS = SUPPORTED_UPSTREAM_FORMATS.filter(format => (
@@ -147,12 +148,15 @@ suite("UpstreamDetailProvider Test Suite", () => {
       failedFormats: ["alpine"],
       successfulFormats: 1,
     });
+    assertWebviewDocument(html, { interactive: true, scripted: true });
 
     assert.ok(html.includes("PyPI"));
+    assert.match(html, /<article class="upstream-card" aria-labelledby="upstream-title-1">/);
+    assert.match(html, /<h3 id="upstream-title-1" class="card-title">PyPI<\/h3>/);
     assert.ok(html.includes("Origin"));
     assert.match(
       html,
-      /<div class="detail-label">Origin<\/div><div class="detail-value mono">https:\/\/pypi\.org<\/div>/
+      /<dt class="detail-label">Origin<\/dt><dd class="detail-value mono">https:\/\/pypi\.org<\/dd>/
     );
     assert.ok(!html.includes("user:pass"));
     assert.ok(!html.includes("/simple/"));
@@ -354,6 +358,8 @@ suite("UpstreamDetailProvider Test Suite", () => {
     const duplicateRetry = provider.retry();
     assert.strictEqual(calls, 2);
     assert.ok(panel.webview.html.includes("Existing results remain visible"));
+    assert.match(panel.webview.html, /const retryFocus = "pending"/);
+    assert.match(panel.webview.html, /data-retry-progress/);
     replacement.resolve(aggregate({
       upstreams: [{ name: "New", format: "npm", origin: "https://new.example" }],
       requestedFormats: ["npm"],
@@ -364,6 +370,7 @@ suite("UpstreamDetailProvider Test Suite", () => {
     await Promise.all([firstRetry, duplicateRetry]);
     assert.ok(panel.webview.html.includes("New"));
     assert.ok(panel.webview.html.includes("Old"));
+    assert.match(panel.webview.html, /const retryFocus = "settled"/);
     assert.strictEqual((panel.webview.html.match(/class="upstream-card"/g) || []).length, 2);
   });
 
@@ -669,7 +676,7 @@ suite("UpstreamDetailProvider Test Suite", () => {
       assert.strictEqual(panel.webview.html.includes("Mirror"), accepted, String(origin));
       if (origin === "") {
         assert.ok(panel.webview.html.includes("Origin unavailable"));
-        assert.ok(!panel.webview.html.includes("()"));
+        assert.doesNotMatch(panel.webview.html, /<h3 class="card-title">Mirror \(\)<\/h3>/);
       }
       assert.ok(!panel.webview.html.includes("user:pass"));
       assert.ok(!panel.webview.html.includes("token=secret"));

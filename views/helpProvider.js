@@ -3,6 +3,7 @@
 const vscode = require('vscode');
 const helpNode = require('../models/helpNode');
 const path = require('path');
+const { HELP_LINKS } = require('../util/helpLinks');
 
 class helpProvider {
     constructor(context) {
@@ -25,13 +26,13 @@ class helpProvider {
             dark: path.join(__filename, "..", "..", "media", "workspace_dark.svg")
         };
 
-        const links = [
-            { label: 'Read extension documentation', url: 'https://docs.cloudsmith.com/developer-tools/vscode', icon: new vscode.ThemeIcon('link-external') },
-            { label: 'Get started with Cloudsmith', url: 'https://docs.cloudsmith.com/', icon: cloudsmithLogo },
-            { label: 'View issues', url: 'https://github.com/cloudsmith-io/cloudsmith-vscode-extension/issues', icon: new vscode.ThemeIcon('logo-github') },
-            { label: 'Report an issue', url: 'https://github.com/cloudsmith-io/cloudsmith-vscode-extension/issues', icon: new vscode.ThemeIcon('logo-github') }
-        ];
-        return links.map(link => new helpNode(link.label, link.url, link.icon));
+        return HELP_LINKS.map(link => new helpNode(
+            link.label,
+            link.url,
+            link.icon === 'cloudsmith' ? cloudsmithLogo : new vscode.ThemeIcon(
+                link.icon === 'github' ? 'logo-github' : 'link-external'
+            )
+        ));
     }
 
     refresh() {
@@ -40,5 +41,4 @@ class helpProvider {
 }
 
 module.exports = { helpProvider };
-
 

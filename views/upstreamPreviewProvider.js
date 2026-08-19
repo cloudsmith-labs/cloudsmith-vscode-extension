@@ -105,16 +105,16 @@ class UpstreamPreviewProvider {
 
     let upstreamHtml = "";
     if (upstreamError) {
-      upstreamHtml = `<p class="error-banner">Could not load upstream data: ${this._escapeHtml(upstreamError)}</p>`;
+      upstreamHtml = `<p class="error-banner" role="alert">Could not load upstream data: ${this._escapeHtml(upstreamError)}</p>`;
     } else if (configs.length === 0) {
       upstreamHtml = upstreamComplete
         ? '<p class="muted">No upstreams configured for this format.</p>'
-        : '<p class="error-banner">Upstream inspection is incomplete. Additional upstreams may exist.</p>';
+        : '<p class="error-banner" role="alert">Upstream inspection is incomplete. Additional upstreams may exist.</p>';
     } else {
       if (!upstreamComplete) {
-        upstreamHtml += '<p class="error-banner">Upstream inspection is incomplete. The loaded configurations are shown below.</p>';
+        upstreamHtml += '<p class="error-banner" role="alert">Upstream inspection is incomplete. The loaded configurations are shown below.</p>';
       }
-      upstreamHtml += '<table class="data-table"><thead><tr><th>Name</th><th>Origin</th><th>Status</th></tr></thead><tbody>';
+      upstreamHtml += '<div class="table-scroll" role="region" aria-label="Loaded upstreams" tabindex="0"><table class="data-table"><caption>Loaded upstream configurations</caption><thead><tr><th scope="col">Name</th><th scope="col">Origin</th><th scope="col">Status</th></tr></thead><tbody>';
       for (const u of displayedConfigs) {
         const active = u.is_active !== false;
         const statusClass = active ? "status-active" : "status-inactive";
@@ -125,7 +125,7 @@ class UpstreamPreviewProvider {
           <td class="${statusClass}">${statusLabel}</td>
         </tr>`;
       }
-      upstreamHtml += "</tbody></table>";
+      upstreamHtml += "</tbody></table></div>";
       if (configs.length > displayedConfigs.length) {
         upstreamHtml += `<p class="muted">Showing ${displayedConfigs.length} of ${configs.length} loaded upstreams.</p>`;
       }
@@ -145,18 +145,22 @@ class UpstreamPreviewProvider {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none';">
+<title>Upstream resolution preview</title>
 <style>
   body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 16px; margin: 0; }
-  h2 { color: var(--vscode-foreground); margin-top: 0; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 8px; }
-  h3 { color: var(--vscode-foreground); margin-top: 20px; }
+  h1 { color: var(--vscode-foreground); margin-top: 0; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 8px; font-size: 1.5em; }
+  h2 { color: var(--vscode-foreground); margin-top: 20px; }
   .header-info { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin-bottom: 16px; }
   .header-info dt { font-weight: 600; color: var(--vscode-descriptionForeground); }
   .header-info dd { margin: 0; }
   .data-table { width: 100%; border-collapse: collapse; margin: 8px 0; }
   .data-table th, .data-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--vscode-panel-border); }
   .data-table th { color: var(--vscode-descriptionForeground); font-weight: 600; font-size: 0.9em; }
-  .mono { font-family: var(--vscode-editor-font-family); font-size: 0.9em; }
+  .mono { font-family: var(--vscode-editor-font-family); font-size: 0.9em; overflow-wrap: anywhere; }
+  .table-scroll { max-width: 100%; overflow-x: auto; }
+  .table-scroll:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 2px; }
   .status-found { color: var(--vscode-testing-iconPassed); }
   .status-missing { color: var(--vscode-errorForeground); }
   .status-active { color: var(--vscode-testing-iconPassed); }
@@ -166,10 +170,12 @@ class UpstreamPreviewProvider {
   .error-banner { background: var(--vscode-inputValidation-errorBackground, rgba(255,0,0,0.08)); border: 1px solid var(--vscode-inputValidation-errorBorder, #c42b1c); color: var(--vscode-errorForeground); padding: 10px 12px; border-radius: 4px; }
   .resolution-yes { background: var(--vscode-inputValidation-infoBackground); border: 1px solid var(--vscode-inputValidation-infoBorder); padding: 10px; border-radius: 4px; margin: 12px 0; }
   .resolution-no { background: var(--vscode-inputValidation-warningBackground); border: 1px solid var(--vscode-inputValidation-warningBorder); padding: 10px; border-radius: 4px; margin: 12px 0; }
+  @media (max-width: 480px) { body { padding: 12px; } .header-info { grid-template-columns: 1fr; gap: 2px; } .header-info dd { margin-bottom: 8px; } }
 </style>
 </head>
 <body>
-  <h2>Upstream resolution preview</h2>
+<main>
+  <h1>Upstream resolution preview</h1>
   <dl class="header-info">
     <dt>Package</dt><dd>${this._escapeHtml(formatUpstreamText(ownDataValue(result, "name"), "Unknown"))}</dd>
     <dt>Format</dt><dd>${this._escapeHtml(formatUpstreamText(canonicalFormat, "Unknown"))}</dd>
@@ -181,8 +187,9 @@ class UpstreamPreviewProvider {
 
   ${resolutionSummary}
 
-  <h3>${upstreamHeading}</h3>
+  <h2>${upstreamHeading}</h2>
   ${upstreamHtml}
+</main>
 </body>
 </html>`;
   }

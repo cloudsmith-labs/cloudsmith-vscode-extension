@@ -2,6 +2,7 @@ const assert = require("assert");
 const vscode = require("vscode");
 const { ComplianceReportProvider } = require("../views/complianceReportProvider");
 const { buildComplianceReportData } = require("../views/dependencyHealthProvider");
+const { assertWebviewDocument } = require("./helpers/webviewSemanticContract");
 
 suite("ComplianceReportProvider", () => {
   test("report data and HTML escape dynamic content", () => {
@@ -101,6 +102,7 @@ suite("ComplianceReportProvider", () => {
 
     const provider = new ComplianceReportProvider({});
     const html = provider._getHtml(reportData);
+    assertWebviewDocument(html, { interactive: true, tables: true });
 
     assert.match(html, /fixture &lt;app&gt;/);
     assert.match(html, /evil&lt;script&gt;alert\(1\)&lt;\/script&gt;&#39;&quot;/);
@@ -108,11 +110,11 @@ suite("ComplianceReportProvider", () => {
     assert.match(html, /proxy &lt;prod&gt;/);
     assert.match(html, /Blocked by policy &lt;rule&gt;/);
     assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
-    assert.match(html, /Vulnerability Findings/);
-    assert.match(html, /License Summary/);
-    assert.match(html, /Policy Compliance/);
-    assert.match(html, /Uncovered Dependencies/);
-    assert.match(html, /Ecosystem Breakdown/);
+    assert.match(html, /Vulnerability findings/);
+    assert.match(html, /License summary/);
+    assert.match(html, /Policy compliance/);
+    assert.match(html, /Uncovered dependencies/);
+    assert.match(html, /Ecosystem breakdown/);
   });
 
   test("show creates a static webview with no local resource access", () => {
@@ -166,7 +168,7 @@ suite("ComplianceReportProvider", () => {
     const provider = new ComplianceReportProvider({});
     const html = provider._getHtml(reportData);
 
-    assert.match(html, /CVE Count \/ Status/);
+    assert.match(html, /CVE count \/ status/);
     assert.match(html, />Unknown<\/td>/);
     assert.match(html, /1 Unknown/);
     assert.doesNotMatch(html, /unknown-package[\s\S]*?<td>0<\/td>/);
@@ -254,7 +256,7 @@ suite("ComplianceReportProvider", () => {
       /3 of 4 applicable artifacts served by Cloudsmith \(75%\); 1 not applicable/
     );
     assert.strictEqual((html.match(/1 not applicable/g) || []).length, 1);
-    assert.match(html, /<summary>Registry lookup not applicable<\/summary>/);
+    assert.match(html, /<summary><h2>Registry lookup not applicable<\/h2><\/summary>/);
     assert.match(html, /local-package/);
     assert.match(html, />path<\/td>/);
     assert.doesNotMatch(html, /private-user|\/Users\//);
@@ -278,7 +280,7 @@ suite("ComplianceReportProvider", () => {
       html,
       /0 of 0 applicable artifacts served by Cloudsmith \(0%\); 5 not applicable/
     );
-    assert.match(html, /<summary>Registry lookup not applicable<\/summary>/);
+    assert.match(html, /<summary><h2>Registry lookup not applicable<\/h2><\/summary>/);
   });
 
   test("malformed optional summary values do not leak into report copy", () => {

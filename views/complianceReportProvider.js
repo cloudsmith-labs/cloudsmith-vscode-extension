@@ -119,7 +119,8 @@ class ComplianceReportProvider {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Dependency Health Report</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none';">
+  <title>Dependency Health report</title>
   <style>
     :root {
       --cs-teal: #1abc9c;
@@ -203,19 +204,19 @@ class ComplianceReportProvider {
     }
 
     .summary-card.dependencies {
-      border-left-color: var(--cs-amber);
+      border-left-color: var(--vscode-editorWarning-foreground);
     }
 
     .summary-card.vulnerabilities {
-      border-left-color: #e67e22;
+      border-left-color: var(--vscode-errorForeground);
     }
 
     .summary-card.licenses {
-      border-left-color: var(--cs-red);
+      border-left-color: var(--vscode-errorForeground);
     }
 
     .summary-card.coverage {
-      border-left-color: var(--cs-teal);
+      border-left-color: var(--vscode-testing-iconPassed);
     }
 
     .summary-value {
@@ -281,6 +282,7 @@ class ComplianceReportProvider {
       border-bottom: 1px solid transparent;
       background: color-mix(in srgb, var(--cs-border) 26%, transparent);
     }
+    .report-section > summary h2 { display: inline; margin: 0; font: inherit; }
 
     .report-section[open] > summary {
       border-bottom-color: var(--cs-border);
@@ -288,6 +290,22 @@ class ComplianceReportProvider {
 
     .report-section > summary::-webkit-details-marker {
       display: none;
+    }
+
+    .report-section > summary::before {
+      content: "▸";
+      display: inline-block;
+      margin-right: 8px;
+    }
+
+    .report-section[open] > summary::before {
+      content: "▾";
+    }
+
+    .report-section > summary:focus-visible,
+    table:focus-visible {
+      outline: 2px solid var(--vscode-focusBorder);
+      outline-offset: -2px;
     }
 
     .section-body {
@@ -313,6 +331,9 @@ class ComplianceReportProvider {
 
     table {
       width: 100%;
+      max-width: 100%;
+      display: block;
+      overflow-x: auto;
       border-collapse: collapse;
       font-size: 13px;
     }
@@ -347,26 +368,26 @@ class ComplianceReportProvider {
     .severity-critical,
     .status-quarantined,
     .classification-restrictive {
-      background: rgba(231, 76, 60, 0.14);
-      color: #ff8d84;
+      background: var(--vscode-inputValidation-errorBackground);
+      color: var(--vscode-errorForeground);
     }
 
     .severity-high {
-      background: rgba(230, 126, 34, 0.16);
-      color: #f1a35a;
+      background: var(--vscode-inputValidation-warningBackground);
+      color: var(--vscode-editorWarning-foreground);
     }
 
     .severity-medium,
     .severity-low,
     .classification-weak-copyleft {
-      background: rgba(243, 156, 18, 0.15);
-      color: #f7c66d;
+      background: var(--vscode-inputValidation-warningBackground);
+      color: var(--vscode-editorWarning-foreground);
     }
 
     .status-default,
     .classification-default {
-      background: rgba(52, 152, 219, 0.13);
-      color: #7ebaf2;
+      background: var(--vscode-inputValidation-infoBackground);
+      color: var(--vscode-textLink-foreground);
     }
 
     .empty-card {
@@ -397,17 +418,25 @@ class ComplianceReportProvider {
         padding: 10px 8px;
       }
     }
+
+    @media (forced-colors: active) {
+      .card, .summary-card, .report-section, .badge, .coverage-bar {
+        border: 1px solid CanvasText;
+        box-shadow: none;
+      }
+      .coverage-fill { background: Highlight; }
+    }
   </style>
 </head>
 <body>
-  <div class="shell">
-    <div class="report-header">
-      <h1>Dependency Health Report</h1>
+  <main class="shell">
+    <header class="report-header">
+      <h1>Dependency Health report</h1>
       <p class="subtitle">${escapeHtml(reportData.projectName || "workspace")} · Scanned ${escapeHtml(formatScanDate(reportData.scanDate))}</p>
-    </div>
+    </header>
 
     <div class="summary-grid">
-      ${renderSummaryCard("dependencies", total, "Artifacts", `${occurrences} occurrences · ${direct} direct`)}
+      ${renderSummaryCard("dependencies", total, "Dependencies", `${occurrences} occurrences · ${direct} direct`)}
       ${renderSummaryCard("vulnerabilities", vulnCount, "Vulnerable", formatSeverityBreakdown(summary))}
       ${renderSummaryCard("licenses", restrictiveLicenseCount, "Restrictive licenses", formatLicenseBreakdown(licenseIds))}
       ${renderSummaryCard("coverage", found, "Cloudsmith coverage", `${coveragePct}% coverage`)}
@@ -425,7 +454,7 @@ class ComplianceReportProvider {
 
     ${emptyState}
     ${sections.join("\n")}
-  </div>
+  </main>
 </body>
 </html>`;
   }
@@ -433,7 +462,7 @@ class ComplianceReportProvider {
 
 function renderSummaryCard(cssClass, value, label, detail) {
   return `
-    <div class="summary-card ${cssClass}">
+    <div class="summary-card ${cssClass}" role="group" aria-label="${escapeHtml(label)}: ${escapeHtml(String(value))}">
       <div class="summary-value">${escapeHtml(String(value))}</div>
       <div class="summary-label">${escapeHtml(label)}</div>
       <div class="summary-detail">${escapeHtml(detail)}</div>
@@ -444,7 +473,7 @@ function renderSummaryCard(cssClass, value, label, detail) {
 function renderSection(title, bodyHtml) {
   return `
     <details class="report-section" open>
-      <summary>${escapeHtml(title)}</summary>
+      <summary><h2>${escapeHtml(title)}</h2></summary>
       <div class="section-body">
         ${bodyHtml}
       </div>
@@ -463,12 +492,13 @@ function renderEcosystemSection(ecosystemBreakdown) {
     `)
     .join("");
 
-  return renderSection("Ecosystem Breakdown", `
-    <table>
+  return renderSection("Ecosystem breakdown", `
+    <table tabindex="0">
+      <caption>Dependencies by ecosystem</caption>
       <thead>
         <tr>
-          <th>Ecosystem</th>
-          <th>Dependencies</th>
+          <th scope="col">Ecosystem</th>
+          <th scope="col">Dependencies</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
@@ -495,16 +525,17 @@ function renderVulnerabilitySection(vulnerableDeps) {
     `;
   }).join("");
 
-  return renderSection("Vulnerability Findings", `
-    <table>
+  return renderSection("Vulnerability findings", `
+    <table tabindex="0">
+      <caption>Dependencies with known vulnerabilities</caption>
       <thead>
         <tr>
-          <th>Package</th>
-          <th>Version</th>
-          <th>Type</th>
-          <th>Severity</th>
-          <th>CVE Count / Status</th>
-          <th>Fix Available</th>
+          <th scope="col">Package</th>
+          <th scope="col">Version</th>
+          <th scope="col">Type</th>
+          <th scope="col">Severity</th>
+          <th scope="col">CVE count / status</th>
+          <th scope="col">Fix available</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
@@ -526,14 +557,15 @@ function renderLicenseSection(restrictiveLicenseDeps) {
     </tr>
   `).join("");
 
-  return renderSection("License Summary", `
-    <table>
+  return renderSection("License summary", `
+    <table tabindex="0">
+      <caption>Dependencies with restrictive or weak copyleft licenses</caption>
       <thead>
         <tr>
-          <th>Package</th>
-          <th>Version</th>
-          <th>SPDX</th>
-          <th>Classification</th>
+          <th scope="col">Package</th>
+          <th scope="col">Version</th>
+          <th scope="col">SPDX</th>
+          <th scope="col">Classification</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
@@ -551,14 +583,15 @@ function renderPolicySection(policyViolationDeps) {
     </tr>
   `).join("");
 
-  return renderSection("Policy Compliance", `
-    <table>
+  return renderSection("Policy compliance", `
+    <table tabindex="0">
+      <caption>Dependencies with policy findings</caption>
       <thead>
         <tr>
-          <th>Package</th>
-          <th>Version</th>
-          <th>Status</th>
-          <th>Detail</th>
+          <th scope="col">Package</th>
+          <th scope="col">Version</th>
+          <th scope="col">Status</th>
+          <th scope="col">Detail</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
@@ -582,13 +615,14 @@ function renderUncoveredSection(uncoveredDeps) {
     groups.push(`
       <div class="section-group">
         <h3>Reachable via upstream proxy</h3>
-        <table>
+        <table tabindex="0">
+          <caption>Uncovered dependencies reachable through an upstream</caption>
           <thead>
             <tr>
-              <th>Package</th>
-              <th>Version</th>
-              <th>Ecosystem</th>
-              <th>Available In</th>
+              <th scope="col">Package</th>
+              <th scope="col">Version</th>
+              <th scope="col">Ecosystem</th>
+              <th scope="col">Available in</th>
             </tr>
           </thead>
           <tbody>
@@ -610,13 +644,14 @@ function renderUncoveredSection(uncoveredDeps) {
     groups.push(`
       <div class="section-group">
         <h3>Not reachable</h3>
-        <table>
+        <table tabindex="0">
+          <caption>Uncovered dependencies not reachable through an upstream</caption>
           <thead>
             <tr>
-              <th>Package</th>
-              <th>Version</th>
-              <th>Ecosystem</th>
-              <th>Reason</th>
+              <th scope="col">Package</th>
+              <th scope="col">Version</th>
+              <th scope="col">Ecosystem</th>
+              <th scope="col">Reason</th>
             </tr>
           </thead>
           <tbody>
@@ -638,13 +673,14 @@ function renderUncoveredSection(uncoveredDeps) {
     groups.push(`
       <div class="section-group">
         <h3>Reachability unknown</h3>
-        <table>
+        <table tabindex="0">
+          <caption>Dependencies with unknown upstream reachability</caption>
           <thead>
             <tr>
-              <th>Package</th>
-              <th>Version</th>
-              <th>Ecosystem</th>
-              <th>Detail</th>
+              <th scope="col">Package</th>
+              <th scope="col">Version</th>
+              <th scope="col">Ecosystem</th>
+              <th scope="col">Detail</th>
             </tr>
           </thead>
           <tbody>
@@ -662,7 +698,7 @@ function renderUncoveredSection(uncoveredDeps) {
     `);
   }
 
-  return renderSection("Uncovered Dependencies", groups.join(""));
+  return renderSection("Uncovered dependencies", groups.join(""));
 }
 
 function renderNotApplicableSection(dependencies) {
@@ -675,13 +711,14 @@ function renderNotApplicableSection(dependencies) {
     </tr>
   `).join("");
   return renderSection("Registry lookup not applicable", `
-    <table>
+    <table tabindex="0">
+      <caption>Dependencies not eligible for registry lookup</caption>
       <thead>
         <tr>
-          <th>Package</th>
-          <th>Version</th>
-          <th>Source kind</th>
-          <th>Detail</th>
+          <th scope="col">Package</th>
+          <th scope="col">Version</th>
+          <th scope="col">Source kind</th>
+          <th scope="col">Detail</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
