@@ -1,30 +1,58 @@
+## 2.3.0 - August 2026
+
+### Reliability and security
+
+- Hardened Dependency Health across all 14 supported ecosystem families and their manifest and lockfile variants, improving direct/transitive relationships, provenance, large-graph handling, cancellation, and protection against false covered or complete results.
+- Made broad package search and pagination reliable across overlapping requests, refreshes, account changes, and stale workspace or repository selections.
+- Made authentication startup and account switching atomic so valid stored credentials no longer appear disconnected during validation and old-account data cannot publish after a switch.
+- Hardened package identity, install-command input, file, path, URL, redirect, WebView message, and API processing boundaries so malformed or stale data cannot drive actions or expose credentials.
+
+### Vulnerability, upstream, and package workflows
+
+- Made vulnerability results fail-safe across clean, vulnerable, partial, unknown, and failed states so incomplete evidence is not presented as clean, with more reliable safe-version and quarantine remediation.
+- Improved upstream inventory, retries, resolution preview, Dependency Health coverage, and pull-through preparation while preserving partial-result truth and account isolation.
+- Made Command Palette, context-menu, and view-title actions state-aware, with deterministic package, workspace, and repository recovery for global commands and safe cancellation of stale prompts.
+
+### Accessibility
+
+- Improved keyboard navigation, focus visibility, high-contrast support, and screen-reader semantics across package details, Dependency Health controls, and custom Cloudsmith WebViews.
+
 ## 2.2.0 - August 2026
-### Dependency, package, and command reliability
+### Transitive Dependency Visibility
 
-- Expanded Dependency Health across 14 package ecosystems and their supported manifests and lockfiles, with more accurate direct/transitive relationships, source classification, duplicate-version handling, cancellation, and bounded workspace parsing.
-- Made package search, filtering, pagination, recent-search recovery, and workspace/repository state transitions deterministic across refreshes, account changes, partial results, and stale selections.
-- Unified vulnerability and quarantine presentation around canonical complete, clean, partial, unknown, and failed states so remediation actions do not treat missing evidence as a clean result.
-- Hardened upstream inventory, resolution preview, pull-through coverage, retries, cache validation, and partial-result reporting across supported repository formats.
-- Made Command Palette and contextual workflows state-aware, with bounded recovery for package and repository selections and safe cancellation when account or view state changes.
-- Strengthened credential, redirect, URL, path, message, inspection, and API-boundary validation while correcting install, promotion, entitlement, and package-state edge cases.
+#### Transitive Dependency Resolution
+- Dependency Health view now resolves the complete dependency set (direct and transitive) by parsing lockfiles and manifests directly.
+- Ecosystems with lockfiles (npm, Yarn, pnpm, Python/Poetry/uv, Rust, Ruby, Go, NuGet, Dart, PHP, Helm, Swift, Hex) resolve the full transitive tree automatically.
+- Maven and Gradle resolve direct dependencies from pom.xml and build.gradle. The extension prompts when a tree file is not found.
+- Docker and Helm resolve direct dependencies (base images and chart dependencies).
+- Summary bar shows total dependency count with direct/transitive breakdown and per-ecosystem composition for multi-ecosystem projects.
 
-### Documentation, accessibility, and release polish
+#### Vulnerability, License, and Policy Overlays
+- Resolved dependencies found in Cloudsmith are checked for known vulnerabilities with severity indicators displayed inline.
+- License classification (permissive, weak copyleft, restrictive) and policy compliance status shown for all covered dependencies.
+- Summary bar aggregates vulnerability counts by severity, restrictive license count, and policy violation count.
 
-#### Documentation accuracy
-- Reworked the README around current authentication, package inspection, search, vulnerability, quarantine, Dependency Health, upstream, and promotion workflows.
-- Documented all 21 active settings with their current defaults and constraints. Two previously contributed no-op settings remain as deprecated compatibility schema so existing configuration stays valid.
-- Clarified which commands are global Command Palette workflows and which actions require a relevant view selection or context menu.
+#### Upstream Proxy Gap Analysis
+- Dependencies not found in Cloudsmith are checked against configured upstream proxies across all repositories.
+- Each uncovered dependency shows whether it's reachable via an existing upstream or requires a new proxy to be configured.
 
-#### Accessible interaction and presentation
-- Added explicit text for material package state, format, version, and policy information that was previously available only through icons or hover text.
-- Made package detail rows self-describing and made Dependency Health sort and filter choices identify their current state in text.
-- Improved WebView landmarks, headings, live status and error announcements, keyboard focus, table semantics, narrow-pane reflow, and high-contrast presentation.
-- Kept retry focus deterministic without moving focus during initial or static rendering.
+#### Tree Visualization
+- New tree view mode displays the full dependency hierarchy with collapsible parent-child relationships.
+- Diamond dependencies collapsed on subsequent occurrences to prevent exponential tree growth.
+- Filters prune the tree to show only vulnerable, uncovered, or restrictive-license dependency paths.
+- Three-way view toggle: direct only, all (flat), or all (tree).
 
-#### Packaged asset and release hygiene
-- Removed obsolete README media and unreferenced packaged assets, and replaced broad media globs with a closed shipped-asset inventory.
-- Routed package and search-result format icons through one bounded resolver with a safe fallback for unknown formats.
-- Added a deterministic polish verification gate covering public documentation, deprecated settings, help links, WebView semantics, and packaged media.
+#### Pull Dependencies Through Upstream
+- New pull action caches uncovered dependencies through a selected repository's upstream proxy directly from the editor.
+- Repository selector shows only repositories with upstream proxies matching the project's dependency formats.
+- Right-click any individual uncovered dependency to pull just that package through an upstream.
+
+#### Compliance Report
+- New report view opens a dependency health summary in a dedicated editor panel with coverage, vulnerability, license, policy, and upstream gap analysis.
+
+#### UX Improvements
+- Toolbar consolidated to five inline actions: scan, pull, view mode cycle, sort and filter, and compliance report.
+- Format-specific icons displayed on uncovered dependencies for at-a-glance ecosystem identification.
 
 ## 2.1.1 - April 2026
 ### Fixed
