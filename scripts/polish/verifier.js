@@ -33,8 +33,10 @@ const FORBIDDEN_DOC_PATTERNS = Object.freeze([
   /all commands are available (?:from|via)/i,
   /full raw (?:api|json)/i,
   /enter your api key directly in (?:the )?extension settings/i,
-  /help\.cloudsmith\.io/i,
-  /github\.com\/cloudsmith-io\/cloudsmith-vscode-extension/i,
+]);
+const FORBIDDEN_DOC_FRAGMENTS = Object.freeze([
+  "help.cloudsmith.io",
+  "github.com/cloudsmith-io/cloudsmith-vscode-extension",
 ]);
 
 function fail(message) {
@@ -245,16 +247,23 @@ function validateNoProductionSettingReads(root) {
   for (const key of DEPRECATED_SETTINGS) {
     const shortName = key.slice("cloudsmith-vsc.".length);
     const hits = [];
-    const visit = (relative) => {
+    const scanFile = (relative) => {
+      if (!relative.endsWith(".js") || relative.endsWith("formatIconInventory.js")) return;
       const absolute = path.join(root, relative);
-      const stat = fs.lstatSync(absolute);
-      if (stat.isDirectory()) {
-        for (const entry of fs.readdirSync(absolute)) visit(`${relative}/${entry}`);
-      } else if (relative.endsWith(".js") && !relative.endsWith("formatIconInventory.js")) {
-        if (fs.readFileSync(absolute, "utf8").includes(shortName)) hits.push(relative);
+      if (fs.readFileSync(absolute, "utf8").includes(shortName)) hits.push(relative);
+    };
+    const visitDirectory = (relative) => {
+      const absolute = path.join(root, relative);
+      for (const entry of fs.readdirSync(absolute, { withFileTypes: true })) {
+        const child = `${relative}/${entry.name}`;
+        if (entry.isDirectory()) visitDirectory(child);
+        else if (entry.isFile()) scanFile(child);
       }
     };
-    for (const relative of roots) visit(relative);
+    for (const relative of roots) {
+      if (relative.endsWith(".js")) scanFile(relative);
+      else visitDirectory(relative);
+    }
     if (hits.length) fail(`${key} must have zero production reads; found ${hits.join(", ")}`);
   }
 }
@@ -273,6 +282,11 @@ function verifyRepository(root = path.resolve(__dirname, "../..")) {
   walkForJunk(root);
   for (const pattern of FORBIDDEN_DOC_PATTERNS) {
     if (pattern.test(readme)) fail(`README contains stale claim matching ${pattern}`);
+  }
+  for (const fragment of FORBIDDEN_DOC_FRAGMENTS) {
+    if (readme.toLowerCase().includes(fragment)) {
+      fail(`README contains stale link fragment: ${fragment}`);
+    }
   }
   return { activeSettings: 21, deprecatedSettings: 2, media: APPROVED_MEDIA.length };
 }
