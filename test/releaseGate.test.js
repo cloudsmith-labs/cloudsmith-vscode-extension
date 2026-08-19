@@ -175,7 +175,7 @@ suite("M9 release gate helpers", () => {
     const currentStart = changelog.indexOf("## 2.3.0 - August 2026");
     const releasedStart = changelog.indexOf("## 2.2.0 - August 2026");
     const olderStart = changelog.indexOf("## 2.1.1 - April 2026");
-    const releasedSection = changelog.slice(releasedStart, olderStart);
+    const releasedSection = changelog.slice(releasedStart, olderStart).replace(/\r\n/g, "\n");
     const releasedSectionHash = crypto.createHash("sha256").update(releasedSection).digest("hex");
 
     assert.ok(currentStart >= 0 && releasedStart > currentStart);
