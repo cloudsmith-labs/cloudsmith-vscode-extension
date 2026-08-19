@@ -24,6 +24,18 @@ function validPackageName(value) {
     && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
+function manualPackageNameValidationMessage(value) {
+  if (typeof value !== "string") return "Enter a package name.";
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    return "Package names cannot contain control characters.";
+  }
+  if (value.length > MAX_PACKAGE_NAME_LENGTH) {
+    return `Package names must be ${MAX_PACKAGE_NAME_LENGTH} characters or fewer.`;
+  }
+  if (value.trim().length === 0) return "Enter a package name.";
+  return null;
+}
+
 function registerUpstreamCommands(deps) {
   const {
     registerCommand,
@@ -285,17 +297,11 @@ function registerUpstreamCommands(deps) {
         packageName = await showAccountInputBox(deps, account, {
           placeHolder: "flask",
           prompt: "Enter the package name",
-          validateInput(value) {
-            if (value.length > MAX_PACKAGE_NAME_LENGTH) {
-              return `Package names must be ${MAX_PACKAGE_NAME_LENGTH} characters or fewer.`;
-            }
-            if (/[\u0000-\u001f\u007f]/.test(value)) {
-              return "Package names cannot contain control characters.";
-            }
-            return null;
-          },
+          validateInput: manualPackageNameValidationMessage,
         });
         if (!isPreviewCurrent(operation)) return;
+        if (typeof packageName !== "string") return;
+        packageName = packageName.trim();
         if (!validPackageName(packageName)) return;
         const formatItems = FORMAT_OPTIONS.map(format => ({ label: format, format }));
         const formatPick = await showAccountQuickPick(

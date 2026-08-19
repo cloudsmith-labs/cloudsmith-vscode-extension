@@ -22,26 +22,27 @@ const {
 
 const MAX_SEARCH_INPUT_LENGTH = 2048;
 
+function searchInputValidationMessage(value) {
+  if (typeof value !== "string") return "Enter a search query.";
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) {
+    return "Search queries cannot contain control characters.";
+  }
+  if (value.length > MAX_SEARCH_INPUT_LENGTH) {
+    return `Search queries must be ${MAX_SEARCH_INPUT_LENGTH} characters or fewer.`;
+  }
+  if (value.trim().length === 0) return "Enter a search query.";
+  return null;
+}
+
 function searchInputOptions(options) {
   return {
     ...options,
-    validateInput(value) {
-      if (value.length > MAX_SEARCH_INPUT_LENGTH) {
-        return `Search queries must be ${MAX_SEARCH_INPUT_LENGTH} characters or fewer.`;
-      }
-      if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) {
-        return "Search queries cannot contain control characters.";
-      }
-      return null;
-    },
+    validateInput: searchInputValidationMessage,
   };
 }
 
 function validSearchInput(value) {
-  return typeof value === "string"
-    && value.trim().length > 0
-    && value.length <= MAX_SEARCH_INPUT_LENGTH
-    && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value);
+  return searchInputValidationMessage(value) === null;
 }
 
 function registerSearchCommands(deps) {

@@ -19,11 +19,20 @@ const {
 
 const MAX_FILTER_INPUT_LENGTH = 2048;
 
+function filterInputValidationMessage(value) {
+  if (typeof value !== "string") return "Enter a filter query.";
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) {
+    return "Filter queries cannot contain control characters.";
+  }
+  if (value.length > MAX_FILTER_INPUT_LENGTH) {
+    return `Enter a query with ${MAX_FILTER_INPUT_LENGTH} characters or fewer.`;
+  }
+  if (value.trim().length === 0) return "Enter a filter query.";
+  return null;
+}
+
 function validFilterInput(value) {
-  return typeof value === "string"
-    && value.trim().length > 0
-    && value.length <= MAX_FILTER_INPUT_LENGTH
-    && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value);
+  return filterInputValidationMessage(value) === null;
 }
 
 function registerPackageCommands(deps) {
@@ -416,15 +425,7 @@ function registerPackageCommands(deps) {
       query = await showAccountInputBox(deps, accountScope, {
         placeHolder: "Enter filter query",
         prompt: `Filter packages in ${repository.name}`,
-        validateInput: value => {
-          if (value.length > MAX_FILTER_INPUT_LENGTH) {
-            return `Enter a query with ${MAX_FILTER_INPUT_LENGTH} characters or fewer.`;
-          }
-          if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) {
-            return "Filter queries cannot contain control characters.";
-          }
-          return null;
-        },
+        validateInput: filterInputValidationMessage,
       });
       if (!validFilterInput(query) || !isCurrent()) return;
       query = buildPresetQuery(SearchQueryBuilder, selected.preset, query);

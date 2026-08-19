@@ -677,6 +677,87 @@ suite("Command registrars", () => {
     assert.deepStrictEqual(warnings, []);
   });
 
+  test("custom search and repository-filter InputBoxes reject whitespace-only queries", async () => {
+    const searchRecorder = recordingRegistration();
+    let searchValidator = null;
+    registerSearchCommands({
+      ...baseDependencies(searchRecorder),
+      context: {},
+      workspaceAccess: workspaceCollectionHarness().access,
+      vscode: {
+        QuickPickItemKind: { Separator: 1 },
+        workspace: { getConfiguration: () => ({ get: () => "" }) },
+        window: {
+          async showInputBox(options) {
+            searchValidator = options.validateInput;
+            return null;
+          },
+          showWarningMessage() {},
+        },
+      },
+      RecentSearches: class {},
+      SearchQueryBuilder: class {},
+      FORMAT_OPTIONS: [],
+      searchProvider: {},
+    });
+    await searchRecorder.handlers.get("cloudsmith-vsc.searchInWorkspace")({
+      slug: "workspace-a",
+      name: "Workspace A",
+    });
+    assert.strictEqual(typeof searchValidator, "function");
+    assert.strictEqual(searchValidator(""), "Enter a search query.");
+    assert.strictEqual(searchValidator("   "), "Enter a search query.");
+    assert.strictEqual(searchValidator(" name:flask "), null);
+    assert.strictEqual(
+      searchValidator("name:flask\u0000"),
+      "Search queries cannot contain control characters."
+    );
+    assert.strictEqual(searchValidator("a".repeat(2048)), null);
+    assert.strictEqual(
+      searchValidator("a".repeat(2049)),
+      "Search queries must be 2048 characters or fewer."
+    );
+
+    const filterRecorder = recordingRegistration();
+    let filterValidator = null;
+    registerPackageCommands({
+      ...baseDependencies(filterRecorder),
+      packageAdapters: {
+        fromRepositoryNode: () => ({
+          workspace: "workspace-a",
+          repository: "repo-a",
+          name: "Repo A",
+        }),
+      },
+      vscode: {
+        window: {
+          async showQuickPick(items) {
+            return items.find(item => item.preset?.applyBuilder === null);
+          },
+          async showInputBox(options) {
+            filterValidator = options.validateInput;
+            return null;
+          },
+        },
+      },
+      cloudsmithProvider: { refresh() { throw new Error("must not refresh"); } },
+    });
+    await filterRecorder.handlers.get("cloudsmith-vsc.filterPackages")({});
+    assert.strictEqual(typeof filterValidator, "function");
+    assert.strictEqual(filterValidator(""), "Enter a filter query.");
+    assert.strictEqual(filterValidator("   "), "Enter a filter query.");
+    assert.strictEqual(filterValidator(" format:python "), null);
+    assert.strictEqual(
+      filterValidator("format:python\u0000"),
+      "Filter queries cannot contain control characters."
+    );
+    assert.strictEqual(filterValidator("a".repeat(2048)), null);
+    assert.strictEqual(
+      filterValidator("a".repeat(2049)),
+      "Enter a query with 2048 characters or fewer."
+    );
+  });
+
   test("package entitlement cancellation neither copies nor echoes the sensitive token", async () => {
     const recorder = recordingRegistration();
     let writes = 0;
@@ -2393,6 +2474,181 @@ suite("Command registrars", () => {
     )));
     assert.deepStrictEqual(shown, [{ resolved: true }]);
     assert.deepStrictEqual(warnings, ["Could not determine package details."]);
+  });
+
+  test("upstream preview validates and normalizes the actual manual package InputBox", async () => {
+    const recorder = recordingRegistration();
+    let validateInput = null;
+    const factoryInputs = [];
+    const previewCalls = [];
+    const warnings = [];
+    const errors = [];
+    registerUpstreamCommands({
+      ...baseDependencies(recorder),
+      context: {},
+      vscode: {
+        ProgressLocation: { Notification: 1 },
+        workspace: {
+          getConfiguration: () => ({ get: key => (
+            key === "defaultWorkspace" ? "workspace-a" : ""
+          ) }),
+        },
+        window: {
+          async showInputBox(options) {
+            validateInput = options.validateInput;
+            return "  flask  ";
+          },
+          async showQuickPick(items) { return items[0]; },
+          showWarningMessage(message) { warnings.push(message); },
+          showErrorMessage(message) { errors.push(message); },
+          async withProgress(_options, task) { return task(); },
+        },
+      },
+      workspaceAccess: workspaceCollectionHarness().access,
+      FORMAT_OPTIONS: ["python"],
+      packageDomain: {
+        createPackageResolutionInput(input) {
+          factoryInputs.push(input);
+          return Object.freeze({ ...input });
+        },
+      },
+      upstreamPreview: {
+        async previewResolution(...args) {
+          previewCalls.push(args);
+          return { resolved: true };
+        },
+      },
+      upstreamPreviewProvider: { show() {} },
+    });
+
+    await recorder.handlers.get("cloudsmith-vsc.previewUpstreamResolution")();
+
+    assert.strictEqual(typeof validateInput, "function");
+    assert.strictEqual(validateInput(""), "Enter a package name.");
+    assert.strictEqual(validateInput("   "), "Enter a package name.");
+    assert.strictEqual(
+      validateInput("flask\nmalicious"),
+      "Package names cannot contain control characters."
+    );
+    assert.strictEqual(validateInput("a".repeat(2048)), null);
+    assert.strictEqual(
+      validateInput("a".repeat(2049)),
+      "Package names must be 2048 characters or fewer."
+    );
+    assert.strictEqual(validateInput("  flask  "), null);
+    assert.deepStrictEqual(factoryInputs, [{
+      workspace: "workspace-a",
+      repository: "repo-a",
+      name: "flask",
+      format: "python",
+    }]);
+    assert.deepStrictEqual(
+      previewCalls.map(args => args.slice(0, 4)),
+      [["workspace-a", "repo-a", "flask", "python"]]
+    );
+    assert.deepStrictEqual(warnings, []);
+    assert.deepStrictEqual(errors, []);
+  });
+
+  test("upstream preview manual InputBox cancellation is silent", async () => {
+    const recorder = recordingRegistration();
+    let picks = 0;
+    let factoryCalls = 0;
+    let previewCalls = 0;
+    const warnings = [];
+    const errors = [];
+    registerUpstreamCommands({
+      ...baseDependencies(recorder),
+      vscode: {
+        window: {
+          async showInputBox() { return null; },
+          async showQuickPick() { picks += 1; return null; },
+          showWarningMessage(message) { warnings.push(message); },
+          showErrorMessage(message) { errors.push(message); },
+        },
+      },
+      FORMAT_OPTIONS: ["python"],
+      packageDomain: {
+        createPackageResolutionInput() { factoryCalls += 1; return {}; },
+      },
+      upstreamPreview: {
+        async previewResolution() { previewCalls += 1; return null; },
+      },
+      upstreamPreviewProvider: { show() {} },
+    });
+
+    await recorder.handlers.get("cloudsmith-vsc.previewUpstreamResolution")();
+    assert.strictEqual(picks, 0);
+    assert.strictEqual(factoryCalls, 0);
+    assert.strictEqual(previewCalls, 0);
+    assert.deepStrictEqual(warnings, []);
+    assert.deepStrictEqual(errors, []);
+  });
+
+  test("upstream preview cancels a pending manual InputBox when the account changes", async () => {
+    const recorder = recordingRegistration();
+    const input = deferred();
+    let changeListener = null;
+    let promptToken = null;
+    let picks = 0;
+    let factoryCalls = 0;
+    let previewCalls = 0;
+    const warnings = [];
+    const errors = [];
+    class CancellationTokenSource {
+      constructor() {
+        this.token = { isCancellationRequested: false };
+      }
+      cancel() { this.token.isCancellationRequested = true; }
+      dispose() {}
+    }
+    const connectionManager = {
+      onDidChange(listener) {
+        changeListener = listener;
+        return { dispose() {} };
+      },
+    };
+    const accountHarness = accountAccessHarness({ connectionManager });
+    registerUpstreamCommands({
+      ...baseDependencies(recorder),
+      workspaceAccess: accountHarness.access,
+      vscode: {
+        CancellationTokenSource,
+        window: {
+          async showInputBox(_options, token) {
+            promptToken = token;
+            return input.promise;
+          },
+          async showQuickPick() { picks += 1; return null; },
+          showWarningMessage(message) { warnings.push(message); },
+          showErrorMessage(message) { errors.push(message); },
+        },
+      },
+      FORMAT_OPTIONS: ["python"],
+      packageDomain: {
+        createPackageResolutionInput() { factoryCalls += 1; return {}; },
+      },
+      upstreamPreview: {
+        async previewResolution() { previewCalls += 1; return null; },
+      },
+      upstreamPreviewProvider: { show() {} },
+    });
+
+    const pending = recorder.handlers.get("cloudsmith-vsc.previewUpstreamResolution")();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(typeof changeListener, "function");
+    assert.strictEqual(promptToken.isCancellationRequested, false);
+    accountHarness.stale();
+    changeListener();
+    assert.strictEqual(promptToken.isCancellationRequested, true);
+    input.resolve("flask");
+    await pending;
+
+    assert.strictEqual(picks, 0);
+    assert.strictEqual(factoryCalls, 0);
+    assert.strictEqual(previewCalls, 0);
+    assert.deepStrictEqual(warnings, []);
+    assert.deepStrictEqual(errors, []);
   });
 
   test("upstream preview is latest-wins within the same account", async () => {

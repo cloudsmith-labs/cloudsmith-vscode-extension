@@ -3,15 +3,20 @@
 const assert = require("assert");
 const path = require("path");
 const vscode = require("vscode");
+const { registerPackageCommands } = require("../commands/packages");
 const PackageNode = require("../models/packageNode");
+const PackageDetailsNode = require("../models/packageDetailsNode");
 const SearchResultNode = require("../models/searchResultNode");
 const DependencyHealthNode = require("../models/dependencyHealthNode");
 const DependencySummaryNode = require("../models/dependencySummaryNode");
+const packageAdapters = require("../domain/packageAdapters");
 const {
   PackageAdapterError,
   fromApiPackageRecord,
-} = require("../domain/packageAdapters");
+} = packageAdapters;
 const { createPackageCoordinate } = require("../domain/package");
+const { captureAccount, isAccountCurrent } = require("../util/accountOperation");
+const { isSelectionCurrent, markSelection } = require("../util/selectionProvenance");
 
 suite("Package Metadata Flow Test Suite", () => {
   let originalGetConfiguration;
@@ -65,6 +70,107 @@ suite("Package Metadata Flow Test Suite", () => {
       version: ["latest"],
       info: ["upstream"],
     });
+  });
+
+  test("real package-detail command arguments copy only while inherited selection is current", async () => {
+    let accountState = Object.freeze({
+      activationId: "activation-a",
+      accountEpoch: 1,
+      sessionConnected: true,
+      status: "connected",
+    });
+    const connectionManager = {
+      getState: () => accountState,
+    };
+    const owner = new PackageNode(pkg, {}, { connectionManager });
+    const detailNode = new PackageDetailsNode(
+      { id: "Version", value: "1.2.3" },
+      {},
+      owner
+    );
+    const treeItem = detailNode.getTreeItem();
+    const commandArgument = treeItem.command.arguments[0];
+
+    assert.strictEqual(commandArgument, detailNode);
+    assert.deepStrictEqual(
+      packageAdapters.fromPackageDetailNode(commandArgument),
+      { id: "Version", value: "1.2.3" }
+    );
+    assert.strictEqual(isSelectionCurrent(commandArgument), true);
+
+    const handlers = new Map();
+    const copied = [];
+    const information = [];
+    const warnings = [];
+    let invalidateOnWrite = false;
+    registerPackageCommands({
+      registerCommand(id, handler) {
+        handlers.set(id, handler);
+        return { dispose() {} };
+      },
+      vscode: {
+        env: {
+          clipboard: {
+            async writeText(value) {
+              copied.push(value);
+              if (invalidateOnWrite) {
+                accountState = Object.freeze({ ...accountState, accountEpoch: 3 });
+              }
+            },
+          },
+        },
+        window: {
+          showInformationMessage(message) { information.push(message); },
+          showWarningMessage(message) { warnings.push(message); },
+        },
+      },
+      workspaceAccess: {
+        connectionManager,
+        captureAccount,
+        isAccountCurrent,
+      },
+      packageAdapters,
+      LicenseClassifier: { buildRestrictiveQuery: () => "license:restrictive" },
+      isCurrentSelection: isSelectionCurrent,
+    });
+
+    const copySelected = handlers.get("cloudsmith-vsc.copySelected");
+    await copySelected(commandArgument);
+    assert.deepStrictEqual(copied, ["1.2.3"]);
+    assert.deepStrictEqual(information, ["Value copied."]);
+    assert.deepStrictEqual(warnings, []);
+
+    accountState = Object.freeze({ ...accountState, accountEpoch: 2 });
+    await copySelected(commandArgument);
+    await copySelected({ _detailId: "Version", _detailValue: "forged" });
+    assert.deepStrictEqual(copied, ["1.2.3"]);
+    assert.deepStrictEqual(information, ["Value copied."]);
+
+    let getterCalls = 0;
+    const hostile = markSelection({}, connectionManager);
+    Object.defineProperty(hostile, "label", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return { id: "Version", value: "forged" };
+      },
+    });
+    await copySelected(hostile);
+    assert.strictEqual(getterCalls, 0);
+    assert.deepStrictEqual(copied, ["1.2.3"]);
+    assert.deepStrictEqual(warnings, ["No package detail selected."]);
+
+    const rawOwner = markSelection({}, connectionManager);
+    const rawNode = new PackageDetailsNode("Completed", {}, rawOwner);
+    assert.strictEqual(rawNode.getTreeItem().command.arguments[0], rawNode);
+    assert.deepStrictEqual(packageAdapters.fromPackageDetailNode(rawNode), {
+      id: "Detail",
+      value: "Completed",
+    });
+    invalidateOnWrite = true;
+    await copySelected(rawNode);
+    assert.deepStrictEqual(copied, ["1.2.3", "Completed"]);
+    assert.deepStrictEqual(information, ["Value copied."]);
   });
 
   test("SearchResultNode preserves install-command metadata", () => {
