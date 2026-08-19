@@ -86,7 +86,7 @@ class CredentialManager {
     return typeof apiKey === "string" && apiKey ? apiKey : null;
   }
 
-  async storeApiKey(operation = null) {
+  async storeApiKey(operation = null, options = {}) {
     const manager = this._getConnectionManager();
     if (!manager) return unavailableResult();
 
@@ -95,13 +95,34 @@ class CredentialManager {
       return Object.freeze({ ok: false, status: "stale", committed: false, state: manager.getState() });
     }
     let apiKey;
+    const CancellationTokenSource = options?.CancellationTokenSource
+      || vscode.CancellationTokenSource;
+    const inputCancellation = typeof CancellationTokenSource === "function"
+      ? new CancellationTokenSource()
+      : null;
+    const operationSubscription = typeof manager.onDidChange === "function"
+      ? manager.onDidChange(() => {
+        if (!manager.isOperationCurrent(token)) inputCancellation?.cancel();
+      })
+      : null;
     try {
-      apiKey = await this._showInputBox({
+      const showInputBox = typeof options?.showInputBox === "function"
+        ? options.showInputBox
+        : this._showInputBox;
+      apiKey = await showInputBox({
         prompt: "Enter a Cloudsmith API key",
         password: true,
         ignoreFocusOut: true,
-      });
+      }, inputCancellation?.token);
     } catch {
+      if (!manager.isOperationCurrent(token)) {
+        return Object.freeze({
+          ok: false,
+          status: "stale",
+          committed: false,
+          state: manager.getState(),
+        });
+      }
       await manager.cancelCredentialOperation(token);
       return Object.freeze({
         ok: false,
@@ -112,6 +133,9 @@ class CredentialManager {
           message: "Could not read the API key. Try again.",
         }),
       });
+    } finally {
+      operationSubscription?.dispose?.();
+      inputCancellation?.dispose?.();
     }
 
     if (typeof apiKey !== "string") {

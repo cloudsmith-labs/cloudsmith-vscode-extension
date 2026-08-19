@@ -33,6 +33,7 @@ const { PromotionProvider } = require("./views/promotionProvider");
 const { normalizePackageQueryIdentity } = require("./util/promotionContracts");
 const { SearchQueryBuilder } = require("./util/searchQueryBuilder");
 const { formatApiError } = require("./util/errorFormatter");
+const { normalizeCvssScore } = require("./util/vulnerabilitySeverity");
 const { LicenseClassifier } = require("./util/licenseClassifier");
 const { generateTerraformConfig } = require("./util/terraformExporter");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("./util/upstreamFormats");
@@ -41,12 +42,18 @@ const recentPackages = require("./util/recentPackages");
 const filterState = require("./util/filterState");
 const { VulnerabilityStateService } = require("./util/vulnerabilityStateService");
 const { WorkspaceCache } = require("./util/workspaceCache");
+const { ContextKeyProjector } = require("./util/contextKeyProjector");
 const { getWorkspaceContextProjector } = require("./util/workspaceContextProjector");
 const { captureAccount, isAccountCurrent } = require("./util/accountOperation");
 const { fetchWorkspaces, normalizedWorkspaceName } = require("./util/workspaceFetcher");
 const { fetchWorkspaceRepositories } = require("./util/workspaceRepositoryFetcher");
 const { PaginatedFetch, replaceCollectionItems } = require("./util/paginatedFetch");
 const { packageCollectionIdentity } = require("./util/collectionIdentity");
+const {
+  serializePackageCollectionInspection,
+  serializePackageInspection,
+} = require("./util/packageInspection");
+const { isSelectionCurrent } = require("./util/selectionProvenance");
 const {
   connectionSetupAvailable,
 } = require("./util/connectionPresentation");
@@ -88,14 +95,6 @@ async function setHasMultipleWorkspacesContext(context, hasMultipleWorkspaces, o
   return projector.project(hasMultipleWorkspaces, options);
 }
 
-async function updateDefaultWorkspaceContext() {
-  await vscode.commands.executeCommand(
-    "setContext",
-    "cloudsmith.hasDefaultWorkspace",
-    Boolean(getDefaultWorkspace())
-  );
-}
-
 async function activate(context) {
   await deactivate();
   const owner = new ActivationOwner();
@@ -120,6 +119,24 @@ async function activateOwned(context, own) {
   const connectionManager = new ConnectionManager(context);
   const connectionBinding = bindConnectionManager(context, connectionManager);
   own(connectionBinding, connectionManager);
+  const extensionContextProjector = new ContextKeyProjector({
+    defaults: {
+      "cloudsmith.hasDefaultWorkspace": false,
+      "cloudsmith.connectionSetupAvailable": false,
+      "cloudsmith.credentialsPresent": false,
+    },
+  });
+  own(extensionContextProjector);
+  const projectExtensionContexts = (state = connectionManager.getState()) => (
+    extensionContextProjector.project({
+      "cloudsmith.hasDefaultWorkspace": Boolean(getDefaultWorkspace()),
+      "cloudsmith.connectionSetupAvailable": connectionSetupAvailable(state),
+      "cloudsmith.credentialsPresent": state?.credentialPresent === true,
+    })
+  );
+  const updateDefaultWorkspaceContext = () => projectExtensionContexts(
+    connectionManager.getState()
+  );
   const upstreamRuntime = new UpstreamRuntime(context, { connectionManager });
   own(upstreamRuntime);
   const repositoryUpstreamInventory = Object.freeze({
@@ -249,29 +266,8 @@ async function activateOwned(context, own) {
   let quarantineExplainProvider = null;
   let upstreamPreviewProvider = null;
   let upstreamDetailProvider = null;
-  let connectionPresentationProjection = Promise.resolve();
-  let connectionPresentationProjectionDisposed = false;
-  own({
-    dispose() {
-      connectionPresentationProjectionDisposed = true;
-      return connectionPresentationProjection;
-    },
-  });
   const projectConnectionPresentation = (state) => {
-    const setupAvailable = connectionSetupAvailable(state);
-    const project = async () => {
-      if (connectionPresentationProjectionDisposed) return;
-      await vscode.commands.executeCommand(
-        "setContext",
-        "cloudsmith.connectionSetupAvailable",
-        setupAvailable
-      );
-    };
-    const run = connectionPresentationProjection.then(project, project);
-    connectionPresentationProjection = run.catch(() => {
-      console.warn("[Cloudsmith] Could not update the connection presentation indicator.");
-    });
-    return run;
+    return projectExtensionContexts(state);
   };
   const connectionSubscription = connectionManager.onDidChange(state => {
     void projectConnectionPresentation(state).catch(() => {});
@@ -385,6 +381,31 @@ async function activateOwned(context, own) {
     CloudsmithAPI,
     apiEndpoint,
     formatApiError,
+    normalizeCvssScore,
+    isCurrentSelection: selection => Boolean(
+      isSelectionCurrent(selection)
+      && (
+        cloudsmithProvider.ownsSelection(selection)
+        || searchProvider.ownsSelection(selection)
+        || dependencyHealthProvider.ownsSelection(selection)
+      )
+    ),
+    isCurrentPackageSelection: selection => Boolean(
+      recentPackages.getAll().includes(selection)
+      || cloudsmithProvider.ownsPackageSelection(selection)
+      || searchProvider.ownsPackageSelection(selection)
+      || dependencyHealthProvider.ownsDependencySelection(selection)
+    ),
+    isCurrentPackageGroupSelection: selection => cloudsmithProvider.ownsSelection(selection),
+    isCurrentRepositorySelection: selection => (
+      cloudsmithProvider.ownsRepositoryContextSelection(selection)
+    ),
+    isCurrentWorkspaceSelection: selection => cloudsmithProvider.ownsWorkspaceSelection(selection),
+    isCurrentDependencySelection: selection => dependencyHealthProvider.ownsDependencySelection(selection),
+    isCurrentEntitlementSelection: selection => Boolean(
+      isSelectionCurrent(selection)
+      && cloudsmithProvider.ownsEntitlementSelection(selection)
+    ),
   };
 
   const handleAuthenticationResult = createAuthenticationResultHandler({
@@ -453,6 +474,8 @@ async function activateOwned(context, own) {
     buildPackageGroupUrl,
     filterState,
     formatApiError,
+    serializePackageCollectionInspection,
+    serializePackageInspection,
   }));
   own(registerSearchCommands({
     ...sharedCommandDependencies,

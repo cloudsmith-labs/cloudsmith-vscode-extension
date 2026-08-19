@@ -87,48 +87,59 @@
         "command": "cloudsmith-vsc.configureCredentials",
         "title": "Set up Cloudsmith authentication",
         "category": "Cloudsmith",
-        "icon": "$(key)"
+        "icon": "$(key)",
+        "enablement": "!cloudsmith.connected && cloudsmith.connectionSetupAvailable"
       },
       {
         "command": "cloudsmith-vsc.connectCloudsmith",
         "title": "Connect to Cloudsmith",
         "category": "Cloudsmith",
-        "icon": "$(plug)"
+        "icon": "$(plug)",
+        "enablement": "!cloudsmith.connected && cloudsmith.connectionSetupAvailable && cloudsmith.credentialsPresent"
       },
       {
         "command": "cloudsmith-vsc.clearCredentials",
         "title": "Clear stored credentials",
-        "icon": "$(sign-out)"
+        "category": "Cloudsmith",
+        "icon": "$(sign-out)",
+        "enablement": "cloudsmith.credentialsPresent"
       },
       {
         "command": "cloudsmith-vsc.copySelected",
         "title": "Copy value",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.inspectPackage",
         "title": "Inspect package",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.inspectPackageGroup",
         "title": "Inspect package group",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.openPackage",
         "title": "View package in Cloudsmith",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.openPackageGroup",
         "title": "View package group in Cloudsmith",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.refreshView",
         "title": "Refresh",
-        "icon": "$(refresh)"
+        "category": "Cloudsmith",
+        "icon": "$(refresh)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vscode-extension.cloudsmithDocs",
@@ -139,298 +150,384 @@
         "command": "cloudsmith-vsc.searchPackages",
         "title": "Search packages",
         "category": "Cloudsmith",
-        "icon": "$(search)"
+        "icon": "$(search)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.clearSearch",
         "title": "Clear search results",
         "category": "Cloudsmith",
-        "icon": "$(clear-all)"
+        "icon": "$(clear-all)",
+        "enablement": "cloudsmith.connected && cloudsmith.searchActive"
       },
       {
         "command": "cloudsmith-vsc.searchNextPage",
         "title": "Load more results",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected && cloudsmith.searchCanLoadMore"
       },
       {
         "command": "cloudsmith-vsc.loadMoreRepositoryPackages",
         "title": "Load more repository packages",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.searchInWorkspace",
         "title": "Search packages in this workspace",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.guidedSearch",
         "title": "Advanced search",
         "category": "Cloudsmith",
-        "icon": "$(list-filter)"
+        "icon": "$(list-filter)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.filterPackages",
         "title": "Filter packages in this repository",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.clearFilter",
         "title": "Clear package filter",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.changeFilter",
         "title": "Change package filter",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.findSafeVersion",
         "title": "Find safe version",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.openCVE",
         "title": "Open CVE in browser",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.showVulnerabilities",
         "title": "Show vulnerabilities",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.showDepVulnerabilities",
         "title": "Show vulnerabilities",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.findDepSafeVersion",
         "title": "Find safe version",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.filterVulnerabilities",
         "title": "Filter vulnerabilities",
         "category": "Cloudsmith",
-        "icon": "$(filter)"
+        "icon": "$(filter)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.explainQuarantine",
         "title": "Explain quarantine",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.scanDependencies",
         "title": "Scan dependencies",
         "category": "Cloudsmith",
-        "icon": "$(play)"
+        "icon": "$(play)",
+        "enablement": "cloudsmith.connected && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.changeDependencyScanScope",
         "title": "Change dependency scan scope",
         "category": "Cloudsmith",
-        "icon": "$(folder-opened)"
+        "icon": "$(folder-opened)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.pullDependencies",
         "title": "Pull dependencies",
         "category": "Cloudsmith",
-        "icon": "$(cloud-download)"
+        "icon": "$(cloud-download)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.pullSingleDependency",
-        "title": "Pull Dependency",
+        "title": "Pull dependency",
         "category": "Cloudsmith",
-        "icon": "$(cloud-download)"
+        "icon": "$(cloud-download)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.cycleDepView",
         "title": "Cycle dependency view",
         "category": "Cloudsmith",
-        "icon": "$(symbol-enum)"
-      },
-      {
-        "command": "cloudsmith-vsc.cycleDepViewDirect",
-        "title": "View: Direct only (click to switch)",
-        "category": "Cloudsmith",
-        "icon": "$(list-selection)"
-      },
-      {
-        "command": "cloudsmith-vsc.cycleDepViewFlat",
-        "title": "View: Flat list (click to switch)",
-        "category": "Cloudsmith",
-        "icon": "$(list-unordered)"
-      },
-      {
-        "command": "cloudsmith-vsc.cycleDepViewTree",
-        "title": "View: Dependency tree (click to switch)",
-        "category": "Cloudsmith",
-        "icon": "$(list-tree)"
+        "icon": "$(symbol-enum)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.depViewDirect",
         "title": "Show direct dependencies",
         "category": "Cloudsmith",
-        "icon": "$(list-selection)"
+        "icon": "$(list-selection)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.depViewFlat",
         "title": "Show all dependencies (flat)",
         "category": "Cloudsmith",
-        "icon": "$(list-unordered)"
+        "icon": "$(list-unordered)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.depViewTree",
         "title": "Show dependency tree",
         "category": "Cloudsmith",
-        "icon": "$(list-tree)"
+        "icon": "$(list-tree)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.depFilterVulnerable",
         "title": "Show only vulnerable",
         "category": "Cloudsmith",
-        "icon": "$(warning)"
+        "icon": "$(warning)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.depFilterUncovered",
         "title": "Show only not in Cloudsmith",
         "category": "Cloudsmith",
-        "icon": "$(package)"
+        "icon": "$(package)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.depFilterRestrictiveLicense",
         "title": "Show only restrictive licenses",
         "category": "Cloudsmith",
-        "icon": "$(law)"
+        "icon": "$(law)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.depFilterPolicyViolation",
         "title": "Show only policy violations",
         "category": "Cloudsmith",
-        "icon": "$(shield)"
+        "icon": "$(shield)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.depFilterClear",
         "title": "Clear dependency filters",
         "category": "Cloudsmith",
-        "icon": "$(clear-all)"
+        "icon": "$(clear-all)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.depSortFilter",
         "title": "Sort & filter dependencies",
         "category": "Cloudsmith",
-        "icon": "$(filter)"
-      },
-      {
-        "command": "cloudsmith-vsc.depSortFilterActive",
-        "title": "Sort & filter dependencies",
-        "category": "Cloudsmith",
-        "icon": "$(filter-filled)"
+        "icon": "$(filter)",
+        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.viewComplianceReport",
         "title": "View compliance report",
         "category": "Cloudsmith",
-        "icon": "$(graph)"
+        "icon": "$(graph)",
+        "enablement": "cloudsmith.connected && cloudsmith.depReportAvailable"
       },
       {
         "command": "cloudsmith-vsc.copyInstallCommand",
         "title": "Copy install command",
         "category": "Cloudsmith",
-        "icon": "$(terminal)"
+        "icon": "$(terminal)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.showInstallCommand",
         "title": "Show install command",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.searchByLicense",
         "title": "Search packages by license",
         "category": "Cloudsmith",
-        "icon": "$(law)"
+        "icon": "$(law)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.openLicenseUrl",
         "title": "View license",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.ssoLogin",
         "title": "Sign in with SSO",
         "category": "Cloudsmith",
-        "icon": "$(terminal)"
+        "icon": "$(terminal)",
+        "enablement": "!cloudsmith.connected && cloudsmith.connectionSetupAvailable"
       },
       {
         "command": "cloudsmith-vsc.importCLICredentials",
         "title": "Import credentials from Cloudsmith CLI",
         "category": "Cloudsmith",
-        "icon": "$(folder-opened)"
+        "icon": "$(folder-opened)",
+        "enablement": "!cloudsmith.connected && cloudsmith.connectionSetupAvailable"
       },
       {
         "command": "cloudsmith-vsc.setDefaultWorkspace",
         "title": "Set default workspace",
         "category": "Cloudsmith",
-        "icon": "$(home)"
+        "icon": "$(home)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.previewUpstreamResolution",
         "title": "Preview upstream resolution",
         "category": "Cloudsmith",
-        "icon": "$(cloud)"
+        "icon": "$(cloud)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.inspectUpstreams",
         "title": "View upstreams",
         "category": "Cloudsmith",
-        "icon": "$(cloud)"
+        "icon": "$(cloud)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.exportTerraform",
         "title": "Export as Terraform",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.showPromotionStatus",
         "title": "Show promotion status",
         "category": "Cloudsmith",
-        "icon": "$(git-compare)"
+        "icon": "$(git-compare)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.promotePackage",
         "title": "Promote package",
         "category": "Cloudsmith",
-        "icon": "$(arrow-right)"
+        "icon": "$(arrow-right)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.copyEntitlementToken",
         "title": "Copy entitlement token",
-        "category": "Cloudsmith"
+        "category": "Cloudsmith",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.filterVulnerable",
         "title": "Show vulnerable packages",
         "category": "Cloudsmith",
-        "icon": "$(shield)"
+        "icon": "$(shield)",
+        "enablement": "cloudsmith.connected"
       },
       {
         "command": "cloudsmith-vsc.filterVulnerableWorkspace",
         "title": "Show vulnerable packages (all repositories)",
         "category": "Cloudsmith",
-        "icon": "$(shield)"
+        "icon": "$(shield)",
+        "enablement": "cloudsmith.connected"
       }
     ],
     "menus": {
       "commandPalette": [
         {
+          "command": "cloudsmith-vsc.copySelected",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.inspectPackageGroup",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.openPackageGroup",
+          "when": "false"
+        },
+        {
           "command": "cloudsmith-vsc.loadMoreRepositoryPackages",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.searchInWorkspace",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.filterPackages",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.clearFilter",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.changeFilter",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.filterVulnerable",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.filterVulnerableWorkspace",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.openCVE",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.showDepVulnerabilities",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.findDepSafeVersion",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.filterVulnerabilities",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.pullSingleDependency",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.openLicenseUrl",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.copyEntitlementToken",
           "when": "false"
         }
       ],
       "view/item/context": [
         {
           "command": "cloudsmith-vsc.inspectPackage",
-          "when": "view == cloudsmithView && viewItem == package",
+          "when": "view == cloudsmithView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
           "group": "navigation"
         },
         {
@@ -445,7 +542,7 @@
         },
         {
           "command": "cloudsmith-vsc.openPackage",
-          "when": "view == cloudsmithView && viewItem == package",
+          "when": "view == cloudsmithView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
           "group": "navigation"
         },
         {
@@ -465,32 +562,22 @@
         },
         {
           "command": "cloudsmith-vsc.inspectPackage",
-          "when": "view == cloudsmithView && viewItem == packageQuarantined",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.openPackage",
-          "when": "view == cloudsmithView && viewItem == packageQuarantined",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.inspectPackage",
-          "when": "view == cloudsmithSearchView && viewItem == packageQuarantined",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable|dependencyHealthQuarantined)$/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.openPackage",
-          "when": "view == cloudsmithSearchView && viewItem == packageQuarantined",
-          "group": "navigation"
-        },
-        {
-          "command": "cloudsmith-vsc.inspectPackage",
-          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable|dependencyHealthQuarantined|dependencyHealthSyncing)$/",
-          "group": "navigation"
-        },
-        {
-          "command": "cloudsmith-vsc.openPackage",
-          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable|dependencyHealthQuarantined|dependencyHealthSyncing)$/",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable|dependencyHealthQuarantined)$/",
           "group": "navigation"
         },
         {
@@ -539,33 +626,43 @@
           "group": "filter@3"
         },
         {
-          "command": "cloudsmith-vsc.inspectPackage",
-          "when": "view == cloudsmithSearchView && viewItem == package",
-          "group": "navigation"
-        },
-        {
-          "command": "cloudsmith-vsc.openPackage",
-          "when": "view == cloudsmithSearchView && viewItem == package",
-          "group": "navigation"
-        },
-        {
           "command": "cloudsmith-vsc.copySelected",
           "when": "view == cloudsmithSearchView && viewItem == packageDetail",
           "group": "9_cutcopypaste"
         },
         {
           "command": "cloudsmith-vsc.findSafeVersion",
-          "when": "viewItem =~ /^(package|packageQuarantined)$/",
+          "when": "view == cloudsmithView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.findSafeVersion",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.openCVE",
-          "when": "viewItem == vulnerability",
+          "when": "view == cloudsmithView && viewItem == vulnerability",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.openCVE",
+          "when": "view == cloudsmithSearchView && viewItem == vulnerability",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.openCVE",
+          "when": "view == cloudsmithDependencyHealthView && viewItem == vulnerability",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.showVulnerabilities",
-          "when": "viewItem =~ /^(package|packageQuarantined)$/",
+          "when": "view == cloudsmithView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.showVulnerabilities",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
           "group": "navigation"
         },
         {
@@ -580,37 +677,87 @@
         },
         {
           "command": "cloudsmith-vsc.filterVulnerabilities",
-          "when": "viewItem == vulnerabilitySummary",
+          "when": "view == cloudsmithView && viewItem == vulnerabilitySummary",
           "group": "inline"
         },
         {
           "command": "cloudsmith-vsc.filterVulnerabilities",
-          "when": "viewItem == vulnerabilitySummary",
+          "when": "view == cloudsmithView && viewItem == vulnerabilitySummary",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.filterVulnerabilities",
+          "when": "view == cloudsmithSearchView && viewItem == vulnerabilitySummary",
+          "group": "inline"
+        },
+        {
+          "command": "cloudsmith-vsc.filterVulnerabilities",
+          "when": "view == cloudsmithSearchView && viewItem == vulnerabilitySummary",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.filterVulnerabilities",
+          "when": "view == cloudsmithDependencyHealthView && viewItem == vulnerabilitySummary",
+          "group": "inline"
+        },
+        {
+          "command": "cloudsmith-vsc.filterVulnerabilities",
+          "when": "view == cloudsmithDependencyHealthView && viewItem == vulnerabilitySummary",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.explainQuarantine",
-          "when": "viewItem =~ /^(packageQuarantined|dependencyHealthQuarantined)$/",
+          "when": "view == cloudsmithView && viewItem == packageQuarantined",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.explainQuarantine",
+          "when": "view == cloudsmithSearchView && viewItem == packageQuarantined",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.explainQuarantine",
+          "when": "view == cloudsmithDependencyHealthView && viewItem == dependencyHealthQuarantined",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.copyInstallCommand",
-          "when": "viewItem =~ /^(package|dependencyHealthFound|dependencyHealthVulnerable)$/",
+          "when": "view == cloudsmithView && viewItem == package",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.copyInstallCommand",
+          "when": "view == cloudsmithSearchView && viewItem == package",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.copyInstallCommand",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable)$/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.showInstallCommand",
-          "when": "viewItem =~ /^(package|dependencyHealthFound|dependencyHealthVulnerable)$/",
+          "when": "view == cloudsmithView && viewItem == package",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.showInstallCommand",
+          "when": "view == cloudsmithSearchView && viewItem == package",
+          "group": "navigation"
+        },
+        {
+          "command": "cloudsmith-vsc.showInstallCommand",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable)$/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.openLicenseUrl",
-          "when": "view == cloudsmithView && viewItem == licenseDetail",
+          "when": "view == cloudsmithView && viewItem == licenseDetailWithUrl",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.openLicenseUrl",
-          "when": "view == cloudsmithSearchView && viewItem == licenseDetail",
+          "when": "view == cloudsmithSearchView && viewItem == licenseDetailWithUrl",
           "group": "navigation"
         },
         {
@@ -630,17 +777,12 @@
         },
         {
           "command": "cloudsmith-vsc.showPromotionStatus",
-          "when": "view == cloudsmithView && viewItem == package",
+          "when": "view == cloudsmithView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
           "group": "2_promotion"
         },
         {
           "command": "cloudsmith-vsc.showPromotionStatus",
-          "when": "view == cloudsmithView && viewItem == packageQuarantined",
-          "group": "2_promotion"
-        },
-        {
-          "command": "cloudsmith-vsc.showPromotionStatus",
-          "when": "view == cloudsmithSearchView && viewItem == package",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
           "group": "2_promotion"
         },
         {
@@ -655,7 +797,7 @@
         },
         {
           "command": "cloudsmith-vsc.copyEntitlementToken",
-          "when": "viewItem == entitlement",
+          "when": "view == cloudsmithView && viewItem == entitlementWithToken",
           "group": "9_cutcopypaste"
         }
       ],
@@ -673,15 +815,10 @@
         {
           "command": "cloudsmith-vsc.connectCloudsmith",
           "group": "navigation",
-          "when": "view == cloudsmithView && !cloudsmith.connected && cloudsmith.connectionSetupAvailable"
+          "when": "view == cloudsmithView && !cloudsmith.connected && cloudsmith.connectionSetupAvailable && cloudsmith.credentialsPresent"
         },
         {
           "command": "cloudsmith-vsc.configureCredentials",
-          "group": "navigation",
-          "when": "view == cloudsmithView && !cloudsmith.connected && cloudsmith.connectionSetupAvailable"
-        },
-        {
-          "command": "cloudsmith-vsc.ssoLogin",
           "group": "navigation",
           "when": "view == cloudsmithView && !cloudsmith.connected && cloudsmith.connectionSetupAvailable"
         },
@@ -693,7 +830,7 @@
         {
           "command": "cloudsmith-vsc.clearCredentials",
           "group": "navigation",
-          "when": "view == cloudsmithView && cloudsmith.connected"
+          "when": "view == cloudsmithView && cloudsmith.credentialsPresent"
         },
         {
           "command": "cloudsmith-vsc.searchPackages",
@@ -703,22 +840,7 @@
         {
           "command": "cloudsmith-vsc.clearSearch",
           "group": "navigation",
-          "when": "view == cloudsmithSearchView && cloudsmith.connected"
-        },
-        {
-          "command": "cloudsmith-vsc.guidedSearch",
-          "group": "navigation",
-          "when": "view == cloudsmithSearchView && cloudsmith.connected"
-        },
-        {
-          "command": "cloudsmith-vsc.searchByLicense",
-          "group": "navigation",
-          "when": "view == cloudsmithSearchView && cloudsmith.connected"
-        },
-        {
-          "command": "cloudsmith-vsc.previewUpstreamResolution",
-          "group": "navigation",
-          "when": "view == cloudsmithSearchView && cloudsmith.connected"
+          "when": "view == cloudsmithSearchView && cloudsmith.connected && cloudsmith.searchActive"
         },
         {
           "command": "cloudsmith-vsc.scanDependencies",
@@ -733,52 +855,22 @@
         {
           "command": "cloudsmith-vsc.pullDependencies",
           "group": "navigation@2",
-          "when": "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.depScanComplete && !cloudsmith.depOperationRunning"
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
         },
         {
-          "command": "cloudsmith-vsc.cycleDepViewDirect",
+          "command": "cloudsmith-vsc.cycleDepView",
           "group": "navigation@3",
-          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depViewMode == 'direct'"
-        },
-        {
-          "command": "cloudsmith-vsc.cycleDepViewFlat",
-          "group": "navigation@3",
-          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depViewMode == 'flat'"
-        },
-        {
-          "command": "cloudsmith-vsc.cycleDepViewTree",
-          "group": "navigation@3",
-          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depViewMode == 'tree'"
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
         },
         {
           "command": "cloudsmith-vsc.depSortFilter",
           "group": "navigation@4",
-          "when": "view == cloudsmithDependencyHealthView && !cloudsmith.depFilterActive"
-        },
-        {
-          "command": "cloudsmith-vsc.depSortFilterActive",
-          "group": "navigation@4",
-          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depFilterActive"
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
         },
         {
           "command": "cloudsmith-vsc.viewComplianceReport",
           "group": "navigation@5",
-          "when": "view == cloudsmithDependencyHealthView && cloudsmith.depScanComplete"
-        },
-        {
-          "command": "cloudsmith-vsc.depViewDirect",
-          "group": "view@1",
-          "when": "view == cloudsmithDependencyHealthView"
-        },
-        {
-          "command": "cloudsmith-vsc.depViewFlat",
-          "group": "view@2",
-          "when": "view == cloudsmithDependencyHealthView"
-        },
-        {
-          "command": "cloudsmith-vsc.depViewTree",
-          "group": "view@3",
-          "when": "view == cloudsmithDependencyHealthView"
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.depReportAvailable"
         }
       ]
     },

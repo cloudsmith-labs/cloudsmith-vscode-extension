@@ -8,13 +8,42 @@ const {
 const {
   buildPresetQuery,
   buildRawSearchQuery,
+  canonicalRepository,
   captureCommandAccount,
-  collectionQuickPickItems,
   createFilterPresets,
-  getDefaultWorkspace,
-  getWorkspaces,
   getWorkspaceRepositories,
+  isCommandAccountCurrent,
+  resolveCommandRepository,
+  resolveCommandWorkspace,
+  safeDisplayName,
+  showAccountInputBox,
+  showAccountQuickPick,
 } = require("./support");
+
+const MAX_SEARCH_INPUT_LENGTH = 2048;
+
+function searchInputValidationMessage(value) {
+  if (typeof value !== "string") return "Enter a search query.";
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) {
+    return "Search queries cannot contain control characters.";
+  }
+  if (value.length > MAX_SEARCH_INPUT_LENGTH) {
+    return `Search queries must be ${MAX_SEARCH_INPUT_LENGTH} characters or fewer.`;
+  }
+  if (value.trim().length === 0) return "Enter a search query.";
+  return null;
+}
+
+function searchInputOptions(options) {
+  return {
+    ...options,
+    validateInput: searchInputValidationMessage,
+  };
+}
+
+function validSearchInput(value) {
+  return searchInputValidationMessage(value) === null;
+}
 
 function registerSearchCommands(deps) {
   const {
@@ -25,40 +54,18 @@ function registerSearchCommands(deps) {
     SearchQueryBuilder,
     LicenseClassifier,
     FORMAT_OPTIONS,
-    packageAdapters,
   } = deps;
   const filterPresets = createFilterPresets(LicenseClassifier);
 
   async function chooseWorkspace(placeHolder, account) {
-    if (!account?.isCurrent()) return null;
-    const defaultWorkspace = getDefaultWorkspace(vscode);
-    if (defaultWorkspace) return defaultWorkspace;
-    const workspaces = await getWorkspaces(deps.workspaceAccess);
-    if (!account.isCurrent()) return null;
-    if (!workspaces) return null;
-    if (workspaces.items.length === 0) {
-      if (workspaces.complete) {
-        vscode.window.showErrorMessage("No workspaces found. Connect to Cloudsmith first.");
-      }
-      return null;
-    }
-    const selected = await vscode.window.showQuickPick(
-      collectionQuickPickItems(
-        vscode,
-        workspaces,
-        workspace => ({ label: workspace.name, description: workspace.slug }),
-        "Workspace list incomplete"
-      ),
-      { placeHolder }
-    );
-    if (!account.isCurrent()) return null;
-    return selected ? selected.description : null;
+    const workspace = await resolveCommandWorkspace(deps, account, { placeHolder });
+    return isCommandAccountCurrent(account) && workspace ? workspace.slug : null;
   }
 
   async function replayOrPrompt(workspace, recentSearches, options, account) {
-    if (!account?.isCurrent()) return null;
+    if (!isCommandAccountCurrent(account)) return null;
     const recent = await recentSearches.getAll();
-    if (!account.isCurrent()) return null;
+    if (!isCommandAccountCurrent(account)) return null;
     if (recent.length === 0) return false;
     const items = [{ label: "Recent searches", kind: vscode.QuickPickItemKind.Separator }];
     for (const entry of recent) {
@@ -70,15 +77,16 @@ function registerSearchCommands(deps) {
     }
     items.push({ label: options.separatorLabel, kind: vscode.QuickPickItemKind.Separator });
     items.push({ label: options.actionLabel, createNew: true });
-    const selected = await vscode.window.showQuickPick(items, {
+    const selected = await showAccountQuickPick(deps, account, items, {
       placeHolder: options.placeHolder,
     });
-    if (!account.isCurrent()) return null;
+    if (!isCommandAccountCurrent(account)) return null;
     if (!selected) return null;
     if (selected.recent) {
       const descriptor = searchDescriptorFromRecent(selected.recent);
-      if (descriptor && account.isCurrent()) {
+      if (descriptor && isCommandAccountCurrent(account)) {
         await executeSearchIntent(searchProvider, descriptor);
+        if (!isCommandAccountCurrent(account)) return null;
       }
       return true;
     }
@@ -89,7 +97,7 @@ function registerSearchCommands(deps) {
     const account = captureCommandAccount(deps.workspaceAccess);
     if (!account) return;
     const workspace = await chooseWorkspace("Select a workspace", account);
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     if (!workspace) return;
     const recentSearches = new RecentSearches(deps.context, workspace);
     const replayed = await replayOrPrompt(workspace, recentSearches, {
@@ -97,56 +105,61 @@ function registerSearchCommands(deps) {
       actionLabel: `$(search) New search in ${workspace}`,
       placeHolder: `Search packages in ${workspace}`,
     }, account);
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     if (replayed === null || replayed === true) return;
-    const query = await vscode.window.showInputBox({
+    const query = await showAccountInputBox(deps, account, searchInputOptions({
       placeHolder: "Search packages (e.g., name:flask, format:python)",
       prompt: `Search packages in ${workspace}`,
-    });
-    if (!account.isCurrent()) return;
-    if (!query) return;
-    if (!account.isCurrent()) return;
+    }));
+    if (!isCommandAccountCurrent(account) || !validSearchInput(query)) return;
     await executeSearchIntent(searchProvider, {
       kind: "workspace",
       workspace,
       query: buildRawSearchQuery(SearchQueryBuilder, query),
       page: 1,
     }, { recentSearches, record: true, isCurrent: account.isCurrent });
+    if (!isCommandAccountCurrent(account)) return;
   }
 
   async function searchInWorkspace(item) {
     const account = captureCommandAccount(deps.workspaceAccess);
-    if (!account) return;
-    const workspace = item && (item.slug || item.name)
-      ? (item.slug || item.name)
-      : getDefaultWorkspace(vscode);
-    if (!workspace) {
-      vscode.window.showWarningMessage(
-        "Could not determine the workspace. Set a default workspace in settings."
-      );
-      return;
-    }
-    const query = await vscode.window.showInputBox({
+    if (
+      !account
+      || !item
+      || deps.isCurrentWorkspaceSelection?.(item) !== true
+    ) return;
+    const isCurrent = () => Boolean(
+      isCommandAccountCurrent(account)
+      && deps.isCurrentWorkspaceSelection?.(item) === true
+    );
+    const resolvedWorkspace = await resolveCommandWorkspace(deps, account, {
+      explicitItem: item,
+      currentSelection: candidate => deps.isCurrentWorkspaceSelection?.(candidate) === true,
+      invalidMessage: "Could not determine workspace details.",
+    });
+    if (!isCurrent() || !resolvedWorkspace) return;
+    const workspace = resolvedWorkspace.slug;
+    const query = await showAccountInputBox(deps, account, searchInputOptions({
       placeHolder: "Search packages (e.g., name:flask, format:python)",
       prompt: `Search packages in ${workspace}`,
-    });
-    if (!account.isCurrent()) return;
-    if (!query) return;
+    }));
+    if (!isCurrent() || !validSearchInput(query)) return;
     const recentSearches = new RecentSearches(deps.context, workspace);
-    if (!account.isCurrent()) return;
+    if (!isCurrent()) return;
     await executeSearchIntent(searchProvider, {
       kind: "workspace",
       workspace,
       query: buildRawSearchQuery(SearchQueryBuilder, query),
       page: 1,
-    }, { recentSearches, record: true, isCurrent: account.isCurrent });
+    }, { recentSearches, record: true, isCurrent });
+    if (!isCurrent()) return;
   }
 
   async function guidedSearch() {
     const account = captureCommandAccount(deps.workspaceAccess);
     if (!account) return;
     const workspace = await chooseWorkspace("Step 1: Select a workspace", account);
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     if (!workspace) return;
     const recentSearches = new RecentSearches(deps.context, workspace);
     const replayed = await replayOrPrompt(workspace, recentSearches, {
@@ -154,67 +167,107 @@ function registerSearchCommands(deps) {
       actionLabel: `$(search) Continue guided search in ${workspace}`,
       placeHolder: `Recent searches in ${workspace}`,
     }, account);
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     if (replayed === null || replayed === true) return;
 
-    const selectedScope = await vscode.window.showQuickPick([
-      { label: "All repositories", description: "Search across the entire workspace" },
-      { label: "Select specific repositories", description: "Choose one or more repositories" },
+    const selectedScope = await showAccountQuickPick(deps, account, [
+      {
+        label: "All repositories",
+        description: "Search across the entire workspace",
+        scope: "all",
+      },
+      {
+        label: "Select specific repositories",
+        description: "Choose one or more repositories",
+        scope: "repositories",
+      },
     ], { placeHolder: "Step 2: Select a search scope" });
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     if (!selectedScope) return;
+    if (selectedScope.scope !== "all" && selectedScope.scope !== "repositories") return;
 
     let selectedRepos = null;
-    if (selectedScope.label === "Select specific repositories") {
-      const repositories = await getWorkspaceRepositories(deps.workspaceAccess, workspace);
-      if (!account.isCurrent()) return;
-      if (!repositories) return;
-      if (repositories.items.length === 0) {
-        if (repositories.complete) {
-          vscode.window.showErrorMessage("No repositories found in this workspace.");
+    if (selectedScope.scope === "repositories") {
+      let retryCount = 0;
+      while (isCommandAccountCurrent(account)) {
+        const repositories = await getWorkspaceRepositories(deps.workspaceAccess, workspace);
+        if (!isCommandAccountCurrent(account) || !repositories) return;
+        const verifiedRepositories = repositories.items
+          .map(repository => canonicalRepository(repository, { slug: workspace }))
+          .filter(Boolean);
+        const repositoryCollectionComplete = repositories.complete === true
+          && verifiedRepositories.length === repositories.items.length;
+        if (repositoryCollectionComplete && verifiedRepositories.length === 0) {
+          vscode.window.showInformationMessage("No repositories were found in this workspace.");
+          return;
         }
-        return;
+        const repositoryItems = verifiedRepositories.map(repository => ({
+          label: safeDisplayName(repository.name, repository.slug, 2048),
+          description: `${workspace}/${safeDisplayName(
+            repository.slug,
+            "unknown-repository",
+            512
+          )}`,
+          repository: Object.freeze({ workspace, slug: repository.slug }),
+        }));
+        if (!repositoryCollectionComplete) {
+          repositoryItems.unshift({
+            label: "Some repositories could not be loaded",
+            kind: vscode.QuickPickItemKind.Separator,
+          });
+          if (retryCount === 0) {
+            repositoryItems.push({
+              label: "$(refresh) Retry loading repositories",
+              description: "Try to load the repository list again",
+              retry: true,
+            });
+          }
+        }
+        const picked = await showAccountQuickPick(deps, account, repositoryItems, {
+          placeHolder: "Select repositories to search",
+          canPickMany: true,
+        });
+        if (!isCommandAccountCurrent(account) || !Array.isArray(picked)) return;
+        if (picked.some(entry => entry.retry)) {
+          retryCount += 1;
+          continue;
+        }
+        const selected = picked
+          .filter(entry => entry.repository)
+          .map(entry => entry.repository.slug);
+        if (selected.length === 0) return;
+        selectedRepos = selected;
+        break;
       }
-      const picked = await vscode.window.showQuickPick(
-        collectionQuickPickItems(
-          vscode,
-          repositories,
-          repository => ({ label: repository.name, description: repository.slug }),
-          "Repository list incomplete"
-        ),
-        { placeHolder: "Select repositories to search", canPickMany: true }
-      );
-      if (!account.isCurrent()) return;
-      if (!picked || picked.length === 0) return;
-      selectedRepos = picked.map(repository => repository.description);
     }
 
-    const selectedFilter = await vscode.window.showQuickPick(
+    const selectedFilter = await showAccountQuickPick(
+      deps,
+      account,
       filterPresets.map(preset => ({ label: preset.label, preset })),
       { placeHolder: "Step 3: Select a filter" }
     );
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     if (!selectedFilter) return;
     const queryParts = [];
     if (selectedFilter.preset.applyBuilder === null) {
-      const custom = await vscode.window.showInputBox({
+      const custom = await showAccountInputBox(deps, account, searchInputOptions({
         placeHolder: "Enter Cloudsmith search query",
         prompt: "Custom search query",
-      });
-      if (!account.isCurrent()) return;
-      if (!custom) return;
+      }));
+      if (!isCommandAccountCurrent(account) || !validSearchInput(custom)) return;
       queryParts.push(buildPresetQuery(SearchQueryBuilder, selectedFilter.preset, custom));
     } else {
       const presetQuery = buildPresetQuery(SearchQueryBuilder, selectedFilter.preset);
       if (presetQuery) queryParts.push(presetQuery);
     }
 
-    const selectedFormats = await vscode.window.showQuickPick([
+    const selectedFormats = await showAccountQuickPick(deps, account, [
       { label: "All formats", description: "No format filter", all: true },
       ...FORMAT_OPTIONS.map(format => ({ label: format, all: false })),
     ], { placeHolder: "Step 4: Filter by format (optional)", canPickMany: true });
-    if (!account.isCurrent()) return;
-    if (selectedFormats && selectedFormats.length > 0 && !selectedFormats.some(format => format.all)) {
+    if (!isCommandAccountCurrent(account) || !Array.isArray(selectedFormats)) return;
+    if (selectedFormats.length > 0 && !selectedFormats.some(format => format.all)) {
       const formatQuery = selectedFormats
         .map(format => new SearchQueryBuilder().format(format.label).build())
         .join(" OR ");
@@ -222,7 +275,7 @@ function registerSearchCommands(deps) {
     }
     const builder = new SearchQueryBuilder();
     for (const part of queryParts) builder.raw(part);
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     await executeSearchIntent(searchProvider, {
       kind: selectedRepos ? "repositories" : "workspace",
       workspace,
@@ -230,58 +283,74 @@ function registerSearchCommands(deps) {
       page: 1,
       ...(selectedRepos ? { repositories: selectedRepos } : {}),
     }, { recentSearches, record: true, isCurrent: account.isCurrent });
+    if (!isCommandAccountCurrent(account)) return;
   }
 
   async function searchByLicense() {
     const account = captureCommandAccount(deps.workspaceAccess);
     if (!account) return;
     const workspace = await chooseWorkspace("Select a workspace to search", account);
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     if (!workspace) return;
-    const selected = await vscode.window.showQuickPick(
+    const selected = await showAccountQuickPick(
+      deps,
+      account,
       LicenseClassifier.getSearchQuickPickItems(),
       { placeHolder: "Select a license to search for" }
     );
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     if (!selected) return;
     const query = selected.query || LicenseClassifier.buildLicenseQuery(selected.label);
     const recentSearches = new RecentSearches(deps.context, workspace);
-    if (!account.isCurrent()) return;
+    if (!isCommandAccountCurrent(account)) return;
     await executeSearchIntent(searchProvider, {
       kind: "workspace", workspace, query, page: 1,
     }, { recentSearches, record: true, isCurrent: account.isCurrent });
+    if (!isCommandAccountCurrent(account)) return;
   }
 
   async function filterVulnerable(item) {
     const account = captureCommandAccount(deps.workspaceAccess);
     if (!account) return;
-    let repository;
-    try {
-      repository = packageAdapters.fromRepositoryNode(item);
-    } catch {
-      vscode.window.showWarningMessage("Could not determine repository details.");
-      return;
-    }
+    if (deps.isCurrentRepositorySelection?.(item) !== true) return;
+    const isCurrent = () => Boolean(
+      isCommandAccountCurrent(account)
+      && deps.isCurrentRepositorySelection?.(item) === true
+    );
+    const repository = await resolveCommandRepository(deps, account, {
+      explicitItem: item,
+      currentSelection: candidate => deps.isCurrentRepositorySelection?.(candidate) === true,
+      invalidMessage: "Could not determine repository details.",
+    });
+    if (!isCurrent() || !repository) return;
     await searchProvider.search(
       repository.workspace,
       "vulnerabilities:>0",
       1,
-      repository.repository
+      repository.slug
     );
-    if (!account.isCurrent()) return;
+    if (!isCurrent()) return;
     await vscode.commands.executeCommand("cloudsmithSearchView.focus");
+    if (!isCurrent()) return;
   }
 
   async function filterVulnerableWorkspace(item) {
     const account = captureCommandAccount(deps.workspaceAccess);
-    if (!account) return;
-    if (!item || !item.slug) {
-      vscode.window.showWarningMessage("Could not determine workspace details.");
-      return;
-    }
-    await searchProvider.search(item.slug, "vulnerabilities:>0");
-    if (!account.isCurrent()) return;
+    if (!account || !item || deps.isCurrentWorkspaceSelection?.(item) !== true) return;
+    const isCurrent = () => Boolean(
+      isCommandAccountCurrent(account)
+      && deps.isCurrentWorkspaceSelection?.(item) === true
+    );
+    const workspace = await resolveCommandWorkspace(deps, account, {
+      explicitItem: item,
+      currentSelection: candidate => deps.isCurrentWorkspaceSelection?.(candidate) === true,
+      invalidMessage: "Could not determine workspace details.",
+    });
+    if (!isCurrent() || !workspace) return;
+    await searchProvider.search(workspace.slug, "vulnerabilities:>0");
+    if (!isCurrent()) return;
     await vscode.commands.executeCommand("cloudsmithSearchView.focus");
+    if (!isCurrent()) return;
   }
 
   return registerCommands(registerCommand, [

@@ -24,6 +24,7 @@ const {
   isAccountCurrent,
   resolveConnectionManager,
 } = require("../util/accountOperation");
+const { inheritSelection, markSelection } = require("../util/selectionProvenance");
 
 const MAX_COLLECTION_PAGES = 20;
 const MAX_COLLECTION_REQUESTS = 24;
@@ -57,6 +58,7 @@ class RepositoryNode {
     }
     this.context = context;
     this._connectionManager = resolveConnectionManager(context, options.connectionManager);
+    markSelection(this, this._connectionManager);
     this._createCloudsmithAPI = options.createCloudsmithAPI
       || (() => new CloudsmithAPI(this.context));
     this._createPaginatedFetch = options.createPaginatedFetch
@@ -89,6 +91,7 @@ class RepositoryNode {
     this._metadataPromise = null;
     this._metadataChildren = [];
     this._metadataLoaded = false;
+    this._entitlementNodes = new WeakSet();
   }
 
   invalidate() {
@@ -101,6 +104,7 @@ class RepositoryNode {
     this._metadataPromise = null;
     this._metadataChildren = [];
     this._metadataLoaded = false;
+    this._entitlementNodes = new WeakSet();
   }
 
   dispose() {
@@ -248,6 +252,7 @@ class RepositoryNode {
     this._metadataPromise = null;
     this._metadataChildren = [];
     this._metadataLoaded = false;
+    this._entitlementNodes = new WeakSet();
   }
 
   _startPackageLoad(descriptor, resume, showProgress) {
@@ -465,11 +470,12 @@ class RepositoryNode {
   _createPackageNode(item, mode) {
     if (mode === "groups") {
       const PackageGroupsNode = require("./packageGroupsNode");
-      return new PackageGroupsNode({
+      const node = new PackageGroupsNode({
         ...item,
         repo: this.slug,
         workspace: this.workspace,
       }, this.context);
+      return inheritSelection(node, this);
     }
     const PackageNode = require("./packageNode");
     return new PackageNode(item, this.context, {
@@ -493,6 +499,33 @@ class RepositoryNode {
       && owner.repositoryNode === this
       && owner.generation === this._generation
       && this._packageState.nodes.includes(owner.packageNode)
+      && !this._lifecycleController.signal.aborted
+    );
+  }
+
+  ownsPackageSelection(selection) {
+    return Boolean(
+      !this._disposed
+      && selection
+      && this._packageState.nodes.includes(selection)
+      && !this._lifecycleController.signal.aborted
+    );
+  }
+
+  ownsEntitlementSelection(selection) {
+    return Boolean(
+      !this._disposed
+      && selection
+      && this._entitlementNodes.has(selection)
+      && !this._lifecycleController.signal.aborted
+    );
+  }
+
+  ownsRepositoryContextSelection(selection) {
+    return Boolean(
+      !this._disposed
+      && selection
+      && (selection === this || this._metadataChildren.includes(selection))
       && !this._lifecycleController.signal.aborted
     );
   }
@@ -706,7 +739,7 @@ class RepositoryNode {
       }
       if (!this._isMetadataCurrent(account, generation, descriptor)) return [];
       if (upstreamState) {
-        children.push(new UpstreamIndicatorNode(
+        const upstreamNode = new UpstreamIndicatorNode(
           upstreamState.upstreams,
           {
             workspace: this.workspace,
@@ -721,7 +754,8 @@ class RepositoryNode {
             unsupportedFormats: upstreamState.unsupportedFormats,
             uninspectedFormats: upstreamState.uninspectedFormats,
           }
-        ));
+        );
+        children.push(inheritSelection(upstreamNode, this));
       } else {
         children.push(new InfoNode(
           "Upstreams: failed to load",
@@ -758,6 +792,16 @@ class RepositoryNode {
               : null,
             failureCount: entitlements.failureCount,
             termination: entitlements.termination,
+            selectionOwner: this,
+            registerEntitlement: (node) => {
+              if (
+                !this._disposed
+                && generation === this._generation
+                && descriptor?.key === this._packageDescriptor?.key
+              ) {
+                this._entitlementNodes.add(node);
+              }
+            },
           }));
         } else if (!entitlements.complete) {
           children.push(new InfoNode(

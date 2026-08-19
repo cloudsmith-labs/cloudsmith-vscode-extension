@@ -29,6 +29,10 @@ const {
   fromRepositoryPackageSelection,
   fromSearchResultNode,
 } = require("../domain/packageAdapters");
+const {
+  serializePackageCollectionInspection,
+  serializePackageInspection,
+} = require("../util/packageInspection");
 
 suite("Canonical package domain", () => {
   function apiRecord(overrides = {}) {
@@ -845,5 +849,44 @@ suite("Canonical package domain", () => {
         },
       },
     }), error => error instanceof PackageDomainError && error.code === "accessor_property");
+  });
+
+  test("serializes only the bounded non-delivery package inspection surface", () => {
+    const pkg = fromApiPackageRecord(apiRecord({
+      cdn_url: "https://cdn.example.invalid/private?token=secret",
+      license_url: "https://example.invalid/license?credential=secret",
+      entitlement_token: "must-not-appear",
+    }));
+
+    const output = serializePackageInspection(pkg);
+    const inspection = JSON.parse(output);
+
+    assert.strictEqual(inspection.workspace, "Workspace");
+    assert.strictEqual(inspection.packageIdentifier, "Package-ID");
+    assert.strictEqual(Object.hasOwn(inspection, "cdnUrl"), false);
+    assert.strictEqual(Object.hasOwn(inspection.license, "url"), false);
+    assert.doesNotMatch(output, /token=secret|credential=secret|must-not-appear/);
+    assert.ok(Buffer.byteLength(output, "utf8") <= 256 * 1024);
+  });
+
+  test("bounds collection inspection and truthfully reports omitted packages", () => {
+    const packages = Array.from({ length: 501 }, (_, index) => fromApiPackageRecord(apiRecord({
+      slug_perm: `package-${index}`,
+      name: `package-${index}`,
+    })));
+
+    const output = serializePackageCollectionInspection(packages, {
+      complete: true,
+      totalCount: 501,
+      termination: "complete",
+    });
+    const inspection = JSON.parse(output);
+
+    assert.strictEqual(inspection.loadedCount, 501);
+    assert.ok(inspection.displayedCount <= 500);
+    assert.strictEqual(inspection.omittedCount, 501 - inspection.displayedCount);
+    assert.strictEqual(inspection.complete, false);
+    assert.strictEqual(inspection.totalCount, 501);
+    assert.ok(Buffer.byteLength(output, "utf8") <= 256 * 1024);
   });
 });

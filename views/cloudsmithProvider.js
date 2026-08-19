@@ -67,6 +67,7 @@ class CloudsmithProvider {
     this._loadingOperationId = null;
     this._operationController = null;
     this._repositoryNodes = new Set();
+    this._workspaceNodes = new Set();
     this._disposed = false;
     this._accountResetOrchestrated = options.accountResetOrchestrated === true;
     this._accountIdentity = accountIdentity(this._connectionManager?.getState?.());
@@ -127,7 +128,19 @@ class CloudsmithProvider {
       return this.getWorkspaces();
     }
     if (connectionNodes) return [];
-    return element.getChildren();
+    const children = element.getChildren();
+    if (children && typeof children.then === "function") {
+      return children.then(result => this._ownChildren(element, result));
+    }
+    return this._ownChildren(element, children);
+  }
+
+  _ownChildren(parent, children) {
+    if (!Array.isArray(children)) return children;
+    for (const child of children) {
+      if (child && typeof child === "object") this._treeParents.set(child, parent);
+    }
+    return children;
   }
 
   refresh(options = {}) {
@@ -277,6 +290,7 @@ class CloudsmithProvider {
           this._createRepositoryNode(repository, workspaceSlug, workspaceNode)
         ),
       });
+      this._workspaceNodes.add(workspaceNode);
       return workspaceNode;
     });
   }
@@ -305,14 +319,64 @@ class CloudsmithProvider {
       node.invalidate();
     }
     this._repositoryNodes.clear();
+    this._workspaceNodes.clear();
     this._vulnerabilitySummaries.clear();
     this._clearVulnerabilityRefreshTimers();
   }
 
   refreshNode(element) {
-    if (element && this._repositoryNodes.has(element)) {
-      this._onDidChangeTreeData.fire(element);
+    if (!this.ownsSelection(element)) return false;
+    this._onDidChangeTreeData.fire(element);
+    return true;
+  }
+
+  ownsSelection(selection) {
+    if (this._disposed || !selection || typeof selection !== "object") return false;
+    let candidate = selection;
+    const visited = new Set();
+    while (candidate && !visited.has(candidate) && visited.size < 24) {
+      visited.add(candidate);
+      if (
+        this._workspaceNodes.has(candidate)
+        || this._repositoryNodes.has(candidate)
+        || this.ownsPackageSelection(candidate)
+        || this.ownsEntitlementSelection(candidate)
+      ) return true;
+      candidate = this._treeParents.get(candidate) || null;
     }
+    return false;
+  }
+
+  ownsWorkspaceSelection(selection) {
+    return Boolean(!this._disposed && selection && this._workspaceNodes.has(selection));
+  }
+
+  ownsRepositorySelection(selection) {
+    return Boolean(!this._disposed && selection && this._repositoryNodes.has(selection));
+  }
+
+  ownsRepositoryContextSelection(selection) {
+    if (this._disposed || !selection) return false;
+    for (const repository of this._repositoryNodes) {
+      if (repository.ownsRepositoryContextSelection(selection)) return true;
+    }
+    return false;
+  }
+
+  ownsPackageSelection(selection) {
+    if (this._disposed || !selection) return false;
+    for (const repository of this._repositoryNodes) {
+      if (repository.ownsPackageSelection(selection)) return true;
+    }
+    return false;
+  }
+
+  ownsEntitlementSelection(selection) {
+    if (this._disposed || !selection) return false;
+    for (const repository of this._repositoryNodes) {
+      if (repository.ownsEntitlementSelection(selection)) return true;
+    }
+    return false;
   }
 
   _registerVulnerabilitySummary(identity, element, owner) {

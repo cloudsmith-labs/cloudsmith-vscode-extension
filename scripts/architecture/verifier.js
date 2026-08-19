@@ -7,6 +7,7 @@ const METADATA_KEYS = Object.freeze([
   "adapterFiles",
   "canonicalFactoryFiles",
   "commandRegistrationFiles",
+  "commandUx",
   "compositionFile",
   "cycleExemptions",
   "ignoredSegments",
@@ -64,6 +65,31 @@ const LAYER_KEYS = Object.freeze([
   "roots",
 ]);
 const REGISTRAR_KEYS = Object.freeze(["commands", "file", "function"]);
+const COMMAND_UX_KEYS = Object.freeze([
+  "classifications",
+  "contextKeys",
+  "contextValues",
+  "directTreeCommands",
+  "viewScopes",
+]);
+const COMMAND_UX_CLASSIFICATION_KEYS = Object.freeze([
+  "contextOnly",
+  "global",
+  "recoverable",
+]);
+const COMMAND_UX_CONTEXT_KEY_KEYS = Object.freeze(["key", "producer"]);
+const COMMAND_UX_CONTEXT_VALUE_KEYS = Object.freeze(["producers", "value"]);
+const COMMAND_UX_DIRECT_COMMAND_KEYS = Object.freeze(["command", "producer"]);
+const COMMAND_UX_VIEW_SCOPE_KEYS = Object.freeze(["command", "placements"]);
+const COMMAND_UX_VIEW_PLACEMENT_KEYS = Object.freeze(["contextValues", "view"]);
+const COMMAND_UX_CUSTOMER_MENU_SURFACES = new Set([
+  "commandPalette",
+  "view/item/context",
+  "view/title",
+]);
+const COMMAND_ID_PATTERN = /^cloudsmith-(?:vsc|vscode-extension)\.[A-Za-z0-9]+$/;
+const CLOUDSMITH_CONTEXT_KEY_PATTERN = /^cloudsmith\.[A-Za-z][A-Za-z0-9.]*$/;
+const CONTEXT_VALUE_PATTERN = /^[A-Za-z][A-Za-z0-9._-]*$/;
 const UPSTREAM_OWNERSHIP_KEYS = Object.freeze([
   "authorityExport",
   "authorityModule",
@@ -181,6 +207,217 @@ function normalizeMetadataPath(root, relativePath, diagnostics, owner = "archite
   return toPosix(relative);
 }
 
+function normalizeCommandUxMetadata(root, commandUx, diagnostics) {
+  if (!sameKeys(commandUx, COMMAND_UX_KEYS)) {
+    diagnostics.push(diagnostic(
+      "ARCH_COMMAND_UX_METADATA",
+      "architecture.json",
+      "commandUx has unsupported or missing keys",
+    ));
+    return null;
+  }
+  if (!sameKeys(commandUx.classifications, COMMAND_UX_CLASSIFICATION_KEYS)) {
+    diagnostics.push(diagnostic(
+      "ARCH_COMMAND_UX_METADATA",
+      "architecture.json",
+      "commandUx.classifications has unsupported or missing keys",
+    ));
+    return null;
+  }
+  const normalized = {
+    classifications: {
+      contextOnly: [],
+      global: [],
+      recoverable: [],
+    },
+    contextKeys: [],
+    contextValues: [],
+    directTreeCommands: [],
+    viewScopes: [],
+  };
+  const classified = new Set();
+  for (const kind of COMMAND_UX_CLASSIFICATION_KEYS) {
+    const commands = commandUx.classifications[kind];
+    if (
+      !isPlainStringArray(commands)
+      || commands.length > 128
+      || commands.some(command => !COMMAND_ID_PATTERN.test(command))
+    ) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_METADATA",
+        "architecture.json",
+        `commandUx.classifications.${kind} must be a bounded command-id array`,
+      ));
+      continue;
+    }
+    for (const command of commands) {
+      if (classified.has(command)) {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_CLASSIFICATION",
+          "architecture.json",
+          `Command has more than one UX classification: ${command}`,
+        ));
+      }
+      classified.add(command);
+      normalized.classifications[kind].push(command);
+    }
+  }
+
+  const contextKeys = new Set();
+  if (!Array.isArray(commandUx.contextKeys) || commandUx.contextKeys.length > 64) {
+    diagnostics.push(diagnostic(
+      "ARCH_COMMAND_UX_METADATA",
+      "architecture.json",
+      "commandUx.contextKeys must be a bounded array",
+    ));
+  } else {
+    for (const entry of commandUx.contextKeys) {
+      const producer = sameKeys(entry, COMMAND_UX_CONTEXT_KEY_KEYS)
+        ? normalizeMetadataPath(root, entry.producer, diagnostics)
+        : null;
+      if (
+        !producer
+        || !producer.endsWith(".js")
+        || !CLOUDSMITH_CONTEXT_KEY_PATTERN.test(entry?.key || "")
+        || contextKeys.has(entry.key)
+      ) {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_METADATA",
+          "architecture.json",
+          `Invalid or duplicate command UX context key: ${String(entry?.key)}`,
+        ));
+        continue;
+      }
+      contextKeys.add(entry.key);
+      normalized.contextKeys.push({ key: entry.key, producer });
+    }
+  }
+
+  const contextValues = new Set();
+  if (!Array.isArray(commandUx.contextValues) || commandUx.contextValues.length > 128) {
+    diagnostics.push(diagnostic(
+      "ARCH_COMMAND_UX_METADATA",
+      "architecture.json",
+      "commandUx.contextValues must be a bounded array",
+    ));
+  } else {
+    for (const entry of commandUx.contextValues) {
+      const producers = sameKeys(entry, COMMAND_UX_CONTEXT_VALUE_KEYS)
+        && isPlainStringArray(entry.producers)
+        && entry.producers.length > 0
+        && entry.producers.length <= 8
+        && !hasDuplicates(entry.producers)
+        ? entry.producers
+          .map(producer => normalizeMetadataPath(root, producer, diagnostics))
+          .filter(Boolean)
+        : [];
+      if (
+        producers.length !== entry?.producers?.length
+        || producers.some(producer => !producer.endsWith(".js"))
+        || !CONTEXT_VALUE_PATTERN.test(entry?.value || "")
+        || contextValues.has(entry.value)
+      ) {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_METADATA",
+          "architecture.json",
+          `Invalid or duplicate command UX context value: ${String(entry?.value)}`,
+        ));
+        continue;
+      }
+      contextValues.add(entry.value);
+      normalized.contextValues.push({ value: entry.value, producers });
+    }
+  }
+
+  const directCommands = new Set();
+  if (!Array.isArray(commandUx.directTreeCommands) || commandUx.directTreeCommands.length > 32) {
+    diagnostics.push(diagnostic(
+      "ARCH_COMMAND_UX_METADATA",
+      "architecture.json",
+      "commandUx.directTreeCommands must be a bounded array",
+    ));
+  } else {
+    for (const entry of commandUx.directTreeCommands) {
+      const producer = sameKeys(entry, COMMAND_UX_DIRECT_COMMAND_KEYS)
+        ? normalizeMetadataPath(root, entry.producer, diagnostics)
+        : null;
+      if (
+        !producer
+        || !producer.endsWith(".js")
+        || !COMMAND_ID_PATTERN.test(entry?.command || "")
+        || directCommands.has(entry.command)
+      ) {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_METADATA",
+          "architecture.json",
+          `Invalid or duplicate direct tree command: ${String(entry?.command)}`,
+        ));
+        continue;
+      }
+      directCommands.add(entry.command);
+      normalized.directTreeCommands.push({ command: entry.command, producer });
+    }
+  }
+
+  const scopedCommands = new Set();
+  if (!Array.isArray(commandUx.viewScopes) || commandUx.viewScopes.length > 128) {
+    diagnostics.push(diagnostic(
+      "ARCH_COMMAND_UX_METADATA",
+      "architecture.json",
+      "commandUx.viewScopes must be a bounded array",
+    ));
+  } else {
+    for (const entry of commandUx.viewScopes) {
+      const placements = sameKeys(entry, COMMAND_UX_VIEW_SCOPE_KEYS)
+        && Array.isArray(entry.placements)
+        && entry.placements.length > 0
+        && entry.placements.length <= 8
+        ? entry.placements
+        : [];
+      const placementViews = new Set();
+      const placementsValid = placements.length === entry?.placements?.length
+        && placements.every(placement => {
+          if (
+            !sameKeys(placement, COMMAND_UX_VIEW_PLACEMENT_KEYS)
+            || !CONTEXT_VALUE_PATTERN.test(placement?.view || "")
+            || placementViews.has(placement.view)
+            || !isPlainStringArray(placement.contextValues)
+            || placement.contextValues.length === 0
+            || placement.contextValues.length > 32
+            || hasDuplicates(placement.contextValues)
+            || placement.contextValues.some(value => !CONTEXT_VALUE_PATTERN.test(value))
+          ) {
+            return false;
+          }
+          placementViews.add(placement.view);
+          return true;
+        });
+      if (
+        !sameKeys(entry, COMMAND_UX_VIEW_SCOPE_KEYS)
+        || !COMMAND_ID_PATTERN.test(entry?.command || "")
+        || !placementsValid
+        || scopedCommands.has(entry.command)
+      ) {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_METADATA",
+          "architecture.json",
+          `Invalid or duplicate command UX view scope: ${String(entry?.command)}`,
+        ));
+        continue;
+      }
+      scopedCommands.add(entry.command);
+      normalized.viewScopes.push({
+        command: entry.command,
+        placements: placements.map(placement => ({
+          view: placement.view,
+          contextValues: [...placement.contextValues],
+        })),
+      });
+    }
+  }
+  return normalized;
+}
+
 function validateMetadata(root, metadata) {
   const diagnostics = [];
   if (!sameKeys(metadata, METADATA_KEYS)) {
@@ -251,6 +488,7 @@ function validateMetadata(root, metadata) {
     adapterFiles: [],
     canonicalFactoryFiles: [],
     commandRegistrationFiles: [],
+    commandUx: null,
     cycleExemptions: [],
     layers: [],
     nonJavaScriptPackageFiles: [],
@@ -258,6 +496,7 @@ function validateMetadata(root, metadata) {
     runtimeRoots: [],
     upstreamOwnership: null,
   };
+  normalized.commandUx = normalizeCommandUxMetadata(root, metadata.commandUx, diagnostics);
   for (const key of [
     "adapterFiles",
     "canonicalFactoryFiles",
@@ -985,6 +1224,563 @@ function collectArchitectureFiles(root, metadata) {
     }
   }
   return { diagnostics, files };
+}
+
+function splitWhenConjuncts(expression) {
+  if (typeof expression !== "string" || !expression.trim()) return null;
+  const parts = [];
+  let start = 0;
+  let quote = null;
+  let inRegex = false;
+  let escaped = false;
+  for (let index = 0; index < expression.length; index += 1) {
+    const character = expression[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if ((quote || inRegex) && character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (inRegex) {
+      if (character === "/") inRegex = false;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === "/" && expression.slice(0, index).trimEnd().endsWith("=~")) {
+      inRegex = true;
+      continue;
+    }
+    const operator = expression.slice(index, index + 2);
+    if (operator === "||") return null;
+    if (operator === "&&") {
+      parts.push(expression.slice(start, index).trim());
+      start = index + 2;
+      index += 1;
+    }
+  }
+  if (quote || inRegex) return null;
+  parts.push(expression.slice(start).trim());
+  return parts.every(Boolean) ? parts : null;
+}
+
+function parseScopedWhen(expression, requireContextValue) {
+  const conjuncts = splitWhenConjuncts(expression);
+  if (!conjuncts) return null;
+  const views = conjuncts.flatMap((conjunct) => {
+    const match = conjunct.match(/^view\s*==\s*([A-Za-z][A-Za-z0-9._-]*)$/);
+    return match ? [match[1]] : [];
+  });
+  if (views.length !== 1) return null;
+  const contextValues = [];
+  for (const conjunct of conjuncts) {
+    const exact = conjunct.match(/^viewItem\s*==\s*([A-Za-z][A-Za-z0-9._-]*)$/);
+    if (exact) {
+      contextValues.push(exact[1]);
+      continue;
+    }
+    const pattern = conjunct.match(
+      /^viewItem\s*=~\s*\/\^\(([A-Za-z][A-Za-z0-9._-]*(?:\|[A-Za-z][A-Za-z0-9._-]*)*)\)\$\/$/,
+    );
+    if (pattern) contextValues.push(...pattern[1].split("|"));
+  }
+  if (requireContextValue && contextValues.length === 0) return null;
+  return { contextValues, view: views[0] };
+}
+
+function extractCloudsmithContextKeys(expression) {
+  if (typeof expression !== "string") return [];
+  const keys = [];
+  let quote = null;
+  let inRegex = false;
+  let escaped = false;
+  for (let cursor = 0; cursor < expression.length; cursor += 1) {
+    const character = expression[cursor];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if ((quote || inRegex) && character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (inRegex) {
+      if (character === "/") inRegex = false;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === "/" && expression.slice(0, cursor).trimEnd().endsWith("=~")) {
+      inRegex = true;
+      continue;
+    }
+    if (!/[A-Za-z_]/.test(character)) continue;
+    let end = cursor + 1;
+    while (end < expression.length && /[A-Za-z0-9._$-]/.test(expression[end])) {
+      end += 1;
+    }
+    const token = expression.slice(cursor, end);
+    if (token.startsWith("cloudsmith.")) keys.push(token);
+    cursor = end - 1;
+  }
+  return keys;
+}
+
+function collectStaticStringLeaves(node, target, limit = 64) {
+  const pending = [node];
+  const seen = new Set();
+  while (pending.length > 0 && seen.size < limit) {
+    const current = pending.pop();
+    if (!current || typeof current !== "object" || seen.has(current)) continue;
+    seen.add(current);
+    const value = staticString(current);
+    if (value !== null) {
+      target.add(value);
+      continue;
+    }
+    for (const [key, child] of Object.entries(current)) {
+      if (["parent", "loc", "range", "tokens", "comments"].includes(key)) continue;
+      if (Array.isArray(child)) pending.push(...child);
+      else if (child && typeof child === "object") pending.push(child);
+    }
+  }
+}
+
+function isContextValueFactoryReturn(node) {
+  let cursor = node?.parent;
+  while (cursor && ![
+    "ArrowFunctionExpression",
+    "FunctionDeclaration",
+    "FunctionExpression",
+  ].includes(cursor.type)) {
+    cursor = cursor.parent;
+  }
+  return cursor && propertyName(cursor.parent) === "_getContextValue";
+}
+
+function collectCommandUxProducerFacts(source, relativePath) {
+  const facts = {
+    contextKeys: new Set(),
+    contextValues: new Set(),
+    directCommands: new Set(),
+    parseFailed: false,
+  };
+  const constantStrings = new Map();
+  const isSnapshotObject = (node) => {
+    const parent = node?.parent;
+    if (
+      parent?.type === "CallExpression"
+      && parent.arguments[0] === node
+      && parent.callee?.type === "MemberExpression"
+      && propertyName(parent.callee) === "project"
+    ) {
+      return true;
+    }
+    if (
+      parent?.type === "Property"
+      && parent.value === node
+      && propertyName(parent) === "defaults"
+      && parent.parent?.type === "ObjectExpression"
+      && parent.parent.parent?.type === "NewExpression"
+      && parent.parent.parent.callee?.type === "Identifier"
+      && parent.parent.parent.callee.name === "ContextKeyProjector"
+    ) {
+      return true;
+    }
+    return false;
+  };
+  const contextKeyForProperty = (node) => {
+    if (node.computed && node.key?.type === "Identifier") {
+      return constantStrings.get(node.key.name) || null;
+    }
+    return propertyName(node);
+  };
+  const rule = {
+    meta: { schema: [] },
+    create() {
+      return {
+        VariableDeclarator(node) {
+          if (node.id?.type !== "Identifier") return;
+          const value = staticString(node.init);
+          if (value !== null) constantStrings.set(node.id.name, value);
+        },
+        Property(node) {
+          const name = propertyName(node);
+          if (name === "command") {
+            const command = staticString(node.value);
+            if (command !== null) facts.directCommands.add(command);
+          }
+          if (name === "contextValue") {
+            collectStaticStringLeaves(node.value, facts.contextValues);
+          }
+          if (isSnapshotObject(node.parent)) {
+            const key = contextKeyForProperty(node);
+            if (typeof key === "string" && key.startsWith("cloudsmith.")) {
+              facts.contextKeys.add(key);
+            }
+          }
+        },
+        AssignmentExpression(node) {
+          if (
+            node.left?.type === "MemberExpression"
+            && propertyName(node.left) === "contextValue"
+          ) {
+            collectStaticStringLeaves(node.right, facts.contextValues);
+          }
+        },
+        ReturnStatement(node) {
+          if (isContextValueFactoryReturn(node)) {
+            collectStaticStringLeaves(node.argument, facts.contextValues);
+          }
+        },
+      };
+    },
+  };
+  const linter = new Linter({ configType: "flat" });
+  const messages = linter.verify(source, [{
+    languageOptions: { ecmaVersion: 2022, sourceType: "commonjs" },
+    linterOptions: { reportUnusedDisableDirectives: "off" },
+    plugins: { commandUxProducer: { rules: { collect: rule } } },
+    rules: { "commandUxProducer/collect": "error" },
+  }], { filename: relativePath });
+  facts.parseFailed = messages.some(message => message.fatal);
+  return facts;
+}
+
+function commandUxManifestDiagnostics(metadata, manifest, files) {
+  const diagnostics = [];
+  const commandUx = metadata.commandUx;
+  if (!commandUx) return diagnostics;
+  const manifestCommands = Array.isArray(manifest?.contributes?.commands)
+    ? manifest.contributes.commands
+    : [];
+  const manifestIds = manifestCommands.map(entry => entry?.command);
+  const manifestSet = new Set(manifestIds);
+  const internalSet = new Set(metadata.internalCommandIds);
+  const classifications = new Map();
+  for (const kind of COMMAND_UX_CLASSIFICATION_KEYS) {
+    for (const command of commandUx.classifications[kind]) {
+      classifications.set(command, kind);
+    }
+  }
+  for (const command of manifestIds) {
+    if (!classifications.has(command)) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_UNCLASSIFIED",
+        "package.json",
+        `Contributed command has no UX classification: ${String(command)}`,
+      ));
+    }
+    if (internalSet.has(command)) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_INTERNAL_CONTRIBUTED",
+        "package.json",
+        `Internal command must not be contributed: ${command}`,
+      ));
+    }
+  }
+  for (const command of classifications.keys()) {
+    if (!manifestSet.has(command)) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_CLASSIFICATION",
+        "architecture.json",
+        `User-facing command UX classification has no contribution: ${command}`,
+      ));
+    }
+  }
+  for (const entry of manifestCommands) {
+    if (
+      typeof entry?.title !== "string"
+      || !entry.title.trim()
+      || entry.category !== "Cloudsmith"
+    ) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_PRESENTATION",
+        "package.json",
+        `Contributed command needs a non-empty title and Cloudsmith category: ${String(entry?.command)}`,
+      ));
+    }
+  }
+
+  const views = new Set(Object.values(manifest?.contributes?.views || {})
+    .flatMap(entries => Array.isArray(entries) ? entries : [])
+    .map(entry => entry?.id)
+    .filter(Boolean));
+  const menus = manifest?.contributes?.menus || {};
+  for (const [surface, entries] of Object.entries(menus)) {
+    if (!COMMAND_UX_CUSTOMER_MENU_SURFACES.has(surface)) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_MENU_SURFACE",
+        "package.json",
+        `Command UX contract does not model contributed menu surface: ${surface}`,
+      ));
+    }
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (internalSet.has(entry?.command)) {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_INTERNAL_SURFACE",
+          "package.json",
+          `Internal command must not appear on customer menu surface ${surface}: ${entry.command}`,
+        ));
+      } else if (!manifestSet.has(entry?.command)) {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_MENU_COMMAND",
+          "package.json",
+          `Menu surface ${surface} references a non-contributed command: ${String(entry?.command)}`,
+        ));
+      }
+    }
+  }
+  for (const entry of Array.isArray(manifest?.contributes?.keybindings)
+    ? manifest.contributes.keybindings
+    : []) {
+    if (internalSet.has(entry?.command)) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_INTERNAL_SURFACE",
+        "package.json",
+        `Internal command must not have a customer keybinding: ${entry.command}`,
+      ));
+    }
+  }
+  const paletteEntries = Array.isArray(menus.commandPalette) ? menus.commandPalette : [];
+  const paletteByCommand = new Map();
+  for (const entry of paletteEntries) {
+    if (!manifestSet.has(entry?.command) || internalSet.has(entry?.command)) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_MENU_COMMAND",
+        "package.json",
+        `Command Palette entry is not a contributed user-facing command: ${String(entry?.command)}`,
+      ));
+    }
+    const entries = paletteByCommand.get(entry?.command) || [];
+    entries.push(entry);
+    paletteByCommand.set(entry?.command, entries);
+  }
+  for (const [command, kind] of classifications) {
+    const entries = paletteByCommand.get(command) || [];
+    if (kind === "contextOnly") {
+      if (entries.length !== 1 || entries[0].when !== "false") {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_PALETTE",
+          "package.json",
+          `Context-only command must have one explicit Command Palette exclusion: ${command}`,
+        ));
+      }
+    } else if (entries.length !== 0) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_PALETTE",
+        "package.json",
+        `Palette-capable command must use enablement instead of a Command Palette when-clause: ${command}`,
+      ));
+    }
+  }
+
+  const knownContextKeys = new Set(commandUx.contextKeys.map(entry => entry.key));
+  const conditionSources = [
+    ...manifestCommands.map(entry => entry?.enablement),
+    ...Object.values(menus).flatMap(entries => (
+      Array.isArray(entries) ? entries.map(entry => entry?.when) : []
+    )),
+  ];
+  for (const condition of conditionSources) {
+    if (typeof condition !== "string") continue;
+    for (const key of extractCloudsmithContextKeys(condition)) {
+      if (!knownContextKeys.has(key)) {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_CONTEXT_KEY",
+          "package.json",
+          `Manifest condition references unknown Cloudsmith context key: ${key}`,
+        ));
+      }
+    }
+  }
+
+  const knownContextValues = new Set(commandUx.contextValues.map(entry => entry.value));
+  const scopeContracts = new Map(commandUx.viewScopes.map(entry => [entry.command, entry]));
+  const observedPlacements = new Map();
+  const itemEntries = Array.isArray(menus["view/item/context"])
+    ? menus["view/item/context"]
+    : [];
+  for (const entry of itemEntries) {
+    if (!manifestSet.has(entry?.command) || internalSet.has(entry?.command)) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_MENU_COMMAND",
+        "package.json",
+        `Item menu entry is not a contributed user-facing command: ${String(entry?.command)}`,
+      ));
+      continue;
+    }
+    const parsed = parseScopedWhen(entry.when, true);
+    const contract = scopeContracts.get(entry.command);
+    const placement = parsed && contract
+      ? contract.placements.find(candidate => candidate.view === parsed.view)
+      : null;
+    if (!parsed || !contract || !placement || !views.has(parsed.view)) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_VIEW_SCOPE",
+        "package.json",
+        `Item menu must have one allowed positive Cloudsmith view scope: ${entry.command}`,
+      ));
+      continue;
+    }
+    let commandPlacements = observedPlacements.get(entry.command);
+    if (!commandPlacements) {
+      commandPlacements = new Map();
+      observedPlacements.set(entry.command, commandPlacements);
+    }
+    const commandValues = commandPlacements.get(parsed.view) || new Set();
+    for (const value of parsed.contextValues) {
+      commandValues.add(value);
+      if (!knownContextValues.has(value) || !placement.contextValues.includes(value)) {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_CONTEXT_VALUE",
+          "package.json",
+          `Item menu uses an undeclared or incompatible ${parsed.view} context value for ${entry.command}: ${value}`,
+        ));
+      }
+    }
+    commandPlacements.set(parsed.view, commandValues);
+  }
+  for (const contract of commandUx.viewScopes) {
+    const commandPlacements = observedPlacements.get(contract.command) || new Map();
+    const actualViews = [...commandPlacements.keys()].sort();
+    const expectedViews = contract.placements.map(placement => placement.view).sort();
+    if (actualViews.length !== expectedViews.length
+      || actualViews.some((view, index) => view !== expectedViews[index])) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_VIEW_SCOPE",
+        "package.json",
+        `Item menu view coverage does not match the command UX contract: ${contract.command}`,
+      ));
+    }
+    for (const placement of contract.placements) {
+      const actualValues = [...(commandPlacements.get(placement.view) || [])].sort();
+      const expectedValues = [...placement.contextValues].sort();
+      if (actualValues.length !== expectedValues.length
+        || actualValues.some((value, index) => value !== expectedValues[index])) {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_CONTEXT_VALUE",
+          "package.json",
+          `Item menu ${placement.view} context compatibility does not match the command UX contract: ${contract.command}`,
+        ));
+      }
+    }
+  }
+
+  const titleEntries = Array.isArray(menus["view/title"]) ? menus["view/title"] : [];
+  for (const entry of titleEntries) {
+    const parsed = parseScopedWhen(entry?.when, false);
+    if (
+      !manifestSet.has(entry?.command)
+      || internalSet.has(entry?.command)
+      || !parsed
+      || !views.has(parsed.view)
+    ) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_VIEW_SCOPE",
+        "package.json",
+        `View-title entry must target one contributed command in one known view: ${String(entry?.command)}`,
+      ));
+    }
+  }
+
+  const directCommands = new Set(commandUx.directTreeCommands.map(entry => entry.command));
+  const itemCommands = new Set(itemEntries.map(entry => entry?.command));
+  for (const command of commandUx.classifications.contextOnly) {
+    if (!itemCommands.has(command) && !directCommands.has(command)) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_DEAD",
+        "package.json",
+        `Context-only command has no intentional non-palette surface: ${command}`,
+      ));
+    }
+  }
+
+  const producerFacts = new Map();
+  const factsFor = (producer) => {
+    if (!producerFacts.has(producer)) {
+      producerFacts.set(
+        producer,
+        files.has(producer)
+          ? collectCommandUxProducerFacts(files.get(producer), producer)
+          : null
+      );
+    }
+    return producerFacts.get(producer);
+  };
+  const producerContracts = [
+    ...commandUx.contextKeys.map(entry => ({
+      kind: "contextKeys",
+      literal: entry.key,
+      producers: [entry.producer],
+    })),
+    ...commandUx.contextValues.map(entry => ({
+      kind: "contextValues",
+      literal: entry.value,
+      producers: entry.producers,
+    })),
+    ...commandUx.directTreeCommands.map(entry => ({
+      kind: "directCommands",
+      literal: entry.command,
+      producers: [entry.producer],
+    })),
+  ];
+  for (const contract of producerContracts) {
+    if (!contract.producers.some(producer => {
+      const facts = factsFor(producer);
+      return facts && !facts.parseFailed && facts[contract.kind].has(contract.literal);
+    })) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_PRODUCER",
+        "architecture.json",
+        `Command UX contract has no reviewed AST-backed producer: ${contract.literal}`,
+      ));
+    }
+  }
+  for (const [relativePath] of files) {
+    const facts = factsFor(relativePath);
+    for (const command of facts?.directCommands || []) {
+      if (internalSet.has(command)) {
+        diagnostics.push(diagnostic(
+          "ARCH_COMMAND_UX_INTERNAL_SURFACE",
+          relativePath,
+          `Internal command must not be exposed by a customer tree item: ${command}`,
+        ));
+      }
+    }
+  }
+  for (const [relativePath, source] of files) {
+    if (!relativePath.startsWith("commands/")) continue;
+    if (/(?:\.|\[\s*["'])_onDidChangeTreeData(?:\b|["'])/.test(source)) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_PRIVATE_PROVIDER",
+        relativePath,
+        "Command code must use an intentional public provider refresh contract",
+      ));
+    }
+    if (/(?:run|use) this command from[^\n"']*context menu/i.test(source)) {
+      diagnostics.push(diagnostic(
+        "ARCH_COMMAND_UX_CONTEXT_DEAD_END",
+        relativePath,
+        "Command copy must not direct palette users back to a context menu",
+      ));
+    }
+  }
+  return diagnostics;
 }
 
 function layerForFile(metadata, relativePath) {
@@ -3136,6 +3932,11 @@ function verifyArchitecture({ root, metadata = null, manifest = null, throwOnErr
   }
   const scan = collectArchitectureFiles(repositoryRoot, validation.metadata);
   diagnostics.push(...scan.diagnostics);
+  diagnostics.push(...commandUxManifestDiagnostics(
+    validation.metadata,
+    packageManifest,
+    scan.files,
+  ));
   const staticResult = analyzeStaticArchitecture(repositoryRoot, validation.metadata, scan.files);
   diagnostics.push(...staticResult.diagnostics);
   const executableResult = staticResult.diagnostics.length === 0

@@ -2,17 +2,38 @@
 
 const { registerCommands } = require("./registrar");
 const {
-  adaptInstallSelection,
   adaptPackageSelection,
   buildInstallCommand,
   buildPresetQuery,
+  captureCommandAccount,
   createFilterPresets,
   firstCollectionFailureMessage,
   isQuarantinedPackage,
   pickInstallCommandVariant,
   pickRecentPackage,
   commentCommandNote,
+  isCommandAccountCurrent,
+  showAccountInputBox,
+  showAccountQuickPick,
 } = require("./support");
+
+const MAX_FILTER_INPUT_LENGTH = 2048;
+
+function filterInputValidationMessage(value) {
+  if (typeof value !== "string") return "Enter a filter query.";
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) {
+    return "Filter queries cannot contain control characters.";
+  }
+  if (value.length > MAX_FILTER_INPUT_LENGTH) {
+    return `Enter a query with ${MAX_FILTER_INPUT_LENGTH} characters or fewer.`;
+  }
+  if (value.trim().length === 0) return "Enter a filter query.";
+  return null;
+}
+
+function validFilterInput(value) {
+  return filterInputValidationMessage(value) === null;
+}
 
 function registerPackageCommands(deps) {
   const {
@@ -36,56 +57,135 @@ function registerPackageCommands(deps) {
     buildPackageUrl,
     buildPackageGroupUrl,
     filterState,
+    serializePackageCollectionInspection,
+    serializePackageInspection,
   } = deps;
   const filterPresets = createFilterPresets(LicenseClassifier);
-  const recentSupport = { recentPackages, packageAdapters, vscode };
+  const recentSupport = { ...deps, recentPackages, packageAdapters, vscode };
 
-  async function selectedPackage(item, options = {}) {
-    const pkg = item
-      ? adaptPackageSelection(packageAdapters, item)
-      : await pickRecentPackage(recentSupport, options);
+  function ownsSelection(kind, item) {
+    let validator = null;
+    if (kind === "isCurrentSelection") validator = deps.isCurrentSelection;
+    if (kind === "isCurrentPackageSelection") validator = deps.isCurrentPackageSelection;
+    if (kind === "isCurrentPackageGroupSelection") validator = deps.isCurrentPackageGroupSelection;
+    if (kind === "isCurrentRepositorySelection") validator = deps.isCurrentRepositorySelection;
+    if (kind === "isCurrentEntitlementSelection") validator = deps.isCurrentEntitlementSelection;
+    return typeof validator === "function" && validator(item) === true;
+  }
+
+  function currentSelection(accountScope, kind, item) {
+    return isCommandAccountCurrent(accountScope) && ownsSelection(kind, item);
+  }
+
+  async function selectedPackage(item, accountScope, options = {}) {
+    let pkg;
+    let selection = item;
+    if (item) {
+      try {
+        pkg = adaptPackageSelection(packageAdapters, item);
+      } catch {
+        vscode.window.showWarningMessage(options.invalidMessage || "Could not determine package details.");
+        return null;
+      }
+      if (!ownsSelection("isCurrentPackageSelection", item)) return null;
+    } else {
+      selection = await pickRecentPackage(recentSupport, {
+        ...options,
+        accountScope,
+        predicate: typeof options.predicate === "function"
+          ? (candidate) => {
+            try {
+              return options.predicate(packageDomain.assertExactPackage(candidate));
+            } catch {
+              return false;
+            }
+          }
+          : undefined,
+        currentSelection: selection => ownsSelection("isCurrentPackageSelection", selection),
+      });
+      pkg = selection;
+    }
     if (!pkg && !item) return null;
+    if (!isCommandAccountCurrent(accountScope)) return null;
     try {
-      return packageDomain.assertExactPackage(pkg);
+      const exactPackage = packageDomain.assertExactPackage(pkg);
+      if (typeof options.predicate === "function" && !options.predicate(exactPackage)) {
+        vscode.window.showWarningMessage(
+          options.invalidStateMessage || "This package is not available for this command."
+        );
+        return null;
+      }
+      const isCurrent = () => currentSelection(
+        accountScope,
+        "isCurrentPackageSelection",
+        selection
+      );
+      if (!isCurrent()) return null;
+      return Object.freeze({ package: exactPackage, isCurrent });
     } catch {
-      vscode.window.showWarningMessage(options.invalidMessage || "Run this command from a package context menu.");
+      vscode.window.showWarningMessage(options.invalidMessage || "Could not determine package details.");
       return null;
     }
   }
 
-  async function showInspectOutput(jsonContent) {
-    const inspectOutput = await vscode.workspace
-      .getConfiguration("cloudsmith-vsc")
-      .get("inspectOutput");
-    if (inspectOutput) {
-      const document = await vscode.workspace.openTextDocument({
-        language: "json",
-        content: jsonContent,
-      });
-      await vscode.window.showTextDocument(document, { preview: true });
-    } else {
-      inspectOutputChannel.clear();
-      inspectOutputChannel.show(true);
-      inspectOutputChannel.append(jsonContent);
+  async function showInspectOutput(jsonContent, isCurrent, errorMessage) {
+    try {
+      const inspectOutput = vscode.workspace
+        .getConfiguration("cloudsmith-vsc")
+        .get("inspectOutput");
+      if (!isCurrent()) return false;
+      if (inspectOutput) {
+        if (!isCurrent()) return false;
+        const document = await vscode.workspace.openTextDocument({
+          language: "json",
+          content: jsonContent,
+        });
+        if (!isCurrent()) return false;
+        await vscode.window.showTextDocument(document, { preview: true });
+      } else {
+        if (!isCurrent()) return false;
+        inspectOutputChannel.clear();
+        if (!isCurrent()) return false;
+        inspectOutputChannel.show(true);
+        if (!isCurrent()) return false;
+        inspectOutputChannel.append(jsonContent);
+      }
+      return isCurrent();
+    } catch {
+      if (!isCurrent()) return false;
+      try {
+        await vscode.window.showErrorMessage(errorMessage);
+      } catch {
+        // Notification failures must not escape the command boundary.
+      }
+      return false;
     }
   }
 
   async function copySelected(item) {
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope || !ownsSelection("isCurrentSelection", item)) return;
+    const isCurrent = () => currentSelection(accountScope, "isCurrentSelection", item);
     let detail;
     try {
       detail = packageAdapters.fromPackageDetailNode(item);
     } catch {
-      vscode.window.showWarningMessage("Run this command from a package context menu.");
+      vscode.window.showWarningMessage("No package detail selected.");
       return;
     }
+    if (!isCurrent()) return;
     await vscode.env.clipboard.writeText(String(detail.value));
+    if (!isCurrent()) return;
     vscode.window.showInformationMessage("Value copied.");
   }
 
   async function inspectPackage(item) {
-    const pkg = await selectedPackage(item);
-    if (!pkg) return;
-    recentPackages.add(pkg);
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope) return;
+    const selected = await selectedPackage(item, accountScope);
+    if (!selected) return;
+    const { package: pkg, isCurrent } = selected;
+    if (!isCurrent()) return;
     let endpoint;
     try {
       endpoint = apiEndpoint([
@@ -98,29 +198,54 @@ function registerPackageCommands(deps) {
       vscode.window.showErrorMessage("Could not inspect the package because its identifier was invalid.");
       return;
     }
+    if (!isCurrent()) return;
     const result = await new CloudsmithAPI(context).get(endpoint, {
       responseType: "object",
       validate: value => Boolean(value) && typeof value === "object" && !Array.isArray(value),
       retry: "safe-read",
     });
+    if (!isCurrent()) return;
     if (!result.ok) {
-      vscode.window.showErrorMessage(deps.formatApiError(result.error));
+      vscode.window.showErrorMessage(
+        `Could not inspect package. ${deps.formatApiError(result.error)}`
+      );
       return;
     }
-    await showInspectOutput(JSON.stringify(result.data, null, 2));
-    vscode.window.showInformationMessage(
-      `Inspecting package ${pkg.name} in repository ${pkg.repository}.`
+    let jsonContent;
+    try {
+      const inspectedPackage = packageAdapters.fromApiPackageRecord(result.data, {
+        expectedWorkspace: pkg.workspace,
+        expectedRepository: pkg.repository,
+      });
+      jsonContent = serializePackageInspection(inspectedPackage);
+    } catch {
+      vscode.window.showErrorMessage("Could not safely inspect the package response.");
+      return;
+    }
+    const outputShown = await showInspectOutput(
+      jsonContent,
+      isCurrent,
+      "Could not inspect package. The inspection output could not be opened."
     );
+    if (!outputShown || !isCurrent()) return;
+    recentPackages.add(pkg);
   }
 
   async function inspectPackageGroup(item) {
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope || !ownsSelection("isCurrentPackageGroupSelection", item)) return;
     let group;
     try {
       group = packageAdapters.fromPackageGroupNode(item);
     } catch {
-      vscode.window.showWarningMessage("Run this command from a package context menu.");
+      vscode.window.showWarningMessage("No package group selected.");
       return;
     }
+    const isCurrent = () => currentSelection(
+      accountScope,
+      "isCurrentPackageGroupSelection",
+      item
+    );
     const cloudsmithAPI = new CloudsmithAPI(context);
     let endpoint;
     let query;
@@ -153,6 +278,7 @@ function registerPackageCommands(deps) {
       );
       return;
     }
+    if (!isCurrent()) return;
     const result = await new PaginatedFetch(cloudsmithAPI).fetchCollection(endpoint, {
       pageSize: 100,
       maxPages: 20,
@@ -174,34 +300,50 @@ function registerPackageCommands(deps) {
       }),
       retry: "safe-read",
     });
+    if (!isCurrent()) return;
     if (!result.complete && result.items.length === 0) {
+      const detail = firstCollectionFailureMessage(result, deps.formatApiError)
+        || "The package group could not be loaded completely.";
       vscode.window.showErrorMessage(
-        firstCollectionFailureMessage(result, deps.formatApiError)
-          || "Could not inspect the package group completely."
+        `Could not inspect package group. ${String(detail).trim()}`
       );
       return;
     }
-    await showInspectOutput(JSON.stringify({
-      items: result.items,
-      complete: result.complete,
-      loadedCount: result.items.length,
-      totalCount: result.pagination?.countAuthoritative ? result.pagination.count : null,
-      termination: result.termination,
-      failureCount: result.failureCount,
-    }, null, 2));
-    if (result.complete) {
-      vscode.window.showInformationMessage(`Inspecting package group ${group.name}.`);
-    } else {
+    let jsonContent;
+    try {
+      jsonContent = serializePackageCollectionInspection(
+        result.items.map(adaptGroupPackage),
+        {
+          complete: result.complete,
+          totalCount: result.pagination?.countAuthoritative ? result.pagination.count : null,
+          termination: result.termination,
+          failureCount: result.failureCount,
+        }
+      );
+    } catch {
+      vscode.window.showErrorMessage("Could not safely inspect the package-group response.");
+      return;
+    }
+    const outputShown = await showInspectOutput(
+      jsonContent,
+      isCurrent,
+      "Could not inspect package group. The inspection output could not be opened."
+    );
+    if (!outputShown || !isCurrent()) return;
+    if (!result.complete) {
       vscode.window.showWarningMessage(
-        `Inspecting an incomplete package-group result (${result.items.length} packages loaded).`
+        `Package-group results are incomplete (${result.items.length} packages loaded).`
       );
     }
   }
 
   async function openPackage(item) {
-    const pkg = await selectedPackage(item);
-    if (!pkg) return;
-    recentPackages.add(pkg);
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope) return;
+    const selected = await selectedPackage(item, accountScope);
+    if (!selected) return;
+    const { package: pkg, isCurrent } = selected;
+    if (!isCurrent()) return;
     const url = buildPackageUrl(
       pkg.workspace,
       pkg.repository,
@@ -211,35 +353,54 @@ function registerPackageCommands(deps) {
       pkg.packageIdentifier
     );
     if (!url) {
-      vscode.window.showWarningMessage("Run this command from a package context menu.");
+      vscode.window.showWarningMessage("Could not open this package in Cloudsmith.");
       return;
     }
+    if (!isCurrent()) return;
     await vscode.env.openExternal(vscode.Uri.parse(url));
+    if (!isCurrent()) return;
+    recentPackages.add(pkg);
   }
 
   async function openPackageGroup(item) {
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope || !ownsSelection("isCurrentPackageGroupSelection", item)) return;
     let group;
     try {
       group = packageAdapters.fromPackageGroupNode(item);
     } catch {
-      vscode.window.showWarningMessage("Run this command from a package context menu.");
+      vscode.window.showWarningMessage("No package group selected.");
       return;
     }
+    const isCurrent = () => currentSelection(
+      accountScope,
+      "isCurrentPackageGroupSelection",
+      item
+    );
     const url = buildPackageGroupUrl(group.workspace, group.repository, group.name);
     if (!url) {
-      vscode.window.showWarningMessage("Please use this command from the package context menu.");
+      vscode.window.showWarningMessage("Could not open this package group in Cloudsmith.");
       return;
     }
+    if (!isCurrent()) return;
     await vscode.env.openExternal(vscode.Uri.parse(url));
   }
 
   async function loadMoreRepositoryPackages(item) {
-    if (item && typeof item.loadMorePackages === "function") {
-      await item.loadMorePackages();
-    }
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (
+      !accountScope
+      || !item
+      || typeof item.loadMorePackages !== "function"
+      || !ownsSelection("isCurrentRepositorySelection", item)
+    ) return;
+    if (!currentSelection(accountScope, "isCurrentRepositorySelection", item)) return;
+    await item.loadMorePackages();
   }
 
   async function filterPackages(item) {
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope || !ownsSelection("isCurrentRepositorySelection", item)) return;
     let repository;
     try {
       repository = packageAdapters.fromRepositoryNode(item);
@@ -247,18 +408,26 @@ function registerPackageCommands(deps) {
       vscode.window.showWarningMessage("No repository selected.");
       return;
     }
-    const selected = await vscode.window.showQuickPick(
+    const isCurrent = () => currentSelection(
+      accountScope,
+      "isCurrentRepositorySelection",
+      item
+    );
+    const selected = await showAccountQuickPick(
+      deps,
+      accountScope,
       filterPresets.map(preset => ({ label: preset.label, preset })),
       { placeHolder: `Filter packages in ${repository.name}` }
     );
-    if (!selected) return;
+    if (!selected || !isCurrent()) return;
     let query;
     if (selected.preset.applyBuilder === null) {
-      query = await vscode.window.showInputBox({
+      query = await showAccountInputBox(deps, accountScope, {
         placeHolder: "Enter filter query",
         prompt: `Filter packages in ${repository.name}`,
+        validateInput: filterInputValidationMessage,
       });
-      if (!query) return;
+      if (!validFilterInput(query) || !isCurrent()) return;
       query = buildPresetQuery(SearchQueryBuilder, selected.preset, query);
     } else {
       query = buildPresetQuery(SearchQueryBuilder, selected.preset);
@@ -267,48 +436,49 @@ function registerPackageCommands(deps) {
     const filterLabel = selected.preset.applyBuilder === null
       ? "Custom query"
       : selected.preset.label;
+    if (!isCurrent()) return;
     if (query) {
       filterState.activeFilters.set(filterKey, { query, label: filterLabel });
     } else {
       filterState.activeFilters.delete(filterKey);
     }
+    if (!isCurrent()) return;
     cloudsmithProvider.refresh();
   }
 
   async function clearFilter(item) {
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope) return;
     let repository;
     try {
       repository = packageAdapters.fromRepositoryNode(item);
     } catch {
       return;
     }
+    if (!ownsSelection("isCurrentRepositorySelection", item)) return;
+    const isCurrent = () => currentSelection(
+      accountScope,
+      "isCurrentRepositorySelection",
+      item
+    );
+    if (!isCurrent()) return;
     filterState.activeFilters.delete(`${repository.workspace}/${repository.repository}`);
+    if (!isCurrent()) return;
     cloudsmithProvider.refresh();
   }
 
   async function installCommand(item, showDocument) {
-    let selection = item;
-    if (!selection) selection = await pickRecentPackage(recentSupport);
-    if (!selection) return;
-    let installSelection;
-    try {
-      installSelection = adaptInstallSelection(
-        packageAdapters,
-        packageDomain,
-        selection
-      );
-    } catch {
-      vscode.window.showWarningMessage(
-        "Could not determine package details for install command."
-      );
-      return;
-    }
-    const pkg = installSelection.package;
-    if (isQuarantinedPackage(pkg)) {
-      vscode.window.showWarningMessage("Install commands are not available for quarantined packages.");
-      return;
-    }
-    if (installSelection.exactPackage) recentPackages.add(installSelection.exactPackage);
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope) return;
+    const selected = await selectedPackage(item, accountScope, {
+      predicate: pkg => pkg.copyable === true && !isQuarantinedPackage(pkg),
+      invalidMessage: "Could not determine package details for install command.",
+      invalidStateMessage: "Install commands are available only for copyable, non-quarantined packages.",
+      emptyMessage: "No recent installable packages. Open or search for a package, then try again.",
+    });
+    if (!selected) return;
+    const { package: pkg, isCurrent } = selected;
+    if (!isCurrent()) return;
     const result = buildInstallCommand(deps, pkg);
     if (!result) return;
     if (showDocument) {
@@ -319,25 +489,33 @@ function registerPackageCommands(deps) {
         }
       }
       if (result.note) content += `\n\n# Note\n${commentCommandNote(result.note)}`;
+      if (!isCurrent()) return;
       const document = await vscode.workspace.openTextDocument({
         language: pkg.format === "maven" ? "xml" : "shellscript",
         content,
       });
+      if (!isCurrent()) return;
       await vscode.window.showTextDocument(document, { preview: true });
+      if (!isCurrent()) return;
+      recentPackages.add(pkg);
       return;
     }
-    const chosenCommand = await pickInstallCommandVariant(deps, result);
+    const chosenCommand = await pickInstallCommandVariant(deps, result, { accountScope });
     if (!chosenCommand) return;
+    if (!isCurrent()) return;
     await vscode.env.clipboard.writeText(
       InstallCommandBuilder.toClipboardCommand(chosenCommand)
     );
-    const message = result.note
-      ? `Install command copied for ${pkg.name}. Note: ${result.note}`
-      : `Install command copied for ${pkg.name}.`;
-    vscode.window.showInformationMessage(message);
+    if (!isCurrent()) return;
+    vscode.window.showInformationMessage("Install command copied.");
+    if (!isCurrent()) return;
+    recentPackages.add(pkg);
   }
 
   async function openLicenseUrl(item) {
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope || !ownsSelection("isCurrentSelection", item)) return;
+    const isCurrent = () => currentSelection(accountScope, "isCurrentSelection", item);
     const licenseInfo = item && item.licenseInfo
       ? item.licenseInfo
       : LicenseClassifier.inspect(item);
@@ -369,26 +547,40 @@ function registerPackageCommands(deps) {
       vscode.window.showWarningMessage("Could not open the license URL. Unsupported protocol.");
       return;
     }
+    if (!isCurrent()) return;
     await vscode.env.openExternal(vscode.Uri.parse(parsedUrl.toString()));
   }
 
   async function copyEntitlementToken(item) {
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (
+      !accountScope
+      || !ownsSelection("isCurrentEntitlementSelection", item)
+    ) return;
+    const isCurrent = () => currentSelection(
+      accountScope,
+      "isCurrentEntitlementSelection",
+      item
+    );
     if (!item || !item.token) {
       vscode.window.showWarningMessage("No token available to copy.");
       return;
     }
+    if (!isCurrent()) return;
     const choice = await vscode.window.showWarningMessage(
       "Copy the entitlement token to the clipboard? Entitlement tokens are sensitive.",
-      "Copy",
-      "Cancel"
+      { modal: true },
+      "Copy"
     );
-    if (choice !== "Copy") return;
+    if (choice !== "Copy" || !isCurrent()) return;
     await vscode.env.clipboard.writeText(item.token);
-    vscode.window.showInformationMessage(`Entitlement token "${item.tokenName}" copied.`);
+    if (!isCurrent()) return;
+    vscode.window.showInformationMessage("Entitlement token copied.");
   }
 
   return registerCommands(registerCommand, [
     ["cloudsmith-vsc.refreshView", () => {
+      if (!captureCommandAccount(deps.workspaceAccess)) return;
       cloudsmithProvider.refresh();
       searchProvider.refresh();
       dependencyHealthProvider.refresh();

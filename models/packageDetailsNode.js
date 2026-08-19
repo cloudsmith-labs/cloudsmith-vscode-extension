@@ -1,6 +1,7 @@
 // Package details node treeview
 
 const vscode = require('vscode');
+const { inheritSelection } = require("../util/selectionProvenance");
 
 /**
  * Unwrap a detail value that may be:
@@ -26,9 +27,10 @@ function unwrapDetail(detail) {
 }
 
 class PackageDetailsNode {
-	constructor(detail, context) {
+	constructor(detail, context, owner = null) {
 		this.context = context;
 		this.label = detail;
+		inheritSelection(this, owner);
 	}
 
 	getTreeItem() {
@@ -97,7 +99,7 @@ class PackageDetailsNode {
 			command: {
 				command: 'cloudsmith-vsc.copySelected',
 				title: 'Copy Label',
-				arguments: [{ _detailId: id, _detailValue: String(value) }]
+				arguments: [this]
 			}
 		};
 	}

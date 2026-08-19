@@ -17,6 +17,17 @@ function fixtureMetadata(root) {
   return {
     schemaVersion: 1,
     compositionFile: "extension.js",
+    commandUx: {
+      classifications: {
+        contextOnly: [],
+        global: ["cloudsmith-vsc.valid"],
+        recoverable: [],
+      },
+      contextKeys: [],
+      contextValues: [],
+      directTreeCommands: [],
+      viewScopes: [],
+    },
     cycleExemptions: [],
     limits: {
       maxDepth: 12,
@@ -126,6 +137,9 @@ function withFixture(name, callback) {
 
 function fixtureManifest(root, metadata) {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  for (const entry of manifest.contributes?.commands || []) {
+    entry.category ??= "Cloudsmith";
+  }
   manifest.main ??= "./extension.js";
   manifest.files ??= [
     "extension.js",
@@ -135,10 +149,11 @@ function fixtureManifest(root, metadata) {
   return manifest;
 }
 
-function resultFor(name, mutate = null) {
+function resultFor(name, mutate = null, mutateManifest = null) {
   return withFixture(name, (root, metadata) => {
     mutate?.(root, metadata);
     const manifest = fixtureManifest(root, metadata);
+    mutateManifest?.(manifest, root, metadata);
     return verifyArchitecture({ root, metadata, manifest, throwOnError: false });
   });
 }
@@ -152,6 +167,183 @@ function assertDiagnostic(result, code, relativePath) {
 
 function runArchitectureSelfTests() {
   assert.deepStrictEqual(resultFor("valid").diagnostics, []);
+  assertDiagnostic(resultFor("valid", (root, metadata) => {
+    metadata.commandUx.classifications.global = [];
+    metadata.commandUx.classifications.contextOnly = ["cloudsmith-vsc.valid"];
+  }), "ARCH_COMMAND_UX_PALETTE", "package.json");
+  assertDiagnostic(resultFor("valid", (root, metadata) => {
+    metadata.internalCommandIds.push("cloudsmith-vsc.valid");
+  }), "ARCH_COMMAND_UX_INTERNAL_CONTRIBUTED", "package.json");
+  assertDiagnostic(resultFor("valid", (root, metadata) => {
+    metadata.commandUx.classifications.global = [];
+    metadata.commandUx.classifications.recoverable = ["cloudsmith-vsc.valid"];
+    metadata.commandUx.contextValues.push({
+      value: "package",
+      producers: ["commands/general.js"],
+    });
+    metadata.commandUx.viewScopes.push({
+      command: "cloudsmith-vsc.valid",
+      placements: [{ view: "fixtureView", contextValues: ["package"] }],
+    });
+    const file = path.join(root, "commands/general.js");
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(
+      "() => undefined",
+      '() => ({ contextValue: "package" })',
+    ));
+  }, (manifest) => {
+    manifest.contributes.views = { fixture: [{ id: "fixtureView", name: "Fixture" }] };
+    manifest.contributes.menus = {
+      "view/item/context": [{
+        command: "cloudsmith-vsc.valid",
+        when: "viewItem == package",
+      }],
+    };
+  }), "ARCH_COMMAND_UX_VIEW_SCOPE", "package.json");
+  assertDiagnostic(resultFor("valid", null, (manifest) => {
+    manifest.contributes.commands[0].enablement = "cloudsmith.unknown";
+  }), "ARCH_COMMAND_UX_CONTEXT_KEY", "package.json");
+  assert.deepStrictEqual(resultFor("valid", (root, metadata) => {
+    metadata.commandUx.classifications.global = [];
+    metadata.commandUx.classifications.recoverable = ["cloudsmith-vsc.valid"];
+    metadata.commandUx.contextValues.push({
+      value: "package",
+      producers: ["commands/general.js"],
+    });
+    metadata.commandUx.viewScopes.push({
+      command: "cloudsmith-vsc.valid",
+      placements: [
+        { view: "fixtureViewA", contextValues: ["package"] },
+        { view: "fixtureViewB", contextValues: ["package"] },
+      ],
+    });
+    const file = path.join(root, "commands/general.js");
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(
+      "() => undefined",
+      '() => ({ contextValue: "package" })',
+    ));
+  }, (manifest) => {
+    manifest.contributes.views = {
+      fixture: [
+        { id: "fixtureViewA", name: "Fixture A" },
+        { id: "fixtureViewB", name: "Fixture B" },
+      ],
+    };
+    manifest.contributes.menus = {
+      "view/item/context": [
+        {
+          command: "cloudsmith-vsc.valid",
+          when: "view == fixtureViewA && viewItem == package",
+        },
+        {
+          command: "cloudsmith-vsc.valid",
+          when: "view == fixtureViewB && viewItem == package",
+        },
+      ],
+    };
+  }).diagnostics, []);
+  assertDiagnostic(resultFor("valid", null, (manifest) => {
+    manifest.contributes.menus = {
+      "editor/context": [{ command: "cloudsmith-vsc.valid", when: "editorTextFocus" }],
+    };
+  }), "ARCH_COMMAND_UX_MENU_SURFACE", "package.json");
+  assertDiagnostic(resultFor("valid", (root, metadata) => {
+    metadata.commandUx.classifications.global = [];
+    metadata.internalCommandIds = ["cloudsmith-vsc.valid"];
+  }, (manifest) => {
+    manifest.contributes.commands = [];
+    manifest.contributes.menus = {
+      commandPalette: [{ command: "cloudsmith-vsc.valid" }],
+    };
+  }), "ARCH_COMMAND_UX_INTERNAL_SURFACE", "package.json");
+  assertDiagnostic(resultFor("valid", (root, metadata) => {
+    metadata.commandUx.contextKeys.push({
+      key: "cloudsmith.connected",
+      producer: "commands/general.js",
+    });
+    const file = path.join(root, "commands/general.js");
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(
+      "() => undefined",
+      '() => projector.project({ "cloudsmith.connected": true })',
+    ));
+  }, (manifest) => {
+    manifest.contributes.commands[0].enablement = "cloudsmith.connected_unknown";
+  }), "ARCH_COMMAND_UX_CONTEXT_KEY", "package.json");
+  assertDiagnostic(resultFor("valid", (root, metadata) => {
+    metadata.commandUx.classifications.global = [];
+    metadata.commandUx.classifications.recoverable = ["cloudsmith-vsc.valid"];
+    metadata.commandUx.contextValues.push(
+      { value: "packageA", producers: ["commands/general.js"] },
+      { value: "packageB", producers: ["commands/general.js"] },
+    );
+    metadata.commandUx.viewScopes.push({
+      command: "cloudsmith-vsc.valid",
+      placements: [
+        { view: "fixtureViewA", contextValues: ["packageA"] },
+        { view: "fixtureViewB", contextValues: ["packageB"] },
+      ],
+    });
+    const file = path.join(root, "commands/general.js");
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(
+      "() => undefined",
+      'selection => ({ contextValue: selection ? "packageA" : "packageB" })',
+    ));
+  }, (manifest) => {
+    manifest.contributes.views = {
+      fixture: [
+        { id: "fixtureViewA", name: "Fixture A" },
+        { id: "fixtureViewB", name: "Fixture B" },
+      ],
+    };
+    manifest.contributes.menus = {
+      "view/item/context": [
+        {
+          command: "cloudsmith-vsc.valid",
+          when: "view == fixtureViewA && viewItem == packageB",
+        },
+        {
+          command: "cloudsmith-vsc.valid",
+          when: "view == fixtureViewB && viewItem == packageA",
+        },
+      ],
+    };
+  }), "ARCH_COMMAND_UX_CONTEXT_VALUE", "package.json");
+  assertDiagnostic(resultFor("valid", (root, metadata) => {
+    metadata.commandUx.contextValues.push({
+      value: "package",
+      producers: ["commands/general.js"],
+    });
+    fs.appendFileSync(
+      path.join(root, "commands/general.js"),
+      '\n// package is not a producer\nconst deadCommandUxString = "package";\n',
+    );
+  }), "ARCH_COMMAND_UX_PRODUCER", "architecture.json");
+  assertDiagnostic(resultFor("valid", (root, metadata) => {
+    metadata.commandUx.classifications.global = [];
+    metadata.commandUx.classifications.contextOnly = ["cloudsmith-vsc.valid"];
+  }, (manifest) => {
+    manifest.contributes.menus = {
+      commandPalette: [{ command: "cloudsmith-vsc.valid", when: "false" }],
+    };
+  }), "ARCH_COMMAND_UX_DEAD", "package.json");
+  assertDiagnostic(resultFor("valid", (root) => {
+    const file = path.join(root, "commands/general.js");
+    const source = fs.readFileSync(file, "utf8");
+    fs.writeFileSync(file, source.replace(
+      "() => undefined",
+      "() => provider._onDidChangeTreeData.fire()",
+    ));
+  }), "ARCH_COMMAND_UX_PRIVATE_PROVIDER", "commands/general.js");
+  assertDiagnostic(resultFor("valid", (root) => {
+    const file = path.join(root, "commands/general.js");
+    const source = fs.readFileSync(file, "utf8");
+    fs.writeFileSync(file, source.replace(
+      "() => undefined",
+      '() => "Run this command from a package context menu."',
+    ));
+  }), "ARCH_COMMAND_UX_CONTEXT_DEAD_END", "commands/general.js");
+  assertDiagnostic(resultFor("valid", (root, metadata) => {
+    metadata.commandUx.classifications.recoverable.push("cloudsmith-vsc.valid");
+  }), "ARCH_COMMAND_UX_CLASSIFICATION", "architecture.json");
   assertDiagnostic(resultFor("pure-vscode"), "ARCH_EXTERNAL_IMPORT", "domain/bad.js");
   assertDiagnostic(resultFor("pure-builtin"), "ARCH_EXTERNAL_IMPORT", "domain/bad.js");
   assertDiagnostic(resultFor("pure-model"), "ARCH_LAYER_EDGE", "domain/bad.js");
@@ -169,7 +361,9 @@ function runArchitectureSelfTests() {
   assertDiagnostic(resultFor("unclassified-command"), "ARCH_UNCLASSIFIED_COMMAND", "commands/rogue.js");
   assertDiagnostic(resultFor("bridge-reverse"), "ARCH_LAYER_EDGE", "util/bridge.js");
   assertDiagnostic(resultFor("duplicate-registration"), "ARCH_COMMAND_DUPLICATE", "commands/general.js");
-  assertDiagnostic(resultFor("missing-manifest"), "ARCH_COMMAND_REGISTRATION_MISSING", "commands");
+  const missingCommand = resultFor("missing-manifest");
+  assertDiagnostic(missingCommand, "ARCH_COMMAND_REGISTRATION_MISSING", "commands");
+  assertDiagnostic(missingCommand, "ARCH_COMMAND_UX_UNCLASSIFIED", "package.json");
   assertDiagnostic(resultFor("noop-disposable"), "ARCH_REGISTRAR_OWNERSHIP_DISPOSAL", "commands/general.js");
   assertDiagnostic(resultFor("deferred-registration"), "ARCH_DEFERRED_COMMAND_REGISTRATION", "commands/general.js");
   assertDiagnostic(resultFor("deferred-alias-registration"), "ARCH_REGISTRAR_STATIC_INVENTORY", "commands/general.js");
@@ -367,7 +561,7 @@ function runArchitectureSelfTests() {
     fs.rmSync(symlinkRoot, { force: true, recursive: true });
   }
 
-  return { invalidFixtures: 66, validFixtures: 1 };
+  return { invalidFixtures: 79, validFixtures: 2 };
 }
 
 module.exports = {

@@ -8,7 +8,7 @@ const {
 } = require("../util/upstreamPullService");
 const { UpstreamChecker } = require("../util/upstreamChecker");
 const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
-const { apiSuccess } = require("./apiResultHelpers");
+const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
 function createResponse(status, body, headers = {}) {
   return new Response(body, { status, headers });
@@ -110,7 +110,18 @@ suite("UpstreamPullService", () => {
         && typeof options.upstreamRuntime.createOperationScope === "function"
         ? options.upstreamRuntime
         : createRuntime(options.upstreamRuntime);
-      super(context, { ...options, upstreamRuntime });
+      const checkPackageAbsence = options.checkPackageAbsence || (async ({
+        workspace,
+        repository,
+      }) => ({
+        workspace,
+        repository,
+        absent: true,
+        present: false,
+        complete: true,
+        stale: false,
+      }));
+      super(context, { ...options, upstreamRuntime, checkPackageAbsence });
     }
   }
 
@@ -210,6 +221,547 @@ suite("UpstreamPullService", () => {
 
     assert.strictEqual(result, null);
     assert.ok(elapsed < 1000, `hostile anchor scan took ${elapsed}ms`);
+  });
+
+  test("exact pull absence lookup exhausts every authoritative page and detects a late match", async () => {
+    const calls = [];
+    const candidate = (name, slug) => ({
+      namespace: "workspace",
+      repository: "repo-b",
+      name,
+      version: "1.0.0",
+      format: "npm",
+      slug_perm: slug,
+    });
+    const firstPage = Array.from(
+      { length: 100 },
+      (_value, index) => candidate(`other-${index}`, `other-${index}`)
+    );
+    const api = {
+      async get(endpoint) {
+        calls.push(endpoint);
+        const page = new URL(endpoint, "https://api.cloudsmith.io").searchParams.get("page");
+        const data = page === "1"
+          ? firstPage
+          : [candidate("target-package", "target-package-1")];
+        return apiSuccess(data, {
+          headers: {
+            "x-pagination-page": page,
+            "x-pagination-pagetotal": "2",
+            "x-pagination-count": "101",
+            "x-pagination-pagesize": "100",
+          },
+        });
+      },
+    };
+    const service = new UpstreamPullService({}, { api });
+
+    const result = await service._checkExactPackageAbsence({
+      workspace: "workspace",
+      repository: "repo-b",
+      dependency: {
+        name: "target-package",
+        version: "1.0.0",
+        format: "npm",
+      },
+    });
+
+    assert.strictEqual(calls.length, 2);
+    assert.deepStrictEqual(result, {
+      workspace: "workspace",
+      repository: "repo-b",
+      absent: false,
+      present: true,
+      complete: true,
+      stale: false,
+    });
+  });
+
+  test("exact pull absence lookup accepts only authoritative exhaustive absence", async () => {
+    const service = new UpstreamPullService({}, {
+      api: {
+        async get() {
+          return apiSuccess([], {
+            headers: {
+              "x-pagination-page": "1",
+              "x-pagination-pagetotal": "1",
+              "x-pagination-count": "0",
+              "x-pagination-pagesize": "100",
+            },
+          });
+        },
+      },
+    });
+
+    const result = await service._checkExactPackageAbsence({
+      workspace: "workspace",
+      repository: "repo-b",
+      dependency: { name: "target-package", version: "1.0.0", format: "npm" },
+    });
+
+    assert.deepStrictEqual(result, {
+      workspace: "workspace",
+      repository: "repo-b",
+      absent: true,
+      present: false,
+      complete: true,
+      stale: false,
+    });
+  });
+
+  test("exact pull absence lookup fails closed on partial, error, and wrong-repository data", async () => {
+    const cases = [
+      {
+        name: "partial pagination",
+        response: apiSuccess([], {
+          headers: {
+            "x-pagination-page": "1",
+            "x-pagination-pagetotal": "2",
+            "x-pagination-count": "101",
+            "x-pagination-pagesize": "100",
+          },
+        }),
+      },
+      {
+        name: "request error",
+        response: apiFailure("network", { retryable: false }),
+      },
+      {
+        name: "wrong repository",
+        response: apiSuccess([{
+          namespace: "workspace",
+          repository: "repo-a",
+          name: "target-package",
+          version: "1.0.0",
+          format: "npm",
+          slug_perm: "target-package-1",
+        }]),
+      },
+    ];
+
+    for (const testCase of cases) {
+      const service = new UpstreamPullService({}, {
+        api: { async get() { return testCase.response; } },
+      });
+      const result = await service._checkExactPackageAbsence({
+        workspace: "workspace",
+        repository: "repo-b",
+        dependency: { name: "target-package", version: "1.0.0", format: "npm" },
+      });
+      assert.strictEqual(result.absent, false, testCase.name);
+      assert.strictEqual(result.complete, false, testCase.name);
+    }
+  });
+
+  test("exact pull absence lookup stops pagination when its account becomes stale", async () => {
+    let state = {
+      activationId: "account-a",
+      accountEpoch: 1,
+      sessionConnected: true,
+    };
+    let calls = 0;
+    const service = new UpstreamPullService({}, {
+      connectionManager: { getState() { return { ...state }; } },
+      api: {
+        async get() {
+          calls += 1;
+          state = { ...state, activationId: "account-b", accountEpoch: 2 };
+          return apiSuccess(Array.from({ length: 100 }, (_value, index) => ({
+            namespace: "workspace",
+            repository: "repo-b",
+            name: `other-${index}`,
+            version: "1.0.0",
+            format: "npm",
+            slug_perm: `other-${index}`,
+          })), {
+            headers: {
+              "x-pagination-page": "1",
+              "x-pagination-pagetotal": "2",
+              "x-pagination-count": "101",
+              "x-pagination-pagesize": "100",
+            },
+          });
+        },
+      },
+    });
+
+    const result = await service._checkExactPackageAbsence({
+      workspace: "workspace",
+      repository: "repo-b",
+      dependency: { name: "target-package", version: "1.0.0", format: "npm" },
+      account: { activationId: "account-a", accountEpoch: 1 },
+    });
+
+    assert.strictEqual(calls, 1);
+    assert.strictEqual(result.absent, false);
+    assert.strictEqual(result.complete, false);
+    assert.strictEqual(result.stale, true);
+  });
+
+  test("pull-all verifies exact target absence before confirmation and again before write", async () => {
+    const absenceCalls = [];
+    const confirmations = [];
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      fetchRepositories: async () => ({
+        items: [{ slug: "repo-b", name: "Repo B" }],
+        complete: true,
+      }),
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
+          return completeRepositoryState({
+            npm: [safeUpstream("npm", "npm", { is_active: true })],
+          });
+        },
+      },
+      checkPackageAbsence: async ({ workspace, repository, dependency }) => {
+        absenceCalls.push({ workspace, repository, name: dependency.name });
+        return {
+          workspace,
+          repository,
+          absent: true,
+          present: false,
+          complete: true,
+          stale: false,
+        };
+      },
+      showQuickPick: async items => items[0],
+      showWarningMessage: async (message, _options, action) => {
+        confirmations.push(message);
+        return action;
+      },
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+    });
+    service._pullDependency = async (_workspace, _repository, dependency) => ({
+      dependency,
+      status: "cached",
+      errorMessage: null,
+      networkError: false,
+    });
+
+    const result = await service.run({
+      workspace: "workspace",
+      repositoryHint: "repo-a",
+      dependencies: [{
+        name: "target-package",
+        version: "1.0.0",
+        format: "npm",
+        cloudsmithStatus: "ABSENT",
+      }],
+    });
+
+    assert.ok(result);
+    assert.strictEqual(result.pullResult.cached, 1);
+    assert.deepStrictEqual(absenceCalls, [
+      { workspace: "workspace", repository: "repo-b", name: "target-package" },
+      { workspace: "workspace", repository: "repo-b", name: "target-package" },
+    ]);
+    assert.strictEqual(confirmations.length, 1);
+  });
+
+  test("pull-all and pull-single repository picks bound and neutralize hostile names", async () => {
+    const unsafeDisplay = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
+    const hostileName = `Repo\u0000\u061c\u200b\u202e\u2067\ufeff Display ${"x".repeat(800)}`;
+    const hostileUpstreamName = `Registry\u0000\u061c\u200b\u202e\u2067\ufeff Source ${"y".repeat(475)}`;
+    const dependency = {
+      name: "target-package",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "ABSENT",
+    };
+
+    for (const method of ["prepare", "prepareSingle"]) {
+      const quickPicks = [];
+      const service = new UpstreamPullService({}, {
+        fetchRepositories: async () => ({
+          items: [{ slug: "safe-repo", name: hostileName }],
+          complete: true,
+        }),
+        upstreamRuntime: {
+          async getRepositoryUpstreamStateForFormats() {
+            return completeRepositoryState({
+              npm: [safeUpstream("npm", hostileUpstreamName, { is_active: true })],
+            });
+          },
+        },
+        showQuickPick: async items => {
+          quickPicks.push(items);
+          return items[0];
+        },
+        showWarningMessage: async (_message, _options, action) => action,
+        showErrorMessage: async () => {},
+        showInformationMessage: async () => {},
+      });
+
+      const prepared = method === "prepare"
+        ? await service.prepare({ workspace: "workspace", dependencies: [dependency] })
+        : await service.prepareSingle({ workspace: "workspace", dependency });
+
+      assert.ok(prepared, method);
+      assert.strictEqual(quickPicks.length, 1, method);
+      assert.strictEqual(quickPicks[0].length, 1, method);
+      const pick = quickPicks[0][0];
+      assert.strictEqual(pick.label, "safe-repo", method);
+      assert.ok(pick.description.startsWith("Repo Display "), method);
+      assert.ok(pick.description.length <= 500, method);
+      assert.doesNotMatch(pick.label, unsafeDisplay, method);
+      assert.doesNotMatch(pick.description, unsafeDisplay, method);
+      assert.doesNotMatch(pick.detail, unsafeDisplay, method);
+      assert.ok(pick.detail.length <= 500, method);
+      if (method === "prepareSingle") {
+        assert.ok(pick.detail.startsWith("npm upstream (Registry Source "), method);
+      } else {
+        assert.strictEqual(pick.detail, "npm upstream configured", method);
+      }
+      assert.strictEqual(prepared.repository.name, pick.description, method);
+      assert.doesNotMatch(prepared.repository.name, unsafeDisplay, method);
+    }
+  });
+
+  test("pull-single repository detail uses a fixed fallback for display-unsafe upstream names", async () => {
+    const quickPicks = [];
+    const service = new UpstreamPullService({}, {
+      fetchRepositories: async () => ({
+        items: [{ slug: "safe-repo", name: "Safe repository" }],
+        complete: true,
+      }),
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
+          return completeRepositoryState({
+            npm: [safeUpstream("npm", "\u0000\u061c\u200b\u202e\u2067\ufeff", { is_active: true })],
+          });
+        },
+      },
+      showQuickPick: async items => {
+        quickPicks.push(items);
+        return items[0];
+      },
+      showWarningMessage: async () => {},
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+    });
+
+    const prepared = await service.prepareSingle({
+      workspace: "workspace",
+      dependency: {
+        name: "target-package",
+        version: "1.0.0",
+        format: "npm",
+        cloudsmithStatus: "ABSENT",
+      },
+    });
+
+    assert.ok(prepared);
+    assert.strictEqual(quickPicks.length, 1);
+    assert.strictEqual(quickPicks[0][0].detail, "npm upstream (npm)");
+  });
+
+  test("pull-all and pull-single reject hostile repository slugs before service mutation", async () => {
+    const unsafeDisplay = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
+    const dependency = {
+      name: "target-package",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "ABSENT",
+    };
+
+    for (const method of ["run", "prepareSingle"]) {
+      let inspectionCalls = 0;
+      let quickPickCalls = 0;
+      let absenceCalls = 0;
+      let credentialCalls = 0;
+      let pullCalls = 0;
+      const messages = [];
+      const service = new UpstreamPullService({}, {
+        credentialManager: {
+          async getApiKey() {
+            credentialCalls += 1;
+            return "api-key";
+          },
+        },
+        fetchRepositories: async () => ({
+          items: [{ slug: "repo\u0000\u061c\u200b\u202e\u2067\ufeff-unsafe", name: "Hostile" }],
+          complete: true,
+        }),
+        upstreamRuntime: {
+          async getRepositoryUpstreamStateForFormats() {
+            inspectionCalls += 1;
+            return completeRepositoryState({
+              npm: [safeUpstream("npm", "npm", { is_active: true })],
+            });
+          },
+        },
+        checkPackageAbsence: async () => {
+          absenceCalls += 1;
+          throw new Error("unsafe repository must not reach absence lookup");
+        },
+        showQuickPick: async items => {
+          quickPickCalls += 1;
+          return items[0];
+        },
+        showWarningMessage: async message => { messages.push(message); },
+        showErrorMessage: async message => { messages.push(message); },
+        showInformationMessage: async message => { messages.push(message); },
+      });
+      service._pullDependency = async () => {
+        pullCalls += 1;
+        throw new Error("unsafe repository must not reach a registry write");
+      };
+
+      const result = method === "run"
+        ? await service.run({ workspace: "workspace", dependencies: [dependency] })
+        : await service.prepareSingle({ workspace: "workspace", dependency });
+
+      assert.strictEqual(result, null, method);
+      assert.strictEqual(inspectionCalls, 0, method);
+      assert.strictEqual(quickPickCalls, 0, method);
+      assert.strictEqual(absenceCalls, 0, method);
+      assert.strictEqual(credentialCalls, 0, method);
+      assert.strictEqual(pullCalls, 0, method);
+      assert.ok(messages.length > 0, method);
+      assert.strictEqual(messages.every(message => !unsafeDisplay.test(message)), true, method);
+    }
+  });
+
+  test("single and all pull preparation fail closed before confirmation on uncertain target absence", async () => {
+    const cases = [
+      {
+        name: "present",
+        result: ({ workspace, repository }) => ({
+          workspace,
+          repository,
+          absent: false,
+          present: true,
+          complete: true,
+          stale: false,
+        }),
+      },
+      {
+        name: "partial",
+        result: ({ workspace, repository }) => ({
+          workspace,
+          repository,
+          absent: false,
+          present: false,
+          complete: false,
+          stale: false,
+        }),
+      },
+      {
+        name: "wrong repository",
+        result: ({ workspace }) => ({
+          workspace,
+          repository: "repo-a",
+          absent: true,
+          present: false,
+          complete: true,
+          stale: false,
+        }),
+      },
+      {
+        name: "error",
+        result: () => { throw new Error("private lookup failure"); },
+      },
+    ];
+
+    for (const testCase of cases) {
+      for (const method of ["prepare", "prepareSingle"]) {
+        let confirmationCalls = 0;
+        const service = new UpstreamPullService({}, {
+          fetchRepositories: async () => ({
+            items: [{ slug: "repo-b", name: "Repo B" }],
+            complete: true,
+          }),
+          upstreamRuntime: {
+            async getRepositoryUpstreamStateForFormats() {
+              return completeRepositoryState({
+                npm: [safeUpstream("npm", "npm", { is_active: true })],
+              });
+            },
+          },
+          checkPackageAbsence: async args => testCase.result(args),
+          showQuickPick: async items => items[0],
+          showWarningMessage: async (message, options, action) => {
+            if (options?.modal || action) confirmationCalls += 1;
+            return action;
+          },
+          showErrorMessage: async () => {},
+          showInformationMessage: async () => {},
+        });
+        const dependency = {
+          name: "target-package",
+          version: "1.0.0",
+          format: "npm",
+          cloudsmithStatus: "ABSENT",
+        };
+        const prepared = method === "prepare"
+          ? await service.prepare({ workspace: "workspace", dependencies: [dependency] })
+          : await service.prepareSingle({ workspace: "workspace", dependency });
+        assert.strictEqual(prepared, null, `${testCase.name}:${method}`);
+        assert.strictEqual(confirmationCalls, 0, `${testCase.name}:${method}`);
+      }
+    }
+  });
+
+  test("a package appearing after confirmation prevents every registry write", async () => {
+    let absenceChecks = 0;
+    let pullCalls = 0;
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      fetchRepositories: async () => ({
+        items: [{ slug: "repo-b", name: "Repo B" }],
+        complete: true,
+      }),
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
+          return completeRepositoryState({
+            npm: [safeUpstream("npm", "npm", { is_active: true })],
+          });
+        },
+      },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        absenceChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: absenceChecks === 1,
+          present: absenceChecks > 1,
+          complete: true,
+          stale: false,
+        };
+      },
+      showQuickPick: async items => items[0],
+      showWarningMessage: async (_message, _options, action) => action,
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+    });
+    service._pullDependency = async () => {
+      pullCalls += 1;
+      throw new Error("must not write");
+    };
+
+    const result = await service.run({
+      workspace: "workspace",
+      dependencies: [{
+        name: "target-package",
+        version: "1.0.0",
+        format: "npm",
+        cloudsmithStatus: "ABSENT",
+      }],
+    });
+
+    assert.strictEqual(absenceChecks, 2);
+    assert.strictEqual(pullCalls, 0);
+    assert.deepStrictEqual(result, {
+      workspace: "workspace",
+      repository: { slug: "repo-b", name: "Repo B" },
+      plan: result.plan,
+      account: null,
+      repositorySearchComplete: true,
+      canceled: true,
+      absenceUnverified: true,
+    });
   });
 
   test("prepare builds a mixed-ecosystem confirmation with skipped formats", async () => {
@@ -1129,6 +1681,118 @@ suite("UpstreamPullService", () => {
 
     assert.strictEqual(await pending, null);
     assert.strictEqual(inspectionCalls, 0);
+  });
+
+  test("repository QuickPick cancels immediately when the captured account changes", async () => {
+    let state = {
+      activationId: "account-a",
+      accountEpoch: 1,
+      sessionConnected: true,
+    };
+    const listeners = new Set();
+    const pickerStarted = deferred();
+    const connectionManager = {
+      getState() { return { ...state }; },
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      switchAccount() {
+        state = { ...state, activationId: "account-b", accountEpoch: 2 };
+        for (const listener of [...listeners]) listener(this.getState());
+      },
+    };
+    let pickerToken = null;
+    const service = new UpstreamPullService({}, {
+      connectionManager,
+      fetchRepositories: async () => ({
+        items: [{ slug: "repo-b", name: "Repo B" }],
+        complete: true,
+      }),
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
+          return completeRepositoryState({
+            npm: [safeUpstream("npm", "npm", { is_active: true })],
+          });
+        },
+      },
+      showQuickPick: async (_items, _options, token) => {
+        pickerToken = token;
+        pickerStarted.resolve();
+        return new Promise(() => {});
+      },
+      showWarningMessage: async () => {},
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+    });
+
+    const pending = service.prepareSingle({
+      workspace: "workspace",
+      dependency: {
+        name: "target-package",
+        version: "1.0.0",
+        format: "npm",
+        cloudsmithStatus: "ABSENT",
+      },
+    });
+    await pickerStarted.promise;
+    connectionManager.switchAccount();
+
+    assert.strictEqual(await pending, null);
+    assert.strictEqual(pickerToken.isCancellationRequested, true);
+    assert.strictEqual(listeners.size, 0);
+  });
+
+  test("target absence completed by a superseded account cannot reach confirmation", async () => {
+    let state = {
+      activationId: "account-a",
+      accountEpoch: 1,
+      sessionConnected: true,
+    };
+    const absence = deferred();
+    let confirmations = 0;
+    const service = new UpstreamPullService({}, {
+      connectionManager: { getState() { return { ...state }; } },
+      fetchRepositories: async () => ({
+        items: [{ slug: "repo-b", name: "Repo B" }],
+        complete: true,
+      }),
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
+          return completeRepositoryState({
+            npm: [safeUpstream("npm", "npm", { is_active: true })],
+          });
+        },
+      },
+      checkPackageAbsence: async () => absence.promise,
+      showQuickPick: async items => items[0],
+      showWarningMessage: async () => { confirmations += 1; },
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+    });
+
+    const pending = service.prepare({
+      workspace: "workspace",
+      dependencies: [{
+        name: "target-package",
+        version: "1.0.0",
+        format: "npm",
+        cloudsmithStatus: "ABSENT",
+      }],
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    state = { ...state, activationId: "account-b", accountEpoch: 2 };
+    absence.resolve({
+      workspace: "workspace",
+      repository: "repo-b",
+      absent: true,
+      present: false,
+      complete: true,
+      stale: false,
+    });
+
+    assert.strictEqual(await pending, null);
+    assert.strictEqual(confirmations, 0);
   });
 
   test("does not offer uncertain dependencies for upstream pull", async () => {

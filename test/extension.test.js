@@ -110,10 +110,9 @@ suite("Extension Test Suite", () => {
     const setupCommands = new Set([
       "cloudsmith-vsc.connectCloudsmith",
       "cloudsmith-vsc.configureCredentials",
-      "cloudsmith-vsc.ssoLogin",
     ]);
     const setupEntries = titleEntries.filter(entry => setupCommands.has(entry.command));
-    assert.strictEqual(setupEntries.length, 3);
+    assert.strictEqual(setupEntries.length, 2);
     for (const entry of setupEntries) {
       assert.match(entry.when, /cloudsmith\.connectionSetupAvailable/);
       assert.match(entry.when, /!cloudsmith\.connected/);

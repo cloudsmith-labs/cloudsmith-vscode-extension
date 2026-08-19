@@ -51,6 +51,7 @@ suite("Safe package promotion workflow", () => {
       version: "1.0.0",
       format: "npm",
       is_copyable: true,
+      status_str: "Completed",
       checksum_sha256: "checksum-a",
       tags: { info: [...sourceTags] },
       ...overrides,
@@ -394,11 +395,59 @@ suite("Safe package promotion workflow", () => {
     assert.strictEqual(harness.calls.post.length, 0);
   });
 
+  test("a fresh quarantine transition blocks copy and every later tag write boundary", async () => {
+    const beforeCopy = createHarness({
+      sourceOverrides: read => ({ status_str: read >= 4 ? "Quarantined" : "Completed" }),
+      tags: { onPromote: ["source-tag"], onReceive: ["target-tag"] },
+    });
+    const beforeCopyOutcome = await beforeCopy.provider.runPromotionWorkflow(beforeCopy.item);
+    assert.strictEqual(beforeCopyOutcome.overall, "failed");
+    assert.strictEqual(beforeCopyOutcome.errorCode, "package_quarantined");
+    assert.deepStrictEqual(beforeCopy.calls.post, []);
+
+    const beforeSourceTag = createHarness({
+      sourceOverrides: read => ({ status_str: read >= 5 ? "Quarantined" : "Completed" }),
+      tags: { onPromote: ["source-tag"], onReceive: ["target-tag"] },
+    });
+    const beforeSourceTagOutcome = await beforeSourceTag.provider.runPromotionWorkflow(
+      beforeSourceTag.item
+    );
+    assert.strictEqual(beforeSourceTagOutcome.copy.status, "succeeded");
+    assert.strictEqual(beforeSourceTagOutcome.sourceTag.errorCode, "package_quarantined");
+    assert.strictEqual(
+      beforeSourceTag.calls.post.filter(call => call.endpoint.endsWith("/tag/")).length,
+      0
+    );
+
+    const beforeTargetTag = createHarness({
+      sourceOverrides: read => ({ status_str: read >= 6 ? "Quarantined" : "Completed" }),
+      tags: { onPromote: ["source-tag"], onReceive: ["target-tag"] },
+    });
+    const beforeTargetTagOutcome = await beforeTargetTag.provider.runPromotionWorkflow(
+      beforeTargetTag.item
+    );
+    assert.strictEqual(beforeTargetTagOutcome.copy.status, "succeeded");
+    assert.strictEqual(beforeTargetTagOutcome.sourceTag.status, "succeeded");
+    assert.strictEqual(beforeTargetTagOutcome.targetTag.errorCode, "package_quarantined");
+    assert.deepStrictEqual(
+      beforeTargetTag.calls.post.map(call => call.endpoint),
+      [
+        "packages/workspace/source/source-package-id/copy/",
+        "packages/workspace/source/source-package-id/tag/",
+      ]
+    );
+  });
+
   test("fresh non-copyable, missing, malformed, and identity-changed packages stop before writes", async () => {
     const cases = [
       { sourceOverrides: { is_copyable: false }, expected: "package_not_copyable" },
+      { sourceOverrides: { status_str: "Quarantined" }, expected: "package_quarantined" },
       { sourceFailureAt: 1, expected: "source_missing" },
       { sourceOverrides: { is_copyable: "false" }, expected: "malformed_copyability" },
+      {
+        sourceOverrides: { status_str: "Completed", status_str_raw: "Quarantined" },
+        expected: "malformed_source_status",
+      },
       { sourceOverrides: { slug_perm: "different" }, expected: "source_identity_changed" },
       { sourceOverrides: { name: "   " }, expected: "malformed_source_package" },
       { sourceOverrides: { version: 1 }, expected: "malformed_source_package" },
@@ -721,7 +770,7 @@ suite("Safe package promotion workflow", () => {
     assert.strictEqual(harness.calls.info.length, 0);
     const laterWarnings = harness.calls.warning.slice(warningCountBeforeAccountChange);
     assert(laterWarnings.some(call => (
-      call.message.includes("active Cloudsmith account changed")
+      call.message.includes("may have changed remote state")
     )));
     assert.strictEqual(laterWarnings.some(call => call.message.includes("artifact")), false);
   });
@@ -746,7 +795,7 @@ suite("Safe package promotion workflow", () => {
     assert.strictEqual(harness.calls.post.length, 1);
     assert.strictEqual(refreshes, 0);
     assert.strictEqual(harness.calls.info.length, 0);
-    assert(harness.calls.warning.some(call => call.message.includes("active Cloudsmith account changed")));
+    assert(harness.calls.warning.some(call => call.message.includes("may have changed remote state")));
   });
 
   test("pipeline and tag configuration are validated before confirmation or writes", async () => {
@@ -782,7 +831,7 @@ suite("Safe package promotion workflow", () => {
   test("final reads can reconcile an unattempted tag verification failure", async () => {
     const harness = createHarness({
       sourceTags: ["source-tag"],
-      sourceFailureAt: 4,
+      sourceFailureAt: 5,
       sourceFailureKind: "network_error",
       sourceFailureStatus: null,
       tags: { onPromote: ["source-tag"], onReceive: [] },

@@ -9,22 +9,32 @@ function deferred() {
 
 function createManagerHarness() {
   const calls = [];
+  const listeners = new Set();
   let current = null;
   let nextId = 0;
   const connectionManager = {
     beginCredentialOperation() {
       calls.push("begin");
+      current?.controller.abort();
       const controller = new AbortController();
       current = Object.freeze({ id: ++nextId, controller, signal: controller.signal });
+      for (const listener of [...listeners]) listener();
       return current;
     },
     isOperationCurrent(token) {
-      return token === current && !token.signal.aborted;
+      return Boolean(token && token === current && !token.signal.aborted);
     },
     cancelCredentialOperation(token) {
       calls.push(["cancel", token.id]);
-      if (token === current) token.controller.abort();
+      if (token !== current) return Object.freeze({ ok: false, status: "stale" });
+      token.controller.abort();
+      current = null;
+      for (const listener of [...listeners]) listener();
       return Object.freeze({ ok: false, status: "cancelled" });
+    },
+    onDidChange(listener) {
+      listeners.add(listener);
+      return { dispose: () => listeners.delete(listener) };
     },
     async replaceCredential(value, token) {
       calls.push(["replace", value, token.id]);
@@ -76,6 +86,62 @@ suite("CredentialManager Test Suite", () => {
     assert.strictEqual(result.ok, true);
     assert.ok(!calls.includes("begin"));
     assert.deepStrictEqual(calls[0], ["replace", "candidate-key", operation.id]);
+  });
+
+  test("an operation-scoped prompt overrides the default input path", async () => {
+    const { calls, connectionManager } = createManagerHarness();
+    const operation = connectionManager.beginCredentialOperation();
+    let defaultPrompts = 0;
+    let scopedPrompts = 0;
+    const manager = new CredentialManager({ secrets: {} }, {
+      connectionManager,
+      showInputBox: async () => {
+        defaultPrompts += 1;
+        return "wrong-key";
+      },
+    });
+
+    const result = await manager.storeApiKey(operation, {
+      async showInputBox(options) {
+        scopedPrompts += 1;
+        assert.strictEqual(options.password, true);
+        return "candidate-key";
+      },
+    });
+
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(defaultPrompts, 0);
+    assert.strictEqual(scopedPrompts, 1);
+    assert.ok(calls.some(call => (
+      Array.isArray(call)
+      && call[0] === "replace"
+      && call[1] === "candidate-key"
+    )));
+  });
+
+  test("a superseding credential operation closes a pending secret prompt", async () => {
+    const { calls, connectionManager } = createManagerHarness();
+    let cancelled = false;
+    const manager = new CredentialManager({ secrets: {} }, {
+      connectionManager,
+      showInputBox(_options, token) {
+        return new Promise(resolve => {
+          token.onCancellationRequested(() => {
+            cancelled = true;
+            resolve(undefined);
+          });
+        });
+      },
+    });
+
+    const pending = manager.storeApiKey();
+    const replacement = connectionManager.beginCredentialOperation();
+    const result = await pending;
+
+    assert.strictEqual(cancelled, true);
+    assert.strictEqual(result.status, "stale");
+    assert.strictEqual(connectionManager.isOperationCurrent(replacement), true);
+    assert.strictEqual(calls.some(call => Array.isArray(call) && call[0] === "replace"), false);
   });
 
   test("cancelling manual input cancels the exact operation without storing", async () => {

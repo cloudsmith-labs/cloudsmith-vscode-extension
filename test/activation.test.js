@@ -173,6 +173,10 @@ suite("Extension activation smoke", () => {
       "cloudsmith-vsc.scanDependenciesPending",
       "cloudsmith-vsc.scanDependenciesComplete",
       "cloudsmith-vsc.rescanDependencies",
+      "cloudsmith-vsc.cycleDepViewDirect",
+      "cloudsmith-vsc.cycleDepViewFlat",
+      "cloudsmith-vsc.cycleDepViewTree",
+      "cloudsmith-vsc.depSortFilterActive",
     ]);
     assert.strictEqual(expected.size, 64);
 
