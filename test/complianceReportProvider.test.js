@@ -1,10 +1,74 @@
 const assert = require("assert");
 const vscode = require("vscode");
-const { ComplianceReportProvider } = require("../views/complianceReportProvider");
+const {
+  ComplianceReportProvider,
+  MAX_INLINE_COMPLIANCE_DETAIL,
+  MAX_INLINE_COMPLIANCE_PRIMARY,
+} = require("../views/complianceReportProvider");
 const { buildComplianceReportData } = require("../views/dependencyHealthProvider");
 const { assertWebviewDocument } = require("./helpers/webviewSemanticContract");
 
 suite("ComplianceReportProvider", () => {
+  test("bounds repeated compliance row content without omitting records", () => {
+    assert.strictEqual(MAX_INLINE_COMPLIANCE_PRIMARY, 320);
+    assert.strictEqual(MAX_INLINE_COMPLIANCE_DETAIL, 512);
+    const provider = new ComplianceReportProvider({});
+    const recordCount = 10;
+    const makeRows = multiplier => Array.from({ length: recordCount }, (_, index) => ({
+      name: `policy-${index}-${"N".repeat(MAX_INLINE_COMPLIANCE_PRIMARY * multiplier)} NAME-TAIL-${index}`,
+      version: `1.${index}.0`,
+      status: "Quarantined",
+      detail: `Policy ${index} ${"\"&<>'".repeat(MAX_INLINE_COMPLIANCE_DETAIL * multiplier)} DETAIL-TAIL-${index}`,
+    }));
+    const render = policyViolationDeps => provider._getHtml({
+      projectName: "fixture",
+      summary: {
+        total: policyViolationDeps.length,
+        found: policyViolationDeps.length,
+        policyViolationCount: policyViolationDeps.length,
+      },
+      policyViolationDeps,
+    });
+    const rows = makeRows(2);
+    const html = render(rows);
+    const longerHtml = render(makeRows(3));
+    const emptyShell = render([]);
+    const expectedUpperEnvelope = emptyShell.length + recordCount * (
+      6 * (MAX_INLINE_COMPLIANCE_PRIMARY + MAX_INLINE_COMPLIANCE_DETAIL) + 1200
+    );
+
+    assert.strictEqual(html.length, longerHtml.length, "canonical tails must not affect report HTML size");
+    assert.ok(html.length <= expectedUpperEnvelope, `${html.length} exceeds ${expectedUpperEnvelope}`);
+    assert.ok(rows[0].detail.length > MAX_INLINE_COMPLIANCE_DETAIL);
+    assert.match(html, /Policy 0 [^<]+…/);
+    assert.doesNotMatch(html, /<script|DETAIL-TAIL|NAME-TAIL/);
+    for (let index = 0; index < recordCount; index += 1) {
+      assert.match(html, new RegExp(`policy-${index}-`));
+      assert.match(html, new RegExp(`1\\.${index}\\.0`));
+    }
+  });
+
+  test("bounds derived provenance without dropping collectively long detail", () => {
+    const provider = new ComplianceReportProvider({});
+    const provenance = Array.from({ length: 10 }, (_, index) => ({
+      source: `https://example.com/${"S".repeat(1200)}-${index}`,
+    }));
+    const html = provider._getHtml({
+      projectName: "fixture",
+      summary: { total: 1, found: 1, vulnCount: 1 },
+      vulnerableDeps: [{
+        name: "derived-provenance",
+        version: "1.0.0",
+        maxSeverity: "High",
+        cveCount: 1,
+        provenance,
+      }],
+    });
+
+    assert.match(html, /<div class="package-detail">Source: [^<]+…<\/div>/);
+    assert.doesNotMatch(html, /-9/);
+  });
+
   test("report data and HTML escape dynamic content", () => {
     const dependencies = [
       {

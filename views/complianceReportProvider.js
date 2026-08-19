@@ -6,6 +6,11 @@ const {
   normalizeDependencyDisplayValue,
 } = require("../util/dependencyRecord");
 
+// Compliance rows may be repeated across a large scan. These are WebView
+// presentation budgets, deliberately smaller than canonical dependency bounds.
+const MAX_INLINE_COMPLIANCE_PRIMARY = 320;
+const MAX_INLINE_COMPLIANCE_DETAIL = 512;
+
 class ComplianceReportProvider {
   constructor(context) {
     this.context = context;
@@ -432,7 +437,9 @@ class ComplianceReportProvider {
   <main class="shell">
     <header class="report-header">
       <h1>Dependency Health report</h1>
-      <p class="subtitle">${escapeHtml(reportData.projectName || "workspace")} · Scanned ${escapeHtml(formatScanDate(reportData.scanDate))}</p>
+      <p class="subtitle">${escapeHtml(
+    complianceDisplayString(reportData.projectName, MAX_INLINE_COMPLIANCE_PRIMARY) || "workspace"
+  )} · Scanned ${escapeHtml(formatScanDate(reportData.scanDate))}</p>
     </header>
 
     <div class="summary-grid">
@@ -486,7 +493,7 @@ function renderEcosystemSection(ecosystemBreakdown) {
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
     .map(([ecosystem, count]) => `
       <tr>
-        <td>${escapeHtml(ecosystem)}</td>
+        <td>${escapeHtml(displayValue(ecosystem, MAX_INLINE_COMPLIANCE_PRIMARY))}</td>
         <td>${escapeHtml(String(count))}</td>
       </tr>
     `)
@@ -771,9 +778,15 @@ function renderPackageCell(dependency) {
     detailParts.push(`${dependency.occurrenceCount} occurrences`);
   }
   const detail = detailParts.length > 0
-    ? `<div class="package-detail">${escapeHtml(detailParts.join(" · "))}</div>`
+    ? `<div class="package-detail">${escapeHtml(
+      complianceCompositeDisplayString(detailParts, MAX_INLINE_COMPLIANCE_DETAIL) || ""
+    )}</div>`
     : "";
-  return `<strong>${escapeHtml(dependency && dependency.name || "")}</strong>${detail}`;
+  const name = complianceDisplayString(
+    dependency && dependency.name,
+    MAX_INLINE_COMPLIANCE_PRIMARY
+  ) || "";
+  return `<strong>${escapeHtml(name)}</strong>${detail}`;
 }
 
 function formatQualifierLabel(key) {
@@ -842,8 +855,35 @@ function clampPercent(value) {
   return Math.max(0, Math.min(100, Number.isFinite(number) ? number : 0));
 }
 
-function displayValue(value) {
-  return normalizeDependencyDisplayValue(value) || "—";
+function displayValue(value, maxLength = MAX_INLINE_COMPLIANCE_DETAIL) {
+  return complianceDisplayString(value, maxLength) || "—";
+}
+
+function complianceDisplayString(value, maxLength) {
+  const normalized = normalizeDependencyDisplayValue(value);
+  return truncateComplianceDisplayString(normalized, maxLength);
+}
+
+function complianceCompositeDisplayString(values, maxLength) {
+  const normalized = values
+    .map(value => normalizeDependencyDisplayValue(value))
+    .filter(value => value != null)
+    .join(" · ");
+  return truncateComplianceDisplayString(normalized, maxLength);
+}
+
+function truncateComplianceDisplayString(normalized, maxLength) {
+  if (!normalized) return null;
+  if (normalized.length <= maxLength) return normalized;
+  let end = maxLength - 1;
+  const boundaryStartsLowSurrogate = end < normalized.length
+    && normalized.charCodeAt(end) >= 0xdc00
+    && normalized.charCodeAt(end) <= 0xdfff;
+  const boundaryEndsHighSurrogate = end > 0
+    && normalized.charCodeAt(end - 1) >= 0xd800
+    && normalized.charCodeAt(end - 1) <= 0xdbff;
+  if (boundaryStartsLowSurrogate && boundaryEndsHighSurrogate) end -= 1;
+  return `${normalized.slice(0, end)}…`;
 }
 
 function normalizeSummaryCount(value) {
@@ -893,5 +933,7 @@ function escapeHtml(str) {
 
 module.exports = {
   ComplianceReportProvider,
+  MAX_INLINE_COMPLIANCE_DETAIL,
+  MAX_INLINE_COMPLIANCE_PRIMARY,
   escapeHtml,
 };
