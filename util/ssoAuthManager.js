@@ -379,12 +379,23 @@ async function readTrustedCredentialFile(root, file, fileSystem) {
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw unsafeFile();
     anchors.push({ target: current, stat });
   }
-  const before = await fileSystem.lstat(normalizedFile);
-  if (!before.isFile() || before.isSymbolicLink() || before.size > MAX_CLI_CONFIG_BYTES) throw unsafeFile();
-  const handle = await fileSystem.open(normalizedFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  let handle;
+  try {
+    handle = await fileSystem.open(normalizedFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  } catch {
+    throw unsafeFile();
+  }
   try {
     const during = await handle.stat();
-    if (!during.isFile() || during.dev !== before.dev || during.ino !== before.ino) throw unsafeFile();
+    const before = await fileSystem.lstat(normalizedFile);
+    if (
+      !during.isFile()
+      || !before.isFile()
+      || before.isSymbolicLink()
+      || during.dev !== before.dev
+      || during.ino !== before.ino
+      || during.size > MAX_CLI_CONFIG_BYTES
+    ) throw unsafeFile();
     const first = await readBoundedFileHandle(handle);
     const middle = await handle.stat();
     const second = await readBoundedFileHandle(handle);

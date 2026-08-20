@@ -177,7 +177,7 @@ function authorizationForCredential(credential) {
 
 function storageFingerprint(serialized) {
   if (typeof serialized !== "string" || !serialized) return null;
-  return sha256(`storage\0${serialized}`);
+  return `storage\0${serialized}`;
 }
 
 function identityFingerprint(credential) {
@@ -185,8 +185,8 @@ function identityFingerprint(credential) {
   const normalized = normalizeCredential(credential);
   if (!normalized.ok) return undefined;
   return normalized.credential.kind === "sso"
-    ? sha256(`sso\0${normalized.credential.credentialId}`)
-    : sha256(`api-key\0${normalized.credential.apiKey}`);
+    ? `sso\0${normalized.credential.credentialId}`
+    : `api-key\0${normalized.credential.apiKey}`;
 }
 
 function credentialSecretValues(credential) {
@@ -231,10 +231,6 @@ function isPlainObject(value) {
 
 function invalid(reason) {
   return Object.freeze({ ok: false, reason });
-}
-
-function sha256(value) {
-  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 module.exports = {
