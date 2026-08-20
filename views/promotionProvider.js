@@ -83,18 +83,8 @@ class PromotionProvider {
     if (!account || !isAccountCurrent(this._connectionManager, account)) {
       return packageLocationFailure("stale_account", "The active Cloudsmith account is unavailable.");
     }
-    let apiKey;
-    try {
-      apiKey = Object.prototype.hasOwnProperty.call(options, "apiKey")
-        ? options.apiKey
-        : await this._credentialManager.getApiKey();
-    } catch {
-      return packageLocationFailure(
-        "authentication_unavailable",
-        "Cloudsmith authentication is unavailable."
-      );
-    }
-    if (!apiKey || !isAccountCurrent(this._connectionManager, account)) {
+    const apiKey = null;
+    if (!isAccountCurrent(this._connectionManager, account)) {
       return packageLocationFailure(
         "authentication_unavailable",
         "Cloudsmith authentication is unavailable."
@@ -240,8 +230,8 @@ class PromotionProvider {
       account = captureAccount(this._connectionManager);
       if (!account) return await this._publishFailure(failureOutcome("authentication_unavailable"));
 
-      const apiKey = await this._credentialManager.getApiKey();
-      if (!apiKey || !this._isCurrent(operation, account)) {
+      const apiKey = null;
+      if (!this._isCurrent(operation, account)) {
         return await this._publishStaleOrFailure(operation, account, "authentication_unavailable");
       }
 

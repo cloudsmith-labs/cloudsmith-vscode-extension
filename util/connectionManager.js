@@ -1,12 +1,25 @@
 const crypto = require("crypto");
 const vscode = require("vscode");
 const { ContextKeyProjector } = require("./contextKeyProjector");
+const { CredentialMutationLock } = require("./credentialMutationLock");
+const {
+  authorizationForCredential,
+  createSSOCredential,
+  decodeStoredCredential,
+  identityFingerprint,
+  normalizeAPIKey,
+  normalizeCredential,
+  nextCredentialGeneration,
+  serializeCredential,
+  storageFingerprint,
+} = require("./credentialEnvelope");
+const { SSOProtocolClient } = require("./ssoProtocolClient");
 
 const AUTH_TOKEN_KEY = "cloudsmith-vsc.authToken";
 const LEGACY_CONNECTION_KEY = "cloudsmith-vsc.isConnected";
 const CONNECTION_CONTEXT_KEY = "cloudsmith.connected";
-const MAX_CREDENTIAL_LENGTH = 4096;
-const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
+const SSO_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
+const SSO_REFRESH_COOLDOWN_MS = 5 * 60 * 1000;
 const SAFE_PUBLIC_ERROR = Symbol("safe-public-error");
 
 const CONNECTION_STATUSES = Object.freeze({
@@ -38,8 +51,8 @@ function createPublicError(kind, message) {
 
 function validationAPIError(error) {
   const messages = {
-    unauthorized: "Authentication failed. Check the API key.",
-    forbidden: "The API key does not have permission to access Cloudsmith.",
+    unauthorized: "Authentication failed. Sign in again or check the API key.",
+    forbidden: "The credential does not have permission to access Cloudsmith.",
     rate_limited: "Cloudsmith rate limited the authentication check. Try again shortly.",
     server_error: "Cloudsmith could not complete the authentication check. Try again later.",
     network_error: "Could not reach Cloudsmith. Check the network connection.",
@@ -52,29 +65,27 @@ function validationAPIError(error) {
   const kind = error && Object.prototype.hasOwnProperty.call(messages, error.kind)
     ? error.kind
     : "api_error";
-  return fixedPublicError(kind, messages[kind] || "Could not validate the API key.");
+  return fixedPublicError(kind, messages[kind] || "Could not validate the credential.");
 }
 
 function normalizeCandidate(candidate) {
-  if (typeof candidate !== "string") {
-    return Object.freeze({ ok: false, reason: "API key must be text." });
-  }
-  const value = candidate.trim();
-  if (!value) {
-    return Object.freeze({ ok: false, reason: "API key cannot be empty." });
-  }
-  if (value.length > MAX_CREDENTIAL_LENGTH) {
-    return Object.freeze({ ok: false, reason: "API key is too long." });
-  }
-  if (CONTROL_CHARACTER_PATTERN.test(value)) {
-    return Object.freeze({ ok: false, reason: "API key contains invalid characters." });
-  }
-  return Object.freeze({ ok: true, value });
+  return normalizeAPIKey(candidate);
 }
 
 function fingerprint(value) {
-  if (typeof value !== "string" || !value) return null;
-  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+  return storageFingerprint(value);
+}
+
+function publicIdentity(value) {
+  for (const key of ["slug", "username"]) {
+    const candidate = value && value[key];
+    if (
+      typeof candidate === "string"
+      && candidate.length <= 128
+      && /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$/.test(candidate)
+    ) return candidate;
+  }
+  return null;
 }
 
 function freezeState(state) {
@@ -142,10 +153,14 @@ class ConnectionManager {
     }
     this.context = context;
     this.activationId = options.activationId || crypto.randomUUID();
-    this._createCloudsmithAPI = options.createCloudsmithAPI || ((apiContext) => {
+    this._createCloudsmithAPI = options.createCloudsmithAPI || ((apiContext, apiOptions = {}) => {
       const { CloudsmithAPI } = require("./cloudsmithAPI");
-      return new CloudsmithAPI(apiContext);
+      return new CloudsmithAPI(apiContext, apiOptions);
     });
+    this._now = options.now || Date.now;
+    this._monotonicNow = options.monotonicNow || (() => Number(process.hrtime.bigint() / 1000000n));
+    this._protocolClient = options.protocolClient || new SSOProtocolClient(options.protocolOptions);
+    this._mutationLock = options.mutationLock || new CredentialMutationLock(context, options.mutationLockOptions);
     this._executeCommand = options.executeCommand || vscode.commands.executeCommand;
     this._connectionContextProjector = options.contextKeyProjector || new ContextKeyProjector({
       defaults: { [CONNECTION_CONTEXT_KEY]: false },
@@ -165,6 +180,12 @@ class ConnectionManager {
     });
     this._stableState = this._state;
     this._knownFingerprint = undefined;
+    this._knownIdentityFingerprint = undefined;
+    this._credential = null;
+    this._refreshPromise = null;
+    this._refreshController = null;
+    this._refreshDueAt = Number.POSITIVE_INFINITY;
+    this._refreshCooldownUntil = 0;
     this._operationCounter = 0;
     this._currentOperation = null;
     this._operationPublicationSequence = new WeakMap();
@@ -195,6 +216,10 @@ class ConnectionManager {
   }
 
   beginCredentialOperation() {
+    // Interactive credential intent always wins over background refresh. The
+    // refresh controller is manager-owned, so canceling one API waiter cannot
+    // cancel refresh for other coalesced callers.
+    if (this._refreshController) this._refreshController.abort();
     return this._beginOperation(true);
   }
 
@@ -237,11 +262,11 @@ class ConnectionManager {
     return this._acceptStoredSnapshot(stored, token, { source: "startup" });
   }
 
-  async replaceCredential(candidate, token = null) {
-    const operation = token || this._beginOperation(true);
+  async replaceCredential(candidate, token = null, options = {}) {
+    const operation = token || this.beginCredentialOperation();
     if (!this.isOperationCurrent(operation)) return this._staleResult();
 
-    const normalized = normalizeCandidate(candidate);
+    const normalized = normalizeCredential(candidate, { now: this._now() });
     if (!normalized.ok) {
       return this._finishReplacementFailure(
         operation,
@@ -249,20 +274,79 @@ class ConnectionManager {
       );
     }
 
-    const validation = await this._validateCandidate(normalized.value, operation.signal);
+    const validation = await this._validateCandidate(normalized.credential, operation.signal, options);
     await this._awaitSecretEventBarrier();
     if (!this._canPublishOperation(operation)) return this._staleResult();
     if (!validation.ok) {
       return this._finishReplacementFailure(operation, validation.error);
     }
+    if (typeof options.beforeCommit === "function") {
+      let confirmed = false;
+      try {
+        confirmed = await options.beforeCommit(validation.identity || null);
+      } catch {
+        confirmed = false;
+      }
+      if (!this._canPublishOperation(operation)) return this._staleResult();
+      if (!confirmed) {
+        return this._finishReplacementFailure(
+          operation,
+          fixedPublicError("cancelled", "Authentication was cancelled.")
+        );
+      }
+    }
 
-    return this._enqueueMutation(() => this._commitCandidate(normalized.value, operation));
+    const serialized = serializeCredential(normalized.credential);
+    return this._enqueueMutation(() => this._mutationLock.run(async () => {
+      let authoritative;
+      try {
+        authoritative = await this.context.secrets.get(AUTH_TOKEN_KEY);
+      } catch (error) {
+        return this._finishIndeterminate(
+          operation,
+          error,
+          "Could not verify current credential storage.",
+          true
+        );
+      }
+      await this._awaitSecretEventBarrier();
+      if (!this._canPublishOperation(operation)) return this._staleResult();
+      if (this._knownFingerprint !== undefined && fingerprint(authoritative) !== this._knownFingerprint) {
+        return this._supersedeWithSnapshot(authoritative, operation);
+      }
+      return this._commitCandidate(serialized, operation);
+    }, { signal: operation.signal })).catch(() => this._finishReplacementFailure(
+      operation,
+      fixedPublicError("credential_lock_failed", "Credential storage is busy. Try again.")
+    ));
   }
 
   async disconnect(token = null) {
     const operation = token || this._beginOperation(true);
     if (!this.isOperationCurrent(operation)) return this._staleResult();
-    return this._enqueueMutation(() => this._commitDelete(operation));
+    if (this._refreshController) this._refreshController.abort();
+    return this._enqueueMutation(() => this._mutationLock.run(async () => {
+      let authoritative;
+      try {
+        authoritative = await this.context.secrets.get(AUTH_TOKEN_KEY);
+      } catch (error) {
+        return this._finishIndeterminate(
+          operation,
+          error,
+          "Could not verify current credential storage.",
+          true
+        );
+      }
+      await this._awaitSecretEventBarrier();
+      if (!this._canPublishOperation(operation)) return this._staleResult();
+      if (this._knownFingerprint !== undefined && fingerprint(authoritative) !== this._knownFingerprint) {
+        return this._supersedeWithSnapshot(authoritative, operation);
+      }
+      return this._commitDelete(operation);
+    }, { signal: operation.signal })).catch(() => this._finishReplacementFailure(
+      operation,
+      fixedPublicError("credential_lock_failed", "Credential storage is busy. Try again.")
+    ));
   }
 
   async checkConnectivity(apiKey) {
@@ -270,13 +354,195 @@ class ConnectionManager {
     if (!normalized.ok) {
       return "false";
     }
-    const validation = await this._validateCandidate(normalized.value);
+    const validation = await this._validateCandidate({ version: 1, kind: "api-key", apiKey: normalized.value });
     if (validation.ok) return "true";
     return validation.error && validation.error.kind === "unauthorized" ? "false" : "error";
   }
 
   async isConnected() {
     return this._state.sessionConnected ? "true" : "false";
+  }
+
+  getCredentialKind() {
+    return this._credential ? this._credential.kind : null;
+  }
+
+  async getAPIKeyForRegistry() {
+    return this._credential && this._credential.kind === "api-key"
+      ? this._credential.apiKey
+      : null;
+  }
+
+  async handleAuthorizationRejected(expectedSession = null) {
+    if (!this._credential || this._credential.kind !== "sso") return null;
+    if (expectedSession && !this._matchesSessionProof(expectedSession, this._credential)) {
+      return Object.freeze({ ok: false, status: "stale", state: this._state });
+    }
+    return this.disconnect();
+  }
+
+  async getAuthorization(options = {}) {
+    if (this._disposed || !this._state.sessionConnected || !this._credential) return null;
+    const startingIdentity = this._knownIdentityFingerprint;
+    let proactiveRefreshStatus = null;
+    let proactiveRefreshProof = null;
+    if (this._credential.kind === "sso") {
+      if (options.expectedSession && !this._matchesSessionProof(options.expectedSession, this._credential)) {
+        return null;
+      }
+      const due = this._monotonicNow() >= this._refreshDueAt;
+      if (options.forceRefresh || due) {
+        const refreshed = await awaitForCaller(
+          this.refreshSSO({ force: Boolean(options.forceRefresh) }),
+          options.signal
+        );
+        if (refreshed === null) return null;
+        if (!refreshed.ok && options.forceRefresh) {
+          const proof = refreshed.rejectionProof || null;
+          return options.returnRefreshResult
+            ? Object.freeze({
+              kind: "sso",
+              refreshFailed: true,
+              status: refreshed.status,
+              ...(proof || {}),
+            })
+            : null;
+        }
+        proactiveRefreshStatus = !options.forceRefresh
+          && !refreshed.ok
+          && refreshed.status !== "stale"
+          ? refreshed.status
+          : null;
+        proactiveRefreshProof = proactiveRefreshStatus
+          ? (refreshed.rejectionProof || refreshed.failureProof || null)
+          : null;
+      }
+    }
+    if (
+      this._disposed
+      || !this._state.sessionConnected
+      || !this._credential
+      || this._knownIdentityFingerprint !== startingIdentity
+    ) return null;
+    const authorization = authorizationForCredential(this._credential);
+    return proactiveRefreshStatus
+      && proactiveRefreshProof
+      && this._matchesSessionProof(proactiveRefreshProof, this._credential)
+      && authorization
+      ? Object.freeze({
+        ...authorization,
+        proactiveRefreshFailed: true,
+        proactiveRefreshStatus,
+      })
+      : authorization;
+  }
+
+  async refreshSSO(options = {}) {
+    if (this._refreshPromise) return this._refreshPromise;
+    const force = Boolean(options.force);
+    if (!this._credential || this._credential.kind !== "sso") {
+      return Object.freeze({ ok: false, status: "not_sso" });
+    }
+    if (!force && this._monotonicNow() < this._refreshCooldownUntil) {
+      return Object.freeze({
+        ok: false,
+        status: "cooldown",
+        preserved: true,
+        failureProof: Object.freeze({
+          credentialId: this._credential.credentialId,
+          generation: this._credential.generation,
+        }),
+      });
+    }
+    const starting = this._credential;
+    const startingFingerprint = this._knownFingerprint;
+    const startingOperationCounter = this._operationCounter;
+    const controller = new AbortController();
+    this._refreshController = controller;
+    const refresh = this._mutationLock.run(async () => {
+      const stored = await this.context.secrets.get(AUTH_TOKEN_KEY);
+      const decoded = decodeStoredCredential(stored, { now: this._now() });
+      if (
+        !decoded.ok
+        || !decoded.credential
+        || decoded.credential.kind !== "sso"
+        || fingerprint(stored) !== startingFingerprint
+        || decoded.credential.credentialId !== starting.credentialId
+        || decoded.credential.generation !== starting.generation
+      ) return Object.freeze({ ok: false, status: "stale" });
+
+      const result = await this._protocolClient.refresh(
+        starting.accessToken,
+        starting.refreshToken,
+        { signal: controller.signal }
+      );
+      if (controller.signal.aborted || this._disposed) return Object.freeze({ ok: false, status: "cancelled" });
+
+      // A network response is only a candidate. Re-read after it arrives and
+      // refuse to publish if a login, logout, external SecretStorage update,
+      // or another generation won while the refresh request was in flight.
+      const authoritative = await this.context.secrets.get(AUTH_TOKEN_KEY);
+      await this._awaitSecretEventBarrier();
+      const current = decodeStoredCredential(authoritative, { now: this._now() });
+      if (
+        controller.signal.aborted
+        || this._operationCounter !== startingOperationCounter
+        || this._currentOperation
+        || !current.ok
+        || !current.credential
+        || current.credential.kind !== "sso"
+        || fingerprint(authoritative) !== startingFingerprint
+        || current.credential.credentialId !== starting.credentialId
+        || current.credential.generation !== starting.generation
+      ) return Object.freeze({ ok: false, status: "stale" });
+
+      let generation;
+      try {
+        generation = nextCredentialGeneration(starting.generation);
+      } catch {
+        return Object.freeze({ ok: false, status: "generation_exhausted", preserved: true });
+      }
+      const operation = this._beginOperation(false);
+      if (result.ok) {
+        const next = createSSOCredential(result.accessToken, result.refreshToken || starting.refreshToken, {
+          credentialId: starting.credentialId,
+          generation,
+          now: this._now(),
+          refreshAttemptedAt: this._now(),
+        });
+        const committed = await this._commitCandidate(serializeCredential(next), operation);
+        return Object.freeze({ ...committed, refreshed: committed.ok });
+      }
+      this._refreshCooldownUntil = this._monotonicNow() + SSO_REFRESH_COOLDOWN_MS;
+      const attempted = createSSOCredential(starting.accessToken, starting.refreshToken, {
+        credentialId: starting.credentialId,
+        generation,
+        now: this._now(),
+        refreshedAt: starting.refreshedAt,
+        refreshAttemptedAt: this._now(),
+      });
+      const committed = await this._commitCandidate(serializeCredential(attempted), operation);
+      return Object.freeze({
+        ok: false,
+        status: result.kind || "refresh_failed",
+        preserved: committed.ok,
+        rejectionProof: committed.ok && ["invalid_session", "refresh_rejected"].includes(result.kind)
+          ? Object.freeze({ credentialId: attempted.credentialId, generation: attempted.generation })
+          : null,
+        failureProof: committed.ok
+          ? Object.freeze({ credentialId: attempted.credentialId, generation: attempted.generation })
+          : null,
+      });
+    }, { signal: controller.signal }).catch(error => Object.freeze({
+      ok: false,
+      status: error && error.kind === "cancelled" ? "cancelled" : "refresh_failed",
+      preserved: true,
+    })).finally(() => {
+      if (this._refreshController === controller) this._refreshController = null;
+      if (this._refreshPromise === refresh) this._refreshPromise = null;
+    });
+    this._refreshPromise = refresh;
+    return refresh;
   }
 
   async connect(options = {}) {
@@ -313,6 +579,7 @@ class ConnectionManager {
   dispose() {
     if (this._disposed) return this._disposal || Promise.resolve();
     this._disposed = true;
+    if (this._refreshController) this._refreshController.abort();
     if (this._currentOperation) this._currentOperation.controller.abort();
     this._currentOperation = null;
     if (this._secretListener && typeof this._secretListener.dispose === "function") {
@@ -358,14 +625,15 @@ class ConnectionManager {
     return token;
   }
 
-  async _validateCandidate(apiKey, signal) {
+  async _validateCandidate(credential, signal, options = {}) {
     if (signal && signal.aborted) {
       return Object.freeze({ ok: false, error: fixedPublicError("cancelled", "Authentication was cancelled.") });
     }
     try {
       const api = this._createCloudsmithAPI(this.context);
+      const requestCredential = { credential };
       const result = await api.get("user/self", {
-        apiKey,
+        ...requestCredential,
         signal,
         responseType: "object",
         validate: value => Boolean(value) && typeof value.authenticated === "boolean",
@@ -375,18 +643,77 @@ class ConnectionManager {
         return Object.freeze({ ok: false, error: fixedPublicError("cancelled", "Authentication was cancelled.") });
       }
       if (result && result.ok && result.data.authenticated) {
-        return Object.freeze({ ok: true });
+        const identity = publicIdentity(result.data);
+        if (credential.kind === "sso" && !identity) {
+          return Object.freeze({
+            ok: false,
+            error: fixedPublicError(
+              "identity_unavailable",
+              "Cloudsmith did not return an account identity that can be confirmed safely."
+            ),
+          });
+        }
+        if (credential.kind === "sso" && options.workspaceSlug) {
+          const workspace = await this._validateWorkspaceAccess(
+            api,
+            credential,
+            options.workspaceSlug,
+            signal
+          );
+          if (!workspace.ok) return workspace;
+        }
+        return Object.freeze({ ok: true, identity: identity || "Cloudsmith account" });
       }
       const error = result && !result.ok
         ? validationAPIError(result.error)
-        : fixedPublicError("unauthorized", "The API key was not accepted by Cloudsmith.");
+        : fixedPublicError("unauthorized", "The credential was not accepted by Cloudsmith.");
       return Object.freeze({ ok: false, error });
     } catch (error) {
       return Object.freeze({
         ok: false,
-        error: publicError(error, "Could not validate the API key."),
+        error: publicError(error, "Could not validate the credential."),
       });
     }
+  }
+
+  async _validateWorkspaceAccess(api, credential, workspaceSlug, signal) {
+    for (let page = 1; page <= 20; page += 1) {
+      const endpoint = `namespaces/?page=${page}&page_size=500&sort=slug`;
+      const result = await api.get(endpoint, {
+        credential,
+        signal,
+        responseType: "array",
+        retry: "never",
+        validate: value => Array.isArray(value) && value.every(item => (
+          item && typeof item === "object" && !Array.isArray(item)
+          && typeof item.slug === "string" && item.slug.length <= 512
+        )),
+      });
+      if (!result || !result.ok) {
+        return Object.freeze({
+          ok: false,
+          error: result && result.error
+            ? validationAPIError(result.error)
+            : fixedPublicError("workspace_check_failed", "Could not verify access to the requested workspace."),
+        });
+      }
+      if (result.data.some(item => item.slug === workspaceSlug)) return Object.freeze({ ok: true });
+      const total = Number(result.headers && result.headers["x-pagination-pagetotal"]);
+      if (!Number.isSafeInteger(total) || total < page || total > 20) {
+        return Object.freeze({
+          ok: false,
+          error: fixedPublicError("workspace_check_failed", "Could not verify access to the requested workspace."),
+        });
+      }
+      if (page === total) break;
+    }
+    return Object.freeze({
+      ok: false,
+      error: fixedPublicError(
+        "workspace_forbidden",
+        "The authenticated account does not have access to the requested Cloudsmith workspace."
+      ),
+    });
   }
 
   async _commitCandidate(candidate, operation) {
@@ -447,7 +774,7 @@ class ConnectionManager {
         await this._reconcileAfterLostOwnership(stored);
         return this._staleResult();
       }
-      this._adoptFingerprint(storedFingerprint);
+      this._adoptFingerprint(storedFingerprint, stored);
       const state = this._makeStableState(CONNECTION_STATUSES.CONNECTED, operation.id, true, true, null);
       this._stableState = state;
       if (!operationOwned) return this._staleResult();
@@ -532,7 +859,7 @@ class ConnectionManager {
         await this._reconcileAfterLostOwnership(stored);
         return this._staleResult();
       }
-      this._adoptFingerprint(null);
+      this._adoptFingerprint(null, null);
       const state = this._makeStableState(CONNECTION_STATUSES.ABSENT, operation.id, false, false, null);
       this._stableState = state;
       if (!operationOwned) return this._staleResult();
@@ -561,7 +888,7 @@ class ConnectionManager {
   async _acceptStoredSnapshot(stored, operation, options = {}) {
     if (!this.isOperationCurrent(operation)) return this._staleResult();
     if (typeof stored !== "string" || !stored) {
-      this._adoptFingerprint(null);
+      this._adoptFingerprint(null, null);
       const state = this._makeStableState(CONNECTION_STATUSES.ABSENT, operation.id, false, false, null);
       this._stableState = state;
       this._setState(state);
@@ -577,12 +904,12 @@ class ConnectionManager {
       });
     }
 
-    const normalized = normalizeCandidate(stored);
-    if (!normalized.ok || normalized.value !== stored) {
-      this._adoptFingerprint(fingerprint(stored));
+    const decoded = decodeStoredCredential(stored, { now: this._now() });
+    if (!decoded.ok || !decoded.credential) {
+      this._adoptFingerprint(fingerprint(stored), stored);
       const error = fixedPublicError(
         "invalid_candidate",
-        normalized.ok ? "Stored credentials are not normalized." : normalized.reason
+        decoded.ok ? "Stored credentials are invalid." : decoded.reason
       );
       const state = this._makeStableState(CONNECTION_STATUSES.FAILED, operation.id, true, false, error);
       this._stableState = state;
@@ -601,9 +928,10 @@ class ConnectionManager {
       });
     }
 
-    const snapshotFingerprint = fingerprint(normalized.value);
-    const identityChanged = this._knownFingerprint !== snapshotFingerprint;
-    this._adoptFingerprint(snapshotFingerprint);
+    const snapshotFingerprint = fingerprint(stored);
+    const nextIdentity = identityFingerprint(decoded.credential);
+    const identityChanged = this._knownIdentityFingerprint !== nextIdentity;
+    this._adoptFingerprint(snapshotFingerprint, stored);
     if (identityChanged) {
       this._stableState = this._makeStableState(
         CONNECTION_STATUSES.FAILED,
@@ -615,9 +943,23 @@ class ConnectionManager {
       this._setState({ ...this._state, sessionConnected: false, credentialPresent: true });
     }
 
-    const validation = await this._validateCandidate(normalized.value, operation.signal);
+    const validation = await this._validateCandidate(decoded.credential, operation.signal);
     if (!this._canPublishOperation(operation)) return this._staleResult();
     if (!validation.ok) {
+      if (
+        options.source === "startup"
+        && decoded.credential.kind === "sso"
+        && validation.error
+        && validation.error.kind === "unauthorized"
+      ) {
+        const recovered = await this._recoverStoredSSO(
+          decoded.credential,
+          snapshotFingerprint,
+          operation
+        );
+        if (recovered) return recovered;
+        if (!this._canPublishOperation(operation)) return this._staleResult();
+      }
       const error = validation.error;
       const state = this._makeStableState(CONNECTION_STATUSES.FAILED, operation.id, true, false, error);
       this._stableState = state;
@@ -636,6 +978,28 @@ class ConnectionManager {
       });
     }
 
+    if (decoded.legacy && options.source === "startup") {
+      // Migration is a storage-format improvement, not a new login. If the
+      // canonical rewrite fails, retain the already validated legacy session.
+      this._stableState = this._makeStableState(
+        CONNECTION_STATUSES.CONNECTED,
+        operation.id,
+        true,
+        true,
+        null
+      );
+      return this._enqueueMutation(() => this._mutationLock.run(async () => {
+        const authoritative = await this.context.secrets.get(AUTH_TOKEN_KEY);
+        if (fingerprint(authoritative) !== snapshotFingerprint) {
+          return this._supersedeWithSnapshot(authoritative, operation);
+        }
+        return this._commitCandidate(serializeCredential(decoded.credential), operation);
+      }, { signal: operation.signal })).catch(() => this._finishReplacementFailure(
+        operation,
+        fixedPublicError("credential_lock_failed", "Credential storage is busy. Try again.")
+      ));
+    }
+
     const state = this._makeStableState(CONNECTION_STATUSES.CONNECTED, operation.id, true, true, null);
     this._stableState = state;
     this._setState(state);
@@ -650,6 +1014,72 @@ class ConnectionManager {
       state: this._state,
       source: options.source || "external",
     });
+  }
+
+  async _recoverStoredSSO(starting, startingFingerprint, operation) {
+    try {
+      return await this._mutationLock.run(async () => {
+        const stored = await this.context.secrets.get(AUTH_TOKEN_KEY);
+        const decoded = decodeStoredCredential(stored, { now: this._now() });
+        if (
+          !this._canPublishOperation(operation)
+          || !decoded.ok
+          || !decoded.credential
+          || decoded.credential.kind !== "sso"
+          || fingerprint(stored) !== startingFingerprint
+          || decoded.credential.credentialId !== starting.credentialId
+          || decoded.credential.generation !== starting.generation
+        ) return null;
+
+        const result = await this._protocolClient.refresh(
+          starting.accessToken,
+          starting.refreshToken,
+          { signal: operation.signal }
+        );
+        if (!this._canPublishOperation(operation)) return null;
+
+        const authoritative = await this.context.secrets.get(AUTH_TOKEN_KEY);
+        await this._awaitSecretEventBarrier();
+        const current = decodeStoredCredential(authoritative, { now: this._now() });
+        if (
+          !this._canPublishOperation(operation)
+          || !current.ok
+          || !current.credential
+          || current.credential.kind !== "sso"
+          || fingerprint(authoritative) !== startingFingerprint
+          || current.credential.credentialId !== starting.credentialId
+          || current.credential.generation !== starting.generation
+        ) return null;
+
+        if (result.ok) {
+          let generation;
+          try {
+            generation = nextCredentialGeneration(starting.generation);
+          } catch {
+            return null;
+          }
+          const next = createSSOCredential(
+            result.accessToken,
+            result.refreshToken || starting.refreshToken,
+            {
+              credentialId: starting.credentialId,
+              generation,
+              now: this._now(),
+              refreshAttemptedAt: this._now(),
+            }
+          );
+          const validation = await this._validateCandidate(next, operation.signal);
+          if (!validation.ok || !this._canPublishOperation(operation)) return null;
+          return this._commitCandidate(serializeCredential(next), operation);
+        }
+        if (["invalid_session", "refresh_rejected"].includes(result.kind)) {
+          return this._commitDelete(operation);
+        }
+        return null;
+      }, { signal: operation.signal });
+    } catch {
+      return null;
+    }
   }
 
   async _supersedeWithSnapshot(stored, operation, writeError) {
@@ -732,6 +1162,8 @@ class ConnectionManager {
 
   _advanceIndeterminateEpoch() {
     this._knownFingerprint = undefined;
+    this._knownIdentityFingerprint = undefined;
+    this._credential = null;
     this._setState({ ...this._state, accountEpoch: this._state.accountEpoch + 1 });
   }
 
@@ -757,13 +1189,51 @@ class ConnectionManager {
     this._projectConnection(false);
   }
 
-  _adoptFingerprint(nextFingerprint) {
-    if (this._knownFingerprint !== nextFingerprint) {
-      this._knownFingerprint = nextFingerprint;
+  _adoptFingerprint(nextFingerprint, stored) {
+    this._knownFingerprint = nextFingerprint;
+    const decoded = stored
+      ? decodeStoredCredential(stored, { now: this._now() })
+      : Object.freeze({ ok: true, credential: null });
+    const nextCredential = decoded.ok ? decoded.credential : null;
+    const nextIdentity = decoded.ok ? identityFingerprint(nextCredential) : undefined;
+    this._credential = nextCredential;
+    this._seedRefreshDeadlines(nextCredential);
+    if (this._knownIdentityFingerprint !== nextIdentity) {
+      this._knownIdentityFingerprint = nextIdentity;
       this._setState({ ...this._state, accountEpoch: this._state.accountEpoch + 1 });
       return true;
     }
     return false;
+  }
+
+  _seedRefreshDeadlines(credential) {
+    if (!credential || credential.kind !== "sso") {
+      this._refreshDueAt = Number.POSITIVE_INFINITY;
+      this._refreshCooldownUntil = 0;
+      return;
+    }
+    const wallNow = this._now();
+    const monotonicNow = this._monotonicNow();
+    const dueRemaining = Math.max(
+      0,
+      Math.min(SSO_REFRESH_INTERVAL_MS, credential.refreshedAt + SSO_REFRESH_INTERVAL_MS - wallNow)
+    );
+    this._refreshDueAt = monotonicNow + dueRemaining;
+    const attempted = credential.refreshAttemptedAt;
+    const cooldownRemaining = attempted === null || attempted < credential.refreshedAt
+      ? 0
+      : Math.max(0, Math.min(SSO_REFRESH_COOLDOWN_MS, attempted + SSO_REFRESH_COOLDOWN_MS - wallNow));
+    this._refreshCooldownUntil = monotonicNow + cooldownRemaining;
+  }
+
+  _matchesSessionProof(proof, credential = this._credential) {
+    return Boolean(
+      proof
+      && credential
+      && credential.kind === "sso"
+      && proof.credentialId === credential.credentialId
+      && proof.generation === credential.generation
+    );
   }
 
   _makeStableState(status, operationId, credentialPresent, sessionConnected, error) {
@@ -903,7 +1373,7 @@ class ConnectionManager {
       if (this._currentOperation) {
         this._operationPublicationSequence.set(this._currentOperation, record.sequence);
       }
-      this._adoptFingerprint(observedFingerprint);
+      this._adoptFingerprint(observedFingerprint, stored);
       if (!intent.active && this._state.status === CONNECTION_STATUSES.INDETERMINATE) {
         this._expectedSecretIntent = null;
         const token = this._beginOperation(true);
@@ -924,6 +1394,24 @@ class ConnectionManager {
     }
 
     if (observedFingerprint === this._knownFingerprint) {
+      if (this._currentOperation) {
+        this._operationPublicationSequence.set(this._currentOperation, record.sequence);
+      }
+      return;
+    }
+
+    const decoded = decodeStoredCredential(stored, { now: this._now() });
+    if (
+      decoded.ok
+      && decoded.credential
+      && decoded.credential.kind === "api-key"
+      && this._credential
+      && this._credential.kind === "api-key"
+      && identityFingerprint(decoded.credential) === this._knownIdentityFingerprint
+      && this._stableState.sessionConnected
+    ) {
+      this._knownFingerprint = observedFingerprint;
+      this._credential = decoded.credential;
       if (this._currentOperation) {
         this._operationPublicationSequence.set(this._currentOperation, record.sequence);
       }
@@ -990,7 +1478,7 @@ class ConnectionManager {
       return;
     }
 
-    this._adoptFingerprint(snapshot.fingerprint);
+    this._adoptFingerprint(snapshot.fingerprint, snapshot.value);
     const credentialPresent = typeof snapshot.value === "string" && snapshot.value.length > 0;
     this._stableState = this._makeStableState(
       credentialPresent ? CONNECTION_STATUSES.FAILED : CONNECTION_STATUSES.ABSENT,
@@ -1173,8 +1661,8 @@ class ConnectionManager {
       );
       return;
     }
-    const normalized = normalizeCandidate(stored);
-    if (!normalized.ok || normalized.value !== stored) {
+    const decoded = decodeStoredCredential(stored, { now: this._now() });
+    if (!decoded.ok || !decoded.credential) {
       this._stableState = this._makeStableState(
         CONNECTION_STATUSES.FAILED,
         this._state.operationId,
@@ -1182,12 +1670,12 @@ class ConnectionManager {
         false,
         fixedPublicError(
           "invalid_candidate",
-          normalized.ok ? "Stored credentials are not normalized." : normalized.reason
+          decoded.ok ? "Stored credentials are invalid." : decoded.reason
         )
       );
       return;
     }
-    const validation = await this._validateCandidate(normalized.value);
+    const validation = await this._validateCandidate(decoded.credential);
     if (this._knownFingerprint !== snapshot.fingerprint) return;
     this._stableState = this._makeStableState(
       validation.ok ? CONNECTION_STATUSES.CONNECTED : CONNECTION_STATUSES.FAILED,
@@ -1224,6 +1712,23 @@ class ConnectionManager {
       state: this._state,
     });
   }
+}
+
+function awaitForCaller(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.resolve(null);
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const onAbort = () => finish(null);
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(promise).then(finish, () => finish(Object.freeze({ ok: false, status: "refresh_failed" })));
+  });
 }
 
 module.exports = {

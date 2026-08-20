@@ -62,9 +62,14 @@ function registerAuthenticationCommands(deps) {
     const useExperimental = vscode.workspace
       .getConfiguration("cloudsmith-vsc")
       .get("experimentalSSOBrowser");
-    const result = useExperimental
-      ? await ssoManager.loginViaBrowser(workspaceSlug.trim(), operation)
-      : await ssoManager.loginViaTerminal(workspaceSlug.trim(), operation);
+    if (!useExperimental) {
+      await connectionManager.cancelCredentialOperation(operation);
+      await vscode.window.showWarningMessage(
+        "Browser SSO is experimental. Enable cloudsmith-vsc.experimentalSSOBrowser to use it."
+      );
+      return;
+    }
+    const result = await ssoManager.loginViaBrowser(workspaceSlug.trim(), operation);
     await handleAuthenticationResult(result);
   }
 
@@ -80,15 +85,15 @@ function registerAuthenticationCommands(deps) {
     const selected = await showCredentialPrompt(operation, "showQuickPick", [
       { label: "$(key) Enter API key", description: "Paste a personal API key", method: "apikey" },
       { label: "$(server) Enter service account API key", description: "Paste a service account API key", method: "apikey" },
-      { label: "$(folder-opened) Import from Cloudsmith CLI", description: "Import credentials from CLI config (~/.cloudsmith/config.ini)", method: "import" },
-      { label: "$(terminal) Sign in with SSO", description: "Run 'cloudsmith auth' in an integrated terminal", method: "sso-terminal" },
+      { label: "$(folder-opened) Import API key from Cloudsmith CLI", description: "Import the [default] API key from a trusted credentials.ini", method: "import" },
+      { label: "$(globe) Sign in with SSO (Experimental)", description: "Sign in through your browser and store a refreshable session", method: "sso-browser" },
     ], { placeHolder: "Select an authentication method" });
     if (!selected) {
       await connectionManager.cancelCredentialOperation(operation);
       return;
     }
     if (!connectionManager.isOperationCurrent(operation)) return;
-    if (selected.method === "sso-terminal") {
+    if (selected.method === "sso-browser") {
       await ssoLogin(operation);
     } else if (selected.method === "import") {
       await importCLICredentials(operation);

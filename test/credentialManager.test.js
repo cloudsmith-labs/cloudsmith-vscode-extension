@@ -1,5 +1,6 @@
 const assert = require("assert");
-const { CredentialManager, runCLIAutoDetect } = require("../util/credentialManager");
+const credentialModule = require("../util/credentialManager");
+const { CredentialManager } = credentialModule;
 
 function deferred() {
   let resolve;
@@ -215,69 +216,7 @@ suite("CredentialManager Test Suite", () => {
     assert.strictEqual(await manager.getApiKey(), "stored-key");
   });
 
-  test("CLI auto-detect owns the operation before reading and cannot supersede manual configure", async () => {
-    const read = deferred();
-    const { calls, connectionManager } = createManagerHarness();
-    connectionManager.getState = () => Object.freeze({
-      status: "absent",
-      credentialPresent: false,
-      sessionConnected: false,
-    });
-    let prompts = 0;
-    const pending = runCLIAutoDetect({
-      connectionManager,
-      secrets: {
-        get() {
-          calls.push("read");
-          return read.promise;
-        },
-      },
-      ssoManager: {
-        hasCLICredentials() { return true; },
-        async importFromCLI() { throw new Error("must not import"); },
-      },
-      showInformationMessage: async () => {
-        prompts += 1;
-        return "Import";
-      },
-      handleAuthenticationResult: async () => {},
-    });
-    assert.deepStrictEqual(calls.slice(0, 2), ["begin", "read"]);
-
-    const manualOperation = connectionManager.beginCredentialOperation();
-    read.resolve(null);
-    const result = await pending;
-
-    assert.strictEqual(result.status, "stale");
-    assert.strictEqual(prompts, 0);
-    assert.strictEqual(connectionManager.isOperationCurrent(manualOperation), true);
-  });
-
-  test("CLI auto-detect cancels its operation when the stored credential read fails", async () => {
-    const secret = "candidate-secret-must-not-leak";
-    const { calls, connectionManager, getCurrent } = createManagerHarness();
-    connectionManager.getState = () => Object.freeze({
-      status: "absent",
-      credentialPresent: false,
-      sessionConnected: false,
-    });
-
-    const result = await runCLIAutoDetect({
-      connectionManager,
-      secrets: {
-        async get() { throw new Error(`read failed for ${secret}`); },
-      },
-      ssoManager: {
-        hasCLICredentials() { throw new Error("must not inspect CLI credentials"); },
-      },
-      showInformationMessage: async () => { throw new Error("must not prompt"); },
-      handleAuthenticationResult: async () => {},
-    });
-
-    assert.strictEqual(result.status, "failed");
-    assert.strictEqual(result.committed, false);
-    assert.strictEqual(connectionManager.isOperationCurrent(getCurrent()), false);
-    assert.deepStrictEqual(calls, ["begin", ["cancel", 1]]);
-    assert.ok(!JSON.stringify(result).includes(secret));
+  test("does not expose activation-time CLI credential auto-detection", () => {
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(credentialModule, "runCLIAutoDetect"), false);
   });
 });

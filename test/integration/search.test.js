@@ -20,7 +20,7 @@ suite("Live integration: controlled package search", function () {
         query: new SearchQueryBuilder().name(liveFixture.packageName).build(),
         page_size: 10,
       },
-    }), { apiKey: liveFixture.apiKey, responseType: "array" });
+    }), { credential: liveFixture.credential, responseType: "array" });
 
     assert.strictEqual(result.ok, true, result.error && result.error.message);
     assert.ok(result.data.some(pkg => pkg.name === liveFixture.packageName));
@@ -37,7 +37,7 @@ suite("Live integration: controlled package search", function () {
           .build(),
         page_size: 10,
       },
-    }), { apiKey: liveFixture.apiKey, responseType: "array" });
+    }), { credential: liveFixture.credential, responseType: "array" });
 
     assert.strictEqual(result.ok, true, result.error && result.error.message);
     const fixture = result.data.find(pkg => pkg.name === liveFixture.quarantinedPackageName);
@@ -50,7 +50,7 @@ suite("Live integration: controlled package search", function () {
       "packages", liveFixture.workspace, liveFixture.repository,
     ], {
       query: { query: "status:quarantined", page_size: 10 },
-    }), { apiKey: liveFixture.apiKey, responseType: "array" });
+    }), { credential: liveFixture.credential, responseType: "array" });
 
     assert.strictEqual(result.ok, true, result.error && result.error.message);
     assert.ok(result.data.length > 0, "Controlled repository has no quarantined fixture");

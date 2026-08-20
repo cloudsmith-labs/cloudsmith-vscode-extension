@@ -18,8 +18,12 @@ Supported authentication methods:
 
 - **API key** — Enter a personal API key in a masked input.
 - **Service account API key** — Enter an API key belonging to a service account in the same masked input.
-- **Import from Cloudsmith CLI** — Import an API key from the local Cloudsmith CLI configuration. When no credential is stored, the extension may detect CLI credentials after startup and ask before importing them.
-- **Sign in with SSO** — By default, open an integrated terminal for `cloudsmith auth`, then import the resulting CLI credential. The optional browser-based SSO flow is experimental and is controlled by `cloudsmith-vsc.experimentalSSOBrowser`.
+- **Import API key from Cloudsmith CLI** — Explicitly import the single `[default]` API key from a trusted user-level `credentials.ini`. The extension never searches the current project and does not scrape the CLI keyring.
+- **Sign in with SSO (Experimental)** — With `cloudsmith-vsc.experimentalSSOBrowser` enabled, bind the supported local callback, discover the identity-provider URL through Cloudsmith, complete browser SAML and optional 2FA, and store the resulting refreshable bearer session. CLI SSO is not offered as an import flow because its bearer tokens remain in the CLI keyring.
+
+API keys are sent only as `X-Api-Key`; SSO sessions are sent only as `Authorization: Bearer`. SSO refresh tokens never leave secure credential storage except for the fixed Cloudsmith refresh exchange. Upstream registry pull currently requires an API key and fails clearly instead of sending an SSO bearer to a registry.
+
+The current Cloudsmith CLI-compatible callback is the fixed root `http://localhost:12400` and does not carry extension-generated state or PKCE. The extension mitigates local callback injection by accepting a strict one-shot response, validating the bearer, verifying access to the requested workspace, and asking you to confirm the authenticated account before saving it. This cannot provide cryptographic request/callback binding, so the browser flow remains experimental pending Cloudsmith security acceptance and isolated live testing.
 
 Use **Clear stored credentials** to disconnect and remove the credential from VS Code's secure storage.
 
@@ -121,7 +125,7 @@ Open **Cloudsmith: Open Cloudsmith settings** to configure the extension.
 | `cloudsmith-vsc.showLicenseIndicators` | `true` | Boolean | Show package and dependency license information. |
 | `cloudsmith-vsc.flagRestrictiveLicenses` | `true` | Boolean | Add an explicit restrictive-license indication to Dependency Health rows. |
 | `cloudsmith-vsc.showDockerDigestCommand` | `false` | Boolean | Offer an exact Docker pull-by-digest command when a digest is available. |
-| `cloudsmith-vsc.experimentalSSOBrowser` | `false` | Boolean; experimental | Attempt browser-based SSO before falling back to the terminal and CLI import flow. |
+| `cloudsmith-vsc.experimentalSSOBrowser` | `false` | Boolean; experimental | Enable direct browser SSO with local callback, optional 2FA, bearer validation, and session refresh. There is no terminal/import fallback for CLI SSO keyring tokens. |
 | `cloudsmith-vsc.resolveTransitiveDependencies` | `true` | Boolean | Read supported lockfiles for transitive dependencies; when disabled, show direct manifest dependencies. |
 | `cloudsmith-vsc.dependencyTreeDefaultView` | `"flat"` | `"direct"`, `"flat"`, `"tree"` | Set the initial Dependency Health view unless a workspace view choice is already stored. |
 | `cloudsmith-vsc.showLegacyPolicies` | `false` | Boolean | Show classic deny, license, and vulnerability policy fields alongside current policy management. |

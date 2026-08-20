@@ -4,7 +4,7 @@ const { helpProvider } = require("./views/helpProvider");
 const { SearchProvider } = require("./views/searchProvider");
 const { CloudsmithAPI } = require("./util/cloudsmithAPI");
 const { apiEndpoint } = require("./util/apiEndpoint");
-const { CredentialManager, runCLIAutoDetect } = require("./util/credentialManager");
+const { CredentialManager } = require("./util/credentialManager");
 const {
   ConnectionManager,
   bindConnectionManager,
@@ -419,14 +419,6 @@ async function activateOwned(context, own) {
     captureAccount,
     isAccountCurrent,
   });
-  let authenticationFollowUpDisposed = false;
-  let cliAutoDetectTimer = null;
-  own({
-    dispose() {
-      authenticationFollowUpDisposed = true;
-      if (cliAutoDetectTimer) clearTimeout(cliAutoDetectTimer);
-    },
-  });
   const initialization = connectionManager.initialize();
   void initialization.then(async result => {
     await handleAuthenticationResult(result, {
@@ -434,19 +426,6 @@ async function activateOwned(context, own) {
       offerDefault: false,
       reportFailure: false,
     });
-    if (authenticationFollowUpDisposed) return;
-    cliAutoDetectTimer = setTimeout(() => {
-      if (authenticationFollowUpDisposed) return;
-      void runCLIAutoDetect({
-        connectionManager,
-        secrets: context.secrets,
-        ssoManager,
-        showInformationMessage: (...args) => vscode.window.showInformationMessage(...args),
-        handleAuthenticationResult,
-      }).catch(() => {
-        console.warn("[Cloudsmith] CLI credential auto-detection failed.");
-      });
-    }, 3000);
   }).catch(() => {
     console.warn("[Cloudsmith] Connection initialization did not complete cleanly.");
   });

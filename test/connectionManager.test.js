@@ -11,6 +11,14 @@ const {
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { FakeSecretStorage } = require("./helpers/fakeSecretStorage");
+const { decodeStoredCredential } = require("../util/credentialEnvelope");
+
+function assertStoredAPIKey(stored, expected) {
+  const decoded = decodeStoredCredential(stored);
+  assert.strictEqual(decoded.ok, true);
+  assert.strictEqual(decoded.credential.kind, "api-key");
+  assert.strictEqual(decoded.credential.apiKey, expected);
+}
 
 function deferred() {
   let resolve;
@@ -36,7 +44,12 @@ function createHarness(initialCredential, validate) {
   const manager = new ConnectionManager(context, {
     activationId: "test-activation",
     createCloudsmithAPI: () => ({
-      get: (_endpoint, options) => validate(options.apiKey, options),
+      get: (_endpoint, options) => validate(
+        options.credential.kind === "api-key"
+          ? options.credential.apiKey
+          : options.credential.accessToken,
+        options
+      ),
     }),
     executeCommand: async (...args) => projections.push(args),
   });
@@ -66,9 +79,27 @@ suite("ConnectionManager Test Suite", () => {
     });
     assert.ok(Object.isFrozen(manager.getState()));
     assert.strictEqual(calls[0][0], "stored-key");
-    assert.strictEqual(calls[0][1].apiKey, "stored-key");
+    assert.strictEqual(calls[0][1].credential.apiKey, "stored-key");
     assert.deepStrictEqual(projections.at(-1), ["setContext", "cloudsmith.connected", true]);
     assert.ok(secrets.deletedKeys.includes("cloudsmith-vsc.isConnected"));
+  });
+
+  test("a failed legacy-envelope rewrite leaves the validated raw API key usable", async () => {
+    const { manager, secrets } = createHarness("legacy-key", async () => (
+      apiSuccess({ authenticated: true })
+    ));
+    secrets.storeHook = async () => { throw new Error("migration write failed"); };
+
+    const result = await manager.initialize();
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.preserved, true);
+    assert.strictEqual(manager.getState().status, CONNECTION_STATUSES.CONNECTED);
+    assert.strictEqual(manager.getState().sessionConnected, true);
+    assert.strictEqual(secrets.value, "legacy-key");
+    const authorization = await manager.getAuthorization();
+    assert.strictEqual(authorization.headerName, "X-Api-Key");
+    assert.strictEqual(authorization.headerValue, "legacy-key");
   });
 
   test("an event during the startup read prevents the pre-event snapshot from validating or publishing", async () => {
@@ -167,7 +198,7 @@ suite("ConnectionManager Test Suite", () => {
 
     assert.strictEqual(result.ok, false);
     assert.strictEqual(result.preserved, true);
-    assert.strictEqual(secrets.value, "old-key");
+    assertStoredAPIKey(secrets.value, "old-key");
     assert.strictEqual(manager.getState().status, CONNECTION_STATUSES.CONNECTED);
     assert.strictEqual(manager.getState().sessionConnected, true);
     assert.strictEqual(manager.getState().accountEpoch, epoch);
@@ -192,7 +223,7 @@ suite("ConnectionManager Test Suite", () => {
 
     assert.strictEqual(secondResult.ok, true);
     assert.strictEqual(firstResult.status, "stale");
-    assert.strictEqual(secrets.value, "second-key");
+    assertStoredAPIKey(secrets.value, "second-key");
     assert.strictEqual(manager.getState().sessionConnected, true);
     assert.strictEqual(manager.getState().accountEpoch, 2);
   });
@@ -221,7 +252,7 @@ suite("ConnectionManager Test Suite", () => {
     const olderResult = await older;
 
     assert.strictEqual(olderResult.status, "stale");
-    assert.strictEqual(secrets.value, "committed-key");
+    assertStoredAPIKey(secrets.value, "committed-key");
     assert.strictEqual(manager.getState().status, CONNECTION_STATUSES.CONNECTED);
     assert.strictEqual(manager.getState().sessionConnected, true);
     assert.strictEqual(manager.getState().accountEpoch, 2);
@@ -235,7 +266,7 @@ suite("ConnectionManager Test Suite", () => {
     await nextTurn();
 
     assert.strictEqual(result.ok, true);
-    assert.strictEqual(secrets.value, "new-key");
+    assertStoredAPIKey(secrets.value, "new-key");
     assert.strictEqual(manager.getState().accountEpoch, 2);
     assert.strictEqual(manager.getState().status, CONNECTION_STATUSES.CONNECTED);
   });
@@ -529,7 +560,7 @@ suite("ConnectionManager Test Suite", () => {
     await nextTurn();
 
     assert.strictEqual(result.status, "superseded");
-    assert.strictEqual(secrets.value, "internal-key");
+    assertStoredAPIKey(secrets.value, "internal-key");
     assert.strictEqual(manager.getState().status, CONNECTION_STATUSES.CONNECTED);
     assert.strictEqual(manager._expectedSecretIntent, null);
   });
@@ -745,7 +776,7 @@ suite("ConnectionManager Test Suite", () => {
     const result = await pending;
 
     assert.strictEqual(result.status, "stale");
-    assert.strictEqual(secrets.value, "internal-key");
+    assertStoredAPIKey(secrets.value, "internal-key");
     assert.strictEqual(manager.getState().status, CONNECTION_STATUSES.CONNECTED);
     assert.ok(manager.getState().operationId > newer.id);
   });
@@ -807,7 +838,7 @@ suite("ConnectionManager Test Suite", () => {
 
     assert.strictEqual(result.ok, false);
     assert.strictEqual(result.preserved, true);
-    assert.strictEqual(secrets.value, "old-key");
+    assertStoredAPIKey(secrets.value, "old-key");
     assert.strictEqual(manager.getState().accountEpoch, 1);
   });
 
@@ -822,7 +853,7 @@ suite("ConnectionManager Test Suite", () => {
     assert.strictEqual(result.status, "superseded");
     assert.strictEqual(result.error.kind, "persistence_mismatch");
     assert.ok(result.error.message.length > 0);
-    assert.strictEqual(secrets.value, "old-key");
+    assertStoredAPIKey(secrets.value, "old-key");
   });
 
   test("a delete that resolves without changing the secret reports a safe persistence mismatch", async () => {
@@ -836,10 +867,10 @@ suite("ConnectionManager Test Suite", () => {
     assert.strictEqual(result.status, "superseded");
     assert.strictEqual(result.error.kind, "persistence_mismatch");
     assert.ok(result.error.message.length > 0);
-    assert.strictEqual(secrets.value, "old-key");
+    assertStoredAPIKey(secrets.value, "old-key");
   });
 
-  test("an unreadable post-write outcome fails closed and advances the epoch conservatively", async () => {
+  test("an unreadable pre-write lock check fails closed without mutating account identity", async () => {
     const { manager, secrets } = createHarness("old-key", async () => apiSuccess({ authenticated: true }));
     await manager.initialize();
     secrets.storeHook = async () => {
@@ -854,7 +885,7 @@ suite("ConnectionManager Test Suite", () => {
     assert.strictEqual(result.status, CONNECTION_STATUSES.INDETERMINATE);
     assert.strictEqual(manager.getState().sessionConnected, false);
     assert.strictEqual(manager.getState().credentialPresent, null);
-    assert.strictEqual(manager.getState().accountEpoch, 2);
+    assert.strictEqual(manager.getState().accountEpoch, 1);
   });
 
   test("an external replacement supersedes an in-flight candidate", async () => {
@@ -1018,7 +1049,7 @@ suite("ConnectionManager Test Suite", () => {
     });
 
     const result = await api.get("user/self", {
-      apiKey: "candidate-key",
+      credential: { version: 1, kind: "api-key", apiKey: "candidate-key" },
       responseType: "object",
       validate: value => value.authenticated === true,
     });

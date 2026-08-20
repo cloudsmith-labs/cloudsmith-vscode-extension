@@ -22,7 +22,7 @@ suite("Live integration: policy decision trace", function () {
           .build(),
         page_size: 10,
       },
-    }), { apiKey: liveFixture.apiKey, responseType: "array" });
+    }), { credential: liveFixture.credential, responseType: "array" });
     assert.strictEqual(packageResult.ok, true, packageResult.error && packageResult.error.message);
     const pkg = packageResult.data.find(value => (
       value.name === liveFixture.quarantinedPackageName
@@ -36,7 +36,7 @@ suite("Live integration: policy decision trace", function () {
     const authenticated = {
       async getV2(endpoint, options) {
         requests += 1;
-        return api.getV2(endpoint, { ...options, apiKey: liveFixture.apiKey });
+        return api.getV2(endpoint, { ...options, credential: liveFixture.credential });
       },
     };
     const locator = {

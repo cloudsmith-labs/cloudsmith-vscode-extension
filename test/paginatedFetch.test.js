@@ -6,7 +6,7 @@ suite("PaginatedFetch typed API boundary", () => {
   test("returns validated data and normalized pagination metadata", async () => {
     let requestOptions;
     const token = { isCancellationRequested: false };
-    const apiKey = "candidate-key";
+    const credential = { version: 1, kind: "api-key", apiKey: "candidate-key" };
     const paginated = new PaginatedFetch({
       async get(endpoint, options) {
         requestOptions = options;
@@ -27,7 +27,7 @@ suite("PaginatedFetch typed API boundary", () => {
       2,
       2,
       "name:artifact",
-      { apiKey, cancellationToken: token, retry: "never" }
+      { credential, cancellationToken: token, retry: "never" }
     );
 
     assert.strictEqual(result.error, null);
@@ -40,7 +40,7 @@ suite("PaginatedFetch typed API boundary", () => {
     });
     assert.strictEqual(requestOptions.cancellationToken, token);
     assert.strictEqual(requestOptions.retry, "never");
-    assert.strictEqual(requestOptions.apiKey, apiKey);
+    assert.strictEqual(requestOptions.credential, credential);
   });
 
   test("keeps typed transport failures distinct from empty pages", async () => {
@@ -57,7 +57,7 @@ suite("PaginatedFetch typed API boundary", () => {
 
     assert.strictEqual(result.error, failure);
     assert.deepStrictEqual(result.data, []);
-    assert.strictEqual(Object.prototype.hasOwnProperty.call(requestOptions, "apiKey"), false);
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(requestOptions, "credential"), false);
   });
 
   test("rejects malformed arrays and incomplete or contradictory pagination metadata", async () => {
