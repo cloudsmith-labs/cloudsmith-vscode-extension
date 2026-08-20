@@ -166,6 +166,7 @@ class ConnectionManager {
       defaults: { [CONNECTION_CONTEXT_KEY]: false },
       executeCommand: this._executeCommand,
       attempts: 2,
+      authorityScope: options.contextAuthorityScope || context,
     });
     this._stateEmitter = new vscode.EventEmitter();
     this.onDidChange = this._stateEmitter.event;
@@ -204,6 +205,10 @@ class ConnectionManager {
 
   getState() {
     return this._state;
+  }
+
+  projectCurrentConnectionContext() {
+    return this._projectConnection(this._state.sessionConnected);
   }
 
   isOperationCurrent(token) {

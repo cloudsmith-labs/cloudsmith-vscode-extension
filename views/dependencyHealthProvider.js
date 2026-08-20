@@ -193,6 +193,7 @@ class DependencyHealthProvider {
         "cloudsmith.depReportAvailable": false,
       },
       executeCommand: this._executeCommand,
+      authorityScope: options.contextAuthorityScope || context,
     });
     this._contextDisposal = null;
     this._debouncedEnrichmentHandlers = new Set();
@@ -249,7 +250,9 @@ class DependencyHealthProvider {
       if (presentationChanged) this.refresh();
     }) || null;
 
-    void this._updateContexts().catch(() => {});
+    if (options.deferInitialContextProjection !== true) {
+      void this._updateContexts().catch(() => {});
+    }
   }
 
   _captureAccountEpoch() {
@@ -333,6 +336,10 @@ class DependencyHealthProvider {
     });
     if (result.error) throw result.error;
     return result.applied;
+  }
+
+  projectCurrentContext() {
+    return this._updateContexts();
   }
 
   hasSuccessfulScan() {

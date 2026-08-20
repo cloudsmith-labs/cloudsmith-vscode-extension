@@ -50,6 +50,7 @@ class SSOAuthManager {
     this._clearTimeout = options.clearTimeout || clearTimeout;
     this._createServer = options.createServer || http.createServer;
     this._serverFactoryInjected = Boolean(options.createServer);
+    this._callbackHosts = normalizeCallbackHosts(options.callbackHosts);
     this._randomBytes = options.randomBytes || crypto.randomBytes;
     this._openExternal = options.openExternal || vscode.env.openExternal;
     this._showErrorMessage = options.showErrorMessage
@@ -218,6 +219,8 @@ class SSOAuthManager {
 
   async _startCallbackServer(signal) {
     const sockets = new Set();
+    const servers = [];
+    const createdServers = [];
     let settle;
     let settled = false;
     let settledOutcome = null;
@@ -232,44 +235,50 @@ class SSOAuthManager {
       return true;
     };
     const handler = (request, response) => this._handleCallbackRequest(request, response, finish);
-    const server = this._serverFactoryInjected
-      ? this._createServer(handler)
-      : this._createServer({ maxHeaderSize: 16 * 1024 }, handler);
-    server.headersTimeout = 5000;
-    server.requestTimeout = 5000;
-    server.keepAliveTimeout = 1000;
-    server.maxRequestsPerSocket = 1;
-    server.maxConnections = 8;
-    server.on("connection", socket => {
-      sockets.add(socket);
-      socket.on("close", () => sockets.delete(socket));
-    });
+    const createServer = () => {
+      const server = this._serverFactoryInjected
+        ? this._createServer(handler)
+        : this._createServer({ maxHeaderSize: 16 * 1024 }, handler);
+      server.headersTimeout = 5000;
+      server.requestTimeout = 5000;
+      server.keepAliveTimeout = 1000;
+      server.maxRequestsPerSocket = 1;
+      server.maxConnections = 8;
+      server.on("connection", socket => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+      });
+      createdServers.push(server);
+      return server;
+    };
     const onAbort = () => finish({ kind: "cancelled" });
+    const onRuntimeError = () => finish({ kind: "listener_failed" });
     signal.addEventListener("abort", onAbort, { once: true });
     if (signal.aborted) onAbort();
 
     try {
-      await new Promise((resolve, reject) => {
-        const onError = (error) => {
-          server.removeListener("listening", onListening);
-          reject(publicFailure(error && error.code === "EADDRINUSE" ? "port_in_use" : "listener_failed"));
-        };
-        const onListening = () => {
-          server.removeListener("error", onError);
-          resolve();
-        };
-        server.once("error", onError);
-        server.once("listening", onListening);
-        server.listen(SAML_CALLBACK_PORT, "127.0.0.1");
-      });
+      for (const host of this._callbackHosts) {
+        const server = createServer();
+        const bound = await bindCallbackServer(server, host);
+        if (!bound) {
+          server.removeAllListeners();
+          continue;
+        }
+        server.on("error", onRuntimeError);
+        servers.push(server);
+      }
+      if (servers.length === 0) throw publicFailure("listener_failed");
     } catch (error) {
       signal.removeEventListener("abort", onAbort);
       for (const socket of sockets) socket.destroy();
-      try { server.close(); } catch { /* not listening */ }
+      await Promise.all(createdServers.map(async server => {
+        server.removeListener("error", onRuntimeError);
+        await closeCallbackServer(server);
+        server.removeAllListeners("connection");
+        server.removeAllListeners("error");
+      }));
       throw error;
     }
-    const onRuntimeError = () => finish({ kind: "listener_failed" });
-    server.on("error", onRuntimeError);
     timeout = this._setTimeout(() => finish({ kind: "timeout" }), CALLBACK_TIMEOUT_MS);
     const close = async () => {
       if (closed) return;
@@ -277,18 +286,17 @@ class SSOAuthManager {
       if (timeout !== null) this._clearTimeout(timeout);
       signal.removeEventListener("abort", onAbort);
       finish({ kind: "cancelled" });
-      server.removeListener("error", onRuntimeError);
-      server.closeIdleConnections?.();
-      server.closeAllConnections?.();
       for (const socket of sockets) socket.destroy();
-      await new Promise(resolve => {
-        try { server.close(() => resolve()); } catch { resolve(); }
-      });
-      server.removeAllListeners("connection");
-      server.removeAllListeners("error");
+      await Promise.all(servers.map(async server => {
+        server.removeListener("error", onRuntimeError);
+        await closeCallbackServer(server);
+        server.removeAllListeners("connection");
+        server.removeAllListeners("error");
+      }));
     };
     return Object.freeze({
-      server,
+      server: servers[0],
+      servers: Object.freeze(servers.slice()),
       outcome,
       close,
       getSettledOutcome: () => settledOutcome,
@@ -363,6 +371,69 @@ class SSOAuthManager {
   }
 }
 
+function normalizeCallbackHosts(value) {
+  const hosts = value === undefined ? ["127.0.0.1", "::1"] : value;
+  if (
+    !Array.isArray(hosts)
+    || hosts.length === 0
+    || hosts.some(host => !["127.0.0.1", "::1"].includes(host))
+    || new Set(hosts).size !== hosts.length
+  ) {
+    throw new TypeError("Callback listeners must use unique IPv4 or IPv6 loopback hosts.");
+  }
+  return Object.freeze(hosts.slice());
+}
+
+function bindCallbackServer(server, host) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      server.removeListener("error", onError);
+      server.removeListener("listening", onListening);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const onError = error => {
+      if (host === "::1" && ["EAFNOSUPPORT", "EADDRNOTAVAIL"].includes(error?.code)) {
+        finish(null, false);
+        return;
+      }
+      finish(publicFailure(error?.code === "EADDRINUSE" ? "port_in_use" : "listener_failed"));
+    };
+    const onListening = () => finish(null, true);
+    server.once("error", onError);
+    server.once("listening", onListening);
+    try {
+      server.listen({
+        host,
+        port: SAML_CALLBACK_PORT,
+        exclusive: true,
+        ...(host === "::1" ? { ipv6Only: true } : {}),
+      });
+    } catch (error) {
+      onError(error);
+    }
+  });
+}
+
+function closeCallbackServer(server) {
+  return new Promise(resolve => {
+    try {
+      server.closeIdleConnections?.();
+      server.closeAllConnections?.();
+      if (!server.listening) {
+        resolve();
+        return;
+      }
+      server.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
 async function readTrustedCredentialFile(root, file, fileSystem) {
   const normalizedRoot = path.resolve(root);
   const normalizedFile = path.resolve(file);
@@ -382,7 +453,8 @@ async function readTrustedCredentialFile(root, file, fileSystem) {
   let handle;
   try {
     handle = await fileSystem.open(normalizedFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-  } catch {
+  } catch (error) {
+    if (error && error.code === "ENOENT") throw error;
     throw unsafeFile();
   }
   try {

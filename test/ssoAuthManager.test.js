@@ -44,9 +44,10 @@ function createManager() {
   };
 }
 
-function requestCallback(target) {
+function requestCallback(target, host = "127.0.0.1") {
   return new Promise((resolve, reject) => {
-    const request = http.get(`http://127.0.0.1:12400${target}`, response => {
+    const authority = host.includes(":") ? `[${host}]` : host;
+    const request = http.get(`http://${authority}:12400${target}`, response => {
       let body = "";
       response.setEncoding("utf8");
       response.on("data", chunk => { body += chunk; });
@@ -107,6 +108,36 @@ suite("SSOAuthManager", () => {
       assert.strictEqual(result.ok, true);
       assert.strictEqual(manager.calls.at(-1)[0], "replace");
       assert.strictEqual(manager.calls.at(-1)[1], "imported-key");
+    } finally {
+      await fs.promises.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("continues after a missing trusted candidate and imports the next credentials.ini", async () => {
+    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "cloudsmith-cli-fallback-"));
+    const configRoot = path.join(root, "config");
+    const home = path.join(root, "home");
+    try {
+      await fs.promises.mkdir(path.join(configRoot, "cloudsmith"), { recursive: true });
+      await fs.promises.mkdir(path.join(home, ".cloudsmith"), { recursive: true });
+      await fs.promises.writeFile(
+        path.join(home, ".cloudsmith", "credentials.ini"),
+        "[default]\napi_key = fallback-key\n",
+        { encoding: "utf8", mode: 0o600 }
+      );
+      const manager = createManager();
+      const sso = new SSOAuthManager({}, {
+        connectionManager: manager,
+        platform: "linux",
+        env: { XDG_CONFIG_HOME: configRoot },
+        home,
+        showErrorMessage() {},
+      });
+
+      const result = await sso.importFromCLI();
+
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(manager.calls.at(-1)[1], "fallback-key");
     } finally {
       await fs.promises.rm(root, { recursive: true, force: true });
     }
@@ -189,6 +220,7 @@ suite("SSOAuthManager", () => {
         server.on("listening", () => order.push("listen"));
         return server;
       },
+      callbackHosts: ["127.0.0.1"],
       protocolClient: {
         async discover(workspace) {
           order.push("discover");
@@ -406,6 +438,7 @@ suite("SSOAuthManager", () => {
         server = http.createServer(handler);
         return server;
       },
+      callbackHosts: ["127.0.0.1"],
       protocolClient: {
         async discover() { return { ok: true, redirectUrl: "https://idp.example/saml" }; },
       },
@@ -435,6 +468,7 @@ suite("SSOAuthManager", () => {
         server = http.createServer(handler);
         return server;
       },
+      callbackHosts: ["127.0.0.1"],
       protocolClient: {
         async discover() {
           server.emit("error", new Error("runtime listener failure"));
@@ -468,6 +502,110 @@ suite("SSOAuthManager", () => {
     assert.strictEqual(callback.server.listenerCount("error"), 0);
     assert.strictEqual(callback.server.listenerCount("connection"), 0);
     assert.strictEqual(callback.server.listening, false);
+    assert.ok(callback.servers.every(server => server.listening === false));
+  });
+
+  test("advertised localhost callback listens on every supported IP loopback", async () => {
+    const controller = new AbortController();
+    const sso = new SSOAuthManager({}, { connectionManager: createManager() });
+    const callback = await sso._startCallbackServer(controller.signal);
+    try {
+      const addresses = callback.servers.map(server => server.address()?.address);
+      assert.ok(addresses.includes("127.0.0.1"));
+
+      if (addresses.includes("::1")) {
+        const ipv6Response = await requestCallback("/?token=unsupported-alias", "::1");
+        assert.strictEqual(ipv6Response.status, 400);
+      }
+      const ipv4Response = await requestCallback(
+        "/?access_token=loopback-access&refresh_token=loopback-refresh",
+        "127.0.0.1"
+      );
+      assert.strictEqual(ipv4Response.status, 200);
+      assert.deepStrictEqual(await callback.outcome, {
+        kind: "tokens",
+        accessToken: "loopback-access",
+        refreshToken: "loopback-refresh",
+      });
+    } finally {
+      await callback.close();
+    }
+  });
+
+  test("continues on deterministic unsupported IPv6 and keeps IPv4 usable", async () => {
+    const controller = new AbortController();
+    const created = [];
+    const sso = new SSOAuthManager({}, {
+      connectionManager: createManager(),
+      createServer(handler) {
+        const server = http.createServer(handler);
+        created.push(server);
+        if (created.length === 2) {
+          server.listen = () => {
+            queueMicrotask(() => {
+              const error = new Error("IPv6 is unavailable");
+              error.code = "EAFNOSUPPORT";
+              server.emit("error", error);
+            });
+            return server;
+          };
+        }
+        return server;
+      },
+    });
+    const callback = await sso._startCallbackServer(controller.signal);
+    try {
+      assert.strictEqual(callback.servers.length, 1);
+      assert.strictEqual(callback.server.address()?.address, "127.0.0.1");
+      const response = await requestCallback(
+        "/?access_token=ipv4-access&refresh_token=ipv4-refresh",
+        "127.0.0.1"
+      );
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(await callback.outcome, {
+        kind: "tokens",
+        accessToken: "ipv4-access",
+        refreshToken: "ipv4-refresh",
+      });
+    } finally {
+      await callback.close();
+    }
+    assert.strictEqual(created[0].listening, false);
+    assert.strictEqual(created[1].listenerCount("error"), 0);
+    assert.strictEqual(created[1].listenerCount("connection"), 0);
+  });
+
+  test("an occupied supported IPv6 callback closes the already-bound IPv4 listener", async () => {
+    const controller = new AbortController();
+    const created = [];
+    const sso = new SSOAuthManager({}, {
+      connectionManager: createManager(),
+      createServer(handler) {
+        const server = http.createServer(handler);
+        created.push(server);
+        if (created.length === 2) {
+          server.listen = () => {
+            queueMicrotask(() => {
+              const error = new Error("IPv6 callback is occupied");
+              error.code = "EADDRINUSE";
+              server.emit("error", error);
+            });
+            return server;
+          };
+        }
+        return server;
+      },
+    });
+
+    await assert.rejects(
+      sso._startCallbackServer(controller.signal),
+      error => error.kind === "port_in_use"
+    );
+
+    assert.strictEqual(created.length, 2);
+    assert.ok(created.every(server => server.listening === false));
+    assert.ok(created.every(server => server.listenerCount("error") === 0));
+    assert.ok(created.every(server => server.listenerCount("connection") === 0));
   });
 
   test("terminal SSO is truthful about non-importable keyring state", async () => {

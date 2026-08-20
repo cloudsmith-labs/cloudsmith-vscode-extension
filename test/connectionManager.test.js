@@ -34,7 +34,7 @@ async function nextTurn() {
   await new Promise(resolve => setImmediate(resolve));
 }
 
-function createHarness(initialCredential, validate) {
+function createHarness(initialCredential, validate, options = {}) {
   const secrets = new FakeSecretStorage(
     initialCredential === null ? {} : { [AUTH_TOKEN_KEY]: initialCredential },
     { primaryKey: AUTH_TOKEN_KEY }
@@ -42,6 +42,7 @@ function createHarness(initialCredential, validate) {
   const projections = [];
   const context = { secrets };
   const manager = new ConnectionManager(context, {
+    ...options,
     activationId: "test-activation",
     createCloudsmithAPI: () => ({
       get: (_endpoint, options) => validate(
@@ -100,6 +101,43 @@ suite("ConnectionManager Test Suite", () => {
     const authorization = await manager.getAuthorization();
     assert.strictEqual(authorization.headerName, "X-Api-Key");
     assert.strictEqual(authorization.headerValue, "legacy-key");
+  });
+
+  test("deactivation cancels legacy migration without waiting for credential-lock timeout", async () => {
+    const lockStarted = deferred();
+    const mutationLock = {
+      run(_task, options = {}) {
+        lockStarted.resolve();
+        return new Promise((_resolve, reject) => {
+          const cancel = () => {
+            const error = new Error("cancelled");
+            error.kind = "cancelled";
+            reject(error);
+          };
+          if (options.signal?.aborted) cancel();
+          else options.signal?.addEventListener("abort", cancel, { once: true });
+        });
+      },
+    };
+    const { manager } = createHarness(
+      "legacy-key",
+      async () => apiSuccess({ authenticated: true }),
+      { mutationLock }
+    );
+    const initialization = manager.initialize();
+    await lockStarted.promise;
+
+    const startedAt = performance.now();
+    await manager.dispose();
+    assert.ok(performance.now() - startedAt < 100);
+    await Promise.race([
+      initialization,
+      new Promise((_resolve, reject) => setTimeout(
+        () => reject(new Error("legacy migration ignored deactivation")),
+        250
+      )),
+    ]);
+    assert.strictEqual(manager.getState().status, CONNECTION_STATUSES.DISPOSED);
   });
 
   test("an event during the startup read prevents the pre-event snapshot from validating or publishing", async () => {

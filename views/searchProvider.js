@@ -81,6 +81,7 @@ class SearchProvider {
                 "cloudsmith.searchCanLoadMore": false,
             },
             executeCommand: options.executeCommand,
+            authorityScope: options.contextAuthorityScope || context,
         });
         this._account = this._readConnectedAccount();
         this._connectionPresentation = connectionPresentation(
@@ -99,7 +100,9 @@ class SearchProvider {
             }
             if (presentationChanged) this.refresh();
         });
-        void this._updateContexts();
+        if (options.deferInitialContextProjection !== true) {
+            this._scheduleContextUpdate();
+        }
     }
 
     get state() {
@@ -533,7 +536,7 @@ class SearchProvider {
             .finally(() => {
                 if (this._activePage?.operation === operation) {
                     this._activePage = null;
-                    if (!this._disposed) void this._updateContexts();
+                    if (!this._disposed) this._scheduleContextUpdate();
                 }
             });
         this._activePage = Object.freeze({ operation, promise });
@@ -1039,7 +1042,7 @@ class SearchProvider {
         if (!this._disposed) {
             this._selectionGeneration += 1;
             this._pruneVulnerabilitySummaries(this._currentCommitted()?.results || []);
-            void this._updateContexts();
+            this._scheduleContextUpdate();
             this._onDidChangeTreeData.fire();
         }
     }
@@ -1110,6 +1113,14 @@ class SearchProvider {
         if (this._disposed) return false;
         const result = await this._contextProjector.project(this._contextSnapshot());
         return result.applied;
+    }
+
+    projectCurrentContext() {
+        return this._updateContexts();
+    }
+
+    _scheduleContextUpdate() {
+        void this._updateContexts().catch(() => {});
     }
 
     _vulnerabilityNodeOptions() {

@@ -6,6 +6,23 @@ const { runDependencyScan } = require("../util/dependencyScanOrchestration");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
 
 suite("Extension Test Suite", () => {
+  test("activation owner observes asynchronous cleanup without blocking reload", async () => {
+    let release;
+    const cleanup = new Promise(resolve => { release = resolve; });
+    const owner = new ActivationOwner();
+    owner.add({ dispose() { return cleanup; } });
+
+    owner.dispose();
+    await Promise.race([
+      owner.settle(),
+      new Promise((_resolve, reject) => setTimeout(
+        () => reject(new Error("reload waited for asynchronous cleanup")),
+        100
+      )),
+    ]);
+    release();
+  });
+
   test("activation owner reports async cleanup failure without retaining its error", async () => {
     const reports = [];
     const owner = new ActivationOwner(() => reports.push("cleanup failed"));

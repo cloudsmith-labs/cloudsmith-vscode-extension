@@ -9,6 +9,7 @@ class WorkspaceContextProjector {
     this._projector = new ContextKeyProjector({
       defaults: { "cloudsmith.hasMultipleWorkspaces": false },
       executeCommand: options.executeCommand,
+      authorityScope: options.authorityScope,
     });
   }
 
@@ -44,7 +45,7 @@ function getWorkspaceContextProjector(context, options = {}) {
   }
   let projector = projectors.get(context);
   if (!projector || projector.isDisposed()) {
-    projector = new WorkspaceContextProjector(options);
+    projector = new WorkspaceContextProjector({ ...options, authorityScope: context });
     projectors.set(context, projector);
   }
   return projector;

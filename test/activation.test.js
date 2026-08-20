@@ -7,6 +7,12 @@ const recentPackages = require("../util/recentPackages");
 const { createExactPackage } = require("../domain/package");
 const { UpstreamRuntime } = require("../util/upstreamRuntime");
 
+function deferred() {
+  let resolve;
+  const promise = new Promise(res => { resolve = res; });
+  return { promise, resolve };
+}
+
 function createMemento() {
   const values = new Map();
   return {
@@ -59,7 +65,15 @@ suite("Extension activation smoke", () => {
     const extension = vscode.extensions.getExtension("Cloudsmith.cloudsmith-vsc");
     assert.ok(extension, "Cloudsmith.cloudsmith-vsc was not loaded as the development extension");
 
-    await extension.activate();
+    const activationStartedAt = performance.now();
+    await Promise.race([
+      extension.activate(),
+      new Promise((_resolve, reject) => setTimeout(
+        () => reject(new Error("real Extension Host activation exceeded three seconds")),
+        3000
+      )),
+    ]);
+    assert.ok(performance.now() - activationStartedAt < 3000);
     assert.strictEqual(extension.isActive, true);
 
     const contributedCommands = (extension.packageJSON.contributes?.commands || [])
@@ -79,6 +93,7 @@ suite("Extension activation smoke", () => {
         `Expected compatibility command ${compatibilityCommand} to be registered`
       );
     }
+    await vscode.commands.executeCommand("cloudsmith-vsc.openSettings");
 
     const viewIds = (extension.packageJSON.contributes?.views?.cloudsmithSideBar || [])
       .map((entry) => entry.id);
@@ -109,59 +124,97 @@ suite("Extension activation smoke", () => {
     );
   });
 
-  test("owns one runtime and settles its initial cache purge before credential access", async () => {
+  test("registers commands and returns before held background readiness", async () => {
     const extension = vscode.extensions.getExtension("Cloudsmith.cloudsmith-vsc");
     const extensionModule = require("../extension");
     await extensionModule.deactivate();
-
-    const cacheKey = "cloudsmith-upstreams:v5:activation-order";
-    const events = [];
-    const initialized = [];
-    const disposed = [];
-    let cacheAtCredentialRead = "unread";
-    let resolveCredentialRead;
-    const credentialRead = new Promise(resolve => { resolveCredentialRead = resolve; });
-    let context;
-    context = createActivationContext(extension.extensionPath, () => {
-      cacheAtCredentialRead = context.globalState.get(cacheKey);
-      events.push("credential-read");
-      resolveCredentialRead();
-    });
-    await context.globalState.update(cacheKey, { accountEpoch: 1 });
-
-    const originalInitialize = UpstreamRuntime.prototype.initialize;
-    const originalDispose = UpstreamRuntime.prototype.dispose;
-    UpstreamRuntime.prototype.initialize = async function (...args) {
-      initialized.push(this);
-      events.push("runtime-initialize-start");
-      const result = await originalInitialize.apply(this, args);
-      events.push("runtime-initialize-settled");
-      return result;
+    const upstreamReadiness = deferred();
+    const secretRead = deferred();
+    const contextProjection = deferred();
+    let upstreamStarted = false;
+    let secretReadStarted = false;
+    let contextProjectionStarted = false;
+    let commandsAtFirstContextProjection = null;
+    const activationRegistrations = new Set();
+    const context = createActivationContext(extension.extensionPath, () => {});
+    const originalSecretGet = context.secrets.get.bind(context.secrets);
+    context.secrets.get = async key => {
+      if (key !== "cloudsmith-vsc.authToken") return originalSecretGet(key);
+      secretReadStarted = true;
+      return secretRead.promise;
     };
-    UpstreamRuntime.prototype.dispose = function (...args) {
-      disposed.push(this);
-      events.push("runtime-dispose");
-      return originalDispose.apply(this, args);
+    const originalInitialize = UpstreamRuntime.prototype.initialize;
+    UpstreamRuntime.prototype.initialize = function () {
+      upstreamStarted = true;
+      return upstreamReadiness.promise;
+    };
+    const originalExecuteCommand = vscode.commands.executeCommand;
+    const originalRegisterCommand = vscode.commands.registerCommand;
+    vscode.commands.registerCommand = function (id, handler) {
+      activationRegistrations.add(id);
+      return originalRegisterCommand.call(vscode.commands, id, handler);
+    };
+    vscode.commands.executeCommand = function (id, ...args) {
+      if (id === "setContext") {
+        contextProjectionStarted = true;
+        commandsAtFirstContextProjection ||= new Set(activationRegistrations);
+        return contextProjection.promise;
+      }
+      return originalExecuteCommand.call(vscode.commands, id, ...args);
     };
 
     try {
-      await extensionModule.activate(context);
-      await credentialRead;
+      const startedAt = performance.now();
+      await Promise.race([
+        extensionModule.activate(context),
+        new Promise((_resolve, reject) => setTimeout(
+          () => reject(new Error("activation waited for background readiness")),
+          750
+        )),
+      ]);
+      assert.ok(performance.now() - startedAt < 750);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.strictEqual(upstreamStarted, true);
+      assert.strictEqual(secretReadStarted, true);
+      assert.strictEqual(contextProjectionStarted, true);
 
-      assert.strictEqual(initialized.length, 1);
-      assert.strictEqual(cacheAtCredentialRead, undefined);
-      assert.ok(
-        events.indexOf("runtime-initialize-settled") < events.indexOf("credential-read"),
-        "Runtime initialization must settle before ConnectionManager reads SecretStorage"
-      );
+      const commands = new Set(await vscode.commands.getCommands(true));
+      for (const command of [
+        "cloudsmith-vsc.openSettings",
+        "cloudsmith-vsc.configureCredentials",
+        "cloudsmith-vsc.searchPackages",
+        "cloudsmith-vsc.scanDependencies",
+      ]) {
+        assert.ok(commands.has(command), `${command} must be registered before readiness`);
+        assert.ok(
+          commandsAtFirstContextProjection?.has(command),
+          `${command} must be registered before startup context projection`
+        );
+      }
+      await vscode.commands.executeCommand("cloudsmith-vsc.openSettings");
+      const guardedResults = await Promise.race([
+        Promise.all([
+          vscode.commands.executeCommand("cloudsmith-vsc.searchPackages"),
+          vscode.commands.executeCommand("cloudsmith-vsc.scanDependencies"),
+        ]),
+        new Promise((_resolve, reject) => setTimeout(
+          () => reject(new Error("connection-sensitive commands ignored unknown authority too slowly")),
+          250
+        )),
+      ]);
+      assert.deepStrictEqual(guardedResults, [undefined, undefined]);
 
+      const deactivationStartedAt = performance.now();
       await extensionModule.deactivate();
-      await extensionModule.deactivate();
-      assert.deepStrictEqual(disposed, initialized);
+      assert.ok(performance.now() - deactivationStartedAt < 250);
     } finally {
-      await extensionModule.deactivate();
+      upstreamReadiness.resolve(false);
+      secretRead.resolve(undefined);
+      contextProjection.resolve(undefined);
       UpstreamRuntime.prototype.initialize = originalInitialize;
-      UpstreamRuntime.prototype.dispose = originalDispose;
+      vscode.commands.registerCommand = originalRegisterCommand;
+      vscode.commands.executeCommand = originalExecuteCommand;
+      await extensionModule.deactivate();
     }
   });
 

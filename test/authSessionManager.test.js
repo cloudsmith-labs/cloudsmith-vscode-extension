@@ -805,6 +805,39 @@ suite("SSO session authority", () => {
     }
   });
 
+  test("two startup hosts serialize legacy API-key migration without losing the session", async () => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "cloudsmith-two-legacy-"));
+    const secrets = new FakeSecretStorage({
+      [AUTH_TOKEN_KEY]: "legacy-shared-key",
+    }, { primaryKey: AUTH_TOKEN_KEY });
+    const context = { secrets, globalStorageUri: { fsPath: directory } };
+    const options = activationId => ({
+      activationId,
+      createCloudsmithAPI: () => ({
+        async get() { return apiSuccess({ authenticated: true }); },
+      }),
+      executeCommand: async () => {},
+    });
+    const first = new ConnectionManager(context, options("legacy-first"));
+    const second = new ConnectionManager(context, options("legacy-second"));
+    try {
+      await Promise.all([first.initialize(), second.initialize()]);
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+
+      const stored = decodeStoredCredential(secrets.value);
+      assert.strictEqual(stored.ok, true);
+      assert.strictEqual(stored.credential.kind, "api-key");
+      assert.strictEqual(stored.credential.apiKey, "legacy-shared-key");
+      assert.strictEqual(first.getState().sessionConnected, true);
+      assert.strictEqual(second.getState().sessionConnected, true);
+    } finally {
+      await first.dispose();
+      await second.dispose();
+      await fs.promises.rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("disconnect aborts an in-flight refresh and a late response cannot resurrect it", async () => {
     const pending = deferred();
     const { manager, secrets } = createSSOHarness({

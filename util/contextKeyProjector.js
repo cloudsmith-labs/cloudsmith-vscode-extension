@@ -4,6 +4,29 @@ const vscode = require("vscode");
 
 const SET_CONTEXT_COMMAND = "setContext";
 const MAX_NEUTRALIZATION_PASSES = 2;
+const defaultAuthorityScope = Object.freeze({});
+const contextAuthorities = new WeakMap();
+const contextWriteTails = new WeakMap();
+
+function scopedMap(registry, scope) {
+  let values = registry.get(scope);
+  if (!values) {
+    values = new Map();
+    registry.set(scope, values);
+  }
+  return values;
+}
+
+function queueContextWrite(tails, key, write) {
+  const previous = tails.get(key) || Promise.resolve();
+  const pending = previous.then(write, write);
+  const tail = pending.then(() => undefined, () => undefined);
+  tails.set(key, tail);
+  tail.finally(() => {
+    if (tails.get(key) === tail) tails.delete(key);
+  });
+  return pending;
+}
 
 /**
  * Serialize complete snapshots for a fixed set of extension-owned context keys.
@@ -12,10 +35,23 @@ const MAX_NEUTRALIZATION_PASSES = 2;
  */
 class ContextKeyProjector {
   constructor(options = {}) {
-    this._executeCommand = options.executeCommand
-      || ((...args) => vscode.commands.executeCommand(...args));
     this._defaults = normalizeDefaults(options.defaults);
     this._keys = Object.keys(this._defaults);
+    const authorityScope = options.authorityScope
+      || (typeof options.executeCommand === "function" ? options.executeCommand : defaultAuthorityScope);
+    if ((typeof authorityScope !== "object" && typeof authorityScope !== "function") || !authorityScope) {
+      throw new TypeError("Context authority scope must be an object.");
+    }
+    this._authorities = scopedMap(contextAuthorities, authorityScope);
+    this._writeTails = scopedMap(contextWriteTails, authorityScope);
+    this._authority = Symbol("cloudsmith-context-authority");
+    for (const key of this._keys) this._authorities.set(key, this._authority);
+    const executeCommand = options.executeCommand
+      || ((...args) => vscode.commands.executeCommand(...args));
+    this._executeCommand = (command, key, value) => queueContextWrite(this._writeTails, key, () => {
+      if (this._authorities.get(key) !== this._authority) return undefined;
+      return executeCommand(command, key, value);
+    });
     this._attempts = Number.isSafeInteger(options.attempts) && options.attempts > 0
       ? Math.min(options.attempts, 3)
       : 1;
@@ -60,7 +96,11 @@ class ContextKeyProjector {
       version: ++this._version,
       isCurrent: null,
     });
-    this._disposal = this._enqueue(operation, this._defaults, true);
+    this._disposal = this._enqueue(operation, this._defaults, true).finally(() => {
+      for (const key of this._keys) {
+        if (this._authorities.get(key) === this._authority) this._authorities.delete(key);
+      }
+    });
     return this._disposal;
   }
 
@@ -191,6 +231,7 @@ class ContextKeyProjector {
     return operation
       && operation.projector === this
       && operation.version === this._version
+      && this._keys.every(key => this._authorities.get(key) === this._authority)
       && (disposal || !this._disposed);
   }
 }

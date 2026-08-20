@@ -130,7 +130,7 @@ suite("CloudsmithProvider", () => {
     await disposal;
     assert.strictEqual(disposalSettled, true);
     assert.strictEqual(await second.project(false), true);
-    assert.deepStrictEqual(applied, ["first:true", "first:false", "second:false"]);
+    assert.deepStrictEqual(applied, ["first:true", "second:false"]);
     await second.dispose();
   });
   let context;

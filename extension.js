@@ -101,8 +101,9 @@ async function activate(context) {
   activeActivationOwner = owner;
   context.subscriptions.push(owner);
   const own = (...resources) => owner.add(...resources);
+  const observe = (...args) => owner.observe(...args);
   try {
-    return await activateOwned(context, own);
+    return activateOwned(context, own, observe);
   } catch (error) {
     owner.dispose();
     await owner.settle();
@@ -111,7 +112,7 @@ async function activate(context) {
   }
 }
 
-async function activateOwned(context, own) {
+function activateOwned(context, own, observe) {
   const activationReset = beginAccountScopedStateReset();
   if (activationReset.syncFailures.length > 0) {
     console.warn("[Cloudsmith] Some account-scoped singleton state could not be cleared.");
@@ -125,6 +126,7 @@ async function activateOwned(context, own) {
       "cloudsmith.connectionSetupAvailable": false,
       "cloudsmith.credentialsPresent": false,
     },
+    authorityScope: context,
   });
   own(extensionContextProjector);
   const projectExtensionContexts = (state = connectionManager.getState()) => (
@@ -160,13 +162,10 @@ async function activateOwned(context, own) {
       upstreamRuntime.getPrivilegedRepositoryUpstreamsForExport(...args)
     ),
   });
-  await upstreamRuntime.initialize();
   const inspectOutputChannel = vscode.window.createOutputChannel("Cloudsmith");
   own(inspectOutputChannel);
   const workspaceContextProjector = getWorkspaceContextProjector(context);
   own(workspaceContextProjector);
-  await setHasMultipleWorkspacesContext(context, false, { workspaceContextProjector });
-  await updateDefaultWorkspaceContext();
 
   // Define main view provider which populates with data
   const workspaceCache = new WorkspaceCache(connectionManager);
@@ -225,6 +224,7 @@ async function activateOwned(context, own) {
   const searchProvider = new SearchProvider(context, {
     connectionManager,
     vulnerabilityStateService,
+    deferInitialContextProjection: true,
   });
   const searchTreeView = vscode.window.createTreeView("cloudsmithSearchView", {
     treeDataProvider: searchProvider,
@@ -246,6 +246,7 @@ async function activateOwned(context, own) {
     upstreamGapRuntime: gapAndPullUpstream,
     upstreamPullService,
     accountResetOrchestrated: true,
+    deferInitialContextProjection: true,
   });
   own(
     { dispose: () => searchProvider.dispose() },
@@ -303,8 +304,6 @@ async function activateOwned(context, own) {
     }
   });
   own(connectionSubscription);
-  void projectConnectionPresentation(connectionManager.getState()).catch(() => {});
-
   // Create vulnerability WebView provider
   vulnerabilityProvider = new VulnerabilityProvider(context, {
     connectionManager,
@@ -419,17 +418,6 @@ async function activateOwned(context, own) {
     captureAccount,
     isAccountCurrent,
   });
-  const initialization = connectionManager.initialize();
-  void initialization.then(async result => {
-    await handleAuthenticationResult(result, {
-      showSuccess: false,
-      offerDefault: false,
-      reportFailure: false,
-    });
-  }).catch(() => {
-    console.warn("[Cloudsmith] Connection initialization did not complete cleanly.");
-  });
-
   own(registerAuthenticationCommands({
     ...sharedCommandDependencies,
     credentialManager,
@@ -492,6 +480,50 @@ async function activateOwned(context, own) {
     generateTerraformConfig,
     FORMAT_OPTIONS,
   }));
+
+  // Commands and their authoritative runtime guards are available before
+  // startup storage, cache, context, credential validation, migration, or
+  // refresh work begins. Each startup promise is activation-owned and
+  // observed; owned resources revoke publication on deactivation without
+  // making reload wait.
+  observe(
+    Promise.resolve().then(() => searchProvider.projectCurrentContext()),
+    () => console.warn("[Cloudsmith] Search presentation initialization did not complete cleanly.")
+  );
+  observe(
+    Promise.resolve().then(() => dependencyHealthProvider.projectCurrentContext()),
+    () => console.warn("[Cloudsmith] Dependency presentation initialization did not complete cleanly.")
+  );
+  observe(
+    Promise.resolve().then(() => setHasMultipleWorkspacesContext(
+      context,
+      false,
+      { workspaceContextProjector }
+    )),
+    () => console.warn("[Cloudsmith] Workspace presentation initialization did not complete cleanly.")
+  );
+  observe(
+    Promise.resolve().then(() => connectionManager.projectCurrentConnectionContext()),
+    () => console.warn("[Cloudsmith] Connection indicator initialization did not complete cleanly.")
+  );
+  observe(
+    Promise.resolve().then(() => projectConnectionPresentation(connectionManager.getState())),
+    () => console.warn("[Cloudsmith] Connection presentation initialization did not complete cleanly.")
+  );
+  observe(
+    Promise.resolve().then(() => upstreamRuntime.initialize()),
+    () => console.warn("[Cloudsmith] Upstream runtime initialization did not complete cleanly.")
+  );
+  observe(
+    Promise.resolve()
+      .then(() => connectionManager.initialize())
+      .then(result => handleAuthenticationResult(result, {
+        showSuccess: false,
+        offerDefault: false,
+        reportFailure: false,
+      })),
+    () => console.warn("[Cloudsmith] Connection initialization did not complete cleanly.")
+  );
 }
 
 // This method is called when your extension is deactivated
