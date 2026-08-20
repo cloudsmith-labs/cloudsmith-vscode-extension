@@ -44,6 +44,23 @@ suite("Package Metadata Flow Test Suite", () => {
     },
   };
 
+  test("package and search rows expose version, format, repository, and material state as text", () => {
+    const statefulPackage = {
+      ...pkg,
+      status_str: "Syncing",
+      policy_violated: true,
+    };
+    const packageItem = new PackageNode(statefulPackage, {}).getTreeItem();
+    const searchItem = new SearchResultNode(statefulPackage, {}).getTreeItem();
+    for (const item of [packageItem, searchItem]) {
+      assert.match(item.description, /1\.0\.0/);
+      assert.match(item.description, /raw/);
+      assert.match(item.description, /Syncing/);
+      assert.match(item.description, /Policy violation/);
+    }
+    assert.match(searchItem.description, /repo/);
+  });
+
   setup(() => {
     originalGetConfiguration = vscode.workspace.getConfiguration;
     vscode.workspace.getConfiguration = () => ({
@@ -360,17 +377,21 @@ suite("Package Metadata Flow Test Suite", () => {
     const details = node => node.getChildren().map(child => child.getTreeItem());
     assert.strictEqual(
       details(statusNode).find(item => item.tooltip.startsWith("Status:")).label,
-      "Completed"
+      "Status"
     );
+    assert.strictEqual(details(statusNode).find(item => item.tooltip.startsWith("Status:")).description, "Completed");
     assert.strictEqual(
       details(policyNode).find(item => item.tooltip.startsWith("Status:")).label,
-      "Policy quarantined"
+      "Status"
     );
+    assert.strictEqual(details(policyNode).find(item => item.tooltip.startsWith("Status:")).description, "Policy quarantined");
     for (const node of [noStatusNode, ...invalidDisplayNodes]) {
       const items = details(node);
       assert.strictEqual(items.some(item => item.tooltip.startsWith("Status:")), false);
-      assert.ok(items.some(item => item.tooltip.startsWith("Version:") && item.label === "1.0.0"));
-      assert.strictEqual(items.some(item => ["Not available", "Unknown", "undefined", "[object Object]"].includes(item.label)), false);
+      assert.ok(items.some(item => item.tooltip.startsWith("Version:") && item.label === "Version" && item.description === "1.0.0"));
+      assert.strictEqual(items.some(item => [item.label, item.description].some(value => (
+        ["Not available", "Unknown", "undefined", "[object Object]"].includes(value)
+      ))), false);
     }
     assert.throws(() => fromApiPackageRecord({ ...pkg, status_str: "" }), /status/);
   });

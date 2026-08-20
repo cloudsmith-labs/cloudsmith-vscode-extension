@@ -3,7 +3,7 @@
   "publisher": "Cloudsmith",
   "displayName": "Cloudsmith VS Code",
   "description": "Access packages from a Cloudsmith instance.",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "license": "SEE LICENSE IN LICENSE",
   "homepage": "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/blob/main/README.md",
   "bugs": {
@@ -24,13 +24,33 @@
     "views/**/*.js",
     "media/icon.svg",
     "media/logo.png",
-    "media/repo.png",
     "media/workspace_dark.svg",
     "media/workspace_light.svg",
-    "media/readme/*.gif",
-    "media/readme/*.jpg",
-    "media/readme/*.png",
-    "media/vscode_icons/file_type_*.svg",
+    "media/readme/brand-banner.png",
+    "media/vscode_icons/file_type_alpine.svg",
+    "media/vscode_icons/file_type_cargo.svg",
+    "media/vscode_icons/file_type_composer.svg",
+    "media/vscode_icons/file_type_conan.svg",
+    "media/vscode_icons/file_type_conda.svg",
+    "media/vscode_icons/file_type_dart.svg",
+    "media/vscode_icons/file_type_deb.svg",
+    "media/vscode_icons/file_type_docker.svg",
+    "media/vscode_icons/file_type_elixir.svg",
+    "media/vscode_icons/file_type_go.svg",
+    "media/vscode_icons/file_type_helm.svg",
+    "media/vscode_icons/file_type_lua.svg",
+    "media/vscode_icons/file_type_maven.svg",
+    "media/vscode_icons/file_type_npm.svg",
+    "media/vscode_icons/file_type_nuget.svg",
+    "media/vscode_icons/file_type_python.svg",
+    "media/vscode_icons/file_type_r.svg",
+    "media/vscode_icons/file_type_rpm.svg",
+    "media/vscode_icons/file_type_ruby.svg",
+    "media/vscode_icons/file_type_rust.svg",
+    "media/vscode_icons/file_type_swift.svg",
+    "media/vscode_icons/file_type_terraform.svg",
+    "media/vscode_icons/file_type_vagrant.svg",
+    "media/vscode_icons/file_type_light_rust.svg",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -921,7 +941,8 @@
         "cloudsmith-vsc.autoScanOnOpen": {
           "type": "boolean",
           "default": false,
-          "description": "Automatically scan project dependencies against Cloudsmith when a workspace is opened. Requires a configured Cloudsmith workspace."
+          "description": "Deprecated compatibility setting. This setting has no effect.",
+          "deprecationMessage": "This setting has no effect and is retained only so existing configuration remains valid."
         },
         "cloudsmith-vsc.dependencyScanWorkspace": {
           "type": "string",
@@ -973,7 +994,7 @@
         "cloudsmith-vsc.showLegacyPolicies": {
           "type": "boolean",
           "default": false,
-          "description": "Show legacy classic policy violation fields (deny, license, vulnerability). Disable if the workspace only uses Enterprise Policy Manager."
+          "description": "Show classic policy violation fields (deny, license, vulnerability). Disable if the workspace uses current policy management."
         },
         "cloudsmith-vsc.restrictiveLicenses": {
           "type": "array",
@@ -1005,7 +1026,8 @@
         "cloudsmith-vsc.showRepoMetrics": {
           "type": "boolean",
           "default": false,
-          "description": "Show storage and bandwidth usage for repositories."
+          "description": "Deprecated compatibility setting. This setting has no effect.",
+          "deprecationMessage": "This setting has no effect and is retained only so existing configuration remains valid."
         }
       }
     }
@@ -1014,8 +1036,9 @@
     "build": "node scripts/verify-build.js",
     "syntax": "node scripts/check-syntax.js",
     "lint": "eslint . --max-warnings 0",
-    "check": "npm run lint && npm run syntax && npm run build && npm run verify:architecture && npm run verify:version",
+    "check": "npm run lint && npm run syntax && npm run build && npm run verify:architecture && npm run verify:polish && npm run verify:version",
     "verify:architecture": "node scripts/architecture/verify.js",
+    "verify:polish": "node scripts/polish/verify.js",
     "verify:version": "node scripts/release/verify-version.js",
     "audit:runtime": "node scripts/release/verify-dependency-audit.js runtime",
     "audit:dev": "node scripts/release/verify-dependency-audit.js development",

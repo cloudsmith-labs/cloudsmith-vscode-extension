@@ -1644,6 +1644,13 @@ suite("Command registrars", () => {
     const pending = recorder.handlers.get("cloudsmith-vsc.depSortFilter")();
     await Promise.resolve();
     assert.strictEqual(showCalls, 1);
+    assert.strictEqual(quickPick.items.filter(item => item.description?.startsWith("Current sort")).length, 1);
+    assert.strictEqual(quickPick.items.filter(item => item.description?.startsWith("Current filter")).length, 1);
+    assert.match(quickPick.items.find(item => item.description?.startsWith("Current sort")).description, /Alphabetical|Default ordering/);
+    assert.strictEqual(
+      quickPick.items.find(item => item.description?.startsWith("Current filter")).description,
+      "Current filter · No filter applied"
+    );
     disposable.dispose();
     await pending;
     assert.strictEqual(hideCalls, 1);

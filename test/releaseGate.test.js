@@ -1,5 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const assert = require("assert");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -16,7 +17,7 @@ const {
 
 function auditLockfile(packageName = "affected") {
   const packages = {
-    "": { name: "cloudsmith-vsc", version: "2.2.0" },
+    "": { name: "cloudsmith-vsc", version: "2.3.0" },
   };
   for (const packagePath of [
     "node_modules/@vscode/vsce-sign",
@@ -146,26 +147,43 @@ suite("M9 release gate helpers", () => {
 
   test("version policy rejects manifest, lockfile, and changelog drift", () => {
     const state = {
-      manifest: { name: "cloudsmith-vsc", publisher: "Cloudsmith", version: "2.2.0" },
+      manifest: { name: "cloudsmith-vsc", publisher: "Cloudsmith", version: "2.3.0" },
       lockfile: {
         name: "cloudsmith-vsc",
-        version: "2.2.0",
-        packages: { "": { name: "cloudsmith-vsc", version: "2.2.0" } },
+        version: "2.3.0",
+        packages: { "": { name: "cloudsmith-vsc", version: "2.3.0" } },
       },
-      changelog: "## Unreleased\n\n## 2.2.0 - August 2026\n",
+      changelog: "## Unreleased\n\n## 2.3.0 - August 2026\n\n## 2.2.0 - August 2026\n",
     };
     assert.deepStrictEqual(assertVersionState(state), {
       name: "cloudsmith-vsc",
       publisher: "Cloudsmith",
-      version: "2.2.0",
+      version: "2.3.0",
     });
     assert.throws(
       () => assertVersionState({ ...state, changelog: "## 2.1.0\n" }),
-      /2.2.0/,
+      /2.3.0/,
     );
     assert.throws(
       () => assertVersionState({ ...state, manifest: { ...state.manifest, name: "../unsafe\nname" } }),
       /safe lowercase/,
+    );
+  });
+
+  test("changelog preserves released 2.2.0 history below 2.3.0", () => {
+    const changelog = fs.readFileSync(path.join(__dirname, "../CHANGELOG.md"), "utf8");
+    const currentStart = changelog.indexOf("## 2.3.0 - August 2026");
+    const releasedStart = changelog.indexOf("## 2.2.0 - August 2026");
+    const olderStart = changelog.indexOf("## 2.1.1 - April 2026");
+    const releasedSection = changelog.slice(releasedStart, olderStart).replace(/\r\n/g, "\n");
+    const releasedSectionHash = crypto.createHash("sha256").update(releasedSection).digest("hex");
+
+    assert.ok(currentStart >= 0 && releasedStart > currentStart);
+    assert.ok(olderStart > releasedStart);
+    assert.strictEqual(
+      releasedSectionHash,
+      "bef2948304e549036a73149c6456b7a59394834ee3aaed29b39ea3b9efa574fd",
+      "2.2.0 changelog history must match the released source"
     );
   });
 

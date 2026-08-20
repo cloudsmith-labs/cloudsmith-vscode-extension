@@ -2,6 +2,7 @@ const assert = require("assert");
 const { UpstreamPreviewProvider } = require("../views/upstreamPreviewProvider");
 const { UpstreamChecker } = require("../util/upstreamChecker");
 const { apiSuccess } = require("./apiResultHelpers");
+const { assertWebviewDocument } = require("./helpers/webviewSemanticContract");
 
 suite("UpstreamPreviewProvider Test Suite", () => {
   test("renders upstream resolution details without any policy section", () => {
@@ -43,11 +44,12 @@ suite("UpstreamPreviewProvider Test Suite", () => {
       },
       canResolveViaUpstream: true,
     });
+    assertWebviewDocument(html, { tables: true });
 
     assert.ok(html.includes("Upstream resolution preview"));
     assert.ok(html.includes("PyPI"));
     assert.ok(html.includes("Legacy mirror"));
-    assert.ok(html.includes("<th>Origin</th>"));
+    assert.ok(html.includes('<th scope="col">Origin</th>'));
     assert.match(html, /<td class="mono">https:\/\/pypi\.org<\/td>/);
     assert.ok(!html.includes("/simple/"));
     assert.ok(html.includes("Upstreams (1 active of 2)"));

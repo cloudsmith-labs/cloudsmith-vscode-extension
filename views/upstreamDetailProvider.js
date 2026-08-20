@@ -172,7 +172,10 @@ class UpstreamDetailProvider {
     const panel = this._panel;
     if (!panel) return;
     panel.webview.html = this._lastSettled
-      ? this._getHtmlContent(workspace, repoSlug, repoName, this._lastSettled, { refreshing: true })
+      ? this._getHtmlContent(workspace, repoSlug, repoName, this._lastSettled, {
+          refreshing: true,
+          retryFocus: "pending",
+        })
       : this._getLoadingHtml(workspace, repoSlug, repoName);
     const promise = this._fetchGroupedUpstreams(workspace, repoSlug, abortController.signal, {
       bypassCache: true,
@@ -191,14 +194,18 @@ class UpstreamDetailProvider {
         repoName,
         settled,
         settled.retainedFormats.length > 0 || result.complete !== true
-          ? { refreshFailed: true }
-          : {}
+          ? { refreshFailed: true, retryFocus: "settled" }
+          : { retryFocus: "settled" }
       );
     } catch {
       if (this._canRender(panel, requestId) && !abortController.signal.aborted) {
         const result = this._lastSettled || failedFetchState();
         panel.webview.html = this._getHtmlContent(
-          workspace, repoSlug, repoName, result, { refreshFailed: true }
+          workspace,
+          repoSlug,
+          repoName,
+          result,
+          { refreshFailed: true, retryFocus: "settled" }
         );
       }
     } finally {
@@ -351,7 +358,9 @@ class UpstreamDetailProvider {
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none';">
+  <title>Loading upstreams for ${this._escape(repoName)}</title>
   <style>
     body {
       margin: 0;
@@ -360,7 +369,7 @@ class UpstreamDetailProvider {
       color: var(--vscode-foreground);
       background: var(--vscode-editor-background);
     }
-    h2 {
+    h1 {
       margin: 0 0 4px 0;
       font-size: 1.35em;
       font-weight: 600;
@@ -381,9 +390,11 @@ class UpstreamDetailProvider {
   </style>
 </head>
 <body>
-  <h2>${this._escape(repoName)}</h2>
+<main aria-busy="true">
+  <h1>${this._escape(repoName)}</h1>
   <p class="subtle">${this._escape(workspace)}/${this._escape(repoSlug)}</p>
-  <p class="loading-copy">Loading upstreams...</p>
+  <p class="loading-copy" role="status" aria-live="polite">Loading upstreams...</p>
+</main>
 </body>
 </html>`;
   }
@@ -414,9 +425,12 @@ class UpstreamDetailProvider {
       const displayed = upstreams.slice(0, remaining);
       renderedCount += displayed.length;
       if (displayed.length === 0) continue;
-      const cards = displayed.map((upstream) => this._renderUpstreamCard(upstream)).join("\n");
+      const firstCardNumber = renderedCount - displayed.length + 1;
+      const cards = displayed.map((upstream, index) => (
+        this._renderUpstreamCard(upstream, `upstream-title-${firstCardNumber + index}`)
+      )).join("\n");
       formatSections.push(`<section class="format-group">
-  <div class="format-header">${this._escape(format)}</div>
+  <h2 class="format-header">${this._escape(format)}</h2>
   <div class="card-list">
     ${cards}
   </div>
@@ -430,7 +444,7 @@ class UpstreamDetailProvider {
     )).join("");
     const retryable = getRetryFormats(fetchState).length > 0;
     const partialWarning = hasLoadedUpstreams && hasFailures
-      ? `<div class="error-state">
+      ? `<div class="error-state" role="status">
   <span class="error-state-title">Some upstream data could not be loaded.</span>
   ${this._escape(successfulFormats || 0)} formats loaded. The configured total is not available.
   ${safeFailureList ? `<ul>${safeFailureList}</ul>` : this._escape(
@@ -439,16 +453,16 @@ class UpstreamDetailProvider {
 </div>`
       : "";
     const refreshNotice = options.refreshing
-      ? `<p class="subtle">Refreshing upstreams… Existing results remain visible.</p>`
+      ? `<p class="subtle" data-retry-progress role="status" aria-live="polite" tabindex="-1">Refreshing upstreams… Existing results remain visible.</p>`
       : options.refreshFailed
-        ? `<p class="subtle">Refresh failed; showing the previous verified results.${
+        ? `<p class="subtle" role="status">Refresh failed; showing the previous verified results.${
           Array.isArray(fetchState.retainedFormats) && fetchState.retainedFormats.length > 0
             ? ` Previously verified: ${this._escape(fetchState.retainedFormats.join(", "))}.`
             : ""
         }</p>`
         : "";
     const retryButton = retryable
-      ? `<button id="retry" type="button">${options.refreshing ? "Retrying…" : "Retry"}</button>`
+      ? `<button id="retry" type="button">${options.refreshing ? "Retrying…" : "Retry"}</button><span id="retry-status" class="sr-only" role="status" aria-live="polite" tabindex="-1"></span>`
       : "";
     const displayLimitNotice = loadedCount > renderedCount
       ? `<p class="subtle">Showing ${renderedCount} of ${loadedCount} loaded upstreams.</p>`
@@ -457,20 +471,34 @@ class UpstreamDetailProvider {
       ? `${refreshNotice}${partialWarning}${displayLimitNotice}${formatSections.join("\n")}${retryButton}`
       : `${refreshNotice}${this._getEmptyOrErrorState(hasFailures, successfulFormats, failures)}${retryButton}`;
     const nonce = crypto.randomBytes(16).toString("base64");
-    const script = retryButton ? `<script nonce="${nonce}">
+    const script = `<script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
   const retry = document.getElementById("retry");
   retry?.addEventListener("click", () => {
-    retry.disabled = true;
+    const status = document.getElementById("retry-status");
+    if (status) {
+      status.textContent = "Refreshing upstreams...";
+      status.focus();
+    }
     vscode.postMessage({ command: "retry" });
   });
-</script>` : "";
+  const retryFocus = ${JSON.stringify(options.retryFocus || null)};
+  if (retryFocus) {
+    const target = retryFocus === "pending"
+      ? document.querySelector("[data-retry-progress]")
+      : document.getElementById("retry")
+        || document.querySelector("[data-result-summary]");
+    if (target) target.focus();
+  }
+</script>`;
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none';">
+  <title>Upstreams for ${this._escape(repoName)}</title>
   <style>
     body {
       margin: 0;
@@ -599,12 +627,28 @@ class UpstreamDetailProvider {
       margin: 8px 0 0 0;
       color: var(--vscode-descriptionForeground);
     }
+    button:focus-visible, [tabindex="-1"]:focus-visible {
+      outline: 2px solid var(--vscode-focusBorder);
+      outline-offset: 2px;
+    }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .details-grid div { display: contents; }
+    .details-grid dt, .details-grid dd { margin: 0; }
+    @media (max-width: 480px) {
+      body { padding: 12px; }
+      .card-header { align-items: flex-start; flex-direction: column; }
+      .status-badges { justify-content: flex-start; }
+      .details-grid { grid-template-columns: 1fr; gap: 2px; }
+      .details-grid dd { margin-bottom: 8px; }
+    }
   </style>
 </head>
 <body>
-  <h1>${this._escape(repoName)}</h1>
+<main${options.refreshing ? ' aria-busy="true"' : ""}>
+  <h1 data-result-summary tabindex="-1">${this._escape(repoName)}</h1>
   <p class="repo-meta">${this._escape(workspace)}/${this._escape(repoSlug)}</p>
   ${contentHtml}
+</main>
   ${script}
 </body>
 </html>`;
@@ -624,14 +668,14 @@ class UpstreamDetailProvider {
       )}</li>`
     )).join("");
 
-    return `<div class="error-state">
+    return `<div class="error-state" role="alert">
   <span class="error-state-title">Could not load upstreams.</span>
   ${this._escape(detail)}
   ${lines ? `<ul>${lines}</ul>` : ""}
 </div>`;
   }
 
-  _renderUpstreamCard(upstream) {
+  _renderUpstreamCard(upstream, titleId = "upstream-title") {
     const isActive = upstream.is_active !== false;
     const statusLabel = isActive ? "Active" : "Inactive";
     const statusClass = isActive ? "status-badge-active" : "status-badge-inactive";
@@ -650,17 +694,17 @@ class UpstreamDetailProvider {
       this._renderDetail("Created", this._formatCreatedAt(upstream.created_at), ""),
     ].filter(Boolean).join("\n");
 
-    return `<article class="upstream-card">
+    return `<article class="upstream-card" aria-labelledby="${titleId}">
   <div class="card-header">
-    <div class="card-title">${this._escape(formatUpstreamText(upstream.name, "Unnamed"))}</div>
+    <h3 id="${titleId}" class="card-title">${this._escape(formatUpstreamText(upstream.name, "Unnamed"))}</h3>
     <div class="status-badges">
       <span class="status-badge ${statusClass}">${this._escape(statusLabel)}</span>
       ${this._renderTrustBadge(upstream)}
     </div>
   </div>
-  <div class="details-grid">
+  <dl class="details-grid">
     ${details}
-  </div>
+  </dl>
 </article>`;
   }
 
@@ -669,7 +713,7 @@ class UpstreamDetailProvider {
     if (!displayValue) return "";
 
     const className = valueClass ? `detail-value ${valueClass}` : "detail-value";
-    return `<div class="detail-label">${label}</div><div class="${className}">${this._escape(displayValue)}</div>`;
+    return `<div><dt class="detail-label">${label}</dt><dd class="${className}">${this._escape(displayValue)}</dd></div>`;
   }
 
   _renderTrustBadge(upstream) {

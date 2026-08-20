@@ -9,6 +9,7 @@ const { packageCollectionIdentity } = require("../util/collectionIdentity");
 const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const VulnerabilitySummaryNode = require("./vulnerabilitySummaryNode");
 const { markSelection } = require("../util/selectionProvenance");
+const { buildPackageRowDescription } = require("../util/packageTreePresentation");
 
 class PackageNode {
   constructor(pkg, context, options = {}) {
@@ -23,7 +24,7 @@ class PackageNode {
       : () => {};
     this._lifecycleSignal = options.lifecycleSignal || null;
     this.slug = { id: "Slug", value: packageModel.slug };
-    this.slug_perm = { id: "Slug", value: packageModel.packageIdentifier };
+    this.slug_perm = { id: "Permanent slug", value: packageModel.packageIdentifier };
     this.name = packageModel.name;
     this.status_str = { id: "Status", value: packageModel.status };
     this.downloads = { id: "Downloads", value: String(packageModel.downloads ?? 0) };
@@ -166,7 +167,7 @@ class PackageNode {
       parts.push("Vulnerability policy violated");
     }
     if (this.status_str_raw === "Quarantined" || this.policy_violated || this.deny_policy_violated) {
-      parts.push("Right-click \u2192 Explain quarantine or find safe version");
+      parts.push("Open the context menu to explain quarantine or find a safe version");
     }
     return parts.join(" — ");
   }
@@ -195,19 +196,18 @@ class PackageNode {
       iconPath = this._getFormatIcon();
     }
 
-    // Build description: combine quarantine and upstream origin info
-    const descParts = [];
-    if (status === "Quarantined") {
-      descParts.push("Quarantined \u2014 right-click for details");
-    }
-    if (this.upstreamSource) {
-      descParts.push("(via upstream)");
-    }
-    const description = descParts.length > 0 ? descParts.join(" ") : undefined;
+    const description = buildPackageRowDescription({
+      version: this.version.value,
+      format: this.format,
+      status,
+      policyViolated: this.policy_violated,
+      denyPolicyViolated: this.deny_policy_violated,
+      upstreamSource: this.upstreamSource,
+    });
 
     return {
       label: pkg,
-      description: description,
+      description,
       tooltip: this._buildTooltip(),
       collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
       contextValue: status === "Quarantined"
@@ -271,7 +271,7 @@ class PackageNode {
       this.uploaded_at,
       this.slug,
       this.slug_perm,
-      { id: "Namespace", value: this.namespace },
+      { id: "Workspace", value: this.namespace },
     ];
     children.push(new DetailGroupNode(
       "More Details",

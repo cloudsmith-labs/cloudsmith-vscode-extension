@@ -5,6 +5,7 @@ const path = require("path");
 const zlib = require("zlib");
 const { spawnSync } = require("child_process");
 const yauzl = require("yauzl");
+const { FORMAT_ICON_FILES } = require("../../util/formatIconInventory");
 
 const root = path.resolve(__dirname, "../..");
 const limits = Object.freeze({
@@ -19,9 +20,10 @@ const generatedEntries = new Set(["[Content_Types].xml", "extension.vsixmanifest
 const baseMedia = new Set([
   "media/icon.svg",
   "media/logo.png",
-  "media/repo.png",
   "media/workspace_dark.svg",
   "media/workspace_light.svg",
+  "media/readme/brand-banner.png",
+  ...FORMAT_ICON_FILES,
 ]);
 const documentMappings = new Map([
   ["README.md", "extension/readme.md"],
@@ -68,10 +70,7 @@ function isApprovedSourcePath(sourcePath) {
   if (baseMedia.has(sourcePath)) {
     return true;
   }
-  if (/^media\/readme\/[^/]+\.(?:gif|jpg|png)$/.test(sourcePath)) {
-    return true;
-  }
-  return /^media\/vscode_icons\/file_type_[^/]+\.svg$/.test(sourcePath);
+  return false;
 }
 
 function sourceToArchivePath(sourcePath) {

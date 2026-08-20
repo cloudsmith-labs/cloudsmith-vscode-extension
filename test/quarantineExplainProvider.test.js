@@ -6,6 +6,7 @@ const { fromPackageSelection } = require("../domain/packageAdapters");
 const { QuarantineExplainProvider } = require("../views/quarantineExplainProvider");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { createWebviewPanelHarness } = require("./helpers/webviewPanelHarness");
+const { assertWebviewDocument } = require("./helpers/webviewSemanticContract");
 
 suite("QuarantineExplainProvider", () => {
   function trace(overrides = {}) {
@@ -43,7 +44,8 @@ suite("QuarantineExplainProvider", () => {
 
   test("renders a focused status-reason explanation without backend-gap copy", () => {
     const html = render();
-    assert.match(html, /<h1>artifact 1\.0\.0<\/h1>/);
+    assertWebviewDocument(html, { interactive: true, scripted: true });
+    assert.match(html, /<h1[^>]*>artifact 1\.0\.0<\/h1>/);
     assert.match(html, />Quarantined</);
     assert.match(html, /<dt>Policy<\/dt><dd>Dependency policy<\/dd>/);
     assert.match(html, /Dependency rule matched/);
@@ -314,13 +316,13 @@ suite("QuarantineExplainProvider", () => {
 
       assert.strictEqual(panelHarness.panelCalls.length, 1);
       assert.match(packageEndpoints[0], /^packages\/workspace-a\/repo-a\/package-a\//);
-      assert.match(panelHarness.panel.webview.html, /<h1>artifact 1\.0\.0<\/h1>/);
+      assert.match(panelHarness.panel.webview.html, /<h1[^>]*>artifact 1\.0\.0<\/h1>/);
       assert.match(panelHarness.panel.webview.html, /Dependency rule matched/);
       assert.match(panelHarness.panel.webview.html, /Refreshing current package status/);
 
       resolveCurrent(apiSuccess(freshPackage()));
       await pending;
-      assert.match(panelHarness.panel.webview.html, /<h1>artifact 1\.0\.0<\/h1>/);
+      assert.match(panelHarness.panel.webview.html, /<h1[^>]*>artifact 1\.0\.0<\/h1>/);
       assert.match(panelHarness.panel.webview.html, /Dependency rule matched/);
       assert.doesNotMatch(panelHarness.panel.webview.html, /Refreshing current package status/);
     }
@@ -337,6 +339,35 @@ suite("QuarantineExplainProvider", () => {
     assert.match(panelHarness.panel.webview.html, /Could not load quarantine details/);
     await panelHarness.send({ command: "findSafeVersion" });
     assert.deepStrictEqual(effects, []);
+  });
+
+  test("keeps retry focus intent through loading and settles it in the same panel", async () => {
+    const panelHarness = createWebviewPanelHarness();
+    let calls = 0;
+    let resolveRetry;
+    const retryResult = new Promise(resolve => { resolveRetry = resolve; });
+    const provider = providerWith(panelHarness, {
+      async get() {
+        calls += 1;
+        return calls === 1
+          ? apiFailure("server_error", { status: 500 })
+          : retryResult;
+      },
+      async getV2() { return emptyDecisionPage(); },
+    });
+    await provider.show(exactPackage());
+    assert.match(panelHarness.panel.webview.html, /data-command="retry"/);
+
+    const pending = panelHarness.send({ command: "retry" });
+    await tick();
+    assert.strictEqual(panelHarness.panelCalls.length, 1);
+    assert.match(panelHarness.panel.webview.html, /const retryFocus = "pending"/);
+    assert.match(panelHarness.panel.webview.html, /data-retry-progress/);
+
+    resolveRetry(apiSuccess(freshPackage()));
+    await pending;
+    assert.match(panelHarness.panel.webview.html, /const retryFocus = "settled"/);
+    assert.match(panelHarness.panel.webview.html, /data-result-summary/);
   });
 
   test("fresh package 404 renders a stable unavailable state without enrichment", async () => {

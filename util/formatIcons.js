@@ -2,30 +2,10 @@
 const fs = require("fs");
 const vscode = require("vscode");
 const { canonicalFormat } = require("./packageNameNormalizer");
-
-const FORMAT_ICON_KEYS = Object.freeze({
-  cargo: "cargo",
-  composer: "composer",
-  conda: "conda",
-  dart: "dart",
-  docker: "docker",
-  elixir: "elixir",
-  gem: "ruby",
-  go: "go",
-  golang: "go",
-  gradle: "maven",
-  helm: "helm",
-  hex: "elixir",
-  maven: "maven",
-  npm: "npm",
-  nuget: "nuget",
-  php: "php",
-  pypi: "python",
-  python: "python",
-  ruby: "ruby",
-  rust: "rust",
-  swift: "swift",
-});
+const {
+  FORMAT_ICON_KEYS,
+  NATIVE_FORMAT_ICONS,
+} = require("./formatIconInventory");
 
 const warnedMissingIcons = new Set();
 
@@ -38,7 +18,16 @@ function getFormatIconPath(format, extensionPath, options = {}) {
     return fallbackIcon;
   }
 
-  const iconKey = FORMAT_ICON_KEYS[normalizedFormat] || normalizedFormat;
+  const nativeIcon = NATIVE_FORMAT_ICONS[normalizedFormat];
+  if (nativeIcon) {
+    return new vscode.ThemeIcon(nativeIcon);
+  }
+
+  const iconKey = FORMAT_ICON_KEYS[normalizedFormat];
+  if (!iconKey) {
+    warnMissingIconOnce(normalizedFormat);
+    return fallbackIcon;
+  }
   const iconPath = resolveThemedIconPath(extensionPath, iconKey);
   if (iconPath) {
     return iconPath;

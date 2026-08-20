@@ -4,13 +4,14 @@
 // Similar to PackageNode but includes repository context and status-based icons.
 
 const vscode = require("vscode");
-const path = require("path");
 const PackageDetailsNode = require("./packageDetailsNode");
 const { LicenseClassifier } = require("../util/licenseClassifier");
+const { getFormatIconPath } = require("../util/formatIcons");
 const { packageCollectionIdentity } = require("../util/collectionIdentity");
 const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const VulnerabilitySummaryNode = require("./vulnerabilitySummaryNode");
 const { markSelection } = require("../util/selectionProvenance");
+const { buildPackageRowDescription } = require("../util/packageTreePresentation");
 
 class SearchResultNode {
     constructor(pkg, context, options = {}) {
@@ -32,7 +33,7 @@ class SearchResultNode {
         this.is_copyable = packageModel.copyable;
         this.status_str = { id: "Status", value: packageModel.status };
         this.slug = { id: "Slug", value: packageModel.slug };
-        this.slug_perm = { id: "Slug", value: packageModel.packageIdentifier };
+        this.slug_perm = { id: "Permanent slug", value: packageModel.packageIdentifier };
         this.downloads = { id: "Downloads", value: String(packageModel.downloads ?? 0) };
         this.version = { id: "Version", value: packageModel.version };
         this.uploaded_at = { id: "Uploaded at", value: packageModel.uploadedAt };
@@ -139,8 +140,7 @@ class SearchResultNode {
         if (format === "raw") {
             return new vscode.ThemeIcon("file-binary");
         }
-        const iconURI = "file_type_" + format + ".svg";
-        return path.join(__filename, "..", "..", "media", "vscode_icons", iconURI);
+        return getFormatIconPath(format, this.context && this.context.extensionPath);
     }
 
     _buildTooltip() {
@@ -164,7 +164,7 @@ class SearchResultNode {
             parts.push("Vulnerability policy violated");
         }
         if (this.status_str_raw === "Quarantined" || this.policy_violated || this.deny_policy_violated) {
-            parts.push("Right-click \u2192 Explain quarantine or find safe version");
+            parts.push("Open the context menu to explain quarantine or find a safe version");
         }
         return parts.join(" — ");
     }
@@ -192,18 +192,19 @@ class SearchResultNode {
             iconPath = this._getFormatIcon();
         }
 
-        // Build description: version + repo + optional quarantine/upstream info
-        const descParts = [`${this.version.value}  (${this.repository})`];
-        if (status === "Quarantined") {
-            descParts.push("Quarantined");
-        }
-        if (this.upstreamSource) {
-            descParts.push("(via upstream)");
-        }
+        const description = buildPackageRowDescription({
+            version: this.version.value,
+            format: this.format,
+            repository: this.repository,
+            status,
+            policyViolated: this.policy_violated,
+            denyPolicyViolated: this.deny_policy_violated,
+            upstreamSource: this.upstreamSource,
+        });
 
         return {
             label: this.name,
-            description: descParts.join(" "),
+            description,
             tooltip: this._buildTooltip(),
             collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
             contextValue: status === "Quarantined"
@@ -266,7 +267,7 @@ class SearchResultNode {
             this.uploaded_at,
             this.slug,
             this.slug_perm,
-            { id: "Namespace", value: this.namespace },
+            { id: "Workspace", value: this.namespace },
         ];
         children.push(new DetailGroupNode(
             "More Details",

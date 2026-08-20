@@ -1,3 +1,22 @@
+## 2.3.0 - August 2026
+
+### Reliability and security
+
+- Hardened Dependency Health across all 14 supported ecosystem families and their manifest and lockfile variants, improving direct/transitive relationships, provenance, large-graph handling, cancellation, and protection against false covered or complete results.
+- Made broad package search and pagination reliable across overlapping requests, refreshes, account changes, and stale workspace or repository selections.
+- Made authentication startup and account switching atomic so valid stored credentials no longer appear disconnected during validation and old-account data cannot publish after a switch.
+- Hardened package identity, install-command input, file, path, URL, redirect, WebView message, and API processing boundaries so malformed or stale data cannot drive actions or expose credentials.
+
+### Vulnerability, upstream, and package workflows
+
+- Made vulnerability results fail-safe across clean, vulnerable, partial, unknown, and failed states so incomplete evidence is not presented as clean, with more reliable safe-version and quarantine remediation.
+- Improved upstream inventory, retries, resolution preview, Dependency Health coverage, and pull-through preparation while preserving partial-result truth and account isolation.
+- Made Command Palette, context-menu, and view-title actions state-aware, with deterministic package, workspace, and repository recovery for global commands and safe cancellation of stale prompts.
+
+### Accessibility
+
+- Improved keyboard navigation, focus visibility, high-contrast support, and screen-reader semantics across package details, Dependency Health controls, and custom Cloudsmith WebViews.
+
 ## 2.2.0 - August 2026
 ### Transitive Dependency Visibility
 
@@ -201,5 +220,3 @@ This release transforms the extension from a basic package explorer into a full 
 
 - Initial release of the Cloudsmith extension. The extension in this release provides a package explorer for your Cloudsmith instance.
 - Future releases will continue to build upon this with further capabilities and features. 
-
-
