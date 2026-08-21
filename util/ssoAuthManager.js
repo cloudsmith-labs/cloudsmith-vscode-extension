@@ -5,6 +5,7 @@ const os = require("os");
 const path = require("path");
 const vscode = require("vscode");
 const { createSSOCredential, normalizeAPIKey, normalizeBearerToken } = require("./credentialEnvelope");
+const { recordSSODiagnostic } = require("./ssoDiagnostics");
 const { SSOProtocolClient, isValidWorkspace } = require("./ssoProtocolClient");
 
 const SAML_CALLBACK_PORT = 12400;
@@ -41,10 +42,12 @@ class SSOAuthManager {
     this._env = options.env || process.env;
     this._home = options.home || os.homedir();
     this._findConfigPath = options.findCLIConfigPath || null;
+    this._diagnosticObserver = options.diagnosticObserver || null;
     this._protocol = options.protocolClient || new SSOProtocolClient({
       fetchImpl: options.fetchImpl,
       setTimeout: options.setTimeout,
       clearTimeout: options.clearTimeout,
+      diagnosticObserver: this._diagnosticObserver,
     });
     this._setTimeout = options.setTimeout || setTimeout;
     this._clearTimeout = options.clearTimeout || clearTimeout;
@@ -124,16 +127,21 @@ class SSOAuthManager {
       callback = await this._startCallbackServer(token.signal);
       if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
       const discovery = await this._protocol.discover(workspaceSlug, { signal: token.signal });
-      if (!discovery.ok) throw publicFailure(discovery.kind);
+      if (!discovery.ok) throw publicFailure(discoveryFailureKind(discovery.kind));
       if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
       const listenerOutcome = callback.getSettledOutcome();
       if (listenerOutcome && ["cancelled", "timeout", "listener_failed"].includes(listenerOutcome.kind)) {
         throw publicFailure(listenerOutcome.kind);
       }
 
-      const idpUri = vscode.Uri.parse(discovery.redirectUrl);
+      // VS Code's URI external-opener path applies encodeURI() to an already
+      // encoded URI. Passing Cloudsmith's SAML redirect as a URI therefore
+      // double-encodes its query payload. Supported extension hosts accept the
+      // original string here and preserve it through the browser boundary.
+      const idpTarget = discovery.redirectUrl;
       let opened = false;
-      try { opened = await this._openExternal(idpUri); } catch { opened = false; }
+      this._record("sso.browser.open");
+      try { opened = await this._openExternal(idpTarget); } catch { opened = false; }
       if (opened === false) {
         const retry = await this._showErrorMessage(
           "Could not open the Cloudsmith identity provider in your browser.",
@@ -142,9 +150,10 @@ class SSOAuthManager {
         );
         if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
         if (retry !== "Retry") throw publicFailure("browser_open_failed", true);
-        try { opened = await this._openExternal(idpUri); } catch { opened = false; }
+        try { opened = await this._openExternal(idpTarget); } catch { opened = false; }
         if (opened === false) throw publicFailure("browser_open_failed");
       }
+      this._record("sso.browser.open", { ok: true });
       if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
       this._showInformationMessage("Cloudsmith browser sign-in started. Waiting for the callback...");
 
@@ -160,6 +169,7 @@ class SSOAuthManager {
       let accessToken;
       let refreshToken;
       if (outcome.kind === "two_factor") {
+        this._record("sso.two-factor.prompt");
         const totp = await this._showInputBox({
           prompt: "Enter your Cloudsmith two-factor authentication code",
           password: true,
@@ -171,34 +181,51 @@ class SSOAuthManager {
         const exchange = await this._protocol.exchangeTwoFactor(outcome.twoFactorToken, totp, {
           signal: token.signal,
         });
-        if (!exchange.ok || !exchange.refreshToken) throw publicFailure(exchange.kind || "two_factor_failed");
+        if (!exchange.ok || !exchange.refreshToken) throw publicFailure("two_factor_failed");
         accessToken = exchange.accessToken;
         refreshToken = exchange.refreshToken;
       } else if (outcome.kind === "tokens") {
         accessToken = outcome.accessToken;
         refreshToken = outcome.refreshToken;
       } else {
-        throw publicFailure("invalid_callback");
+        throw publicFailure("callback_invalid_fields");
       }
 
-      const credential = createSSOCredential(accessToken, refreshToken);
-      return manager.replaceCredential(credential, token, {
+      let credential;
+      try {
+        credential = createSSOCredential(accessToken, refreshToken);
+      } catch {
+        throw publicFailure("credential_invalid");
+      }
+      this._record("sso.credential.constructed", {
+        credentialKind: "sso",
+        hasRefreshToken: Boolean(refreshToken),
+      });
+      const result = await manager.replaceCredential(credential, token, {
         workspaceSlug,
         beforeCommit: async identity => {
           const label = sanitizeDisplay(identity);
-          if (!label) return false;
+          if (!label) {
+            this._record("sso.identity.confirmation", { ok: false });
+            return false;
+          }
           const choice = await this._showInformationMessage(
             `Continue as ${label} for Cloudsmith workspace ${workspaceSlug}?`,
             { modal: true },
             "Continue"
           );
-          return choice === "Continue";
+          const confirmed = choice === "Continue";
+          this._record("sso.identity.confirmation", { ok: confirmed });
+          return confirmed;
         },
       });
+      if (result.ok) this._record("sso.connected", { credentialKind: "sso", ok: true });
+      return result;
     } catch (error) {
       if (manager.isOperationCurrent(token)) await manager.cancelCredentialOperation(token);
       const kind = error && error.kind ? error.kind : "browser_failed";
       const message = callbackErrorMessage(kind);
+      this._record("sso.failed", { errorKind: kind, ok: false });
       if (!(error && error.reported)) this._showErrorMessage(message);
       return failedResult(kind, message);
     } finally {
@@ -218,6 +245,7 @@ class SSOAuthManager {
   }
 
   async _startCallbackServer(signal) {
+    this._record("sso.callback.start");
     const sockets = new Set();
     const servers = [];
     const createdServers = [];
@@ -266,6 +294,10 @@ class SSOAuthManager {
         }
         server.on("error", onRuntimeError);
         servers.push(server);
+        this._record("sso.callback.bound", {
+          callbackFamily: host === "::1" ? "ipv6" : "ipv4",
+          ok: true,
+        });
       }
       if (servers.length === 0) throw publicFailure("listener_failed");
     } catch (error) {
@@ -304,60 +336,89 @@ class SSOAuthManager {
   }
 
   _handleCallbackRequest(request, response, finish) {
+    const family = callbackFamily(request?.socket?.localAddress);
+    this._record("sso.callback.received", family ? { callbackFamily: family } : undefined);
     const generic = (status, received = false, twoFactor = false) => {
       const nonce = this._randomBytes(18).toString("base64");
       response.writeHead(status, callbackHeaders(nonce));
       response.end(callbackHtml(nonce, received, twoFactor));
     };
+    const reject = (status, errorKind, metadata) => {
+      this._record("sso.callback.rejected", { errorKind, ok: false, ...(metadata || {}) });
+      generic(status);
+    };
     if (request.method !== "GET" || request.headers["transfer-encoding"] || Number(request.headers["content-length"] || 0) > 0) {
-      generic(405);
+      reject(request.method !== "GET" ? 405 : 400, request.method !== "GET" ? "callback_invalid_method" : "callback_invalid_body");
       return;
     }
     if (typeof request.url !== "string" || Buffer.byteLength(request.url, "utf8") > MAX_CALLBACK_TARGET_BYTES || !request.url.startsWith("/")) {
-      generic(400);
+      reject(400, "callback_invalid_path");
       return;
     }
     let parsed;
     try {
       parsed = new URL(request.url, "http://localhost");
     } catch {
-      generic(400);
+      reject(400, "callback_invalid_path");
       return;
     }
     if (parsed.origin !== "http://localhost" || parsed.pathname !== "/" || parsed.hash) {
-      generic(404);
+      reject(404, "callback_invalid_path");
       return;
     }
     const pairs = [...parsed.searchParams.entries()];
-    if (pairs.length === 0 || pairs.length > MAX_CALLBACK_PAIRS || pairs.some(([name]) => !RECOGNIZED_CALLBACK_FIELDS.has(name))) {
-      generic(400);
+    const recognizedNames = pairs.every(([name]) => RECOGNIZED_CALLBACK_FIELDS.has(name));
+    const callbackMetadata = {
+      queryPairCount: pairs.length,
+      ...(recognizedNames ? { parameterNames: pairs.map(([name]) => name) } : {}),
+    };
+    this._record("sso.callback.received", { ...callbackMetadata, ...(family ? { callbackFamily: family } : {}) });
+    if (pairs.length === 0 || pairs.length > MAX_CALLBACK_PAIRS || !recognizedNames) {
+      reject(400, "callback_invalid_fields", callbackMetadata);
       return;
     }
     const values = Object.create(null);
     for (const [name, value] of pairs) {
-      if (Object.prototype.hasOwnProperty.call(values, name) || !validCallbackValue(name, value)) {
-        generic(400);
+      if (Object.prototype.hasOwnProperty.call(values, name)) {
+        reject(400, "callback_duplicate", callbackMetadata);
+        return;
+      }
+      if (!validCallbackValue(name, value)) {
+        reject(400, name === "error" ? "callback_invalid_fields" : "callback_invalid_token", {
+          ...callbackMetadata,
+          tokenCharacterClass: "rejected",
+          tokenLength: value.length,
+        });
         return;
       }
       values[name] = value;
     }
     const has = name => Object.prototype.hasOwnProperty.call(values, name);
     if (has("error") && pairs.length === 1) {
-      if (finish({ kind: "error" })) generic(200);
+      if (finish({ kind: "error" })) {
+        this._record("sso.callback.accepted", { ...callbackMetadata, outcomeKind: "error", ok: true });
+        generic(200);
+      }
       else generic(409);
       return;
     }
     if (has("two_factor_token") && pairs.length === 1) {
-      if (finish({ kind: "two_factor", twoFactorToken: values.two_factor_token })) generic(200, true, true);
+      if (finish({ kind: "two_factor", twoFactorToken: values.two_factor_token })) {
+        this._record("sso.callback.accepted", { ...callbackMetadata, outcomeKind: "two_factor", ok: true });
+        generic(200, true, true);
+      }
       else generic(409);
       return;
     }
     if (has("access_token") && has("refresh_token") && pairs.length === 2) {
-      if (finish({ kind: "tokens", accessToken: values.access_token, refreshToken: values.refresh_token })) generic(200, true);
+      if (finish({ kind: "tokens", accessToken: values.access_token, refreshToken: values.refresh_token })) {
+        this._record("sso.callback.accepted", { ...callbackMetadata, outcomeKind: "tokens", ok: true });
+        generic(200, true);
+      }
       else generic(409);
       return;
     }
-    generic(400);
+    reject(400, "callback_invalid_fields", callbackMetadata);
   }
 
   isValidWorkspaceSlug(workspaceSlug) {
@@ -368,6 +429,10 @@ class SSOAuthManager {
     if (this._connectionManager) return this._connectionManager;
     const { getConnectionManager } = require("./connectionManager");
     return getConnectionManager(this.context);
+  }
+
+  _record(stage, metadata) {
+    recordSSODiagnostic(this._diagnosticObserver, stage, metadata);
   }
 }
 
@@ -609,8 +674,36 @@ function callbackErrorMessage(kind) {
     identity_provider_error: "The identity provider did not complete Cloudsmith sign-in.",
     workspace_forbidden: "The authenticated account cannot access the requested Cloudsmith workspace.",
     listener_failed: "The local Cloudsmith sign-in listener stopped unexpectedly.",
+    callback_invalid_fields: "The browser sign-in response was not accepted.",
+    callback_invalid_token: "The browser sign-in response was not accepted.",
+    credential_invalid: "Cloudsmith returned an SSO session that could not be used safely.",
+    discovery_http_error: "Could not start SSO for that workspace. Try again.",
+    discovery_invalid_response: "Could not start SSO for that workspace. Try again.",
+    discovery_network_error: "Could not start SSO for that workspace. Check the network connection and try again.",
+    discovery_redirect_rejected: "Could not start SSO for that workspace. Try again.",
+    discovery_timeout: "Could not start SSO for that workspace. Try again.",
+    two_factor_failed: "Cloudsmith did not accept the two-factor verification.",
   };
   return messages[kind] || "Cloudsmith browser sign-in could not be completed.";
+}
+
+function discoveryFailureKind(kind) {
+  const kinds = {
+    http_error: "discovery_http_error",
+    invalid_response: "discovery_invalid_response",
+    network_error: "discovery_network_error",
+    redirect_rejected: "discovery_redirect_rejected",
+    response_too_large: "discovery_invalid_response",
+    timeout: "discovery_timeout",
+    transient: "discovery_http_error",
+  };
+  return kinds[kind] || kind;
+}
+
+function callbackFamily(address) {
+  if (address === "127.0.0.1") return "ipv4";
+  if (address === "::1") return "ipv6";
+  return null;
 }
 
 function publicFailure(kind, reported = false) {

@@ -1,4 +1,5 @@
 const assert = require("assert");
+const { createSSODiagnosticObserver } = require("../util/ssoDiagnostics");
 const { SSOProtocolClient } = require("../util/ssoProtocolClient");
 
 function jsonResponse(value, status = 200, headers = {}) {
@@ -27,6 +28,46 @@ suite("Cloudsmith SSO protocol client", () => {
     assert.strictEqual(calls[0].options.method, "GET");
     assert.strictEqual(calls[0].options.redirect, "manual");
     assert.ok(!Object.keys(calls[0].options.headers).some(name => /authorization|api-key/i.test(name)));
+  });
+
+  test("discovery diagnostics retain safe shape metadata without the redirect query", async () => {
+    const lines = [];
+    const client = new SSOProtocolClient({
+      diagnosticObserver: createSSODiagnosticObserver({ appendLine(line) { lines.push(line); } }),
+      fetchImpl: async () => jsonResponse({
+        redirect_url: "https://idp.customer.example/saml?RelayState=synthetic-secret-marker",
+      }),
+    });
+
+    const result = await client.discover("workspace-a");
+
+    assert.strictEqual(result.ok, true);
+    const output = lines.join("\n");
+    assert.strictEqual(output.includes("synthetic-secret-marker"), false);
+    assert.strictEqual(output.includes("RelayState"), false);
+    assert.match(output, /"idpHostname":"idp\.customer\.example"/);
+    assert.match(output, /"hasQuery":true/);
+    assert.match(output, /"statusCode":200/);
+  });
+
+  test("discovery diagnostics classify a JSON HTTP failure without recording its body", async () => {
+    const lines = [];
+    const marker = "synthetic-secret-marker";
+    const client = new SSOProtocolClient({
+      diagnosticObserver: createSSODiagnosticObserver({ appendLine(line) { lines.push(line); } }),
+      fetchImpl: async () => jsonResponse({ detail: marker }, 404),
+    });
+
+    const result = await client.discover("workspace-a");
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.kind, "http_error");
+    const output = lines.join("\n");
+    assert.strictEqual(output.includes(marker), false);
+    assert.match(output, /"jsonShapeValid":true/);
+    assert.match(output, /"redirectUrlPresent":false/);
+    assert.match(output, /"statusCode":404/);
+    assert.match(output, /"errorKind":"discovery_http_error"/);
   });
 
   test("rejects discovery redirects and unsafe IdP URLs", async () => {
@@ -92,6 +133,37 @@ suite("Cloudsmith SSO protocol client", () => {
     assert.strictEqual(calls[1].url, "https://api.cloudsmith.io/user/refresh-token/");
     assert.strictEqual(calls[1].options.headers.Authorization, "Bearer old-access");
     assert.strictEqual(calls[1].options.body, "refresh_token=old-refresh");
+  });
+
+  test("invalid exchange token pairs emit one final semantic diagnostic per request", async () => {
+    const lines = [];
+    const client = new SSOProtocolClient({
+      diagnosticObserver: createSSODiagnosticObserver({ appendLine(line) { lines.push(line); } }),
+      fetchImpl: async () => jsonResponse({ access_token: "", refresh_token: "refresh" }),
+    });
+
+    const twoFactor = await client.exchangeTwoFactor("two-factor", "123456");
+    const refreshed = await client.refresh("old-access", "old-refresh");
+
+    assert.strictEqual(twoFactor.kind, "invalid_response");
+    assert.strictEqual(refreshed.kind, "invalid_response");
+    const events = lines.map(line => JSON.parse(line.slice("[SSO] ".length)));
+    assert.deepStrictEqual(events, [
+      {
+        stage: "sso.two-factor.exchange",
+        errorKind: "invalid_response",
+        hasRefreshToken: false,
+        ok: false,
+        statusCode: 200,
+      },
+      {
+        stage: "sso.refresh.exchange",
+        errorKind: "invalid_response",
+        hasRefreshToken: false,
+        ok: false,
+        statusCode: 200,
+      },
+    ]);
   });
 
   test("preserves a session on refresh rejection until its ordinary bearer is also rejected", async () => {

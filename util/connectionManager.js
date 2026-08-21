@@ -14,6 +14,7 @@ const {
   storageFingerprint,
 } = require("./credentialEnvelope");
 const { SSOProtocolClient } = require("./ssoProtocolClient");
+const { recordSSODiagnostic } = require("./ssoDiagnostics");
 
 const AUTH_TOKEN_KEY = "cloudsmith-vsc.authToken";
 const LEGACY_CONNECTION_KEY = "cloudsmith-vsc.isConnected";
@@ -159,7 +160,11 @@ class ConnectionManager {
     });
     this._now = options.now || Date.now;
     this._monotonicNow = options.monotonicNow || (() => Number(process.hrtime.bigint() / 1000000n));
-    this._protocolClient = options.protocolClient || new SSOProtocolClient(options.protocolOptions);
+    this._diagnosticObserver = options.diagnosticObserver || null;
+    this._protocolClient = options.protocolClient || new SSOProtocolClient({
+      ...(options.protocolOptions || {}),
+      diagnosticObserver: this._diagnosticObserver,
+    });
     this._mutationLock = options.mutationLock || new CredentialMutationLock(context, options.mutationLockOptions);
     this._executeCommand = options.executeCommand || vscode.commands.executeCommand;
     this._connectionContextProjector = options.contextKeyProjector || new ContextKeyProjector({
@@ -302,7 +307,7 @@ class ConnectionManager {
     }
 
     const serialized = serializeCredential(normalized.credential);
-    return this._enqueueMutation(() => this._mutationLock.run(async () => {
+    const committed = await this._enqueueMutation(() => this._mutationLock.run(async () => {
       let authoritative;
       try {
         authoritative = await this.context.secrets.get(AUTH_TOKEN_KEY);
@@ -324,6 +329,14 @@ class ConnectionManager {
       operation,
       fixedPublicError("credential_lock_failed", "Credential storage is busy. Try again.")
     ));
+    if (normalized.credential.kind === "sso") {
+      this._record("sso.credential.commit", {
+        credentialKind: "sso",
+        errorKind: committed.ok ? undefined : credentialResultErrorKind(committed),
+        ok: Boolean(committed.ok),
+      });
+    }
+    return committed;
   }
 
   async disconnect(token = null) {
@@ -631,6 +644,9 @@ class ConnectionManager {
   }
 
   async _validateCandidate(credential, signal, options = {}) {
+    if (credential.kind === "sso") {
+      this._record("sso.credential.validate.start", { credentialKind: "sso" });
+    }
     if (signal && signal.aborted) {
       return Object.freeze({ ok: false, error: fixedPublicError("cancelled", "Authentication was cancelled.") });
     }
@@ -646,6 +662,15 @@ class ConnectionManager {
       });
       if (signal && signal.aborted) {
         return Object.freeze({ ok: false, error: fixedPublicError("cancelled", "Authentication was cancelled.") });
+      }
+      if (credential.kind === "sso") {
+        this._record("sso.user-self.response", {
+          authenticated: Boolean(result?.ok && result.data?.authenticated === true),
+          errorKind: result?.ok ? undefined : result?.error?.kind,
+          fieldNames: result?.ok && result.data ? Object.keys(result.data) : [],
+          ok: Boolean(result?.ok),
+          statusCode: result?.status,
+        });
       }
       if (result && result.ok && result.data.authenticated) {
         const identity = publicIdentity(result.data);
@@ -695,6 +720,13 @@ class ConnectionManager {
         )),
       });
       if (!result || !result.ok) {
+        this._record("sso.workspace-check.response", {
+          errorKind: result?.error?.kind || "workspace_check_failed",
+          ok: false,
+          pageNumber: page,
+          statusCode: result?.status,
+          targetFound: false,
+        });
         return Object.freeze({
           ok: false,
           error: result && result.error
@@ -702,7 +734,15 @@ class ConnectionManager {
             : fixedPublicError("workspace_check_failed", "Could not verify access to the requested workspace."),
         });
       }
-      if (result.data.some(item => item.slug === workspaceSlug)) return Object.freeze({ ok: true });
+      const targetFound = result.data.some(item => item.slug === workspaceSlug);
+      this._record("sso.workspace-check.response", {
+        ok: true,
+        pageNumber: page,
+        resultCount: result.data.length,
+        statusCode: result.status,
+        targetFound,
+      });
+      if (targetFound) return Object.freeze({ ok: true });
       const total = Number(result.headers && result.headers["x-pagination-pagetotal"]);
       if (!Number.isSafeInteger(total) || total < page || total > 20) {
         return Object.freeze({
@@ -1717,6 +1757,16 @@ class ConnectionManager {
       state: this._state,
     });
   }
+
+  _record(stage, metadata) {
+    recordSSODiagnostic(this._diagnosticObserver, stage, metadata);
+  }
+}
+
+function credentialResultErrorKind(result) {
+  if (result?.error?.kind === "credential_lock_failed") return "credential_lock_failed";
+  if (result?.error?.kind === "stale" || result?.status === "stale") return "stale";
+  return "credential_commit_failed";
 }
 
 function awaitForCaller(promise, signal) {

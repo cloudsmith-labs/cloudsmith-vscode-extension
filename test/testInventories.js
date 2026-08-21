@@ -31,6 +31,7 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/remediationHelper.test.js",
   "test/runtimeProcessGuard.test.js",
   "test/searchQueryBuilder.test.js",
+  "test/ssoDiagnostics.test.js",
   "test/ssoProtocolClient.test.js",
   "test/testHelpers.test.js",
   "test/testInventories.test.js",

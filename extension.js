@@ -70,6 +70,7 @@ const { registerUpstreamCommands } = require("./commands/upstream");
 const { createCommandRegistration } = require("./commands/registrar");
 const { getWorkspaces: loadAuthenticatedWorkspaces } = require("./util/workspaceAccess");
 const { ActivationOwner } = require("./util/activationOwner");
+const { createSSODiagnosticObserver } = require("./util/ssoDiagnostics");
 const {
   beginAccountScopedStateReset,
   completeAccountScopedStateReset,
@@ -117,7 +118,12 @@ function activateOwned(context, own, observe) {
   if (activationReset.syncFailures.length > 0) {
     console.warn("[Cloudsmith] Some account-scoped singleton state could not be cleared.");
   }
-  const connectionManager = new ConnectionManager(context);
+  const inspectOutputChannel = vscode.window.createOutputChannel("Cloudsmith");
+  own(inspectOutputChannel);
+  const ssoDiagnosticObserver = createSSODiagnosticObserver(inspectOutputChannel);
+  const connectionManager = new ConnectionManager(context, {
+    diagnosticObserver: ssoDiagnosticObserver,
+  });
   const connectionBinding = bindConnectionManager(context, connectionManager);
   own(connectionBinding, connectionManager);
   const extensionContextProjector = new ContextKeyProjector({
@@ -162,8 +168,6 @@ function activateOwned(context, own, observe) {
       upstreamRuntime.getPrivilegedRepositoryUpstreamsForExport(...args)
     ),
   });
-  const inspectOutputChannel = vscode.window.createOutputChannel("Cloudsmith");
-  own(inspectOutputChannel);
   const workspaceContextProjector = getWorkspaceContextProjector(context);
   own(workspaceContextProjector);
 
@@ -335,7 +339,10 @@ function activateOwned(context, own, observe) {
   promotionProvider = new PromotionProvider(context, { connectionManager, credentialManager });
   own({ dispose: () => promotionProvider.dispose() });
 
-  const ssoManager = new SSOAuthManager(context, { connectionManager });
+  const ssoManager = new SSOAuthManager(context, {
+    connectionManager,
+    diagnosticObserver: ssoDiagnosticObserver,
+  });
 
 
   const registerCommand = createCommandRegistration(vscode.commands);

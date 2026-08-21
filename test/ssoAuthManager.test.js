@@ -3,6 +3,7 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const { createSSODiagnosticObserver } = require("../util/ssoDiagnostics");
 const {
   SSOAuthManager,
   cliCredentialCandidates,
@@ -58,6 +59,95 @@ function requestCallback(target, host = "127.0.0.1") {
 }
 
 suite("SSOAuthManager", () => {
+  test("classifies discovery failures without the generic browser fallback", async () => {
+    const messages = [];
+    const manager = createManager();
+    const sso = new SSOAuthManager({}, {
+      callbackHosts: ["127.0.0.1"],
+      connectionManager: manager,
+      protocolClient: { async discover() { return { ok: false, kind: "network_error" }; } },
+      showErrorMessage(message) { messages.push(message); },
+    });
+
+    const result = await sso.loginViaBrowser("workspace");
+
+    assert.strictEqual(result.error.kind, "discovery_network_error");
+    assert.deepStrictEqual(messages, [
+      "Could not start SSO for that workspace. Check the network connection and try again.",
+    ]);
+  });
+
+  test("classifies an unavailable workspace discovery response before browser launch", async () => {
+    const messages = [];
+    let browserOpens = 0;
+    const manager = createManager();
+    const sso = new SSOAuthManager({}, {
+      callbackHosts: ["127.0.0.1"],
+      connectionManager: manager,
+      openExternal: async () => { browserOpens += 1; return true; },
+      protocolClient: { async discover() { return { ok: false, kind: "http_error", status: 404 }; } },
+      showErrorMessage(message) { messages.push(message); },
+    });
+
+    const result = await sso.loginViaBrowser("workspace");
+
+    assert.strictEqual(result.error.kind, "discovery_http_error");
+    assert.strictEqual(browserOpens, 0);
+    assert.deepStrictEqual(messages, ["Could not start SSO for that workspace. Try again."]);
+  });
+
+  test("records invalid callback token shape without emitting the token value", () => {
+    const lines = [];
+    const marker = "synthetic:secret:marker";
+    const sso = new SSOAuthManager({}, {
+      connectionManager: createManager(),
+      diagnosticObserver: createSSODiagnosticObserver({ appendLine(line) { lines.push(line); } }),
+    });
+    let status = null;
+    sso._handleCallbackRequest(
+      {
+        method: "GET",
+        url: `/?access_token=${encodeURIComponent(marker)}&refresh_token=refresh-token`,
+        headers: {},
+        socket: { localAddress: "127.0.0.1" },
+      },
+      { writeHead(value) { status = value; }, end() {} },
+      () => true
+    );
+
+    assert.strictEqual(status, 400);
+    const output = lines.join("\n");
+    assert.strictEqual(output.includes(marker), false);
+    assert.match(output, /"errorKind":"callback_invalid_token"/);
+    assert.match(output, /"parameterNames":\["access_token","refresh_token"\]/);
+    assert.match(output, /"tokenLength":23/);
+  });
+
+  test("rejects an unknown callback field without recording its attacker-controlled name", () => {
+    const lines = [];
+    const sso = new SSOAuthManager({}, {
+      connectionManager: createManager(),
+      diagnosticObserver: createSSODiagnosticObserver({ appendLine(line) { lines.push(line); } }),
+    });
+    let status = null;
+    sso._handleCallbackRequest(
+      {
+        method: "GET",
+        url: "/?csa_secret_key=value",
+        headers: {},
+        socket: { localAddress: "127.0.0.1" },
+      },
+      { writeHead(value) { status = value; }, end() {} },
+      () => true
+    );
+
+    assert.strictEqual(status, 400);
+    const output = lines.join("\n");
+    assert.strictEqual(output.includes("csa_secret_key"), false);
+    assert.match(output, /"errorKind":"callback_invalid_fields"/);
+    assert.match(output, /"queryPairCount":1/);
+  });
+
   test("uses platform user-level credentials.ini candidates and never cwd/config.ini", () => {
     assert.deepStrictEqual(cliCredentialCandidates("darwin", {}, "/Users/test").map(item => item.file), [
       "/Users/test/Library/Application Support/cloudsmith/credentials.ini",
@@ -208,11 +298,12 @@ suite("SSOAuthManager", () => {
     }
   });
 
-  test("binds first, discovers, opens only the IdP, accepts exact tokens, and confirms identity", async () => {
+  test("binds first, opens the exact encoded IdP string, accepts exact tokens, and confirms identity", async () => {
     const manager = createManager();
     const order = [];
     let opened = null;
     let callbackResponse;
+    const redirectUrl = "https://idp.customer.example/saml?SAMLRequest=synthetic%2Bvalue%2Fwith%3Dpadding";
     const sso = new SSOAuthManager({}, {
       connectionManager: manager,
       createServer(handler) {
@@ -225,11 +316,11 @@ suite("SSOAuthManager", () => {
         async discover(workspace) {
           order.push("discover");
           assert.strictEqual(workspace, "workspace-a");
-          return { ok: true, redirectUrl: "https://idp.customer.example/saml?state=sensitive" };
+          return { ok: true, redirectUrl };
         },
       },
-      async openExternal(uri) {
-        opened = uri.toString(true);
+      async openExternal(target) {
+        opened = target;
         order.push("open");
         callbackResponse = await requestCallback("/?access_token=access-token&refresh_token=refresh-token");
         return true;
@@ -243,7 +334,8 @@ suite("SSOAuthManager", () => {
     const result = await sso.loginViaBrowser("workspace-a");
     assert.strictEqual(result.ok, true);
     assert.deepStrictEqual(order, ["listen", "discover", "open"]);
-    assert.strictEqual(opened, "https://idp.customer.example/saml?state=sensitive");
+    assert.strictEqual(typeof opened, "string");
+    assert.strictEqual(opened, redirectUrl);
     const replacement = manager.calls.find(call => call[0] === "replace");
     assert.strictEqual(replacement[1].kind, "sso");
     assert.strictEqual(replacement[1].accessToken, "access-token");
@@ -527,6 +619,19 @@ suite("SSOAuthManager", () => {
         accessToken: "loopback-access",
         refreshToken: "loopback-refresh",
       });
+    } finally {
+      await callback.close();
+    }
+  });
+
+  test("the advertised localhost callback reaches an actual loopback listener on this host", async () => {
+    const controller = new AbortController();
+    const sso = new SSOAuthManager({}, { connectionManager: createManager() });
+    const callback = await sso._startCallbackServer(controller.signal);
+    try {
+      const response = await requestCallback("/?token=unsupported-alias", "localhost");
+      assert.strictEqual(response.status, 400);
+      assert.strictEqual(callback.getSettledOutcome(), null);
     } finally {
       await callback.close();
     }
