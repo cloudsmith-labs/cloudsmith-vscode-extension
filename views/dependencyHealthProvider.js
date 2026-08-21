@@ -11,6 +11,7 @@ const {
   createSafeAdapterWarning,
 } = require("../util/dependencyAdapterRegistry");
 const {
+  DEPENDENCY_QUALIFIER_KEYS,
   DEPENDENCY_VERSION_STATES,
   getDependencyArtifactKey,
   getDependencyConcreteVersion: getCanonicalDependencyConcreteVersion,
@@ -24,6 +25,12 @@ const {
 } = require("../util/diagnosticsPublisher");
 const { fetchWorkspaceRepositories } = require("../util/workspaceRepositoryFetcher");
 const { SearchQueryBuilder } = require("../util/searchQueryBuilder");
+const {
+  dockerCandidateMatchesPlatform,
+  mavenArtifactFileName,
+  normalizeNuGetVersion,
+  rubyCandidateMatchesPlatform,
+} = require("../util/registryEndpoints");
 const { LicenseClassifier } = require("../util/licenseClassifier");
 const {
   canonicalFormat,
@@ -2558,10 +2565,13 @@ async function lookupExactDependency({
   const endpoint = buildPackageLookupEndpoint(cloudsmithWorkspace, cloudsmithRepo);
   const lookupNames = getDependencyLookupNames(dependency);
   const format = canonicalFormat(dependency && (dependency.format || dependency.ecosystem));
+  const lookupVersion = format === "nuget"
+    ? normalizeNuGetVersion(concreteVersion)
+    : concreteVersion;
   if (
     !endpoint
     || !boundedExactLookupString(format, LOOKUP_MAX_PACKAGE_FORMAT_LENGTH)
-    || !boundedExactLookupString(concreteVersion, LOOKUP_MAX_PACKAGE_VERSION_LENGTH)
+    || !boundedExactLookupString(lookupVersion, LOOKUP_MAX_PACKAGE_VERSION_LENGTH)
     || lookupNames.length === 0
     || !api
     || typeof api.get !== "function"
@@ -2575,14 +2585,17 @@ async function lookupExactDependency({
 
   let pagesFetched = 0;
   for (const lookupName of lookupNames) {
-    const query = new SearchQueryBuilder()
+    const queryBuilder = new SearchQueryBuilder()
       .format(format)
-      .name(lookupName)
-      .version(concreteVersion)
-      .build();
+      .name(lookupName);
+    if (format !== "docker") {
+      queryBuilder.version(lookupVersion);
+    }
+    const query = queryBuilder.build();
     let page = 1;
     let paginationAnchor = null;
     const seenPackageIdentities = new Set();
+    const accumulatedCandidates = [];
 
     while (true) {
       if (token && token.isCancellationRequested) {
@@ -2684,7 +2697,12 @@ async function lookupExactDependency({
       }
       for (const identity of pageIdentities) seenPackageIdentities.add(identity);
       pagesFetched += 1;
-      const match = matchCoverageCandidates(response.data, dependency, concreteVersion);
+      accumulatedCandidates.push(...response.data);
+      const match = matchCoverageCandidates(
+        accumulatedCandidates,
+        dependency,
+        lookupVersion
+      );
       if (match) {
         let canonicalMatch;
         try {
@@ -3192,17 +3210,31 @@ function countCoverageDependencies(trees) {
 
 function buildPackageIndex(packages, format) {
   const index = new Map();
+  const normalizedFormat = canonicalFormat(format);
   for (const pkg of packages) {
-    const versionKey = String(pkg.version || "").trim();
+    const versionKeys = new Set([String(pkg.version || "").trim()]);
+    if (normalizedFormat === "nuget") {
+      const normalizedVersion = normalizeNuGetVersion(pkg.version);
+      if (normalizedVersion) versionKeys.add(normalizedVersion);
+    }
+    if (normalizedFormat === "docker" && Array.isArray(pkg?.tags?.version)) {
+      for (const tag of pkg.tags.version) {
+        const normalizedTag = String(tag || "").trim();
+        if (normalizedTag) versionKeys.add(normalizedTag);
+      }
+    }
     for (const nameKey of getCaseAwareCloudsmithPackageLookupKeys(pkg, format)) {
       if (!index.has(nameKey)) {
         index.set(nameKey, new Map());
       }
       const versionMap = index.get(nameKey);
-      if (!versionMap.has(versionKey)) {
-        versionMap.set(versionKey, []);
+      for (const versionKey of versionKeys) {
+        if (!versionKey) continue;
+        if (!versionMap.has(versionKey)) {
+          versionMap.set(versionKey, []);
+        }
+        versionMap.get(versionKey).push(pkg);
       }
-      versionMap.get(versionKey).push(pkg);
     }
   }
   return index;
@@ -3219,7 +3251,9 @@ function findCoverageMatch(packageIndex, dependency) {
     if (!versions) {
       continue;
     }
-    const versionKey = concreteVersion;
+    const versionKey = canonicalFormat(dependency.format || dependency.ecosystem) === "nuget"
+      ? normalizeNuGetVersion(concreteVersion)
+      : concreteVersion;
     if (versions.has(versionKey)) {
       const match = matchCoverageCandidates(versions.get(versionKey), dependency, concreteVersion);
       if (match) {
@@ -3238,8 +3272,12 @@ function matchCoverageCandidates(candidates, dependency, expectedVersion = getCo
   const dependencyFormat = canonicalFormat(
     dependency && (dependency.format || dependency.ecosystem)
   );
+  const normalizedExpectedVersion = dependencyFormat === "nuget"
+    ? normalizeNuGetVersion(expectedVersion)
+    : String(expectedVersion).trim();
+  const candidateList = Array.isArray(candidates) ? candidates : [];
 
-  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+  for (const candidate of candidateList) {
     const candidateFormat = canonicalFormat(candidate && (candidate.format || candidate.ecosystem));
     if (!dependencyFormat || candidateFormat !== dependencyFormat) {
       continue;
@@ -3247,7 +3285,21 @@ function matchCoverageCandidates(candidates, dependency, expectedVersion = getCo
     if (!packageNameMatchesDependency(candidate, dependency)) {
       continue;
     }
-    if (String(candidate.version || "").trim() === expectedVersion) {
+    const dockerTags = dependencyFormat === "docker" && Array.isArray(candidate?.tags?.version)
+      ? candidate.tags.version
+      : [];
+    const requestedDigest = dependencyFormat === "docker"
+      ? String(dependency?.qualifiers?.digest || dependency?.digest || "").trim().toLowerCase()
+      : "";
+    const observedVersion = String(candidate.version || "").trim();
+    const versionMatches = dependencyFormat === "nuget"
+      ? normalizeNuGetVersion(observedVersion) === normalizedExpectedVersion
+      : observedVersion === normalizedExpectedVersion;
+    const digestMatches = requestedDigest
+      && observedVersion.toLowerCase().replace(/^[a-z0-9_+.-]+:/, "")
+        === requestedDigest.replace(/^[a-z0-9_+.-]+:/, "");
+    const tagMatches = dockerTags.some(tag => String(tag) === normalizedExpectedVersion);
+    if (dependencyFormat === "docker" ? (requestedDigest ? digestMatches : tagMatches) : versionMatches) {
       return candidate;
     }
   }
@@ -3263,7 +3315,8 @@ function packageNameMatchesDependency(candidate, dependency) {
 
   if (format === "maven" && dependencyName.includes(":")) {
     const candidateKeys = getCaseAwareCloudsmithPackageLookupKeys(candidate, format);
-    return candidateKeys.some((key) => key.includes(":") && key === dependencyName);
+    return candidateKeys.some((key) => key.includes(":") && key === dependencyName)
+      && mavenCandidateContainsRequestedArtifact(candidate, dependency);
   }
 
   if (format === "swift") {
@@ -3282,28 +3335,42 @@ function packageNameMatchesDependency(candidate, dependency) {
     return Boolean(dependencyIdentity && candidateIdentity && dependencyIdentity === candidateIdentity);
   }
 
-  if (format === "ruby" && dependency && dependency.qualifiers && dependency.qualifiers.platform) {
-    const candidateIdentifiers = candidate && candidate.identifiers
-      && typeof candidate.identifiers === "object"
-      ? candidate.identifiers
-      : {};
-    const candidatePlatform = String(
-      candidate && (candidate.platform || candidate.architecture)
-      || candidateIdentifiers.platform
-      || candidateIdentifiers.architecture
-      || ""
-    ).trim();
-    if (
-      candidatePlatform
-      && candidatePlatform.toLowerCase() !== String(dependency.qualifiers.platform).toLowerCase()
-    ) {
-      return false;
-    }
+  if (
+    format === "docker"
+    && !dockerCandidateMatchesPlatform(candidate, dependency?.qualifiers?.platform)
+  ) {
+    return false;
+  }
+
+  if (
+    format === "ruby"
+    && !rubyCandidateMatchesPlatform(candidate, dependency?.qualifiers?.platform)
+  ) {
+    return false;
   }
 
   const dependencyKeys = getCaseAwarePackageLookupKeys(dependency && dependency.name, format);
   const candidateKeys = new Set(getCaseAwareCloudsmithPackageLookupKeys(candidate, format));
   return dependencyKeys.some((key) => candidateKeys.has(key));
+}
+
+function mavenCandidateContainsRequestedArtifact(candidate, dependency) {
+  const qualifiers = dependency?.qualifiers;
+  const hasArtifactQualifier = qualifiers
+    && typeof qualifiers === "object"
+    && (Object.prototype.hasOwnProperty.call(qualifiers, "classifier")
+      || Object.prototype.hasOwnProperty.call(qualifiers, "type"));
+  if (!hasArtifactQualifier) return true;
+  const expectedFileName = mavenArtifactFileName(
+    dependency,
+    getConcreteDependencyVersion(dependency)
+  );
+  if (!expectedFileName || !Array.isArray(candidate?.files)) return false;
+  return candidate.files.some(file => (
+    file
+    && typeof file === "object"
+    && String(file.filename || file.name || file.path || "").split("/").pop() === expectedFileName
+  ));
 }
 
 function applyCoverageMatchBatchToTrees(trees, matchMap) {
@@ -4343,6 +4410,7 @@ function normalizeUserInteraction(userInteraction) {
 }
 
 function resolveSingleDependencyPullTarget(coordinate, trees) {
+  const expectedQualifierIdentity = dependencyPullQualifierIdentity(coordinate);
   const matches = (Array.isArray(trees) ? trees : [])
     .flatMap(tree => Array.isArray(tree?.dependencies) ? tree.dependencies : [])
     .filter(dependency => (
@@ -4350,6 +4418,7 @@ function resolveSingleDependencyPullTarget(coordinate, trees) {
       && dependency.name === coordinate.name
       && getConcreteDependencyVersion(dependency) === coordinate.version
       && canonicalFormat(dependency.format || dependency.ecosystem) === coordinate.format
+      && dependencyPullQualifierIdentity(dependency) === expectedQualifierIdentity
       && isAbsentCoverageStatus(dependency.cloudsmithStatus)
     ));
   if (matches.length === 0) return null;
@@ -4363,6 +4432,16 @@ function resolveSingleDependencyPullTarget(coordinate, trees) {
     format: coordinate.format,
     ecosystem: dependency.ecosystem || coordinate.format,
   };
+}
+
+function dependencyPullQualifierIdentity(dependency) {
+  const qualifiers = dependency && dependency.qualifiers;
+  if (!qualifiers || typeof qualifiers !== "object" || Array.isArray(qualifiers)) {
+    return JSON.stringify([]);
+  }
+  return JSON.stringify(DEPENDENCY_QUALIFIER_KEYS
+    .filter(key => Object.prototype.hasOwnProperty.call(qualifiers, key))
+    .map(key => [key, qualifiers[key]]));
 }
 
 function formatSingleDependencyLabel(dependency) {

@@ -247,6 +247,72 @@ suite("Canonical package domain", () => {
     const repositoryCoordinate = packageCoordinateFromExact(fromApiPackageRecord(apiRecord()));
     assert.strictEqual(assertRepositoryPackageCoordinate(repositoryCoordinate), repositoryCoordinate);
     assert.strictEqual(repositoryCoordinate.repository, "Repository");
+    assert.deepStrictEqual(repositoryCoordinate.qualifiers, {});
+    assert.ok(Object.isFrozen(repositoryCoordinate.qualifiers));
+  });
+
+  test("snapshots bounded dependency qualifiers into canonical pull coordinates", () => {
+    const configurations = ["compile", "runtime"];
+    const qualifiers = {
+      alias: "declared-alias",
+      classifier: "sources",
+      configurations,
+      digest: "sha256:abcdef",
+      environment: "production",
+      platform: "x86_64-linux",
+      pullPolicy: "always",
+      repository: "registry.example.test",
+      scope: "com.example",
+      section: "dependencies",
+      service: "api",
+      stage: "builder",
+      tag: "latest",
+      targetFramework: "net8.0",
+      type: "jar",
+    };
+    const coordinate = createPackageCoordinate({
+      workspace: "workspace",
+      repository: "repository",
+      name: "artifact",
+      version: "1.0.0",
+      format: "maven",
+      qualifiers,
+    });
+
+    qualifiers.classifier = "javadoc";
+    configurations.push("test");
+    assert.deepStrictEqual(coordinate.qualifiers, {
+      alias: "declared-alias",
+      classifier: "sources",
+      configurations: ["compile", "runtime"],
+      digest: "sha256:abcdef",
+      environment: "production",
+      platform: "x86_64-linux",
+      pullPolicy: "always",
+      repository: "registry.example.test",
+      scope: "com.example",
+      section: "dependencies",
+      service: "api",
+      stage: "builder",
+      tag: "latest",
+      targetFramework: "net8.0",
+      type: "jar",
+    });
+    assert.ok(Object.isFrozen(coordinate.qualifiers));
+    assert.ok(Object.isFrozen(coordinate.qualifiers.configurations));
+
+    assert.throws(() => createPackageCoordinate({
+      workspace: "workspace",
+      repository: "repository",
+      name: "artifact",
+      version: "1.0.0",
+      format: "maven",
+      qualifiers: { unsupported: "identity" },
+    }), error => (
+      error instanceof PackageDomainError
+      && error.code === "unknown_field"
+      && error.field === "qualifiers.unsupported"
+    ));
   });
 
   test("provides a dedicated versionless upstream-resolution input", () => {
@@ -595,6 +661,7 @@ suite("Canonical package domain", () => {
     });
     assert.ok(isPackageCoordinate(coordinate));
     assert.strictEqual(coordinate.workspace, "workspace");
+    assert.deepStrictEqual(coordinate.qualifiers, {});
     const unmatchedResolution = fromPackageResolutionSelection({
       declarationName: "declared-alias",
       name: "normalized-name",
@@ -619,6 +686,36 @@ suite("Canonical package domain", () => {
       version: "1.0.0",
       format: "npm",
     }, { workspace: "workspace" }), PackageAdapterError);
+  });
+
+  test("preserves dependency node qualifiers when adapting unresolved pull coordinates", () => {
+    const coordinate = fromDependencyHealthNode({
+      name: "com.example:artifact",
+      resolvedVersion: "1.0.0",
+      format: "maven",
+      qualifiers: {
+        type: "test-jar",
+        classifier: "tests",
+        platform: "java",
+        tag: "release",
+        digest: "sha256:abcdef",
+        targetFramework: "net8.0",
+      },
+    }, {
+      workspace: "workspace",
+      repository: "repository",
+    });
+
+    assert.ok(isPackageCoordinate(coordinate));
+    assert.deepStrictEqual(coordinate.qualifiers, {
+      classifier: "tests",
+      digest: "sha256:abcdef",
+      platform: "java",
+      tag: "release",
+      targetFramework: "net8.0",
+      type: "test-jar",
+    });
+    assert.ok(Object.isFrozen(coordinate.qualifiers));
   });
 
   test("duplicate dependency and recent match aliases require full canonical consensus", () => {

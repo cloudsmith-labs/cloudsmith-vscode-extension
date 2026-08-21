@@ -1,5 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const path = require("path");
+const { DEPENDENCY_VERSION_STATES } = require("../dependencyRecord");
 const {
   buildTree,
   countIndent,
@@ -77,12 +78,14 @@ const dockerParser = {
       const parsed = parseCompose(content, sourceFile, projectEnvironment, cancellationToken);
       return buildTree("docker", sourceFile, parsed.dependencies, parsed.warnings);
     }
-    return buildTree("docker", sourceFile, parseDockerfile(content, sourceFile, cancellationToken));
+    const parsed = parseDockerfile(content, sourceFile, cancellationToken);
+    return buildTree("docker", sourceFile, parsed.dependencies, parsed.warnings);
   },
 };
 
 function parseDockerfile(content, sourceFile, cancellationToken) {
   const dependencies = [];
+  const warnings = [];
   const stageAliases = new Set();
   const argDefaults = new Map();
   let stageIndex = 0;
@@ -119,6 +122,12 @@ function parseDockerfile(content, sourceFile, cancellationToken) {
       continue;
     }
 
+    if (parsed.platformUnresolved) {
+      warnings.push(
+        "A Dockerfile target platform could not be resolved, so dependency results are partial."
+      );
+    }
+
     dependencies.push(withDockerResolutionEvidence(createDependency({
       name: parsed.name,
       version: parsed.version,
@@ -132,12 +141,13 @@ function parseDockerfile(content, sourceFile, cancellationToken) {
       tag: parsed.tag,
       digest: parsed.digest,
       stage: parsed.alias || `stage-${stageIndex + 1}`,
+      platform: parsed.platform || null,
       packageSource: { kind: "registry" },
     }), parsed));
     stageIndex += 1;
   }
 
-  return dependencies;
+  return { dependencies, warnings };
 }
 
 function parseCompose(content, sourceFile, projectEnvironment = new Map(), cancellationToken) {
@@ -164,8 +174,18 @@ function parseCompose(content, sourceFile, projectEnvironment = new Map(), cance
     const shouldIncludeImage = currentService.image && normalizedPullPolicy !== "build";
     if (shouldIncludeImage) {
       const interpolated = interpolateComposeValue(currentService.image, projectEnvironment);
-      if (interpolated.unresolved) {
+      const interpolatedPlatform = interpolateComposeValue(
+        currentService.platform,
+        projectEnvironment
+      );
+      if (interpolated.unresolved || interpolatedPlatform.unresolved) {
         warnings.push("A Compose image reference could not be resolved, so dependency results are partial.");
+        currentService = null;
+        return;
+      }
+      const platform = normalizeDockerPlatform(interpolatedPlatform.value);
+      if (interpolatedPlatform.value && !platform) {
+        warnings.push("A Compose image platform was invalid and could not be checked.");
         currentService = null;
         return;
       }
@@ -185,6 +205,7 @@ function parseCompose(content, sourceFile, projectEnvironment = new Map(), cance
           pullPolicy: normalizedPullPolicy || "default",
           tag: parsed.tag,
           digest: parsed.digest,
+          platform: platform || null,
           packageSource: { kind: "registry" },
         }), parsed));
       } else if (interpolated.value) {
@@ -225,6 +246,7 @@ function parseCompose(content, sourceFile, projectEnvironment = new Map(), cance
         indent,
         hasBuild: false,
         image: "",
+        platform: "",
         pullPolicy: "",
       };
       continue;
@@ -240,6 +262,10 @@ function parseCompose(content, sourceFile, projectEnvironment = new Map(), cance
     }
     if (cleaned.startsWith("image:")) {
       currentService.image = unquote(cleaned.slice("image:".length).trim());
+      continue;
+    }
+    if (cleaned.startsWith("platform:")) {
+      currentService.platform = unquote(cleaned.slice("platform:".length).trim());
       continue;
     }
     if (cleaned.startsWith("pull_policy:")) {
@@ -393,7 +419,17 @@ function interpolateComposeValue(input, environment) {
 function parseFromInstruction(line, argDefaults, stageAliases) {
   const parts = line.split(/\s+/).filter(Boolean);
   let index = 1;
+  let platform = "";
+  let platformUnresolved = false;
   while (parts[index] && parts[index].startsWith("--")) {
+    if (parts[index].toLowerCase().startsWith("--platform=")) {
+      const resolvedPlatform = resolveDockerArgs(
+        unquote(parts[index].slice("--platform=".length)),
+        argDefaults
+      );
+      platform = normalizeDockerPlatform(resolvedPlatform);
+      platformUnresolved = !platform || resolvedPlatform.includes("$");
+    }
     index += 1;
   }
   const imageToken = parts[index];
@@ -413,8 +449,20 @@ function parseFromInstruction(line, argDefaults, stageAliases) {
   return {
     ...parsed,
     alias: alias ? unquote(alias) : "",
+    platform,
+    platformUnresolved,
     isDependency: !stageReference && parsed.name.toLowerCase() !== "scratch",
   };
+}
+
+function normalizeDockerPlatform(value) {
+  const platform = String(value || "").trim().toLowerCase();
+  if (!platform) return "";
+  const parts = platform.split("/");
+  return (
+    (parts.length === 2 || parts.length === 3)
+    && parts.every(part => part && /^[a-z0-9_.-]+$/.test(part))
+  ) ? parts.join("/") : "";
 }
 
 function parseDockerImageReference(reference) {
@@ -447,11 +495,17 @@ function parseDockerImageReference(reference) {
 }
 
 function withDockerResolutionEvidence(dependency, parsed) {
+  const hasResolutionEvidence = Boolean(
+    parsed && parsed.hasResolutionEvidence && !parsed.platformUnresolved
+  );
   return {
     ...dependency,
-    hasResolutionEvidence: Boolean(parsed && parsed.hasResolutionEvidence),
-    resolvedVersion: parsed && parsed.hasResolutionEvidence ? parsed.version : null,
+    hasResolutionEvidence,
+    resolvedVersion: hasResolutionEvidence ? parsed.version : null,
     declaredConstraint: parsed && (parsed.tag || parsed.digest) || null,
+    ...(parsed?.platformUnresolved
+      ? { versionState: DEPENDENCY_VERSION_STATES.INCOMPLETE }
+      : {}),
   };
 }
 

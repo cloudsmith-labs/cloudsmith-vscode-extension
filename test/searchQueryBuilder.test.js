@@ -75,6 +75,22 @@ suite('SearchQueryBuilder Test Suite', () => {
 		assert.strictEqual(result, 'name:pkg\\:\\\"beta\\\"');
 	});
 
+	test('registry-native slash identities remain searchable while query operators are escaped', () => {
+		const builder = new SearchQueryBuilder();
+		assert.strictEqual(
+			builder.name('@scope/package OR status:quarantined').build(),
+			'name:"@scope/package OR status\\:quarantined"'
+		);
+	});
+
+	test('ordinary hyphen and plus identity characters remain searchable', () => {
+		const builder = new SearchQueryBuilder();
+		assert.strictEqual(
+			builder.name('@aws-sdk/client-s3').version('1.2.3-beta+build').build(),
+			'name:@aws-sdk/client-s3 AND version:1.2.3-beta+build'
+		);
+	});
+
 	test('empty build returns empty string', () => {
 		const builder = new SearchQueryBuilder();
 		assert.strictEqual(builder.build(), '');

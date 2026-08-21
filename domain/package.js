@@ -9,6 +9,27 @@ const MAX_METADATA_LENGTH = 4096;
 const MAX_URL_LENGTH = 8192;
 const MAX_TAGS_PER_FIELD = 100;
 const MAX_TAG_LENGTH = 500;
+const MAX_COORDINATE_QUALIFIER_VALUE_LENGTH = 4096;
+const MAX_COORDINATE_QUALIFIER_ARRAY_LENGTH = 64;
+
+const PACKAGE_COORDINATE_QUALIFIER_KEYS = Object.freeze([
+  "alias",
+  "classifier",
+  "configurations",
+  "digest",
+  "environment",
+  "platform",
+  "pullPolicy",
+  "repository",
+  "scope",
+  "section",
+  "service",
+  "stage",
+  "tag",
+  "targetFramework",
+  "type",
+]);
+const PACKAGE_COORDINATE_QUALIFIER_KEY_SET = new Set(PACKAGE_COORDINATE_QUALIFIER_KEYS);
 
 const CONTROL_OR_BIDI_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/;
 const UNSAFE_PATH_PATTERN = /[\\/?#]/;
@@ -24,6 +45,7 @@ const SEMANTIC_FIELDS = Object.freeze([
   "name",
   "version",
   "format",
+  "qualifiers",
   "slug",
   "status",
   "statusReason",
@@ -119,6 +141,7 @@ function createPackageCoordinate(input) {
     name: requiredString(source, "name", MAX_NAME_LENGTH, { trim: false }),
     version: requiredString(source, "version", MAX_VERSION_LENGTH, { trim: false }),
     format: requiredString(source, "format", MAX_FORMAT_LENGTH),
+    qualifiers: createPackageCoordinateQualifiers(readOwn(source, "qualifiers")),
   };
   Object.freeze(value);
   PACKAGE_COORDINATES.add(value);
@@ -207,6 +230,70 @@ function createTags(value) {
     info: createStringArray(readOwn(source, "info"), "tags.info"),
     version: createStringArray(readOwn(source, "version"), "tags.version"),
   });
+}
+
+function createPackageCoordinateQualifiers(value) {
+  if (value == null) return Object.freeze({});
+  const source = requireRecord(value, "package coordinate qualifiers");
+  for (const key of Object.getOwnPropertyNames(source)) {
+    if (!PACKAGE_COORDINATE_QUALIFIER_KEY_SET.has(key)) {
+      throw domainError(
+        "unknown_field",
+        `qualifiers.${key}`,
+        "The package coordinate qualifiers contain an unsupported field."
+      );
+    }
+  }
+
+  const qualifiers = {};
+  for (const key of PACKAGE_COORDINATE_QUALIFIER_KEYS) {
+    const qualifier = readOwn(source, key);
+    if (qualifier === undefined || qualifier === null || qualifier === "") continue;
+    if (key === "configurations") {
+      Object.defineProperty(qualifiers, key, {
+        value: createCoordinateQualifierArray(qualifier, `qualifiers.${key}`),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+      continue;
+    }
+    Object.defineProperty(qualifiers, key, {
+      value: validateString(
+        qualifier,
+        `qualifiers.${key}`,
+        MAX_COORDINATE_QUALIFIER_VALUE_LENGTH
+      ),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return Object.freeze(qualifiers);
+}
+
+function createCoordinateQualifierArray(value, field) {
+  if (!Array.isArray(value) || value.length > MAX_COORDINATE_QUALIFIER_ARRAY_LENGTH) {
+    throw domainError("invalid_array", field, `The ${field} value is invalid.`);
+  }
+  assertNoSymbolProperties(value, field);
+  assertNoOwnAccessors(value, field);
+  if (Object.getPrototypeOf(value) !== Array.prototype) {
+    throw domainError("invalid_array", field, `The ${field} value is invalid.`);
+  }
+  const result = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !("value" in descriptor)) {
+      throw domainError("invalid_array", field, `The ${field} value is invalid.`);
+    }
+    result.push(validateString(
+      descriptor.value,
+      field,
+      MAX_COORDINATE_QUALIFIER_VALUE_LENGTH
+    ));
+  }
+  return Object.freeze(result);
 }
 
 function createStringArray(value, field) {

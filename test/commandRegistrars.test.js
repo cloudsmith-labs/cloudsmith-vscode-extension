@@ -1599,6 +1599,7 @@ suite("Command registrars", () => {
       workspace: "workspace-a",
       repository: "repo-a",
       name: "left-pad",
+      qualifiers: Object.freeze({ targetFramework: "net8.0" }),
     });
     const exact = Object.freeze({
       identityState: "exact",
