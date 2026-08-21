@@ -8,6 +8,8 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/commandUxOracle.test.js",
   "test/collectionIdentity.test.js",
   "test/connectionPresentation.test.js",
+  "test/credentialEnvelope.test.js",
+  "test/credentialMutationLock.test.js",
   "test/dependencyAdapterRegistry.test.js",
   "test/dependencyManifestDiscovery.test.js",
   "test/dependencyPolicyEnricher.test.js",
@@ -29,6 +31,8 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/remediationHelper.test.js",
   "test/runtimeProcessGuard.test.js",
   "test/searchQueryBuilder.test.js",
+  "test/ssoDiagnostics.test.js",
+  "test/ssoProtocolClient.test.js",
   "test/testHelpers.test.js",
   "test/testInventories.test.js",
   "test/upstreamFormats.test.js",
@@ -58,6 +62,7 @@ const STANDALONE_NODE_TESTS = Object.freeze([
 ]);
 
 const VSCODE_CORE_TESTS = Object.freeze([
+  "test/authSessionManager.test.js",
   "test/cloudsmithAPI.test.js",
   "test/cloudsmithProvider.test.js",
   "test/complianceReportProvider.test.js",
@@ -108,6 +113,15 @@ const LIVE_TESTS = Object.freeze([
   "test/integration/vulnerabilities.test.js",
 ]);
 
+const SSO_LIVE_TESTS = Object.freeze([
+  "test/integration/ssoAuthentication.test.js",
+]);
+
+const SSO_LIVE_REQUIRED_ENV = Object.freeze([
+  "CLOUDSMITH_SSO_LIVE_TESTS",
+  "CLOUDSMITH_SSO_TEST_WORKSPACE",
+]);
+
 const LIVE_TEST_SKIP_REASON = "Live Cloudsmith tests are optional and excluded from the default test gate because they require explicitly controlled account fixtures.";
 const LIVE_REQUIRED_ENV = Object.freeze([
   "CLOUDSMITH_TEST_API_KEY",
@@ -122,6 +136,8 @@ module.exports = {
   LIVE_REQUIRED_ENV,
   LIVE_TEST_SKIP_REASON,
   LIVE_TESTS,
+  SSO_LIVE_REQUIRED_ENV,
+  SSO_LIVE_TESTS,
   STANDALONE_NODE_TESTS,
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,

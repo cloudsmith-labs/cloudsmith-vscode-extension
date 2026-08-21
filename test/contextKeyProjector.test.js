@@ -54,6 +54,37 @@ suite("ContextKeyProjector", () => {
     await projector.dispose();
   });
 
+  test("a replacement projector supersedes delayed cleanup from the prior activation", async () => {
+    const cleanupStarted = deferred();
+    const releaseCleanup = deferred();
+    const values = new Map();
+    let holdCleanup = false;
+    const executeCommand = async (_command, key, value) => {
+      if (holdCleanup && key === "cloudsmith.testFirst" && value === false) {
+        cleanupStarted.resolve();
+        await releaseCleanup.promise;
+      }
+      values.set(key, value);
+    };
+    const oldProjector = createProjector(executeCommand);
+    await oldProjector.project(snapshot(true, true));
+    holdCleanup = true;
+    const oldCleanup = oldProjector.dispose();
+    await cleanupStarted.promise;
+
+    const replacement = createProjector(executeCommand);
+    const replacementProjection = replacement.project(snapshot(true, true));
+    releaseCleanup.resolve();
+
+    await oldCleanup;
+    assert.strictEqual((await replacementProjection).applied, true);
+    assert.deepStrictEqual([...values], [
+      ["cloudsmith.testFirst", true],
+      ["cloudsmith.testSecond", true],
+    ]);
+    await replacement.dispose();
+  });
+
   test("reprojects neutral values with bounded retries when authority changes during an await", async () => {
     const firstStarted = deferred();
     const releaseFirst = deferred();

@@ -4,6 +4,7 @@ const path = require("path");
 const {
   LIVE_TEST_SKIP_REASON,
   LIVE_TESTS,
+  SSO_LIVE_TESTS,
   STANDALONE_NODE_TESTS,
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,
@@ -14,6 +15,7 @@ const MAX_TEST_TRAVERSAL_DEPTH = 8;
 const MAX_TEST_TRAVERSAL_ENTRIES = 512;
 const inventories = Object.freeze({
   live: LIVE_TESTS,
+  ssoLive: SSO_LIVE_TESTS,
   node: STANDALONE_NODE_TESTS,
   smoke: VSCODE_SMOKE_TESTS,
   vscode: VSCODE_CORE_TESTS,
@@ -61,6 +63,7 @@ suite("test runner inventories", () => {
     assert.match(vscodeConfig, /VSCODE_CORE_TESTS/);
     assert.match(vscodeConfig, /VSCODE_SMOKE_TESTS/);
     assert.match(vscodeConfig, /LIVE_TESTS/);
+    assert.match(vscodeConfig, /SSO_LIVE_TESTS/);
     assert.match(nodeRunner, /STANDALONE_NODE_TESTS/);
     const combinedRunner = fs.readFileSync(path.join(root, "scripts", "run-tests.js"), "utf8");
     assert.match(combinedRunner, /LIVE_TEST_SKIP_REASON/);

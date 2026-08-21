@@ -5,7 +5,6 @@ class ActivationOwner {
     console.warn("[Cloudsmith] An activation resource could not be disposed cleanly.");
   }) {
     this._resources = [];
-    this._pending = [];
     this._disposed = false;
     this._reportFailure = reportFailure;
   }
@@ -32,18 +31,27 @@ class ActivationOwner {
   }
 
   async settle() {
-    const pending = this._pending.splice(0);
-    if (pending.length > 0) {
-      const results = await Promise.allSettled(pending);
-      if (results.some(result => result.status === "rejected")) this._reportFailure();
-    }
+    // Ownership revocation must not inherit arbitrary latency from an async
+    // disposable. Every promise is observed when registered, while settle()
+    // yields once so immediately rejected cleanup is reported without making
+    // activation or reload wait for storage, network, or VS Code command work.
+    await Promise.resolve();
+  }
+
+  observe(promise, reportFailure = this._reportFailure) {
+    return Promise.resolve(promise).then(
+      () => undefined,
+      () => {
+        try { reportFailure(); } catch { /* observation remains fail-open */ }
+      }
+    );
   }
 
   _disposeResource(resource) {
     try {
       const result = resource.dispose();
       if (result && typeof result.then === "function") {
-        this._pending.push(Promise.resolve(result));
+        this.observe(result);
       }
     } catch {
       this._reportFailure();

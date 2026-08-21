@@ -35,8 +35,8 @@ function runSelfTests() {
       commands: [{ command: "cloudsmith-vsc.example", title: "Example command" }],
     },
   };
-  const active = Array.from({ length: 20 }, (_, index) => `| \`cloudsmith-vsc.filler${index}\` | \`false\` | Boolean | Filler. |`).join("\n");
-  for (let index = 0; index < 20; index += 1) {
+  const active = Array.from({ length: 19 }, (_, index) => `| \`cloudsmith-vsc.filler${index}\` | \`false\` | Boolean | Filler. |`).join("\n");
+  for (let index = 0; index < 19; index += 1) {
     manifest.contributes.configuration.properties[`cloudsmith-vsc.filler${index}`] = { type: "boolean", default: false };
   }
   const readme = `### Active settings\n| Setting | Default | Constraints | Purpose |\n|---|---|---|---|\n| \`cloudsmith-vsc.example\` | \`3\` | Integer, 1-5 | Example. |\n${active}\n### Deprecated compatibility settings\n| Setting | Default | Status | Purpose |\n|---|---|---|---|\n| \`cloudsmith-vsc.autoScanOnOpen\` | \`false\` | Deprecated | No effect. |\n| \`cloudsmith-vsc.showRepoMetrics\` | \`false\` | Deprecated | No effect. |\n## Command surfaces\n| Surface | Command ID | Command | Purpose |\n|---|---|---|---|\n| Command Palette | \`cloudsmith-vsc.example\` | \`Example command\` | Example. |`;

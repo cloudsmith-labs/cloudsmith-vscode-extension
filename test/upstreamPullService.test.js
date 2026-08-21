@@ -132,6 +132,39 @@ suite("UpstreamPullService", () => {
     );
   });
 
+  test("an SSO session is never sent to an upstream registry", async () => {
+    let fetches = 0;
+    const errors = [];
+    const service = new UpstreamPullService({}, {
+      credentialManager: {
+        async getApiKey() { return null; },
+        getCredentialKind() { return "sso"; },
+      },
+      fetchImpl: async () => { fetches += 1; throw new Error("registry request must not run"); },
+      showErrorMessage: async message => { errors.push(message); },
+      showInformationMessage: async () => {},
+      showWarningMessage: async () => {},
+    });
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repository" },
+      plan: {
+        pullableDependencies: [{
+          name: "dependency",
+          version: "1.0.0",
+          format: "npm",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    });
+    assert.strictEqual(result, null);
+    assert.strictEqual(fetches, 0);
+    assert.deepStrictEqual(errors, [
+      "Upstream registry pull currently requires a Cloudsmith API key. Your SSO session was not sent to the registry.",
+    ]);
+  });
+
   test("builds canonical registry trigger URLs for supported formats", () => {
     const mavenPlan = buildRegistryTriggerPlan("workspace", "repo", {
       name: "com.example:demo-app",

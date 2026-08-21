@@ -13,7 +13,7 @@ suite("Live integration: controlled vulnerability fixture", function () {
       liveFixture.workspace,
       liveFixture.repository,
       liveFixture.vulnerablePackageSlug,
-    ]), { apiKey: liveFixture.apiKey, responseType: "array" });
+    ]), { credential: liveFixture.credential, responseType: "array" });
     assert.strictEqual(scansResult.ok, true, scansResult.error && scansResult.error.message);
     assert.ok(scansResult.data.length > 0, "Configured vulnerable package has no scans");
 
@@ -28,7 +28,7 @@ suite("Live integration: controlled vulnerability fixture", function () {
       liveFixture.repository,
       liveFixture.vulnerablePackageSlug,
       scan.identifier,
-    ]), { apiKey: liveFixture.apiKey, responseType: "object" });
+    ]), { credential: liveFixture.credential, responseType: "object" });
     assert.strictEqual(detailResult.ok, true, detailResult.error && detailResult.error.message);
 
     const results = extractVulnerabilityResults(detailResult.data);

@@ -55,8 +55,8 @@ class PaginatedFetch {
       signal: options.signal,
       cancellationToken: options.cancellationToken,
     };
-    if (Object.prototype.hasOwnProperty.call(options, "apiKey")) {
-      requestOptions.apiKey = options.apiKey;
+    if (Object.prototype.hasOwnProperty.call(options, "credential")) {
+      requestOptions.credential = options.credential;
     }
 
     let result;

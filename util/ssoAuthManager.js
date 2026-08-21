@@ -3,107 +3,64 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
-const url = require("url");
 const vscode = require("vscode");
+const { createSSOCredential, normalizeAPIKey, normalizeBearerToken } = require("./credentialEnvelope");
+const { recordSSODiagnostic } = require("./ssoDiagnostics");
+const { SSOProtocolClient, isValidWorkspace } = require("./ssoProtocolClient");
 
 const SAML_CALLBACK_PORT = 12400;
-const CALLBACK_SUCCESS_PATH = "/authenticated";
-const TOKEN_PARAM_NAMES = ["api_key", "token", "access_token", "key"];
-const WORKSPACE_SLUG_PATTERN = /^[A-Za-z0-9._-]+$/;
-const MAX_WORKSPACE_SLUG_LENGTH = 128;
 const MAX_CLI_CONFIG_BYTES = 64 * 1024;
-
-function configTooLargeError() {
-  const error = new Error("Cloudsmith CLI configuration exceeds the supported size.");
-  error.code = "CONFIG_TOO_LARGE";
-  return error;
-}
-
-async function readBoundedTextFile(filePath) {
-  const handle = await fs.promises.open(filePath, "r");
-  try {
-    const buffer = Buffer.alloc(MAX_CLI_CONFIG_BYTES + 1);
-    let total = 0;
-    while (total < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
-      if (bytesRead === 0) break;
-      total += bytesRead;
-    }
-    if (total > MAX_CLI_CONFIG_BYTES) throw configTooLargeError();
-    return buffer.subarray(0, total).toString("utf8");
-  } finally {
-    await handle.close();
-  }
-}
-
-function readBoundedTextFileSync(filePath) {
-  const descriptor = fs.openSync(filePath, "r");
-  try {
-    const buffer = Buffer.alloc(MAX_CLI_CONFIG_BYTES + 1);
-    let total = 0;
-    while (total < buffer.length) {
-      const bytesRead = fs.readSync(descriptor, buffer, total, buffer.length - total, total);
-      if (bytesRead === 0) break;
-      total += bytesRead;
-    }
-    if (total > MAX_CLI_CONFIG_BYTES) throw configTooLargeError();
-    return buffer.subarray(0, total).toString("utf8");
-  } finally {
-    fs.closeSync(descriptor);
-  }
-}
+const MAX_CALLBACK_TARGET_BYTES = 20 * 1024;
+const MAX_CALLBACK_PAIRS = 8;
+const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
+const RECOGNIZED_CALLBACK_FIELDS = new Set([
+  "access_token",
+  "refresh_token",
+  "two_factor_token",
+  "error",
+]);
 
 function failedResult(kind, message) {
   return Object.freeze({
     ok: false,
-    status: "failed",
+    status: kind === "stale" ? "stale" : "failed",
     committed: false,
     error: Object.freeze({ kind, message }),
   });
 }
 
 function unavailableResult() {
-  return failedResult(
-    "unavailable",
-    "Authentication is not ready. Reload the extension and try again."
-  );
+  return failedResult("unavailable", "Authentication is not ready. Reload the extension and try again.");
 }
 
 class SSOAuthManager {
   constructor(context, options = {}) {
     this.context = context;
     this._connectionManager = options.connectionManager || null;
-    this._readFile = options.readFile
-      ? async filePath => {
-        const content = await options.readFile(filePath, "utf8");
-        if (Buffer.byteLength(content, "utf8") > MAX_CLI_CONFIG_BYTES) throw configTooLargeError();
-        return content;
-      }
-      : readBoundedTextFile;
-    this._readFileSync = options.readFileSync
-      ? filePath => {
-        const content = options.readFileSync(filePath, "utf8");
-        if (Buffer.byteLength(content, "utf8") > MAX_CLI_CONFIG_BYTES) throw configTooLargeError();
-        return content;
-      }
-      : readBoundedTextFileSync;
-    this._accessSync = options.accessSync || fs.accessSync;
+    this._fs = options.fs || fs.promises;
+    this._platform = options.platform || process.platform;
+    this._env = options.env || process.env;
+    this._home = options.home || os.homedir();
     this._findConfigPath = options.findCLIConfigPath || null;
+    this._diagnosticObserver = options.diagnosticObserver || null;
+    this._protocol = options.protocolClient || new SSOProtocolClient({
+      fetchImpl: options.fetchImpl,
+      setTimeout: options.setTimeout,
+      clearTimeout: options.clearTimeout,
+      diagnosticObserver: this._diagnosticObserver,
+    });
     this._setTimeout = options.setTimeout || setTimeout;
     this._clearTimeout = options.clearTimeout || clearTimeout;
     this._createServer = options.createServer || http.createServer;
+    this._serverFactoryInjected = Boolean(options.createServer);
+    this._callbackHosts = normalizeCallbackHosts(options.callbackHosts);
     this._randomBytes = options.randomBytes || crypto.randomBytes;
     this._openExternal = options.openExternal || vscode.env.openExternal;
     this._showErrorMessage = options.showErrorMessage
       || vscode.window.showErrorMessage.bind(vscode.window);
     this._showInformationMessage = options.showInformationMessage
       || vscode.window.showInformationMessage.bind(vscode.window);
-    this._showWarningMessage = options.showWarningMessage
-      || vscode.window.showWarningMessage.bind(vscode.window);
-    this._createTerminal = options.createTerminal
-      || vscode.window.createTerminal.bind(vscode.window);
-    this._onDidCloseTerminal = options.onDidCloseTerminal
-      || vscode.window.onDidCloseTerminal.bind(vscode.window);
+    this._showInputBox = options.showInputBox || vscode.window.showInputBox.bind(vscode.window);
   }
 
   async importFromCLI(operation = null) {
@@ -112,150 +69,48 @@ class SSOAuthManager {
     const token = operation || manager.beginCredentialOperation();
     if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
 
-    const configPath = this._findCLIConfigPath();
-    if (!configPath) {
-      await manager.cancelCredentialOperation(token);
-      this._showErrorMessage(
-        'Could not find Cloudsmith CLI configuration. Run "cloudsmith auth" in a terminal first.'
-      );
-      return failedResult("config_missing", "Cloudsmith CLI configuration was not found.");
-    }
-
-    let content;
+    let candidates;
     try {
-      content = await this._readFile(configPath);
-    } catch (error) {
-      await manager.cancelCredentialOperation(token);
-      const tooLarge = error && error.code === "CONFIG_TOO_LARGE";
-      const publicMessage = tooLarge
-        ? "Cloudsmith CLI config is too large to import."
-        : "Could not read Cloudsmith CLI config. Check file permissions.";
-      this._showErrorMessage(publicMessage);
-      return failedResult(
-        tooLarge ? "config_too_large" : "config_read_failed",
-        publicMessage
-      );
-    }
-    if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
-
-    const apiKey = this._parseAPIKeyFromConfig(content);
-    if (!apiKey) {
-      await manager.cancelCredentialOperation(token);
-      this._showErrorMessage(
-        "No API key found in Cloudsmith CLI config. Run 'cloudsmith auth -o {workspace}' first."
-      );
-      return failedResult("credential_missing", "No API key was found in the CLI configuration.");
-    }
-
-    return manager.replaceCredential(apiKey, token);
-  }
-
-  hasCLICredentials() {
-    const configPath = this._findCLIConfigPath();
-    if (!configPath) return false;
-    try {
-      const content = this._readFileSync(configPath, "utf8");
-      return Boolean(this._parseAPIKeyFromConfig(content));
+      if (this._findConfigPath) {
+        const file = this._findConfigPath();
+        candidates = file ? [{ root: path.dirname(file), file }] : [];
+      } else {
+        candidates = cliCredentialCandidates(this._platform, this._env, this._home);
+      }
     } catch {
-      return false;
+      candidates = [];
     }
-  }
-
-  _findCLIConfigPath() {
-    if (this._findConfigPath) return this._findConfigPath();
-    const home = os.homedir();
-    const candidates = [
-      path.join(home, ".cloudsmith", "config.ini"),
-      path.join(process.env.XDG_CONFIG_HOME || path.join(home, ".config"), "cloudsmith", "config.ini"),
-    ];
-    if (process.platform === "darwin") {
-      candidates.push(path.join(home, "Library", "Application Support", "cloudsmith", "config.ini"));
-    }
-    if (process.platform === "win32" && process.env.APPDATA) {
-      candidates.push(path.join(process.env.APPDATA, "cloudsmith", "config.ini"));
-    }
+    const found = [];
     for (const candidate of candidates) {
+      let content;
       try {
-        this._accessSync(candidate, fs.constants.R_OK);
-        return candidate;
-      } catch {
-        // Try the next platform-specific location.
+        content = await readTrustedCredentialFile(candidate.root, candidate.file, this._fs);
+      } catch (error) {
+        if (error && error.code === "ENOENT") continue;
+        if (manager.isOperationCurrent(token)) await manager.cancelCredentialOperation(token);
+        const message = "Could not safely read Cloudsmith CLI credentials.ini.";
+        this._showErrorMessage(message);
+        return failedResult("config_read_failed", message);
       }
-    }
-    return null;
-  }
-
-  _parseAPIKeyFromConfig(content) {
-    if (typeof content !== "string") return null;
-    if (Buffer.byteLength(content, "utf8") > MAX_CLI_CONFIG_BYTES) return null;
-    for (const line of content.split("\n")) {
-      const match = line.trim().match(/^api_key\s*=\s*(.+)$/);
-      if (match) {
-        const key = match[1].trim();
-        if (key) return key;
+      if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
+      const parsed = parseDefaultAPIKey(content);
+      if (!parsed.ok) {
+        await manager.cancelCredentialOperation(token);
+        const message = "Cloudsmith CLI credentials.ini is ambiguous or malformed.";
+        this._showErrorMessage(message);
+        return failedResult("config_invalid", message);
       }
+      if (parsed.apiKey) found.push(parsed.apiKey);
     }
-    return null;
-  }
-
-  async loginViaTerminal(workspaceSlug, operation = null) {
-    const manager = this._getConnectionManager();
-    if (!manager) return unavailableResult();
-    const token = operation || manager.beginCredentialOperation();
-    if (!this.isValidWorkspaceSlug(workspaceSlug)) {
+    if (found.length !== 1) {
       await manager.cancelCredentialOperation(token);
-      this._showErrorMessage("Enter a valid Cloudsmith workspace slug.");
-      return failedResult("invalid_workspace", "The Cloudsmith workspace slug is invalid.");
+      const message = found.length > 1
+        ? "Multiple Cloudsmith CLI API keys were found. Choose one explicitly in the CLI first."
+        : "No [default] API key was found in trusted Cloudsmith CLI credentials.ini files.";
+      this._showErrorMessage(message);
+      return failedResult(found.length > 1 ? "ambiguous_credentials" : "credential_missing", message);
     }
-
-    let terminal = null;
-    let closeDisposable = null;
-    let timeout = null;
-    let abortListener = null;
-    try {
-      terminal = this._createTerminal("Cloudsmith SSO");
-      terminal.show();
-      terminal.sendText(`cloudsmith auth -o ${workspaceSlug}`);
-      await new Promise((resolve) => {
-        let done = false;
-        const finish = () => {
-          if (done) return;
-          done = true;
-          resolve();
-        };
-        closeDisposable = this._onDidCloseTerminal((closed) => {
-          if (closed === terminal) finish();
-        });
-        timeout = this._setTimeout(finish, 10000);
-        abortListener = finish;
-        token.signal.addEventListener("abort", abortListener, { once: true });
-        if (token.signal.aborted) finish();
-      });
-
-      if (!manager.isOperationCurrent(token)) {
-        return failedResult("stale", "Authentication was superseded.");
-      }
-      const choice = await this._showInformationMessage(
-        "Import credentials from the Cloudsmith CLI config?",
-        "Import",
-        "Not now"
-      );
-      if (!manager.isOperationCurrent(token)) {
-        return failedResult("stale", "Authentication was superseded.");
-      }
-      if (choice === "Import") return this.importFromCLI(token);
-      return manager.cancelCredentialOperation(token);
-    } catch {
-      if (manager.isOperationCurrent(token)) await manager.cancelCredentialOperation(token);
-      return failedResult(
-        "terminal_failed",
-        "Could not start Cloudsmith CLI authentication."
-      );
-    } finally {
-      if (timeout !== null) this._clearTimeout(timeout);
-      if (closeDisposable && typeof closeDisposable.dispose === "function") closeDisposable.dispose();
-      if (abortListener) token.signal.removeEventListener("abort", abortListener);
-    }
+    return manager.replaceCredential(found[0], token);
   }
 
   async loginViaBrowser(workspaceSlug, operation = null) {
@@ -264,160 +119,310 @@ class SSOAuthManager {
     const token = operation || manager.beginCredentialOperation();
     if (!this.isValidWorkspaceSlug(workspaceSlug)) {
       await manager.cancelCredentialOperation(token);
-      this._showErrorMessage("Enter a valid Cloudsmith workspace slug.");
       return failedResult("invalid_workspace", "The Cloudsmith workspace slug is invalid.");
     }
 
-    const callbackId = this._randomBytes(16).toString("hex");
-    const callbackPath = `/callback/${callbackId}`;
-    let server = null;
+    let callback = null;
     try {
-      const serverResult = await this._startCallbackServer(callbackPath);
-      server = serverResult.server;
+      callback = await this._startCallbackServer(token.signal);
       if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
-
-      const redirectUrl = `http://127.0.0.1:${SAML_CALLBACK_PORT}${callbackPath}`;
-      const authUrl =
-        `https://api.cloudsmith.io/orgs/${encodeURIComponent(workspaceSlug)}/saml/` +
-        `?redirect_url=${encodeURIComponent(redirectUrl)}`;
-      const tokenPromise = this._waitForCallbackToken(server, token.signal);
-      await this._openExternal(vscode.Uri.parse(authUrl));
+      const discovery = await this._protocol.discover(workspaceSlug, { signal: token.signal });
+      if (!discovery.ok) throw publicFailure(discoveryFailureKind(discovery.kind));
       if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
-      this._showInformationMessage("Browser sign-in started. Waiting for authentication...");
-
-      const candidate = await tokenPromise;
-      if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
-      if (candidate) return manager.replaceCredential(candidate, token);
-
-      const choice = await this._showWarningMessage(
-        "Browser-based SSO did not complete. Select a fallback method.",
-        "Open Terminal",
-        "Import from CLI",
-        "Dismiss"
-      );
-      if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
-      if (choice === "Open Terminal") return this.loginViaTerminal(workspaceSlug, token);
-      if (choice === "Import from CLI") return this.importFromCLI(token);
-      return manager.cancelCredentialOperation(token);
-    } catch {
-      if (manager.isOperationCurrent(token)) await manager.cancelCredentialOperation(token);
-      const message = "Browser authentication could not start or complete.";
-      this._showErrorMessage(
-        `Could not complete browser SSO on port ${SAML_CALLBACK_PORT}. ${message}`
-      );
-      return failedResult("browser_failed", message);
-    } finally {
-      if (server) this._shutdownServer(server);
-    }
-  }
-
-  _waitForCallbackToken(server, signal) {
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = (candidate) => {
-        if (settled) return;
-        settled = true;
-        if (server._timeout !== null) this._clearTimeout(server._timeout);
-        server._timeout = null;
-        signal.removeEventListener("abort", onAbort);
-        server._resolveToken = null;
-        resolve(candidate);
-      };
-      const onAbort = () => finish(null);
-      server._resolveToken = finish;
-      server._timeout = this._setTimeout(() => finish(null), 5 * 60 * 1000);
-      signal.addEventListener("abort", onAbort, { once: true });
-      if (signal.aborted) onAbort();
-    });
-  }
-
-  _startCallbackServer(expectedPath) {
-    return new Promise((resolve, reject) => {
-      const server = this._createServer((req, res) => this._handleCallbackRequest(req, res, server));
-      server._expectedPath = expectedPath;
-      server._timeout = null;
-      const onError = (error) => {
-        const message = error.code === "EADDRINUSE"
-          ? `Port ${SAML_CALLBACK_PORT} is already in use`
-          : "Failed to start the callback server";
-        reject(new Error(message));
-      };
-      server.once("error", onError);
-      server.listen(SAML_CALLBACK_PORT, "127.0.0.1", () => {
-        server.removeListener("error", onError);
-        server.on("error", () => {
-          if (server._resolveToken) server._resolveToken(null);
-          this._shutdownServer(server);
-        });
-        resolve({ server, port: SAML_CALLBACK_PORT });
-      });
-    });
-  }
-
-  _handleCallbackRequest(req, res, server) {
-    const parsed = url.parse(req.url, true);
-    const params = parsed.query || {};
-    const pathName = parsed.pathname || "/";
-    if (req.method !== "GET") {
-      res.writeHead(405, { "Content-Type": "text/plain" });
-      res.end("Method Not Allowed");
-      return;
-    }
-    if (pathName !== server._expectedPath) {
-      res.writeHead(404, { "Content-Type": "text/plain" });
-      res.end("Not Found");
-      return;
-    }
-
-    let token = null;
-    for (const name of TOKEN_PARAM_NAMES) {
-      if (typeof params[name] === "string" && params[name]) {
-        token = params[name];
-        break;
+      const listenerOutcome = callback.getSettledOutcome();
+      if (listenerOutcome && ["cancelled", "timeout", "listener_failed"].includes(listenerOutcome.kind)) {
+        throw publicFailure(listenerOutcome.kind);
       }
+
+      // VS Code's URI external-opener path applies encodeURI() to an already
+      // encoded URI. Passing Cloudsmith's SAML redirect as a URI therefore
+      // double-encodes its query payload. Supported extension hosts accept the
+      // original string here and preserve it through the browser boundary.
+      const idpTarget = discovery.redirectUrl;
+      let opened = false;
+      this._record("sso.browser.open");
+      try { opened = await this._openExternal(idpTarget); } catch { opened = false; }
+      if (opened === false) {
+        const retry = await this._showErrorMessage(
+          "Could not open the Cloudsmith identity provider in your browser.",
+          "Retry",
+          "Cancel"
+        );
+        if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
+        if (retry !== "Retry") throw publicFailure("browser_open_failed", true);
+        try { opened = await this._openExternal(idpTarget); } catch { opened = false; }
+        if (opened === false) throw publicFailure("browser_open_failed");
+      }
+      this._record("sso.browser.open", { ok: true });
+      if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
+      this._showInformationMessage("Cloudsmith browser sign-in started. Waiting for the callback...");
+
+      const outcome = await callback.outcome;
+      if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
+      await callback.close();
+      callback = null;
+      if (outcome.kind === "error") throw publicFailure("identity_provider_error");
+      if (["cancelled", "timeout", "listener_failed"].includes(outcome.kind)) {
+        throw publicFailure(outcome.kind);
+      }
+
+      let accessToken;
+      let refreshToken;
+      if (outcome.kind === "two_factor") {
+        this._record("sso.two-factor.prompt");
+        const totp = await this._showInputBox({
+          prompt: "Enter your Cloudsmith two-factor authentication code",
+          password: true,
+          ignoreFocusOut: true,
+          validateInput: value => (/^[0-9]{6,10}$/.test(value || "") ? null : "Enter a valid code."),
+        });
+        if (!manager.isOperationCurrent(token)) return failedResult("stale", "Authentication was superseded.");
+        if (!totp) return manager.cancelCredentialOperation(token);
+        const exchange = await this._protocol.exchangeTwoFactor(outcome.twoFactorToken, totp, {
+          signal: token.signal,
+        });
+        if (!exchange.ok || !exchange.refreshToken) throw publicFailure("two_factor_failed");
+        accessToken = exchange.accessToken;
+        refreshToken = exchange.refreshToken;
+      } else if (outcome.kind === "tokens") {
+        accessToken = outcome.accessToken;
+        refreshToken = outcome.refreshToken;
+      } else {
+        throw publicFailure("callback_invalid_fields");
+      }
+
+      let credential;
+      try {
+        credential = createSSOCredential(accessToken, refreshToken);
+      } catch {
+        throw publicFailure("credential_invalid");
+      }
+      this._record("sso.credential.constructed", {
+        credentialKind: "sso",
+        hasRefreshToken: Boolean(refreshToken),
+      });
+      const result = await manager.replaceCredential(credential, token, {
+        workspaceSlug,
+        beforeCommit: async identity => {
+          const label = sanitizeDisplay(identity);
+          if (!label) {
+            this._record("sso.identity.confirmation", { ok: false });
+            return false;
+          }
+          const choice = await this._showInformationMessage(
+            `Continue as ${label} for Cloudsmith workspace ${workspaceSlug}?`,
+            { modal: true },
+            "Continue"
+          );
+          const confirmed = choice === "Continue";
+          this._record("sso.identity.confirmation", { ok: confirmed });
+          return confirmed;
+        },
+      });
+      if (result.ok) this._record("sso.connected", { credentialKind: "sso", ok: true });
+      return result;
+    } catch (error) {
+      if (manager.isOperationCurrent(token)) await manager.cancelCredentialOperation(token);
+      const kind = error && error.kind ? error.kind : "browser_failed";
+      const message = callbackErrorMessage(kind);
+      this._record("sso.failed", { errorKind: kind, ok: false });
+      if (!(error && error.reported)) this._showErrorMessage(message);
+      return failedResult(kind, message);
+    } finally {
+      if (callback) await callback.close();
     }
-    if (server._resolveToken) server._resolveToken(token);
-    if (token) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(this._buildCallbackHtml(true, CALLBACK_SUCCESS_PATH));
-      return;
-    }
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(this._buildCallbackHtml(false));
   }
 
-  _shutdownServer(server) {
-    if (typeof server._resolveToken === "function") {
-      server._resolveToken(null);
-    } else if (server._timeout !== null) {
-      this._clearTimeout(server._timeout);
-      server._timeout = null;
+  async loginViaTerminal(_workspaceSlug, operation = null) {
+    const manager = this._getConnectionManager();
+    if (manager && operation && manager.isOperationCurrent(operation)) {
+      await manager.cancelCredentialOperation(operation);
     }
-    server._resolveToken = null;
+    return failedResult(
+      "unsupported_terminal_flow",
+      "CLI SSO credentials remain in the CLI keyring and cannot be imported into VS Code."
+    );
+  }
+
+  async _startCallbackServer(signal) {
+    this._record("sso.callback.start");
+    const sockets = new Set();
+    const servers = [];
+    const createdServers = [];
+    let settle;
+    let settled = false;
+    let settledOutcome = null;
+    let timeout = null;
+    let closed = false;
+    const outcome = new Promise(resolve => { settle = resolve; });
+    const finish = (value) => {
+      if (settled) return false;
+      settled = true;
+      settledOutcome = value;
+      settle(value);
+      return true;
+    };
+    const handler = (request, response) => this._handleCallbackRequest(request, response, finish);
+    const createServer = () => {
+      const server = this._serverFactoryInjected
+        ? this._createServer(handler)
+        : this._createServer({ maxHeaderSize: 16 * 1024 }, handler);
+      server.headersTimeout = 5000;
+      server.requestTimeout = 5000;
+      server.keepAliveTimeout = 1000;
+      server.maxRequestsPerSocket = 1;
+      server.maxConnections = 8;
+      server.on("connection", socket => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+      });
+      createdServers.push(server);
+      return server;
+    };
+    const onAbort = () => finish({ kind: "cancelled" });
+    const onRuntimeError = () => finish({ kind: "listener_failed" });
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+
     try {
-      server.close();
-    } catch {
-      // The server may already be closed.
+      for (const host of this._callbackHosts) {
+        const server = createServer();
+        const bound = await bindCallbackServer(server, host);
+        if (!bound) {
+          server.removeAllListeners();
+          continue;
+        }
+        server.on("error", onRuntimeError);
+        servers.push(server);
+        this._record("sso.callback.bound", {
+          callbackFamily: host === "::1" ? "ipv6" : "ipv4",
+          ok: true,
+        });
+      }
+      if (servers.length === 0) throw publicFailure("listener_failed");
+    } catch (error) {
+      signal.removeEventListener("abort", onAbort);
+      for (const socket of sockets) socket.destroy();
+      await Promise.all(createdServers.map(async server => {
+        server.removeListener("error", onRuntimeError);
+        await closeCallbackServer(server);
+        server.removeAllListeners("connection");
+        server.removeAllListeners("error");
+      }));
+      throw error;
     }
+    timeout = this._setTimeout(() => finish({ kind: "timeout" }), CALLBACK_TIMEOUT_MS);
+    const close = async () => {
+      if (closed) return;
+      closed = true;
+      if (timeout !== null) this._clearTimeout(timeout);
+      signal.removeEventListener("abort", onAbort);
+      finish({ kind: "cancelled" });
+      for (const socket of sockets) socket.destroy();
+      await Promise.all(servers.map(async server => {
+        server.removeListener("error", onRuntimeError);
+        await closeCallbackServer(server);
+        server.removeAllListeners("connection");
+        server.removeAllListeners("error");
+      }));
+    };
+    return Object.freeze({
+      server: servers[0],
+      servers: Object.freeze(servers.slice()),
+      outcome,
+      close,
+      getSettledOutcome: () => settledOutcome,
+    });
+  }
+
+  _handleCallbackRequest(request, response, finish) {
+    const family = callbackFamily(request?.socket?.localAddress);
+    this._record("sso.callback.received", family ? { callbackFamily: family } : undefined);
+    const generic = (status, received = false, twoFactor = false) => {
+      const nonce = this._randomBytes(18).toString("base64");
+      response.writeHead(status, callbackHeaders(nonce));
+      response.end(callbackHtml(nonce, received, twoFactor));
+    };
+    const reject = (status, errorKind, metadata) => {
+      this._record("sso.callback.rejected", { errorKind, ok: false, ...(metadata || {}) });
+      generic(status);
+    };
+    if (request.method !== "GET" || request.headers["transfer-encoding"] || Number(request.headers["content-length"] || 0) > 0) {
+      reject(request.method !== "GET" ? 405 : 400, request.method !== "GET" ? "callback_invalid_method" : "callback_invalid_body");
+      return;
+    }
+    if (typeof request.url !== "string" || Buffer.byteLength(request.url, "utf8") > MAX_CALLBACK_TARGET_BYTES || !request.url.startsWith("/")) {
+      reject(400, "callback_invalid_path");
+      return;
+    }
+    let parsed;
+    try {
+      parsed = new URL(request.url, "http://localhost");
+    } catch {
+      reject(400, "callback_invalid_path");
+      return;
+    }
+    if (parsed.origin !== "http://localhost" || parsed.pathname !== "/" || parsed.hash) {
+      reject(404, "callback_invalid_path");
+      return;
+    }
+    const pairs = [...parsed.searchParams.entries()];
+    const recognizedNames = pairs.every(([name]) => RECOGNIZED_CALLBACK_FIELDS.has(name));
+    const callbackMetadata = {
+      queryPairCount: pairs.length,
+      ...(recognizedNames ? { parameterNames: pairs.map(([name]) => name) } : {}),
+    };
+    this._record("sso.callback.received", { ...callbackMetadata, ...(family ? { callbackFamily: family } : {}) });
+    if (pairs.length === 0 || pairs.length > MAX_CALLBACK_PAIRS || !recognizedNames) {
+      reject(400, "callback_invalid_fields", callbackMetadata);
+      return;
+    }
+    const values = Object.create(null);
+    for (const [name, value] of pairs) {
+      if (Object.prototype.hasOwnProperty.call(values, name)) {
+        reject(400, "callback_duplicate", callbackMetadata);
+        return;
+      }
+      if (!validCallbackValue(name, value)) {
+        reject(400, name === "error" ? "callback_invalid_fields" : "callback_invalid_token", {
+          ...callbackMetadata,
+          tokenCharacterClass: "rejected",
+          tokenLength: value.length,
+        });
+        return;
+      }
+      values[name] = value;
+    }
+    const has = name => Object.prototype.hasOwnProperty.call(values, name);
+    if (has("error") && pairs.length === 1) {
+      if (finish({ kind: "error" })) {
+        this._record("sso.callback.accepted", { ...callbackMetadata, outcomeKind: "error", ok: true });
+        generic(200);
+      }
+      else generic(409);
+      return;
+    }
+    if (has("two_factor_token") && pairs.length === 1) {
+      if (finish({ kind: "two_factor", twoFactorToken: values.two_factor_token })) {
+        this._record("sso.callback.accepted", { ...callbackMetadata, outcomeKind: "two_factor", ok: true });
+        generic(200, true, true);
+      }
+      else generic(409);
+      return;
+    }
+    if (has("access_token") && has("refresh_token") && pairs.length === 2) {
+      if (finish({ kind: "tokens", accessToken: values.access_token, refreshToken: values.refresh_token })) {
+        this._record("sso.callback.accepted", { ...callbackMetadata, outcomeKind: "tokens", ok: true });
+        generic(200, true);
+      }
+      else generic(409);
+      return;
+    }
+    reject(400, "callback_invalid_fields", callbackMetadata);
   }
 
   isValidWorkspaceSlug(workspaceSlug) {
-    return typeof workspaceSlug === "string"
-      && workspaceSlug.length > 0
-      && workspaceSlug.length <= MAX_WORKSPACE_SLUG_LENGTH
-      && WORKSPACE_SLUG_PATTERN.test(workspaceSlug);
-  }
-
-  _buildCallbackHtml(success, replacePath) {
-    const heading = success ? "\u2705 Credentials received" : "\u274C Credentials not received";
-    const message = success
-      ? "Return to VS Code while the credentials are validated and saved."
-      : "No credentials were found in the redirect. Try the terminal flow or CLI import.";
-    const script = replacePath
-      ? `<script>if (window.history && window.history.replaceState) { window.history.replaceState(null, "", "${replacePath}"); }</script>`
-      : "";
-    return "<html><body style=\"font-family:sans-serif;text-align:center;padding:40px\">" +
-      `<h2>${heading}</h2><p>${message}</p>${script}</body></html>`;
+    return isValidWorkspace(workspaceSlug);
   }
 
   _getConnectionManager() {
@@ -425,6 +430,310 @@ class SSOAuthManager {
     const { getConnectionManager } = require("./connectionManager");
     return getConnectionManager(this.context);
   }
+
+  _record(stage, metadata) {
+    recordSSODiagnostic(this._diagnosticObserver, stage, metadata);
+  }
 }
 
-module.exports = { SSOAuthManager };
+function normalizeCallbackHosts(value) {
+  const hosts = value === undefined ? ["127.0.0.1", "::1"] : value;
+  if (
+    !Array.isArray(hosts)
+    || hosts.length === 0
+    || hosts.some(host => !["127.0.0.1", "::1"].includes(host))
+    || new Set(hosts).size !== hosts.length
+  ) {
+    throw new TypeError("Callback listeners must use unique IPv4 or IPv6 loopback hosts.");
+  }
+  return Object.freeze(hosts.slice());
+}
+
+function bindCallbackServer(server, host) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      server.removeListener("error", onError);
+      server.removeListener("listening", onListening);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const onError = error => {
+      if (host === "::1" && ["EAFNOSUPPORT", "EADDRNOTAVAIL"].includes(error?.code)) {
+        finish(null, false);
+        return;
+      }
+      finish(publicFailure(error?.code === "EADDRINUSE" ? "port_in_use" : "listener_failed"));
+    };
+    const onListening = () => finish(null, true);
+    server.once("error", onError);
+    server.once("listening", onListening);
+    try {
+      server.listen({
+        host,
+        port: SAML_CALLBACK_PORT,
+        exclusive: true,
+        ...(host === "::1" ? { ipv6Only: true } : {}),
+      });
+    } catch (error) {
+      onError(error);
+    }
+  });
+}
+
+function closeCallbackServer(server) {
+  return new Promise(resolve => {
+    try {
+      server.closeIdleConnections?.();
+      server.closeAllConnections?.();
+      if (!server.listening) {
+        resolve();
+        return;
+      }
+      server.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+async function readTrustedCredentialFile(root, file, fileSystem) {
+  const normalizedRoot = path.resolve(root);
+  const normalizedFile = path.resolve(file);
+  const relative = path.relative(normalizedRoot, normalizedFile);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw unsafeFile();
+  const anchors = [];
+  const rootStat = await fileSystem.lstat(normalizedRoot);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw unsafeFile();
+  anchors.push({ target: normalizedRoot, stat: rootStat });
+  let current = normalizedRoot;
+  for (const part of relative.split(path.sep).slice(0, -1)) {
+    current = path.join(current, part);
+    const stat = await fileSystem.lstat(current);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw unsafeFile();
+    anchors.push({ target: current, stat });
+  }
+  let handle;
+  try {
+    handle = await fileSystem.open(normalizedFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  } catch (error) {
+    if (error && error.code === "ENOENT") throw error;
+    throw unsafeFile();
+  }
+  try {
+    const during = await handle.stat();
+    const before = await fileSystem.lstat(normalizedFile);
+    if (
+      !during.isFile()
+      || !before.isFile()
+      || before.isSymbolicLink()
+      || during.dev !== before.dev
+      || during.ino !== before.ino
+      || during.size > MAX_CLI_CONFIG_BYTES
+    ) throw unsafeFile();
+    const first = await readBoundedFileHandle(handle);
+    const middle = await handle.stat();
+    const second = await readBoundedFileHandle(handle);
+    const after = await handle.stat();
+    if (
+      first.length > MAX_CLI_CONFIG_BYTES
+      || !first.equals(second)
+      || !sameFileStat(during, middle)
+      || !sameFileStat(during, after)
+    ) throw unsafeFile();
+    for (const anchor of anchors) {
+      const finalStat = await fileSystem.lstat(anchor.target);
+      if (
+        !finalStat.isDirectory()
+        || finalStat.isSymbolicLink()
+        || finalStat.dev !== anchor.stat.dev
+        || finalStat.ino !== anchor.stat.ino
+      ) throw unsafeFile();
+    }
+    const finalPathStat = await fileSystem.lstat(normalizedFile);
+    if (
+      !finalPathStat.isFile()
+      || finalPathStat.isSymbolicLink()
+      || !sameFileStat(during, finalPathStat)
+    ) throw unsafeFile();
+    return new TextDecoder("utf-8", { fatal: true }).decode(first);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readBoundedFileHandle(handle) {
+  const buffer = Buffer.alloc(MAX_CLI_CONFIG_BYTES + 1);
+  let offset = 0;
+  while (offset < buffer.length) {
+    const result = await handle.read(buffer, offset, buffer.length - offset, offset);
+    if (!result.bytesRead) break;
+    offset += result.bytesRead;
+  }
+  return buffer.subarray(0, offset);
+}
+
+function sameFileStat(left, right) {
+  return Boolean(
+    left
+    && right
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs
+  );
+}
+
+function cliCredentialCandidates(platform, env, home) {
+  const platformPath = platform === "win32" ? path.win32 : path;
+  const candidates = [];
+  const add = (root) => {
+    if (!root || !platformPath.isAbsolute(root)) return;
+    const candidate = { root, file: platformPath.join(root, "cloudsmith", "credentials.ini") };
+    if (!candidates.some(item => normalizedPath(item.file, platform) === normalizedPath(candidate.file, platform))) candidates.push(candidate);
+  };
+  if (platform === "darwin") add(platformPath.join(home, "Library", "Application Support"));
+  else if (platform === "win32") add(env.APPDATA || home);
+  else add(platformPath.isAbsolute(env.XDG_CONFIG_HOME || "") ? env.XDG_CONFIG_HOME : platformPath.join(home, ".config"));
+  const legacyRoot = platformPath.join(home, ".cloudsmith");
+  candidates.push({ root: legacyRoot, file: platformPath.join(legacyRoot, "credentials.ini") });
+  return candidates;
+}
+
+function parseDefaultAPIKey(content) {
+  if (typeof content !== "string" || Buffer.byteLength(content, "utf8") > MAX_CLI_CONFIG_BYTES) return { ok: false };
+  const text = content.replace(/^\uFEFF/, "");
+  let section = null;
+  let defaultSeen = false;
+  let apiKey = null;
+  for (const rawLine of text.split(/\r?\n/)) {
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(rawLine)) return { ok: false };
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+    const header = line.match(/^\[([^\]]+)\]$/);
+    if (header) {
+      section = header[1];
+      if (section === "default") {
+        if (defaultSeen) return { ok: false };
+        defaultSeen = true;
+      }
+      continue;
+    }
+    if (!section || !line.includes("=")) return { ok: false };
+    if (section !== "default") continue;
+    const index = line.indexOf("=");
+    const key = line.slice(0, index).trim();
+    let value = line.slice(index + 1).trim();
+    if (key !== "api_key") continue;
+    if (apiKey !== null) return { ok: false };
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+    else if (value.startsWith('"') || value.endsWith('"') || value.startsWith("'") || value.endsWith("'")) return { ok: false };
+    const normalized = normalizeAPIKey(value);
+    if (!normalized.ok || normalized.value !== value) return { ok: false };
+    apiKey = normalized.value;
+  }
+  return { ok: true, apiKey };
+}
+
+function validCallbackValue(name, value) {
+  const max = name === "error" ? 1024 : 8192;
+  if (!value || value.length > max || /[\u0000-\u001f\u007f]/.test(value)) return false;
+  return name === "error" || normalizeBearerToken(value, name).ok;
+}
+
+function callbackHeaders(nonce) {
+  return {
+    "Cache-Control": "no-store, max-age=0",
+    Pragma: "no-cache",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Type": "text/html; charset=utf-8",
+    Connection: "close",
+    "Content-Security-Policy": `default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; script-src 'nonce-${nonce}'`,
+  };
+}
+
+function callbackHtml(nonce, received, twoFactor) {
+  const heading = received ? "Sign-in received" : "Sign-in request not accepted";
+  const detail = twoFactor
+    ? "Return to VS Code to complete two-factor verification."
+    : received
+      ? "Return to VS Code while your session is verified."
+      : "Return to VS Code and try again.";
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Cloudsmith sign-in</title></head><body><h1>${heading}</h1><p>${detail}</p><script nonce="${nonce}">history.replaceState(null,document.title,location.pathname)</script></body></html>`;
+}
+
+function callbackErrorMessage(kind) {
+  const messages = {
+    port_in_use: `Port ${SAML_CALLBACK_PORT} is already in use. Close the application using it and try again.`,
+    browser_open_failed: "Could not open the Cloudsmith identity provider in your browser.",
+    timeout: "Cloudsmith browser sign-in timed out.",
+    identity_provider_error: "The identity provider did not complete Cloudsmith sign-in.",
+    workspace_forbidden: "The authenticated account cannot access the requested Cloudsmith workspace.",
+    listener_failed: "The local Cloudsmith sign-in listener stopped unexpectedly.",
+    callback_invalid_fields: "The browser sign-in response was not accepted.",
+    callback_invalid_token: "The browser sign-in response was not accepted.",
+    credential_invalid: "Cloudsmith returned an SSO session that could not be used safely.",
+    discovery_http_error: "Could not start SSO for that workspace. Try again.",
+    discovery_invalid_response: "Could not start SSO for that workspace. Try again.",
+    discovery_network_error: "Could not start SSO for that workspace. Check the network connection and try again.",
+    discovery_redirect_rejected: "Could not start SSO for that workspace. Try again.",
+    discovery_timeout: "Could not start SSO for that workspace. Try again.",
+    two_factor_failed: "Cloudsmith did not accept the two-factor verification.",
+  };
+  return messages[kind] || "Cloudsmith browser sign-in could not be completed.";
+}
+
+function discoveryFailureKind(kind) {
+  const kinds = {
+    http_error: "discovery_http_error",
+    invalid_response: "discovery_invalid_response",
+    network_error: "discovery_network_error",
+    redirect_rejected: "discovery_redirect_rejected",
+    response_too_large: "discovery_invalid_response",
+    timeout: "discovery_timeout",
+    transient: "discovery_http_error",
+  };
+  return kinds[kind] || kind;
+}
+
+function callbackFamily(address) {
+  if (address === "127.0.0.1") return "ipv4";
+  if (address === "::1") return "ipv6";
+  return null;
+}
+
+function publicFailure(kind, reported = false) {
+  const error = new Error("Cloudsmith browser sign-in failed.");
+  error.kind = kind || "browser_failed";
+  error.reported = Boolean(reported);
+  return error;
+}
+
+function unsafeFile() {
+  const error = new Error("Unsafe credentials file.");
+  error.code = "UNSAFE_CREDENTIAL_FILE";
+  return error;
+}
+
+function sanitizeDisplay(value) {
+  return typeof value === "string" && value.length <= 256
+    ? value.replace(/[\u0000-\u001f\u007f]/g, "").trim()
+    : "";
+}
+
+function normalizedPath(value, platform) {
+  const normalized = (platform === "win32" ? path.win32 : path).normalize(value);
+  return platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+module.exports = {
+  SAML_CALLBACK_PORT,
+  SSOAuthManager,
+  cliCredentialCandidates,
+  parseDefaultAPIKey,
+  readTrustedCredentialFile,
+};

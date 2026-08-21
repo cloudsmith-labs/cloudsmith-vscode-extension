@@ -1,7 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const path = require("path");
 const { spawnSync } = require("child_process");
-const { LIVE_REQUIRED_ENV } = require("../test/testInventories");
+const { LIVE_REQUIRED_ENV, SSO_LIVE_REQUIRED_ENV } = require("../test/testInventories");
 
 const root = path.resolve(__dirname, "..");
 const isWindows = process.platform === "win32";
@@ -15,8 +15,14 @@ const zeroProbe = process.argv.includes("--zero-probe");
 const labelIndex = process.argv.indexOf("--label");
 const label = labelIndex === -1 ? (process.env.VSCODE_TEST_LABEL || "core") : process.argv[labelIndex + 1];
 
-if (!label || !["core", "smoke", "live"].includes(label)) {
-  throw new Error("The VS Code test label must be core, smoke, or live");
+if (!label || !["core", "smoke", "live", "sso-live"].includes(label)) {
+  throw new Error("The VS Code test label must be core, smoke, live, or sso-live");
+}
+if (label === "sso-live") {
+  const missing = SSO_LIVE_REQUIRED_ENV.filter(name => !process.env[name]);
+  if (missing.length > 0) {
+    throw new Error(`SSO live test configuration is incomplete; set: ${missing.join(", ")}`);
+  }
 }
 if (label === "live") {
   if (process.env.CLOUDSMITH_LIVE_TESTS !== "1") {

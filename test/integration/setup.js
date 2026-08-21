@@ -17,6 +17,11 @@ for (const name of LIVE_REQUIRED_ENV) {
 
 const liveFixture = Object.freeze({
   apiKey: process.env.CLOUDSMITH_TEST_API_KEY,
+  credential: Object.freeze({
+    version: 1,
+    kind: "api-key",
+    apiKey: process.env.CLOUDSMITH_TEST_API_KEY,
+  }),
   packageName: process.env.CLOUDSMITH_TEST_PACKAGE_NAME,
   quarantinedPackageName: process.env.CLOUDSMITH_TEST_QUARANTINED_PACKAGE_NAME,
   repository: process.env.CLOUDSMITH_TEST_REPOSITORY,

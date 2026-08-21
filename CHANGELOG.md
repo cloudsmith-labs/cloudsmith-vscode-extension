@@ -7,6 +7,13 @@
 - Made authentication startup and account switching atomic so valid stored credentials no longer appear disconnected during validation and old-account data cannot publish after a switch.
 - Hardened package identity, install-command input, file, path, URL, redirect, WebView message, and API processing boundaries so malformed or stale data cannot drive actions or expose credentials.
 
+### Authentication
+
+- Added first-class browser SSO sign-in through the organization's identity provider, including optional 2FA, Bearer validation, workspace verification, secure session persistence, refresh, and reload recovery.
+- Stored API-key and SSO credentials in one atomic, versioned secure-storage envelope while automatically upgrading valid legacy API keys without re-entry.
+- Added bounded, coalesced SSO refresh with token rotation, stale-operation protection, and exact API-key versus bearer header routing.
+- Made CLI import explicit and API-key-only from trusted user-level `credentials.ini` files; removed activation-time CLI probing and the non-transferable terminal-SSO import path.
+
 ### Vulnerability, upstream, and package workflows
 
 - Made vulnerability results fail-safe across clean, vulnerable, partial, unknown, and failed states so incomplete evidence is not presented as clean, with more reliable safe-version and quarantine remediation.

@@ -365,6 +365,96 @@ suite("Command registrars", () => {
     assert.strictEqual(browserLogins, 0);
   });
 
+  test("SSO ignores absent and legacy experimental setting values", async () => {
+    for (const legacyValue of [undefined, false, true]) {
+      const recorder = recordingRegistration();
+      const operation = Object.freeze({ id: `sso-${String(legacyValue)}` });
+      const serviceResult = Object.freeze({ ok: true });
+      const browserLogins = [];
+      const handled = [];
+      let configurationReads = 0;
+      let warnings = 0;
+      registerAuthenticationCommands({
+        ...baseDependencies(recorder),
+        vscode: {
+          workspace: {
+            getConfiguration() {
+              configurationReads += 1;
+              return { get: () => legacyValue };
+            },
+          },
+          window: {
+            async showInputBox() { return " workspace-a "; },
+            async showWarningMessage() { warnings += 1; },
+          },
+        },
+        connectionManager: {
+          isOperationCurrent: value => value === operation,
+          async cancelCredentialOperation() {},
+        },
+        ssoManager: {
+          isValidWorkspaceSlug: value => value === "workspace-a",
+          async loginViaBrowser(workspace, value) {
+            browserLogins.push({ workspace, operation: value });
+            return serviceResult;
+          },
+        },
+        async handleAuthenticationResult(result) { handled.push(result); },
+      });
+
+      await recorder.handlers.get("cloudsmith-vsc.ssoLogin")(operation);
+      assert.deepStrictEqual(browserLogins, [{ workspace: "workspace-a", operation }]);
+      assert.deepStrictEqual(handled, [serviceResult]);
+      assert.strictEqual(configurationReads, 0);
+      assert.strictEqual(warnings, 0);
+    }
+  });
+
+  test("authentication picker presents supported SSO and routes it to the browser flow", async () => {
+    const recorder = recordingRegistration();
+    const operation = Object.freeze({ id: "picker-sso" });
+    const serviceResult = Object.freeze({ ok: true });
+    let pickerItems = null;
+    const browserLogins = [];
+    const handled = [];
+    registerAuthenticationCommands({
+      ...baseDependencies(recorder),
+      vscode: {
+        window: {
+          async showQuickPick(items) {
+            pickerItems = items;
+            return items.find(item => item.method === "sso-browser");
+          },
+          async showInputBox() { return "workspace-a"; },
+        },
+      },
+      connectionManager: {
+        beginCredentialOperation: () => operation,
+        isOperationCurrent: value => value === operation,
+        async cancelCredentialOperation() {},
+      },
+      credentialManager: {},
+      ssoManager: {
+        isValidWorkspaceSlug: value => value === "workspace-a",
+        async loginViaBrowser(workspace, value) {
+          browserLogins.push({ workspace, operation: value });
+          return serviceResult;
+        },
+      },
+      async handleAuthenticationResult(result) { handled.push(result); },
+    });
+
+    await recorder.handlers.get("cloudsmith-vsc.configureCredentials")();
+    const ssoItem = pickerItems.find(item => item.method === "sso-browser");
+    assert.deepStrictEqual(ssoItem, {
+      label: "$(globe) Sign in with SSO",
+      description: "Sign in through your organization's identity provider",
+      method: "sso-browser",
+    });
+    assert.deepStrictEqual(browserLogins, [{ workspace: "workspace-a", operation }]);
+    assert.deepStrictEqual(handled, [serviceResult]);
+  });
+
   test("authentication method cancellation closes its credential operation", async () => {
     const recorder = recordingRegistration();
     const operation = Object.freeze({ id: 1 });

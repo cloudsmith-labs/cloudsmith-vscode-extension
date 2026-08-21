@@ -14,6 +14,10 @@ const DEPRECATED_SETTINGS = new Set([
   "cloudsmith-vsc.autoScanOnOpen",
   "cloudsmith-vsc.showRepoMetrics",
 ]);
+const SETTINGS_WITH_NO_PRODUCTION_READS = new Set([
+  ...DEPRECATED_SETTINGS,
+  "cloudsmith-vsc.experimentalSSOBrowser",
+]);
 const BASE_MEDIA = Object.freeze([
   "media/icon.svg",
   "media/logo.png",
@@ -126,8 +130,8 @@ function validateSettingsDocs(manifest, readme) {
       fail(`${key} must explain its no-op compatibility status`);
     }
   }
-  if (rows.filter(row => row.classification === "active").length !== 21) {
-    fail("README must document exactly 21 active settings");
+  if (rows.filter(row => row.classification === "active").length !== 20) {
+    fail("README must document exactly 20 active settings");
   }
 }
 
@@ -244,7 +248,7 @@ function walkForJunk(root, relative = "") {
 
 function validateNoProductionSettingReads(root) {
   const roots = ["extension.js", "commands", "domain", "models", "util", "views"];
-  for (const key of DEPRECATED_SETTINGS) {
+  for (const key of SETTINGS_WITH_NO_PRODUCTION_READS) {
     const shortName = key.slice("cloudsmith-vsc.".length);
     const hits = [];
     const scanFile = (relative) => {
@@ -288,7 +292,7 @@ function verifyRepository(root = path.resolve(__dirname, "../..")) {
       fail(`README contains stale link fragment: ${fragment}`);
     }
   }
-  return { activeSettings: 21, deprecatedSettings: 2, media: APPROVED_MEDIA.length };
+  return { activeSettings: 20, deprecatedSettings: 2, media: APPROVED_MEDIA.length };
 }
 
 module.exports = {

@@ -434,7 +434,10 @@ class UpstreamPullService {
       return { canceled: true, stale: true };
     }
     if (!apiKey) {
-      await this._showErrorMessage("Authentication failed. Check your API key in Cloudsmith settings.");
+      const message = this._credentialManager.getCredentialKind?.() === "sso"
+        ? "Upstream registry pull currently requires a Cloudsmith API key. Your SSO session was not sent to the registry."
+        : "Authentication failed. Check your API key in Cloudsmith settings.";
+      await this._showErrorMessage(message);
       return null;
     }
 

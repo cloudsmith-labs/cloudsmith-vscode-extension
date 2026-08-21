@@ -2,6 +2,12 @@
 
 const crypto = require("crypto");
 const { CredentialManager } = require("./credentialManager");
+const {
+  authorizationForCredential,
+  createAPIKeyCredential,
+  credentialSecretValues,
+  normalizeCredential,
+} = require("./credentialEnvelope");
 const { isSecretQueryName } = require("./apiEndpoint");
 const extensionVersion = require("../package.json").version;
 const vscodeVersion = require("vscode").version;
@@ -242,7 +248,7 @@ function messageForError(kind, outcomeUnknown = false) {
   }
   switch (kind) {
     case "unauthorized":
-      return "Authentication failed. Check the API key.";
+      return "Authentication failed. Sign in again or check the configured credential.";
     case "forbidden":
       return "Could not access this resource. Check permissions.";
     case "not_found":
@@ -457,8 +463,8 @@ class CloudsmithAPI {
     let cancellationDisposable = null;
     let timeoutHandle = null;
     let attempts = 0;
-    let selectedKey = null;
-    let storedKey = null;
+    let selectedAuthorization = null;
+    let explicitCredential = false;
     const keys = new Set();
     const deadline = this._now() + timeoutMs;
 
@@ -549,15 +555,25 @@ class CloudsmithAPI {
         return cancelledFailure();
       }
 
-      const hasCandidateKey = Object.prototype.hasOwnProperty.call(options, "apiKey");
-      if (hasCandidateKey) {
-        if (typeof options.apiKey === "string" && options.apiKey) {
-          selectedKey = options.apiKey;
-          keys.add(selectedKey);
+      if (Object.prototype.hasOwnProperty.call(options, "credential")) {
+        explicitCredential = true;
+        const normalized = normalizeCredential(options.credential);
+        if (normalized.ok) {
+          selectedAuthorization = authorizationForCredential(normalized.credential);
+          for (const secret of credentialSecretValues(normalized.credential)) keys.add(secret);
         }
+      } else if (Object.prototype.hasOwnProperty.call(options, "apiKey") && options.apiKey != null) {
+        // Raw credential overrides are intentionally unsupported at the API boundary.
+        return failure({ kind: "invalid_request" });
       } else {
         const credentialResult = await this._awaitAbortable(
-          Promise.resolve().then(() => this._credentialManager.getApiKey()),
+          Promise.resolve().then(async () => {
+            if (typeof this._credentialManager.getAuthorization === "function") {
+              return this._credentialManager.getAuthorization({ signal: controller.signal });
+            }
+            const apiKey = await this._credentialManager.getApiKey();
+            return apiKey ? authorizationForCredential(createAPIKeyCredential(apiKey)) : null;
+          }),
           controller.signal
         );
         if (credentialResult.aborted) {
@@ -566,21 +582,22 @@ class CloudsmithAPI {
         if (!credentialResult.ok) {
           return failure({ kind: "invalid_request" });
         }
-        storedKey = credentialResult.value;
-        if (typeof storedKey === "string" && storedKey) {
-          keys.add(storedKey);
+        selectedAuthorization = credentialResult.value;
+        if (selectedAuthorization && typeof selectedAuthorization.headerValue === "string") {
+          keys.add(selectedAuthorization.headerValue.replace(/^Bearer\s+/i, ""));
         }
         if (abortKind !== null || this._now() >= deadline) {
           if (abortKind === null) abort("timeout");
           return cancelledFailure();
         }
-        selectedKey = storedKey;
       }
       if (
-        typeof selectedKey !== "string"
-        || !selectedKey
-        || selectedKey.length > 4096
-        || /[\u0000-\u001f\u007f]/.test(selectedKey)
+        !selectedAuthorization
+        || !["X-Api-Key", "Authorization"].includes(selectedAuthorization.headerName)
+        || typeof selectedAuthorization.headerValue !== "string"
+        || !selectedAuthorization.headerValue
+        || selectedAuthorization.headerValue.length > 8200
+        || /[\u0000-\u001f\u007f]/.test(selectedAuthorization.headerValue)
       ) {
         return failure({ kind: "unauthorized", status: 401 });
       }
@@ -617,9 +634,17 @@ class CloudsmithAPI {
         }
       }
 
-      const maxAttempts = retry === "safe-read" && isReadMethod(method)
+      const transportAttempts = retry === "safe-read" && isReadMethod(method)
         ? MAX_READ_RETRIES + 1
         : 1;
+      const maxAttempts = transportAttempts + (
+        isReadMethod(method)
+        && !explicitCredential
+        && selectedAuthorization.kind === "sso"
+          ? 1
+          : 0
+      );
+      let authReplayUsed = false;
       let currentFailure = null;
 
       while (attempts < maxAttempts) {
@@ -633,7 +658,7 @@ class CloudsmithAPI {
           requestUrl,
           method,
           body,
-          selectedKey,
+          selectedAuthorization,
           apiVersion,
           responseType,
           validate: options.validate,
@@ -674,6 +699,72 @@ class CloudsmithAPI {
           outcomeUnknown,
         });
 
+        if (
+          !explicitCredential
+          && selectedAuthorization.kind === "sso"
+          && attemptResult.status === 401
+          && ["invalid_session", "refresh_rejected"].includes(
+            selectedAuthorization.proactiveRefreshStatus
+          )
+        ) {
+          await Promise.resolve(
+            this._credentialManager.handleAuthorizationRejected?.(sessionProof(selectedAuthorization))
+          ).catch(() => {});
+          return currentFailure;
+        }
+
+        if (
+          isReadMethod(method)
+          && !explicitCredential
+          && selectedAuthorization.kind === "sso"
+          && attemptResult.status === 401
+          && !authReplayUsed
+          && selectedAuthorization.proactiveRefreshFailed !== true
+        ) {
+          const refreshed = await this._awaitAbortable(
+            Promise.resolve().then(() => (
+              typeof this._credentialManager.getAuthorization === "function"
+                ? this._credentialManager.getAuthorization({
+                  forceRefresh: true,
+                  signal: controller.signal,
+                  expectedSession: sessionProof(selectedAuthorization),
+                  returnRefreshResult: true,
+                })
+                : null
+            )),
+            controller.signal
+          );
+          if (refreshed.aborted) return cancelledFailure();
+          if (!refreshed.ok || !refreshed.value) return currentFailure;
+          if (refreshed.value.refreshFailed === true) {
+            if (["invalid_session", "refresh_rejected"].includes(refreshed.value.status)) {
+              await Promise.resolve(
+                this._credentialManager.handleAuthorizationRejected?.(
+                  sessionProof(refreshed.value)
+                )
+              ).catch(() => {});
+            }
+            return currentFailure;
+          }
+          selectedAuthorization = refreshed.value;
+          keys.add(selectedAuthorization.headerValue.replace(/^Bearer\s+/i, ""));
+          authReplayUsed = true;
+          continue;
+        }
+
+        if (
+          isReadMethod(method)
+          && !explicitCredential
+          && selectedAuthorization.kind === "sso"
+          && attemptResult.status === 401
+          && authReplayUsed
+        ) {
+          await Promise.resolve(
+            this._credentialManager.handleAuthorizationRejected?.(sessionProof(selectedAuthorization))
+          ).catch(() => {});
+          return currentFailure;
+        }
+
         const shouldRetry = attempts < maxAttempts
           && retry === "safe-read"
           && attemptResult.retryable;
@@ -713,7 +804,7 @@ class CloudsmithAPI {
     requestUrl,
     method,
     body,
-    selectedKey,
+    selectedAuthorization,
     apiVersion,
     responseType,
     validate,
@@ -738,7 +829,7 @@ class CloudsmithAPI {
         const headers = {
           Accept: "application/json",
           "User-Agent": userAgent,
-          "X-Api-Key": selectedKey,
+          [selectedAuthorization.headerName]: selectedAuthorization.headerValue,
         };
         if (body !== undefined) {
           headers["Content-Type"] = "application/json";
@@ -1027,6 +1118,18 @@ class CloudsmithAPI {
       }
     });
   }
+}
+
+function sessionProof(authorization) {
+  return authorization
+    && authorization.kind === "sso"
+    && typeof authorization.credentialId === "string"
+    && Number.isSafeInteger(authorization.generation)
+    ? Object.freeze({
+      credentialId: authorization.credentialId,
+      generation: authorization.generation,
+    })
+    : null;
 }
 
 function isApiResult(value) {

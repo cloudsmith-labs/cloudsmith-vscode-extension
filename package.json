@@ -401,12 +401,12 @@
         "command": "cloudsmith-vsc.ssoLogin",
         "title": "Sign in with SSO",
         "category": "Cloudsmith",
-        "icon": "$(terminal)",
+        "icon": "$(globe)",
         "enablement": "!cloudsmith.connected && cloudsmith.connectionSetupAvailable"
       },
       {
         "command": "cloudsmith-vsc.importCLICredentials",
-        "title": "Import credentials from Cloudsmith CLI",
+        "title": "Import API key from Cloudsmith CLI",
         "category": "Cloudsmith",
         "icon": "$(folder-opened)",
         "enablement": "!cloudsmith.connected && cloudsmith.connectionSetupAvailable"
@@ -975,11 +975,6 @@
           "default": false,
           "description": "Show an additional 'Pull by digest' option for Docker install commands. Digest-based pulls pin an exact image for reproducibility."
         },
-        "cloudsmith-vsc.experimentalSSOBrowser": {
-          "type": "boolean",
-          "default": false,
-          "description": "Experimental: Attempt browser-based SSO authentication directly via SAML redirect. Falls back to CLI import if this fails. Enable to help debug the SSO token exchange."
-        },
         "cloudsmith-vsc.resolveTransitiveDependencies": {
           "type": "boolean",
           "default": true,
@@ -1048,6 +1043,7 @@
     "test:vscode": "node scripts/run-vscode-tests.js",
     "test:zero-guard": "node scripts/run-tests.js --zero-probe",
     "test:live": "node scripts/run-vscode-tests.js --label live",
+    "test:sso-live": "node scripts/run-vscode-tests.js --label sso-live",
     "package": "node scripts/release/package-vsix.js",
     "package:verify": "node scripts/release/verify-vsix.js --require-sidecars",
     "package:list": "node scripts/release/verify-vsix.js --require-sidecars --list",

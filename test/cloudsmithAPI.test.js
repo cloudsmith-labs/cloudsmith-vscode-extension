@@ -531,7 +531,9 @@ suite("CloudsmithAPI typed transport", () => {
     const secretValue = await api.get(`packages/workspace/?query=${API_KEY}`);
     const oldSecretName = await api.get("packages/workspace/?x-api-key=old-secret-value");
     const encodedSecretName = await api.get("packages/workspace/?client%255fsecret=old-secret-value");
-    const emptyCandidate = await api.get("user/self", { apiKey: "" });
+    const emptyCandidate = await api.get("user/self", {
+      credential: { version: 1, kind: "api-key", apiKey: "" },
+    });
 
     assert.strictEqual(secretEndpoint.error.kind, "invalid_request");
     assert.strictEqual(secretValue.error.kind, "invalid_request");
@@ -570,7 +572,7 @@ suite("CloudsmithAPI typed transport", () => {
       return jsonResponse({});
     });
     const candidateResult = await candidateApi.get("packages/candidate%2541/", {
-      apiKey: "candidate%41",
+      credential: { version: 1, kind: "api-key", apiKey: "candidate%41" },
     });
 
     assert.strictEqual(storedResult.error.kind, "invalid_request");
@@ -621,5 +623,166 @@ suite("CloudsmithAPI typed transport", () => {
     assert.strictEqual(oversizedStream.error.kind, "invalid_response");
     assert.strictEqual(streamReads, 1);
     assert.strictEqual(streamCanceled, true);
+  });
+
+  test("SSO sends only bearer authorization while API keys send only X-Api-Key", async () => {
+    const requests = [];
+    const sso = createApi(async (_url, request) => {
+      requests.push(request);
+      return jsonResponse({ authenticated: true });
+    }, {
+      credentialManager: {
+        async getAuthorization() {
+          return { kind: "sso", headerName: "Authorization", headerValue: "Bearer access-token" };
+        },
+      },
+    });
+    await sso.get("user/self", { responseType: "object" });
+    assert.strictEqual(requests[0].headers.Authorization, "Bearer access-token");
+    assert.strictEqual(requests[0].headers["X-Api-Key"], undefined);
+
+    const apiKey = createApi(async (_url, request) => {
+      requests.push(request);
+      return jsonResponse({ authenticated: true });
+    });
+    await apiKey.get("user/self", { responseType: "object" });
+    assert.strictEqual(requests[1].headers["X-Api-Key"], API_KEY);
+    assert.strictEqual(requests[1].headers.Authorization, undefined);
+  });
+
+  test("a read 401 forces one SSO refresh, replays once, then disconnects on a second 401", async () => {
+    let mode = "success";
+    let fetches = 0;
+    let forced = 0;
+    let rejected = 0;
+    const credentialManager = {
+      async getAuthorization(options = {}) {
+        if (options.forceRefresh) forced += 1;
+        if (options.forceRefresh) {
+          assert.deepStrictEqual(options.expectedSession, {
+            credentialId: "a".repeat(32),
+            generation: 0,
+          });
+        }
+        return {
+          kind: "sso",
+          headerName: "Authorization",
+          headerValue: options.forceRefresh ? "Bearer access-new" : "Bearer access-old",
+          credentialId: "a".repeat(32),
+          generation: options.forceRefresh ? 1 : 0,
+        };
+      },
+      async handleAuthorizationRejected(proof) {
+        assert.deepStrictEqual(proof, {
+          credentialId: "a".repeat(32),
+          generation: 1,
+        });
+        rejected += 1;
+      },
+    };
+    const api = createApi(async (_url, request) => {
+      fetches += 1;
+      if (request.headers.Authorization === "Bearer access-old") return jsonResponse({ detail: "expired" }, 401);
+      return mode === "success"
+        ? jsonResponse({ authenticated: true })
+        : jsonResponse({ detail: "still expired" }, 401);
+    }, { credentialManager });
+    const success = await api.get("user/self", { responseType: "object" });
+    assert.strictEqual(success.ok, true);
+    assert.strictEqual(fetches, 2);
+    assert.strictEqual(forced, 1);
+    assert.strictEqual(rejected, 0);
+
+    mode = "failure";
+    fetches = 0;
+    forced = 0;
+    const failure = await api.get("user/self", { responseType: "object" });
+    assert.strictEqual(failure.ok, false);
+    assert.strictEqual(fetches, 2);
+    assert.strictEqual(forced, 1);
+    assert.strictEqual(rejected, 1);
+  });
+
+  test("a write 401 is never refreshed or replayed", async () => {
+    let fetches = 0;
+    let forced = 0;
+    const api = createApi(async () => {
+      fetches += 1;
+      return jsonResponse({ detail: "expired" }, 401);
+    }, {
+      credentialManager: {
+        async getAuthorization(options = {}) {
+          if (options.forceRefresh) forced += 1;
+          return { kind: "sso", headerName: "Authorization", headerValue: "Bearer access-old" };
+        },
+      },
+    });
+    const result = await api.post("packages/copy/", { package: "id" });
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(fetches, 1);
+    assert.strictEqual(forced, 0);
+  });
+
+  test("a request does not force a second refresh after its proactive refresh already failed", async () => {
+    let forced = 0;
+    let fetches = 0;
+    const api = createApi(async () => {
+      fetches += 1;
+      return jsonResponse({ detail: "expired" }, 401);
+    }, {
+      credentialManager: {
+        async getAuthorization(options = {}) {
+          if (options.forceRefresh) forced += 1;
+          return {
+            kind: "sso",
+            headerName: "Authorization",
+            headerValue: "Bearer access-old",
+            credentialId: "7".repeat(32),
+            generation: 2,
+            proactiveRefreshFailed: true,
+          };
+        },
+      },
+    });
+    const result = await api.get("user/self", { responseType: "object" });
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.status, 401);
+    assert.strictEqual(fetches, 1);
+    assert.strictEqual(forced, 0);
+  });
+
+  test("an ordinary 401 plus a rejected forced refresh disconnects only the proven generation", async () => {
+    let rejected = null;
+    let forced = 0;
+    const proof = { credentialId: "6".repeat(32), generation: 3 };
+    const rejectionProof = { credentialId: "6".repeat(32), generation: 4 };
+    const api = createApi(async () => jsonResponse({ detail: "expired" }, 401), {
+      credentialManager: {
+        async getAuthorization(options = {}) {
+          if (options.forceRefresh) {
+            forced += 1;
+            assert.deepStrictEqual(options.expectedSession, proof);
+            assert.strictEqual(options.returnRefreshResult, true);
+            return {
+              kind: "sso",
+              refreshFailed: true,
+              status: "refresh_rejected",
+              ...rejectionProof,
+            };
+          }
+          return {
+            kind: "sso",
+            headerName: "Authorization",
+            headerValue: "Bearer rejected-access",
+            ...proof,
+          };
+        },
+        async handleAuthorizationRejected(value) { rejected = value; },
+      },
+    });
+    const result = await api.get("user/self", { responseType: "object" });
+    assert.strictEqual(result.status, 401);
+    assert.strictEqual(forced, 1);
+    assert.deepStrictEqual(rejected, rejectionProof);
   });
 });

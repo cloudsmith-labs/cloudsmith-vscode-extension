@@ -53,7 +53,7 @@ const COMMANDS = Object.freeze([
   ["cloudsmith-vsc.searchByLicense", "Search packages by license", "global", true, "cloudsmith.connected"],
   ["cloudsmith-vsc.openLicenseUrl", "View license", "context-only", false, "cloudsmith.connected"],
   ["cloudsmith-vsc.ssoLogin", "Sign in with SSO", "global", true, "!cloudsmith.connected && cloudsmith.connectionSetupAvailable"],
-  ["cloudsmith-vsc.importCLICredentials", "Import credentials from Cloudsmith CLI", "global", true, "!cloudsmith.connected && cloudsmith.connectionSetupAvailable"],
+  ["cloudsmith-vsc.importCLICredentials", "Import API key from Cloudsmith CLI", "global", true, "!cloudsmith.connected && cloudsmith.connectionSetupAvailable"],
   ["cloudsmith-vsc.setDefaultWorkspace", "Set default workspace", "global", true, "cloudsmith.connected"],
   ["cloudsmith-vsc.previewUpstreamResolution", "Preview upstream resolution", "global", true, "cloudsmith.connected"],
   ["cloudsmith-vsc.inspectUpstreams", "View upstreams", "recoverable", true, "cloudsmith.connected"],
