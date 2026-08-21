@@ -399,7 +399,7 @@
       },
       {
         "command": "cloudsmith-vsc.ssoLogin",
-        "title": "Sign in with SSO (Experimental)",
+        "title": "Sign in with SSO",
         "category": "Cloudsmith",
         "icon": "$(globe)",
         "enablement": "!cloudsmith.connected && cloudsmith.connectionSetupAvailable"
@@ -974,11 +974,6 @@
           "type": "boolean",
           "default": false,
           "description": "Show an additional 'Pull by digest' option for Docker install commands. Digest-based pulls pin an exact image for reproducibility."
-        },
-        "cloudsmith-vsc.experimentalSSOBrowser": {
-          "type": "boolean",
-          "default": false,
-          "description": "Experimental: Enable direct browser SSO with the supported local callback, optional 2FA, bearer validation, and refresh. CLI SSO keyring tokens cannot be imported as a fallback."
         },
         "cloudsmith-vsc.resolveTransitiveDependencies": {
           "type": "boolean",

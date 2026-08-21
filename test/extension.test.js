@@ -6,6 +6,31 @@ const { runDependencyScan } = require("../util/dependencyScanOrchestration");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
 
 suite("Extension Test Suite", () => {
+  test("manifest and current documentation expose SSO without an experimental gate", () => {
+    const root = path.join(__dirname, "..");
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+    const ssoCommand = manifest.contributes.commands.find(
+      command => command.command === "cloudsmith-vsc.ssoLogin"
+    );
+    const properties = manifest.contributes.configuration.properties;
+    const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
+    const changelog = fs.readFileSync(path.join(root, "CHANGELOG.md"), "utf8");
+    const currentStart = changelog.indexOf("## 2.3.0 - August 2026");
+    const releasedStart = changelog.indexOf("## 2.2.0 - August 2026");
+    const currentChangelog = changelog.slice(currentStart, releasedStart);
+
+    assert.strictEqual(ssoCommand.title, "Sign in with SSO");
+    assert.strictEqual(
+      Object.prototype.hasOwnProperty.call(properties, "cloudsmith-vsc.experimentalSSOBrowser"),
+      false
+    );
+    assert.doesNotMatch(readme, /experimentalSSOBrowser|Sign in with SSO \(Experimental\)/i);
+    assert.doesNotMatch(
+      currentChangelog,
+      /experimentalSSOBrowser|experimental first-class browser SSO|browser SSO remains/i
+    );
+  });
+
   test("activation owner observes asynchronous cleanup without blocking reload", async () => {
     let release;
     const cleanup = new Promise(resolve => { release = resolve; });
