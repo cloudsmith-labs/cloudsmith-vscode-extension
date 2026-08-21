@@ -14,7 +14,7 @@ class SearchQueryBuilder {
             value = String(value);
         }
 
-        const escaped = value.replace(/(\\|&&|\|\||[+\-!(){}\[\]^"~*?:/|&])/g, (match) => `\\${match}`);
+        const escaped = value.replace(/(\\|&&|\|\||[!(){}\[\]^"~*?:|&])/g, (match) => `\\${match}`);
         return /\s/.test(escaped) ? `"${escaped}"` : escaped;
     }
 

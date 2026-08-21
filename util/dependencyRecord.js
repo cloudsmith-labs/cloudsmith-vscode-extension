@@ -363,12 +363,14 @@ function getDependencyArtifactKey(dependency) {
     artifactQualifiers.platform = qualifiers.platform;
   }
   if (format === "maven") {
-    if (qualifiers.type) artifactQualifiers.type = qualifiers.type;
-    if (qualifiers.classifier) artifactQualifiers.classifier = qualifiers.classifier;
+    const mavenArtifact = normalizeMavenArtifactIdentity(qualifiers);
+    artifactQualifiers.extension = mavenArtifact.extension;
+    if (mavenArtifact.classifier) artifactQualifiers.classifier = mavenArtifact.classifier;
   }
   if (format === "docker") {
     if (qualifiers.tag) artifactQualifiers.tag = qualifiers.tag;
     if (qualifiers.digest) artifactQualifiers.digest = qualifiers.digest;
+    if (qualifiers.platform) artifactQualifiers.platform = qualifiers.platform;
   }
   return JSON.stringify([
     format,
@@ -376,6 +378,31 @@ function getDependencyArtifactKey(dependency) {
     getDependencyConcreteVersion(dependency) || "",
     artifactQualifiers,
   ]);
+}
+
+function normalizeMavenArtifactIdentity(qualifiers) {
+  const type = String(qualifiers?.type || "jar").trim().toLowerCase();
+  const extension = [
+    "bundle",
+    "ejb",
+    "ejb-client",
+    "java-source",
+    "javadoc",
+    "maven-plugin",
+    "test-jar",
+  ].includes(type) ? "jar" : type;
+  const implicitClassifiers = {
+    "ejb-client": "client",
+    "java-source": "sources",
+    javadoc: "javadoc",
+    "test-jar": "tests",
+  };
+  return {
+    extension,
+    classifier: String(
+      qualifiers?.classifier || implicitClassifiers[type] || ""
+    ).trim(),
+  };
 }
 
 function getDependencyConcreteVersion(dependency) {

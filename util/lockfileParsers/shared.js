@@ -784,6 +784,7 @@ function dependencyKey(dependency) {
   if (ecosystem === "docker") {
     if (qualifiers.tag) artifactQualifiers.tag = qualifiers.tag;
     if (qualifiers.digest) artifactQualifiers.digest = qualifiers.digest;
+    if (qualifiers.platform) artifactQualifiers.platform = qualifiers.platform;
     if (qualifiers.service) artifactQualifiers.service = qualifiers.service;
     if (qualifiers.stage) artifactQualifiers.stage = qualifiers.stage;
     if (qualifiers.pullPolicy) artifactQualifiers.pullPolicy = qualifiers.pullPolicy;

@@ -27,6 +27,7 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/polishGate.test.js",
   "test/promotionContracts.test.js",
   "test/recentPackages.test.js",
+  "test/registryEndpoints.test.js",
   "test/releaseGate.test.js",
   "test/remediationHelper.test.js",
   "test/runtimeProcessGuard.test.js",

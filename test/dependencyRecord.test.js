@@ -416,6 +416,24 @@ suite("dependencyRecord", () => {
       getDependencyArtifactKey(createRuby("ruby")),
       getDependencyArtifactKey(createRuby("x86_64-linux"))
     );
+
+    const createMaven = qualifiers => createDependencyRecord({
+      ecosystem: "maven",
+      name: "com.example:demo",
+      resolvedVersion: "1.2.3",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      legacyVersion: "1.2.3",
+      qualifiers,
+      packageSource: { kind: "registry" },
+    });
+    assert.strictEqual(
+      getDependencyArtifactKey(createMaven({})),
+      getDependencyArtifactKey(createMaven({ type: "jar" }))
+    );
+    assert.strictEqual(
+      getDependencyArtifactKey(createMaven({ type: "test-jar" })),
+      getDependencyArtifactKey(createMaven({ type: "jar", classifier: "tests" }))
+    );
   });
 
   test("derives workspace-relative source labels", () => {

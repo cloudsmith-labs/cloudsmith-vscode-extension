@@ -177,13 +177,14 @@ suite("DependencyHealthProvider Test Suite", () => {
     };
   }
 
-  function pullCoordinate(name, version, format = "npm") {
+  function pullCoordinate(name, version, format = "npm", qualifiers = {}) {
     return createPackageCoordinate({
       workspace: "workspace-a",
       repository: "repo-a",
       name,
       version,
       format,
+      qualifiers,
     });
   }
 
@@ -2072,6 +2073,170 @@ suite("DependencyHealthProvider Test Suite", () => {
     );
   });
 
+  test("_runCoverageChecks matches Docker dependencies by Cloudsmith version tag", async () => {
+    const dependency = createDependency("alpine", "3.20.3", "docker");
+    const provider = new DependencyHealthProvider(createContext());
+    provider._fullTrees = [{
+      ecosystem: "docker",
+      sourceFile: "docker-compose.yml",
+      dependencies: [dependency],
+    }];
+    provider._displayTrees = cloneTrees(provider._fullTrees);
+    provider._rebuildSummary = () => {};
+    provider.refresh = () => {};
+    let requestedQuery = "";
+    provider._services.createCloudsmithAPI = () => createLookupApi((endpoint) => {
+      requestedQuery = new URL(endpoint, "https://api.cloudsmith.io/v1/")
+        .searchParams.get("query");
+      return lookupPage([{
+        name: "library/alpine",
+        version: "a".repeat(64),
+        format: "docker",
+        tags: { info: ["upstream"], version: ["3.20.3"] },
+      }]);
+    });
+
+    await provider._runCoverageChecks(
+      "workspace",
+      "repo",
+      1,
+      { report() {} },
+      { isCancellationRequested: false }
+    );
+
+    assert.doesNotMatch(requestedQuery, /version:3\.20\.3/);
+    assert.strictEqual(provider._fullTrees[0].dependencies[0].cloudsmithStatus, "FOUND");
+    assert.deepStrictEqual(
+      provider._fullTrees[0].dependencies[0].cloudsmithPackage.tags.version,
+      ["3.20.3"]
+    );
+  });
+
+  test("coverage matching requires exact Docker, Maven, and Ruby qualifiers and normalizes NuGet", () => {
+    const dockerDependency = {
+      ...createDependency("example", "stable", "docker"),
+      qualifiers: { tag: "stable", digest: `sha256:${"a".repeat(64)}` },
+    };
+    assert.strictEqual(matchCoverageCandidates([{
+      name: "library/example",
+      version: "b".repeat(64),
+      format: "docker",
+      tags: { version: ["stable"] },
+    }], dockerDependency), null);
+    assert.ok(matchCoverageCandidates([{
+      name: "library/example",
+      version: "a".repeat(64),
+      format: "docker",
+      tags: { version: ["stable"] },
+    }], dockerDependency));
+    const dockerPlatformDependency = {
+      ...createDependency("example", "stable", "docker"),
+      qualifiers: { tag: "stable", platform: "linux/arm64" },
+    };
+    const dockerTagCandidate = {
+      name: "library/example",
+      version: "a".repeat(64),
+      format: "docker",
+      tags: { version: ["stable"] },
+    };
+    assert.strictEqual(matchCoverageCandidates([
+      {
+        ...dockerTagCandidate,
+        name: "library/example",
+        version: "b".repeat(64),
+        format: "docker",
+        tags: { version: ["stable"] },
+        architectures: [{ name: "amd64" }],
+        identifiers: { architecture: "amd64", docker_platform_os: "linux" },
+      },
+    ], dockerPlatformDependency), null);
+    assert.strictEqual(matchCoverageCandidates([
+      dockerTagCandidate,
+      {
+        name: "library/example",
+        version: "c".repeat(64),
+        format: "docker",
+        architectures: [{ name: "arm64" }],
+        identifiers: { architecture: "arm64", docker_platform_os: "linux" },
+      },
+    ], dockerPlatformDependency), null);
+    assert.ok(matchCoverageCandidates([{
+      ...dockerTagCandidate,
+      architectures: [{ name: "arm64" }],
+      identifiers: { architecture: "arm64", docker_platform_os: "linux" },
+    }], dockerPlatformDependency));
+
+    const mavenDependency = {
+      ...createDependency("com.example:demo", "1.2.3", "maven"),
+      qualifiers: { type: "test-jar", classifier: "tests" },
+    };
+    const mavenCandidate = {
+      name: "demo",
+      version: "1.2.3",
+      format: "maven",
+      identifiers: { group_id: "com.example" },
+    };
+    assert.strictEqual(matchCoverageCandidates([{
+      ...mavenCandidate,
+      files: [{ filename: "demo-1.2.3.jar" }],
+    }], mavenDependency), null);
+    assert.ok(matchCoverageCandidates([{
+      ...mavenCandidate,
+      files: [{ filename: "demo-1.2.3-tests.jar" }],
+    }], mavenDependency));
+    assert.ok(matchCoverageCandidates([{
+      ...mavenCandidate,
+      files: [{ filename: "demo-1.2.3-tests.jar" }],
+    }], {
+      ...createDependency("com.example:demo", "1.2.3", "maven"),
+      qualifiers: { type: "test-jar" },
+    }));
+
+    assert.strictEqual(matchCoverageCandidates([{
+      name: "native-gem",
+      version: "1.0.0",
+      format: "ruby",
+    }], {
+      ...createDependency("native-gem", "1.0.0", "ruby"),
+      qualifiers: { platform: "x86_64-linux" },
+    }), null);
+    assert.ok(matchCoverageCandidates([{
+      name: "native-gem",
+      version: "1.0.0",
+      format: "ruby",
+      architectures: [{ name: "x86_64-linux" }],
+    }], {
+      ...createDependency("native-gem", "1.0.0", "ruby"),
+      qualifiers: { platform: "x86_64-linux" },
+    }));
+
+    assert.ok(matchCoverageCandidates([{
+      name: "Example.Package",
+      version: "1.2.3-beta",
+      format: "nuget",
+    }], createDependency("Example.Package", "01.02.003.0-BETA+build.7", "nuget")));
+  });
+
+  test("exact NuGet coverage lookup queries the normalized package version", async () => {
+    const api = createLookupApi(() => lookupPage([{
+      name: "Example.Package",
+      version: "1.2.3-beta",
+      format: "nuget",
+    }]));
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("Example.Package", "01.02.003.0-BETA+build.7", "nuget"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
+    const query = new URL(api.calls[0], "https://api.cloudsmith.io/v1/").searchParams.get("query");
+    assert.match(query, /version:1\.2\.3-beta/);
+    assert.doesNotMatch(query, /01\.02\.003/);
+  });
+
   test("_runCoverageChecks bounds exact lookup concurrency", async () => {
     const provider = new DependencyHealthProvider(createContext());
     const dependencies = Array.from({ length: 20 }, (_, index) => (
@@ -2342,7 +2507,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(apiCalls, 0);
   });
 
-  test("exact lookup finds a package on the first page with escaped name and version terms", async () => {
+  test("exact lookup finds a scoped package without escaping its registry-native slash", async () => {
     const expectedPackage = { name: "@scope/pkg", version: "1.0.0", format: "npm" };
     const api = createLookupApi(() => lookupPage([expectedPackage]));
 
@@ -2363,7 +2528,8 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(result.package.version, expectedPackage.version);
     assert.strictEqual(result.pagesFetched, 1);
     const query = new URL(api.calls[0], "https://api.cloudsmith.io/v1/").searchParams.get("query");
-    assert.ok(query.includes("name:@scope\\/pkg"));
+    assert.ok(query.includes("name:@scope/pkg"));
+    assert.ok(!query.includes("name:@scope\\/pkg"));
     assert.ok(query.includes("version:1.0.0"));
   });
 
@@ -3143,6 +3309,7 @@ suite("DependencyHealthProvider Test Suite", () => {
         slug_perm: "spring-boot-starter-web-3.2.0",
         status_str: "Completed",
         identifiers: { group_id: "org.springframework.boot" },
+        files: [{ filename: "spring-boot-starter-web-3.2.0.jar" }],
       }
     );
 
@@ -3515,6 +3682,67 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.deepStrictEqual(events, ["prepare", "confirm"]);
     assert.match(confirmationMessage, /target-package@1\.0\.0/);
     assert.match(confirmationMessage, /workspace-a\/repo-b/);
+  });
+
+  test("single pull resolves colliding coordinates by their exact dependency qualifiers", async () => {
+    const preparedDependencies = [];
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      upstreamPullService: {
+        async prepareSingle({ dependency }) {
+          preparedDependencies.push(dependency);
+          return null;
+        },
+      },
+    });
+    provider.lastWorkspace = "workspace-a";
+    provider.lastRepo = "repo-a";
+    provider._projectFolderPath = "/project";
+    provider._hasSuccessfulScan = true;
+    provider._updateContexts = async () => {};
+    provider.refresh = () => {};
+
+    const cases = [
+      {
+        format: "maven",
+        name: "com.example:artifact",
+        left: { type: "jar", classifier: "javadoc" },
+        right: { type: "test-jar", classifier: "tests" },
+      },
+      {
+        format: "docker",
+        name: "registry.example.test/team/image",
+        left: { tag: "latest", digest: "sha256:1111", service: "worker" },
+        right: { tag: "latest", digest: "sha256:2222", service: "api" },
+      },
+      {
+        format: "ruby",
+        name: "native-gem",
+        left: { platform: "java" },
+        right: { platform: "x86_64-linux" },
+      },
+      {
+        format: "nuget",
+        name: "Framework.Package",
+        left: { targetFramework: "net9.0" },
+        right: { targetFramework: "net8.0" },
+      },
+    ];
+
+    for (const entry of cases) {
+      const dependencies = [entry.left, entry.right].map(qualifiers => ({
+        ...createProblemDependency(entry.name, "1.0.0", "/project/manifest", entry.format),
+        qualifiers,
+      }));
+      provider._fullTrees = [{ dependencies }];
+      await provider.pullSingleDependency(
+        pullCoordinate(entry.name, "1.0.0", entry.format, entry.right)
+      );
+    }
+
+    assert.deepStrictEqual(
+      preparedDependencies.map(dependency => dependency.qualifiers),
+      cases.map(entry => entry.right)
+    );
   });
 
   test("coverage refresh waits for every enrichment sibling after one rejects", async () => {

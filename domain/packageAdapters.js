@@ -32,6 +32,7 @@ const SEMANTIC_FIELDS = Object.freeze([
   "declaredVersion",
   "resolvedVersion",
   "format",
+  "qualifiers",
   "status",
   "status_str",
   "status_str_raw",
@@ -432,7 +433,15 @@ function fromDependencyHealthNode(node, options = {}) {
       required: true,
       unwrapDepth: MAX_WRAPPER_DEPTH,
     });
-    return createPackageCoordinate({ workspace, repository, name, version, format });
+    const qualifiers = readOwn(node, "qualifiers");
+    return createPackageCoordinate({
+      workspace,
+      repository,
+      name,
+      version,
+      format,
+      qualifiers,
+    });
   } catch (error) {
     throw asAdapterError(error, "invalid_dependency_package", "dependency package");
   }

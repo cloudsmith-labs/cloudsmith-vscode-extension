@@ -129,6 +129,54 @@ suite("dockerParser Test Suite", () => {
     assert.strictEqual(tree.dependencies[1].hasResolutionEvidence, true);
   });
 
+  test("preserves explicit Dockerfile and Compose target platforms", async () => {
+    const workspace = await createWorkspace();
+    const dockerfilePath = path.join(workspace, "Dockerfile");
+    await writeTextFile(dockerfilePath, [
+      "FROM --platform=linux/arm64/v8 example/api:1.2.3",
+      "",
+    ].join("\n"));
+    const dockerfileTree = await dockerParser.resolve({
+      lockfilePath: dockerfilePath,
+      workspaceFolder: workspace,
+    });
+    assert.strictEqual(dockerfileTree.dependencies[0].qualifiers.platform, "linux/arm64/v8");
+
+    const composePath = path.join(workspace, "compose.yaml");
+    await writeTextFile(composePath, [
+      "services:",
+      "  api:",
+      "    image: example/api:1.2.3",
+      "    platform: linux/arm64",
+      "",
+    ].join("\n"));
+    const composeTree = await dockerParser.resolve({
+      lockfilePath: composePath,
+      workspaceFolder: workspace,
+    });
+    assert.strictEqual(composeTree.dependencies[0].qualifiers.platform, "linux/arm64");
+  });
+
+  test("marks unresolved Dockerfile target platforms as partial and unpullable", async () => {
+    const workspace = await createWorkspace();
+    const lockfilePath = path.join(workspace, "Dockerfile");
+    await writeTextFile(lockfilePath, [
+      "FROM --platform=$TARGETPLATFORM example/api:1.2.3",
+      "",
+    ].join("\n"));
+
+    const tree = await dockerParser.resolve({ lockfilePath, workspaceFolder: workspace });
+
+    assert.strictEqual(tree.dependencies.length, 1);
+    assert.strictEqual(tree.dependencies[0].hasResolutionEvidence, false);
+    assert.strictEqual(tree.dependencies[0].resolvedVersion, null);
+    assert.strictEqual(tree.dependencies[0].versionState, "incomplete");
+    assert.strictEqual(tree.dependencies[0].qualifiers.platform, undefined);
+    assert.deepStrictEqual(tree.warnings, [
+      "A Dockerfile target platform could not be resolved, so dependency results are partial.",
+    ]);
+  });
+
   test("warns safely when Compose interpolation cannot be resolved", async () => {
     const workspace = await createWorkspace();
     const lockfilePath = path.join(workspace, "compose.yml");

@@ -58,6 +58,30 @@ suite("dependencyAdapterRegistry", () => {
     assert.strictEqual(adapter.ecosystem, "npm");
   });
 
+  test("keeps an unresolved Docker target platform ineligible after canonical adaptation", async () => {
+    const workspace = await createWorkspace();
+    const dockerfilePath = path.join(workspace, "Dockerfile");
+    await writeTextFile(
+      dockerfilePath,
+      "FROM --platform=$TARGETPLATFORM example/api:1.2.3\n"
+    );
+
+    const result = await createDefaultDependencyAdapterRegistry().parseManifest({
+      filePath: dockerfilePath,
+      format: "docker",
+      workspaceFolder: workspace,
+    });
+
+    assert.strictEqual(result.status, ADAPTER_RESULT_STATUSES.PARTIAL);
+    assert.strictEqual(result.dependencies.length, 1);
+    assert.strictEqual(
+      result.dependencies[0].versionState,
+      DEPENDENCY_VERSION_STATES.INCOMPLETE
+    );
+    assert.strictEqual(result.dependencies[0].resolvedVersion, null);
+    assert.strictEqual(result.dependencies[0].lookupEligibility.state, "unresolved");
+  });
+
   test("accepts an empty adapter detection array", async () => {
     const registry = new DependencyAdapterRegistry([
       createContractAdapter("empty-detector", async () => []),
