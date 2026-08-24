@@ -281,7 +281,7 @@ suite("InstallCommandBuilder Test Suite", () => {
 
     assert.match(command, /^cargo add 'serde@=1\.0\.0' --registry '[A-Za-z0-9_-]+'$/);
     const registry = command.match(/--registry '([^']+)'$/)[1];
-    assert.match(result.note, new RegExp(`\\[registries\\.${registry}\\]`));
+    assert.ok(result.note.split("\n").includes(`[registries.${registry}]`));
     assert.ok(result.note.includes("sparse+https://cargo.cloudsmith.io/my-org/my-repo/"));
   });
 
@@ -296,8 +296,8 @@ suite("InstallCommandBuilder Test Suite", () => {
     assert.notStrictEqual(registry(dotted), registry(dashed));
     assert.notStrictEqual(registry(uppercase), registry(dashed));
     assert.notStrictEqual(registry(leftBoundary), registry(rightBoundary));
-    assert.match(dotted.note, new RegExp(`\\[registries\\.${registry(dotted)}\\]`));
-    assert.match(dashed.note, new RegExp(`\\[registries\\.${registry(dashed)}\\]`));
+    assert.ok(dotted.note.split("\n").includes(`[registries.${registry(dotted)}]`));
+    assert.ok(dashed.note.split("\n").includes(`[registries.${registry(dashed)}]`));
   });
 
   test("go generates a repository-targeted go get with valid Go environment semantics", () => {
@@ -473,8 +473,12 @@ suite("InstallCommandBuilder Test Suite", () => {
       ws,
       repo
     );
+    const goProxyUrl = "https://golang.cloudsmith.io/my-org/my-repo/";
     for (const variant of [go.command, ...go.alternatives.map(item => item.command)]) {
-      assert.match(variant, /https:\/\/golang\.cloudsmith\.io\/my-org\/my-repo\//u);
+      assert.ok(
+        variant.includes(`GOPROXY='${goProxyUrl}'`)
+          || variant.includes(`set GOPROXY=${goProxyUrl}&&`)
+      );
       assert.match(variant, /github\.com\/gin-gonic\/gin@v1\.9\.1/u);
       assert.match(variant, /GONOPROXY(?:=|=')none/u);
       assert.doesNotMatch(variant, /proxy\.golang\.org|,direct|\|direct|GONOSUMCHECK/u);
@@ -491,10 +495,10 @@ suite("InstallCommandBuilder Test Suite", () => {
       composer.command,
       ...composer.alternatives.map(item => item.command),
     ]) {
-      assert.match(variant, /https:\/\/composer\.cloudsmith\.io\/my-org\/my-repo\//u);
+      assert.ok(variant.includes("'https://composer.cloudsmith.io/my-org/my-repo/'"));
       assert.match(variant, /vendor\/package:2\.0\.0/u);
       assert.match(variant, /repositories\.packagist\.org false/u);
-      assert.doesNotMatch(variant, /repo\.packagist\.org/u);
+      assert.strictEqual(variant.includes("repo.packagist.org"), false);
     }
 
     const rpm = InstallCommandBuilder.build("rpm", "httpd", "2.4.57", ws, repo, {
@@ -509,15 +513,15 @@ suite("InstallCommandBuilder Test Suite", () => {
     const docker = InstallCommandBuilder.build("docker", "team/image", sha256, ws, repo, {
       tags: { version: ["stable"] },
     });
-    for (const variant of [
+    const dockerRepository = "docker.cloudsmith.io/my-org/my-repo/team/image";
+    assert.strictEqual(
       docker.command,
-      ...docker.alternatives.map(item => item.command),
-    ]) {
-      assert.match(variant, /docker\.cloudsmith\.io\/my-org\/my-repo\/team\/image/u);
-      assert.doesNotMatch(variant, /docker\.io|index\.docker\.io/u);
-    }
-    assert.match(docker.command, new RegExp(`@sha256:${sha256}$`, "u"));
-    assert.match(docker.alternatives[0].command, /:stable$/u);
+      `# Verify package details before running\ndocker pull ${dockerRepository}@sha256:${sha256}`
+    );
+    assert.deepStrictEqual(docker.alternatives, [{
+      label: "Pull by tag",
+      command: `# Verify package details before running\ndocker pull ${dockerRepository}:stable`,
+    }]);
   });
 
   test("dart targets the selected hosted repository on the executable command", () => {
