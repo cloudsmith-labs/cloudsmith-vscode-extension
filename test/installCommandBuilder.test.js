@@ -491,15 +491,24 @@ suite("InstallCommandBuilder Test Suite", () => {
       ws,
       repo
     );
-    for (const variant of [
+    assert.strictEqual(
       composer.command,
-      ...composer.alternatives.map(item => item.command),
-    ]) {
-      assert.ok(variant.includes("'https://composer.cloudsmith.io/my-org/my-repo/'"));
-      assert.match(variant, /vendor\/package:2\.0\.0/u);
-      assert.match(variant, /repositories\.packagist\.org false/u);
-      assert.strictEqual(variant.includes("repo.packagist.org"), false);
-    }
+      "# Verify package details before running\n"
+        + "composer config repositories.packagist.org false && "
+        + "composer config repositories.cloudsmith composer "
+        + "'https://composer.cloudsmith.io/my-org/my-repo/' "
+        + "&& composer require 'vendor/package:2.0.0'"
+    );
+    assert.deepStrictEqual(composer.alternatives, [{
+      label: "PowerShell",
+      command: "# Verify package details before running\n"
+        + "composer config repositories.packagist.org false; "
+        + "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; "
+        + "composer config repositories.cloudsmith composer "
+        + "'https://composer.cloudsmith.io/my-org/my-repo/'; "
+        + "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; "
+        + "composer require 'vendor/package:2.0.0'",
+    }]);
 
     const rpm = InstallCommandBuilder.build("rpm", "httpd", "2.4.57", ws, repo, {
       qualifiers: { epoch: "1", release: "8.el9", architecture: "x86_64" },
