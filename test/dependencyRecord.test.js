@@ -416,6 +416,73 @@ suite("dependencyRecord", () => {
       getDependencyArtifactKey(createRuby("ruby")),
       getDependencyArtifactKey(createRuby("x86_64-linux"))
     );
+
+    const createMaven = qualifiers => createDependencyRecord({
+      ecosystem: "maven",
+      name: "com.example:demo",
+      resolvedVersion: "1.2.3",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      legacyVersion: "1.2.3",
+      qualifiers,
+      packageSource: { kind: "registry" },
+    });
+    assert.strictEqual(
+      getDependencyArtifactKey(createMaven({})),
+      getDependencyArtifactKey(createMaven({ type: "jar" }))
+    );
+    assert.strictEqual(
+      getDependencyArtifactKey(createMaven({ type: "test-jar" })),
+      getDependencyArtifactKey(createMaven({ type: "jar", classifier: "tests" }))
+    );
+
+    const createDocker = platform => createDependencyRecord({
+      ecosystem: "docker",
+      name: "alpine",
+      resolvedVersion: "3.20.3",
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      legacyVersion: "3.20.3",
+      qualifiers: { tag: "3.20.3", platform },
+      packageSource: { kind: "registry" },
+    });
+    assert.strictEqual(
+      getDependencyArtifactKey(createDocker("linux/x86_64")),
+      getDependencyArtifactKey(createDocker("linux/amd64"))
+    );
+    assert.strictEqual(
+      getDependencyArtifactKey(createDocker("linux/aarch64/v8")),
+      getDependencyArtifactKey(createDocker("linux/arm64"))
+    );
+    const dockerDigestBase = {
+      ecosystem: "docker",
+      name: "alpine",
+      resolvedVersion: `sha256:${"a".repeat(64)}`,
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      legacyVersion: `sha256:${"a".repeat(64)}`,
+      packageSource: { kind: "registry" },
+    };
+    assert.strictEqual(
+      getDependencyArtifactKey(createDependencyRecord({
+        ...dockerDigestBase,
+        qualifiers: { digest: `SHA256:${"A".repeat(64)}` },
+      })),
+      getDependencyArtifactKey(createDependencyRecord({
+        ...dockerDigestBase,
+        qualifiers: { digest: `sha256:${"a".repeat(64)}` },
+      }))
+    );
+
+    const createNugetVersion = version => createDependencyRecord({
+      ecosystem: "nuget",
+      name: "Example.Package",
+      resolvedVersion: version,
+      versionState: DEPENDENCY_VERSION_STATES.RESOLVED,
+      legacyVersion: version,
+      packageSource: { kind: "registry" },
+    });
+    assert.strictEqual(
+      getDependencyArtifactKey(createNugetVersion("01.02.003.0-BETA+build.7")),
+      getDependencyArtifactKey(createNugetVersion("1.2.3-beta"))
+    );
   });
 
   test("derives workspace-relative source labels", () => {

@@ -1,5 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const vscode = require("vscode");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const { CloudsmithAPI } = require("./cloudsmithAPI");
 const { CredentialManager } = require("./credentialManager");
 const { apiEndpoint } = require("./apiEndpoint");
@@ -7,15 +8,31 @@ const { fetchWorkspaceRepositories } = require("./workspaceRepositoryFetcher");
 const { PaginatedFetch } = require("./paginatedFetch");
 const { SearchQueryBuilder } = require("./searchQueryBuilder");
 const {
+  packageCandidateEvidenceShapeIsValid,
+  qualifierEvidenceIsIncomplete,
+} = require("./exactPackageEvidence");
+const {
   buildRegistryTriggerPlan,
+  dockerCandidateMatchesPlatform,
+  dockerDigestMatches,
   findPythonDistributionUrl,
   formatForDependency,
   isPullUnsupportedFormat,
   isTrustedRegistryUrl,
+  mavenArtifactFileName,
+  normalizeNuGetVersion,
+  parseCargoDownloadUrl,
+  parseCargoIndexEntry,
   parseComposerDistUrl,
   parseDartArchiveUrl,
-  resolveAndValidateRegistryUrl,
+  parseDockerManifest,
+  parseNpmTarballUrl,
+  parseNuGetPackageUrl,
+  resolveAndValidateDockerBlobRedirectUrl,
+  resolveAndValidateScopedRegistryUrl,
+  rubyCandidateMatchesPlatform,
 } = require("./registryEndpoints");
+const { getDependencyArtifactKey } = require("./dependencyRecord");
 const {
   canonicalFormat,
   getCloudsmithPackageLookupKeys,
@@ -36,11 +53,26 @@ const MAX_CONCURRENT_PULLS = 5;
 const INITIAL_AUTH_PROBE_CONCURRENCY = 3;
 const MAX_REGISTRY_REDIRECTS = 5;
 const REQUEST_TIMEOUT_MS = 30 * 1000;
+const DOCKER_BLOB_REQUEST_TIMEOUT_MS = 120 * 1000;
+const MAX_REGISTRY_REQUEST_TIMEOUT_MS = 120 * 1000;
 const MAX_REGISTRY_METADATA_BYTES = 1024 * 1024;
 const ABSENCE_LOOKUP_PAGE_SIZE = 100;
 const ABSENCE_LOOKUP_MAX_PAGES = 100;
 const ABSENCE_LOOKUP_MAX_ITEMS = ABSENCE_LOOKUP_PAGE_SIZE * ABSENCE_LOOKUP_MAX_PAGES;
 const ABSENCE_LOOKUP_MAX_FIELD_LENGTH = 2048;
+const DEFAULT_POST_TRIGGER_POLL_DELAYS_MS = Object.freeze([
+  0,
+  1000,
+  2000,
+  4000,
+  8000,
+  15000,
+  30000,
+  60000,
+]);
+const MAX_POST_TRIGGER_POLL_ATTEMPTS = 10;
+const MAX_POST_TRIGGER_POLL_DELAY_MS = 60 * 1000;
+const MAX_POST_TRIGGER_POLL_TOTAL_DELAY_MS = 120 * 1000;
 const REPOSITORY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
 const REPOSITORY_DISPLAY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/gu;
 const SAFE_REGISTRY_ERROR_MESSAGES = new Set([
@@ -93,6 +125,12 @@ class UpstreamPullService {
     this._checkPackageAbsence = typeof options.checkPackageAbsence === "function"
       ? options.checkPackageAbsence
       : this._checkExactPackageAbsence.bind(this);
+    this._postTriggerPollDelaysMs = normalizePostTriggerPollDelays(
+      options.postTriggerPollDelaysMs
+    );
+    this._postTriggerDelay = typeof options.postTriggerDelay === "function"
+      ? options.postTriggerDelay
+      : this._delayPostTriggerPoll.bind(this);
   }
 
   async run(options) {
@@ -400,16 +438,40 @@ class UpstreamPullService {
       options.signal || null,
       prepared?.account || null
     );
+    const isExecutionCurrent = () => this._isPreparationCurrent(executionOperation);
     const absence = await this._verifyTargetAbsence(
       prepared?.workspace,
       prepared?.repository?.slug,
       prepared?.plan?.pullableDependencies,
       executionOperation
     );
-    if (!absence || !this._isPreparedAccountCurrent(prepared)) {
-      return { canceled: true, stale: true };
+    if (!absence || !isExecutionCurrent()) {
+      return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
     }
     if (!absence.ok) {
+      if (
+        absence.reason === "present"
+        && prepared?.plan?.pullableDependencies?.length === 1
+        && this._isPreparationCurrent(executionOperation)
+      ) {
+        const detail = toPublicPullDetail({
+          dependency: absence.dependency,
+          status: PULL_STATUS.ALREADY_EXISTS,
+          errorMessage: null,
+          networkError: false,
+        });
+        await publishStatus(
+          typeof options.onStatus === "function" ? options.onStatus : null,
+          detail
+        );
+        if (!this._isPreparationCurrent(executionOperation)) {
+          return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
+        }
+        return {
+          canceled: false,
+          pullResult: buildPullResult([detail]),
+        };
+      }
       await this._showWarningMessage(buildAbsenceVerificationFailureMessage(
         absence,
         prepared.workspace,
@@ -417,21 +479,22 @@ class UpstreamPullService {
       ));
       return { canceled: true, absenceUnverified: true };
     }
-    if (!this._isPreparedAccountCurrent(prepared)) {
-      return { canceled: true, stale: true };
+    executionOperation.absenceProofs = absence.proofs;
+    if (!isExecutionCurrent()) {
+      return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
     }
     let apiKey;
     try {
       apiKey = await this._credentialManager.getApiKey();
     } catch {
-      if (!this._isPreparedAccountCurrent(prepared)) {
-        return { canceled: true, stale: true };
+      if (!isExecutionCurrent()) {
+        return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
       }
       await this._showErrorMessage("Authentication failed. Check your API key in Cloudsmith settings.");
       return null;
     }
-    if (!this._isPreparedAccountCurrent(prepared)) {
-      return { canceled: true, stale: true };
+    if (!isExecutionCurrent()) {
+      return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
     }
     if (!apiKey) {
       const message = this._credentialManager.getCredentialKind?.() === "sso"
@@ -447,6 +510,7 @@ class UpstreamPullService {
     const queue = prepared.plan.pullableDependencies.slice();
     let nextDependencyIndex = 0;
     const details = [];
+    const verificationReceipts = new Map();
     const counts = createResultCounts(prepared.plan.pullableDependencies.length);
     const state = {
       authFailureCount: 0,
@@ -476,9 +540,9 @@ class UpstreamPullService {
     };
 
     const processNext = async () => {
-      if (!this._isPreparedAccountCurrent(prepared)) {
+      if (!isExecutionCurrent()) {
         state.canceled = true;
-        state.stale = true;
+        state.stale = !this._isPreparedAccountCurrent(prepared);
         return;
       }
       if (token && token.isCancellationRequested) {
@@ -504,9 +568,9 @@ class UpstreamPullService {
           errorMessage: null,
         };
         await publishStatus(onStatus, pullingDetail);
-        if (!this._isPreparedAccountCurrent(prepared)) {
+        if (!isExecutionCurrent()) {
           state.canceled = true;
-          state.stale = true;
+          state.stale = !this._isPreparedAccountCurrent(prepared);
           return;
         }
 
@@ -518,7 +582,8 @@ class UpstreamPullService {
             dependency,
             apiKey,
             token,
-            () => this._isPreparedAccountCurrent(prepared)
+            executionOperation.signal,
+            isExecutionCurrent
           );
         } catch {
           result = createPullFailure(
@@ -527,9 +592,9 @@ class UpstreamPullService {
           );
         }
 
-        if (!this._isPreparedAccountCurrent(prepared)) {
+        if (!isExecutionCurrent()) {
           state.canceled = true;
-          state.stale = true;
+          state.stale = !this._isPreparedAccountCurrent(prepared);
           return;
         }
 
@@ -537,6 +602,33 @@ class UpstreamPullService {
           state.canceled = true;
           state.stale = result.stale === true;
           return;
+        }
+
+        if (result.triggerSucceeded === true) {
+          result = await this._verifyPostTriggerPresence(
+            prepared.workspace,
+            prepared.repository.slug,
+            dependency,
+            executionOperation,
+            { dockerPlatformVerified: result.dockerPlatformVerified === true }
+          );
+          if (result.canceled) {
+            state.canceled = true;
+            state.stale = result.stale === true;
+            return;
+          }
+        }
+        if (!this._isPreparationCurrent(executionOperation)) {
+          state.canceled = true;
+          state.stale = !this._isPreparedAccountCurrent(prepared);
+          return;
+        }
+
+        if (result.coverageReceipt) {
+          verificationReceipts.set(
+            getDependencyArtifactKey(dependency),
+            Object.freeze({ ...result.coverageReceipt })
+          );
         }
 
         result = toPublicPullDetail(result);
@@ -591,7 +683,7 @@ class UpstreamPullService {
         && (state.expandedConcurrency || launchedCount < INITIAL_AUTH_PROBE_CONCURRENCY)
         && nextDependencyIndex < queue.length
         && !(token && token.isCancellationRequested)
-        && this._isPreparedAccountCurrent(prepared)
+        && isExecutionCurrent()
         && !state.stopForAuthFailure
       ) {
         launchedCount += 1;
@@ -603,9 +695,9 @@ class UpstreamPullService {
           () => pending.delete(promise)
         );
       }
-      if (!this._isPreparedAccountCurrent(prepared)) {
+      if (!isExecutionCurrent()) {
         state.canceled = true;
-        state.stale = true;
+        state.stale = !this._isPreparedAccountCurrent(prepared);
       }
     };
 
@@ -647,6 +739,7 @@ class UpstreamPullService {
 
     return {
       canceled: false,
+      ...(verificationReceipts.size > 0 ? { verificationReceipts } : {}),
       pullResult: {
         total: counts.total,
         cached: counts.cached,
@@ -816,6 +909,7 @@ class UpstreamPullService {
       || dependencies.length === 0
     ) return null;
 
+    const proofs = new Map();
     for (const dependency of dependencies) {
       if (!this._isPreparationCurrent(operation)) return null;
       let result;
@@ -848,8 +942,12 @@ class UpstreamPullService {
           dependency,
         };
       }
+      proofs.set(
+        getDependencyArtifactKey(dependency),
+        new Set(Array.isArray(result.observedIdentities) ? result.observedIdentities : [])
+      );
     }
-    return { ok: true };
+    return { ok: true, proofs };
   }
 
   async _checkExactPackageAbsence({
@@ -859,9 +957,14 @@ class UpstreamPullService {
     cancellationToken,
     signal,
     account,
+    baselineIdentities,
+    dockerPlatformVerified = false,
   }) {
     const format = canonicalFormat(dependency?.format || dependency?.ecosystem);
-    const version = String(dependency?.version || "").trim();
+    const requestedVersion = String(dependency?.version || "").trim();
+    const version = format === "nuget"
+      ? normalizeNuGetVersion(requestedVersion)
+      : requestedVersion;
     const lookupNames = getPackageLookupKeys(
       dependency?.name,
       format,
@@ -886,14 +989,24 @@ class UpstreamPullService {
     }
     const paginatedFetch = new PaginatedFetch(this._api);
 
+    let incompleteQualifierEvidence = false;
+    const observedIdentities = new Set();
     for (const lookupName of lookupNames) {
-      const query = new SearchQueryBuilder()
+      const queryBuilder = new SearchQueryBuilder()
         .name(lookupName)
-        .format(format)
-        .version(version)
-        .build();
+        .format(format);
+      if (format !== "docker") {
+        queryBuilder.version(version);
+      }
+      let query;
+      try {
+        query = queryBuilder.build();
+      } catch {
+        return incompleteAbsenceResult(workspace, repository);
+      }
       let resume = null;
       const knownIdentities = new Set();
+      const accumulatedCandidates = [];
       while (true) {
         if (
           isCancellationRequested(cancellationToken)
@@ -925,9 +1038,23 @@ class UpstreamPullService {
         ) {
           return incompleteAbsenceResult(workspace, repository, true);
         }
-        const present = result.items.some(candidate => (
-          exactPackageCandidateMatches(candidate, dependency, format, version)
-        ));
+        accumulatedCandidates.push(...result.items);
+        for (const candidate of result.items) {
+          observedIdentities.add(exactPackageCandidateIdentity(candidate));
+        }
+        if (accumulatedCandidates.some(candidate => (
+          exactPackageCandidateEvidenceIsIncomplete(candidate, dependency, format, version)
+        ))) {
+          incompleteQualifierEvidence = true;
+        }
+        const present = exactPackageCandidateCollectionMatches(
+          accumulatedCandidates,
+          dependency,
+          format,
+          version,
+          baselineIdentities,
+          dockerPlatformVerified
+        );
         if (present) {
           return {
             workspace,
@@ -949,6 +1076,10 @@ class UpstreamPullService {
       }
     }
 
+    if (incompleteQualifierEvidence) {
+      return incompleteAbsenceResult(workspace, repository);
+    }
+
     return {
       workspace,
       repository,
@@ -956,7 +1087,130 @@ class UpstreamPullService {
       present: false,
       complete: true,
       stale: false,
+      observedIdentities: [...observedIdentities],
     };
+  }
+
+  async _verifyPostTriggerPresence(
+    workspace,
+    repository,
+    dependency,
+    operation,
+    verificationReceipt = {}
+  ) {
+    for (const delayMs of this._postTriggerPollDelaysMs) {
+      if (!this._isPreparationCurrent(operation)) {
+        return {
+          canceled: true,
+          stale: !this._isAbsenceAccountCurrent(operation?.account),
+        };
+      }
+      if (delayMs > 0) {
+        try {
+          await this._postTriggerDelay(delayMs, operation);
+        } catch {
+          // Delay failures are treated as an inconclusive verification attempt.
+        }
+      }
+      if (!this._isPreparationCurrent(operation)) {
+        return {
+          canceled: true,
+          stale: !this._isAbsenceAccountCurrent(operation?.account),
+        };
+      }
+
+      let result;
+      try {
+        result = await this._checkPackageAbsence({
+          workspace,
+          repository,
+          dependency,
+          cancellationToken: operation.cancellationToken,
+          signal: operation.signal,
+          account: operation.account,
+          baselineIdentities: operation.absenceProofs?.get(
+            getDependencyArtifactKey(dependency)
+          ),
+          dockerPlatformVerified: verificationReceipt.dockerPlatformVerified === true,
+        });
+      } catch {
+        result = null;
+      }
+      if (!this._isPreparationCurrent(operation)) {
+        return {
+          canceled: true,
+          stale: !this._isAbsenceAccountCurrent(operation?.account),
+        };
+      }
+
+      const scoped = result
+        && result.workspace === workspace
+        && result.repository === repository
+        && result.stale !== true;
+      if (
+        scoped
+        && result.present === true
+        && result.absent === false
+      ) {
+        const format = canonicalFormat(dependency?.format || dependency?.ecosystem);
+        const coverageReceipt = {
+          ...(format === "docker" && verificationReceipt.dockerPlatformVerified === true
+            ? { dockerPlatformVerified: true }
+            : {}),
+          ...(format === "swift" && String(dependency?.qualifiers?.scope || "").trim()
+            ? { swiftScopeVerified: true }
+            : {}),
+        };
+        return {
+          dependency,
+          status: PULL_STATUS.CACHED,
+          errorMessage: null,
+          networkError: false,
+          ...(Object.keys(coverageReceipt).length > 0 ? { coverageReceipt } : {}),
+        };
+      }
+    }
+
+    return createPullFailure(
+      dependency,
+      "Cloudsmith did not confirm the package in the target repository after the upstream request completed."
+    );
+  }
+
+  _delayPostTriggerPoll(delayMs, operation) {
+    if (delayMs <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      let settled = false;
+      let timeoutHandle = null;
+      const disposables = [];
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (timeoutHandle !== null) this._clearTimeout(timeoutHandle);
+        for (const disposable of disposables.reverse()) disposable?.dispose?.();
+        if (operation?.signal) {
+          operation.signal.removeEventListener("abort", finish);
+        }
+        resolve();
+      };
+
+      if (typeof operation?.cancellationToken?.onCancellationRequested === "function") {
+        disposables.push(operation.cancellationToken.onCancellationRequested(finish));
+      }
+      if (typeof this._connectionManager?.onDidChange === "function") {
+        disposables.push(this._connectionManager.onDidChange(() => {
+          if (!this._isPreparationCurrent(operation)) finish();
+        }));
+      }
+      if (operation?.signal) {
+        operation.signal.addEventListener("abort", finish, { once: true });
+      }
+      if (!this._isPreparationCurrent(operation)) {
+        finish();
+        return;
+      }
+      timeoutHandle = this._setTimeout(finish, delayMs);
+    });
   }
 
   _isAbsenceAccountCurrent(account) {
@@ -996,7 +1250,7 @@ class UpstreamPullService {
       || Boolean(prepared?.account && isAccountCurrent(this._connectionManager, prepared.account));
   }
 
-  async _pullDependency(workspace, repo, dependency, apiKey, token, isCurrent = null) {
+  async _pullDependency(workspace, repo, dependency, apiKey, token, signal = null, isCurrent = null) {
     const plan = buildRegistryTriggerPlan(workspace, repo, dependency);
     const format = formatForDependency(dependency);
 
@@ -1017,7 +1271,7 @@ class UpstreamPullService {
       plan.request,
       apiKey,
       token,
-      { captureBody: plan.strategy !== "direct", isCurrent }
+      { captureBody: plan.strategy !== "direct", isCurrent, signal }
     );
     if (metadataAttempt.canceled) {
       return metadataAttempt;
@@ -1039,17 +1293,93 @@ class UpstreamPullService {
       return mapRegistryAttempt(dependency, metadataAttempt, format);
     }
 
+    if (plan.strategy === "docker-manifest") {
+      return this._pullDockerManifest(
+        plan,
+        dependency,
+        metadataAttempt,
+        apiKey,
+        token,
+        signal,
+        isCurrent
+      );
+    }
+
     let artifactUrl = null;
     if (plan.strategy === "python-simple-index") {
-      artifactUrl = findPythonDistributionUrl(metadataAttempt.body, dependency.version, plan.request.url);
+      artifactUrl = findPythonDistributionUrl(
+        metadataAttempt.body,
+        plan.packageName || dependency.name,
+        dependency.version,
+        plan.request.url,
+        plan.trustScope
+      );
+    } else if (plan.strategy === "npm-packument") {
+      artifactUrl = parseNpmTarballUrl(
+        metadataAttempt.body,
+        plan.packageName || dependency.name,
+        dependency.version,
+        plan.request.url,
+        plan.trustScope
+      );
+    } else if (plan.strategy === "cargo-sparse-index") {
+      const indexEntry = parseCargoIndexEntry(
+        metadataAttempt.body,
+        plan.crateName || dependency.name,
+        dependency.version
+      );
+      if (!indexEntry) {
+        return {
+          dependency,
+          status: PULL_STATUS.NOT_FOUND,
+          errorMessage: missingArtifactMessage(plan.strategy, dependency.version),
+          networkError: false,
+        };
+      }
+
+      const configAttempt = await this._requestRegistry(
+        plan.configRequest,
+        apiKey,
+        token,
+        { captureBody: true, isCurrent, signal }
+      );
+      if (configAttempt.canceled) {
+        return configAttempt;
+      }
+      if (configAttempt.statusCode < 200 || configAttempt.statusCode >= 300) {
+        return mapRegistryAttempt(dependency, configAttempt, format);
+      }
+      artifactUrl = parseCargoDownloadUrl(
+        configAttempt.body,
+        indexEntry.name,
+        indexEntry.version,
+        indexEntry.checksum,
+        plan.configRequest.url,
+        plan.trustScope
+      );
     } else if (plan.strategy === "dart-api") {
-      artifactUrl = parseDartArchiveUrl(metadataAttempt.body, dependency.version, plan.request.url);
+      artifactUrl = parseDartArchiveUrl(
+        metadataAttempt.body,
+        plan.packageName || dependency.name,
+        dependency.version,
+        plan.request.url,
+        plan.trustScope
+      );
     } else if (plan.strategy === "composer-p2") {
       artifactUrl = parseComposerDistUrl(
         metadataAttempt.body,
         plan.packageName || dependency.name,
         dependency.version,
-        plan.request.url
+        plan.request.url,
+        plan.trustScope
+      );
+    } else if (plan.strategy === "nuget-service-index") {
+      artifactUrl = parseNuGetPackageUrl(
+        metadataAttempt.body,
+        plan.packageName,
+        plan.packageVersion,
+        plan.request.url,
+        plan.trustScope
       );
     }
 
@@ -1070,11 +1400,12 @@ class UpstreamPullService {
       {
         method: "GET",
         url: artifactUrl,
+        authScheme: plan.request.authScheme,
         headers: {},
       },
       apiKey,
       token,
-      { captureBody: false, isCurrent }
+      { captureBody: false, isCurrent, signal }
     );
 
     if (artifactAttempt.canceled) {
@@ -1084,8 +1415,84 @@ class UpstreamPullService {
     return mapRegistryAttempt(dependency, artifactAttempt, format);
   }
 
+  async _pullDockerManifest(plan, dependency, initialAttempt, apiKey, token, signal, isCurrent) {
+    let parsed = parseDockerManifest(initialAttempt.body, dependency?.qualifiers || {});
+    if (!parsed) {
+      return {
+        dependency,
+        status: PULL_STATUS.NOT_FOUND,
+        errorMessage: "No usable Docker image manifest was found upstream.",
+        networkError: false,
+      };
+    }
+
+    let dockerPlatformVerified = false;
+    if (parsed.manifestDigest) {
+      const manifestAttempt = await this._requestRegistry(
+        {
+          method: "GET",
+          url: `${plan.imageBaseUrl}/manifests/${encodeURIComponent(parsed.manifestDigest)}`,
+          headers: { Accept: plan.request.headers.Accept },
+        },
+        apiKey,
+        token,
+        { captureBody: true, isCurrent, signal }
+      );
+      if (manifestAttempt.canceled) return manifestAttempt;
+      if (manifestAttempt.statusCode < 200 || manifestAttempt.statusCode >= 300) {
+        return mapRegistryAttempt(dependency, manifestAttempt, "docker");
+      }
+      parsed = parseDockerManifest(manifestAttempt.body, dependency?.qualifiers || {});
+      if (!parsed || parsed.manifestDigest || parsed.blobDigests.length === 0) {
+        return {
+          dependency,
+          status: PULL_STATUS.NOT_FOUND,
+          errorMessage: "No usable Docker image manifest was found upstream.",
+          networkError: false,
+        };
+      }
+      dockerPlatformVerified = Boolean(dependency?.qualifiers?.platform);
+    }
+
+    let lastAttempt = initialAttempt;
+    for (const digest of parsed.blobDigests) {
+      if (isCurrent && !isCurrent()) {
+        return { canceled: true, stale: true };
+      }
+      lastAttempt = await this._requestRegistry(
+        {
+          method: "GET",
+          url: `${plan.imageBaseUrl}/blobs/${encodeURIComponent(digest)}`,
+          redirectPolicy: "docker-blob",
+          headers: {},
+        },
+        apiKey,
+        token,
+        {
+          captureBody: false,
+          isCurrent,
+          signal,
+          timeoutMs: DOCKER_BLOB_REQUEST_TIMEOUT_MS,
+        }
+      );
+      if (lastAttempt.canceled) return lastAttempt;
+      if (lastAttempt.statusCode < 200 || lastAttempt.statusCode >= 300) {
+        return mapRegistryAttempt(dependency, lastAttempt, "docker");
+      }
+    }
+
+    const result = mapRegistryAttempt(dependency, lastAttempt, "docker");
+    return result.triggerSucceeded && dockerPlatformVerified
+      ? { ...result, dockerPlatformVerified: true }
+      : result;
+  }
+
   async _requestRegistry(request, apiKey, token, options = {}) {
     const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    const externalSignal = options.signal || null;
+    if (externalSignal?.aborted) {
+      return { canceled: true };
+    }
     if (isCurrent && !isCurrent()) {
       return { canceled: true, stale: true };
     }
@@ -1100,13 +1507,18 @@ class UpstreamPullService {
     };
     const timeoutHandle = this._setTimeout(() => {
       abort("timeout");
-    }, REQUEST_TIMEOUT_MS);
+    }, normalizeRegistryRequestTimeout(options.timeoutMs));
 
     const cancellationDisposable = token && typeof token.onCancellationRequested === "function"
       ? token.onCancellationRequested(() => abort("cancelled"))
       : null;
     if (token && token.isCancellationRequested) {
       abort("cancelled");
+    }
+    const abortFromSignal = () => abort("cancelled");
+    if (externalSignal) {
+      externalSignal.addEventListener("abort", abortFromSignal, { once: true });
+      if (externalSignal.aborted) abortFromSignal();
     }
 
     try {
@@ -1125,7 +1537,11 @@ class UpstreamPullService {
         ? await discardRegistryBody(response, controller.signal)
         : await readRegistryBody(response, MAX_REGISTRY_METADATA_BYTES, controller.signal);
 
-      if (abortCause === "cancelled" || (token && token.isCancellationRequested)) {
+      if (
+        abortCause === "cancelled"
+        || (token && token.isCancellationRequested)
+        || externalSignal?.aborted
+      ) {
         return { canceled: true };
       }
       if (abortCause === "timeout" || controller.signal.aborted) {
@@ -1140,7 +1556,11 @@ class UpstreamPullService {
       if (isCurrent && !isCurrent()) {
         return { canceled: true, stale: true };
       }
-      if (abortCause === "cancelled" || (token && token.isCancellationRequested)) {
+      if (
+        abortCause === "cancelled"
+        || (token && token.isCancellationRequested)
+        || externalSignal?.aborted
+      ) {
         return { canceled: true };
       }
 
@@ -1157,11 +1577,18 @@ class UpstreamPullService {
       if (cancellationDisposable && typeof cancellationDisposable.dispose === "function") {
         cancellationDisposable.dispose();
       }
+      if (externalSignal) {
+        externalSignal.removeEventListener("abort", abortFromSignal);
+      }
     }
   }
 
   async _fetchRegistryResponse(request, apiKey, signal, redirectCount, isCurrent = null) {
-    if (!request || !isTrustedRegistryUrl(request.url)) {
+    const sendCredentials = request?.sendCredentials !== false;
+    const isCredentiallessDockerBlobRequest = request?.redirectPolicy === "docker-blob"
+      && !sendCredentials
+      && resolveAndValidateDockerBlobRedirectUrl(request.url, request.url) === request.url;
+    if (!request || (!isTrustedRegistryUrl(request.url) && !isCredentiallessDockerBlobRequest)) {
       throw new Error("Refused to send Cloudsmith credentials to an untrusted registry host.");
     }
     if (isCurrent && !isCurrent()) {
@@ -1171,7 +1598,9 @@ class UpstreamPullService {
     const fetchResult = await this._awaitRegistryAbortable(this._fetchImpl(request.url, {
       method: request.method || "GET",
       headers: {
-        Authorization: buildBasicAuthHeader(apiKey),
+        ...(sendCredentials
+          ? { Authorization: buildRegistryAuthHeader(apiKey, request.authScheme) }
+          : {}),
         ...buildRegistryRequestHeaders(request.headers),
       },
       redirect: "manual",
@@ -1197,10 +1626,18 @@ class UpstreamPullService {
     const location = response.headers && typeof response.headers.get === "function"
       ? response.headers.get("location")
       : "";
-    const redirectUrl = resolveAndValidateRegistryUrl(location, request.url);
-    const currentUrl = new URL(request.url);
-    const nextUrl = redirectUrl ? new URL(redirectUrl) : null;
-    if (!nextUrl || nextUrl.hostname !== currentUrl.hostname) {
+    let redirectUrl = resolveAndValidateScopedRegistryUrl(
+      location,
+      request.url,
+      null,
+      { allowQuery: true }
+    );
+    let redirectSendsCredentials = sendCredentials;
+    if (!redirectUrl && request.redirectPolicy === "docker-blob") {
+      redirectUrl = resolveAndValidateDockerBlobRedirectUrl(location, request.url);
+      redirectSendsCredentials = false;
+    }
+    if (!redirectUrl) {
       await cancelRegistryBody(response);
       throw new Error("Registry redirect target was rejected.");
     }
@@ -1215,6 +1652,7 @@ class UpstreamPullService {
       {
         ...request,
         url: redirectUrl,
+        sendCredentials: redirectSendsCredentials,
       },
       apiKey,
       signal,
@@ -1273,7 +1711,7 @@ function isBoundedLookupField(value) {
     && value.length > 0
     && value.length <= ABSENCE_LOOKUP_MAX_FIELD_LENGTH
     && value.trim() === value
-    && !/[\u0000-\u001f\u007f]/u.test(value);
+    && !REPOSITORY_CONTROL_OR_BIDI.test(value);
 }
 
 function isExactPackageCandidateArray(value, workspace, repository) {
@@ -1288,37 +1726,68 @@ function isExactPackageCandidateArray(value, workspace, repository) {
       && isBoundedLookupField(candidate.name)
       && isBoundedLookupField(candidate.version)
       && isBoundedLookupField(candidate.format)
+      && isBoundedLookupField(exactPackageCandidateIdentifier(candidate))
+      && packageCandidateEvidenceShapeIsValid(candidate)
       && Boolean(exactPackageCandidateIdentity(candidate))
     ));
 }
 
 function exactPackageCandidateIdentity(candidate) {
   if (!candidate || typeof candidate !== "object") return null;
+  const packageIdentifier = exactPackageCandidateIdentifier(candidate);
+  if (!packageIdentifier) return null;
   const stableIdentifier = [
     candidate.namespace,
     candidate.repository,
     candidate.format,
     candidate.name,
     candidate.version,
-    candidate.slug_perm || candidate.identifier || "",
+    packageIdentifier,
   ];
   return stableIdentifier.every(value => typeof value === "string")
     ? JSON.stringify(stableIdentifier)
     : null;
 }
 
+function exactPackageCandidateIdentifier(candidate) {
+  try {
+    return fromApiPackageRecord(candidate).packageIdentifier;
+  } catch {
+    return null;
+  }
+}
+
 function exactPackageCandidateMatches(candidate, dependency, format, version) {
   if (
-    candidate.version !== version
-    || canonicalFormat(candidate.format) !== format
+    canonicalFormat(candidate.format) !== format
   ) return false;
+  if (format === "docker") {
+    const versionTags = Array.isArray(candidate?.tags?.version)
+      ? candidate.tags.version
+      : [];
+    const requestedDigest = String(
+      dependency?.qualifiers?.digest || dependency?.digest || ""
+    ).trim().toLowerCase();
+    const observedDigest = String(candidate.version || "").trim().toLowerCase();
+    const digestMatches = requestedDigest
+      && dockerDigestMatches(observedDigest, requestedDigest);
+    const tagMatches = versionTags.some(tag => String(tag) === version);
+    if (requestedDigest ? !digestMatches : !tagMatches) return false;
+  } else if (
+    format === "nuget"
+      ? normalizeNuGetVersion(candidate.version) !== normalizeNuGetVersion(version)
+      : candidate.version !== version
+  ) {
+    return false;
+  }
   const dependencyName = String(dependency?.name || "").trim();
   if (!dependencyName) return false;
 
   if (format === "maven" && dependencyName.includes(":")) {
     const expectedName = normalizePackageName(dependencyName, format);
     return getCloudsmithPackageLookupKeys(candidate, format)
-      .some(key => key.includes(":") && key === expectedName);
+      .some(key => key.includes(":") && key === expectedName)
+      && mavenCandidateContainsRequestedArtifact(candidate, dependency);
   }
   if (format === "swift") {
     const candidateIdentifiers = candidate.identifiers
@@ -1335,22 +1804,11 @@ function exactPackageCandidateMatches(candidate, dependency, format, version) {
     );
     return Boolean(expected && observed && expected === observed);
   }
-  if (format === "ruby" && dependency?.qualifiers?.platform) {
-    const candidateIdentifiers = candidate.identifiers
-      && typeof candidate.identifiers === "object"
-      ? candidate.identifiers
-      : {};
-    const observedPlatform = String(
-      candidate.platform
-      || candidate.architecture
-      || candidateIdentifiers.platform
-      || candidateIdentifiers.architecture
-      || ""
-    ).trim();
-    if (
-      observedPlatform
-      && observedPlatform.toLowerCase() !== String(dependency.qualifiers.platform).toLowerCase()
-    ) return false;
+  if (
+    format === "ruby"
+    && !rubyCandidateMatchesPlatform(candidate, dependency?.qualifiers?.platform)
+  ) {
+    return false;
   }
 
   const expectedKeys = getPackageLookupKeys(
@@ -1360,6 +1818,85 @@ function exactPackageCandidateMatches(candidate, dependency, format, version) {
   );
   const observedKeys = new Set(getCloudsmithPackageLookupKeys(candidate, format));
   return expectedKeys.some(key => observedKeys.has(key));
+}
+
+function exactPackageCandidateCollectionMatches(
+  candidates,
+  dependency,
+  format,
+  version,
+  baselineIdentities,
+  dockerPlatformVerified
+) {
+  const requestedPlatform = format === "docker"
+    ? String(dependency && dependency.qualifiers && dependency.qualifiers.platform || "").trim()
+    : "";
+  const identityCandidate = candidates.find(candidate => (
+    exactPackageCandidateMatches(candidate, dependency, format, version)
+    && (
+      !requestedPlatform
+      || dockerPlatformVerified === true
+      || dockerCandidateMatchesPlatform(candidate, requestedPlatform)
+    )
+  ));
+  if (identityCandidate) return true;
+  if (format === "swift" && baselineIdentities instanceof Set) {
+    return candidates.some(candidate => (
+      !baselineIdentities.has(exactPackageCandidateIdentity(candidate))
+      && exactPackageCandidateBaseNameMatches(candidate, dependency, format)
+      && candidate.version === version
+      && qualifierEvidenceIsIncomplete(candidate, dependency, format)
+    ));
+  }
+  return false;
+}
+
+function exactPackageCandidateEvidenceIsIncomplete(candidate, dependency, format, version) {
+  if (!exactPackageCandidateBaseNameMatches(candidate, dependency, format)) return false;
+  if (format === "docker") {
+    if (qualifierEvidenceIsIncomplete(candidate, dependency, format)) return true;
+    const requestedPlatform = String(
+      dependency && dependency.qualifiers && dependency.qualifiers.platform || ""
+    ).trim();
+    return Boolean(
+      requestedPlatform
+      && exactPackageCandidateMatches(candidate, dependency, format, version)
+      && !dockerCandidateMatchesPlatform(candidate, requestedPlatform)
+    );
+  }
+  const candidateVersionMatches = format === "nuget"
+    ? normalizeNuGetVersion(candidate.version) === normalizeNuGetVersion(version)
+    : candidate.version === version;
+  return candidateVersionMatches
+    && qualifierEvidenceIsIncomplete(candidate, dependency, format);
+}
+
+function exactPackageCandidateBaseNameMatches(candidate, dependency, format) {
+  if (canonicalFormat(candidate && candidate.format) !== format) return false;
+  const dependencyName = String(dependency && dependency.name || "").trim();
+  if (!dependencyName) return false;
+  if (format === "maven" && dependencyName.includes(":")) {
+    const expectedName = normalizePackageName(dependencyName, format);
+    return getCloudsmithPackageLookupKeys(candidate, format)
+      .some(key => key.includes(":") && key === expectedName);
+  }
+  const expectedKeys = new Set(getPackageLookupKeys(
+    dependencyName,
+    format,
+    dependency && (dependency.identifiers || dependency.qualifiers)
+  ));
+  return getCloudsmithPackageLookupKeys(candidate, format)
+    .some(key => expectedKeys.has(key));
+}
+
+function mavenCandidateContainsRequestedArtifact(candidate, dependency) {
+  const expectedFileName = mavenArtifactFileName(dependency);
+  if (!expectedFileName || !Array.isArray(candidate?.files)) return false;
+  return candidate.files.some(file => (
+    file
+    && typeof file === "object"
+    && String(file.filename || file.name || file.path || "").split("/").pop() === expectedFileName
+  ));
 }
 
 function incompleteAbsenceResult(workspace, repository, stale = false) {
@@ -1855,6 +2392,24 @@ function createResultCounts(total) {
   };
 }
 
+function buildPullResult(details) {
+  const safeDetails = Array.isArray(details) ? details : [];
+  const counts = createResultCounts(safeDetails.length);
+  for (const detail of safeDetails) updateResultCounts(counts, detail);
+  return {
+    total: counts.total,
+    cached: counts.cached,
+    alreadyExisted: counts.alreadyExisted,
+    notFound: counts.notFound,
+    formatMismatched: counts.formatMismatched,
+    errors: counts.errors,
+    networkErrors: counts.networkErrors,
+    authFailed: counts.authFailed,
+    skipped: counts.skipped,
+    details: safeDetails,
+  };
+}
+
 function updateResultCounts(counts, result) {
   counts.completed += 1;
   switch (result.status) {
@@ -1898,21 +2453,17 @@ function recomputeResultCounts(counts, results) {
 }
 
 function mapRegistryAttempt(dependency, attempt, format) {
-  if (attempt.statusCode >= 200 && attempt.statusCode < 300) {
+  if (
+    (attempt.statusCode >= 200 && attempt.statusCode < 300)
+    || attempt.statusCode === 304
+    || attempt.statusCode === 409
+  ) {
     return {
       dependency,
-      status: PULL_STATUS.CACHED,
+      status: PULL_STATUS.PENDING,
       errorMessage: null,
       networkError: false,
-    };
-  }
-
-  if (attempt.statusCode === 304 || attempt.statusCode === 409) {
-    return {
-      dependency,
-      status: PULL_STATUS.ALREADY_EXISTS,
-      errorMessage: null,
-      networkError: false,
+      triggerSucceeded: true,
     };
   }
 
@@ -1970,6 +2521,10 @@ function missingArtifactMessage(strategy, version) {
   switch (strategy) {
     case "python-simple-index":
       return `No distribution file was found for version ${version}.`;
+    case "npm-packument":
+      return `No npm tarball URL was found for version ${version}.`;
+    case "cargo-sparse-index":
+      return `No downloadable Cargo crate was found for version ${version}.`;
     case "dart-api":
       return `No Dart archive URL was found for version ${version}.`;
     case "composer-p2":
@@ -2014,8 +2569,35 @@ function buildBasicAuthHeader(apiKey) {
   return `Basic ${Buffer.from(`token:${apiKey}`).toString("base64")}`;
 }
 
+function buildRegistryAuthHeader(apiKey, scheme) {
+  return String(scheme || "").toLowerCase() === "bearer"
+    ? `Bearer ${apiKey}`
+    : buildBasicAuthHeader(apiKey);
+}
+
+function normalizeRegistryRequestTimeout(value) {
+  const timeout = Number(value);
+  return Number.isInteger(timeout) && timeout > 0
+    ? Math.min(timeout, MAX_REGISTRY_REQUEST_TIMEOUT_MS)
+    : REQUEST_TIMEOUT_MS;
+}
+
 function isRedirectStatus(statusCode) {
-  return Number.isInteger(statusCode) && statusCode >= 300 && statusCode < 400;
+  return [301, 302, 303, 307, 308].includes(statusCode);
+}
+
+function normalizePostTriggerPollDelays(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_POST_TRIGGER_POLL_ATTEMPTS) {
+    return DEFAULT_POST_TRIGGER_POLL_DELAYS_MS;
+  }
+  const delays = value.map(delay => Number(delay));
+  if (
+    delays.some(delay => !Number.isInteger(delay) || delay < 0 || delay > MAX_POST_TRIGGER_POLL_DELAY_MS)
+    || delays.reduce((total, delay) => total + delay, 0) > MAX_POST_TRIGGER_POLL_TOTAL_DELAY_MS
+  ) {
+    return DEFAULT_POST_TRIGGER_POLL_DELAYS_MS;
+  }
+  return Object.freeze(delays);
 }
 
 function safeHost(url) {
@@ -2047,11 +2629,15 @@ function pullDependencyKey(dependency) {
   const format = String(
     canonicalFormat(dependency && (dependency.format || dependency.ecosystem)) || ""
   ).toLowerCase();
-  return [
+  return getDependencyArtifactKey({
+    ...dependency,
+    ecosystem: format,
     format,
-    normalizePackageName(dependency && dependency.name, format),
-    String(dependency && dependency.version || "").trim(),
-  ].join(":");
+    normalizedName: normalizePackageName(dependency && dependency.name, format),
+    resolvedVersion: String(
+      dependency && (dependency.resolvedVersion || dependency.version) || ""
+    ).trim(),
+  });
 }
 
 function singleFormatPullHeader(dependencies, repositoryLabel) {

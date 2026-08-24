@@ -7,7 +7,7 @@ const {
 } = require("../util/searchIntent");
 const {
   buildPresetQuery,
-  buildRawSearchQuery,
+  buildAdvancedSearchQuery,
   canonicalRepository,
   captureCommandAccount,
   createFilterPresets,
@@ -21,10 +21,11 @@ const {
 } = require("./support");
 
 const MAX_SEARCH_INPUT_LENGTH = 2048;
+const QUERY_CONTROL_OR_BIDI_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/;
 
 function searchInputValidationMessage(value) {
   if (typeof value !== "string") return "Enter a search query.";
-  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) {
+  if (QUERY_CONTROL_OR_BIDI_PATTERN.test(value)) {
     return "Search queries cannot contain control characters.";
   }
   if (value.length > MAX_SEARCH_INPUT_LENGTH) {
@@ -115,7 +116,7 @@ function registerSearchCommands(deps) {
     await executeSearchIntent(searchProvider, {
       kind: "workspace",
       workspace,
-      query: buildRawSearchQuery(SearchQueryBuilder, query),
+      query: buildAdvancedSearchQuery(SearchQueryBuilder, query),
       page: 1,
     }, { recentSearches, record: true, isCurrent: account.isCurrent });
     if (!isCommandAccountCurrent(account)) return;
@@ -149,7 +150,7 @@ function registerSearchCommands(deps) {
     await executeSearchIntent(searchProvider, {
       kind: "workspace",
       workspace,
-      query: buildRawSearchQuery(SearchQueryBuilder, query),
+      query: buildAdvancedSearchQuery(SearchQueryBuilder, query),
       page: 1,
     }, { recentSearches, record: true, isCurrent });
     if (!isCurrent()) return;
@@ -273,13 +274,22 @@ function registerSearchCommands(deps) {
         .join(" OR ");
       queryParts.push(`(${formatQuery})`);
     }
-    const builder = new SearchQueryBuilder();
-    for (const part of queryParts) builder.raw(part);
+    const finalQuery = queryParts
+      .map(part => queryParts.length > 1 ? `(${part})` : part)
+      .join(" AND ") || "*";
+    const finalQueryError = searchInputValidationMessage(finalQuery);
+    if (finalQueryError) {
+      await deps.vscode.window.showWarningMessage(
+        "The combined search query exceeds the safe query limit. Shorten the custom query or select fewer formats."
+      );
+      return;
+    }
+    const builder = new SearchQueryBuilder().advanced(finalQuery);
     if (!isCommandAccountCurrent(account)) return;
     await executeSearchIntent(searchProvider, {
       kind: selectedRepos ? "repositories" : "workspace",
       workspace,
-      query: builder.build() || "*",
+      query: builder.build(),
       page: 1,
       ...(selectedRepos ? { repositories: selectedRepos } : {}),
     }, { recentSearches, record: true, isCurrent: account.isCurrent });

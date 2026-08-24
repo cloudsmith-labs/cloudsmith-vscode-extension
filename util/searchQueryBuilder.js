@@ -1,6 +1,29 @@
 // Builds query strings for the Cloudsmith packages API.
 // Handles escaping, boolean operators, and field-specific syntax.
 
+const MAX_ADVANCED_QUERY_LENGTH = 2048;
+const QUERY_CONTROL_OR_BIDI_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/;
+
+function isValidAdvancedQuery(value) {
+    return typeof value === 'string'
+        && value.trim().length > 0
+        && value.length <= MAX_ADVANCED_QUERY_LENGTH
+        && !QUERY_CONTROL_OR_BIDI_PATTERN.test(value);
+}
+
+function escapeCloudsmithQueryValue(value) {
+    const normalized = typeof value === 'string' ? value : String(value);
+    const escaped = normalized.replace(
+        /(?:^[+-]+|\\|&&|\|\||[!(){}\[\]^$'"~*?:<>|&])/g,
+        (match, offset) => (
+            offset === 0 && /^[+-]+$/.test(match)
+                ? [...match].map((character) => `\\${character}`).join('')
+                : `\\${match}`
+        )
+    );
+    return /\s/.test(escaped) ? `"${escaped}"` : escaped;
+}
+
 class SearchQueryBuilder {
     constructor() {
         this.terms = [];
@@ -10,12 +33,7 @@ class SearchQueryBuilder {
      * Escape a value for use in a Cloudsmith query.
      */
     _escapeValue(value) {
-        if (typeof value !== 'string') {
-            value = String(value);
-        }
-
-        const escaped = value.replace(/(\\|&&|\|\||[+\-!(){}\[\]^"~*?:/|&])/g, (match) => `\\${match}`);
-        return /\s/.test(escaped) ? `"${escaped}"` : escaped;
+        return escapeCloudsmithQueryValue(value);
     }
 
     /** Add a name search term. */
@@ -49,8 +67,24 @@ class SearchQueryBuilder {
     }
 
     /**
+     * Add a user-authored Cloudsmith query-language expression after validating
+     * its transport boundary. Operators remain intentional DSL, not field data.
+     */
+    advanced(queryString) {
+        if (typeof queryString !== 'string') {
+            throw new TypeError('Advanced Cloudsmith query must be a string.');
+        }
+        const query = queryString.trim();
+        if (!isValidAdvancedQuery(query)) {
+            throw new TypeError('Advanced Cloudsmith query is invalid.');
+        }
+        this.terms.push(query);
+        return this;
+    }
+
+    /**
      * Add a raw query term (pass-through for advanced users).
-     * @warning Raw input is not escaped; only use trusted, advanced query fragments here.
+     * @warning Raw input is not escaped or validated; only use trusted internal fragments here.
      */
     raw(queryString) {
         if (queryString) {
@@ -61,7 +95,11 @@ class SearchQueryBuilder {
 
     /** Build the final query string. */
     build() {
-        return this.terms.join(' AND ');
+        const query = this.terms.join(' AND ');
+        if (query && !isValidAdvancedQuery(query)) {
+            throw new RangeError('Cloudsmith query exceeds the safe transport boundary.');
+        }
+        return query;
     }
 
     /** Reset the builder for reuse. */
@@ -75,8 +113,11 @@ class SearchQueryBuilder {
      * Returns packages that are not quarantined and have no deny policy violations.
      */
     static permissible(name) {
-        const builder = new SearchQueryBuilder();
-        return `name:${builder._escapeValue(name)} AND NOT status:quarantined AND deny_policy_violated:false`;
+        return new SearchQueryBuilder()
+            .name(name)
+            .raw('NOT status:quarantined')
+            .raw('deny_policy_violated:false')
+            .build();
     }
 
     /**
@@ -87,4 +128,8 @@ class SearchQueryBuilder {
     }
 }
 
-module.exports = { SearchQueryBuilder };
+module.exports = {
+    SearchQueryBuilder,
+    escapeCloudsmithQueryValue,
+    isValidAdvancedQuery,
+};

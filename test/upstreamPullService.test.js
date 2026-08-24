@@ -8,6 +8,7 @@ const {
 } = require("../util/upstreamPullService");
 const { UpstreamChecker } = require("../util/upstreamChecker");
 const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
+const { getDependencyArtifactKey } = require("../util/dependencyRecord");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
 function createResponse(status, body, headers = {}) {
@@ -173,8 +174,9 @@ suite("UpstreamPullService", () => {
     });
     assert.strictEqual(
       mavenPlan.request.url,
-      "https://dl.cloudsmith.io/basic/workspace/repo/maven/com/example/demo-app/1.2.3/demo-app-1.2.3.pom"
+      "https://dl.cloudsmith.io/basic/workspace/repo/maven/com/example/demo-app/1.2.3/demo-app-1.2.3.jar"
     );
+    assert.strictEqual(mavenPlan.artifactRequest, undefined);
 
     const npmPlan = buildRegistryTriggerPlan("workspace", "repo", {
       name: "@scope/widget",
@@ -183,7 +185,7 @@ suite("UpstreamPullService", () => {
     });
     assert.strictEqual(
       npmPlan.request.url,
-      "https://npm.cloudsmith.io/workspace/repo/%40scope/widget/-/widget-4.5.6.tgz"
+      "https://npm.cloudsmith.io/workspace/repo/%40scope%2Fwidget/4.5.6"
     );
 
     const goPlan = buildRegistryTriggerPlan("workspace", "repo", {
@@ -193,7 +195,7 @@ suite("UpstreamPullService", () => {
     });
     assert.strictEqual(
       goPlan.request.url,
-      "https://golang.cloudsmith.io/workspace/repo/github.com/!my!org/!my!module/@v/v1.0.0.info"
+      "https://golang.cloudsmith.io/workspace/repo/github.com/!my!org/!my!module/@v/v1.0.0.zip"
     );
 
     const cargoPlan = buildRegistryTriggerPlan("workspace", "repo", {
@@ -247,6 +249,7 @@ suite("UpstreamPullService", () => {
     const startedAt = Date.now();
     const result = findPythonDistributionUrl(
       hostileHtml,
+      "artifact",
       "1.0.0",
       "https://dl.cloudsmith.io/basic/workspace/repo/python/simple/artifact/"
     );
@@ -339,7 +342,565 @@ suite("UpstreamPullService", () => {
       present: false,
       complete: true,
       stale: false,
+      observedIdentities: [],
     });
+  });
+
+  test("exact pull presence lookup preserves scoped npm slash identity", async () => {
+    let requestedQuery = "";
+    const service = new UpstreamPullService({}, {
+      api: {
+        async get(endpoint) {
+          requestedQuery = new URL(endpoint, "https://api.cloudsmith.io")
+            .searchParams.get("query");
+          return apiSuccess([{
+            namespace: "workspace",
+            repository: "repo-b",
+            name: "@aws-sdk/client-s3",
+            version: "3.600.0",
+            format: "npm",
+            slug_perm: "node-8-9-2",
+          }]);
+        },
+      },
+    });
+
+    const result = await service._checkExactPackageAbsence({
+      workspace: "workspace",
+      repository: "repo-b",
+      dependency: { name: "@aws-sdk/client-s3", version: "3.600.0", format: "npm" },
+    });
+
+    assert.match(requestedQuery, /name:@aws-sdk\/client-s3/);
+    assert.doesNotMatch(requestedQuery, /@aws\\-sdk|client\\-s3|@aws-sdk\\\/client-s3/);
+    assert.strictEqual(result.present, true);
+    assert.strictEqual(result.absent, false);
+    assert.strictEqual(result.complete, true);
+  });
+
+  test("leading modifier-like names cannot broaden exact pull presence", async () => {
+    const queries = [];
+    const service = new UpstreamPullService({}, {
+      api: {
+        async get(endpoint) {
+          queries.push(new URL(endpoint, "https://api.cloudsmith.io")
+            .searchParams.get("query"));
+          return apiSuccess([{
+            namespace: "workspace",
+            repository: "repo-b",
+            name: "target-package",
+            version: "1.0.0",
+            format: "npm",
+            slug_perm: "different-package",
+          }]);
+        },
+      },
+    });
+
+    const result = await service._checkExactPackageAbsence({
+      workspace: "workspace",
+      repository: "repo-b",
+      dependency: { name: "+-target-package", version: "1.0.0", format: "npm" },
+    });
+
+    assert.ok(queries[0].includes("name:\\+\\-target-package"));
+    assert.strictEqual(result.present, false);
+    assert.strictEqual(result.absent, true);
+    assert.strictEqual(result.complete, true);
+  });
+
+  test("leading modifier-like names still produce exact pull presence", async () => {
+    const service = new UpstreamPullService({}, {
+      api: {
+        async get() {
+          return apiSuccess([{
+            namespace: "workspace",
+            repository: "repo-b",
+            name: "--target-package",
+            version: "1.0.0-beta+build",
+            format: "npm",
+            slug_perm: "exact-package",
+          }]);
+        },
+      },
+    });
+
+    const result = await service._checkExactPackageAbsence({
+      workspace: "workspace",
+      repository: "repo-b",
+      dependency: {
+        name: "--target-package",
+        version: "1.0.0-beta+build",
+        format: "npm",
+      },
+    });
+
+    assert.strictEqual(result.present, true);
+    assert.strictEqual(result.absent, false);
+    assert.strictEqual(result.complete, true);
+  });
+
+  test("exact Docker presence matches the requested tag instead of the stored manifest digest", async () => {
+    let requestedQuery = "";
+    const service = new UpstreamPullService({}, {
+      api: {
+        async get(endpoint) {
+          requestedQuery = new URL(endpoint, "https://api.cloudsmith.io")
+            .searchParams.get("query");
+          return apiSuccess([{
+            namespace: "workspace",
+            repository: "repo-b",
+            name: "library/hello-world",
+            version: "a".repeat(64),
+            format: "docker",
+            slug_perm: "hello-world-linux",
+            tags: { version: ["linux"] },
+          }]);
+        },
+      },
+    });
+
+    const result = await service._checkExactPackageAbsence({
+      workspace: "workspace",
+      repository: "repo-b",
+      dependency: { name: "hello-world", version: "linux", format: "docker" },
+    });
+
+    assert.match(requestedQuery, /name:hello-world/);
+    assert.doesNotMatch(requestedQuery, /version:linux/);
+    assert.strictEqual(result.present, true);
+    assert.strictEqual(result.absent, false);
+    assert.strictEqual(result.complete, true);
+  });
+
+  test("exact Docker digest presence cannot be satisfied by the same tag on another digest", async () => {
+    const service = new UpstreamPullService({}, {
+      api: {
+        async get() {
+          return apiSuccess([{
+            namespace: "workspace",
+            repository: "repo-b",
+            name: "library/example",
+            version: "b".repeat(64),
+            format: "docker",
+            slug_perm: "example-stable",
+            tags: { version: ["stable"] },
+          }]);
+        },
+      },
+    });
+
+    const result = await service._checkExactPackageAbsence({
+      workspace: "workspace",
+      repository: "repo-b",
+      dependency: {
+        name: "example",
+        version: "stable",
+        format: "docker",
+        qualifiers: { tag: "stable", digest: `sha256:${"a".repeat(64)}` },
+      },
+    });
+
+    assert.strictEqual(result.present, false);
+    assert.strictEqual(result.absent, true);
+    assert.strictEqual(result.complete, true);
+  });
+
+  test("platform-qualified Docker presence rejects unlinked split-row evidence before and after pull", async () => {
+    const tagCandidate = {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "library/example",
+      version: "a".repeat(64),
+      format: "docker",
+      slug_perm: "example-stable",
+      tags: { version: ["stable"] },
+    };
+    const architectureCandidate = architecture => ({
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "library/example",
+      version: `${architecture}-${"b".repeat(48)}`,
+      format: "docker",
+      slug_perm: `example-${architecture}`,
+      architectures: [{ name: architecture }],
+      identifiers: { architecture, docker_platform_os: "linux" },
+    });
+    const check = async (candidates, options = {}) => new UpstreamPullService({}, {
+      api: { async get() { return apiSuccess(candidates); } },
+    })._checkExactPackageAbsence({
+      workspace: "workspace",
+      repository: "repo-b",
+      dependency: {
+        name: "example",
+        version: "stable",
+        format: "docker",
+        qualifiers: { tag: "stable", platform: "linux/arm64" },
+      },
+      ...options,
+    });
+
+    const wrongPlatform = await check([
+      tagCandidate,
+      architectureCandidate("amd64"),
+    ]);
+    assert.strictEqual(wrongPlatform.complete, false);
+    const preexistingSplitShape = await check([
+      tagCandidate,
+      architectureCandidate("arm64"),
+    ]);
+    assert.strictEqual(preexistingSplitShape.complete, false);
+    const postTriggerSplitShape = await check([
+      tagCandidate,
+      architectureCandidate("arm64"),
+    ]);
+    assert.strictEqual(postTriggerSplitShape.present, false);
+    assert.strictEqual(postTriggerSplitShape.absent, false);
+    assert.strictEqual(postTriggerSplitShape.complete, false);
+    const verifiedRegistryManifest = await check([tagCandidate], {
+      dockerPlatformVerified: true,
+    });
+    assert.strictEqual(verifiedRegistryManifest.present, true);
+    assert.strictEqual(verifiedRegistryManifest.complete, true);
+  });
+
+  test("exact Docker digest presence preserves the digest algorithm when Cloudsmith supplies it", async () => {
+    const hex = "a".repeat(64);
+    const check = async observedVersion => new UpstreamPullService({}, {
+      api: {
+        async get() {
+          return apiSuccess([{
+            namespace: "workspace",
+            repository: "repo-b",
+            name: "library/example",
+            version: observedVersion,
+            format: "docker",
+            slug_perm: "example-digest",
+            tags: { info: ["upstream"] },
+          }]);
+        },
+      },
+    })._checkExactPackageAbsence({
+      workspace: "workspace",
+      repository: "repo-b",
+      dependency: {
+        name: "example",
+        version: `sha256:${hex}`,
+        format: "docker",
+        qualifiers: { digest: `sha256:${hex}` },
+      },
+    });
+
+    assert.strictEqual((await check(`sha512:${hex}`)).absent, true);
+    assert.strictEqual((await check(`unknown:${hex}`)).absent, true);
+    assert.strictEqual((await check(hex)).present, true);
+  });
+
+  test("exact Swift lookup uses the bare API name but fails closed without scope evidence", async () => {
+    let requestedQuery = "";
+    const service = new UpstreamPullService({}, {
+      api: {
+        async get(endpoint) {
+          requestedQuery = new URL(endpoint, "https://api.cloudsmith.io/v1/")
+            .searchParams.get("query");
+          return apiSuccess([{
+            namespace: "acme",
+            repository: "repo-b",
+            name: "logging",
+            version: "1.2.3",
+            format: "swift",
+            slug_perm: "logging-1.2.3",
+          }]);
+        },
+      },
+    });
+
+    const result = await service._checkExactPackageAbsence({
+      workspace: "acme",
+      repository: "repo-b",
+      dependency: {
+        name: "acme.logging",
+        version: "1.2.3",
+        format: "swift",
+        qualifiers: { scope: "acme" },
+      },
+    });
+
+    assert.match(requestedQuery, /name:logging/);
+    assert.strictEqual(result.present, false);
+    assert.strictEqual(result.absent, false);
+    assert.strictEqual(result.complete, false);
+  });
+
+  test("exact Swift lookup accepts a newly observed bare row only after proven absence", async () => {
+    const service = new UpstreamPullService({}, {
+      api: {
+        async get() {
+          return apiSuccess([{
+            namespace: "workspace",
+            repository: "repo-b",
+            name: "logging",
+            version: "1.2.3",
+            format: "swift",
+            slug_perm: "logging-1.2.3",
+          }]);
+        },
+      },
+    });
+    const result = await service._checkExactPackageAbsence({
+      workspace: "workspace",
+      repository: "repo-b",
+      dependency: {
+        name: "acme.logging",
+        version: "1.2.3",
+        format: "swift",
+        qualifiers: { scope: "acme" },
+      },
+      baselineIdentities: new Set(),
+    });
+
+    assert.strictEqual(result.present, true);
+    assert.strictEqual(result.absent, false);
+    assert.strictEqual(result.complete, true);
+  });
+
+  test("exact Swift lookup accepts embedded dotted and slash scope evidence", async () => {
+    for (const candidateName of ["acme.logging", "acme/logging"]) {
+      const service = new UpstreamPullService({}, {
+        api: {
+          async get() {
+            return apiSuccess([{
+              namespace: "workspace",
+              repository: "repo-b",
+              name: candidateName,
+              version: "1.2.3",
+              format: "swift",
+              slug_perm: `logging-${candidateName.includes(".") ? "dot" : "slash"}`,
+            }]);
+          },
+        },
+      });
+
+      const result = await service._checkExactPackageAbsence({
+        workspace: "workspace",
+        repository: "repo-b",
+        dependency: {
+          name: "acme.logging",
+          version: "1.2.3",
+          format: "swift",
+          qualifiers: { scope: "acme" },
+        },
+      });
+
+      assert.strictEqual(result.present, true, candidateName);
+      assert.strictEqual(result.absent, false, candidateName);
+      assert.strictEqual(result.complete, true, candidateName);
+    }
+  });
+
+  test("exact presence normalizes NuGet versions and verifies Maven and Ruby artifact qualifiers", async () => {
+    async function check(dependency, candidate) {
+      const service = new UpstreamPullService({}, {
+        api: { async get() { return apiSuccess([candidate]); } },
+      });
+      return service._checkExactPackageAbsence({
+        workspace: "workspace",
+        repository: "repo-b",
+        dependency,
+      });
+    }
+
+    const nuget = await check({
+      name: "Example.Package",
+      version: "01.02.003.0-BETA+build.7",
+      format: "nuget",
+    }, {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "Example.Package",
+      version: "1.2.3-beta",
+      format: "nuget",
+      slug_perm: "nuget-example",
+    });
+    assert.strictEqual(nuget.present, true);
+
+    const mavenWrongClassifier = await check({
+      name: "com.example:demo",
+      version: "1.2.3",
+      format: "maven",
+      qualifiers: { type: "test-jar", classifier: "tests" },
+    }, {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "demo",
+      version: "1.2.3",
+      format: "maven",
+      slug_perm: "maven-demo",
+      identifiers: { group_id: "com.example", name: "demo" },
+      files: [{ filename: "demo-1.2.3.jar" }],
+    });
+    assert.strictEqual(mavenWrongClassifier.absent, true);
+
+    const mavenExactClassifier = await check({
+      name: "com.example:demo",
+      version: "1.2.3",
+      format: "maven",
+      qualifiers: { type: "test-jar", classifier: "tests" },
+    }, {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "demo",
+      version: "1.2.3",
+      format: "maven",
+      slug_perm: "maven-demo-tests",
+      identifiers: { group_id: "com.example", name: "demo" },
+      files: [{ filename: "demo-1.2.3-tests.jar" }],
+    });
+    assert.strictEqual(mavenExactClassifier.present, true);
+
+    const mavenImplicitClassifier = await check({
+      name: "com.example:demo",
+      version: "1.2.3",
+      format: "maven",
+      qualifiers: { type: "test-jar" },
+    }, {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "demo",
+      version: "1.2.3",
+      format: "maven",
+      slug_perm: "maven-demo-tests-implicit",
+      identifiers: { group_id: "com.example", name: "demo" },
+      files: [{ filename: "demo-1.2.3-tests.jar" }],
+    });
+    assert.strictEqual(mavenImplicitClassifier.present, true);
+
+    const mavenDefaultJar = await check({
+      name: "com.example:demo",
+      version: "1.2.3",
+      format: "maven",
+    }, {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "demo",
+      version: "1.2.3",
+      format: "maven",
+      slug_perm: "maven-demo-default",
+      identifiers: { group_id: "com.example", name: "demo" },
+      files: [{ filename: "demo-1.2.3.jar" }],
+    });
+    assert.strictEqual(mavenDefaultJar.present, true);
+
+    const mavenPomOnly = await check({
+      name: "com.example:demo",
+      version: "1.2.3",
+      format: "maven",
+    }, {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "demo",
+      version: "1.2.3",
+      format: "maven",
+      slug_perm: "maven-demo-pom-only",
+      identifiers: { group_id: "com.example", name: "demo" },
+      files: [{ filename: "demo-1.2.3.pom" }],
+    });
+    assert.strictEqual(mavenPomOnly.present, false);
+    assert.strictEqual(mavenPomOnly.absent, true);
+
+    const rubyMissingPlatform = await check({
+      name: "native-gem",
+      version: "1.0.0",
+      format: "ruby",
+      qualifiers: { platform: "x86_64-linux" },
+    }, {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "native-gem",
+      version: "1.0.0",
+      format: "ruby",
+      slug_perm: "ruby-native-gem",
+    });
+    assert.strictEqual(rubyMissingPlatform.absent, false);
+    assert.strictEqual(rubyMissingPlatform.complete, false);
+
+    const rubyDefaultAgainstNative = await check({
+      name: "native-gem",
+      version: "1.0.0",
+      format: "ruby",
+    }, {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "native-gem",
+      version: "1.0.0",
+      format: "ruby",
+      slug_perm: "ruby-native-only",
+      architectures: [{ name: "arm64-darwin" }],
+    });
+    assert.strictEqual(rubyDefaultAgainstNative.present, false);
+    assert.strictEqual(rubyDefaultAgainstNative.absent, true);
+
+    const rubyArchitectureArray = await check({
+      name: "native-gem",
+      version: "1.0.0",
+      format: "ruby",
+      qualifiers: { platform: "x86_64-linux" },
+    }, {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "native-gem",
+      version: "1.0.0",
+      format: "ruby",
+      slug_perm: "ruby-native-gem-architecture-array",
+      architectures: [{ name: "x86_64-linux" }],
+    });
+    assert.strictEqual(rubyArchitectureArray.present, true);
+  });
+
+  test("exact absence fails closed when qualifier evidence is omitted from a plausible row", async () => {
+    async function check(dependency, candidate) {
+      const service = new UpstreamPullService({}, {
+        api: { async get() { return apiSuccess([candidate]); } },
+      });
+      return service._checkExactPackageAbsence({
+        workspace: "workspace",
+        repository: "repo-b",
+        dependency,
+      });
+    }
+
+    const maven = await check({
+      name: "com.example:demo",
+      version: "1.2.3",
+      format: "maven",
+      qualifiers: { type: "test-jar", classifier: "tests" },
+    }, {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "demo",
+      version: "1.2.3",
+      format: "maven",
+      slug_perm: "demo-1.2.3",
+      identifiers: { group_id: "com.example" },
+    });
+    assert.strictEqual(maven.complete, false);
+    assert.strictEqual(maven.absent, false);
+
+    const ruby = await check({
+      name: "native-gem",
+      version: "1.0.0",
+      format: "ruby",
+      qualifiers: { platform: "x86_64-linux" },
+    }, {
+      namespace: "workspace",
+      repository: "repo-b",
+      name: "native-gem",
+      version: "1.0.0",
+      format: "ruby",
+      slug_perm: "native-gem-1.0.0",
+    });
+    assert.strictEqual(ruby.complete, false);
+    assert.strictEqual(ruby.absent, false);
   });
 
   test("exact pull absence lookup fails closed on partial, error, and wrong-repository data", async () => {
@@ -370,6 +931,50 @@ suite("UpstreamPullService", () => {
           slug_perm: "target-package-1",
         }]),
       },
+      {
+        name: "malformed stable identifier",
+        response: apiSuccess([{
+          namespace: "workspace",
+          repository: "repo-b",
+          name: "target-package",
+          version: "1.0.0",
+          format: "npm",
+          slug_perm: "target-package\u202e",
+        }]),
+      },
+      {
+        name: "missing stable identifier",
+        response: apiSuccess([{
+          namespace: "workspace",
+          repository: "repo-b",
+          name: "target-package",
+          version: "1.0.0",
+          format: "npm",
+        }]),
+      },
+      {
+        name: "malformed consumed identifier evidence",
+        response: apiSuccess([{
+          namespace: "workspace",
+          repository: "repo-b",
+          name: "target-package",
+          version: "1.0.0",
+          format: "npm",
+          slug_perm: "target-package-1",
+          identifiers: { group_id: { hostile: true } },
+        }]),
+      },
+      {
+        name: "bidi-bearing primary identity",
+        response: apiSuccess([{
+          namespace: "workspace",
+          repository: "repo-b",
+          name: "target-package\u202e",
+          version: "1.0.0",
+          format: "npm",
+          slug_perm: "target-package-1",
+        }]),
+      },
     ];
 
     for (const testCase of cases) {
@@ -383,6 +988,47 @@ suite("UpstreamPullService", () => {
       });
       assert.strictEqual(result.absent, false, testCase.name);
       assert.strictEqual(result.complete, false, testCase.name);
+    }
+  });
+
+  test("exact pull lookup accepts only canonical package identifier aliases", async () => {
+    async function check(identifierFields) {
+      const service = new UpstreamPullService({}, {
+        api: {
+          async get() {
+            return apiSuccess([{
+              namespace: "workspace",
+              repository: "repo-b",
+              name: "target-package",
+              version: "1.0.0",
+              format: "npm",
+              ...identifierFields,
+            }]);
+          },
+        },
+      });
+      return service._checkExactPackageAbsence({
+        workspace: "workspace",
+        repository: "repo-b",
+        dependency: { name: "target-package", version: "1.0.0", format: "npm" },
+      });
+    }
+
+    for (const identifierFields of [
+      { packageIdentifier: "target-package-1" },
+      { slug_perm_raw: "target-package-1" },
+    ]) {
+      assert.strictEqual((await check(identifierFields)).present, true);
+    }
+    for (const identifierFields of [
+      { identifier: "target-package-1" },
+      { slug_perm: "unsafe/identifier" },
+      { slug_perm: "%252f" },
+      { slug_perm: "target-package-1", slug_perm_raw: "conflict" },
+    ]) {
+      const result = await check(identifierFields);
+      assert.strictEqual(result.present, false);
+      assert.strictEqual(result.complete, false);
     }
   });
 
@@ -737,7 +1383,7 @@ suite("UpstreamPullService", () => {
     }
   });
 
-  test("a package appearing after confirmation prevents every registry write", async () => {
+  test("a package appearing after confirmation becomes already-exists without a registry write", async () => {
     let absenceChecks = 0;
     let pullCalls = 0;
     const service = new UpstreamPullService({}, {
@@ -786,15 +1432,302 @@ suite("UpstreamPullService", () => {
 
     assert.strictEqual(absenceChecks, 2);
     assert.strictEqual(pullCalls, 0);
-    assert.deepStrictEqual(result, {
-      workspace: "workspace",
-      repository: { slug: "repo-b", name: "Repo B" },
-      plan: result.plan,
-      account: null,
-      repositorySearchComplete: true,
-      canceled: true,
-      absenceUnverified: true,
+    assert.strictEqual(result.canceled, false);
+    assert.strictEqual(result.pullResult.cached, 0);
+    assert.strictEqual(result.pullResult.alreadyExisted, 1);
+    assert.strictEqual(result.pullResult.details[0].status, "exists");
+  });
+
+  test("single-package execution preflight reports already-exists before credentials or registry access", async () => {
+    let credentialCalls = 0;
+    let registryCalls = 0;
+    const statuses = [];
+    const service = new UpstreamPullService({}, {
+      credentialManager: {
+        async getApiKey() {
+          credentialCalls += 1;
+          return "api-key";
+        },
+      },
+      checkPackageAbsence: async ({ workspace, repository }) => ({
+        workspace,
+        repository,
+        absent: false,
+        present: true,
+        complete: true,
+        stale: false,
+      }),
+      fetchImpl: async () => {
+        registryCalls += 1;
+        throw new Error("registry request must not run");
+      },
     });
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: {
+        pullableDependencies: [{
+          name: "target-package",
+          version: "1.0.0",
+          format: "ruby",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    }, {
+      onStatus(detail) { statuses.push(detail.status); },
+    });
+
+    assert.strictEqual(result.canceled, false);
+    assert.strictEqual(result.pullResult.cached, 0);
+    assert.strictEqual(result.pullResult.alreadyExisted, 1);
+    assert.strictEqual(credentialCalls, 0);
+    assert.strictEqual(registryCalls, 0);
+    assert.deepStrictEqual(statuses, ["exists"]);
+  });
+
+  test("2xx, 304, and 409 registry responses wait for delayed exact presence before cached", async () => {
+    for (const statusCode of [200, 204, 304, 409]) {
+      let exactChecks = 0;
+      let registryCalls = 0;
+      const delays = [];
+      const statuses = [];
+      const service = new UpstreamPullService({}, {
+        credentialManager: { async getApiKey() { return "api-key"; } },
+        checkPackageAbsence: async ({ workspace, repository }) => {
+          exactChecks += 1;
+          if (exactChecks < 3) {
+            assert.strictEqual(statuses.includes("cached"), false, String(statusCode));
+          }
+          return {
+            workspace,
+            repository,
+            absent: exactChecks < 3,
+            present: exactChecks >= 3,
+            complete: true,
+            stale: false,
+          };
+        },
+        postTriggerPollDelaysMs: [0, 17],
+        postTriggerDelay: async delayMs => { delays.push(delayMs); },
+        fetchImpl: async () => {
+          registryCalls += 1;
+          return new Response(null, { status: statusCode });
+        },
+      });
+
+      const result = await service.execute({
+        workspace: "workspace",
+        repository: { slug: "repo" },
+        plan: {
+          pullableDependencies: [{
+            name: "target-package",
+            version: "1.0.0",
+            format: "ruby",
+            cloudsmithStatus: "NOT_FOUND",
+          }],
+          skippedDependencies: [],
+        },
+      }, {
+        onStatus(detail) { statuses.push(detail.status); },
+      });
+
+      assert.strictEqual(result.canceled, false, String(statusCode));
+      assert.strictEqual(result.pullResult.cached, 1, String(statusCode));
+      assert.strictEqual(result.pullResult.alreadyExisted, 0, String(statusCode));
+      assert.strictEqual(exactChecks, 3, String(statusCode));
+      assert.strictEqual(registryCalls, 1, String(statusCode));
+      assert.deepStrictEqual(delays, [17], String(statusCode));
+      assert.deepStrictEqual(statuses, ["pulling", "cached"], String(statusCode));
+    }
+  });
+
+  test("scoped Swift execution emits exact-scope verification evidence", async () => {
+    let exactChecks = 0;
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        exactChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: exactChecks === 1,
+          present: exactChecks > 1,
+          complete: true,
+          stale: false,
+        };
+      },
+      fetchImpl: async () => new Response(null, { status: 200 }),
+    });
+    const dependency = {
+      name: "acme.logging",
+      version: "1.2.3",
+      format: "swift",
+      qualifiers: { scope: "acme" },
+      cloudsmithStatus: "NOT_FOUND",
+    };
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: { pullableDependencies: [dependency], skippedDependencies: [] },
+    });
+
+    assert.strictEqual(result.pullResult.cached, 1);
+    assert.strictEqual(exactChecks, 2);
+    assert.deepStrictEqual([...result.verificationReceipts.entries()], [[
+      getDependencyArtifactKey(dependency),
+      { swiftScopeVerified: true },
+    ]]);
+  });
+
+  test("successful registry trigger with permanent exact absence returns a non-cached error", async () => {
+    let exactChecks = 0;
+    let registryCalls = 0;
+    const delays = [];
+    const statuses = [];
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        exactChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: true,
+          present: false,
+          complete: true,
+          stale: false,
+        };
+      },
+      postTriggerPollDelaysMs: [0, 5, 10],
+      postTriggerDelay: async delayMs => { delays.push(delayMs); },
+      fetchImpl: async () => {
+        registryCalls += 1;
+        return createResponse(200, "");
+      },
+    });
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: {
+        pullableDependencies: [{
+          name: "target-package",
+          version: "1.0.0",
+          format: "ruby",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    }, {
+      onStatus(detail) { statuses.push(detail.status); },
+    });
+
+    assert.strictEqual(result.canceled, false);
+    assert.strictEqual(result.pullResult.cached, 0);
+    assert.strictEqual(result.pullResult.alreadyExisted, 0);
+    assert.strictEqual(result.pullResult.errors, 1);
+    assert.match(result.pullResult.details[0].errorMessage, /did not confirm the package/i);
+    assert.strictEqual(exactChecks, 4);
+    assert.strictEqual(registryCalls, 1);
+    assert.deepStrictEqual(delays, [5, 10]);
+    assert.deepStrictEqual(statuses, ["pulling", "error"]);
+  });
+
+  test("post-trigger polling cancellation cannot publish stale cached success", async () => {
+    const token = cancellationToken();
+    let exactChecks = 0;
+    const statuses = [];
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        exactChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: true,
+          present: false,
+          complete: true,
+          stale: false,
+        };
+      },
+      postTriggerPollDelaysMs: [0, 1],
+      postTriggerDelay: async () => { token.cancel(); },
+      fetchImpl: async () => createResponse(200, ""),
+    });
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: {
+        pullableDependencies: [{
+          name: "target-package",
+          version: "1.0.0",
+          format: "ruby",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    }, {
+      token,
+      onStatus(detail) { statuses.push(detail.status); },
+    });
+
+    assert.deepStrictEqual(result, { canceled: true });
+    assert.strictEqual(exactChecks, 2);
+    assert.deepStrictEqual(statuses, ["pulling"]);
+  });
+
+  test("post-trigger polling account supersession cannot publish stale cached success", async () => {
+    let accountState = {
+      activationId: "account-a",
+      accountEpoch: 1,
+      sessionConnected: true,
+    };
+    let exactChecks = 0;
+    const statuses = [];
+    const service = new UpstreamPullService({}, {
+      connectionManager: { getState() { return { ...accountState }; } },
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        exactChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: true,
+          present: false,
+          complete: true,
+          stale: false,
+        };
+      },
+      postTriggerPollDelaysMs: [0, 1],
+      postTriggerDelay: async () => {
+        accountState = { ...accountState, activationId: "account-b", accountEpoch: 2 };
+      },
+      fetchImpl: async () => createResponse(200, ""),
+    });
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      account: { activationId: "account-a", accountEpoch: 1 },
+      plan: {
+        pullableDependencies: [{
+          name: "target-package",
+          version: "1.0.0",
+          format: "ruby",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    }, {
+      onStatus(detail) { statuses.push(detail.status); },
+    });
+
+    assert.deepStrictEqual(result, { canceled: true, stale: true });
+    assert.strictEqual(exactChecks, 2);
+    assert.deepStrictEqual(statuses, ["pulling"]);
   });
 
   test("prepare builds a mixed-ecosystem confirmation with skipped formats", async () => {
@@ -897,8 +1830,57 @@ suite("UpstreamPullService", () => {
     );
   });
 
+  test("prepare preserves same-version pull targets with distinct artifact qualifiers", async () => {
+    const service = new UpstreamPullService({}, {
+      fetchRepositories: async () => ({
+        items: [{ slug: "repo", name: "Repo" }],
+        complete: true,
+      }),
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
+          return completeRepositoryState({
+            maven: [safeUpstream("maven", "maven", { is_active: true })],
+          });
+        },
+      },
+      showQuickPick: async items => items[0],
+      showWarningMessage: async (_message, _options, action) => action,
+    });
+    const dependency = {
+      name: "com.example:demo",
+      version: "1.2.3",
+      format: "maven",
+      cloudsmithStatus: "ABSENT",
+    };
+
+    const prepared = await service.prepare({
+      workspace: "workspace",
+      repositoryHint: "repo",
+      dependencies: [
+        { ...dependency, qualifiers: { type: "jar", classifier: "javadoc" } },
+        { ...dependency, qualifiers: { type: "jar", classifier: "javadoc", scope: "test" } },
+        { ...dependency, qualifiers: { type: "javadoc" } },
+        { ...dependency, qualifiers: { type: "test-jar" } },
+        { ...dependency, qualifiers: { type: "test-jar", scope: "runtime" } },
+        { ...dependency, qualifiers: { type: "jar", classifier: "tests" } },
+      ],
+    });
+
+    assert.ok(prepared);
+    assert.deepStrictEqual(
+      prepared.plan.pullableDependencies.map(item => (
+        buildRegistryTriggerPlan("workspace", "repo", item).request.url
+      )),
+      [
+        "https://dl.cloudsmith.io/basic/workspace/repo/maven/com/example/demo/1.2.3/demo-1.2.3-javadoc.jar",
+        "https://dl.cloudsmith.io/basic/workspace/repo/maven/com/example/demo/1.2.3/demo-1.2.3-tests.jar",
+      ]
+    );
+  });
+
   test("pulls Python dependencies via same-host redirects using manual auth-preserving requests", async () => {
     const calls = [];
+    let exactChecks = 0;
     const initialIndexUrl = "https://dl.cloudsmith.io/basic/workspace/repo/python/simple/requests/";
     const redirectedIndexUrl = "https://dl.cloudsmith.io/basic/workspace/repo/python/simple/requests/index.html";
     const artifactUrl = "https://dl.cloudsmith.io/basic/workspace/repo/python/packages/requests-2.31.0-py3-none-any.whl";
@@ -908,6 +1890,17 @@ suite("UpstreamPullService", () => {
         async getApiKey() {
           return "api-key";
         },
+      },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        exactChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: exactChecks === 1,
+          present: exactChecks > 1,
+          complete: true,
+          stale: false,
+        };
       },
       fetchImpl: async (url, options) => {
         calls.push({ url, options });
@@ -945,6 +1938,7 @@ suite("UpstreamPullService", () => {
 
     assert.strictEqual(result.canceled, false);
     assert.strictEqual(result.pullResult.cached, 1);
+    assert.strictEqual(exactChecks, 2);
     assert.strictEqual(calls.length, 3);
     assert.deepStrictEqual(
       calls.map((call) => call.url),
@@ -955,6 +1949,362 @@ suite("UpstreamPullService", () => {
       calls.every((call) => call.options.headers.Authorization === authorizationHeader),
       true
     );
+  });
+
+  test("pulls an exact scoped npm prerelease through its packument tarball", async () => {
+    const calls = [];
+    let exactChecks = 0;
+    const packumentUrl = "https://npm.cloudsmith.io/workspace/repo/%40scope%2Fwidget-name/1.2.3-beta.1";
+    const tarballUrl = "https://npm.cloudsmith.io/workspace/repo/@scope/widget-name/-/content-addressed.tgz";
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        exactChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: exactChecks === 1,
+          present: exactChecks > 1,
+          complete: true,
+          stale: false,
+        };
+      },
+      fetchImpl: async (url) => {
+        calls.push(url);
+        if (url === packumentUrl) {
+          return createResponse(200, JSON.stringify({
+            name: "@scope/widget-name",
+            version: "1.2.3-beta.1",
+            dist: { tarball: tarballUrl },
+          }));
+        }
+        if (url === tarballUrl) return createResponse(200, "artifact");
+        throw new Error(`Unexpected URL: ${url}`);
+      },
+    });
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: {
+        pullableDependencies: [{
+          name: "@scope/widget-name",
+          version: "1.2.3-beta.1",
+          format: "npm",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    });
+
+    assert.strictEqual(result.pullResult.cached, 1);
+    assert.strictEqual(exactChecks, 2);
+    assert.deepStrictEqual(calls, [packumentUrl, tarballUrl]);
+  });
+
+  test("maps npm packument 404 and 401/403 without attempting a tarball", async () => {
+    for (const [statusCode, expectedStatus] of [[404, "not_found"], [401, "auth_failed"], [403, "auth_failed"]]) {
+      let registryCalls = 0;
+      const service = new UpstreamPullService({}, {
+        credentialManager: { async getApiKey() { return "api-key"; } },
+        fetchImpl: async () => {
+          registryCalls += 1;
+          return createResponse(statusCode, "");
+        },
+        showErrorMessage: async () => {},
+      });
+
+      const result = await service.execute({
+        workspace: "workspace",
+        repository: { slug: "repo" },
+        plan: {
+          pullableDependencies: [{
+            name: "package-with-hyphens",
+            version: "1.2.3",
+            format: "npm",
+            cloudsmithStatus: "NOT_FOUND",
+          }],
+          skippedDependencies: [],
+        },
+      });
+
+      assert.strictEqual(result.pullResult.details[0].status, expectedStatus, String(statusCode));
+      assert.strictEqual(result.pullResult.cached, 0, String(statusCode));
+      assert.strictEqual(registryCalls, 1, String(statusCode));
+    }
+  });
+
+  test("pulls an exact NuGet package through its advertised v3 package base", async () => {
+    const calls = [];
+    let exactChecks = 0;
+    const indexUrl = "https://nuget.cloudsmith.io/workspace/repo/v3/index.json";
+    const packageBase = "https://nuget.cloudsmith.io/workspace/repo/v3/flat/";
+    const packageUrl = `${packageBase}serilog/3.1.1/serilog.3.1.1.nupkg`;
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        exactChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: exactChecks === 1,
+          present: exactChecks > 1,
+          complete: true,
+          stale: false,
+        };
+      },
+      fetchImpl: async (url) => {
+        calls.push(url);
+        if (url === indexUrl) {
+          return createResponse(200, JSON.stringify({
+            resources: [{
+              "@id": packageBase,
+              "@type": "PackageBaseAddress/3.0.0",
+            }],
+          }));
+        }
+        if (url === packageUrl) return createResponse(200, "package");
+        throw new Error(`Unexpected URL: ${url}`);
+      },
+    });
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: {
+        pullableDependencies: [{
+          name: "Serilog",
+          version: "3.1.1",
+          format: "nuget",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    });
+
+    assert.strictEqual(result.pullResult.cached, 1);
+    assert.strictEqual(exactChecks, 2);
+    assert.deepStrictEqual(calls, [indexUrl, packageUrl]);
+  });
+
+  test("pulls an exact Cargo crate through sparse index and config metadata", async () => {
+    const calls = [];
+    let exactChecks = 0;
+    const checksum = "a".repeat(64);
+    const indexUrl = "https://cargo.cloudsmith.io/workspace/repo/se/rd/serde";
+    const configUrl = "https://cargo.cloudsmith.io/workspace/repo/config.json";
+    const artifactUrl = `https://cargo.cloudsmith.io/workspace/repo/api/v1/crates/serde/1.0.200/${checksum}/download`;
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        exactChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: exactChecks === 1,
+          present: exactChecks > 1,
+          complete: true,
+          stale: false,
+        };
+      },
+      fetchImpl: async (url) => {
+        calls.push(url);
+        if (url === indexUrl) {
+          return createResponse(200, JSON.stringify({
+            name: "serde",
+            vers: "1.0.200",
+            cksum: checksum,
+          }));
+        }
+        if (url === configUrl) {
+          return createResponse(200, JSON.stringify({
+            dl: "https://cargo.cloudsmith.io/workspace/repo/api/v1/crates/{crate}/{version}/{sha256-checksum}/download",
+          }));
+        }
+        if (url === artifactUrl) return createResponse(200, "artifact");
+        throw new Error(`Unexpected URL: ${url}`);
+      },
+    });
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: {
+        pullableDependencies: [{
+          name: "serde",
+          version: "1.0.200",
+          format: "cargo",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    });
+
+    assert.strictEqual(result.pullResult.cached, 1);
+    assert.strictEqual(exactChecks, 2);
+    assert.deepStrictEqual(calls, [indexUrl, configUrl, artifactUrl]);
+  });
+
+  test("pulls only the qualifier-selected Maven artifact", async () => {
+    const calls = [];
+    let exactChecks = 0;
+    const jarUrl = "https://dl.cloudsmith.io/basic/workspace/repo/maven/com/example/demo/1.2.3/demo-1.2.3-tests.jar";
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        exactChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: exactChecks === 1,
+          present: exactChecks > 1,
+          complete: true,
+          stale: false,
+        };
+      },
+      fetchImpl: async (url) => {
+        calls.push(url);
+        if (url === jarUrl) return createResponse(200, "artifact");
+        throw new Error(`Unexpected URL: ${url}`);
+      },
+    });
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: {
+        pullableDependencies: [{
+          name: "com.example:demo",
+          version: "1.2.3",
+          format: "maven",
+          qualifiers: { type: "test-jar", classifier: "tests" },
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    });
+
+    assert.strictEqual(result.pullResult.cached, 1);
+    assert.strictEqual(exactChecks, 2);
+    assert.deepStrictEqual(calls, [jarUrl]);
+  });
+
+  test("pulls a Docker platform manifest and every referenced image blob", async () => {
+    const calls = [];
+    const requestTimeouts = [];
+    let exactChecks = 0;
+    const platformReceipts = [];
+    const manifestDigest = `sha256:${"a".repeat(64)}`;
+    const configDigest = `sha256:${"b".repeat(64)}`;
+    const layerDigest = `sha256:${"c".repeat(64)}`;
+    const baseUrl = "https://docker.cloudsmith.io/v2/workspace/repo/library/redis";
+    const tagUrl = `${baseUrl}/manifests/7.2`;
+    const manifestUrl = `${baseUrl}/manifests/${encodeURIComponent(manifestDigest)}`;
+    const configUrl = `${baseUrl}/blobs/${encodeURIComponent(configDigest)}`;
+    const layerUrl = `${baseUrl}/blobs/${encodeURIComponent(layerDigest)}`;
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      checkPackageAbsence: async ({ workspace, repository, dockerPlatformVerified }) => {
+        exactChecks += 1;
+        platformReceipts.push(dockerPlatformVerified === true);
+        return {
+          workspace,
+          repository,
+          absent: exactChecks === 1,
+          present: exactChecks > 1,
+          complete: true,
+          stale: false,
+        };
+      },
+      fetchImpl: async (url) => {
+        calls.push(url);
+        if (url === tagUrl) {
+          return createResponse(200, JSON.stringify({
+            schemaVersion: 2,
+            manifests: [{
+              digest: manifestDigest,
+              platform: { os: "linux", architecture: "amd64" },
+            }],
+          }));
+        }
+        if (url === manifestUrl) {
+          return createResponse(200, JSON.stringify({
+            schemaVersion: 2,
+            config: { digest: configDigest },
+            layers: [{ digest: layerDigest }],
+          }));
+        }
+        if (url === configUrl || url === layerUrl) return createResponse(200, "blob");
+        throw new Error(`Unexpected URL: ${url}`);
+      },
+      setTimeout(_callback, delay) {
+        requestTimeouts.push(delay);
+        return {};
+      },
+      clearTimeout() {},
+    });
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: {
+        pullableDependencies: [{
+          name: "redis",
+          version: "7.2",
+          format: "docker",
+          qualifiers: { tag: "7.2", platform: "linux/amd64" },
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    });
+
+    assert.strictEqual(result.pullResult.cached, 1);
+    assert.strictEqual(exactChecks, 2);
+    assert.deepStrictEqual(platformReceipts, [false, true]);
+    assert.deepStrictEqual([...result.verificationReceipts.values()], [{
+      dockerPlatformVerified: true,
+    }]);
+    assert.deepStrictEqual(calls, [tagUrl, manifestUrl, configUrl, layerUrl]);
+    assert.deepStrictEqual(requestTimeouts, [30000, 30000, 120000, 120000]);
+  });
+
+  test("Docker blob redirects strip credentials before following safe storage URLs", async () => {
+    const calls = [];
+    const blobUrl = "https://docker.cloudsmith.io/v2/workspace/repo/library/demo/blobs/sha256%3Aabc";
+    const storageUrl = "https://distribution.cloudfront.net/object?signature=value";
+    const service = new UpstreamPullService({}, {
+      fetchImpl: async (url, options) => {
+        calls.push({ url, options });
+        return url === blobUrl
+          ? createResponse(307, "", { location: storageUrl })
+          : createResponse(200, "blob");
+      },
+    });
+
+    const result = await service._requestRegistry({
+      method: "GET",
+      url: blobUrl,
+      redirectPolicy: "docker-blob",
+      headers: {},
+    }, "api-key", null, { captureBody: false });
+
+    assert.strictEqual(result.statusCode, 200);
+    assert.strictEqual(calls.length, 2);
+    assert.match(calls[0].options.headers.Authorization, /^Basic /);
+    assert.strictEqual(calls[1].url, storageUrl);
+    assert.strictEqual(calls[1].options.headers.Authorization, undefined);
+
+    const ordinaryService = new UpstreamPullService({}, {
+      fetchImpl: async () => createResponse(307, "", { location: storageUrl }),
+    });
+    const rejected = await ordinaryService._requestRegistry({
+      method: "GET",
+      url: blobUrl,
+      headers: {},
+    }, "api-key", null, { captureBody: false });
+    assert.strictEqual(rejected.statusCode, 0);
+    assert.match(rejected.errorMessage, /redirect target was rejected/i);
   });
 
   test("rejects redirects to untrusted hosts before forwarding credentials", async () => {
@@ -1042,6 +2392,183 @@ suite("UpstreamPullService", () => {
     assert.strictEqual(bodyReads, 2);
     assert.strictEqual(bodyCanceled, false);
     assert.strictEqual(textRead, false);
+  });
+
+  test("Dart registry metadata and archives use hosted Pub bearer authentication", async () => {
+    const calls = [];
+    let exactChecks = 0;
+    const metadataUrl = "https://dart.cloudsmith.io/workspace/repo/api/packages/collection";
+    const archiveUrl = "https://dart.cloudsmith.io/workspace/repo/packages/collection-1.19.0.tar.gz";
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        exactChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: exactChecks === 1,
+          present: exactChecks > 1,
+          complete: true,
+          stale: false,
+        };
+      },
+      fetchImpl: async (url, options) => {
+        calls.push({ url, authorization: options.headers.Authorization });
+        if (url === metadataUrl) {
+          return createResponse(200, JSON.stringify({
+            name: "collection",
+            versions: [{ version: "1.19.0", archive_url: archiveUrl }],
+          }));
+        }
+        if (url === archiveUrl) return createResponse(200, "archive");
+        throw new Error(`Unexpected URL: ${url}`);
+      },
+    });
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: {
+        pullableDependencies: [{
+          name: "collection",
+          version: "1.19.0",
+          format: "dart",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    });
+
+    assert.strictEqual(result.pullResult.cached, 1);
+    assert.deepStrictEqual(calls, [
+      { url: metadataUrl, authorization: "Bearer api-key" },
+      { url: archiveUrl, authorization: "Bearer api-key" },
+    ]);
+  });
+
+  test("Go and platform-qualified Ruby pulls dispatch their exact native artifacts", async () => {
+    const cases = [
+      {
+        dependency: {
+          name: "github.com/MyOrg/MyModule",
+          version: "v1.2.3-RC1",
+          format: "go",
+          cloudsmithStatus: "NOT_FOUND",
+        },
+        expectedUrl: "https://golang.cloudsmith.io/workspace/repo/github.com/!my!org/!my!module/@v/v1.2.3-!r!c1.zip",
+      },
+      {
+        dependency: {
+          name: "nokogiri",
+          version: "1.16.5",
+          format: "ruby",
+          qualifiers: { platform: "x86_64-linux" },
+          cloudsmithStatus: "NOT_FOUND",
+        },
+        expectedUrl: "https://dl.cloudsmith.io/basic/workspace/repo/ruby/gems/nokogiri-1.16.5-x86_64-linux.gem",
+      },
+    ];
+
+    for (const testCase of cases) {
+      const calls = [];
+      let exactChecks = 0;
+      const service = new UpstreamPullService({}, {
+        credentialManager: { async getApiKey() { return "api-key"; } },
+        checkPackageAbsence: async ({ workspace, repository }) => {
+          exactChecks += 1;
+          return {
+            workspace,
+            repository,
+            absent: exactChecks === 1,
+            present: exactChecks > 1,
+            complete: true,
+            stale: false,
+          };
+        },
+        fetchImpl: async (url, options) => {
+          calls.push({ url, authorization: options.headers.Authorization });
+          return createResponse(200, "artifact");
+        },
+      });
+      const result = await service.execute({
+        workspace: "workspace",
+        repository: { slug: "repo" },
+        plan: { pullableDependencies: [testCase.dependency], skippedDependencies: [] },
+      });
+
+      assert.strictEqual(result.pullResult.cached, 1);
+      assert.deepStrictEqual(calls, [{
+        url: testCase.expectedUrl,
+        authorization: `Basic ${Buffer.from("token:api-key").toString("base64")}`,
+      }]);
+    }
+  });
+
+  test("an external AbortSignal cancels in-flight registry metadata before artifact dispatch", async () => {
+    const controller = new AbortController();
+    let fetchCalls = 0;
+    let requestSignal = null;
+    let fetchStarted;
+    const started = new Promise(resolve => { fetchStarted = resolve; });
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      checkPackageAbsence: async ({ workspace, repository }) => ({
+        workspace,
+        repository,
+        absent: true,
+        present: false,
+        complete: true,
+        stale: false,
+      }),
+      fetchImpl: async (_url, options) => {
+        fetchCalls += 1;
+        requestSignal = options.signal;
+        fetchStarted();
+        return new Promise(() => {});
+      },
+    });
+
+    const pending = service.execute({
+      workspace: "workspace",
+      repository: { slug: "repo" },
+      plan: {
+        pullableDependencies: [{
+          name: "left-pad",
+          version: "1.3.0",
+          format: "npm",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    }, { signal: controller.signal });
+    await started;
+    controller.abort();
+    const result = await pending;
+
+    assert.strictEqual(result.canceled, true);
+    assert.strictEqual(fetchCalls, 1);
+    assert.strictEqual(requestSignal.aborted, true);
+  });
+
+  test("registry request timeouts are bounded and allow longer Docker blob transfers", async () => {
+    let scheduledDelay = null;
+    const service = new UpstreamPullService({}, {
+      fetchImpl: async () => createResponse(200, "blob"),
+      setTimeout(_callback, delay) {
+        scheduledDelay = delay;
+        return {};
+      },
+      clearTimeout() {},
+    });
+
+    const result = await service._requestRegistry({
+      method: "GET",
+      url: "https://docker.cloudsmith.io/v2/workspace/repo/library/example/blobs/sha256%3Aabc",
+      headers: {},
+    }, "api-key", null, { captureBody: false, timeoutMs: 10 * 60 * 1000 });
+
+    assert.strictEqual(result.statusCode, 200);
+    assert.strictEqual(scheduledDelay, 120000);
   });
 
   test("registry metadata bodies are bounded before retention", async () => {
@@ -1180,14 +2707,18 @@ suite("UpstreamPullService", () => {
     assert.strictEqual(readerCancelCalled, true);
   });
 
-  test("registry redirects cannot move credentials between allowed Cloudsmith hosts", async () => {
-    let calls = 0;
+  test("registry redirects preserve credentials only across trusted hosts in the same repository", async () => {
+    const calls = [];
+    const authorizationHeader = `Basic ${Buffer.from("token:api-key").toString("base64")}`;
     const service = new UpstreamPullService({}, {
-      fetchImpl: async () => {
-        calls += 1;
-        return createResponse(302, "", {
-          location: "https://npm.cloudsmith.io/workspace/repo/package.tgz",
-        });
+      fetchImpl: async (url, options) => {
+        calls.push({ url, options });
+        if (calls.length === 1) {
+          return createResponse(302, "", {
+            location: "https://npm.cloudsmith.io/workspace/repo/package.tgz?redirect=registry",
+          });
+        }
+        return createResponse(200, "metadata");
       },
     });
 
@@ -1197,9 +2728,33 @@ suite("UpstreamPullService", () => {
       headers: {},
     }, "api-key", null, { captureBody: true });
 
-    assert.strictEqual(result.statusCode, 0);
-    assert.match(result.errorMessage, /redirect target was rejected/i);
-    assert.strictEqual(calls, 1);
+    assert.strictEqual(result.statusCode, 200);
+    assert.strictEqual(result.body, "metadata");
+    assert.strictEqual(calls.length, 2);
+    assert.strictEqual(calls[1].options.headers.Authorization, authorizationHeader);
+    assert.strictEqual(
+      calls[1].url,
+      "https://npm.cloudsmith.io/workspace/repo/package.tgz?redirect=registry"
+    );
+
+    let crossRepositoryCalls = 0;
+    const crossRepositoryService = new UpstreamPullService({}, {
+      fetchImpl: async () => {
+        crossRepositoryCalls += 1;
+        return createResponse(302, "", {
+          location: "https://npm.cloudsmith.io/workspace/other-repo/package.tgz",
+        });
+      },
+    });
+    const rejected = await crossRepositoryService._requestRegistry({
+      method: "GET",
+      url: "https://dl.cloudsmith.io/basic/workspace/repo/python/simple/artifact/",
+      headers: {},
+    }, "api-key", null, { captureBody: true });
+
+    assert.strictEqual(rejected.statusCode, 0);
+    assert.match(rejected.errorMessage, /redirect target was rejected/i);
+    assert.strictEqual(crossRepositoryCalls, 1);
   });
 
   test("stops after three authentication failures before expanding concurrency", async () => {

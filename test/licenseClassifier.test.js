@@ -224,16 +224,16 @@ suite("LicenseClassifier Test Suite", () => {
       const inspection = LicenseClassifier.inspect("(MIT OR GPL-3.0)");
       assert.deepStrictEqual(inspection.identifiers, ["MIT", "GPL-3.0"]);
       assert.strictEqual(inspection.tier, "restrictive");
-      assert.strictEqual(inspection.searchQuery, "(license:MIT OR license:GPL\\-3.0)");
+      assert.strictEqual(inspection.searchQuery, "(license:MIT OR license:GPL-3.0)");
       assert.strictEqual(LicenseClassifier.buildLicenseQuery("(MIT OR GPL-3.0)"), inspection.searchQuery);
     });
 
     test("buildRestrictiveQuery uses the shared restrictive catalog", () => {
       const query = LicenseClassifier.buildRestrictiveQuery();
-      assert.ok(query.includes("license:AGPL\\-3.0"));
-      assert.ok(query.includes("license:GPL\\-3.0"));
-      assert.ok(query.includes("license:SSPL\\-1.0"));
-      assert.ok(query.includes("license:EUPL\\-1.2"));
+      assert.ok(query.includes("license:AGPL-3.0"));
+      assert.ok(query.includes("license:GPL-3.0"));
+      assert.ok(query.includes("license:SSPL-1.0"));
+      assert.ok(query.includes("license:EUPL-1.2"));
     });
 
     test("search quick-pick items reuse a precomputed searchQuery when present", () => {
@@ -355,13 +355,13 @@ suite("LicenseClassifier Test Suite", () => {
       assert.strictEqual(inspection.canonicalValue, "Apache-2.0");
       assert.strictEqual(inspection.canonicalSourceField, "spdx_license");
       assert.strictEqual(inspection.tier, "permissive");
-      assert.strictEqual(inspection.searchQuery, "license:Apache\\-2.0");
+      assert.strictEqual(inspection.searchQuery, "license:Apache-2.0");
       assert.strictEqual(inspection.licenseUrl, "https://spdx.org/licenses/Apache-2.0.html");
       assert.strictEqual(LicenseClassifier.buildLicenseQuery({
         spdx_license: "Apache-2.0",
         license: null,
         raw_license: null,
-      }), "license:Apache\\-2.0");
+      }), "license:Apache-2.0");
       assert.strictEqual(LicenseClassifier.resolveLicenseUrl({
         spdx_license: "Apache-2.0",
         license: null,
@@ -384,7 +384,7 @@ suite("LicenseClassifier Test Suite", () => {
       assert.strictEqual(inspection.canonicalSourceField, "spdx_license");
       assert.strictEqual(inspection.spdxIdentifier, "Apache-2.0");
       assert.strictEqual(inspection.tier, "permissive");
-      assert.strictEqual(inspection.searchQuery, "license:Apache\\-2.0");
+      assert.strictEqual(inspection.searchQuery, "license:Apache-2.0");
       assert.strictEqual(inspection.licenseUrl, "https://spdx.org/licenses/Apache-2.0.html");
     });
 
@@ -423,7 +423,40 @@ suite("LicenseClassifier Test Suite", () => {
       const restrictiveItems = LicenseClassifier.getSearchableLicensesByTier().restrictive;
       assert.ok(restrictiveItems.some((item) => item.license === "MIT" && item.overrideApplied));
       assert.ok(restrictiveItems.some((item) => item.license === "LicenseRef-Cloudsmith-Custom" && item.overrideApplied));
-      assert.ok(LicenseClassifier.buildRestrictiveQuery().includes("license:LicenseRef\\-Cloudsmith\\-Custom"));
+      assert.ok(LicenseClassifier.buildRestrictiveQuery().includes("license:LicenseRef-Cloudsmith-Custom"));
+    });
+
+    test("restrictive query overrides are bounded and reject control or bidi identifiers", () => {
+      vscode.workspace.getConfiguration = () => ({
+        get(key) {
+          if (key !== "restrictiveLicenses") return undefined;
+          return [
+            "LicenseRef-Safe-Custom",
+            "LicenseRef-Hostile\nOR status:quarantined",
+            "LicenseRef-Bidi\u202e",
+            "+LicenseRef$Hostile",
+            ...Array.from({ length: 100 }, (_, index) => `LicenseRef-Long-${index}-${"x".repeat(240)}`),
+          ];
+        },
+      });
+
+      const query = LicenseClassifier.buildRestrictiveQuery();
+
+      assert.match(query, /LicenseRef-Safe-Custom/);
+      assert.match(query, /\\\+LicenseRef\\\$Hostile/);
+      assert.doesNotMatch(query, /status:quarantined|Bidi|\u202e|\n/);
+      assert.ok(query.length <= 2048);
+    });
+
+    test("license query literals preserve SPDX punctuation and escape query operators", () => {
+      assert.strictEqual(
+        LicenseClassifier.buildQueryFromIdentifiers([
+          "AGPL-3.0",
+          "LicenseRef/vendor+custom",
+          "+leading$<>'",
+        ]),
+        "(license:AGPL-3.0 OR license:LicenseRef/vendor+custom OR license:\\+leading\\$\\<\\>\\')"
+      );
     });
   });
 });

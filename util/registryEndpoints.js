@@ -1,10 +1,14 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const {
   canonicalFormat,
+  normalizeNuGetVersion,
   sanitizePackageNameInput,
 } = require("./packageNameNormalizer");
 
 const MAX_REGISTRY_VALUE_LENGTH = 4096;
+const MAX_REGISTRY_URL_LENGTH = 16384;
+const MAX_REGISTRY_DECODE_DEPTH = 8;
+const REGISTRY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
 const TRUSTED_REGISTRY_HOSTS = new Set([
   "cargo.cloudsmith.io",
   "composer.cloudsmith.io",
@@ -32,6 +36,15 @@ const DOCKER_MANIFEST_ACCEPT =
   + "application/vnd.oci.image.manifest.v1+json, "
   + "application/vnd.oci.image.index.v1+json";
 
+const NPM_PACKUMENT_ACCEPT = "application/vnd.npm.install-v1+json, application/json";
+const DART_PACKAGE_ACCEPT = "application/vnd.pub.v2+json";
+const MAX_DOCKER_MANIFEST_DESCRIPTORS = 256;
+const DOCKER_DIGEST_PATTERN = /^([a-z0-9_+.-]+):([a-f0-9]{32,512})$/i;
+const DOCKER_BLOB_REDIRECT_HOST_SUFFIXES = Object.freeze([
+  ".amazonaws.com",
+  ".cloudfront.net",
+]);
+
 function formatForEcosystem(ecosystemOrFormat) {
   const normalized = canonicalFormat(ecosystemOrFormat);
   return normalized || null;
@@ -54,25 +67,20 @@ function encodePathSegment(value) {
     !normalized
     || normalized !== raw
     || normalized.length > MAX_REGISTRY_VALUE_LENGTH
-    || /[\u0000-\u001f\u007f\\/?#]/.test(normalized)
+    || REGISTRY_CONTROL_OR_BIDI.test(normalized)
+    || /[\\/?#]/.test(normalized)
   ) {
     return "";
   }
 
-  let decoded = normalized;
-  for (let depth = 0; depth < 3; depth += 1) {
-    let next;
-    try {
-      next = decodeURIComponent(decoded);
-    } catch {
-      return "";
-    }
-    if (next === decoded) {
-      break;
-    }
-    decoded = next;
-  }
-  if (decoded === "." || decoded === ".." || /[\u0000-\u001f\u007f\\/?#]/.test(decoded)) {
+  const decoded = repeatedlyDecode(normalized);
+  if (
+    decoded == null
+    || decoded === "."
+    || decoded === ".."
+    || REGISTRY_CONTROL_OR_BIDI.test(decoded)
+    || /[\\/?#]/.test(decoded)
+  ) {
     return "";
   }
 
@@ -81,7 +89,7 @@ function encodePathSegment(value) {
 
 function encodePath(value) {
   const raw = String(value == null ? "" : value);
-  if (!raw || raw !== raw.trim() || /[\\?#\u0000-\u001f\u007f]/.test(raw)) {
+  if (!raw || raw !== raw.trim() || REGISTRY_CONTROL_OR_BIDI.test(raw) || /[\\?#]/.test(raw)) {
     return "";
   }
   const segments = raw.split("/");
@@ -116,25 +124,38 @@ function encodeGoModulePath(modulePath) {
   )).join("/");
 }
 
+function encodeGoVersion(version) {
+  const raw = String(version || "");
+  if (!raw || raw !== raw.trim()) {
+    return "";
+  }
+  return encodePathSegment([...raw]
+    .map((character) => {
+      if (character === "!") return "!!";
+      if (character >= "A" && character <= "Z") return `!${character.toLowerCase()}`;
+      return character;
+    })
+    .join(""));
+}
+
 function cargoIndexPath(crateName) {
   const normalized = String(crateName || "").trim().toLowerCase();
-  if (!normalized) {
+  const encodedName = encodePathSegment(normalized);
+  if (!encodedName) {
     return null;
   }
+  const prefix = cargoPrefix(normalized);
+  return prefix ? `${prefix}/${encodedName}` : null;
+}
 
-  if (normalized.length <= 2) {
-    return encodePathSegment(normalized);
-  }
-
-  if (normalized.length === 3) {
-    return `1/${encodePathSegment(normalized)}`;
-  }
-
-  return [
-    encodePathSegment(normalized.slice(0, 2)),
-    encodePathSegment(normalized.slice(2, 4)),
-    encodePathSegment(normalized),
-  ].join("/");
+function cargoPrefix(crateName, lowercase = false) {
+  const raw = String(crateName || "").trim();
+  const name = lowercase ? raw.toLowerCase() : raw;
+  if (!encodePathSegment(name)) return null;
+  if (name.length === 1) return "1";
+  if (name.length === 2) return "2";
+  if (name.length === 3) return `3/${encodePathSegment(name.slice(0, 1))}`;
+  return `${encodePathSegment(name.slice(0, 2))}/${encodePathSegment(name.slice(2, 4))}`;
 }
 
 function buildNpmPackagePath(name) {
@@ -150,8 +171,8 @@ function buildNpmPackagePath(name) {
 
     const encodedName = encodePathSegment(rawName);
     return {
-      segments: [encodedName],
-      tarballBaseName: encodedName,
+      packumentPath: encodedName,
+      packageName: rawName,
     };
   }
 
@@ -168,9 +189,138 @@ function buildNpmPackagePath(name) {
   const packageName = rawName.slice(separatorIndex + 1);
 
   return {
-    segments: [encodePathSegment(scope), encodePathSegment(packageName)],
-    tarballBaseName: encodePathSegment(packageName),
+    // npm's registry route treats the complete scoped name as one encoded
+    // package identifier. The slash is identity here, not a path boundary.
+    packumentPath: encodeURIComponent(`${scope}/${packageName}`),
+    packageName: `${scope}/${packageName}`,
   };
+}
+
+function normalizeDockerImageName(name) {
+  const raw = sanitizePackageNameInput(name).replace(/^\/+|\/+$/g, "").toLowerCase();
+  if (!raw) {
+    return "";
+  }
+
+  const segments = raw.split("/");
+  if (segments.some(segment => !encodePathSegment(segment))) {
+    return "";
+  }
+
+  if (["docker.io", "index.docker.io", "registry-1.docker.io"].includes(segments[0])) {
+    segments.shift();
+  }
+  if (segments.length === 1) {
+    segments.unshift("library");
+  }
+
+  return segments.join("/");
+}
+
+function dockerCandidateMatchesPlatform(candidate, platform) {
+  const requested = parseDockerPlatform(platform);
+  if (!requested) return !String(platform || "").trim();
+  const identifiers = candidate?.identifiers && typeof candidate.identifiers === "object"
+    ? candidate.identifiers
+    : {};
+  const observedPlatforms = collectCandidateArchitectureValues(candidate)
+    .map(parseDockerPlatform)
+    .filter(Boolean);
+  const architecture = normalizeDockerArchitecture(
+    candidate?.architecture || identifiers.architecture
+  );
+  const os = String(
+    candidate?.os || candidate?.platform_os || identifiers.docker_platform_os || ""
+  ).trim().toLowerCase();
+  const variant = String(
+    candidate?.variant || identifiers.docker_platform_variant || ""
+  ).trim().toLowerCase();
+  if (architecture && os) {
+    observedPlatforms.push({ os, architecture, variant });
+  }
+  return observedPlatforms.some(observed => (
+    observed.os === requested.os
+    && observed.architecture === requested.architecture
+    && dockerVariantMatches(requested, observed)
+  ));
+}
+
+function parseDockerPlatform(value) {
+  const parts = String(value || "").trim().toLowerCase().split("/");
+  if (parts.length < 2 || parts.length > 3 || parts.some(part => !part)) return null;
+  return {
+    os: parts[0],
+    architecture: normalizeDockerArchitecture(parts[1]),
+    variant: parts[2] || "",
+  };
+}
+
+function normalizeDockerArchitecture(value) {
+  const architecture = String(value || "").trim().toLowerCase();
+  if (architecture === "x86_64" || architecture === "x86-64") return "amd64";
+  if (architecture === "aarch64") return "arm64";
+  return architecture;
+}
+
+function dockerVariantMatches(requested, observed) {
+  if (!requested.variant) return true;
+  if (observed.variant) return observed.variant === requested.variant;
+  return requested.architecture === "arm64" && requested.variant === "v8";
+}
+
+function dockerDigestMatches(observedValue, requestedValue) {
+  const observed = String(observedValue || "").trim().toLowerCase();
+  const requested = String(requestedValue || "").trim().toLowerCase();
+  if (!observed || !requested) return false;
+  const split = value => {
+    const match = value.match(DOCKER_DIGEST_PATTERN);
+    if (match && isDockerDigest(value)) return { algorithm: match[1], digest: match[2] };
+    if (!/^[a-f0-9]{32,512}$/.test(value)) return null;
+    return {
+      algorithm: value.length === 64 ? "sha256" : value.length === 128 ? "sha512" : "",
+      digest: value,
+    };
+  };
+  const observedDigest = split(observed);
+  const requestedDigest = split(requested);
+  if (!observedDigest || !requestedDigest) return false;
+  if (
+    observedDigest.algorithm !== requestedDigest.algorithm
+    && (observedDigest.algorithm || requestedDigest.algorithm)
+  ) {
+    return false;
+  }
+  return observedDigest.digest === requestedDigest.digest;
+}
+
+function rubyCandidateMatchesPlatform(candidate, platform) {
+  const requested = String(platform || "ruby").trim().toLowerCase() || "ruby";
+  const observed = collectCandidateArchitectureValues(candidate)
+    .map(value => String(value || "").trim().toLowerCase())
+    .filter(Boolean);
+  return requested === "ruby"
+    ? observed.length === 0 || observed.includes("ruby")
+    : observed.includes(requested);
+}
+
+function collectCandidateArchitectureValues(candidate) {
+  const identifiers = candidate?.identifiers && typeof candidate.identifiers === "object"
+    ? candidate.identifiers
+    : {};
+  const values = [
+    candidate?.platform,
+    candidate?.architecture,
+    identifiers.platform,
+    identifiers.architecture,
+  ];
+  if (Array.isArray(candidate?.architectures)) {
+    for (const architecture of candidate.architectures) {
+      values.push(architecture && typeof architecture === "object"
+        ? architecture.name || architecture.slug || architecture.identifier
+        : architecture);
+    }
+  }
+  return values.filter(value => typeof value === "string" && value.trim());
 }
 
 function buildMavenCoordinates(dependency) {
@@ -193,7 +343,20 @@ function buildMavenCoordinates(dependency) {
   const groupSegments = groupId.split(".").map(segment => encodePathSegment(segment));
   const encodedArtifactId = encodePathSegment(artifactId);
   const encodedVersion = encodePathSegment(version);
-  if (!groupSegments.every(Boolean) || !encodedArtifactId || !encodedVersion) {
+  const qualifiers = dependency?.qualifiers || {};
+  const type = String(qualifiers.type || "jar").trim().toLowerCase();
+  const classifierValue = qualifiers.classifier || mavenDefaultClassifier(type);
+  const classifier = classifierValue
+    ? encodePathSegment(classifierValue)
+    : "";
+  const extension = mavenArtifactExtension(type);
+  if (
+    !groupSegments.every(Boolean)
+    || !encodedArtifactId
+    || !encodedVersion
+    || (classifierValue && !classifier)
+    || !extension
+  ) {
     return null;
   }
 
@@ -201,7 +364,48 @@ function buildMavenCoordinates(dependency) {
     groupPath: groupSegments.join("/"),
     artifactId: encodedArtifactId,
     version: encodedVersion,
+    classifier,
+    extension,
   };
+}
+
+function mavenDefaultClassifier(type) {
+  switch (type) {
+    case "test-jar": return "tests";
+    case "java-source": return "sources";
+    case "javadoc": return "javadoc";
+    case "ejb-client": return "client";
+    default: return "";
+  }
+}
+
+function mavenArtifactFileName(dependency, versionOverride = null) {
+  const coordinates = buildMavenCoordinates(versionOverride == null ? dependency : {
+    ...dependency,
+    version: versionOverride,
+  });
+  if (!coordinates) {
+    return "";
+  }
+  try {
+    return decodeURIComponent(
+      `${coordinates.artifactId}-${coordinates.version}`
+      + `${coordinates.classifier ? `-${coordinates.classifier}` : ""}`
+      + `.${coordinates.extension}`
+    );
+  } catch {
+    return "";
+  }
+}
+
+function mavenArtifactExtension(type) {
+  if (!type || /[\u0000-\u001f\u007f\\/?#]/.test(type)) {
+    return "";
+  }
+  if (["bundle", "ejb", "ejb-client", "java-source", "javadoc", "maven-plugin", "test-jar"].includes(type)) {
+    return "jar";
+  }
+  return encodePathSegment(type);
 }
 
 function buildComposerCoordinates(name) {
@@ -225,16 +429,32 @@ function buildComposerCoordinates(name) {
   };
 }
 
-function buildSwiftCoordinates(name) {
+function buildSwiftCoordinates(name, qualifiers = {}) {
   const rawName = sanitizePackageNameInput(name);
-  const parts = rawName.split("/");
-  if (parts.length < 2 || parts.some(part => !encodePathSegment(part))) {
+  const rawScope = sanitizePackageNameInput(qualifiers && qualifiers.scope);
+  let scope = rawScope;
+  let packageName = rawName;
+  if (scope && (packageName.toLowerCase().startsWith(`${scope.toLowerCase()}.`)
+    || packageName.toLowerCase().startsWith(`${scope.toLowerCase()}/`))) {
+    packageName = packageName.slice(scope.length + 1);
+  } else if (!scope) {
+    const slashIndex = packageName.indexOf("/");
+    const dotIndex = packageName.indexOf(".");
+    const separatorIndex = slashIndex > 0 ? slashIndex : dotIndex;
+    if (separatorIndex > 0) {
+      scope = packageName.slice(0, separatorIndex);
+      packageName = packageName.slice(separatorIndex + 1);
+    }
+  }
+  const encodedScope = scope ? encodePathSegment(scope.toLowerCase()) : "";
+  const encodedName = encodePathSegment(packageName.toLowerCase());
+  if (!encodedScope || !encodedName) {
     return null;
   }
 
   return {
-    scope: parts.slice(0, -1).map((part) => encodePathSegment(part)).join("/"),
-    name: encodePathSegment(parts[parts.length - 1]),
+    scope: encodedScope,
+    name: encodedName,
   };
 }
 
@@ -262,7 +482,7 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
         strategy: "direct",
         request: {
           method: "GET",
-          url: `https://dl.cloudsmith.io/basic/${safeWorkspace}/${safeRepo}/maven/${coordinates.groupPath}/${coordinates.artifactId}/${coordinates.version}/${coordinates.artifactId}-${coordinates.version}.pom`,
+          url: `https://dl.cloudsmith.io/basic/${safeWorkspace}/${safeRepo}/maven/${coordinates.groupPath}/${coordinates.artifactId}/${coordinates.version}/${coordinates.artifactId}-${coordinates.version}${coordinates.classifier ? `-${coordinates.classifier}` : ""}.${coordinates.extension}`,
           headers: {},
         },
       };
@@ -274,11 +494,15 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
       }
       return {
         format,
-        strategy: "direct",
+        strategy: "npm-packument",
+        packageName: packagePath.packageName,
+        trustScope: createRegistryTrustScope(workspace, repo),
         request: {
           method: "GET",
-          url: `https://npm.cloudsmith.io/${safeWorkspace}/${safeRepo}/${packagePath.segments.join("/")}/-/${packagePath.tarballBaseName}-${version}.tgz`,
-          headers: {},
+          url: `https://npm.cloudsmith.io/${safeWorkspace}/${safeRepo}/${packagePath.packumentPath}/${version}`,
+          headers: {
+            Accept: NPM_PACKUMENT_ACCEPT,
+          },
         },
       };
     }
@@ -290,6 +514,8 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
       return {
         format,
         strategy: "python-simple-index",
+        packageName: normalizedName,
+        trustScope: createRegistryTrustScope(workspace, repo),
         request: {
           method: "GET",
           url: `https://dl.cloudsmith.io/basic/${safeWorkspace}/${safeRepo}/python/simple/${encodePathSegment(normalizedName)}/`,
@@ -299,7 +525,8 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
     }
     case "go": {
       const modulePath = encodeGoModulePath(String(dependency && dependency.name || "").trim());
-      if (!modulePath || !version) {
+      const goVersion = encodeGoVersion(dependency && dependency.version);
+      if (!modulePath || !goVersion) {
         return null;
       }
       return {
@@ -307,7 +534,7 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
         strategy: "direct",
         request: {
           method: "GET",
-          url: `https://golang.cloudsmith.io/${safeWorkspace}/${safeRepo}/${modulePath}/@v/${version}.info`,
+          url: `https://golang.cloudsmith.io/${safeWorkspace}/${safeRepo}/${modulePath}/@v/${goVersion}.zip`,
           headers: {},
         },
       };
@@ -319,16 +546,31 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
       }
       return {
         format,
-        strategy: "direct",
+        strategy: "cargo-sparse-index",
+        crateName: String(dependency && dependency.name || "").trim().toLowerCase(),
+        trustScope: createRegistryTrustScope(workspace, repo),
         request: {
           method: "GET",
           url: `https://cargo.cloudsmith.io/${safeWorkspace}/${safeRepo}/${indexPath}`,
-          headers: {},
+          headers: {
+            Accept: "text/plain, application/octet-stream",
+          },
+        },
+        configRequest: {
+          method: "GET",
+          url: `https://cargo.cloudsmith.io/${safeWorkspace}/${safeRepo}/config.json`,
+          headers: {
+            Accept: "application/json",
+          },
         },
       };
     }
     case "ruby": {
       const name = encodePathSegment(dependency && dependency.name);
+      const platformValue = dependency?.qualifiers?.platform || dependency?.platform;
+      const platform = platformValue && String(platformValue).toLowerCase() !== "ruby"
+        ? encodePathSegment(platformValue)
+        : "";
       if (!name || !version) {
         return null;
       }
@@ -337,37 +579,52 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
         strategy: "direct",
         request: {
           method: "GET",
-          url: `https://dl.cloudsmith.io/basic/${safeWorkspace}/${safeRepo}/ruby/gems/${name}-${version}.gem`,
+          url: `https://dl.cloudsmith.io/basic/${safeWorkspace}/${safeRepo}/ruby/gems/${name}-${version}${platform ? `-${platform}` : ""}.gem`,
           headers: {},
         },
       };
     }
     case "nuget": {
-      const name = encodePathSegment(dependency && dependency.name);
-      if (!name || !version) {
+      const normalizedName = sanitizePackageNameInput(dependency && dependency.name).toLowerCase();
+      const normalizedVersion = normalizeNuGetVersion(dependency && dependency.version);
+      const name = encodePathSegment(normalizedName);
+      const packageVersion = encodePathSegment(normalizedVersion);
+      if (!name || !packageVersion) {
         return null;
       }
       return {
         format,
-        strategy: "direct",
+        strategy: "nuget-service-index",
+        packageName: name,
+        packageVersion,
+        trustScope: createRegistryTrustScope(workspace, repo),
         request: {
           method: "GET",
-          url: `https://nuget.cloudsmith.io/${safeWorkspace}/${safeRepo}/v3/package/${name}/${version}/${name}.${version}.nupkg`,
-          headers: {},
+          url: `https://nuget.cloudsmith.io/${safeWorkspace}/${safeRepo}/v3/index.json`,
+          headers: { Accept: "application/json" },
         },
       };
     }
     case "docker": {
-      const image = encodePath(dependency && dependency.name);
-      if (!image || !version) {
+      const image = encodePath(normalizeDockerImageName(dependency && dependency.name));
+      const qualifiers = dependency?.qualifiers || dependency?.identifiers || {};
+      const requestedDigest = String(qualifiers.digest || dependency?.digest || "").trim();
+      if (requestedDigest && !isDockerDigest(requestedDigest)) {
+        return null;
+      }
+      const reference = encodePathSegment(
+        requestedDigest || qualifiers.tag || dependency?.version
+      );
+      if (!image || !reference) {
         return null;
       }
       return {
         format,
-        strategy: "direct",
+        strategy: "docker-manifest",
+        imageBaseUrl: `https://docker.cloudsmith.io/v2/${safeWorkspace}/${safeRepo}/${image}`,
         request: {
           method: "GET",
-          url: `https://docker.cloudsmith.io/v2/${safeWorkspace}/${safeRepo}/${image}/manifests/${version}`,
+          url: `https://docker.cloudsmith.io/v2/${safeWorkspace}/${safeRepo}/${image}/manifests/${reference}`,
           headers: {
             Accept: DOCKER_MANIFEST_ACCEPT,
           },
@@ -397,10 +654,15 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
       return {
         format,
         strategy: "dart-api",
+        packageName: String(dependency && dependency.name || "").trim(),
+        trustScope: createRegistryTrustScope(workspace, repo),
         request: {
           method: "GET",
           url: `https://dart.cloudsmith.io/${safeWorkspace}/${safeRepo}/api/packages/${name}`,
-          headers: {},
+          authScheme: "bearer",
+          headers: {
+            Accept: DART_PACKAGE_ACCEPT,
+          },
         },
       };
     }
@@ -413,6 +675,7 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
         format,
         strategy: "composer-p2",
         packageName: coordinates.packageName,
+        trustScope: createRegistryTrustScope(workspace, repo),
         request: {
           method: "GET",
           url: `https://composer.cloudsmith.io/${safeWorkspace}/${safeRepo}/p2/${coordinates.vendor}/${coordinates.package}.json`,
@@ -436,7 +699,10 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
       };
     }
     case "swift": {
-      const coordinates = buildSwiftCoordinates(dependency && dependency.name);
+      const coordinates = buildSwiftCoordinates(
+        dependency && dependency.name,
+        dependency && (dependency.qualifiers || dependency.identifiers)
+      );
       if (!coordinates || !coordinates.scope || !coordinates.name || !version) {
         return null;
       }
@@ -502,12 +768,221 @@ function buildRegistryTriggerPlan(workspace, repo, dependency) {
   return remainingSegments.length > 0 && remainingSegments.every(Boolean) ? plan : null;
 }
 
+function createRegistryTrustScope(workspace, repo) {
+  const normalizedWorkspace = String(workspace || "").trim();
+  const normalizedRepository = String(repo || "").trim();
+  if (!encodePathSegment(normalizedWorkspace) || !encodePathSegment(normalizedRepository)) {
+    return null;
+  }
+  return Object.freeze({
+    workspace: normalizedWorkspace,
+    repository: normalizedRepository,
+  });
+}
+
+function repeatedlyDecode(value) {
+  let decoded = String(value || "");
+  if (decoded.length > MAX_REGISTRY_URL_LENGTH) return null;
+  for (let depth = 0; depth < MAX_REGISTRY_DECODE_DEPTH; depth += 1) {
+    let next;
+    try {
+      next = decodeURIComponent(decoded);
+    } catch {
+      return null;
+    }
+    if (next === decoded) {
+      return decoded;
+    }
+    decoded = next;
+  }
+  return null;
+}
+
+function hasUnsafeRegistryPath(pathname) {
+  const decoded = repeatedlyDecode(pathname);
+  if (decoded == null || REGISTRY_CONTROL_OR_BIDI.test(decoded) || /\\/.test(decoded)) {
+    return true;
+  }
+  return decoded.split("/").some(segment => segment === "." || segment === "..");
+}
+
+function decodedPathSegments(parsedUrl) {
+  const segments = parsedUrl.pathname.split("/").filter(Boolean);
+  const decoded = segments.map(repeatedlyDecode);
+  return decoded.every(value => value != null) ? decoded : null;
+}
+
+function repositoryCoordinatesForUrl(parsedUrl) {
+  const segments = decodedPathSegments(parsedUrl);
+  if (!segments) {
+    return null;
+  }
+
+  if (parsedUrl.hostname === "dl.cloudsmith.io") {
+    if (segments.length < 3 || !["basic", "public", "signed"].includes(segments[0])) {
+      return null;
+    }
+    return { workspace: segments[1], repository: segments[2] };
+  }
+
+  if (parsedUrl.hostname === "docker.cloudsmith.io") {
+    if (segments.length < 3 || segments[0] !== "v2") {
+      return null;
+    }
+    return { workspace: segments[1], repository: segments[2] };
+  }
+
+  if (segments.length < 2) {
+    return null;
+  }
+  return { workspace: segments[0], repository: segments[1] };
+}
+
+function inferRegistryTrustScope(baseUrl) {
+  let parsed;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    return null;
+  }
+  if (!isTrustedRegistryUrl(parsed.toString()) || hasUnsafeRegistryPath(parsed.pathname)) {
+    return null;
+  }
+  const coordinates = repositoryCoordinatesForUrl(parsed);
+  return coordinates
+    ? createRegistryTrustScope(coordinates.workspace, coordinates.repository)
+    : null;
+}
+
+function isSupportedArtifactHash(hash) {
+  if (!hash) {
+    return true;
+  }
+  const match = /^#([a-z0-9_+-]{1,32})=([a-f0-9]{16,256})$/i.exec(hash);
+  return Boolean(match);
+}
+
+/**
+ * Resolve a metadata-provided registry URL and constrain it to the selected
+ * Cloudsmith workspace/repository. A valid Python index hash fragment may be
+ * accepted and is stripped because URL fragments must never be sent over HTTP.
+ */
+function resolveAndValidateScopedRegistryUrl(candidate, baseUrl, trustScope, options = {}) {
+  if (
+    !candidate
+    || String(candidate).length > MAX_REGISTRY_URL_LENGTH
+    || String(baseUrl || "").length > MAX_REGISTRY_URL_LENGTH
+  ) {
+    return null;
+  }
+
+  let resolved;
+  try {
+    resolved = new URL(candidate, baseUrl);
+  } catch {
+    return null;
+  }
+
+  if (
+    (resolved.search && !options.allowQuery)
+    || (resolved.hash && (!options.allowHashFragment || !isSupportedArtifactHash(resolved.hash)))
+    || hasUnsafeRegistryPath(resolved.pathname)
+  ) {
+    return null;
+  }
+
+  resolved.hash = "";
+  if (!isTrustedRegistryUrl(resolved.toString())) {
+    return null;
+  }
+
+  const expectedScope = trustScope || inferRegistryTrustScope(baseUrl);
+  const actualScope = repositoryCoordinatesForUrl(resolved);
+  if (
+    !expectedScope
+    || !actualScope
+    || actualScope.workspace !== expectedScope.workspace
+    || actualScope.repository !== expectedScope.repository
+  ) {
+    return null;
+  }
+
+  return resolved.toString();
+}
+
+function resolveAndValidateDockerBlobRedirectUrl(candidate, baseUrl) {
+  if (
+    !candidate
+    || String(candidate).length > MAX_REGISTRY_URL_LENGTH
+    || String(baseUrl || "").length > MAX_REGISTRY_URL_LENGTH
+  ) return null;
+  const rawCandidate = String(candidate);
+  const rawPath = rawCandidate
+    .replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+/i, "")
+    .split(/[?#]/, 1)[0];
+  if (hasUnsafeRegistryPath(rawPath)) return null;
+  let resolved;
+  try {
+    resolved = new URL(candidate, baseUrl);
+  } catch {
+    return null;
+  }
+
+  if (isTrustedRegistryUrl(resolved.toString())) {
+    return resolveAndValidateScopedRegistryUrl(
+      resolved.toString(),
+      baseUrl,
+      null,
+      { allowQuery: true }
+    );
+  }
+
+  const hostname = resolved.hostname.toLowerCase();
+  if (
+    resolved.protocol !== "https:"
+    || resolved.port
+    || resolved.username
+    || resolved.password
+    || resolved.hash
+    || hasUnsafeRegistryPath(resolved.pathname)
+    || !hostname.includes(".")
+    || hostname.endsWith(".")
+    || isLiteralIpHostname(hostname)
+    || !isSafeDnsHostname(hostname)
+    || hostname === "localhost"
+    || hostname.endsWith(".localhost")
+    || hostname.endsWith(".local")
+    || hostname.endsWith(".internal")
+    || hostname.endsWith(".home.arpa")
+    || !DOCKER_BLOB_REDIRECT_HOST_SUFFIXES.some(suffix => hostname.endsWith(suffix))
+  ) {
+    return null;
+  }
+  return resolved.toString();
+}
+
+function isSafeDnsHostname(hostname) {
+  return hostname.length <= 253 && hostname.split(".").every(label => (
+    label.length > 0
+    && label.length <= 63
+    && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)
+  ));
+}
+
+function isLiteralIpHostname(hostname) {
+  if (hostname.startsWith("[") && hostname.endsWith("]")) return true;
+  const parts = hostname.split(".");
+  return parts.length === 4
+    && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
 function isTrustedCloudsmithHost(host) {
   const normalizedHost = String(host || "").trim().toLowerCase();
   return TRUSTED_REGISTRY_HOSTS.has(normalizedHost);
 }
 
 function isTrustedRegistryUrl(candidateUrl) {
+  if (String(candidateUrl || "").length > MAX_REGISTRY_URL_LENGTH) return false;
   try {
     const parsed = new URL(candidateUrl);
     return parsed.protocol === "https:"
@@ -520,25 +995,6 @@ function isTrustedRegistryUrl(candidateUrl) {
   } catch {
     return false;
   }
-}
-
-function resolveAndValidateRegistryUrl(candidate, baseUrl) {
-  if (!candidate) {
-    return null;
-  }
-
-  let resolved;
-  try {
-    resolved = new URL(candidate, baseUrl);
-  } catch {
-    return null;
-  }
-
-  if (!isTrustedRegistryUrl(resolved.toString())) {
-    return null;
-  }
-
-  return resolved.toString();
 }
 
 function collectHrefValues(html) {
@@ -589,38 +1045,95 @@ function collectHrefValues(html) {
   return hrefs;
 }
 
-function scorePythonArtifact(url, version) {
-  const normalizedVersion = String(version || "").trim().toLowerCase();
-  const fileName = decodeURIComponent(String(url || "").split("/").pop() || "").toLowerCase();
+function normalizePythonFileNameIdentity(value) {
+  return String(value || "").trim().toLowerCase().replace(/[-_.]+/g, "-");
+}
 
+function pythonArtifactIdentity(url) {
+  let fileName;
+  try {
+    const parsed = new URL(url);
+    fileName = decodeURIComponent(parsed.pathname.split("/").pop() || "");
+  } catch {
+    return null;
+  }
   if (!fileName) {
+    return null;
+  }
+
+  const lowerFileName = fileName.toLowerCase();
+  if (lowerFileName.endsWith(".whl")) {
+    const fields = fileName.slice(0, -4).split("-");
+    if (fields.length < 5) {
+      return null;
+    }
+    return {
+      name: normalizePythonFileNameIdentity(fields[0]),
+      version: normalizePythonFileNameIdentity(fields[1]),
+      score: 2,
+    };
+  }
+
+  const extension = lowerFileName.endsWith(".tar.gz")
+    ? ".tar.gz"
+    : lowerFileName.endsWith(".zip")
+      ? ".zip"
+      : "";
+  if (!extension) {
+    return null;
+  }
+
+  return {
+    stem: fileName.slice(0, -extension.length),
+    score: 1,
+  };
+}
+
+function scorePythonArtifact(url, packageName, version) {
+  const identity = pythonArtifactIdentity(url);
+  const normalizedName = normalizePythonFileNameIdentity(packageName);
+  const normalizedVersion = normalizePythonFileNameIdentity(version);
+  if (!identity || !normalizedVersion) {
     return -1;
   }
 
-  let score = 0;
-  if (normalizedVersion) {
-    if (!fileName.includes(normalizedVersion)) {
+  if (identity.stem != null) {
+    const versionSuffix = `-${String(version || "").trim()}`.toLowerCase();
+    if (!identity.stem.toLowerCase().endsWith(versionSuffix)) {
       return -1;
     }
-    score += 10;
+    const distribution = identity.stem.slice(0, -versionSuffix.length);
+    if (normalizedName && normalizePythonFileNameIdentity(distribution) !== normalizedName) {
+      return -1;
+    }
+    return identity.score + 10;
   }
 
-  if (fileName.endsWith(".whl")) {
-    score += 2;
-  } else if (fileName.endsWith(".tar.gz") || fileName.endsWith(".zip")) {
-    score += 1;
+  if (
+    identity.version !== normalizedVersion
+    || (normalizedName && identity.name !== normalizedName)
+  ) {
+    return -1;
   }
-
-  return score;
+  return identity.score + 10;
 }
 
-function findPythonDistributionUrl(html, version, baseUrl) {
+function findPythonDistributionUrl(html, packageName, version, baseUrl, trustScope) {
+  const wantedName = sanitizePackageNameInput(packageName);
+  const wantedVersion = String(version || "").trim();
+  if (!wantedName || !wantedVersion || !baseUrl) return null;
+
   const candidates = collectHrefValues(html)
-    .map((href) => resolveAndValidateRegistryUrl(href, baseUrl))
+    .map((href) => resolveAndValidateScopedRegistryUrl(
+      href,
+      baseUrl,
+      trustScope,
+      { allowHashFragment: true }
+    ))
     .filter(Boolean)
     .map((url) => ({
       url,
-      score: scorePythonArtifact(url, version),
+      score: scorePythonArtifact(url, wantedName, wantedVersion),
     }))
     .filter((candidate) => candidate.score >= 0)
     .sort((left, right) => right.score - left.score || left.url.localeCompare(right.url));
@@ -628,7 +1141,7 @@ function findPythonDistributionUrl(html, version, baseUrl) {
   return candidates.length > 0 ? candidates[0].url : null;
 }
 
-function parseDartArchiveUrl(body, version, baseUrl) {
+function parseNpmTarballUrl(body, packageName, version, baseUrl, trustScope) {
   let payload;
   try {
     payload = JSON.parse(String(body || ""));
@@ -636,7 +1149,282 @@ function parseDartArchiveUrl(body, version, baseUrl) {
     return null;
   }
 
+  const wantedName = sanitizePackageNameInput(packageName).toLowerCase();
   const wantedVersion = String(version || "").trim();
+  if (
+    !wantedName
+    || !wantedVersion
+    || !payload
+    || typeof payload !== "object"
+    || Array.isArray(payload)
+    || typeof payload.name !== "string"
+    || payload.name.toLowerCase() !== wantedName
+  ) {
+    return null;
+  }
+
+  const entry = payload.version === wantedVersion
+    ? payload
+    : payload.versions
+      && typeof payload.versions === "object"
+      && !Array.isArray(payload.versions)
+      && Object.prototype.hasOwnProperty.call(payload.versions, wantedVersion)
+      ? payload.versions[wantedVersion]
+      : null;
+  if (
+    !entry
+    || typeof entry !== "object"
+    || Array.isArray(entry)
+    || entry.version !== wantedVersion
+    || !entry.dist
+    || typeof entry.dist !== "object"
+  ) {
+    return null;
+  }
+
+  return resolveAndValidateScopedRegistryUrl(
+    entry.dist.tarball,
+    baseUrl,
+    trustScope
+  );
+}
+
+function parseCargoIndexEntry(body, crateName, version) {
+  const wantedName = String(crateName || "").trim().toLowerCase();
+  const wantedVersion = String(version || "").trim();
+  if (!wantedName || !wantedVersion) {
+    return null;
+  }
+
+  const lines = String(body || "").split(/\r?\n/, 10001);
+  if (lines.length > 10000) {
+    return null;
+  }
+  for (const line of lines) {
+    if (!line.trim()) {
+      continue;
+    }
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (
+      entry
+      && typeof entry === "object"
+      && String(entry.name || "").toLowerCase() === wantedName
+      && entry.vers === wantedVersion
+      && /^[a-f0-9]{64}$/i.test(String(entry.cksum || ""))
+    ) {
+      return Object.freeze({
+        name: String(entry.name),
+        version: entry.vers,
+        checksum: String(entry.cksum).toLowerCase(),
+        yanked: Boolean(entry.yanked),
+      });
+    }
+  }
+  return null;
+}
+
+function parseCargoDownloadUrl(body, crateName, version, checksum, baseUrl, trustScope) {
+  let payload;
+  try {
+    payload = JSON.parse(String(body || ""));
+  } catch {
+    return null;
+  }
+
+  const rawName = String(crateName || "").trim();
+  const encodedName = encodePathSegment(rawName);
+  const encodedVersion = encodePathSegment(version);
+  const normalizedChecksum = String(checksum || "").trim().toLowerCase();
+  if (
+    !payload
+    || typeof payload.dl !== "string"
+    || !encodedName
+    || !encodedVersion
+    || !/^[a-f0-9]{64}$/.test(normalizedChecksum)
+  ) {
+    return null;
+  }
+
+  const prefix = cargoPrefix(rawName);
+  const lowerPrefix = cargoPrefix(rawName, true);
+  if (!prefix || !lowerPrefix) return null;
+  const hadTemplateMarker = /\{(?:crate|version|prefix|lowerprefix|sha256-checksum)\}/.test(payload.dl);
+  let candidate = payload.dl
+    .replaceAll("{crate}", encodedName)
+    .replaceAll("{version}", encodedVersion)
+    .replaceAll("{prefix}", prefix)
+    .replaceAll("{lowerprefix}", lowerPrefix)
+    .replaceAll("{sha256-checksum}", normalizedChecksum);
+  if (/\{[^{}]+\}/.test(candidate)) {
+    return null;
+  }
+  if (!hadTemplateMarker) {
+    candidate = `${candidate.replace(/\/$/, "")}/${encodedName}/${encodedVersion}/download`;
+  }
+
+  return resolveAndValidateScopedRegistryUrl(candidate, baseUrl, trustScope);
+}
+
+function parseDockerManifest(body, preferredPlatform = {}) {
+  let payload;
+  try {
+    payload = JSON.parse(String(body || ""));
+  } catch {
+    return null;
+  }
+
+  if (!payload || payload.schemaVersion !== 2) {
+    return null;
+  }
+
+  if (Array.isArray(payload.manifests)) {
+    if (
+      payload.manifests.length === 0
+      || payload.manifests.length > MAX_DOCKER_MANIFEST_DESCRIPTORS
+    ) {
+      return null;
+    }
+    const requested = preferredDockerPlatform(preferredPlatform);
+    if (!requested) {
+      return null;
+    }
+    const candidates = payload.manifests.filter(entry => (
+      entry
+      && isDockerDigest(entry.digest)
+      && entry.platform
+      && typeof entry.platform === "object"
+    ));
+    const exact = candidates.find(entry => dockerPlatformValuesMatch(requested, entry.platform));
+    const selected = exact || (requested.explicit ? null : candidates.find(entry => (
+      String(entry.platform.os || "").toLowerCase() === "linux"
+      && String(entry.platform.architecture || "").toLowerCase() === "amd64"
+    ))) || (requested.explicit ? null : candidates[0]);
+    return selected ? { manifestDigest: selected.digest, blobDigests: [] } : null;
+  }
+
+  const descriptors = [payload.config, ...(Array.isArray(payload.layers) ? payload.layers : [])];
+  if (
+    descriptors.length === 0
+    || descriptors.length > MAX_DOCKER_MANIFEST_DESCRIPTORS
+    || descriptors.some(entry => !entry || !isDockerDigest(entry.digest))
+  ) {
+    return null;
+  }
+
+  return {
+    manifestDigest: null,
+    blobDigests: [...new Set(descriptors.map(entry => entry.digest))],
+  };
+}
+
+function preferredDockerPlatform(value) {
+  const preferred = value && typeof value === "object" ? value : {};
+  const platform = String(preferred.platform || "").trim().toLowerCase();
+  if (platform) {
+    const parsed = parseDockerPlatform(platform);
+    if (!parsed) return null;
+    return {
+      ...parsed,
+      explicit: true,
+    };
+  }
+
+  const explicit = Boolean(preferred.os || preferred.architecture || preferred.arch || preferred.variant);
+  const os = String(preferred.os || "linux").trim().toLowerCase();
+  const architecture = normalizeDockerArchitecture(
+    preferred.architecture || preferred.arch || "amd64"
+  );
+  const variant = String(preferred.variant || "").trim().toLowerCase();
+  if (
+    !os
+    || !architecture
+    || !/^[a-z0-9_.-]+$/.test(os)
+    || !/^[a-z0-9_.-]+$/.test(architecture)
+    || (variant && !/^[a-z0-9_.-]+$/.test(variant))
+  ) {
+    return null;
+  }
+  return { os, architecture, variant, explicit };
+}
+
+function dockerPlatformValuesMatch(requested, observedValue) {
+  if (!requested || !observedValue || typeof observedValue !== "object") return false;
+  const observed = {
+    os: String(observedValue.os || "").trim().toLowerCase(),
+    architecture: normalizeDockerArchitecture(observedValue.architecture),
+    variant: String(observedValue.variant || "").trim().toLowerCase(),
+  };
+  return Boolean(
+    observed.os
+    && observed.architecture
+    && observed.os === requested.os
+    && observed.architecture === requested.architecture
+    && dockerVariantMatches(requested, observed)
+  );
+}
+
+function parseNuGetPackageUrl(body, packageName, packageVersion, baseUrl, trustScope) {
+  let payload;
+  try {
+    payload = JSON.parse(String(body || ""));
+  } catch {
+    return null;
+  }
+  const normalizedName = encodePathSegment(String(packageName || "").toLowerCase());
+  const normalizedVersion = encodePathSegment(normalizeNuGetVersion(packageVersion));
+  if (!normalizedName || !normalizedVersion || !Array.isArray(payload?.resources)) {
+    return null;
+  }
+
+  for (const resource of payload.resources.slice(0, 256)) {
+    if (!resource || typeof resource !== "object") continue;
+    const types = Array.isArray(resource["@type"])
+      ? resource["@type"]
+      : [resource["@type"]];
+    if (!types.some(type => String(type || "").startsWith("PackageBaseAddress/"))) {
+      continue;
+    }
+    const packageBase = resolveAndValidateScopedRegistryUrl(
+      resource["@id"],
+      baseUrl,
+      trustScope
+    );
+    if (!packageBase) continue;
+    return `${packageBase.replace(/\/$/, "")}/${normalizedName}/${normalizedVersion}/${normalizedName}.${normalizedVersion}.nupkg`;
+  }
+  return null;
+}
+
+function isDockerDigest(value) {
+  if (typeof value !== "string" || value.length > 1024) return false;
+  const match = value.match(DOCKER_DIGEST_PATTERN);
+  if (!match) return false;
+  const algorithm = match[1].toLowerCase();
+  const length = match[2].length;
+  if (algorithm === "sha256") return length === 64;
+  if (algorithm === "sha512") return length === 128;
+  return length >= 32 && length <= 512;
+}
+
+function parseDartArchiveUrl(body, packageName, version, baseUrl, trustScope) {
+  let payload;
+  try {
+    payload = JSON.parse(String(body || ""));
+  } catch {
+    return null;
+  }
+
+  const wantedName = sanitizePackageNameInput(packageName).toLowerCase();
+  const observedName = sanitizePackageNameInput(payload && payload.name).toLowerCase();
+  const wantedVersion = String(version || "").trim();
+  if (!wantedName || observedName !== wantedName) {
+    return null;
+  }
   const candidates = [];
 
   if (payload && payload.latest && payload.latest.version === wantedVersion && payload.latest.archive_url) {
@@ -661,7 +1449,7 @@ function parseDartArchiveUrl(body, version, baseUrl) {
   }
 
   for (const candidate of candidates) {
-    const resolved = resolveAndValidateRegistryUrl(candidate, baseUrl);
+    const resolved = resolveAndValidateScopedRegistryUrl(candidate, baseUrl, trustScope);
     if (resolved) {
       return resolved;
     }
@@ -670,7 +1458,7 @@ function parseDartArchiveUrl(body, version, baseUrl) {
   return null;
 }
 
-function parseComposerDistUrl(body, packageName, version, baseUrl) {
+function parseComposerDistUrl(body, packageName, version, baseUrl, trustScope) {
   let payload;
   try {
     payload = JSON.parse(String(body || ""));
@@ -679,42 +1467,60 @@ function parseComposerDistUrl(body, packageName, version, baseUrl) {
   }
 
   const entries = [];
-  const normalizedPackageName = sanitizePackageNameInput(packageName);
+  const normalizedPackageName = sanitizePackageNameInput(packageName).toLowerCase();
 
   if (payload && payload.packages && typeof payload.packages === "object") {
-    if (Array.isArray(payload.packages[normalizedPackageName])) {
-      entries.push(...payload.packages[normalizedPackageName]);
-    } else {
-      for (const value of Object.values(payload.packages)) {
-        if (Array.isArray(value)) {
-          entries.push(...value);
-        }
+    const exactKey = Object.keys(payload.packages).find(key => (
+      sanitizePackageNameInput(key).toLowerCase() === normalizedPackageName
+    ));
+    if (exactKey && Array.isArray(payload.packages[exactKey])) {
+      entries.push(...payload.packages[exactKey]);
+    }
+  } else if (Array.isArray(payload)) {
+    for (const entry of payload) {
+      if (
+        entry
+        && sanitizePackageNameInput(entry.name).toLowerCase() === normalizedPackageName
+      ) {
+        entries.push(entry);
       }
     }
   }
 
-  if (Array.isArray(payload)) {
-    entries.push(...payload);
-  }
-
-  const matchedEntry = entries.find((entry) => entry && entry.version === version)
-    || entries.find(Boolean);
+  const matchedEntry = entries.find((entry) => (
+    entry
+    && entry.version === version
+    && (!entry.name
+      || sanitizePackageNameInput(entry.name).toLowerCase() === normalizedPackageName)
+  ));
   const distUrl = matchedEntry
     && matchedEntry.dist
     && typeof matchedEntry.dist === "object"
     ? matchedEntry.dist.url
     : null;
 
-  return resolveAndValidateRegistryUrl(distUrl, baseUrl);
+  return resolveAndValidateScopedRegistryUrl(distUrl, baseUrl, trustScope);
 }
 
 module.exports = {
   buildRegistryTriggerPlan,
+  dockerCandidateMatchesPlatform,
+  dockerDigestMatches,
   findPythonDistributionUrl,
   formatForDependency,
   isPullUnsupportedFormat,
+  isDockerDigest,
   isTrustedRegistryUrl,
+  mavenArtifactFileName,
+  normalizeNuGetVersion,
+  parseDockerManifest,
+  parseNuGetPackageUrl,
+  parseCargoDownloadUrl,
+  parseCargoIndexEntry,
   parseComposerDistUrl,
   parseDartArchiveUrl,
-  resolveAndValidateRegistryUrl,
+  parseNpmTarballUrl,
+  resolveAndValidateDockerBlobRedirectUrl,
+  resolveAndValidateScopedRegistryUrl,
+  rubyCandidateMatchesPlatform,
 };

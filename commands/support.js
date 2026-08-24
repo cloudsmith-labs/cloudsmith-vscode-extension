@@ -676,14 +676,15 @@ function commentCommandNote(note) {
     .join("\n");
 }
 
-function buildRawSearchQuery(SearchQueryBuilder, query) {
-  return new SearchQueryBuilder().raw(query).build();
+function buildAdvancedSearchQuery(SearchQueryBuilder, query) {
+  if (query == null || query === "") return "";
+  return new SearchQueryBuilder().advanced(query).build();
 }
 
 function buildPresetQuery(SearchQueryBuilder, preset, customQuery) {
   if (!preset) return "";
   if (preset.applyBuilder === null) {
-    return buildRawSearchQuery(SearchQueryBuilder, customQuery || "");
+    return buildAdvancedSearchQuery(SearchQueryBuilder, customQuery || "");
   }
   const builder = new SearchQueryBuilder();
   const maybeString = preset.applyBuilder(builder);
@@ -731,7 +732,7 @@ module.exports = {
   adaptRepositoryResolutionSelection,
   buildInstallCommand,
   buildPresetQuery,
-  buildRawSearchQuery,
+  buildAdvancedSearchQuery,
   canonicalRepository,
   captureCommandAccount,
   isCommandAccountCurrent,

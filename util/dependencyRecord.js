@@ -3,6 +3,8 @@ const path = require("path");
 const { URL, pathToFileURL } = require("url");
 const {
   canonicalFormat,
+  normalizeDockerPlatformIdentity,
+  normalizeNuGetVersion,
   normalizePackageName,
   normalizeSwiftIdentity,
   sanitizePackageNameInput,
@@ -359,23 +361,54 @@ function getDependencyArtifactKey(dependency) {
     ? normalizeSwiftIdentity(dependency && dependency.name, qualifiers.scope)
     : String(dependency && (dependency.normalizedName || dependency.name) || "");
   const artifactQualifiers = {};
-  if (format === "ruby" && qualifiers.platform) {
-    artifactQualifiers.platform = qualifiers.platform;
+  if (format === "ruby") {
+    artifactQualifiers.platform = String(qualifiers.platform || "ruby").toLowerCase();
   }
   if (format === "maven") {
-    if (qualifiers.type) artifactQualifiers.type = qualifiers.type;
-    if (qualifiers.classifier) artifactQualifiers.classifier = qualifiers.classifier;
+    const mavenArtifact = normalizeMavenArtifactIdentity(qualifiers);
+    artifactQualifiers.extension = mavenArtifact.extension;
+    if (mavenArtifact.classifier) artifactQualifiers.classifier = mavenArtifact.classifier;
   }
   if (format === "docker") {
     if (qualifiers.tag) artifactQualifiers.tag = qualifiers.tag;
-    if (qualifiers.digest) artifactQualifiers.digest = qualifiers.digest;
+    if (qualifiers.digest) artifactQualifiers.digest = String(qualifiers.digest).toLowerCase();
+    if (qualifiers.platform) {
+      artifactQualifiers.platform = normalizeDockerPlatformIdentity(qualifiers.platform)
+        || qualifiers.platform;
+    }
   }
+  const concreteVersion = getDependencyConcreteVersion(dependency) || "";
   return JSON.stringify([
     format,
     caseSensitive ? identityName : identityName.toLowerCase(),
-    getDependencyConcreteVersion(dependency) || "",
+    format === "nuget" ? normalizeNuGetVersion(concreteVersion) || concreteVersion : concreteVersion,
     artifactQualifiers,
   ]);
+}
+
+function normalizeMavenArtifactIdentity(qualifiers) {
+  const type = String(qualifiers?.type || "jar").trim().toLowerCase();
+  const extension = [
+    "bundle",
+    "ejb",
+    "ejb-client",
+    "java-source",
+    "javadoc",
+    "maven-plugin",
+    "test-jar",
+  ].includes(type) ? "jar" : type;
+  const implicitClassifiers = {
+    "ejb-client": "client",
+    "java-source": "sources",
+    javadoc: "javadoc",
+    "test-jar": "tests",
+  };
+  return {
+    extension,
+    classifier: String(
+      qualifiers?.classifier || implicitClassifiers[type] || ""
+    ).trim(),
+  };
 }
 
 function getDependencyConcreteVersion(dependency) {

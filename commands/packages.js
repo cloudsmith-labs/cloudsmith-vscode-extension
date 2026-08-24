@@ -18,10 +18,11 @@ const {
 } = require("./support");
 
 const MAX_FILTER_INPUT_LENGTH = 2048;
+const QUERY_CONTROL_OR_BIDI_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/;
 
 function filterInputValidationMessage(value) {
   if (typeof value !== "string") return "Enter a filter query.";
-  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) {
+  if (QUERY_CONTROL_OR_BIDI_PATTERN.test(value)) {
     return "Filter queries cannot contain control characters.";
   }
   if (value.length > MAX_FILTER_INPUT_LENGTH) {

@@ -802,6 +802,14 @@ suite("Command registrars", () => {
       searchValidator("name:flask\u0000"),
       "Search queries cannot contain control characters."
     );
+    assert.strictEqual(
+      searchValidator("name:flask\nOR name:other"),
+      "Search queries cannot contain control characters."
+    );
+    assert.strictEqual(
+      searchValidator("name:flask\u202e"),
+      "Search queries cannot contain control characters."
+    );
     assert.strictEqual(searchValidator("a".repeat(2048)), null);
     assert.strictEqual(
       searchValidator("a".repeat(2049)),
@@ -839,6 +847,14 @@ suite("Command registrars", () => {
     assert.strictEqual(filterValidator(" format:python "), null);
     assert.strictEqual(
       filterValidator("format:python\u0000"),
+      "Filter queries cannot contain control characters."
+    );
+    assert.strictEqual(
+      filterValidator("format:python\nOR format:npm"),
+      "Filter queries cannot contain control characters."
+    );
+    assert.strictEqual(
+      filterValidator("format:python\u202e"),
       "Filter queries cannot contain control characters."
     );
     assert.strictEqual(filterValidator("a".repeat(2048)), null);
@@ -1140,7 +1156,7 @@ suite("Command registrars", () => {
     const operations = [];
     const serviceFailure = Object.freeze({ ok: false, error: "search unavailable" });
     class SearchQueryBuilder {
-      raw(value) { this.value = value; return this; }
+      advanced(value) { this.value = value; return this; }
       build() { return this.value; }
     }
     class RecentSearches {
@@ -1190,6 +1206,7 @@ suite("Command registrars", () => {
       },
       workspaceAccess: harness.access,
       SearchQueryBuilder: class {
+        advanced() { return this; }
         raw() { return this; }
         build() { return "name:widget"; }
       },
@@ -1344,6 +1361,55 @@ suite("Command registrars", () => {
     assert.strictEqual(JSON.stringify(repositoryItems).includes("\u2066"), false);
   });
 
+  test("guided search rejects an oversized combined custom and format query gracefully", async () => {
+    const recorder = recordingRegistration();
+    const warnings = [];
+    let beginCalls = 0;
+    class RecentSearches {
+      async getAll() { return []; }
+    }
+    class SearchQueryBuilder {
+      advanced(value) { this.value = value; return this; }
+      format(value) { this.value = `format:${value}`; return this; }
+      build() { return this.value || ""; }
+    }
+    registerSearchCommands({
+      ...baseDependencies(recorder),
+      context: {},
+      FORMAT_OPTIONS: ["npm"],
+      SearchQueryBuilder,
+      RecentSearches,
+      vscode: {
+        workspace: { getConfiguration: () => ({ get: () => "workspace-a" }) },
+        window: {
+          async showInputBox() { return "x".repeat(2048); },
+          async showQuickPick(items, options) {
+            if (options.placeHolder === "Step 2: Select a search scope") {
+              return items.find(item => item.scope === "all");
+            }
+            if (options.placeHolder === "Step 3: Select a filter") {
+              return items.find(item => item.preset && item.preset.applyBuilder === null);
+            }
+            if (options.placeHolder === "Step 4: Filter by format (optional)") {
+              return [items.find(item => item.label === "npm")];
+            }
+            throw new Error(`Unexpected picker: ${options.placeHolder}`);
+          },
+          async showWarningMessage(message) { warnings.push(message); },
+        },
+      },
+      workspaceAccess: workspaceCollectionHarness().access,
+      searchProvider: { beginSearch() { beginCalls += 1; } },
+    });
+
+    await recorder.handlers.get("cloudsmith-vsc.guidedSearch")();
+
+    assert.strictEqual(beginCalls, 0);
+    assert.deepStrictEqual(warnings, [
+      "The combined search query exceeds the safe query limit. Shorten the custom query or select fewer formats.",
+    ]);
+  });
+
   test("workspace search shortcuts recheck provider ownership after recovery prompts", async () => {
     const recorder = recordingRegistration();
     let current = true;
@@ -1366,6 +1432,7 @@ suite("Command registrars", () => {
       workspaceAccess: workspaceCollectionHarness().access,
       RecentSearches,
       SearchQueryBuilder: class {
+        advanced() { return this; }
         raw() { return this; }
         build() { return "name:widget"; }
       },
@@ -1599,6 +1666,7 @@ suite("Command registrars", () => {
       workspace: "workspace-a",
       repository: "repo-a",
       name: "left-pad",
+      qualifiers: Object.freeze({ targetFramework: "net8.0" }),
     });
     const exact = Object.freeze({
       identityState: "exact",

@@ -261,6 +261,27 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.currentQuery, "second");
   });
 
+  test("beginSearch rejects control and bidi-bearing replay descriptors", async () => {
+    let fetchCount = 0;
+    const { provider } = createProvider({
+      fetchPage: async () => {
+        fetchCount += 1;
+        return page([]);
+      },
+    });
+    for (const query of ["name:foo\nOR name:bar", "name:foo\u202e"]) {
+      const operation = provider.beginSearch({
+        kind: "workspace",
+        workspace: "workspace-a",
+        query,
+      });
+      assert.match(operation.validationError, /search query was invalid/);
+      await provider.executeSearch(operation);
+      assert.strictEqual(provider.state.failure.kind, "invalid_request");
+    }
+    assert.strictEqual(fetchCount, 0);
+  });
+
   test("a stale root success cannot replace or refresh over the latest result", async () => {
     const slow = deferred();
     const fast = deferred();
