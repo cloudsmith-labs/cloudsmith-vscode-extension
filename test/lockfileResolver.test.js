@@ -161,6 +161,7 @@ suite("LockfileResolver Test Suite", () => {
       identifiers: {
         group_id: "org.springframework.boot",
       },
+      files: [{ filename: "spring-boot-starter-3.2.0.jar" }],
     };
     const index = buildPackageIndex([cloudsmithPackage], "maven");
 

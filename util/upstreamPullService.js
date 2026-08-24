@@ -1,5 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const vscode = require("vscode");
+const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const { CloudsmithAPI } = require("./cloudsmithAPI");
 const { CredentialManager } = require("./credentialManager");
 const { apiEndpoint } = require("./apiEndpoint");
@@ -7,8 +8,13 @@ const { fetchWorkspaceRepositories } = require("./workspaceRepositoryFetcher");
 const { PaginatedFetch } = require("./paginatedFetch");
 const { SearchQueryBuilder } = require("./searchQueryBuilder");
 const {
+  packageCandidateEvidenceShapeIsValid,
+  qualifierEvidenceIsIncomplete,
+} = require("./exactPackageEvidence");
+const {
   buildRegistryTriggerPlan,
   dockerCandidateMatchesPlatform,
+  dockerDigestMatches,
   findPythonDistributionUrl,
   formatForDependency,
   isPullUnsupportedFormat,
@@ -473,6 +479,7 @@ class UpstreamPullService {
       ));
       return { canceled: true, absenceUnverified: true };
     }
+    executionOperation.absenceProofs = absence.proofs;
     if (!isExecutionCurrent()) {
       return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
     }
@@ -503,6 +510,7 @@ class UpstreamPullService {
     const queue = prepared.plan.pullableDependencies.slice();
     let nextDependencyIndex = 0;
     const details = [];
+    const verificationReceipts = new Map();
     const counts = createResultCounts(prepared.plan.pullableDependencies.length);
     const state = {
       authFailureCount: 0,
@@ -601,7 +609,8 @@ class UpstreamPullService {
             prepared.workspace,
             prepared.repository.slug,
             dependency,
-            executionOperation
+            executionOperation,
+            { dockerPlatformVerified: result.dockerPlatformVerified === true }
           );
           if (result.canceled) {
             state.canceled = true;
@@ -613,6 +622,13 @@ class UpstreamPullService {
           state.canceled = true;
           state.stale = !this._isPreparedAccountCurrent(prepared);
           return;
+        }
+
+        if (result.coverageReceipt) {
+          verificationReceipts.set(
+            getDependencyArtifactKey(dependency),
+            Object.freeze({ ...result.coverageReceipt })
+          );
         }
 
         result = toPublicPullDetail(result);
@@ -723,6 +739,7 @@ class UpstreamPullService {
 
     return {
       canceled: false,
+      ...(verificationReceipts.size > 0 ? { verificationReceipts } : {}),
       pullResult: {
         total: counts.total,
         cached: counts.cached,
@@ -892,6 +909,7 @@ class UpstreamPullService {
       || dependencies.length === 0
     ) return null;
 
+    const proofs = new Map();
     for (const dependency of dependencies) {
       if (!this._isPreparationCurrent(operation)) return null;
       let result;
@@ -924,8 +942,12 @@ class UpstreamPullService {
           dependency,
         };
       }
+      proofs.set(
+        getDependencyArtifactKey(dependency),
+        new Set(Array.isArray(result.observedIdentities) ? result.observedIdentities : [])
+      );
     }
-    return { ok: true };
+    return { ok: true, proofs };
   }
 
   async _checkExactPackageAbsence({
@@ -935,6 +957,8 @@ class UpstreamPullService {
     cancellationToken,
     signal,
     account,
+    baselineIdentities,
+    dockerPlatformVerified = false,
   }) {
     const format = canonicalFormat(dependency?.format || dependency?.ecosystem);
     const requestedVersion = String(dependency?.version || "").trim();
@@ -965,6 +989,8 @@ class UpstreamPullService {
     }
     const paginatedFetch = new PaginatedFetch(this._api);
 
+    let incompleteQualifierEvidence = false;
+    const observedIdentities = new Set();
     for (const lookupName of lookupNames) {
       const queryBuilder = new SearchQueryBuilder()
         .name(lookupName)
@@ -972,7 +998,12 @@ class UpstreamPullService {
       if (format !== "docker") {
         queryBuilder.version(version);
       }
-      const query = queryBuilder.build();
+      let query;
+      try {
+        query = queryBuilder.build();
+      } catch {
+        return incompleteAbsenceResult(workspace, repository);
+      }
       let resume = null;
       const knownIdentities = new Set();
       const accumulatedCandidates = [];
@@ -1008,9 +1039,22 @@ class UpstreamPullService {
           return incompleteAbsenceResult(workspace, repository, true);
         }
         accumulatedCandidates.push(...result.items);
-        const present = accumulatedCandidates.some(candidate => (
-          exactPackageCandidateMatches(candidate, dependency, format, version)
-        ));
+        for (const candidate of result.items) {
+          observedIdentities.add(exactPackageCandidateIdentity(candidate));
+        }
+        if (accumulatedCandidates.some(candidate => (
+          exactPackageCandidateEvidenceIsIncomplete(candidate, dependency, format, version)
+        ))) {
+          incompleteQualifierEvidence = true;
+        }
+        const present = exactPackageCandidateCollectionMatches(
+          accumulatedCandidates,
+          dependency,
+          format,
+          version,
+          baselineIdentities,
+          dockerPlatformVerified
+        );
         if (present) {
           return {
             workspace,
@@ -1032,6 +1076,10 @@ class UpstreamPullService {
       }
     }
 
+    if (incompleteQualifierEvidence) {
+      return incompleteAbsenceResult(workspace, repository);
+    }
+
     return {
       workspace,
       repository,
@@ -1039,10 +1087,17 @@ class UpstreamPullService {
       present: false,
       complete: true,
       stale: false,
+      observedIdentities: [...observedIdentities],
     };
   }
 
-  async _verifyPostTriggerPresence(workspace, repository, dependency, operation) {
+  async _verifyPostTriggerPresence(
+    workspace,
+    repository,
+    dependency,
+    operation,
+    verificationReceipt = {}
+  ) {
     for (const delayMs of this._postTriggerPollDelaysMs) {
       if (!this._isPreparationCurrent(operation)) {
         return {
@@ -1073,6 +1128,10 @@ class UpstreamPullService {
           cancellationToken: operation.cancellationToken,
           signal: operation.signal,
           account: operation.account,
+          baselineIdentities: operation.absenceProofs?.get(
+            getDependencyArtifactKey(dependency)
+          ),
+          dockerPlatformVerified: verificationReceipt.dockerPlatformVerified === true,
         });
       } catch {
         result = null;
@@ -1093,11 +1152,21 @@ class UpstreamPullService {
         && result.present === true
         && result.absent === false
       ) {
+        const format = canonicalFormat(dependency?.format || dependency?.ecosystem);
+        const coverageReceipt = {
+          ...(format === "docker" && verificationReceipt.dockerPlatformVerified === true
+            ? { dockerPlatformVerified: true }
+            : {}),
+          ...(format === "swift" && String(dependency?.qualifiers?.scope || "").trim()
+            ? { swiftScopeVerified: true }
+            : {}),
+        };
         return {
           dependency,
           status: PULL_STATUS.CACHED,
           errorMessage: null,
           networkError: false,
+          ...(Object.keys(coverageReceipt).length > 0 ? { coverageReceipt } : {}),
         };
       }
     }
@@ -1236,20 +1305,6 @@ class UpstreamPullService {
       );
     }
 
-    if (plan.strategy === "maven-artifact") {
-      if (plan.artifactRequest.url === plan.request.url) {
-        return mapRegistryAttempt(dependency, metadataAttempt, format);
-      }
-      const artifactAttempt = await this._requestRegistry(
-        plan.artifactRequest,
-        apiKey,
-        token,
-        { captureBody: false, isCurrent, signal }
-      );
-      if (artifactAttempt.canceled) return artifactAttempt;
-      return mapRegistryAttempt(dependency, artifactAttempt, format);
-    }
-
     let artifactUrl = null;
     if (plan.strategy === "python-simple-index") {
       artifactUrl = findPythonDistributionUrl(
@@ -1305,6 +1360,7 @@ class UpstreamPullService {
     } else if (plan.strategy === "dart-api") {
       artifactUrl = parseDartArchiveUrl(
         metadataAttempt.body,
+        plan.packageName || dependency.name,
         dependency.version,
         plan.request.url,
         plan.trustScope
@@ -1370,6 +1426,7 @@ class UpstreamPullService {
       };
     }
 
+    let dockerPlatformVerified = false;
     if (parsed.manifestDigest) {
       const manifestAttempt = await this._requestRegistry(
         {
@@ -1394,6 +1451,7 @@ class UpstreamPullService {
           networkError: false,
         };
       }
+      dockerPlatformVerified = Boolean(dependency?.qualifiers?.platform);
     }
 
     let lastAttempt = initialAttempt;
@@ -1423,7 +1481,10 @@ class UpstreamPullService {
       }
     }
 
-    return mapRegistryAttempt(dependency, lastAttempt, "docker");
+    const result = mapRegistryAttempt(dependency, lastAttempt, "docker");
+    return result.triggerSucceeded && dockerPlatformVerified
+      ? { ...result, dockerPlatformVerified: true }
+      : result;
   }
 
   async _requestRegistry(request, apiKey, token, options = {}) {
@@ -1650,7 +1711,7 @@ function isBoundedLookupField(value) {
     && value.length > 0
     && value.length <= ABSENCE_LOOKUP_MAX_FIELD_LENGTH
     && value.trim() === value
-    && !/[\u0000-\u001f\u007f]/u.test(value);
+    && !REPOSITORY_CONTROL_OR_BIDI.test(value);
 }
 
 function isExactPackageCandidateArray(value, workspace, repository) {
@@ -1665,23 +1726,35 @@ function isExactPackageCandidateArray(value, workspace, repository) {
       && isBoundedLookupField(candidate.name)
       && isBoundedLookupField(candidate.version)
       && isBoundedLookupField(candidate.format)
+      && isBoundedLookupField(exactPackageCandidateIdentifier(candidate))
+      && packageCandidateEvidenceShapeIsValid(candidate)
       && Boolean(exactPackageCandidateIdentity(candidate))
     ));
 }
 
 function exactPackageCandidateIdentity(candidate) {
   if (!candidate || typeof candidate !== "object") return null;
+  const packageIdentifier = exactPackageCandidateIdentifier(candidate);
+  if (!packageIdentifier) return null;
   const stableIdentifier = [
     candidate.namespace,
     candidate.repository,
     candidate.format,
     candidate.name,
     candidate.version,
-    candidate.slug_perm || candidate.identifier || "",
+    packageIdentifier,
   ];
   return stableIdentifier.every(value => typeof value === "string")
     ? JSON.stringify(stableIdentifier)
     : null;
+}
+
+function exactPackageCandidateIdentifier(candidate) {
+  try {
+    return fromApiPackageRecord(candidate).packageIdentifier;
+  } catch {
+    return null;
+  }
 }
 
 function exactPackageCandidateMatches(candidate, dependency, format, version) {
@@ -1697,13 +1770,9 @@ function exactPackageCandidateMatches(candidate, dependency, format, version) {
     ).trim().toLowerCase();
     const observedDigest = String(candidate.version || "").trim().toLowerCase();
     const digestMatches = requestedDigest
-      && observedDigest.replace(/^[a-z0-9_+.-]+:/, "")
-        === requestedDigest.replace(/^[a-z0-9_+.-]+:/, "");
+      && dockerDigestMatches(observedDigest, requestedDigest);
     const tagMatches = versionTags.some(tag => String(tag) === version);
     if (requestedDigest ? !digestMatches : !tagMatches) return false;
-    if (!dockerCandidateMatchesPlatform(candidate, dependency?.qualifiers?.platform)) {
-      return false;
-    }
   } else if (
     format === "nuget"
       ? normalizeNuGetVersion(candidate.version) !== normalizeNuGetVersion(version)
@@ -1751,13 +1820,76 @@ function exactPackageCandidateMatches(candidate, dependency, format, version) {
   return expectedKeys.some(key => observedKeys.has(key));
 }
 
+function exactPackageCandidateCollectionMatches(
+  candidates,
+  dependency,
+  format,
+  version,
+  baselineIdentities,
+  dockerPlatformVerified
+) {
+  const requestedPlatform = format === "docker"
+    ? String(dependency && dependency.qualifiers && dependency.qualifiers.platform || "").trim()
+    : "";
+  const identityCandidate = candidates.find(candidate => (
+    exactPackageCandidateMatches(candidate, dependency, format, version)
+    && (
+      !requestedPlatform
+      || dockerPlatformVerified === true
+      || dockerCandidateMatchesPlatform(candidate, requestedPlatform)
+    )
+  ));
+  if (identityCandidate) return true;
+  if (format === "swift" && baselineIdentities instanceof Set) {
+    return candidates.some(candidate => (
+      !baselineIdentities.has(exactPackageCandidateIdentity(candidate))
+      && exactPackageCandidateBaseNameMatches(candidate, dependency, format)
+      && candidate.version === version
+      && qualifierEvidenceIsIncomplete(candidate, dependency, format)
+    ));
+  }
+  return false;
+}
+
+function exactPackageCandidateEvidenceIsIncomplete(candidate, dependency, format, version) {
+  if (!exactPackageCandidateBaseNameMatches(candidate, dependency, format)) return false;
+  if (format === "docker") {
+    if (qualifierEvidenceIsIncomplete(candidate, dependency, format)) return true;
+    const requestedPlatform = String(
+      dependency && dependency.qualifiers && dependency.qualifiers.platform || ""
+    ).trim();
+    return Boolean(
+      requestedPlatform
+      && exactPackageCandidateMatches(candidate, dependency, format, version)
+      && !dockerCandidateMatchesPlatform(candidate, requestedPlatform)
+    );
+  }
+  const candidateVersionMatches = format === "nuget"
+    ? normalizeNuGetVersion(candidate.version) === normalizeNuGetVersion(version)
+    : candidate.version === version;
+  return candidateVersionMatches
+    && qualifierEvidenceIsIncomplete(candidate, dependency, format);
+}
+
+function exactPackageCandidateBaseNameMatches(candidate, dependency, format) {
+  if (canonicalFormat(candidate && candidate.format) !== format) return false;
+  const dependencyName = String(dependency && dependency.name || "").trim();
+  if (!dependencyName) return false;
+  if (format === "maven" && dependencyName.includes(":")) {
+    const expectedName = normalizePackageName(dependencyName, format);
+    return getCloudsmithPackageLookupKeys(candidate, format)
+      .some(key => key.includes(":") && key === expectedName);
+  }
+  const expectedKeys = new Set(getPackageLookupKeys(
+    dependencyName,
+    format,
+    dependency && (dependency.identifiers || dependency.qualifiers)
+  ));
+  return getCloudsmithPackageLookupKeys(candidate, format)
+    .some(key => expectedKeys.has(key));
+}
+
 function mavenCandidateContainsRequestedArtifact(candidate, dependency) {
-  const qualifiers = dependency?.qualifiers;
-  const hasArtifactQualifier = qualifiers
-    && typeof qualifiers === "object"
-    && (Object.prototype.hasOwnProperty.call(qualifiers, "classifier")
-      || Object.prototype.hasOwnProperty.call(qualifiers, "type"));
-  if (!hasArtifactQualifier) return true;
   const expectedFileName = mavenArtifactFileName(dependency);
   if (!expectedFileName || !Array.isArray(candidate?.files)) return false;
   return candidate.files.some(file => (

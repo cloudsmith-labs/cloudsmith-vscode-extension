@@ -26,7 +26,12 @@ const {
 const { fetchWorkspaceRepositories } = require("../util/workspaceRepositoryFetcher");
 const { SearchQueryBuilder } = require("../util/searchQueryBuilder");
 const {
+  packageCandidateEvidenceShapeIsValid,
+  qualifierEvidenceIsIncomplete,
+} = require("../util/exactPackageEvidence");
+const {
   dockerCandidateMatchesPlatform,
+  dockerDigestMatches,
   mavenArtifactFileName,
   normalizeNuGetVersion,
   rubyCandidateMatchesPlatform,
@@ -83,6 +88,7 @@ const LOOKUP_MAX_PACKAGE_FORMAT_LENGTH = 100;
 const LOOKUP_MAX_PACKAGE_VERSION_LENGTH = 2048;
 const COVERAGE_MATCH_BATCH_SIZE = 50;
 const ENRICHMENT_PROGRESS_DEBOUNCE_MS = 500;
+const LOOKUP_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
 
 const CLOUDSMITH_COVERAGE_STATUS = Object.freeze({
   CHECKING: "CHECKING",
@@ -901,9 +907,9 @@ class DependencyHealthProvider {
       cancellationToken: token,
     });
     if (typeof this._dependencyAdapters.getDiscoveryWarnings === "function") {
-      warnings.push(...this._dependencyAdapters.getDiscoveryWarnings().map(
-        safeDiscoveryWarning
-      ));
+      for (const warning of this._dependencyAdapters.getDiscoveryWarnings()) {
+        appendUniqueWarning(warnings, safeDiscoveryWarning(warning));
+      }
     }
     if (token.isCancellationRequested) {
       return { canceled: true };
@@ -963,7 +969,9 @@ class DependencyHealthProvider {
             coveredManifestPaths.add(path.resolve(sourceManifestPath));
           }
           if (result.warnings.length > 0) {
-            warnings.push(...result.warnings.map(createSafeAdapterWarning));
+            for (const warning of result.warnings) {
+              warnings.push(createSafeAdapterWarning(warning));
+            }
           }
         }
       }
@@ -993,6 +1001,7 @@ class DependencyHealthProvider {
       this._fullTrees = [];
       this._summary = emptySummary();
       this._statusMessage = null;
+      this._warnings = warnings.slice();
       if (this._lastManifests.length === 0) {
         this._noManifestsFolder = path.basename(folderPath);
       }
@@ -1014,6 +1023,7 @@ class DependencyHealthProvider {
       this._fullTrees = [];
       this._summary = emptySummary();
       this._statusMessage = null;
+      this._warnings = warnings.slice();
       await this._storeReportData(this._reportDateFactory());
       return { canceled: false };
     }
@@ -1027,7 +1037,7 @@ class DependencyHealthProvider {
     if (limited.truncated) {
       const warning = "Dependency display reached its configured safety limit; "
         + "the complete resolved inventory remains available to the scan pipeline.";
-      this._warnings.push(warning);
+      appendUniqueWarning(this._warnings, warning);
     }
     this._statusMessage = null;
     this._rebuildSummary();
@@ -1077,19 +1087,13 @@ class DependencyHealthProvider {
         || result.status === ADAPTER_RESULT_STATUSES.UNSUPPORTED
       ) {
         const message = createSafeAdapterError(result.error).message;
-        if (!warnings.includes(message)) {
-          warnings.push(message);
-        }
-        if (!parserErrors.includes(message)) {
-          parserErrors.push(message);
-        }
+        warnings.push(message);
+        parserErrors.push(message);
         continue;
       }
       for (const warning of result.warnings || []) {
         const safeWarning = createSafeAdapterWarning(warning);
-        if (!warnings.includes(safeWarning)) {
-          warnings.push(safeWarning);
-        }
+        warnings.push(safeWarning);
       }
       if (
         ![
@@ -1161,7 +1165,9 @@ class DependencyHealthProvider {
         progress,
         token,
         progressLabel,
-        requestBudget
+        requestBudget,
+        options.verificationReceipt || null,
+        options.verificationReceipts || null
       );
     }
 
@@ -1274,7 +1280,9 @@ class DependencyHealthProvider {
     progress,
     token,
     progressLabel = "Matching coverage",
-    requestBudget = null
+    requestBudget = null,
+    verificationReceipt = null,
+    verificationReceipts = null
   ) {
     const uniqueDependencies = dependencies.slice();
     const api = uniqueDependencies.some((dependency) => getConcreteDependencyVersion(dependency))
@@ -1297,6 +1305,9 @@ class DependencyHealthProvider {
 
         let result;
         try {
+          const dependencyVerificationReceipt = verificationReceipts instanceof Map
+            ? verificationReceipts.get(getDependencyArtifactKey(dependency)) || null
+            : verificationReceipt;
           result = await lookupExactDependency({
             api,
             cloudsmithWorkspace,
@@ -1304,6 +1315,7 @@ class DependencyHealthProvider {
             dependency,
             token,
             requestBudget,
+            verificationReceipt: dependencyVerificationReceipt,
           });
         } catch {
           result = createCoverageLookupResult(
@@ -1678,7 +1690,8 @@ class DependencyHealthProvider {
               execution.workspace,
               execution.repository.slug,
               progress,
-              cancellationSource.token
+              cancellationSource.token,
+              { verificationReceipts: execution.verificationReceipts }
             );
 
             if (cancellationSource.token.isCancellationRequested) {
@@ -1852,12 +1865,16 @@ class DependencyHealthProvider {
             const pullDetail = getSingleDependencyPullDetail(execution.pullResult);
             if (isSuccessfulSingleDependencyPull(pullDetail)) {
               progress.report({ message: "Refreshing Cloudsmith coverage..." });
+              const verificationReceipt = execution.verificationReceipts instanceof Map
+                ? execution.verificationReceipts.get(getDependencyArtifactKey(prepared.dependency))
+                : null;
               await this._refreshSingleDependencyAfterPull(
                 prepared.workspace,
                 prepared.repository.slug,
                 prepared.dependency,
                 progress,
-                cancellationSource.token
+                cancellationSource.token,
+                { verificationReceipt }
               );
             }
 
@@ -1909,24 +1926,41 @@ class DependencyHealthProvider {
     }
   }
 
-  async _refreshCoverageAfterPull(cloudsmithWorkspace, cloudsmithRepo, progress, token) {
+  async _refreshCoverageAfterPull(
+    cloudsmithWorkspace,
+    cloudsmithRepo,
+    progress,
+    token,
+    options = {}
+  ) {
     await this._refreshCoverageForDependencies(
       cloudsmithWorkspace,
       cloudsmithRepo,
       null,
       progress,
       token,
-      { refreshRemainingUpstream: true }
+      {
+        refreshRemainingUpstream: true,
+        verificationReceipts: options.verificationReceipts || null,
+      }
     );
   }
 
-  async _refreshSingleDependencyAfterPull(cloudsmithWorkspace, cloudsmithRepo, dependency, progress, token) {
+  async _refreshSingleDependencyAfterPull(
+    cloudsmithWorkspace,
+    cloudsmithRepo,
+    dependency,
+    progress,
+    token,
+    options = {}
+  ) {
     await this._refreshCoverageForDependencies(
       cloudsmithWorkspace,
       cloudsmithRepo,
       [dependency],
       progress,
-      token
+      token,
+      { verificationReceipt: options.verificationReceipt || null }
     );
   }
 
@@ -1982,6 +2016,8 @@ class DependencyHealthProvider {
       {
         packageIndexFailureVerb: "refresh",
         progressLabel: "Refreshing Cloudsmith coverage",
+        verificationReceipt: options.verificationReceipt || null,
+        verificationReceipts: options.verificationReceipts || null,
       }
     );
 
@@ -2139,7 +2175,11 @@ class DependencyHealthProvider {
       return nodes;
     }
 
-    if (!this._hasSuccessfulScan && this._scanOperation.status === SCAN_STATES.IDLE) {
+    if (
+      !this._hasSuccessfulScan
+      && this._scanOperation.status === SCAN_STATES.IDLE
+      && this._warnings.length === 0
+    ) {
       return [
         new InfoNode(
           "Scan dependencies",
@@ -2151,6 +2191,15 @@ class DependencyHealthProvider {
       ];
     }
 
+    if (this._warnings.length > 0) {
+      nodes.push(new InfoNode(
+        this._warnings[0],
+        "",
+        this._warnings.join("\n"),
+        "warning",
+        "statusMessage"
+      ));
+    }
     nodes.push(new InfoNode(
       "No dependencies found",
       "",
@@ -2537,6 +2586,7 @@ async function lookupExactDependency({
   dependency,
   token,
   requestBudget = null,
+  verificationReceipt = null,
 }) {
   if (dependency && dependency.lookupEligibility
     && dependency.lookupEligibility.state === "unresolved") {
@@ -2584,6 +2634,7 @@ async function lookupExactDependency({
   }
 
   let pagesFetched = 0;
+  let incompleteQualifierEvidence = false;
   for (const lookupName of lookupNames) {
     const queryBuilder = new SearchQueryBuilder()
       .format(format)
@@ -2591,7 +2642,17 @@ async function lookupExactDependency({
     if (format !== "docker") {
       queryBuilder.version(lookupVersion);
     }
-    const query = queryBuilder.build();
+    let query;
+    try {
+      query = queryBuilder.build();
+    } catch {
+      return createCoverageLookupResult(
+        CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED,
+        null,
+        "The Cloudsmith package identity exceeded the safe query boundary.",
+        pagesFetched
+      );
+    }
     let page = 1;
     let paginationAnchor = null;
     const seenPackageIdentities = new Set();
@@ -2698,10 +2759,16 @@ async function lookupExactDependency({
       for (const identity of pageIdentities) seenPackageIdentities.add(identity);
       pagesFetched += 1;
       accumulatedCandidates.push(...response.data);
+      if (accumulatedCandidates.some(candidate => (
+        coverageCandidateEvidenceIsIncomplete(candidate, dependency, format, lookupVersion)
+      ))) {
+        incompleteQualifierEvidence = true;
+      }
       const match = matchCoverageCandidates(
         accumulatedCandidates,
         dependency,
-        lookupVersion
+        lookupVersion,
+        verificationReceipt
       );
       if (match) {
         let canonicalMatch;
@@ -2748,6 +2815,15 @@ async function lookupExactDependency({
       }
       page += 1;
     }
+  }
+
+  if (incompleteQualifierEvidence) {
+    return createCoverageLookupResult(
+      CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE,
+      null,
+      "Cloudsmith did not return enough artifact evidence to prove package absence.",
+      pagesFetched
+    );
   }
 
   return createCoverageLookupResult(
@@ -3000,6 +3076,7 @@ function isPackageCandidateArray(value, expectedWorkspace, expectedRepository) {
       && boundedExactLookupString(candidate.version, LOOKUP_MAX_PACKAGE_VERSION_LENGTH)
       && candidate.namespace === expectedWorkspace
       && (!expectedRepository || candidate.repository === expectedRepository)
+      && packageCandidateEvidenceShapeIsValid(candidate)
       && Boolean(getPackagePolicyFlags(candidate))
       && Boolean(packageCandidateIdentity(candidate))
     ));
@@ -3018,7 +3095,7 @@ function boundedExactLookupString(value, maxLength) {
     && value.length > 0
     && value.length <= maxLength
     && value.trim() === value
-    && !/[\u0000-\u001f\u007f]/.test(value);
+    && !LOOKUP_CONTROL_OR_BIDI.test(value);
 }
 
 function isLookupEligibleForConsumer(dependency) {
@@ -3264,7 +3341,12 @@ function findCoverageMatch(packageIndex, dependency) {
   return null;
 }
 
-function matchCoverageCandidates(candidates, dependency, expectedVersion = getConcreteDependencyVersion(dependency)) {
+function matchCoverageCandidates(
+  candidates,
+  dependency,
+  expectedVersion = getConcreteDependencyVersion(dependency),
+  verificationReceipt = null
+) {
   if (!expectedVersion) {
     return null;
   }
@@ -3276,13 +3358,29 @@ function matchCoverageCandidates(candidates, dependency, expectedVersion = getCo
     ? normalizeNuGetVersion(expectedVersion)
     : String(expectedVersion).trim();
   const candidateList = Array.isArray(candidates) ? candidates : [];
+  const requestedDockerPlatform = dependencyFormat === "docker"
+    ? String(dependency && dependency.qualifiers && dependency.qualifiers.platform || "").trim()
+    : "";
 
   for (const candidate of candidateList) {
     const candidateFormat = canonicalFormat(candidate && (candidate.format || candidate.ecosystem));
     if (!dependencyFormat || candidateFormat !== dependencyFormat) {
       continue;
     }
-    if (!packageNameMatchesDependency(candidate, dependency)) {
+    const nameMatches = packageNameMatchesDependency(candidate, dependency)
+      || (
+        dependencyFormat === "swift"
+        && verificationReceipt?.swiftScopeVerified === true
+        && coverageCandidateBaseNameMatches(candidate, dependency, dependencyFormat)
+      );
+    if (!nameMatches) {
+      continue;
+    }
+    if (
+      requestedDockerPlatform
+      && verificationReceipt?.dockerPlatformVerified !== true
+      && !dockerCandidateMatchesPlatform(candidate, requestedDockerPlatform)
+    ) {
       continue;
     }
     const dockerTags = dependencyFormat === "docker" && Array.isArray(candidate?.tags?.version)
@@ -3296,14 +3394,59 @@ function matchCoverageCandidates(candidates, dependency, expectedVersion = getCo
       ? normalizeNuGetVersion(observedVersion) === normalizedExpectedVersion
       : observedVersion === normalizedExpectedVersion;
     const digestMatches = requestedDigest
-      && observedVersion.toLowerCase().replace(/^[a-z0-9_+.-]+:/, "")
-        === requestedDigest.replace(/^[a-z0-9_+.-]+:/, "");
+      && dockerDigestMatches(observedVersion, requestedDigest);
     const tagMatches = dockerTags.some(tag => String(tag) === normalizedExpectedVersion);
     if (dependencyFormat === "docker" ? (requestedDigest ? digestMatches : tagMatches) : versionMatches) {
       return candidate;
     }
   }
   return null;
+}
+
+function coverageCandidateEvidenceIsIncomplete(candidate, dependency, format, expectedVersion) {
+  if (!coverageCandidateBaseNameMatches(candidate, dependency, format)) return false;
+  if (format === "docker") {
+    if (qualifierEvidenceIsIncomplete(candidate, dependency, format)) return true;
+    const requestedPlatform = String(
+      dependency && dependency.qualifiers && dependency.qualifiers.platform || ""
+    ).trim();
+    if (!requestedPlatform) return false;
+    const dockerTags = Array.isArray(candidate && candidate.tags && candidate.tags.version)
+      ? candidate.tags.version
+      : [];
+    const requestedDigest = String(
+      dependency && dependency.qualifiers && dependency.qualifiers.digest
+      || dependency && dependency.digest
+      || ""
+    ).trim();
+    const identityMatches = requestedDigest
+      ? dockerDigestMatches(candidate && candidate.version, requestedDigest)
+      : dockerTags.some(tag => String(tag) === String(expectedVersion));
+    return identityMatches && !dockerCandidateMatchesPlatform(candidate, requestedPlatform);
+  }
+  const versionMatches = format === "nuget"
+    ? normalizeNuGetVersion(candidate.version) === normalizeNuGetVersion(expectedVersion)
+    : String(candidate.version || "").trim() === String(expectedVersion || "").trim();
+  return versionMatches && qualifierEvidenceIsIncomplete(candidate, dependency, format);
+}
+
+function coverageCandidateBaseNameMatches(candidate, dependency, format) {
+  if (canonicalFormat(candidate && (candidate.format || candidate.ecosystem)) !== format) {
+    return false;
+  }
+  const dependencyName = packageIdentityName(dependency && dependency.name, format);
+  if (!dependencyName) return false;
+  if (format === "maven" && dependencyName.includes(":")) {
+    return getCaseAwareCloudsmithPackageLookupKeys(candidate, format)
+      .some(key => key.includes(":") && key === dependencyName);
+  }
+  const expectedKeys = new Set(getCaseAwarePackageLookupKeys(
+    dependency && dependency.name,
+    format,
+    dependency && dependency.qualifiers
+  ));
+  return getCaseAwareCloudsmithPackageLookupKeys(candidate, format)
+    .some(key => expectedKeys.has(key));
 }
 
 function packageNameMatchesDependency(candidate, dependency) {
@@ -3336,13 +3479,6 @@ function packageNameMatchesDependency(candidate, dependency) {
   }
 
   if (
-    format === "docker"
-    && !dockerCandidateMatchesPlatform(candidate, dependency?.qualifiers?.platform)
-  ) {
-    return false;
-  }
-
-  if (
     format === "ruby"
     && !rubyCandidateMatchesPlatform(candidate, dependency?.qualifiers?.platform)
   ) {
@@ -3355,12 +3491,6 @@ function packageNameMatchesDependency(candidate, dependency) {
 }
 
 function mavenCandidateContainsRequestedArtifact(candidate, dependency) {
-  const qualifiers = dependency?.qualifiers;
-  const hasArtifactQualifier = qualifiers
-    && typeof qualifiers === "object"
-    && (Object.prototype.hasOwnProperty.call(qualifiers, "classifier")
-      || Object.prototype.hasOwnProperty.call(qualifiers, "type"));
-  if (!hasArtifactQualifier) return true;
   const expectedFileName = mavenArtifactFileName(
     dependency,
     getConcreteDependencyVersion(dependency)

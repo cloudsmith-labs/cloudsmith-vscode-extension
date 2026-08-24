@@ -76,6 +76,39 @@ const DEPENDENCY_FILE_ADAPTER_ERROR_CODES = Object.freeze({
 });
 const MAX_STRUCTURAL_GRAPH_ENTRIES = 50000;
 const MAX_STRUCTURAL_GRAPH_EDGES = 500000;
+const SAFE_DOCKER_ADAPTER_WARNINGS = new Map([
+  [
+    "a dockerfile target platform could not be resolved, so dependency results are partial.",
+    "A Dockerfile target platform could not be resolved; affected dependencies remain incomplete.",
+  ],
+  [
+    "a compose image reference could not be resolved, so dependency results are partial.",
+    "A Compose image reference could not be resolved; affected dependencies were omitted.",
+  ],
+  [
+    "a compose image platform could not be resolved, so dependency results are partial.",
+    "A Compose image platform could not be resolved; affected dependencies remain incomplete.",
+  ],
+  [
+    "a compose image platform was invalid and could not be checked.",
+    "A Compose image platform was invalid; affected dependencies remain incomplete.",
+  ],
+  [
+    "a compose pull policy could not be resolved, so dependency results are partial.",
+    "A Compose pull policy could not be resolved; affected services were omitted.",
+  ],
+  [
+    "a compose service requests a local build but has no usable build definition.",
+    "A Compose service requested a local build without a usable build definition.",
+  ],
+  [
+    "a compose image reference was invalid and could not be checked.",
+    "A Compose image reference was invalid; affected dependencies were omitted.",
+  ],
+]);
+for (const safeWarning of SAFE_DOCKER_ADAPTER_WARNINGS.values()) {
+  SAFE_DOCKER_ADAPTER_WARNINGS.set(safeWarning.toLowerCase(), safeWarning);
+}
 
 const RESOLUTION_AVAILABILITY = Object.freeze({
   AVAILABLE: "available",
@@ -1155,6 +1188,9 @@ function createAdapterResult(values) {
 
 function createSafeAdapterWarning(warning) {
   const normalized = boundedAdapterText(String(warning || ""), "warning").toLowerCase();
+  if (SAFE_DOCKER_ADAPTER_WARNINGS.has(normalized)) {
+    return SAFE_DOCKER_ADAPTER_WARNINGS.get(normalized);
+  }
   if (normalized.includes("display is capped") || normalized.includes("display reached")) {
     return "Dependency display reached its configured safety limit.";
   }

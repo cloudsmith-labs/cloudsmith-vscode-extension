@@ -20,6 +20,7 @@ const {
 } = require("../util/collectionIdentity");
 const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const { ContextKeyProjector } = require("../util/contextKeyProjector");
+const { isValidAdvancedQuery } = require("../util/searchQueryBuilder");
 
 const MAX_RESULTS = 5000;
 const MAX_REPOSITORIES = 1000;
@@ -1216,7 +1217,11 @@ function normalizeDescriptor(value) {
         "workspace",
         MAX_WORKSPACE_LENGTH
     );
-    if (typeof value.query !== "string" || value.query.length > MAX_QUERY_LENGTH) {
+    if (
+        typeof value.query !== "string"
+        || value.query.length > MAX_QUERY_LENGTH
+        || !isValidAdvancedQuery(value.query)
+    ) {
         throw new Error("Could not search packages. The search query was invalid.");
     }
     const query = value.query;

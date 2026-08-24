@@ -123,6 +123,18 @@ suite("RecentSearches", () => {
     })), /descriptor is invalid/);
   });
 
+  test("rejects control and bidi-bearing queries at persistence boundaries", async () => {
+    const searches = recent();
+    await assert.rejects(
+      searches.add(descriptor({ query: "name:flask\nOR name:django" })),
+      /descriptor is invalid/
+    );
+    await assert.rejects(
+      searches.add(descriptor({ query: "name:flask\u202e" })),
+      /descriptor is invalid/
+    );
+  });
+
   test("caps entries and keeps newest-first order", async () => {
     const searches = recent();
     for (let index = 0; index < 12; index += 1) {

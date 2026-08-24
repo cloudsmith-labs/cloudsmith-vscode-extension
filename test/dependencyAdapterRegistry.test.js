@@ -6,6 +6,7 @@ const {
   ADAPTER_RESULT_STATUSES,
   DependencyAdapterRegistry,
   createDefaultDependencyAdapterRegistry,
+  createSafeAdapterWarning,
 } = require("../util/dependencyAdapterRegistry");
 const {
   DEPENDENCY_VERSION_STATES,
@@ -43,6 +44,32 @@ suite("dependencyAdapterRegistry", () => {
       },
     };
   }
+
+  test("preserves code-owned Docker and Compose warning classes at the UI boundary", () => {
+    const fixtures = [
+      [
+        "A Dockerfile target platform could not be resolved, so dependency results are partial.",
+        "A Dockerfile target platform could not be resolved; affected dependencies remain incomplete.",
+      ],
+      [
+        "A Compose image reference could not be resolved, so dependency results are partial.",
+        "A Compose image reference could not be resolved; affected dependencies were omitted.",
+      ],
+      [
+        "A Compose image platform could not be resolved, so dependency results are partial.",
+        "A Compose image platform could not be resolved; affected dependencies remain incomplete.",
+      ],
+      [
+        "A Compose image platform was invalid and could not be checked.",
+        "A Compose image platform was invalid; affected dependencies remain incomplete.",
+      ],
+    ];
+
+    for (const [warning, expected] of fixtures) {
+      assert.strictEqual(createSafeAdapterWarning(warning), expected);
+      assert.strictEqual(createSafeAdapterWarning(expected), expected);
+    }
+  });
 
   suiteTeardown(async () => {
     await Promise.all(tempDirs.map((tempDir) => removeDirectory(tempDir)));

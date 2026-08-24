@@ -23,6 +23,7 @@ const {
   RESOLUTION_SOURCE_KINDS,
   createDependencyRecord,
   createDependencySource,
+  getDependencyArtifactKey,
 } = require("../util/dependencyRecord");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { bindConnectionManager } = require("../util/connectionManager");
@@ -1782,6 +1783,104 @@ suite("DependencyHealthProvider Test Suite", () => {
     }
   });
 
+  test("_performScan preserves identical file-level warnings from separate Dockerfiles", async () => {
+    const originalGetConfiguration = vscode.workspace.getConfiguration;
+    vscode.workspace.getConfiguration = () => ({ get: () => 10000 });
+    const warning = "A Dockerfile target platform could not be resolved; affected dependencies remain incomplete.";
+    const detections = ["/project/api/Dockerfile", "/project/worker/Dockerfile"].map(filePath => ({
+      adapterId: "dockerParser",
+      ecosystem: "docker",
+      filePath,
+    }));
+    const dependencyAdapters = {
+      async detectManifests() { return []; },
+      getDiscoveryWarnings() { return []; },
+      async detect() { return detections; },
+      async parse(detection) {
+        return {
+          status: ADAPTER_RESULT_STATUSES.PARTIAL,
+          adapterId: "dockerParser",
+          ecosystem: "docker",
+          sourceFile: detection.filePath,
+          source: null,
+          dependencies: [],
+          warnings: [warning],
+          error: null,
+        };
+      },
+    };
+
+    try {
+      const provider = new DependencyHealthProvider(createContext(), null, { dependencyAdapters });
+      provider._storeReportData = async () => {};
+
+      const result = await provider._performScan(
+        "workspace-a",
+        "repo-a",
+        "/project",
+        { report() {} },
+        { isCancellationRequested: false }
+      );
+
+      assert.deepStrictEqual(result, { canceled: false });
+      assert.deepStrictEqual(provider._warnings, [
+        "A Dockerfile target platform could not be resolved; affected dependencies remain incomplete.",
+        "A Dockerfile target platform could not be resolved; affected dependencies remain incomplete.",
+      ]);
+      const renderedLabels = (await provider.getChildren()).map(node => node.getTreeItem().label);
+      assert.strictEqual(renderedLabels.filter(label => label === warning).length, 1);
+      assert.ok(renderedLabels.includes("No dependencies found"));
+    } finally {
+      vscode.workspace.getConfiguration = originalGetConfiguration;
+    }
+  });
+
+  test("_performScan preserves fallback warnings from separate Dockerfiles", async () => {
+    const originalGetConfiguration = vscode.workspace.getConfiguration;
+    vscode.workspace.getConfiguration = () => ({
+      get(key) { return key === "resolveTransitiveDependencies" ? false : 10000; },
+    });
+    const warning = "A Dockerfile target platform could not be resolved; affected dependencies remain incomplete.";
+    const manifests = ["/project/api/Dockerfile", "/project/worker/Dockerfile"].map(filePath => ({
+      adapterId: "dockerParser",
+      ecosystem: "docker",
+      filePath,
+    }));
+    const dependencyAdapters = {
+      async detectManifests() { return manifests; },
+      getDiscoveryWarnings() { return []; },
+      async parseManifest(manifest) {
+        return {
+          status: ADAPTER_RESULT_STATUSES.PARTIAL,
+          adapterId: "dockerParser",
+          ecosystem: "docker",
+          sourceFile: manifest.filePath,
+          source: null,
+          dependencies: [],
+          warnings: [warning],
+          error: null,
+        };
+      },
+    };
+
+    try {
+      const provider = new DependencyHealthProvider(createContext(), null, { dependencyAdapters });
+      provider._storeReportData = async () => {};
+
+      await provider._performScan(
+        "workspace-a",
+        "repo-a",
+        "/project",
+        { report() {} },
+        { isCancellationRequested: false }
+      );
+
+      assert.deepStrictEqual(provider._warnings, [warning, warning]);
+    } finally {
+      vscode.workspace.getConfiguration = originalGetConfiguration;
+    }
+  });
+
   test("_performScan composes lock-backed and uncovered manifest-only projects", async () => {
     const originalGetConfiguration = vscode.workspace.getConfiguration;
     vscode.workspace.getConfiguration = () => ({ get: () => 10000 });
@@ -2139,16 +2238,14 @@ suite("DependencyHealthProvider Test Suite", () => {
       format: "docker",
       tags: { version: ["stable"] },
     };
+    const taggedManifestWithDifferentPlatformMetadata = {
+      ...dockerTagCandidate,
+      version: "b".repeat(64),
+      architectures: [{ name: "amd64" }],
+      identifiers: { architecture: "amd64", docker_platform_os: "linux" },
+    };
     assert.strictEqual(matchCoverageCandidates([
-      {
-        ...dockerTagCandidate,
-        name: "library/example",
-        version: "b".repeat(64),
-        format: "docker",
-        tags: { version: ["stable"] },
-        architectures: [{ name: "amd64" }],
-        identifiers: { architecture: "amd64", docker_platform_os: "linux" },
-      },
+      taggedManifestWithDifferentPlatformMetadata,
     ], dockerPlatformDependency), null);
     assert.strictEqual(matchCoverageCandidates([
       dockerTagCandidate,
@@ -2160,11 +2257,33 @@ suite("DependencyHealthProvider Test Suite", () => {
         identifiers: { architecture: "arm64", docker_platform_os: "linux" },
       },
     ], dockerPlatformDependency), null);
+
+    const digestHex = "d".repeat(64);
+    const algorithmQualifiedDependency = {
+      ...createDependency("example", `sha256:${digestHex}`, "docker"),
+      qualifiers: { digest: `sha256:${digestHex}` },
+    };
+    assert.strictEqual(matchCoverageCandidates([{
+      name: "library/example",
+      version: `sha512:${digestHex}`,
+      format: "docker",
+    }], algorithmQualifiedDependency), null);
     assert.ok(matchCoverageCandidates([{
-      ...dockerTagCandidate,
-      architectures: [{ name: "arm64" }],
-      identifiers: { architecture: "arm64", docker_platform_os: "linux" },
-    }], dockerPlatformDependency));
+      name: "library/example",
+      version: digestHex,
+      format: "docker",
+    }], algorithmQualifiedDependency));
+
+    const swiftCandidate = {
+      namespace: "acme",
+      name: "logging",
+      version: "1.2.3",
+      format: "swift",
+    };
+    assert.strictEqual(matchCoverageCandidates([swiftCandidate], {
+      ...createDependency("acme.logging", "1.2.3", "swift"),
+      qualifiers: { scope: "acme" },
+    }), null);
 
     const mavenDependency = {
       ...createDependency("com.example:demo", "1.2.3", "maven"),
@@ -2533,6 +2652,48 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.ok(query.includes("version:1.0.0"));
   });
 
+  test("exact lookup does not accept a cross-package result for a leading modifier-like name", async () => {
+    const api = createLookupApi(() => lookupPage([{
+      name: "target-package",
+      version: "1.0.0",
+      format: "npm",
+    }]));
+
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency("+-target-package", "1.0.0"),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.ABSENT);
+    const query = new URL(api.calls[0], "https://api.cloudsmith.io/v1/")
+      .searchParams.get("query");
+    assert.ok(query.includes("name:\\+\\-target-package"));
+  });
+
+  test("exact lookup still finds an exact leading modifier-like identity", async () => {
+    const expectedPackage = {
+      name: "--target-package",
+      version: "1.0.0-beta+build",
+      format: "npm",
+    };
+    const api = createLookupApi(() => lookupPage([expectedPackage]));
+
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: createDependency(expectedPackage.name, expectedPackage.version),
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
+    assert.strictEqual(result.package.name, expectedPackage.name);
+    assert.strictEqual(result.package.version, expectedPackage.version);
+  });
+
   test("exact lookup follows pagination until a later-page match is found", async () => {
     const expectedPackage = { name: "left-pad", version: "1.0.0", format: "npm" };
     const api = createLookupApi((endpoint) => {
@@ -2755,6 +2916,31 @@ suite("DependencyHealthProvider Test Suite", () => {
         namespace: "workspace",
         repository: "repo",
         slug_perm: null,
+      },
+      {
+        name: "left-pad",
+        version: "1.0.0",
+        format: "npm",
+        namespace: "workspace",
+        repository: "repo",
+        slug_perm: "left-pad\u202e",
+      },
+      {
+        name: "left-pad",
+        version: "1.0.0",
+        format: "npm",
+        namespace: "workspace",
+        repository: "repo",
+        slug_perm: "left-pad",
+        identifiers: { group_id: { hostile: true } },
+      },
+      {
+        name: "left-pad\u202e",
+        version: "1.0.0",
+        format: "npm",
+        namespace: "workspace",
+        repository: "repo",
+        slug_perm: "left-pad-bidi",
       },
     ]) {
       const result = await lookupExactDependency({
@@ -3037,6 +3223,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       version: "1.0.0",
       format: "maven",
       identifiers: { group_id: "com.expected" },
+      files: [{ filename: "shared-artifact-1.0.0.jar" }],
     };
     const api = createLookupApi((endpoint) => {
       const page = Number(new URL(endpoint, "https://api.cloudsmith.io/v1/").searchParams.get("page"));
@@ -3046,6 +3233,7 @@ suite("DependencyHealthProvider Test Suite", () => {
           version: "1.0.0",
           format: "maven",
           identifiers: { group_id: "com.wrong" },
+          files: [{ filename: "shared-artifact-1.0.0.jar" }],
         }], 1, 2, 2, 1)
         : lookupPage([correct], 2, 2, 2, 1);
     });
@@ -3067,6 +3255,118 @@ suite("DependencyHealthProvider Test Suite", () => {
       "https://api.cloudsmith.io/v1/"
     ).searchParams.get("query").replace(/\\/g, "");
     assert.ok(firstQuery.includes("name:com.expected:shared-artifact"));
+  });
+
+  test("coverage lookup remains incomplete when exact qualifier evidence is omitted", async () => {
+    const api = createLookupApi(() => lookupPage([{
+      name: "demo",
+      version: "1.2.3",
+      format: "maven",
+      identifiers: { group_id: "com.example" },
+    }]));
+    const dependency = {
+      ...createDependency("com.example:demo", "1.2.3", "maven"),
+      qualifiers: { type: "test-jar", classifier: "tests" },
+    };
+
+    const result = await lookupExactDependency({
+      api,
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency,
+      token: { isCancellationRequested: false },
+    });
+
+    assert.strictEqual(result.status, CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE);
+    assert.match(result.detail, /artifact evidence/i);
+  });
+
+  test("post-pull receipts preserve verified Docker platform and Swift scope coverage", async () => {
+    const dockerDependency = {
+      ...createDependency("alpine", "3.20.3", "docker"),
+      qualifiers: { tag: "3.20.3", platform: "linux/arm64" },
+    };
+    const dockerCandidate = {
+      name: "library/alpine",
+      version: "a".repeat(64),
+      format: "docker",
+      tags: { version: ["3.20.3"] },
+    };
+    const docker = await lookupExactDependency({
+      api: createLookupApi(() => lookupPage([dockerCandidate])),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: dockerDependency,
+      token: { isCancellationRequested: false },
+      verificationReceipt: { dockerPlatformVerified: true },
+    });
+    assert.strictEqual(docker.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
+
+    const swiftDependency = {
+      ...createDependency("acme.logging", "1.2.3", "swift"),
+      qualifiers: { scope: "acme" },
+    };
+    const swift = await lookupExactDependency({
+      api: createLookupApi(() => lookupPage([{
+        name: "logging",
+        version: "1.2.3",
+        format: "swift",
+      }])),
+      cloudsmithWorkspace: "workspace",
+      cloudsmithRepo: "repo",
+      dependency: swiftDependency,
+      token: { isCancellationRequested: false },
+      verificationReceipt: { swiftScopeVerified: true },
+    });
+    assert.strictEqual(swift.status, CLOUDSMITH_COVERAGE_STATUS.FOUND);
+  });
+
+  test("bulk coverage refresh applies verification receipts only to their exact artifacts", async () => {
+    const alpha = {
+      ...createProblemDependency("alpha", "1.0", "/project/Dockerfile", "docker"),
+      qualifiers: { tag: "1.0", platform: "linux/arm64" },
+    };
+    const beta = {
+      ...createProblemDependency("beta", "1.0", "/project/Dockerfile", "docker"),
+      qualifiers: { tag: "1.0", platform: "linux/arm64" },
+    };
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCloudsmithAPI: () => createLookupApi((endpoint) => lookupPage([{
+        namespace: "workspace",
+        repository: "repository",
+        name: endpoint.includes("alpha") ? "library/alpha" : "library/beta",
+        version: "a".repeat(64),
+        format: "docker",
+        tags: { version: ["1.0"] },
+      }])),
+    });
+    provider._fullTrees = [{ ecosystem: "docker", dependencies: [alpha, beta] }];
+    provider._displayTrees = provider._fullTrees;
+    provider.refresh = () => {};
+
+    await provider._runCoverageResolution(
+      "workspace",
+      "repository",
+      { docker: [alpha, beta] },
+      2,
+      { report() {} },
+      { isCancellationRequested: false },
+      {
+        verificationReceipts: new Map([[
+          getDependencyArtifactKey(alpha),
+          { dockerPlatformVerified: true },
+        ]]),
+      }
+    );
+
+    assert.strictEqual(
+      provider._fullTrees[0].dependencies[0].cloudsmithStatus,
+      CLOUDSMITH_COVERAGE_STATUS.FOUND
+    );
+    assert.strictEqual(
+      provider._fullTrees[0].dependencies[1].cloudsmithStatus,
+      CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
+    );
   });
 
   test("Maven and Go package identities preserve case", async () => {
@@ -3532,6 +3832,53 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(provider._displayTrees[0].dependencies[0].license.spdx, "Apache-2.0");
   });
 
+  test("pullDependencies transports per-artifact verification receipts into bulk refresh", async () => {
+    const dependency = createProblemDependency(
+      "bulk-package",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const verificationReceipts = new Map([[
+      getDependencyArtifactKey(dependency),
+      { dockerPlatformVerified: true },
+    ]]);
+    let refreshOptions = null;
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-b" },
+            plan: { skippedDependencies: [] },
+            verificationReceipts,
+            pullResult: null,
+          };
+        },
+      },
+    });
+    provider.lastWorkspace = "workspace-a";
+    provider.lastRepo = "repo-a";
+    provider._projectFolderPath = "/project";
+    provider._hasSuccessfulScan = true;
+    provider._fullTrees = [{ dependencies: [dependency] }];
+    provider._updateContexts = async () => {};
+    provider.refresh = () => {};
+    provider._refreshCoverageAfterPull = async (
+      _workspace,
+      _repo,
+      _progress,
+      _token,
+      options
+    ) => {
+      refreshOptions = options;
+    };
+
+    await provider.pullDependencies();
+
+    assert.strictEqual(refreshOptions.verificationReceipts, verificationReceipts);
+  });
+
   test("pullSingleDependency refreshes coverage after a successful single-package pull", async () => {
     const originalWithProgress = vscode.window.withProgress;
     const originalShowInformationMessage = vscode.window.showInformationMessage;
@@ -3568,10 +3915,14 @@ suite("DependencyHealthProvider Test Suite", () => {
               plan: { skippedDependencies: [] },
             };
           },
-          async execute(_prepared, options) {
+          async execute(prepared, options) {
             assert.strictEqual(options.token, preparationToken);
             return {
               canceled: false,
+              verificationReceipts: new Map([[
+                getDependencyArtifactKey(prepared.dependency),
+                { swiftScopeVerified: true },
+              ]]),
               pullResult: {
                 total: 1,
                 cached: 1,
@@ -3612,8 +3963,15 @@ suite("DependencyHealthProvider Test Suite", () => {
       }];
       provider._updateContexts = async () => {};
       provider.refresh = () => {};
-      provider._refreshSingleDependencyAfterPull = async (workspace, repo, dependency) => {
-        refreshArgs = { workspace, repo, dependency };
+      provider._refreshSingleDependencyAfterPull = async (
+        workspace,
+        repo,
+        dependency,
+        _progress,
+        _token,
+        options
+      ) => {
+        refreshArgs = { workspace, repo, dependency, options };
       };
 
       await provider.pullSingleDependency(pullCoordinate("requests", "2.31.0", "python"));
@@ -3623,6 +3981,9 @@ suite("DependencyHealthProvider Test Suite", () => {
       assert.strictEqual(refreshArgs.dependency.name, "requests");
       assert.strictEqual(refreshArgs.dependency.version, "2.31.0");
       assert.strictEqual(refreshArgs.dependency.format, "python");
+      assert.deepStrictEqual(refreshArgs.options, {
+        verificationReceipt: { swiftScopeVerified: true },
+      });
       assert.ok(preparationToken);
       assert.strictEqual(provider.lastRepo, "repo-a");
       assert.deepStrictEqual(notifications, ["requests@2.31.0 cached in repo-b"]);

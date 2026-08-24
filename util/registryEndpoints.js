@@ -1,10 +1,14 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const {
   canonicalFormat,
+  normalizeNuGetVersion,
   sanitizePackageNameInput,
 } = require("./packageNameNormalizer");
 
 const MAX_REGISTRY_VALUE_LENGTH = 4096;
+const MAX_REGISTRY_URL_LENGTH = 16384;
+const MAX_REGISTRY_DECODE_DEPTH = 8;
+const REGISTRY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
 const TRUSTED_REGISTRY_HOSTS = new Set([
   "cargo.cloudsmith.io",
   "composer.cloudsmith.io",
@@ -35,7 +39,7 @@ const DOCKER_MANIFEST_ACCEPT =
 const NPM_PACKUMENT_ACCEPT = "application/vnd.npm.install-v1+json, application/json";
 const DART_PACKAGE_ACCEPT = "application/vnd.pub.v2+json";
 const MAX_DOCKER_MANIFEST_DESCRIPTORS = 256;
-const DOCKER_DIGEST_PATTERN = /^[a-z0-9_+.-]+:[a-f0-9]{32,512}$/i;
+const DOCKER_DIGEST_PATTERN = /^([a-z0-9_+.-]+):([a-f0-9]{32,512})$/i;
 const DOCKER_BLOB_REDIRECT_HOST_SUFFIXES = Object.freeze([
   ".amazonaws.com",
   ".cloudfront.net",
@@ -63,25 +67,20 @@ function encodePathSegment(value) {
     !normalized
     || normalized !== raw
     || normalized.length > MAX_REGISTRY_VALUE_LENGTH
-    || /[\u0000-\u001f\u007f\\/?#]/.test(normalized)
+    || REGISTRY_CONTROL_OR_BIDI.test(normalized)
+    || /[\\/?#]/.test(normalized)
   ) {
     return "";
   }
 
-  let decoded = normalized;
-  for (let depth = 0; depth < 3; depth += 1) {
-    let next;
-    try {
-      next = decodeURIComponent(decoded);
-    } catch {
-      return "";
-    }
-    if (next === decoded) {
-      break;
-    }
-    decoded = next;
-  }
-  if (decoded === "." || decoded === ".." || /[\u0000-\u001f\u007f\\/?#]/.test(decoded)) {
+  const decoded = repeatedlyDecode(normalized);
+  if (
+    decoded == null
+    || decoded === "."
+    || decoded === ".."
+    || REGISTRY_CONTROL_OR_BIDI.test(decoded)
+    || /[\\/?#]/.test(decoded)
+  ) {
     return "";
   }
 
@@ -90,7 +89,7 @@ function encodePathSegment(value) {
 
 function encodePath(value) {
   const raw = String(value == null ? "" : value);
-  if (!raw || raw !== raw.trim() || /[\\?#\u0000-\u001f\u007f]/.test(raw)) {
+  if (!raw || raw !== raw.trim() || REGISTRY_CONTROL_OR_BIDI.test(raw) || /[\\?#]/.test(raw)) {
     return "";
   }
   const segments = raw.split("/");
@@ -145,24 +144,18 @@ function cargoIndexPath(crateName) {
   if (!encodedName) {
     return null;
   }
+  const prefix = cargoPrefix(normalized);
+  return prefix ? `${prefix}/${encodedName}` : null;
+}
 
-  if (normalized.length === 1) {
-    return `1/${encodedName}`;
-  }
-
-  if (normalized.length === 2) {
-    return `2/${encodedName}`;
-  }
-
-  if (normalized.length === 3) {
-    return `3/${encodePathSegment(normalized.slice(0, 1))}/${encodedName}`;
-  }
-
-  return [
-    encodePathSegment(normalized.slice(0, 2)),
-    encodePathSegment(normalized.slice(2, 4)),
-    encodedName,
-  ].join("/");
+function cargoPrefix(crateName, lowercase = false) {
+  const raw = String(crateName || "").trim();
+  const name = lowercase ? raw.toLowerCase() : raw;
+  if (!encodePathSegment(name)) return null;
+  if (name.length === 1) return "1";
+  if (name.length === 2) return "2";
+  if (name.length === 3) return `3/${encodePathSegment(name.slice(0, 1))}`;
+  return `${encodePathSegment(name.slice(0, 2))}/${encodePathSegment(name.slice(2, 4))}`;
 }
 
 function buildNpmPackagePath(name) {
@@ -201,41 +194,6 @@ function buildNpmPackagePath(name) {
     packumentPath: encodeURIComponent(`${scope}/${packageName}`),
     packageName: `${scope}/${packageName}`,
   };
-}
-
-function normalizeNuGetVersion(version) {
-  const raw = String(version || "").trim();
-  if (!raw || /[\u0000-\u001f\u007f\\/?#]/.test(raw)) {
-    return "";
-  }
-
-  const withoutMetadata = raw.split("+", 1)[0];
-  const separatorIndex = withoutMetadata.indexOf("-");
-  const release = separatorIndex >= 0
-    ? withoutMetadata.slice(0, separatorIndex)
-    : withoutMetadata;
-  const prerelease = separatorIndex >= 0
-    ? withoutMetadata.slice(separatorIndex + 1)
-    : "";
-  const releaseParts = release.split(".");
-  if (
-    releaseParts.length < 1
-    || releaseParts.length > 4
-    || releaseParts.some(part => !/^\d+$/.test(part))
-    || (separatorIndex >= 0 && !/^[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/.test(prerelease))
-  ) {
-    return "";
-  }
-
-  const normalizedRelease = releaseParts.map(part => part.replace(/^0+(?=\d)/, ""));
-  while (normalizedRelease.length < 3) {
-    normalizedRelease.push("0");
-  }
-  if (normalizedRelease.length === 4 && normalizedRelease[3] === "0") {
-    normalizedRelease.pop();
-  }
-
-  return `${normalizedRelease.join(".")}${prerelease ? `-${prerelease.toLowerCase()}` : ""}`;
 }
 
 function normalizeDockerImageName(name) {
@@ -310,9 +268,33 @@ function dockerVariantMatches(requested, observed) {
   return requested.architecture === "arm64" && requested.variant === "v8";
 }
 
+function dockerDigestMatches(observedValue, requestedValue) {
+  const observed = String(observedValue || "").trim().toLowerCase();
+  const requested = String(requestedValue || "").trim().toLowerCase();
+  if (!observed || !requested) return false;
+  const split = value => {
+    const match = value.match(DOCKER_DIGEST_PATTERN);
+    if (match && isDockerDigest(value)) return { algorithm: match[1], digest: match[2] };
+    if (!/^[a-f0-9]{32,512}$/.test(value)) return null;
+    return {
+      algorithm: value.length === 64 ? "sha256" : value.length === 128 ? "sha512" : "",
+      digest: value,
+    };
+  };
+  const observedDigest = split(observed);
+  const requestedDigest = split(requested);
+  if (!observedDigest || !requestedDigest) return false;
+  if (
+    observedDigest.algorithm !== requestedDigest.algorithm
+    && (observedDigest.algorithm || requestedDigest.algorithm)
+  ) {
+    return false;
+  }
+  return observedDigest.digest === requestedDigest.digest;
+}
+
 function rubyCandidateMatchesPlatform(candidate, platform) {
-  const requested = String(platform || "").trim().toLowerCase();
-  if (!requested) return true;
+  const requested = String(platform || "ruby").trim().toLowerCase() || "ruby";
   const observed = collectCandidateArchitectureValues(candidate)
     .map(value => String(value || "").trim().toLowerCase())
     .filter(Boolean);
@@ -447,16 +429,32 @@ function buildComposerCoordinates(name) {
   };
 }
 
-function buildSwiftCoordinates(name) {
+function buildSwiftCoordinates(name, qualifiers = {}) {
   const rawName = sanitizePackageNameInput(name);
-  const parts = rawName.split("/");
-  if (parts.length < 2 || parts.some(part => !encodePathSegment(part))) {
+  const rawScope = sanitizePackageNameInput(qualifiers && qualifiers.scope);
+  let scope = rawScope;
+  let packageName = rawName;
+  if (scope && (packageName.toLowerCase().startsWith(`${scope.toLowerCase()}.`)
+    || packageName.toLowerCase().startsWith(`${scope.toLowerCase()}/`))) {
+    packageName = packageName.slice(scope.length + 1);
+  } else if (!scope) {
+    const slashIndex = packageName.indexOf("/");
+    const dotIndex = packageName.indexOf(".");
+    const separatorIndex = slashIndex > 0 ? slashIndex : dotIndex;
+    if (separatorIndex > 0) {
+      scope = packageName.slice(0, separatorIndex);
+      packageName = packageName.slice(separatorIndex + 1);
+    }
+  }
+  const encodedScope = scope ? encodePathSegment(scope.toLowerCase()) : "";
+  const encodedName = encodePathSegment(packageName.toLowerCase());
+  if (!encodedScope || !encodedName) {
     return null;
   }
 
   return {
-    scope: parts.slice(0, -1).map((part) => encodePathSegment(part)).join("/"),
-    name: encodePathSegment(parts[parts.length - 1]),
+    scope: encodedScope,
+    name: encodedName,
   };
 }
 
@@ -481,13 +479,8 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
       }
       return {
         format,
-        strategy: "maven-artifact",
+        strategy: "direct",
         request: {
-          method: "GET",
-          url: `https://dl.cloudsmith.io/basic/${safeWorkspace}/${safeRepo}/maven/${coordinates.groupPath}/${coordinates.artifactId}/${coordinates.version}/${coordinates.artifactId}-${coordinates.version}.pom`,
-          headers: {},
-        },
-        artifactRequest: {
           method: "GET",
           url: `https://dl.cloudsmith.io/basic/${safeWorkspace}/${safeRepo}/maven/${coordinates.groupPath}/${coordinates.artifactId}/${coordinates.version}/${coordinates.artifactId}-${coordinates.version}${coordinates.classifier ? `-${coordinates.classifier}` : ""}.${coordinates.extension}`,
           headers: {},
@@ -615,8 +608,12 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
     case "docker": {
       const image = encodePath(normalizeDockerImageName(dependency && dependency.name));
       const qualifiers = dependency?.qualifiers || dependency?.identifiers || {};
+      const requestedDigest = String(qualifiers.digest || dependency?.digest || "").trim();
+      if (requestedDigest && !isDockerDigest(requestedDigest)) {
+        return null;
+      }
       const reference = encodePathSegment(
-        qualifiers.digest || dependency?.digest || qualifiers.tag || dependency?.version
+        requestedDigest || qualifiers.tag || dependency?.version
       );
       if (!image || !reference) {
         return null;
@@ -657,6 +654,7 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
       return {
         format,
         strategy: "dart-api",
+        packageName: String(dependency && dependency.name || "").trim(),
         trustScope: createRegistryTrustScope(workspace, repo),
         request: {
           method: "GET",
@@ -701,7 +699,10 @@ function buildRegistryTriggerPlanUnchecked(workspace, repo, dependency) {
       };
     }
     case "swift": {
-      const coordinates = buildSwiftCoordinates(dependency && dependency.name);
+      const coordinates = buildSwiftCoordinates(
+        dependency && dependency.name,
+        dependency && (dependency.qualifiers || dependency.identifiers)
+      );
       if (!coordinates || !coordinates.scope || !coordinates.name || !version) {
         return null;
       }
@@ -781,7 +782,8 @@ function createRegistryTrustScope(workspace, repo) {
 
 function repeatedlyDecode(value) {
   let decoded = String(value || "");
-  for (let depth = 0; depth < 3; depth += 1) {
+  if (decoded.length > MAX_REGISTRY_URL_LENGTH) return null;
+  for (let depth = 0; depth < MAX_REGISTRY_DECODE_DEPTH; depth += 1) {
     let next;
     try {
       next = decodeURIComponent(decoded);
@@ -789,16 +791,16 @@ function repeatedlyDecode(value) {
       return null;
     }
     if (next === decoded) {
-      break;
+      return decoded;
     }
     decoded = next;
   }
-  return decoded;
+  return null;
 }
 
 function hasUnsafeRegistryPath(pathname) {
   const decoded = repeatedlyDecode(pathname);
-  if (decoded == null || /[\u0000-\u001f\u007f\\]/.test(decoded)) {
+  if (decoded == null || REGISTRY_CONTROL_OR_BIDI.test(decoded) || /\\/.test(decoded)) {
     return true;
   }
   return decoded.split("/").some(segment => segment === "." || segment === "..");
@@ -866,7 +868,11 @@ function isSupportedArtifactHash(hash) {
  * accepted and is stripped because URL fragments must never be sent over HTTP.
  */
 function resolveAndValidateScopedRegistryUrl(candidate, baseUrl, trustScope, options = {}) {
-  if (!candidate) {
+  if (
+    !candidate
+    || String(candidate).length > MAX_REGISTRY_URL_LENGTH
+    || String(baseUrl || "").length > MAX_REGISTRY_URL_LENGTH
+  ) {
     return null;
   }
 
@@ -905,7 +911,11 @@ function resolveAndValidateScopedRegistryUrl(candidate, baseUrl, trustScope, opt
 }
 
 function resolveAndValidateDockerBlobRedirectUrl(candidate, baseUrl) {
-  if (!candidate) return null;
+  if (
+    !candidate
+    || String(candidate).length > MAX_REGISTRY_URL_LENGTH
+    || String(baseUrl || "").length > MAX_REGISTRY_URL_LENGTH
+  ) return null;
   const rawCandidate = String(candidate);
   const rawPath = rawCandidate
     .replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+/i, "")
@@ -972,6 +982,7 @@ function isTrustedCloudsmithHost(host) {
 }
 
 function isTrustedRegistryUrl(candidateUrl) {
+  if (String(candidateUrl || "").length > MAX_REGISTRY_URL_LENGTH) return false;
   try {
     const parsed = new URL(candidateUrl);
     return parsed.protocol === "https:"
@@ -984,25 +995,6 @@ function isTrustedRegistryUrl(candidateUrl) {
   } catch {
     return false;
   }
-}
-
-function resolveAndValidateRegistryUrl(candidate, baseUrl) {
-  if (!candidate) {
-    return null;
-  }
-
-  let resolved;
-  try {
-    resolved = new URL(candidate, baseUrl);
-  } catch {
-    return null;
-  }
-
-  if (!isTrustedRegistryUrl(resolved.toString())) {
-    return null;
-  }
-
-  return resolved.toString();
 }
 
 function collectHrefValues(html) {
@@ -1127,24 +1119,15 @@ function scorePythonArtifact(url, packageName, version) {
 }
 
 function findPythonDistributionUrl(html, packageName, version, baseUrl, trustScope) {
-  // Backward-compatible shape: (html, version, baseUrl). Exact distribution
-  // identity requires the new four-argument form used by pull-through.
-  let wantedName = packageName;
-  let wantedVersion = version;
-  let registryBaseUrl = baseUrl;
-  let expectedScope = trustScope;
-  if (baseUrl === undefined) {
-    wantedName = "";
-    wantedVersion = packageName;
-    registryBaseUrl = version;
-    expectedScope = undefined;
-  }
+  const wantedName = sanitizePackageNameInput(packageName);
+  const wantedVersion = String(version || "").trim();
+  if (!wantedName || !wantedVersion || !baseUrl) return null;
 
   const candidates = collectHrefValues(html)
     .map((href) => resolveAndValidateScopedRegistryUrl(
       href,
-      registryBaseUrl,
-      expectedScope,
+      baseUrl,
+      trustScope,
       { allowHashFragment: true }
     ))
     .filter(Boolean)
@@ -1253,8 +1236,8 @@ function parseCargoDownloadUrl(body, crateName, version, checksum, baseUrl, trus
     return null;
   }
 
-  const normalizedName = String(crateName || "").trim().toLowerCase();
-  const encodedName = encodePathSegment(normalizedName);
+  const rawName = String(crateName || "").trim();
+  const encodedName = encodePathSegment(rawName);
   const encodedVersion = encodePathSegment(version);
   const normalizedChecksum = String(checksum || "").trim().toLowerCase();
   if (
@@ -1267,13 +1250,15 @@ function parseCargoDownloadUrl(body, crateName, version, checksum, baseUrl, trus
     return null;
   }
 
-  const prefix = cargoIndexPath(normalizedName);
+  const prefix = cargoPrefix(rawName);
+  const lowerPrefix = cargoPrefix(rawName, true);
+  if (!prefix || !lowerPrefix) return null;
   const hadTemplateMarker = /\{(?:crate|version|prefix|lowerprefix|sha256-checksum)\}/.test(payload.dl);
   let candidate = payload.dl
     .replaceAll("{crate}", encodedName)
     .replaceAll("{version}", encodedVersion)
     .replaceAll("{prefix}", prefix)
-    .replaceAll("{lowerprefix}", prefix.toLowerCase())
+    .replaceAll("{lowerprefix}", lowerPrefix)
     .replaceAll("{sha256-checksum}", normalizedChecksum);
   if (/\{[^{}]+\}/.test(candidate)) {
     return null;
@@ -1308,18 +1293,13 @@ function parseDockerManifest(body, preferredPlatform = {}) {
     if (!requested) {
       return null;
     }
-    const { os: requestedOs, architecture: requestedArchitecture, variant: requestedVariant } = requested;
     const candidates = payload.manifests.filter(entry => (
       entry
       && isDockerDigest(entry.digest)
       && entry.platform
       && typeof entry.platform === "object"
     ));
-    const exact = candidates.find(entry => (
-      String(entry.platform.os || "").toLowerCase() === requestedOs
-      && String(entry.platform.architecture || "").toLowerCase() === requestedArchitecture
-      && (!requestedVariant || String(entry.platform.variant || "").toLowerCase() === requestedVariant)
-    ));
+    const exact = candidates.find(entry => dockerPlatformValuesMatch(requested, entry.platform));
     const selected = exact || (requested.explicit ? null : candidates.find(entry => (
       String(entry.platform.os || "").toLowerCase() === "linux"
       && String(entry.platform.architecture || "").toLowerCase() === "amd64"
@@ -1346,26 +1326,19 @@ function preferredDockerPlatform(value) {
   const preferred = value && typeof value === "object" ? value : {};
   const platform = String(preferred.platform || "").trim().toLowerCase();
   if (platform) {
-    const parts = platform.split("/");
-    if (
-      (parts.length !== 2 && parts.length !== 3)
-      || parts.some(part => !part || !/^[a-z0-9_.-]+$/.test(part))
-    ) {
-      return null;
-    }
+    const parsed = parseDockerPlatform(platform);
+    if (!parsed) return null;
     return {
-      os: parts[0],
-      architecture: parts[1],
-      variant: parts[2] || "",
+      ...parsed,
       explicit: true,
     };
   }
 
   const explicit = Boolean(preferred.os || preferred.architecture || preferred.arch || preferred.variant);
   const os = String(preferred.os || "linux").trim().toLowerCase();
-  const architecture = String(
+  const architecture = normalizeDockerArchitecture(
     preferred.architecture || preferred.arch || "amd64"
-  ).trim().toLowerCase();
+  );
   const variant = String(preferred.variant || "").trim().toLowerCase();
   if (
     !os
@@ -1377,6 +1350,22 @@ function preferredDockerPlatform(value) {
     return null;
   }
   return { os, architecture, variant, explicit };
+}
+
+function dockerPlatformValuesMatch(requested, observedValue) {
+  if (!requested || !observedValue || typeof observedValue !== "object") return false;
+  const observed = {
+    os: String(observedValue.os || "").trim().toLowerCase(),
+    architecture: normalizeDockerArchitecture(observedValue.architecture),
+    variant: String(observedValue.variant || "").trim().toLowerCase(),
+  };
+  return Boolean(
+    observed.os
+    && observed.architecture
+    && observed.os === requested.os
+    && observed.architecture === requested.architecture
+    && dockerVariantMatches(requested, observed)
+  );
 }
 
 function parseNuGetPackageUrl(body, packageName, packageVersion, baseUrl, trustScope) {
@@ -1412,12 +1401,17 @@ function parseNuGetPackageUrl(body, packageName, packageVersion, baseUrl, trustS
 }
 
 function isDockerDigest(value) {
-  return typeof value === "string"
-    && value.length <= 1024
-    && DOCKER_DIGEST_PATTERN.test(value);
+  if (typeof value !== "string" || value.length > 1024) return false;
+  const match = value.match(DOCKER_DIGEST_PATTERN);
+  if (!match) return false;
+  const algorithm = match[1].toLowerCase();
+  const length = match[2].length;
+  if (algorithm === "sha256") return length === 64;
+  if (algorithm === "sha512") return length === 128;
+  return length >= 32 && length <= 512;
 }
 
-function parseDartArchiveUrl(body, version, baseUrl, trustScope) {
+function parseDartArchiveUrl(body, packageName, version, baseUrl, trustScope) {
   let payload;
   try {
     payload = JSON.parse(String(body || ""));
@@ -1425,7 +1419,12 @@ function parseDartArchiveUrl(body, version, baseUrl, trustScope) {
     return null;
   }
 
+  const wantedName = sanitizePackageNameInput(packageName).toLowerCase();
+  const observedName = sanitizePackageNameInput(payload && payload.name).toLowerCase();
   const wantedVersion = String(version || "").trim();
+  if (!wantedName || observedName !== wantedName) {
+    return null;
+  }
   const candidates = [];
 
   if (payload && payload.latest && payload.latest.version === wantedVersion && payload.latest.archive_url) {
@@ -1468,25 +1467,32 @@ function parseComposerDistUrl(body, packageName, version, baseUrl, trustScope) {
   }
 
   const entries = [];
-  const normalizedPackageName = sanitizePackageNameInput(packageName);
+  const normalizedPackageName = sanitizePackageNameInput(packageName).toLowerCase();
 
   if (payload && payload.packages && typeof payload.packages === "object") {
-    if (Array.isArray(payload.packages[normalizedPackageName])) {
-      entries.push(...payload.packages[normalizedPackageName]);
-    } else {
-      for (const value of Object.values(payload.packages)) {
-        if (Array.isArray(value)) {
-          entries.push(...value);
-        }
+    const exactKey = Object.keys(payload.packages).find(key => (
+      sanitizePackageNameInput(key).toLowerCase() === normalizedPackageName
+    ));
+    if (exactKey && Array.isArray(payload.packages[exactKey])) {
+      entries.push(...payload.packages[exactKey]);
+    }
+  } else if (Array.isArray(payload)) {
+    for (const entry of payload) {
+      if (
+        entry
+        && sanitizePackageNameInput(entry.name).toLowerCase() === normalizedPackageName
+      ) {
+        entries.push(entry);
       }
     }
   }
 
-  if (Array.isArray(payload)) {
-    entries.push(...payload);
-  }
-
-  const matchedEntry = entries.find((entry) => entry && entry.version === version);
+  const matchedEntry = entries.find((entry) => (
+    entry
+    && entry.version === version
+    && (!entry.name
+      || sanitizePackageNameInput(entry.name).toLowerCase() === normalizedPackageName)
+  ));
   const distUrl = matchedEntry
     && matchedEntry.dist
     && typeof matchedEntry.dist === "object"
@@ -1498,12 +1504,12 @@ function parseComposerDistUrl(body, packageName, version, baseUrl, trustScope) {
 
 module.exports = {
   buildRegistryTriggerPlan,
-  cargoIndexPath,
-  createRegistryTrustScope,
   dockerCandidateMatchesPlatform,
+  dockerDigestMatches,
   findPythonDistributionUrl,
   formatForDependency,
   isPullUnsupportedFormat,
+  isDockerDigest,
   isTrustedRegistryUrl,
   mavenArtifactFileName,
   normalizeNuGetVersion,
@@ -1515,7 +1521,6 @@ module.exports = {
   parseDartArchiveUrl,
   parseNpmTarballUrl,
   resolveAndValidateDockerBlobRedirectUrl,
-  resolveAndValidateRegistryUrl,
   resolveAndValidateScopedRegistryUrl,
   rubyCandidateMatchesPlatform,
 };

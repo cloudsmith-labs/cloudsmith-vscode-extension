@@ -2,6 +2,8 @@
 // Versioned, bounded recent-search persistence.
 // Searches are non-secret, but only the fields required to replay them are stored.
 
+const { isValidAdvancedQuery } = require("./searchQueryBuilder");
+
 const STORAGE_KEY_PREFIX = "cloudsmith-recentSearches:v2";
 const STORAGE_VERSION = 2;
 const DEFAULT_MAX = 10;
@@ -92,6 +94,7 @@ function normalizeEntry(entry, expectedWorkspace, now) {
     !isBoundedString(workspace, MAX_WORKSPACE_LENGTH)
     || workspace !== workspace.trim()
     || !isBoundedString(query, MAX_QUERY_LENGTH)
+    || !isValidAdvancedQuery(query)
     || !scope
     || (expectedWorkspace && workspace !== expectedWorkspace)
   ) {
@@ -118,6 +121,7 @@ function isStoredEntry(value, expectedWorkspace) {
     !isBoundedString(value.workspace, MAX_WORKSPACE_LENGTH)
     || value.workspace !== value.workspace.trim()
     || !isBoundedString(value.query, MAX_QUERY_LENGTH)
+    || !isValidAdvancedQuery(value.query)
     || (expectedWorkspace && value.workspace !== expectedWorkspace)
     || !Number.isFinite(value.timestamp)
     || value.timestamp <= 0

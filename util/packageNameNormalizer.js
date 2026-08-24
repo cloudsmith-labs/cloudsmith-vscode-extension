@@ -60,6 +60,44 @@ function normalizePackageName(name, ecosystemOrFormat) {
   return rawName.toLowerCase();
 }
 
+function normalizeNuGetVersion(version) {
+  const raw = String(version || "").trim();
+  if (!raw || /[\u0000-\u001f\u007f\\/?#]/.test(raw)) return "";
+  const withoutMetadata = raw.split("+", 1)[0];
+  const separatorIndex = withoutMetadata.indexOf("-");
+  const release = separatorIndex >= 0
+    ? withoutMetadata.slice(0, separatorIndex)
+    : withoutMetadata;
+  const prerelease = separatorIndex >= 0
+    ? withoutMetadata.slice(separatorIndex + 1)
+    : "";
+  const releaseParts = release.split(".");
+  if (
+    releaseParts.length < 1
+    || releaseParts.length > 4
+    || releaseParts.some(part => !/^\d+$/.test(part))
+    || (separatorIndex >= 0 && !/^[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/.test(prerelease))
+  ) return "";
+  const normalizedRelease = releaseParts.map(part => part.replace(/^0+(?=\d)/, ""));
+  while (normalizedRelease.length < 3) normalizedRelease.push("0");
+  if (normalizedRelease.length === 4 && normalizedRelease[3] === "0") {
+    normalizedRelease.pop();
+  }
+  return `${normalizedRelease.join(".")}${prerelease ? `-${prerelease.toLowerCase()}` : ""}`;
+}
+
+function normalizeDockerPlatformIdentity(platform) {
+  const parts = String(platform || "").trim().toLowerCase().split("/");
+  if (parts.length < 2 || parts.length > 3 || parts.some(part => !part)) return "";
+  const architecture = {
+    "x86-64": "amd64",
+    x86_64: "amd64",
+    aarch64: "arm64",
+  }[parts[1]] || parts[1];
+  const variant = architecture === "arm64" && parts[2] === "v8" ? "" : parts[2] || "";
+  return `${parts[0]}/${architecture}${variant ? `/${variant}` : ""}`;
+}
+
 function getPackageLookupKeys(name, ecosystemOrFormat, identifiers) {
   const format = canonicalFormat(ecosystemOrFormat);
   const rawName = sanitizePackageNameInput(name);
@@ -85,7 +123,9 @@ function getPackageLookupKeys(name, ecosystemOrFormat, identifiers) {
 
   if (format === "swift") {
     const scope = sanitizePackageNameInput(identifiers && identifiers.scope);
-    return [normalizeSwiftIdentity(rawName, scope)].filter(Boolean);
+    const identity = normalizeSwiftIdentity(rawName, scope);
+    const unscoped = swiftUnscopedName(identity);
+    return [...new Set([identity, unscoped].filter(Boolean))];
   }
 
   return [normalizePackageName(rawName, format)];
@@ -122,7 +162,14 @@ function normalizeSwiftIdentity(name, scope) {
   const rawScope = sanitizePackageNameInput(scope);
   if (!rawName) return "";
   const normalizedName = rawName.toLowerCase().replace(/^\/+|\/+$/g, "");
-  if (!rawScope) return normalizedName;
+  if (!rawScope) {
+    const slashIndex = normalizedName.indexOf("/");
+    if (slashIndex > 0) return normalizedName;
+    const dotIndex = normalizedName.indexOf(".");
+    return dotIndex > 0
+      ? `${normalizedName.slice(0, dotIndex)}/${normalizedName.slice(dotIndex + 1)}`
+      : normalizedName;
+  }
   const normalizedScope = rawScope.toLowerCase().replace(/^\/+|\/+$/g, "");
   if (!normalizedScope) return normalizedName;
   if (
@@ -132,6 +179,14 @@ function normalizeSwiftIdentity(name, scope) {
     return `${normalizedScope}/${normalizedName.slice(normalizedScope.length + 1)}`;
   }
   return `${normalizedScope}/${normalizedName}`;
+}
+
+function swiftUnscopedName(identity) {
+  const normalized = sanitizePackageNameInput(identity).toLowerCase();
+  if (!normalized) return "";
+  const slashIndex = normalized.lastIndexOf("/");
+  const separatorIndex = slashIndex >= 0 ? slashIndex : normalized.indexOf(".");
+  return separatorIndex >= 0 ? normalized.slice(separatorIndex + 1) : normalized;
 }
 
 function buildDockerLookupKeys(name) {
@@ -178,6 +233,8 @@ module.exports = {
   getCloudsmithPackageLookupKeys,
   getPackageLookupKeys,
   normalizePackageName,
+  normalizeNuGetVersion,
+  normalizeDockerPlatformIdentity,
   normalizeSwiftIdentity,
   sanitizePackageNameInput,
 };

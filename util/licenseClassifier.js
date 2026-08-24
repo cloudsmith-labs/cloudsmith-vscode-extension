@@ -2,6 +2,21 @@
 // Supports compound SPDX expressions and user-configurable restrictive overrides.
 
 const vscode = require("vscode");
+const {
+  escapeCloudsmithQueryValue,
+  isValidAdvancedQuery,
+} = require("./searchQueryBuilder");
+
+const MAX_QUERY_LICENSE_IDENTIFIERS = 64;
+const MAX_QUERY_LICENSE_IDENTIFIER_LENGTH = 256;
+const QUERY_CONTROL_OR_BIDI_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
+
+function isSafeQueryLicenseIdentifier(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= MAX_QUERY_LICENSE_IDENTIFIER_LENGTH
+    && !QUERY_CONTROL_OR_BIDI_PATTERN.test(value);
+}
 
 function isExpressionWhitespace(character) {
   return character.trim() === "";
@@ -232,8 +247,7 @@ class LicenseClassifier {
    * @returns {string}
    */
   static _escapeQueryValue(value) {
-    const escaped = value.replace(/(\\|&&|\|\||[+\-!(){}\[\]^"~*?:/|&])/g, (match) => `\\${match}`);
-    return /\s/.test(escaped) ? `"${escaped}"` : escaped;
+    return escapeCloudsmithQueryValue(value);
   }
 
   /**
@@ -246,9 +260,9 @@ class LicenseClassifier {
       const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
       const userList = config.get("restrictiveLicenses");
       if (Array.isArray(userList)) {
-        for (const lic of userList) {
+        for (const lic of userList.slice(0, MAX_QUERY_LICENSE_IDENTIFIERS)) {
           const normalized = LicenseClassifier._normalizeIdentifier(lic);
-          if (normalized) {
+          if (isSafeQueryLicenseIdentifier(normalized)) {
             overrides.add(normalized);
           }
         }
@@ -284,7 +298,11 @@ class LicenseClassifier {
     const seen = new Set();
     for (const identifier of identifiers) {
       const normalized = LicenseClassifier._normalizeIdentifier(identifier);
-      if (normalized && !seen.has(normalized)) {
+      if (
+        isSafeQueryLicenseIdentifier(normalized)
+        && !seen.has(normalized)
+        && uniqueIdentifiers.length < MAX_QUERY_LICENSE_IDENTIFIERS
+      ) {
         seen.add(normalized);
         uniqueIdentifiers.push(normalized);
       }
@@ -294,11 +312,15 @@ class LicenseClassifier {
       return "";
     }
 
-    const clauses = uniqueIdentifiers.map((identifier) => `license:${LicenseClassifier._escapeQueryValue(identifier)}`);
-    if (clauses.length === 1) {
-      return clauses[0];
+    const clauses = [];
+    for (const identifier of uniqueIdentifiers) {
+      const clause = `license:${LicenseClassifier._escapeQueryValue(identifier)}`;
+      const next = clauses.length === 0 ? clause : `(${[...clauses, clause].join(" OR ")})`;
+      if (!isValidAdvancedQuery(next)) break;
+      clauses.push(clause);
     }
-    return `(${clauses.join(" OR ")})`;
+    if (clauses.length === 0) return "";
+    return clauses.length === 1 ? clauses[0] : `(${clauses.join(" OR ")})`;
   }
 
   /**
