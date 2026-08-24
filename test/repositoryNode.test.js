@@ -1030,11 +1030,23 @@ suite("RepositoryNode Test Suite", () => {
     assert.strictEqual(repositoryNode._packageState.nodes.length, 2);
     assert.strictEqual(repositoryNode._packageState.failures.length, 1);
     assert.ok(repositoryNode._packageState.continuation);
+    let children = await repositoryNode.getChildren();
+    const partial = children.find(child => (
+      child.getTreeItem().contextValue === "repositoryPackagesPartial"
+    ));
+    assert.ok(partial);
+    assert.strictEqual(partial.getTreeItem().command.command, "cloudsmith-vsc.loadMoreRepositoryPackages");
+    assert.strictEqual(children.filter(child => repositoryNode.ownsPackageSelection(child)).length, 2);
+    assert.strictEqual(children.some(child => (
+      child.getTreeItem().contextValue === "repositoryLoadMore"
+    )), false);
 
     await repositoryNode.loadMorePackages();
     assert.strictEqual(repositoryNode._packageState.nodes.length, 3);
     assert.strictEqual(repositoryNode._packageState.failures.length, 0);
     assert.strictEqual(repositoryNode._packageState.complete, true);
+    children = await repositoryNode.getChildren();
+    assert.strictEqual(children.some(child => child.terminalOutcome), false);
   });
 
   test("fails closed on a duplicate cross-page identity", async () => {
@@ -1143,9 +1155,141 @@ suite("RepositoryNode Test Suite", () => {
     const children = await repositoryNode.getChildren();
     const labels = children.map(child => child.getTreeItem().label);
 
-    assert.ok(labels.includes("Package loading cancelled"));
+    assert.ok(labels.includes("Package loading canceled"));
     assert.strictEqual(labels.includes("Repository is empty"), false);
     assert.strictEqual(repositoryNode._packageState.complete, false);
+  });
+
+  test("FUX-002 publishes machine-readable empty, failed, and cancelled package outcomes", async () => {
+    const cases = [
+      {
+        name: "empty",
+        result: makeCollectionResult({ complete: true }),
+        contextValue: "repositoryPackagesEmpty",
+        action: "none",
+        authoritative: true,
+      },
+      {
+        name: "failed",
+        result: makeCollectionResult({
+          failures: [collectionFailure(1, "timeout")],
+          termination: "request_failed",
+          requestCount: 1,
+        }),
+        contextValue: "repositoryPackagesFailed",
+        action: "retry",
+        authoritative: false,
+      },
+      {
+        name: "cancelled",
+        result: makeCollectionResult({
+          cancelled: true,
+          termination: "cancelled",
+          requestCount: 1,
+        }),
+        contextValue: "repositoryPackagesCancelled",
+        action: "retry",
+        authoritative: false,
+      },
+    ];
+
+    for (const expected of cases) {
+      const repositoryNode = new RepositoryNode(
+        { slug: `packages-${expected.name}`, slug_perm: `packages-${expected.name}`, name: "Packages" },
+        "acme",
+        context,
+        {
+          connectionManager,
+          createPaginatedFetch: () => ({
+            async fetchCollection() { return expected.result; },
+          }),
+        }
+      );
+
+      const children = await repositoryNode.getChildren();
+      const terminal = children.find(child => (
+        child.getTreeItem().contextValue === expected.contextValue
+      ));
+      assert.ok(terminal, `${expected.name} must publish an explicit terminal row`);
+      assert.deepStrictEqual(terminal.terminalOutcome, {
+        kind: expected.name,
+        scope: "repository",
+        authoritative: expected.authoritative,
+        action: expected.action,
+      });
+      assert.strictEqual(
+        children.some(child => child.getTreeItem().contextValue === "repositoryPackagesEmpty"),
+        expected.name === "empty",
+        `${expected.name} must not become a false empty state`
+      );
+      const item = terminal.getTreeItem();
+      if (expected.action === "retry") {
+        assert.strictEqual(item.description, "Retry");
+        assert.strictEqual(item.command.command, "cloudsmith-vsc.refreshView");
+        assert.strictEqual(JSON.stringify(item).includes("The page request failed."), false);
+      } else {
+        assert.strictEqual(item.command, undefined);
+      }
+    }
+  });
+
+  test("FUX-002 preserves packages beside partial and cancelled package outcomes", async () => {
+    const cases = [
+      {
+        name: "partial",
+        result: makeCollectionResult({
+          items: [makePackage("partial-package", { repository: "partial" })],
+          failures: [collectionFailure(1, "timeout")],
+          termination: "request_failed",
+          pageCount: 1,
+          requestCount: 1,
+          pagination: makePagination(1, 1, 30, 1),
+        }),
+        contextValue: "repositoryPackagesPartial",
+      },
+      {
+        name: "cancelled",
+        result: makeCollectionResult({
+          items: [makePackage("cancelled-package", { repository: "cancelled" })],
+          cancelled: true,
+          termination: "cancelled",
+          pageCount: 1,
+          requestCount: 1,
+          pagination: makePagination(1, 1, 30, 1),
+        }),
+        contextValue: "repositoryPackagesCancelled",
+      },
+    ];
+
+    for (const expected of cases) {
+      const repositoryNode = new RepositoryNode(
+        { slug: expected.name, slug_perm: expected.name, name: "Packages" },
+        "acme",
+        context,
+        {
+          connectionManager,
+          createPaginatedFetch: () => ({
+            async fetchCollection() { return expected.result; },
+          }),
+        }
+      );
+
+      const children = await repositoryNode.getChildren();
+      const packageNodes = children.filter(child => repositoryNode.ownsPackageSelection(child));
+      const terminal = children.find(child => (
+        child.getTreeItem().contextValue === expected.contextValue
+      ));
+      assert.deepStrictEqual(packageNodes.map(node => node.name), [`${expected.name}-package`]);
+      assert.ok(
+        children.some(child => child instanceof UpstreamIndicatorNode),
+        "metadata must coexist with retained package and terminal rows"
+      );
+      assert.ok(terminal, `${expected.name} must remain explicit beside retained packages`);
+      assert.strictEqual(terminal.terminalOutcome.kind, expected.name);
+      assert.strictEqual(terminal.terminalOutcome.authoritative, false);
+      assert.strictEqual(terminal.getTreeItem().description, "Retry");
+      assert.strictEqual(terminal.getTreeItem().command.command, "cloudsmith-vsc.refreshView");
+    }
   });
 
   test("stops exposing continuation at the cumulative page cap", async () => {
@@ -1200,7 +1344,11 @@ suite("RepositoryNode Test Suite", () => {
     assert.strictEqual(repositoryNode._packageState.nodes.length, 20);
     assert.strictEqual(repositoryNode._packageState.capReached, true);
     assert.strictEqual(repositoryNode._packageState.continuation, null);
-    assert.ok(children.some(child => child.getTreeItem().label === "Package loading limit reached"));
+    const terminal = children.find(child => (
+      child.getTreeItem().contextValue === "repositoryPackagesPartial"
+    ));
+    assert.strictEqual(terminal.getTreeItem().label, "Some packages are not shown");
+    assert.strictEqual(terminal.terminalOutcome.action, "change-filter");
     assert.strictEqual(children.some(child => (
       child.getTreeItem().contextValue === "repositoryLoadMore"
     )), false);
@@ -1260,6 +1408,14 @@ suite("RepositoryNode Test Suite", () => {
       repositoryNode._packageState.nodes.map(node => `${node.format}:${node.name}`),
       ["npm:shared", "python:shared"]
     );
+    const children = await repositoryNode.getChildren();
+    assert.deepStrictEqual(
+      children
+        .filter(child => repositoryNode.ownsPackageSelection(child))
+        .map(child => child.getTreeItem().contextValue),
+      ["packageGroup", "packageGroup"]
+    );
+    assert.strictEqual(children.some(child => child.terminalOutcome), false);
   });
 
   test("rejects contradictory continuation metadata without another request", async () => {

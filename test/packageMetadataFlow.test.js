@@ -15,6 +15,9 @@ const {
   fromApiPackageRecord,
 } = packageAdapters;
 const { createPackageCoordinate } = require("../domain/package");
+const {
+  PACKAGE_ACTIONS,
+} = require("../domain/packageActionCapabilities");
 const { captureAccount, isAccountCurrent } = require("../util/accountOperation");
 const { isSelectionCurrent, markSelection } = require("../util/selectionProvenance");
 
@@ -331,7 +334,10 @@ suite("Package Metadata Flow Test Suite", () => {
     assert.strictEqual(canonicalNode.cloudsmithMatch, canonical);
     assert.strictEqual(canonicalNode.cloudsmithStatus, "FOUND");
     assert.strictEqual(canonicalNode.state, rawNode.state);
-    assert.strictEqual(canonicalNode.getTreeItem().contextValue, "dependencyHealthFound");
+    assert.strictEqual(
+      canonicalNode.getTreeItem().contextValue,
+      "dependencyHealthActions.inspect.open"
+    );
     assert.match(canonicalNode.getTreeItem().description, /Vulnerability status unknown/);
     assert.doesNotMatch(canonicalNode.getTreeItem().description, /No issues found/);
     assert.deepStrictEqual(
@@ -714,9 +720,134 @@ suite("Package Metadata Flow Test Suite", () => {
       assert.strictEqual(node.repository, undefined);
       assert.strictEqual(node.slug_perm, undefined);
       assert.deepStrictEqual(node.getChildren(), []);
-      assert.notStrictEqual(node.getTreeItem().contextValue, "dependencyHealthFound");
-      assert.notStrictEqual(node.getTreeItem().contextValue, "dependencyHealthVulnerable");
-      assert.notStrictEqual(node.getTreeItem().contextValue, "dependencyHealthQuarantined");
+      assert.doesNotMatch(node.getTreeItem().contextValue, /^dependencyHealthActions(?:\.|$)/);
+    }
+  });
+
+  test("combined vulnerable and quarantined package contexts retain safe actions", () => {
+    const combined = {
+      ...pkg,
+      status_str: "Quarantined",
+      is_copyable: true,
+      num_vulnerabilities: 2,
+      max_severity: "High",
+    };
+    const packageNode = new PackageNode(combined, {});
+    const searchNode = new SearchResultNode(combined, {});
+    const dependencyNode = new DependencyHealthNode({
+      name: "artifact",
+      version: "1.0.0",
+      format: "raw",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: combined,
+    }, null, {});
+
+    for (const node of [packageNode, searchNode, dependencyNode]) {
+      const contextValue = node.getTreeItem().contextValue;
+      assert.match(contextValue, /\.showVulnerabilities(?:\.|$)/);
+      assert.match(contextValue, /\.findSafeVersion(?:\.|$)/);
+      assert.match(contextValue, /\.explainQuarantine(?:\.|$)/);
+      assert.doesNotMatch(contextValue, /\.install(?:\.|$)/);
+      assert.strictEqual(node.getActionCapabilities().actions.install, false);
+    }
+    const description = dependencyNode.getTreeItem().description;
+    assert.match(description, /Quarantined/);
+    assert.match(description, /Vulnerabilities found \(2 High\)/);
+  });
+
+  test("seven evidence states project exact actions across Workspaces, Search, and Dependency Health", () => {
+    const states = [
+      ["vulnerable", { vulnerable: true }],
+      ["quarantined", { quarantined: true }],
+      ["vulnerable and quarantined", { vulnerable: true, quarantined: true }],
+      ["vulnerable and policy-violating", { vulnerable: true, policyViolation: true }],
+      ["vulnerable and restrictive", { vulnerable: true, restrictiveLicense: true }],
+      ["quarantined and policy-violating", { quarantined: true, policyViolation: true }],
+      ["clean", {}],
+    ];
+    const actionOrder = Object.values(PACKAGE_ACTIONS);
+    const expectedFor = (packageSurface, evidence) => {
+      const quarantined = evidence.quarantined === true;
+      const vulnerable = evidence.vulnerable === true;
+      const enabled = new Set([
+        PACKAGE_ACTIONS.INSPECT,
+        PACKAGE_ACTIONS.OPEN,
+        ...(packageSurface || vulnerable
+          ? [PACKAGE_ACTIONS.FIND_SAFE_VERSION, PACKAGE_ACTIONS.SHOW_VULNERABILITIES]
+          : []),
+        ...(quarantined ? [PACKAGE_ACTIONS.EXPLAIN_QUARANTINE] : []),
+        ...(!quarantined ? [PACKAGE_ACTIONS.INSTALL] : []),
+        ...(packageSurface && !quarantined ? [PACKAGE_ACTIONS.PROMOTE] : []),
+        ...(packageSurface ? [PACKAGE_ACTIONS.SHOW_PROMOTION_STATUS] : []),
+      ]);
+      return Object.fromEntries(actionOrder.map(action => [action, enabled.has(action)]));
+    };
+
+    for (const [stateName, evidence] of states) {
+      const record = {
+        ...pkg,
+        status_str: evidence.quarantined ? "Quarantined" : "Completed",
+        is_copyable: true,
+        policy_violated: evidence.policyViolation === true,
+        deny_policy_violated: false,
+        num_vulnerabilities: evidence.vulnerable ? 2 : 0,
+        has_vulnerabilities: evidence.vulnerable === true,
+        security_scan_status: evidence.vulnerable
+          ? "Scan Detected Vulnerabilities"
+          : "Scan Detected No Vulnerabilities",
+        max_severity: evidence.vulnerable ? "High" : "None",
+        license: evidence.restrictiveLicense ? "GPL-3.0-only" : "MIT",
+        raw_license: evidence.restrictiveLicense ? "GPL-3.0-only" : "MIT",
+        spdx_license: evidence.restrictiveLicense ? "GPL-3.0-only" : "MIT",
+      };
+      const surfaces = [
+        ["Workspaces", new PackageNode(record, {}), true, "packageActions"],
+        ["Search", new SearchResultNode(record, {}), true, "packageActions"],
+        ["Dependency Health", new DependencyHealthNode({
+          name: record.name,
+          version: record.version,
+          format: record.format,
+          cloudsmithStatus: "FOUND",
+          cloudsmithPackage: record,
+        }, null, {}), false, "dependencyHealthActions"],
+      ];
+
+      for (const [surfaceName, node, packageSurface, family] of surfaces) {
+        const expected = expectedFor(packageSurface, evidence);
+        const capabilities = node.getActionCapabilities();
+        assert.deepStrictEqual(
+          capabilities.actions,
+          expected,
+          `${stateName} on ${surfaceName}`
+        );
+        assert.deepStrictEqual(capabilities.evidence, {
+          copyable: true,
+          exact: true,
+          found: true,
+          policyViolation: evidence.policyViolation === true,
+          quarantined: evidence.quarantined === true,
+          restrictiveLicense: evidence.restrictiveLicense === true,
+          vulnerable: evidence.vulnerable === true,
+        }, `${stateName} evidence on ${surfaceName}`);
+        assert.strictEqual(
+          node.getTreeItem().contextValue,
+          [family, ...actionOrder.filter(action => expected[action])].join("."),
+          `${stateName} context on ${surfaceName}`
+        );
+      }
+    }
+  });
+
+  test("policy-only package and search tooltips do not advertise quarantine actions", () => {
+    const policyOnly = {
+      ...pkg,
+      policy_violated: true,
+      deny_policy_violated: false,
+    };
+    for (const node of [new PackageNode(policyOnly, {}), new SearchResultNode(policyOnly, {})]) {
+      const tooltip = node.getTreeItem().tooltip;
+      assert.match(tooltip, /Review policy findings in package details/);
+      assert.doesNotMatch(tooltip, /explain quarantine/);
     }
   });
 
@@ -889,7 +1020,9 @@ suite("Package Metadata Flow Test Suite", () => {
 
     assert.strictEqual(cleanNode.getTreeItem().description, "4.18.2 — Vulnerability status unknown");
     assert.strictEqual(vulnerableNode.getTreeItem().description, "4.18.2 — Vulnerabilities found (2 High)");
-    assert.strictEqual(quarantinedNode.getTreeItem().description, "4.18.2 — Quarantined");
+    assert.match(quarantinedNode.getTreeItem().description, /^4\.18\.2 — Quarantined/);
+    assert.match(quarantinedNode.getTreeItem().description, /Vulnerability status unknown/);
+    assert.doesNotMatch(quarantinedNode.getTreeItem().description, /Policy violation/);
   });
 
   test("dependency vulnerability indicators never turn conflicting positive evidence into clean state", () => {

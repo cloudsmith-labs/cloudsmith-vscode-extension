@@ -9,9 +9,15 @@ const {
 } = require("../../util/formatIconInventory");
 const { ECOSYSTEM_TO_FORMAT } = require("../../util/packageNameNormalizer");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("../../util/upstreamFormats");
+const { LockfileResolver } = require("../../util/lockfileResolver");
+const {
+  AUTHENTICATION_METHODS,
+  PULL_THROUGH_API_KEY_MESSAGE,
+} = require("../../domain/authCapabilities");
 
 const DEPRECATED_SETTINGS = new Set([
   "cloudsmith-vsc.autoScanOnOpen",
+  "cloudsmith-vsc.showDockerDigestCommand",
   "cloudsmith-vsc.showRepoMetrics",
 ]);
 const SETTINGS_WITH_NO_PRODUCTION_READS = new Set([
@@ -27,12 +33,57 @@ const BASE_MEDIA = Object.freeze([
 ]);
 const APPROVED_MEDIA = Object.freeze([...BASE_MEDIA, ...FORMAT_ICON_FILES]);
 const DECORATIVE_README_MEDIA = new Set(["media/readme/brand-banner.png"]);
-const HELP_LINK_URLS = Object.freeze([
-  "https://docs.cloudsmith.com/developer-tools/vscode",
+const EXTENSION_HOMEPAGE =
+  "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/blob/main/README.md";
+const RETIRED_EXTENSION_DOCS_URL = "https://docs.cloudsmith.com/developer-tools/vscode";
+const SECONDARY_HELP_LINK_URLS = Object.freeze([
   "https://docs.cloudsmith.com/",
   "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues",
   "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues/new/choose",
 ]);
+const REQUIRED_MAJOR_COMMANDS = Object.freeze([
+  "cloudsmith-vsc.configureCredentials",
+  "cloudsmith-vsc.searchPackages",
+  "cloudsmith-vsc.guidedSearch",
+  "cloudsmith-vsc.scanDependencies",
+  "cloudsmith-vsc.pullDependencies",
+  "cloudsmith-vsc.depSortFilter",
+  "cloudsmith-vsc.viewComplianceReport",
+  "cloudsmith-vsc.inspectPackage",
+  "cloudsmith-vsc.showVulnerabilities",
+  "cloudsmith-vsc.findSafeVersion",
+  "cloudsmith-vsc.explainQuarantine",
+  "cloudsmith-vsc.copyInstallCommand",
+  "cloudsmith-vsc.showInstallCommand",
+  "cloudsmith-vsc.inspectUpstreams",
+  "cloudsmith-vsc.previewUpstreamResolution",
+  "cloudsmith-vsc.showPromotionStatus",
+  "cloudsmith-vsc.promotePackage",
+]);
+const DOCUMENTED_FAMILY_ECOSYSTEMS = Object.freeze({
+  "npm": "npm",
+  "Python": "python",
+  "Maven": "maven",
+  "Gradle": "gradle",
+  "Go": "go",
+  "Cargo / Rust": "cargo",
+  "Ruby": "ruby",
+  "Docker": "docker",
+  "NuGet / .NET": "nuget",
+  "Dart": "dart",
+  "Composer / PHP": "composer",
+  "Helm": "helm",
+  "Swift": "swift",
+  "Hex / Elixir": "hex",
+});
+const INSTALL_COMMAND_DOCUMENTATION = Object.freeze([
+  "Generated install guidance preserves each format's native package identity, including supported qualifiers, and targets the selected Cloudsmith workspace and repository.",
+  "**Cargo** includes a repository-specific `.cargo/config.toml` registry stanza and requires separate token setup for private repositories",
+  "**Maven** provides separate `~/.m2/settings.xml` mirror and `pom.xml` dependency merge guidance rather than a shell install command",
+  "**Go** sets a repository-specific `GOPROXY`, with native HTTP Basic credentials and carefully scoped checksum settings potentially required for private modules",
+]);
+const AUTH_TRANSPORT_DOCUMENTATION =
+  "Cloudsmith REST API requests use `X-Api-Key` for API keys and `Authorization: Bearer` for SSO sessions. Pull-through uses format-native registry authentication only with validated Cloudsmith registry hosts.";
 const FORBIDDEN_DOC_PATTERNS = Object.freeze([
   /all commands are available (?:from|via)/i,
   /full raw (?:api|json)/i,
@@ -130,8 +181,10 @@ function validateSettingsDocs(manifest, readme) {
       fail(`${key} must explain its no-op compatibility status`);
     }
   }
-  if (rows.filter(row => row.classification === "active").length !== 20) {
-    fail("README must document exactly 20 active settings");
+  const expectedActiveCount = Object.keys(properties)
+    .filter(key => !DEPRECATED_SETTINGS.has(key)).length;
+  if (rows.filter(row => row.classification === "active").length !== expectedActiveCount) {
+    fail(`README must document exactly ${expectedActiveCount} active settings`);
   }
 }
 
@@ -205,12 +258,134 @@ function validateMedia(root, manifest, architecture, readme) {
   }
 }
 
-function validateHelpLinks(helpLinks, readme) {
+function validateHelpLinks(helpLinks, readme, manifest = {}) {
+  const homepage = manifest && manifest.homepage;
+  if (helpLinks.some(link => link?.url === RETIRED_EXTENSION_DOCS_URL)) {
+    fail("retired extension documentation URL must not be used by Help");
+  }
+  if (homepage !== EXTENSION_HOMEPAGE) {
+    fail("package.json homepage must target the maintained repository README");
+  }
+  const expected = [
+    {
+      id: "extensionDocs",
+      label: "Read extension documentation",
+      url: homepage,
+      icon: "external",
+    },
+    {
+      id: "gettingStarted",
+      label: "Get started with Cloudsmith",
+      url: SECONDARY_HELP_LINK_URLS[0],
+      icon: "cloudsmith",
+    },
+    {
+      id: "viewIssues",
+      label: "View issues",
+      url: SECONDARY_HELP_LINK_URLS[1],
+      icon: "github",
+    },
+    {
+      id: "reportIssue",
+      label: "Report an issue",
+      url: SECONDARY_HELP_LINK_URLS[2],
+      icon: "github",
+    },
+  ];
+  if (JSON.stringify(helpLinks) !== JSON.stringify(expected)) {
+    fail("help links differ from the verified destinations and presentation");
+  }
   const urls = helpLinks.map(link => link.url);
-  if (JSON.stringify(urls) !== JSON.stringify(HELP_LINK_URLS)) fail("help links differ from the verified destinations");
   if (new Set(urls).size !== urls.length) fail("help links must be distinct");
   for (const url of urls) {
-    if (!url.startsWith("https://") || !readme.includes(url)) fail(`README/help link is missing or unsafe: ${url}`);
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      fail(`README/help link is missing or unsafe: ${url}`);
+    }
+    if (
+      parsed.protocol !== "https:"
+      || parsed.username
+      || parsed.password
+      || parsed.search
+      || parsed.hash
+      || !readme.includes(url)
+    ) fail(`README/help link is missing or unsafe: ${url}`);
+  }
+}
+
+function validateDocumentationTruth(manifest, readme) {
+  const supportedStart = readme.indexOf("### Supported dependency inputs");
+  const viewsStart = readme.indexOf("### Views, filters, and reports");
+  if (supportedStart < 0 || viewsStart <= supportedStart) {
+    fail("README supported dependency input section is missing or out of order");
+  }
+  const documentedEcosystems = parseMarkdownRows(
+    readme.slice(supportedStart, viewsStart)
+  )
+    .filter(row => row[0] !== "Family")
+    .map(row => DOCUMENTED_FAMILY_ECOSYSTEMS[row[0]])
+    .filter(Boolean)
+    .sort();
+  const resolverEcosystems = LockfileResolver.getResolvers()
+    .map(resolver => resolver && resolver.ecosystem)
+    .filter(value => typeof value === "string")
+    .sort();
+  if (JSON.stringify(documentedEcosystems) !== JSON.stringify(resolverEcosystems)) {
+    fail("README dependency ecosystems differ from the registered resolver inventory");
+  }
+
+  const connectStart = readme.indexOf("## Connect to Cloudsmith");
+  const browseStart = readme.indexOf("## Browse and inspect packages");
+  const connectDocs = readme.slice(connectStart, browseStart);
+  for (const method of AUTHENTICATION_METHODS) {
+    if (!connectDocs.includes(`**${method.documentationLabel}**`)) {
+      fail(`README omits authentication method: ${method.documentationLabel}`);
+    }
+  }
+  if (!connectDocs.includes(PULL_THROUGH_API_KEY_MESSAGE)) {
+    fail("README omits the pull-through API-key prerequisite");
+  }
+  if (!connectDocs.includes(AUTH_TRANSPORT_DOCUMENTATION)) {
+    fail("README omits the REST API and registry authentication boundary");
+  }
+  if (!readme.includes(
+    "A vulnerable quarantined package keeps **Show vulnerabilities**, **Find safe version**, **Explain quarantine**, and the read-only **Show promotion status** action available. **Copy install command**, **Show install command**, and **Promote package** remain unavailable while the package is quarantined."
+  )) {
+    fail("README omits the combined vulnerable and quarantined action contract");
+  }
+  for (const guidance of INSTALL_COMMAND_DOCUMENTATION) {
+    if (!readme.includes(guidance)) {
+      fail(`README omits install-command guidance: ${guidance}`);
+    }
+  }
+
+  const commands = new Map((manifest?.contributes?.commands || []).map(entry => [entry.command, entry]));
+  const documentedCommands = new Set(commandRows(readme).map(row => row.id));
+  for (const command of REQUIRED_MAJOR_COMMANDS) {
+    if (!commands.has(command) || !documentedCommands.has(command)) {
+      fail(`README omits major command workflow: ${command}`);
+    }
+  }
+  for (const command of ["cloudsmith-vsc.pullDependencies", "cloudsmith-vsc.pullSingleDependency"]) {
+    if (!String(commands.get(command)?.enablement || "").includes("cloudsmith.pullThroughAvailable")) {
+      fail(`${command} must use the pull-through capability in manifest enablement`);
+    }
+  }
+  const contributedMenus = manifest?.contributes?.menus || {};
+  const pullMenus = [
+    ...(contributedMenus["view/item/context"] || []),
+    ...(contributedMenus["view/title"] || []),
+  ]
+    .filter(entry => [
+      "cloudsmith-vsc.pullDependencies",
+      "cloudsmith-vsc.pullSingleDependency",
+    ].includes(entry?.command));
+  if (!pullMenus.length || pullMenus.some(entry => (
+    !String(entry.when || "").includes("cloudsmith.pullThroughAvailable")
+  ))) {
+    fail("pull-through menu surfaces must use the projected authentication capability");
   }
 }
 
@@ -279,8 +454,9 @@ function verifyRepository(root = path.resolve(__dirname, "../..")) {
   const { HELP_LINKS } = require(path.join(root, "util/helpLinks"));
   validateSettingsDocs(manifest, readme);
   validateCommandDocs(manifest, architecture, readme);
+  validateDocumentationTruth(manifest, readme);
   validateMedia(root, manifest, architecture, readme);
-  validateHelpLinks(HELP_LINKS, readme);
+  validateHelpLinks(HELP_LINKS, readme, manifest);
   validateFormatInventory();
   validateNoProductionSettingReads(root);
   walkForJunk(root);
@@ -292,7 +468,12 @@ function verifyRepository(root = path.resolve(__dirname, "../..")) {
       fail(`README contains stale link fragment: ${fragment}`);
     }
   }
-  return { activeSettings: 20, deprecatedSettings: 2, media: APPROVED_MEDIA.length };
+  const settingKeys = Object.keys(manifest?.contributes?.configuration?.properties || {});
+  return {
+    activeSettings: settingKeys.filter(key => !DEPRECATED_SETTINGS.has(key)).length,
+    deprecatedSettings: settingKeys.filter(key => DEPRECATED_SETTINGS.has(key)).length,
+    media: APPROVED_MEDIA.length,
+  };
 }
 
 module.exports = {
@@ -302,6 +483,7 @@ module.exports = {
   validateCommandDocs,
   validateFormatInventory,
   validateHelpLinks,
+  validateDocumentationTruth,
   validateMedia,
   validateSettingsDocs,
   verifyRepository,

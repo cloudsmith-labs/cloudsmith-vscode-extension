@@ -2,6 +2,7 @@
 // Handles escaping, boolean operators, and field-specific syntax.
 
 const MAX_ADVANCED_QUERY_LENGTH = 2048;
+const MAX_STRICT_FIELD_VALUE_LENGTH = 2048;
 const QUERY_CONTROL_OR_BIDI_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/;
 
 function isValidAdvancedQuery(value) {
@@ -13,7 +14,36 @@ function isValidAdvancedQuery(value) {
 
 function escapeCloudsmithQueryValue(value) {
     const normalized = typeof value === 'string' ? value : String(value);
-    const escaped = normalized.replace(
+    return quoteCloudsmithQueryValue(escapeCloudsmithQueryLiteral(normalized));
+}
+
+function escapeExactCloudsmithQueryValue(value) {
+    const normalized = normalizeStrictCloudsmithQueryValue(value);
+    const escaped = escapeCloudsmithQueryLiteral(normalized);
+    return quoteCloudsmithQueryValue(`^${escaped}$`);
+}
+
+function normalizeStrictCloudsmithQueryValue(value) {
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+            throw new TypeError('Cloudsmith query field value must be finite.');
+        }
+        return String(value);
+    }
+    if (
+        typeof value !== 'string'
+        || value.trim().length === 0
+        || value.trim() !== value
+        || value.length > MAX_STRICT_FIELD_VALUE_LENGTH
+        || QUERY_CONTROL_OR_BIDI_PATTERN.test(value)
+    ) {
+        throw new TypeError('Cloudsmith query field value is invalid.');
+    }
+    return value;
+}
+
+function escapeCloudsmithQueryLiteral(normalized) {
+    return normalized.replace(
         /(?:^[+-]+|\\|&&|\|\||[!(){}\[\]^$'"~*?:<>|&])/g,
         (match, offset) => (
             offset === 0 && /^[+-]+$/.test(match)
@@ -21,6 +51,9 @@ function escapeCloudsmithQueryValue(value) {
                 : `\\${match}`
         )
     );
+}
+
+function quoteCloudsmithQueryValue(escaped) {
     return /\s/.test(escaped) ? `"${escaped}"` : escaped;
 }
 
@@ -42,6 +75,12 @@ class SearchQueryBuilder {
         return this;
     }
 
+    /** Add an exact canonical package-name term. */
+    exactName(value) {
+        this.terms.push(`name:${escapeExactCloudsmithQueryValue(value)}`);
+        return this;
+    }
+
     /** Add a format filter. */
     format(value) {
         this.terms.push(`format:${this._escapeValue(value)}`);
@@ -57,6 +96,18 @@ class SearchQueryBuilder {
     /** Add a version filter. */
     version(value) {
         this.terms.push(`version:${this._escapeValue(value)}`);
+        return this;
+    }
+
+    /** Add a semantic version lower bound, excluding the current version. */
+    versionGreaterThan(value) {
+        this.terms.push(`version:>${this._escapeValue(normalizeStrictCloudsmithQueryValue(value))}`);
+        return this;
+    }
+
+    /** Add an inclusive semantic version lower bound. */
+    versionAtLeast(value) {
+        this.terms.push(`version:>=${this._escapeValue(normalizeStrictCloudsmithQueryValue(value))}`);
         return this;
     }
 

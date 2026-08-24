@@ -5,6 +5,12 @@ const {
   getWorkspaces,
   getWorkspaceRepositories,
 } = require("../util/workspaceAccess");
+const {
+  PACKAGE_ACTION_SURFACES,
+  PACKAGE_ACTIONS,
+  derivePackageActionCapabilities,
+  hasPackageAction,
+} = require("../domain/packageActionCapabilities");
 
 const DISPLAY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/gu;
 const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
@@ -605,20 +611,53 @@ async function pickRecentPackage(deps, options = {}) {
   return selected.package;
 }
 
-function isQuarantinedPackage(pkg) {
-  return Boolean(pkg) && pkg.status === "Quarantined";
+function packageActionCapabilitiesForPackage(pkg) {
+  try {
+    const vulnerability = pkg && pkg.vulnerability;
+    const license = pkg && pkg.license;
+    return derivePackageActionCapabilities({
+      surface: PACKAGE_ACTION_SURFACES.PACKAGE,
+      found: Boolean(pkg && pkg.identityState === "exact"),
+      exact: Boolean(pkg && pkg.identityState === "exact"),
+      copyable: pkg?.copyable === true,
+      vulnerable: Boolean(vulnerability && (
+        vulnerability.detected === true
+        || (Number.isInteger(vulnerability.count) && vulnerability.count > 0)
+      )),
+      quarantined: pkg?.status === "Quarantined",
+      policyViolation: pkg?.policy?.violated === true,
+      restrictiveLicense: license?.classification === "restrictive"
+        || license?.tier === "restrictive",
+    });
+  } catch {
+    return derivePackageActionCapabilities();
+  }
 }
 
-function installOptions(vscode, pkg) {
-  const options = {};
+function isPackageActionAvailable(pkg, action) {
+  return hasPackageAction(packageActionCapabilitiesForPackage(pkg), action);
+}
+
+function isDependencyActionAvailable(item, action) {
+  try {
+    return hasPackageAction(item?.getActionCapabilities?.(), action);
+  } catch {
+    return false;
+  }
+}
+
+function isInstallablePackage(pkg) {
+  return isPackageActionAvailable(pkg, PACKAGE_ACTIONS.INSTALL);
+}
+
+function isQuarantinedPackage(pkg) {
+  return isPackageActionAvailable(pkg, PACKAGE_ACTIONS.EXPLAIN_QUARANTINE);
+}
+
+function installOptions(pkg, coordinate) {
+  const options = { qualifiers: coordinate.qualifiers };
   if (pkg.tags && (pkg.tags.info.length > 0 || pkg.tags.version.length > 0)) {
     options.tags = pkg.tags;
-  }
-  if (
-    vscode.workspace.getConfiguration("cloudsmith-vsc").get("showDockerDigestCommand", false)
-  ) {
-    if (pkg.checksumSha256) options.checksumSha256 = pkg.checksumSha256;
-    if (pkg.versionDigest) options.versionDigest = pkg.versionDigest;
   }
   if (pkg.cdnUrl) options.cdnUrl = pkg.cdnUrl;
   if (pkg.filename) options.filename = pkg.filename;
@@ -627,13 +666,14 @@ function installOptions(vscode, pkg) {
 
 function buildInstallCommand(deps, pkg) {
   try {
+    const coordinate = deps.packageDomain.packageCoordinateFromExact(pkg);
     return deps.InstallCommandBuilder.build(
-      pkg.format,
-      pkg.name,
-      pkg.version || "latest",
-      pkg.workspace,
-      pkg.repository,
-      installOptions(deps.vscode, pkg)
+      coordinate.format,
+      coordinate.name,
+      coordinate.version,
+      coordinate.workspace,
+      coordinate.repository,
+      installOptions(pkg, coordinate)
     );
   } catch (error) {
     if (error instanceof deps.InstallCommandValidationError) {
@@ -648,32 +688,58 @@ function buildInstallCommand(deps, pkg) {
 
 async function pickInstallCommandVariant(deps, result, options = {}) {
   if (!result.alternatives || result.alternatives.length === 0) {
-    return result.command;
+    return Object.freeze({
+      command: result.command,
+      commentStyle: result.commentStyle || "shell",
+    });
   }
   const picks = [
     {
       label: "$(arrow-right) Primary",
       description: deps.InstallCommandBuilder.toClipboardCommand(result.command),
       command: result.command,
+      commentStyle: result.commentStyle || "shell",
     },
     ...result.alternatives.map(alternative => ({
       label: `$(arrow-right) ${alternative.label}`,
       description: deps.InstallCommandBuilder.toClipboardCommand(alternative.command),
       command: alternative.command,
+      commentStyle: alternative.commentStyle || result.commentStyle || "shell",
     })),
   ];
   const promptOptions = { placeHolder: "Select an install command" };
   const selected = options.accountScope
     ? await showAccountQuickPick(deps, options.accountScope, picks, promptOptions)
     : await deps.vscode.window.showQuickPick(picks, promptOptions);
-  return selected ? selected.command : null;
+  return selected && picks.includes(selected) ? selected : null;
 }
 
-function commentCommandNote(note) {
+function commentCommandNote(note, prefix = "# ") {
   return String(note)
     .split(/\r?\n/)
-    .map(line => `# ${line}`)
+    .map(line => `${prefix}${line}`)
     .join("\n");
+}
+
+function renderInstallCommandGuidance(deps, result, chosenCommand) {
+  const selection = typeof chosenCommand === "string"
+    ? { command: chosenCommand, commentStyle: "shell" }
+    : chosenCommand;
+  let content = deps.InstallCommandBuilder.toClipboardCommand(selection.command);
+  if (result.note) {
+    content += selection.commentStyle === "cmd"
+      ? `\n\nREM Note\n${commentCommandNote(result.note, "REM ")}`
+      : result.language === "markdown"
+      ? `\n\n## Note\n\n${result.note}`
+      : `\n\n# Note\n${commentCommandNote(result.note)}`;
+  }
+  return content;
+}
+
+function installGuidanceCopiedMessage(result) {
+  return result?.language === "markdown"
+    ? "Maven setup guidance copied. Merge the XML into the named files; do not run it as a shell command."
+    : "Install command copied.";
 }
 
 function buildAdvancedSearchQuery(SearchQueryBuilder, query) {
@@ -743,9 +809,14 @@ module.exports = {
   getDefaultWorkspace,
   getWorkspaces,
   getWorkspaceRepositories,
+  isDependencyActionAvailable,
+  isInstallablePackage,
+  installGuidanceCopiedMessage,
+  isPackageActionAvailable,
   isQuarantinedPackage,
   pickInstallCommandVariant,
   pickRecentPackage,
+  renderInstallCommandGuidance,
   resolveCommandRepository,
   resolveCommandWorkspace,
   safeDisplayName,

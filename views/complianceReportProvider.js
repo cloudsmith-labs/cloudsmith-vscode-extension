@@ -64,6 +64,7 @@ class ComplianceReportProvider {
     const vulnCount = normalizeSummaryCount(summary.vulnCount);
     const restrictiveLicenseCount = normalizeSummaryCount(summary.restrictiveLicenseCount);
     const coveragePct = clampPercent(summary.coveragePct);
+    const vulnerabilityCoverageComplete = summary.vulnerabilityCoverageComplete === true;
     const licenseIds = uniqueLicenseIds(reportData.restrictiveLicenseDeps || []);
     const sections = [];
 
@@ -103,12 +104,20 @@ class ComplianceReportProvider {
     ].reduce((total, value) => (
       Number.isSafeInteger(value) && value > 0 ? total + value : total
     ), 0);
-    const emptyState = sections.length === 0
-      ? incompleteCount > 0
-        ? `
+    const incompleteState = incompleteCount > 0
+      ? `
         <div class="card empty-card">
           <h2>Compliance status incomplete</h2>
           <p>${escapeHtml(String(incompleteCount))} dependency lookups were unresolved, failed, incomplete, rate limited, or still in progress. No clean compliance conclusion can be made.</p>
+        </div>
+      `
+      : "";
+    const emptyState = sections.length === 0 && incompleteCount === 0
+      ? !vulnerabilityCoverageComplete
+        ? `
+        <div class="card empty-card">
+          <h2>Compliance status unavailable</h2>
+          <p>Vulnerability status could not be confirmed. Run the dependency scan again.</p>
         </div>
       `
         : `
@@ -459,6 +468,7 @@ class ComplianceReportProvider {
       <p class="coverage-label">${escapeHtml(formatCoverageLabel(summary))}</p>
     </div>
 
+    ${incompleteState}
     ${emptyState}
     ${sections.join("\n")}
   </main>
@@ -527,14 +537,14 @@ function renderVulnerabilitySection(vulnerableDeps) {
         <td>${escapeHtml(dependency.isDirect ? "Direct" : "Transitive")}</td>
         <td><span class="badge ${severityClass}">${escapeHtml(dependency.maxSeverity || "Unknown")}</span></td>
         <td>${escapeHtml(vulnerabilityEvidence)}</td>
-        <td>${escapeHtml(dependency.hasFixAvailable ? "Yes" : "No")}</td>
+        <td>${escapeHtml(fixAvailabilityLabel(dependency))}</td>
       </tr>
     `;
   }).join("");
 
   return renderSection("Vulnerability findings", `
     <table tabindex="0">
-      <caption>Dependencies with known vulnerabilities</caption>
+      <caption>Dependency vulnerability status</caption>
       <thead>
         <tr>
           <th scope="col">Package</th>
@@ -552,6 +562,14 @@ function renderVulnerabilitySection(vulnerableDeps) {
 
 function boundedVulnerabilityStatus(value) {
   return value === "Detected" ? "Detected" : "Unknown";
+}
+
+function fixAvailabilityLabel(dependency) {
+  if (dependency && dependency.fixAvailability === "yes") return "Yes";
+  if (dependency && dependency.fixAvailability === "no") return "No";
+  if (dependency && dependency.hasFixAvailable === true) return "Yes";
+  if (dependency && dependency.hasFixAvailable === false) return "No";
+  return "Unknown";
 }
 
 function renderLicenseSection(restrictiveLicenseDeps) {
@@ -815,12 +833,19 @@ function formatSeverityBreakdown(summary) {
     ["highCount", "High"],
     ["mediumCount", "Medium"],
     ["lowCount", "Low"],
-    ["vulnUnknownCount", "Unknown"],
+    ["vulnDetectedUnknownSeverityCount", "severity unknown"],
+    ["vulnUnknownCount", "status unavailable"],
   ]) {
     const count = normalizeSummaryCount(summary && summary[key]);
     if (count > 0) parts.push(`${count} ${label}`);
   }
-  return parts.length > 0 ? parts.join(", ") : "No known vulnerabilities";
+  if (parts.length > 0) return parts.join(", ");
+  const vulnCount = normalizeSummaryCount(summary && summary.vulnCount);
+  if (vulnCount > 0) return `${vulnCount} detected, severity unknown`;
+  if (summary && summary.vulnerabilityCoverageComplete === true) {
+    return "No known vulnerabilities";
+  }
+  return "Vulnerability status unavailable";
 }
 
 function formatLicenseBreakdown(licenseIds) {

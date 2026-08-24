@@ -4,6 +4,7 @@ const path = require("path");
 const { ActivationOwner } = require("../util/activationOwner");
 const { runDependencyScan } = require("../util/dependencyScanOrchestration");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("../util/upstreamFormats");
+const { createExtensionContextBinding } = require("../extension");
 
 suite("Extension Test Suite", () => {
   test("manifest and current documentation expose SSO without an experimental gate", () => {
@@ -144,6 +145,15 @@ suite("Extension Test Suite", () => {
       group: "navigation@1.5",
       when: "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning",
     });
+
+    const pullEntry = manifest.contributes.menus["view/title"].find(
+      (entry) => entry.command === "cloudsmith-vsc.pullDependencies"
+    );
+    assert.deepStrictEqual(pullEntry, {
+      command: "cloudsmith-vsc.pullDependencies",
+      group: "navigation@2",
+      when: "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.pullThroughAvailable && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning",
+    });
   });
 
   test("connection-sensitive title actions do not infer absence while initializing", () => {
@@ -166,5 +176,54 @@ suite("Extension Test Suite", () => {
     ))) {
       assert.match(entry.when, /cloudsmith\.connected/);
     }
+  });
+
+  test("pull-through context follows API key to SSO to API key without reload", async () => {
+    const listeners = new Set();
+    let state = {
+      sessionConnected: true,
+      credentialPresent: true,
+      credentialKind: "api-key",
+    };
+    const manager = {
+      getState: () => ({ ...state }),
+      getAuthenticationCapabilities() {
+        return { pullThroughAvailable: state.credentialKind === "api-key" };
+      },
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      emit(next) {
+        state = { ...state, ...next };
+        for (const listener of listeners) listener({ ...state });
+      },
+    };
+    const projections = [];
+    const binding = createExtensionContextBinding({
+      connectionManager: manager,
+      contextProjector: {
+        async project(values) {
+          projections.push({ ...values });
+        },
+      },
+      getDefaultWorkspace: () => null,
+      connectionSetupAvailable: () => false,
+    });
+
+    await binding.project(manager.getState());
+    manager.emit({ credentialKind: "sso" });
+    await new Promise(resolve => setImmediate(resolve));
+    manager.emit({ credentialKind: "api-key" });
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.deepStrictEqual(
+      projections.map(values => values["cloudsmith.pullThroughAvailable"]),
+      [true, false, true]
+    );
+    binding.dispose();
+    manager.emit({ credentialKind: "sso" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(projections.length, 3);
   });
 });

@@ -85,7 +85,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     }
   }
 
-  function createContext(isConnected = "true") {
+  function createContext(isConnected = "true", credentialKind = "api-key") {
     const context = {
       secrets: {
         onDidChange() {},
@@ -108,6 +108,11 @@ suite("DependencyHealthProvider Test Suite", () => {
           sessionConnected: connected,
           status: connected ? "connected" : "absent",
         });
+      },
+      getAuthenticationCapabilities() {
+        return {
+          pullThroughAvailable: connected && credentialKind === "api-key",
+        };
       },
     };
     bindConnectionManager(context, connectionManager);
@@ -3792,6 +3797,71 @@ suite("DependencyHealthProvider Test Suite", () => {
     provider.dispose();
   });
 
+  test("terminal canonical vulnerability publication refreshes stored compliance truth", () => {
+    let listener = null;
+    let state = Object.freeze({
+      status: "unknown",
+      complete: false,
+      stale: false,
+      detected: true,
+      reportedCount: 1,
+      count: null,
+      records: Object.freeze([]),
+    });
+    const vulnerabilityStateService = {
+      onDidChange(value) { listener = value; return { dispose() { listener = null; } }; },
+      prime() { return state; },
+    };
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      vulnerabilityStateService,
+    });
+    provider._fullTrees = [{
+      ecosystem: "npm",
+      sourceFile: "package-lock.json",
+      dependencies: [{
+        ...createFoundDependency("left-pad", "1.0.0"),
+        vulnerabilities: {
+          count: 1,
+          countKnown: true,
+          countAuthoritative: true,
+          detected: true,
+          unknown: false,
+          detailsLoaded: false,
+          entries: [],
+        },
+      }],
+    }];
+    provider._lastScanTimestamp = "2026-08-09T12:00:00.000Z";
+    provider._reportData = provider._buildComplianceReportData(provider._lastScanTimestamp);
+
+    assert.strictEqual(provider.getReportData().summary.vulnerabilityCoverageComplete, false);
+    assert.strictEqual(provider.getReportData().vulnerableDeps[0].maxSeverity, null);
+
+    state = Object.freeze({
+      status: "complete-vulnerable",
+      complete: true,
+      stale: false,
+      count: 1,
+      maxSeverity: "Medium",
+      records: Object.freeze([Object.freeze({
+        vulnerability_id: "CVE-2026-53550",
+        severity: "Medium",
+        fixed_version: Object.freeze({ version: "2.0.0" }),
+      })]),
+    });
+    listener(Object.freeze({ identity: "left-pad", state }));
+
+    const report = provider.getReportData();
+    assert.strictEqual(report.summary.vulnerabilityCoverageComplete, true);
+    assert.strictEqual(report.summary.mediumCount, 1);
+    assert.deepStrictEqual(report.vulnerableDeps.map(row => ({
+      count: row.cveCount,
+      severity: row.maxSeverity,
+      hasFixAvailable: row.hasFixAvailable,
+    })), [{ count: 1, severity: "Medium", hasFixAvailable: true }]);
+    provider.dispose();
+  });
+
   test("_runLicenseEnrichment flushes multiple progress patches in one refresh", async () => {
     const provider = new DependencyHealthProvider(createContext(), null, {
       enrichLicenses: async (_dependencies, options = {}) => {
@@ -3830,6 +3900,56 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(refreshCount, 1);
     assert.strictEqual(provider._fullTrees[0].dependencies[0].license.spdx, "Apache-2.0");
     assert.strictEqual(provider._displayTrees[0].dependencies[0].license.spdx, "Apache-2.0");
+  });
+
+  test("SSO pull entry points stop before progress, preparation, or execution", async () => {
+    let progressCalls = 0;
+    let bulkCalls = 0;
+    let singlePreparationCalls = 0;
+    let executionCalls = 0;
+    const errors = [];
+    const provider = new DependencyHealthProvider(createContext("true", "sso"), null, {
+      userInteraction: createUserInteraction({
+        async withProgress() {
+          progressCalls += 1;
+          throw new Error("progress must not start");
+        },
+        showErrorMessage(message) { errors.push(message); },
+      }),
+      upstreamPullService: {
+        async run() { bulkCalls += 1; },
+        async prepareSingle() { singlePreparationCalls += 1; },
+        async execute() { executionCalls += 1; },
+      },
+    });
+    provider.lastWorkspace = "workspace-a";
+    provider.lastRepo = "repo-a";
+    provider._projectFolderPath = "/project";
+    provider._hasSuccessfulScan = true;
+    provider._fullTrees = [{ dependencies: [createProblemDependency(
+      "dependency",
+      "1.0.0",
+      "/project/package.json"
+    )] }];
+
+    await provider.pullDependencies();
+    await provider.pullSingleDependency(null);
+
+    assert.deepStrictEqual({
+      bulkCalls,
+      executionCalls,
+      progressCalls,
+      singlePreparationCalls,
+    }, {
+      bulkCalls: 0,
+      executionCalls: 0,
+      progressCalls: 0,
+      singlePreparationCalls: 0,
+    });
+    assert.deepStrictEqual(errors, [
+      "Pull-through requires a Cloudsmith API key. Sign in with an API key to continue.",
+      "Pull-through requires a Cloudsmith API key. Sign in with an API key to continue.",
+    ]);
   });
 
   test("pullDependencies transports per-artifact verification receipts into bulk refresh", async () => {
@@ -4262,6 +4382,9 @@ suite("DependencyHealthProvider Test Suite", () => {
     const listeners = new Set();
     const connectionManager = {
       getState: () => Object.freeze({ ...state }),
+      getAuthenticationCapabilities() {
+        return { pullThroughAvailable: state.sessionConnected };
+      },
       onDidChange(listener) {
         listeners.add(listener);
         return { dispose() { listeners.delete(listener); } };

@@ -1,6 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const { registerCommands } = require("./registrar");
+const { AUTHENTICATION_METHODS } = require("../domain/authCapabilities");
 
 function registerAuthenticationCommands(deps) {
   const {
@@ -72,12 +73,17 @@ function registerAuthenticationCommands(deps) {
 
   async function configureCredentials() {
     const operation = connectionManager.beginCredentialOperation();
-    const selected = await showCredentialPrompt(operation, "showQuickPick", [
-      { label: "$(key) Enter API key", description: "Paste a personal API key", method: "apikey" },
-      { label: "$(server) Enter service account API key", description: "Paste a service account API key", method: "apikey" },
-      { label: "$(folder-opened) Import API key from Cloudsmith CLI", description: "Import the [default] API key from a trusted credentials.ini", method: "import" },
-      { label: "$(globe) Sign in with SSO", description: "Sign in through your organization's identity provider", method: "sso-browser" },
-    ], { placeHolder: "Select an authentication method" });
+    const selected = await showCredentialPrompt(
+      operation,
+      "showQuickPick",
+      AUTHENTICATION_METHODS.map(({ id, label, description, method }) => ({
+        id,
+        label,
+        description,
+        method,
+      })),
+      { placeHolder: "Select an authentication method" }
+    );
     if (!selected) {
       await connectionManager.cancelCredentialOperation(operation);
       return;
@@ -88,11 +94,14 @@ function registerAuthenticationCommands(deps) {
     } else if (selected.method === "import") {
       await importCLICredentials(operation);
     } else {
+      const inputPrompt = selected.id === "service-account-api-key"
+        ? "Enter a Cloudsmith service account API key"
+        : "Enter a Cloudsmith personal API key";
       const result = await credentialManager.storeApiKey(operation, {
         showInputBox: options => showCredentialPrompt(
           operation,
           "showInputBox",
-          options
+          { ...options, prompt: inputPrompt }
         ),
       });
       await handleAuthenticationResult(result);

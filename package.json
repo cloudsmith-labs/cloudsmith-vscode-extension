@@ -285,14 +285,14 @@
         "title": "Pull dependencies",
         "category": "Cloudsmith",
         "icon": "$(cloud-download)",
-        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
+        "enablement": "cloudsmith.connected && cloudsmith.pullThroughAvailable && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.pullSingleDependency",
         "title": "Pull dependency",
         "category": "Cloudsmith",
         "icon": "$(cloud-download)",
-        "enablement": "cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
+        "enablement": "cloudsmith.connected && cloudsmith.pullThroughAvailable && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
       },
       {
         "command": "cloudsmith-vsc.cycleDepView",
@@ -547,7 +547,7 @@
       "view/item/context": [
         {
           "command": "cloudsmith-vsc.inspectPackage",
-          "when": "view == cloudsmithView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "when": "view == cloudsmithView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.inspect(?:\\.|$)/",
           "group": "navigation"
         },
         {
@@ -562,7 +562,7 @@
         },
         {
           "command": "cloudsmith-vsc.openPackage",
-          "when": "view == cloudsmithView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "when": "view == cloudsmithView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.open(?:\\.|$)/",
           "group": "navigation"
         },
         {
@@ -582,22 +582,22 @@
         },
         {
           "command": "cloudsmith-vsc.inspectPackage",
-          "when": "view == cloudsmithSearchView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.inspect(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.openPackage",
-          "when": "view == cloudsmithSearchView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.open(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.inspectPackage",
-          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable|dependencyHealthQuarantined)$/",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^dependencyHealthActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.inspect(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.openPackage",
-          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable|dependencyHealthQuarantined)$/",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^dependencyHealthActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.open(?:\\.|$)/",
           "group": "navigation"
         },
         {
@@ -652,12 +652,12 @@
         },
         {
           "command": "cloudsmith-vsc.findSafeVersion",
-          "when": "view == cloudsmithView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "when": "view == cloudsmithView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.findSafeVersion(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.findSafeVersion",
-          "when": "view == cloudsmithSearchView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.findSafeVersion(?:\\.|$)/",
           "group": "navigation"
         },
         {
@@ -677,22 +677,22 @@
         },
         {
           "command": "cloudsmith-vsc.showVulnerabilities",
-          "when": "view == cloudsmithView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "when": "view == cloudsmithView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.showVulnerabilities(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.showVulnerabilities",
-          "when": "view == cloudsmithSearchView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.showVulnerabilities(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.showDepVulnerabilities",
-          "when": "view == cloudsmithDependencyHealthView && viewItem == dependencyHealthVulnerable",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^dependencyHealthActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.showVulnerabilities(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.findDepSafeVersion",
-          "when": "view == cloudsmithDependencyHealthView && viewItem == dependencyHealthVulnerable",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^dependencyHealthActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.findSafeVersion(?:\\.|$)/",
           "group": "navigation"
         },
         {
@@ -727,47 +727,47 @@
         },
         {
           "command": "cloudsmith-vsc.explainQuarantine",
-          "when": "view == cloudsmithView && viewItem == packageQuarantined",
+          "when": "view == cloudsmithView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.explainQuarantine(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.explainQuarantine",
-          "when": "view == cloudsmithSearchView && viewItem == packageQuarantined",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.explainQuarantine(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.explainQuarantine",
-          "when": "view == cloudsmithDependencyHealthView && viewItem == dependencyHealthQuarantined",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^dependencyHealthActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.explainQuarantine(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.copyInstallCommand",
-          "when": "view == cloudsmithView && viewItem == package",
+          "when": "view == cloudsmithView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.install(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.copyInstallCommand",
-          "when": "view == cloudsmithSearchView && viewItem == package",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.install(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.copyInstallCommand",
-          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable)$/",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^dependencyHealthActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.install(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.showInstallCommand",
-          "when": "view == cloudsmithView && viewItem == package",
+          "when": "view == cloudsmithView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.install(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.showInstallCommand",
-          "when": "view == cloudsmithSearchView && viewItem == package",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.install(?:\\.|$)/",
           "group": "navigation"
         },
         {
           "command": "cloudsmith-vsc.showInstallCommand",
-          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthFound|dependencyHealthVulnerable)$/",
+          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^dependencyHealthActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.install(?:\\.|$)/",
           "group": "navigation"
         },
         {
@@ -787,32 +787,32 @@
         },
         {
           "command": "cloudsmith-vsc.pullSingleDependency",
-          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthMissing|dependencyHealthUpstreamReachable)$/",
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.pullThroughAvailable && viewItem =~ /^(dependencyHealthMissing|dependencyHealthUpstreamReachable)$/",
           "group": "inline"
         },
         {
           "command": "cloudsmith-vsc.pullSingleDependency",
-          "when": "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthMissing|dependencyHealthUpstreamReachable)$/",
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.pullThroughAvailable && viewItem =~ /^(dependencyHealthMissing|dependencyHealthUpstreamReachable)$/",
           "group": "1_pull"
         },
         {
           "command": "cloudsmith-vsc.showPromotionStatus",
-          "when": "view == cloudsmithView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "when": "view == cloudsmithView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.showPromotionStatus(?:\\.|$)/",
           "group": "2_promotion"
         },
         {
           "command": "cloudsmith-vsc.showPromotionStatus",
-          "when": "view == cloudsmithSearchView && viewItem =~ /^(package|packageNotCopyable|packageQuarantined)$/",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.showPromotionStatus(?:\\.|$)/",
           "group": "2_promotion"
         },
         {
           "command": "cloudsmith-vsc.promotePackage",
-          "when": "view == cloudsmithView && viewItem == package",
+          "when": "view == cloudsmithView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.promote(?:\\.|$)/",
           "group": "2_promotion"
         },
         {
           "command": "cloudsmith-vsc.promotePackage",
-          "when": "view == cloudsmithSearchView && viewItem == package",
+          "when": "view == cloudsmithSearchView && viewItem =~ /^packageActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.promote(?:\\.|$)/",
           "group": "2_promotion"
         },
         {
@@ -875,7 +875,7 @@
         {
           "command": "cloudsmith-vsc.pullDependencies",
           "group": "navigation@2",
-          "when": "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
+          "when": "view == cloudsmithDependencyHealthView && cloudsmith.connected && cloudsmith.pullThroughAvailable && cloudsmith.depScanSucceeded && !cloudsmith.depOperationRunning"
         },
         {
           "command": "cloudsmith-vsc.cycleDepView",
@@ -973,7 +973,8 @@
         "cloudsmith-vsc.showDockerDigestCommand": {
           "type": "boolean",
           "default": false,
-          "description": "Show an additional 'Pull by digest' option for Docker install commands. Digest-based pulls pin an exact image for reproducibility."
+          "description": "Deprecated compatibility setting. Exact Docker digest pulls are generated automatically when canonical package identity includes a manifest digest.",
+          "deprecationMessage": "This setting has no effect; exact Docker digest pulls are now automatic. It is retained only so existing configuration remains valid."
         },
         "cloudsmith-vsc.resolveTransitiveDependencies": {
           "type": "boolean",
@@ -1057,6 +1058,7 @@
     "@vscode/test-electron": "3.1.0",
     "@vscode/vsce": "^3.9.2",
     "eslint": "^9.25.1",
+    "xml2js": "0.5.0",
     "yauzl": "3.4.0"
   },
   "dependencies": {},

@@ -4,43 +4,63 @@ const { InstallCommandBuilder } = require('../../util/installCommandBuilder');
 suite('Integration: Install Command Builder', function () {
 
   const formats = [
-    { format: 'python', urlPart: 'python/simple/' },
-    { format: 'npm', urlPart: 'npm.cloudsmith.io' },
-    { format: 'nuget', urlPart: 'nuget.cloudsmith.io' },
-    { format: 'docker', urlPart: 'docker.cloudsmith.io' },
-    { format: 'helm', urlPart: 'helm/charts/' },
-    { format: 'cargo', urlPart: 'cargo' },
-    { format: 'go', urlPart: 'go' },
-    { format: 'ruby', urlPart: 'ruby/' },
-    { format: 'conda', urlPart: 'conda.cloudsmith.io' },
-    { format: 'composer', urlPart: 'composer' },
-    { format: 'dart', urlPart: 'dart' },
-    { format: 'rpm', urlPart: 'dl.cloudsmith.io' },
-    { format: 'raw', urlPart: 'dl.cloudsmith.io' },
+    { format: 'python', commandPart: 'dl.cloudsmith.io/basic/my-ws/my-repo/python/simple/' },
+    { format: 'npm', commandPart: 'npm.cloudsmith.io/my-ws/my-repo/' },
+    { format: 'nuget', commandPart: 'nuget.cloudsmith.io/my-ws/my-repo/v3/index.json' },
+    { format: 'docker', commandPart: 'docker.cloudsmith.io/my-ws/my-repo/' },
+    { format: 'helm', commandPart: 'dl.cloudsmith.io/basic/my-ws/my-repo/helm/charts/' },
+    { format: 'cargo', commandPart: "--registry 'cloudsmith-my-ws-my-repo-", notePart: 'cargo.cloudsmith.io/my-ws/my-repo/' },
+    { format: 'go', commandPart: 'golang.cloudsmith.io/my-ws/my-repo/' },
+    { format: 'ruby', commandPart: 'dl.cloudsmith.io/basic/my-ws/my-repo/ruby/' },
+    { format: 'conda', commandPart: 'conda.cloudsmith.io/my-ws/my-repo/', options: { qualifiers: { build: 'build_0', subdir: 'linux-64' } } },
+    { format: 'composer', name: 'vendor/test-pkg', commandPart: 'composer.cloudsmith.io/my-ws/my-repo/' },
+    { format: 'dart', name: 'test_pkg', commandPart: 'dart.cloudsmith.io/my-ws/my-repo/' },
+    { format: 'rpm', commandPart: "--enablerepo='my-ws-my-repo'", notePart: 'dl.cloudsmith.io/basic/my-ws/my-repo/', options: { qualifiers: { release: '1', architecture: 'x86_64' } } },
+    { format: 'raw', commandPart: 'dl.cloudsmith.io/basic/my-ws/my-repo/', options: { cdnUrl: 'https://dl.cloudsmith.io/basic/my-ws/my-repo/raw/files/test-pkg-1.0.0' } },
   ];
 
-  for (const { format, urlPart } of formats) {
-    test(`${format} generates a valid install command`, function () {
-      const result = InstallCommandBuilder.build(format, 'test-pkg', '1.0.0', 'my-ws', 'my-repo');
+  for (const { format, name = 'test-pkg', commandPart, notePart, options } of formats) {
+    test(`${format} preserves identity and targets the selected Cloudsmith repository`, function () {
+      const result = InstallCommandBuilder.build(
+        format, name, '1.0.0', 'my-ws', 'my-repo', options
+      );
       assert.ok(result.command, `${format}: command should be non-empty`);
       assert.ok(
         result.command.startsWith('# Verify package details before running') || format === 'maven',
         `${format}: command should include the verification banner`
       );
-      assert.ok(result.command.includes('test-pkg'), `${format}: command should contain package name`);
+      assert.ok(result.command.includes(name), `${format}: command should contain package name`);
       assert.ok(result.command.includes('1.0.0'), `${format}: command should contain version`);
       assert.ok(
-        result.command.includes(urlPart) || result.note && result.note.includes(urlPart),
-        `${format}: command or note should contain format-specific URL part "${urlPart}"`
+        result.command.includes(commandPart),
+        `${format}: executable/config output should select "${commandPart}"`
       );
+      if (notePart) assert.ok(result.note && result.note.includes(notePart));
+      assert.strictEqual(`${result.command}\n${result.note || ''}`.includes('actual-secret-value'), false);
     });
   }
 
-  test('maven generates pom.xml snippet with repository and dependency', function () {
-    const result = InstallCommandBuilder.build('maven', 'test-pkg', '1.0.0', 'ws', 'repo');
-    assert.ok(result.command.includes('<repository>'), 'Should contain <repository> block');
+  test('formats with public defaults explicitly suppress or replace them', function () {
+    const ruby = InstallCommandBuilder.build('ruby', 'rack', '3.1.0', 'ws', 'repo');
+    const conda = InstallCommandBuilder.build('conda', 'numpy', '2.0.0', 'ws', 'repo', {
+      qualifiers: { build: 'py312_0', subdir: 'linux-64' },
+    });
+    const cargo = InstallCommandBuilder.build('cargo', 'serde', '1.0.0', 'ws', 'repo');
+    const dart = InstallCommandBuilder.build('dart', 'http', '1.2.0', 'ws', 'repo');
+
+    assert.ok(ruby.command.includes('--clear-sources'));
+    assert.ok(conda.command.includes('--override-channels'));
+    assert.ok(cargo.command.includes('--registry'));
+    assert.ok(dart.command.includes('--hosted'));
+    assert.ok(!dart.command.includes('--hosted-url'));
+  });
+
+  test('maven generates separate settings and pom.xml merge guidance', function () {
+    const result = InstallCommandBuilder.build('maven', 'example:test-pkg', '1.0.0', 'ws', 'repo');
+    assert.ok(result.command.includes('<mirror>'), 'Should contain a settings.xml mirror block');
     assert.ok(result.command.includes('<dependency>'), 'Should contain <dependency> block');
     assert.ok(result.command.includes('maven/'), 'Should contain maven URL');
+    assert.strictEqual(result.language, 'markdown');
   });
 
   test('maven splits groupId:artifactId correctly', function () {
@@ -60,7 +80,8 @@ suite('Integration: Install Command Builder', function () {
   test('private-repo formats include auth notes', function () {
     const formatsWithNotes = ['python', 'npm', 'docker', 'cargo', 'go'];
     for (const format of formatsWithNotes) {
-      const result = InstallCommandBuilder.build(format, 'pkg', '1.0', 'ws', 'repo');
+      const version = ['npm', 'cargo', 'go'].includes(format) ? '1.0.0' : '1.0';
+      const result = InstallCommandBuilder.build(format, 'pkg', version, 'ws', 'repo');
       assert.ok(result.note, `${format}: should have an auth note for private repos`);
       assert.ok(typeof result.note === 'string', `${format}: note should be a string`);
     }

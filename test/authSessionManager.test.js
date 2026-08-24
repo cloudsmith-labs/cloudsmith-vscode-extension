@@ -82,6 +82,19 @@ function createSSOHarness(protocolClient, options = {}) {
 }
 
 suite("SSO session authority", () => {
+  test("connected SSO remains unavailable to registry pull-through", async () => {
+    const { manager } = createSSOHarness({});
+
+    const result = await manager.initialize();
+
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(manager.getState().sessionConnected, true);
+    assert.strictEqual(manager.getCredentialKind(), "sso");
+    assert.deepStrictEqual(manager.getAuthenticationCapabilities(), {
+      pullThroughAvailable: false,
+    });
+  });
+
   test("runs discovery, callback, validation, commit, ordinary bearer API, and refresh end to end", async () => {
     let wall = 0;
     let monotonic = 0;

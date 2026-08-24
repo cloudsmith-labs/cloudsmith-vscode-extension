@@ -9,6 +9,21 @@ suite('SearchQueryBuilder Test Suite', () => {
 		assert.strictEqual(builder.name('flask').build(), 'name:flask');
 	});
 
+	test('exactName() anchors the escaped canonical package identity without changing fuzzy name()', () => {
+		const cases = [
+			['js-yaml', 'name:^js-yaml$'],
+			['@scope/package', 'name:^@scope/package$'],
+			['foo+bar/baz', 'name:^foo+bar/baz$'],
+			['my package', 'name:"^my package$"'],
+			['literal^middle$end', 'name:^literal\\^middle\\$end$'],
+			['pkg:name OR status:quarantined', 'name:"^pkg\\:name OR status\\:quarantined$"'],
+		];
+		for (const [input, expected] of cases) {
+			assert.strictEqual(new SearchQueryBuilder().exactName(input).build(), expected, input);
+		}
+		assert.strictEqual(new SearchQueryBuilder().name('js-yaml').build(), 'name:js-yaml');
+	});
+
 	test('format() produces format:value', () => {
 		const builder = new SearchQueryBuilder();
 		assert.strictEqual(builder.format('python').build(), 'format:python');
@@ -22,6 +37,45 @@ suite('SearchQueryBuilder Test Suite', () => {
 	test('version() produces version:value', () => {
 		const builder = new SearchQueryBuilder();
 		assert.strictEqual(builder.version('3.0.0').build(), 'version:3.0.0');
+	});
+
+	test('version comparison methods keep trusted operators outside escaped version data', () => {
+		assert.strictEqual(
+			new SearchQueryBuilder().versionGreaterThan('3.14.2').build(),
+			'version:>3.14.2'
+		);
+		assert.strictEqual(
+			new SearchQueryBuilder().versionAtLeast('4.2.0-beta+build').build(),
+			'version:>=4.2.0-beta+build'
+		);
+		assert.strictEqual(
+			new SearchQueryBuilder().versionAtLeast('4.2.0 OR status:quarantined').build(),
+			'version:>="4.2.0 OR status\\:quarantined"'
+		);
+	});
+
+	test('exact and comparison fields reject empty, non-finite, control-bearing, and oversized values', () => {
+		const invalidValues = [
+			undefined,
+			null,
+			'',
+			'   ',
+			'1.0.0\nstatus:quarantined',
+			'pkg\u202ename',
+			'x'.repeat(2049),
+			Number.NaN,
+			Number.POSITIVE_INFINITY,
+			{},
+		];
+		for (const value of invalidValues) {
+			assert.throws(() => new SearchQueryBuilder().exactName(value), TypeError);
+			assert.throws(() => new SearchQueryBuilder().versionGreaterThan(value), TypeError);
+			assert.throws(() => new SearchQueryBuilder().versionAtLeast(value), TypeError);
+		}
+		assert.strictEqual(
+			new SearchQueryBuilder().versionGreaterThan(2).build(),
+			'version:>2'
+		);
 	});
 
 	test('tag() produces tag:value', () => {

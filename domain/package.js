@@ -14,22 +14,29 @@ const MAX_COORDINATE_QUALIFIER_ARRAY_LENGTH = 64;
 
 const PACKAGE_COORDINATE_QUALIFIER_KEYS = Object.freeze([
   "alias",
+  "architecture",
+  "build",
   "classifier",
   "configurations",
   "digest",
   "environment",
+  "epoch",
+  "nativeVersion",
   "platform",
   "pullPolicy",
+  "release",
   "repository",
   "scope",
   "section",
   "service",
   "stage",
+  "subdir",
   "tag",
   "targetFramework",
   "type",
 ]);
 const PACKAGE_COORDINATE_QUALIFIER_KEY_SET = new Set(PACKAGE_COORDINATE_QUALIFIER_KEYS);
+const VERSIONLESS_PACKAGE_FORMATS = new Set(["generic", "raw"]);
 
 const CONTROL_OR_BIDI_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/;
 const UNSAFE_PATH_PATTERN = /[\\/?#]/;
@@ -43,6 +50,7 @@ const SEMANTIC_FIELDS = Object.freeze([
   "repository",
   "packageIdentifier",
   "name",
+  "coordinateName",
   "version",
   "format",
   "qualifiers",
@@ -74,6 +82,12 @@ const SEMANTIC_FIELDS = Object.freeze([
   "declared",
   "raw",
   "url",
+  "architecture",
+  "build",
+  "epoch",
+  "nativeVersion",
+  "release",
+  "subdir",
 ]);
 
 class PackageDomainError extends TypeError {
@@ -93,6 +107,9 @@ class PackageDomainError extends TypeError {
 function createExactPackage(input) {
   if (isExactPackage(input)) return input;
   const source = requireRecord(input, "package");
+  const name = requiredString(source, "name", MAX_NAME_LENGTH, { trim: false });
+  const coordinateName = optionalString(source, "coordinateName", MAX_NAME_LENGTH) || name;
+  const format = requiredString(source, "format", MAX_FORMAT_LENGTH);
   const value = {
     kind: "package",
     identityState: "exact",
@@ -103,9 +120,11 @@ function createExactPackage(input) {
       "packageIdentifier",
       MAX_PACKAGE_IDENTIFIER_LENGTH
     ),
-    name: requiredString(source, "name", MAX_NAME_LENGTH, { trim: false }),
-    version: requiredString(source, "version", MAX_VERSION_LENGTH, { trim: false }),
-    format: requiredString(source, "format", MAX_FORMAT_LENGTH),
+    name,
+    coordinateName,
+    version: packageVersion(source, format),
+    format,
+    qualifiers: createPackageCoordinateQualifiers(readOwn(source, "qualifiers")),
     slug: optionalString(source, "slug", MAX_PACKAGE_IDENTIFIER_LENGTH),
     status: optionalString(source, "status", MAX_METADATA_LENGTH),
     statusReason: optionalString(source, "statusReason", MAX_METADATA_LENGTH),
@@ -130,6 +149,7 @@ function createPackageCoordinate(input) {
   if (isPackageCoordinate(input)) return input;
   const source = requireRecord(input, "package coordinate");
   const repositoryValue = readOwn(source, "repository");
+  const format = requiredString(source, "format", MAX_FORMAT_LENGTH);
   const value = {
     kind: "package",
     identityState: "coordinate",
@@ -139,8 +159,8 @@ function createPackageCoordinate(input) {
       : validatePathPart(repositoryValue, "repository", MAX_SCOPE_LENGTH),
     packageIdentifier: null,
     name: requiredString(source, "name", MAX_NAME_LENGTH, { trim: false }),
-    version: requiredString(source, "version", MAX_VERSION_LENGTH, { trim: false }),
-    format: requiredString(source, "format", MAX_FORMAT_LENGTH),
+    version: packageVersion(source, format),
+    format,
     qualifiers: createPackageCoordinateQualifiers(readOwn(source, "qualifiers")),
   };
   Object.freeze(value);
@@ -215,9 +235,10 @@ function packageCoordinateFromExact(value) {
   return createPackageCoordinate({
     workspace: pkg.workspace,
     repository: pkg.repository,
-    name: pkg.name,
+    name: pkg.coordinateName,
     version: pkg.version,
     format: pkg.format,
+    qualifiers: pkg.qualifiers,
   });
 }
 
@@ -497,6 +518,14 @@ function requiredString(record, field, maxLength, options = {}) {
     throw domainError("missing_field", field, `The ${field} value is required.`);
   }
   return validateString(value, field, maxLength, options);
+}
+
+function packageVersion(record, format) {
+  const value = readOwn(record, "version");
+  if (value === "" && VERSIONLESS_PACKAGE_FORMATS.has(String(format).toLowerCase())) {
+    return "";
+  }
+  return requiredString(record, "version", MAX_VERSION_LENGTH, { trim: false });
 }
 
 function optionalString(record, field, maxLength) {

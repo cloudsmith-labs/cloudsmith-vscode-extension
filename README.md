@@ -21,7 +21,7 @@ Supported authentication methods:
 - **Sign in with SSO** — Sign in through your organization's identity provider in the browser. The extension validates, securely stores, and refreshes the resulting Cloudsmith session.
 - **Import API key from Cloudsmith CLI** — Explicitly import the single `[default]` API key from a trusted user-level `credentials.ini`. The extension never searches the current project and does not scrape the CLI keyring.
 
-API keys are sent only as `X-Api-Key`; SSO sessions are sent only as `Authorization: Bearer`. SSO refresh tokens never leave secure credential storage except for the fixed Cloudsmith refresh exchange. Upstream registry pull currently requires an API key and fails clearly instead of sending an SSO bearer to a registry.
+Cloudsmith REST API requests use `X-Api-Key` for API keys and `Authorization: Bearer` for SSO sessions. Pull-through uses format-native registry authentication only with validated Cloudsmith registry hosts. SSO refresh tokens never leave secure credential storage except for the fixed Cloudsmith refresh exchange. Pull-through requires a Cloudsmith API key. Sign in with an API key to continue.
 
 Use **Clear stored credentials** to disconnect and remove the credential from VS Code's secure storage.
 
@@ -41,6 +41,8 @@ Package and search-result context menus provide actions such as:
 - **Explain quarantine** for quarantined packages
 - **Show promotion status** and **Promote package** when the package is eligible
 
+Generated install guidance preserves each format's native package identity, including supported qualifiers, and targets the selected Cloudsmith workspace and repository. Review the generated guidance before using it: **Cargo** includes a repository-specific `.cargo/config.toml` registry stanza and requires separate token setup for private repositories; **Maven** provides separate `~/.m2/settings.xml` mirror and `pom.xml` dependency merge guidance rather than a shell install command; and **Go** sets a repository-specific `GOPROXY`, with native HTTP Basic credentials and carefully scoped checksum settings potentially required for private modules.
+
 ## Search packages
 
 Use **Search packages** for a workspace-wide query. Recent searches can be selected and run again. **Advanced search** supports all repositories or a selected set of repositories, common security and license filters, format filters, and custom Cloudsmith search syntax.
@@ -52,6 +54,8 @@ Workspace and repository context menus include scoped search and filter shortcut
 Vulnerability state is derived from canonical scan evidence. A package is shown as clean only when the available result authoritatively reports no known vulnerabilities; incomplete or failed data is not presented as clean.
 
 **Show vulnerabilities** opens severity, CVSS, description, affected version, and fix-version details. **Find safe version** searches for eligible alternatives and offers follow-up package actions. Quarantine reasoning is presented separately through **Explain quarantine**, which shows the current reason and policy details when available.
+
+A vulnerable quarantined package keeps **Show vulnerabilities**, **Find safe version**, **Explain quarantine**, and the read-only **Show promotion status** action available. **Copy install command**, **Show install command**, and **Promote package** remain unavailable while the package is quarantined.
 
 ## Dependency Health
 
@@ -90,7 +94,7 @@ Use **Sort & filter dependencies** to change ordering or show vulnerable, uncove
 
 ### Pull through an upstream
 
-After a successful scan, **Pull dependencies** can fetch eligible uncovered packages through a matching repository upstream. This action can cause packages to be cached in Cloudsmith and always presents a confirmation before network writes. A dependency context menu can pull one eligible package. Coverage is refreshed after the operation.
+After a successful scan with API-key authentication, **Pull dependencies** can fetch eligible uncovered packages through a matching repository upstream. This action can cause packages to be cached in Cloudsmith and always presents a confirmation before network writes. A dependency context menu can pull one eligible package. Coverage is refreshed after the operation.
 
 ## Upstreams
 
@@ -122,7 +126,6 @@ Open **Cloudsmith: Open Cloudsmith settings** to configure the extension.
 | `cloudsmith-vsc.maxDependenciesToScan` | `10000` | Integer, minimum 1 | Bound dependencies displayed and evaluated; pull operations retain the complete resolved input. |
 | `cloudsmith-vsc.showLicenseIndicators` | `true` | Boolean | Show package and dependency license information. |
 | `cloudsmith-vsc.flagRestrictiveLicenses` | `true` | Boolean | Add an explicit restrictive-license indication to Dependency Health rows. |
-| `cloudsmith-vsc.showDockerDigestCommand` | `false` | Boolean | Offer an exact Docker pull-by-digest command when a digest is available. |
 | `cloudsmith-vsc.resolveTransitiveDependencies` | `true` | Boolean | Read supported lockfiles for transitive dependencies; when disabled, show direct manifest dependencies. |
 | `cloudsmith-vsc.dependencyTreeDefaultView` | `"flat"` | `"direct"`, `"flat"`, `"tree"` | Set the initial Dependency Health view unless a workspace view choice is already stored. |
 | `cloudsmith-vsc.showLegacyPolicies` | `false` | Boolean | Show classic deny, license, and vulnerability policy fields alongside current policy management. |
@@ -138,6 +141,7 @@ These settings have no effect and remain contributed only so existing user and w
 | Setting | Default | Status | Purpose |
 |---|---|---|---|
 | `cloudsmith-vsc.autoScanOnOpen` | `false` | Deprecated; no effect | Retained for configuration compatibility. |
+| `cloudsmith-vsc.showDockerDigestCommand` | `false` | Deprecated; no effect | Exact manifest-digest pulls are automatic; retained for configuration compatibility. |
 | `cloudsmith-vsc.showRepoMetrics` | `false` | Deprecated; no effect | Retained for configuration compatibility. |
 
 ## Command surfaces
@@ -154,11 +158,15 @@ These primary workflows are recoverable from the Command Palette and ask for mis
 | Command Palette | `cloudsmith-vsc.searchPackages` | `Search packages` | Search the current or selected workspace. |
 | Command Palette | `cloudsmith-vsc.guidedSearch` | `Advanced search` | Build a scoped or filtered package query. |
 | Command Palette | `cloudsmith-vsc.scanDependencies` | `Scan dependencies` | Scan supported dependency inputs. |
+| Command Palette | `cloudsmith-vsc.pullDependencies` | `Pull dependencies` | Pull eligible uncovered dependencies through a matching upstream with API-key authentication. |
 | Command Palette | `cloudsmith-vsc.depSortFilter` | `Sort & filter dependencies` | Change Dependency Health ordering and filters. |
 | Command Palette | `cloudsmith-vsc.viewComplianceReport` | `View compliance report` | Open the latest completed report when available. |
 | Command Palette | `cloudsmith-vsc.inspectPackage` | `Inspect package` | Select or reuse an eligible package and show its validated inspection JSON. |
 | Command Palette | `cloudsmith-vsc.showVulnerabilities` | `Show vulnerabilities` | Select or reuse a package and open vulnerability details. |
+| Command Palette | `cloudsmith-vsc.findSafeVersion` | `Find safe version` | Select or reuse a package and find eligible safe versions. |
 | Command Palette | `cloudsmith-vsc.explainQuarantine` | `Explain quarantine` | Select or reuse a quarantined package. |
+| Command Palette | `cloudsmith-vsc.copyInstallCommand` | `Copy install command` | Select or reuse an eligible package and copy its install command. |
+| Command Palette | `cloudsmith-vsc.showInstallCommand` | `Show install command` | Select or reuse an eligible package and open its install command. |
 | Command Palette | `cloudsmith-vsc.inspectUpstreams` | `View upstreams` | Select or reuse a repository and open upstream details. |
 | Command Palette | `cloudsmith-vsc.previewUpstreamResolution` | `Preview upstream resolution` | Preview a supported package and repository resolution. |
 | Command Palette | `cloudsmith-vsc.showPromotionStatus` | `Show promotion status` | Select or reuse a package and show its pipeline state. |
@@ -172,7 +180,7 @@ Context-only actions include **Copy value**, **Inspect package group**, reposito
 
 ## Help and support
 
-Open the Help and feedback view for [extension documentation](https://docs.cloudsmith.com/developer-tools/vscode), [Cloudsmith documentation](https://docs.cloudsmith.com/), the [issue tracker](https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues), and the [verified new-issue form](https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues/new/choose).
+Open the Help and feedback view for [extension documentation](https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/blob/main/README.md), [Cloudsmith documentation](https://docs.cloudsmith.com/), the [issue tracker](https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues), and the [verified new-issue form](https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues/new/choose).
 
 Package grouping is documented in [Cloudsmith package groups](https://docs.cloudsmith.com/artifact-management/package-groups).
 
