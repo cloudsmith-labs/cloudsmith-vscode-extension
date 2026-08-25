@@ -4,6 +4,8 @@ const { getUpstreamFormatDescriptor, normalizeUpstreamFormat } = require("./upst
 const { sanitizeSafeInventoryUpstream } = require("./upstreamChecker");
 
 const UPSTREAM_REPO_CONCURRENCY = 4;
+const DEFAULT_REPOSITORY_OPERATION_TIMEOUT_MS = 50_000;
+const MAX_REPOSITORY_OPERATION_TIMEOUT_MS = 120_000;
 
 function getUncoveredDependencyKey(dependency) {
   const format = canonicalFormat(dependency && (dependency.format || dependency.ecosystem));
@@ -185,7 +187,35 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
   });
 
   const repoUpstreamStates = new Map();
+  const accountedRepositories = new Set();
+  const repositoryOperationTimeoutMs = boundedRepositoryOperationTimeoutMs(
+    options.repositoryOperationTimeoutMs
+  );
   let completed = 0;
+
+  const publishRepositoryProgress = () => {
+    if (!onProgress) return;
+    publishProgress(onProgress, new Map(), {
+      completed,
+      inspected: repoUpstreamStates.size,
+      total: repositoriesToInspect.length,
+      workspace,
+      stage: "upstream",
+    });
+  };
+  const accountRepository = (repo, state, publish = true) => {
+    if (accountedRepositories.has(repo)) return;
+    accountedRepositories.add(repo);
+    if (state !== undefined) {
+      const safeState = snapshotSafeRepositoryState(state, formatsToInspect);
+      repoUpstreamStates.set(repo, {
+        repo,
+        ...safeState,
+      });
+    }
+    completed = accountedRepositories.size;
+    if (publish && completed < repositoriesToInspect.length) publishRepositoryProgress();
+  };
 
   try {
     await runPromisePool(repositoriesToInspect, UPSTREAM_REPO_CONCURRENCY, async (repo) => {
@@ -195,9 +225,8 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
         || operationScope.scheduler?.stopped
       ) return false;
 
-      let state;
-      try {
-        state = await upstreamRuntime.getRepositoryUpstreamStateForFormats(
+      const completion = await settleRepositoryOperation(
+        signal => upstreamRuntime.getRepositoryUpstreamStateForFormats(
           workspace,
           repo,
           formatsToInspect,
@@ -205,34 +234,43 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
             account: options.account,
             operationScope,
             operationTimeoutMs: options.operationTimeoutMs,
+            signal,
           }
-        );
-      } catch {
-        state = null;
-      }
+        ),
+        {
+          cancellationToken,
+          signal: operationScope.signal,
+          timeoutMs: repositoryOperationTimeoutMs,
+        }
+      );
       if (
         isCancelled(cancellationToken)
         || operationScope.signal?.aborted
-        || operationScope.scheduler?.stopped
+        || completion.kind === "cancelled"
       ) return false;
-      const safeState = snapshotSafeRepositoryState(state, formatsToInspect);
-      repoUpstreamStates.set(repo, {
-        repo,
-        ...safeState,
-      });
-
-      completed += 1;
-      if (onProgress) {
-        publishProgress(onProgress, new Map(), {
-          completed,
-          total: repositoriesToInspect.length,
-          workspace,
-          stage: "upstream",
-        });
-      }
-      return true;
+      // A rejected or timed-out repository was admitted and reached a terminal
+      // inspection attempt. Snapshot it as incomplete so progress terminates
+      // without inventing authoritative negative evidence.
+      const state = completion.kind === "fulfilled" ? completion.value : null;
+      // A request can safely settle while opening the shared scheduler's
+      // circuit. Retain and account that terminal state; `stopped` only
+      // prevents new fan-out and does not invalidate work already completed.
+      accountRepository(repo, state);
+      return operationScope.scheduler?.stopped ? false : true;
     });
 
+    if (
+      !isCancelled(cancellationToken)
+      && !operationScope.signal?.aborted
+      && operationScope.scheduler?.stopped
+    ) {
+      // Repositories not admitted after a circuit/budget stop are terminally
+      // accounted as uninspected. They intentionally have no snapshot, which
+      // keeps `repositoriesComplete` false and all negative evidence unknown.
+      for (const repo of repositoriesToInspect) accountRepository(repo, undefined, false);
+    }
+
+    const cancelled = isCancelled(cancellationToken) || operationScope.signal?.aborted;
     const snapshots = repositoriesToInspect
       .filter((repo) => repoUpstreamStates.has(repo))
       .map((repo) => repoUpstreamStates.get(repo));
@@ -240,21 +278,38 @@ async function analyzeUpstreamGaps(uncoveredDependencies, workspace, repositorie
     const patchMap = buildGapPatch(uncoveredDependencies, snapshots, {
       repositoriesComplete: repositoriesComplete
         && snapshots.length === repositoriesToInspect.length
-        && !isCancelled(cancellationToken)
-        && !operationScope.signal?.aborted,
+        && !cancelled,
     });
-    if (onProgress && patchMap.size > 0) {
+    const inspectionComplete = repositoriesComplete
+      && snapshots.length === repositoriesToInspect.length
+      && snapshots.every(snapshot => repositorySnapshotComplete(snapshot, formatsToInspect))
+      && !cancelled;
+    // Cancellation/supersession owns settlement at the scan transaction. Do
+    // not misrepresent it as a completed-but-partial coverage inspection or
+    // publish enrichment state from an operation the caller no longer owns.
+    if (onProgress && !cancelled) {
       publishProgress(onProgress, new Map(patchMap), {
         completed,
+        inspected: snapshots.length,
         total: repositoriesToInspect.length,
         workspace,
         stage: "upstream",
+        terminal: true,
+        outcome: inspectionComplete ? "complete" : "partial",
       });
     }
     return applyGapPatch(uncoveredDependencies, patchMap);
   } finally {
     operationScope.dispose();
   }
+}
+
+function repositorySnapshotComplete(snapshot, requestedFormats) {
+  if (snapshot?.complete !== true) return false;
+  return requestedFormats.every(format => (
+    !snapshot.failedFormats.includes(format)
+    && !snapshot.uninspectedFormats.includes(format)
+  ));
 }
 
 function snapshotSafeRepositoryState(state, requestedFormats) {
@@ -305,6 +360,73 @@ function publishProgress(onProgress, patchMap, metadata) {
   } catch {
     // Progress callbacks are observers and cannot abort or outlive the bounded work pool.
   }
+}
+
+async function settleRepositoryOperation(operation, options = {}) {
+  const controller = new AbortController();
+  const signal = options.signal;
+  const cancellationToken = options.cancellationToken;
+  let timer = null;
+  let cancellationDisposable = null;
+  let resolveBoundary;
+  let boundarySettled = false;
+  const boundary = new Promise((resolve) => {
+    resolveBoundary = resolve;
+  });
+  const settleBoundary = (kind) => {
+    if (boundarySettled) return;
+    boundarySettled = true;
+    controller.abort();
+    resolveBoundary({ kind });
+  };
+  const onAbort = () => settleBoundary("cancelled");
+
+  if (signal?.aborted || isCancelled(cancellationToken)) {
+    settleBoundary("cancelled");
+  } else {
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+    if (typeof cancellationToken?.onCancellationRequested === "function") {
+      cancellationDisposable = cancellationToken.onCancellationRequested(onAbort);
+    }
+    if (signal?.aborted || isCancelled(cancellationToken)) onAbort();
+    if (!boundarySettled) {
+      timer = setTimeout(() => settleBoundary("timeout"), options.timeoutMs);
+      timer.unref?.();
+    }
+  }
+
+  // Both branches stay observed after a timeout/cancellation wins the race.
+  // A non-cooperative runtime cannot strand the repository pool or surface a
+  // late unhandled rejection.
+  let observed;
+  if (controller.signal.aborted) {
+    observed = Promise.resolve({ kind: "cancelled" });
+  } else {
+    try {
+      // Invoke synchronously so shared scheduler/circuit state is visible to
+      // the next pool worker before it can admit additional repository work.
+      observed = Promise.resolve(operation(controller.signal)).then(
+        value => ({ kind: "fulfilled", value }),
+        () => ({ kind: "rejected" })
+      );
+    } catch {
+      observed = Promise.resolve({ kind: "rejected" });
+    }
+  }
+
+  try {
+    return await Promise.race([observed, boundary]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    signal?.removeEventListener?.("abort", onAbort);
+    cancellationDisposable?.dispose?.();
+  }
+}
+
+function boundedRepositoryOperationTimeoutMs(value) {
+  return Number.isSafeInteger(value) && value > 0
+    ? Math.min(value, MAX_REPOSITORY_OPERATION_TIMEOUT_MS)
+    : DEFAULT_REPOSITORY_OPERATION_TIMEOUT_MS;
 }
 
 async function runPromisePool(items, concurrency, worker) {

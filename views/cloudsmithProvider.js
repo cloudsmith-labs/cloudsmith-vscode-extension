@@ -212,17 +212,12 @@ class CloudsmithProvider {
 
     if (packageProjectionFailures > 0) {
       for (let index = published.length - 1; index >= 0; index -= 1) {
-        if (
-          isRepositoryTerminalNode(published[index])
-          && published[index].terminalOutcome.kind === "empty"
-        ) published.splice(index, 1);
+        if (isRepositoryTerminalNode(published[index])) published.splice(index, 1);
       }
-      if (!published.some(isRepositoryTerminalNode)) {
-        published.push(new RepositoryTerminalNode(
-          packageCount > 0 ? "partial" : "failed",
-          repository
-        ));
-      }
+      insertRepositoryTerminal(published, new RepositoryTerminalNode(
+        packageCount > 0 ? "partial" : "failed",
+        repository
+      ));
     }
 
     const hasTerminal = published.some(isRepositoryTerminalNode);
@@ -233,7 +228,10 @@ class CloudsmithProvider {
       packageLoadActive = false;
     }
     if (packageCount === 0 && !hasTerminal && !packageLoadActive) {
-      published.push(new RepositoryTerminalNode("failed", repository));
+      insertRepositoryTerminal(
+        published,
+        new RepositoryTerminalNode("failed", repository)
+      );
     }
     this._repositoryProjectionState.set(repository, Object.freeze({
       packageCandidates,
@@ -801,6 +799,10 @@ function vulnerabilityEventIdentity(event) {
   if (typeof event === "string") return event;
   if (typeof event?.identity === "string") return event.identity;
   return null;
+}
+
+function insertRepositoryTerminal(children, terminal) {
+  children.unshift(terminal);
 }
 
 function isRenderableTreeItem(item) {

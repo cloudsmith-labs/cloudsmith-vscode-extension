@@ -3,7 +3,7 @@
 // Search results tree data provider for the Package Search view.
 
 const vscode = require("vscode");
-const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { CloudsmithAPI, DEFAULT_TIMEOUT_MS } = require("../util/cloudsmithAPI");
 const { apiEndpoint } = require("../util/apiEndpoint");
 const { PaginatedFetch } = require("../util/paginatedFetch");
 const SearchResultNode = require("../models/searchResultNode");
@@ -33,6 +33,10 @@ const MAX_MULTI_REPO_PAGES = 20;
 const MAX_SINGLE_SEARCH_PAGES = 20;
 const MAX_SINGLE_SEARCH_REQUESTS = 24;
 const MAX_FAILURE_DETAILS = 20;
+const DEFAULT_PAGE_OPERATION_TIMEOUT_MS = DEFAULT_TIMEOUT_MS + (5 * 1000);
+const MAX_PAGE_OPERATION_TIMEOUT_MS = 2 * 60 * 1000;
+const PAGE_OPERATION_CANCELLED = Object.freeze({ kind: "cancelled" });
+const PAGE_OPERATION_TIMEOUT = Object.freeze({ kind: "timeout" });
 // Broad package queries can exceed the transport deadline at larger page sizes.
 // Keep the interactive workspace/repository path small and predictable; the
 // configurable size remains available only to bounded selected-repository runs.
@@ -56,6 +60,9 @@ class SearchProvider {
             const config = vscode.workspace.getConfiguration("cloudsmith-vsc");
             return config.get("searchPageSize");
         });
+        this._pageOperationTimeoutMs = normalizePageOperationTimeout(
+            options.pageOperationTimeoutMs
+        );
         this._vulnerabilityStateService = options.vulnerabilityStateService || null;
         this._vulnerabilitySummaries = new Map();
         this._treeParents = new WeakMap();
@@ -501,7 +508,7 @@ class SearchProvider {
      * Load exactly one next page. Duplicate commands for the same committed
      * session and target page receive the same promise and cannot double-fetch.
      */
-    loadNextPage() {
+    loadNextPage(continuationClaim = null) {
         const account = this._readConnectedAccount();
         const committed = this._currentCommitted(account);
         if (
@@ -511,6 +518,12 @@ class SearchProvider {
             || !committed.pagination
             || committed.descriptor.kind === "repositories"
             || this._activeRoot
+        ) {
+            return Promise.resolve();
+        }
+        if (
+            continuationClaim !== null
+            && continuationClaim !== continuationClaimFor(committed)
         ) {
             return Promise.resolve();
         }
@@ -534,8 +547,31 @@ class SearchProvider {
         });
         const promise = Promise.resolve()
             .then(() => this._executePage(operation))
+            .catch(() => {
+                if (this._isCurrentPage(operation)) {
+                    this._failPage(
+                        operation,
+                        "Could not load more packages. The operation failed unexpectedly.",
+                        null,
+                        "unexpected",
+                        true
+                    );
+                }
+            })
             .finally(() => {
                 if (this._activePage?.operation === operation) {
+                    if (
+                        this._state.pending?.operationId === operation.id
+                        && this._isCurrentPage(operation)
+                    ) {
+                        this._failPage(
+                            operation,
+                            "Could not load more packages. The operation did not reach a valid result.",
+                            null,
+                            "unexpected",
+                            true
+                        );
+                    }
                     this._activePage = null;
                     if (!this._disposed) this._scheduleContextUpdate();
                 }
@@ -589,23 +625,46 @@ class SearchProvider {
                 this._discardPage(operation);
                 return;
             }
-            result = await this._withProgress(progressOptions("Loading more packages..."), (_progress, token) => {
+            const outcome = await this._withProgress(progressOptions("Loading more packages..."), (_progress, token) => {
                 progressToken = token;
-                if (token?.isCancellationRequested) return null;
+                if (token?.isCancellationRequested) return PAGE_OPERATION_CANCELLED;
                 operation.requestAttempt.started = true;
-                return paginatedFetch.fetchPage(
-                    endpoint,
-                    targetPage,
-                    pageSize,
-                    descriptor.query,
-                    {
-                        cancellationToken: token,
-                        retry: "never",
-                        signal: operation.controller.signal,
-                        validate: isPackageSearchArray,
-                    }
+                return settlePageOperation(
+                    paginatedFetch.fetchPage(
+                        endpoint,
+                        targetPage,
+                        pageSize,
+                        descriptor.query,
+                        {
+                            cancellationToken: token,
+                            retry: "never",
+                            signal: operation.controller.signal,
+                            validate: isPackageSearchArray,
+                        }
+                    ),
+                    operation.controller.signal,
+                    token,
+                    this._pageOperationTimeoutMs
                 );
             });
+            if (outcome?.kind === "timeout") {
+                if (!this._isCurrentPage(operation)) return;
+                this._failPage(
+                    operation,
+                    "Could not load more packages. The request timed out. Try loading the page again.",
+                    null,
+                    "timeout"
+                );
+                operation.controller.abort();
+                return;
+            }
+            if (outcome?.kind === "cancelled") {
+                if (this._isCurrentPage(operation)) this._cancelPage(operation);
+                operation.controller.abort();
+                return;
+            }
+            if (outcome?.kind === "rejected") throw outcome.error;
+            result = outcome?.kind === "fulfilled" ? outcome.value : outcome;
         } catch (error) {
             if (!this._continuePage(operation, progressToken)) return;
             this._failPage(
@@ -794,6 +853,7 @@ class SearchProvider {
             return;
         }
         const committed = commitPageAttempt(operation, { terminal, failed: true });
+        const customerMessage = actionablePageFailureMessage(message, committed.pageable);
         this._state = freezeState({
             committed,
             pending: null,
@@ -802,11 +862,12 @@ class SearchProvider {
                 activationId: operation.account.activationId,
                 accountEpoch: operation.account.accountEpoch,
                 descriptor: committed.descriptor,
+                targetPage: operation.targetPage,
                 kind: kind || "page_failed",
-                message,
+                message: customerMessage,
             },
         });
-        this._notify("error", message);
+        this._notify("error", customerMessage);
         this.refresh();
     }
 
@@ -1032,7 +1093,8 @@ class SearchProvider {
                 committed.pagination.page,
                 committed.pagination.pageTotal,
                 committed.pagination.count,
-                committed.results.length
+                committed.results.length,
+                continuationClaimFor(committed)
             ));
         }
         this._ownPackageSelections(committed.results, account);
@@ -1287,6 +1349,48 @@ function clampPageSize(value) {
     return Math.min(100, Math.max(1, Math.floor(numeric)));
 }
 
+function normalizePageOperationTimeout(value) {
+    return Number.isSafeInteger(value) && value > 0
+        ? Math.min(value, MAX_PAGE_OPERATION_TIMEOUT_MS)
+        : DEFAULT_PAGE_OPERATION_TIMEOUT_MS;
+}
+
+function settlePageOperation(promise, signal, cancellationToken, timeoutMs) {
+    return new Promise((resolve) => {
+        let settled = false;
+        let timeout = null;
+        let cancellationDisposable = null;
+        const finish = (outcome) => {
+            if (settled) return false;
+            settled = true;
+            if (timeout !== null) clearTimeout(timeout);
+            signal?.removeEventListener?.("abort", cancel);
+            cancellationDisposable?.dispose?.();
+            cancellationDisposable = null;
+            resolve(outcome);
+            return true;
+        };
+        const cancel = () => finish(PAGE_OPERATION_CANCELLED);
+
+        signal?.addEventListener?.("abort", cancel, { once: true });
+        if (typeof cancellationToken?.onCancellationRequested === "function") {
+            const disposable = cancellationToken.onCancellationRequested(cancel);
+            if (settled) disposable?.dispose?.();
+            else cancellationDisposable = disposable;
+        }
+        if (signal?.aborted || cancellationToken?.isCancellationRequested) cancel();
+        if (!settled) {
+            timeout = setTimeout(() => finish(PAGE_OPERATION_TIMEOUT), timeoutMs);
+            timeout.unref?.();
+        }
+
+        Promise.resolve(promise).then(
+            value => finish({ kind: "fulfilled", value }),
+            error => finish({ kind: "rejected", error })
+        );
+    });
+}
+
 function isPackageSearchArray(value) {
     return Array.isArray(value) && value.every(pkg => canonicalizeSearchPackage(pkg) !== null);
 }
@@ -1488,6 +1592,29 @@ function freezeCommitted(value) {
             pageLimitReached: Boolean(diagnostics.pageLimitReached),
         }),
     });
+}
+
+function continuationClaimFor(committed) {
+    return JSON.stringify([
+        committed.activationId,
+        committed.accountEpoch,
+        committed.operationId,
+        committed.pagination?.page || 0,
+    ]);
+}
+
+function actionablePageFailureMessage(message, canRetryPage) {
+    const normalized = typeof message === "string" && message.trim().length > 0
+        ? message.trim()
+        : "Could not load more packages.";
+    const base = normalized
+        .replace(
+            /\s+(?:(?:try|retry) loading the page(?: again)?|(?:rerun|retry) the search)[.!?]?$/i,
+            ""
+        )
+        .replace(/[.!?]+$/, "");
+    const action = canRetryPage ? "Try loading the page again." : "Rerun the search.";
+    return `${base}. ${action}`;
 }
 
 function commitPageAttempt(operation, { terminal = false } = {}) {
@@ -2067,10 +2194,15 @@ function summaryNode(committed) {
 }
 
 function failureNode(failure) {
+    const pageFailure = Number.isSafeInteger(failure.targetPage) && failure.targetPage > 1;
+    const label = pageFailure
+        ? "Could not load more results"
+        : `Search failed for: ${failure.descriptor.query}`;
+    const pageDetail = pageFailure ? `\nPage: ${failure.targetPage}` : "";
     return new InfoNode(
-        `Search failed for: ${failure.descriptor.query}`,
+        label,
         failure.message,
-        `Query: ${failure.descriptor.query}\n${failure.message}`,
+        `Query: ${failure.descriptor.query}${pageDetail}\n${failure.message}`,
         "error"
     );
 }

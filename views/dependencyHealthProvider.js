@@ -97,6 +97,7 @@ const LOOKUP_MAX_PACKAGE_VERSION_LENGTH = 2048;
 const COVERAGE_MATCH_BATCH_SIZE = 50;
 const ENRICHMENT_PROGRESS_DEBOUNCE_MS = 500;
 const LOOKUP_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
+const UPSTREAM_COVERAGE_INCOMPLETE_WARNING = "Upstream coverage is incomplete. Positive matches are shown; missing coverage remains unknown.";
 
 const CLOUDSMITH_COVERAGE_STATUS = Object.freeze({
   CHECKING: "CHECKING",
@@ -1488,7 +1489,7 @@ class DependencyHealthProvider {
     if (!normalizedRepositories.complete) {
       appendUniqueWarning(
         this._warnings,
-        "Repository enumeration for upstream analysis was incomplete. Positive proxy matches are retained, but missing proxy coverage is shown as unknown."
+        UPSTREAM_COVERAGE_INCOMPLETE_WARNING
       );
     }
 
@@ -1520,10 +1521,24 @@ class DependencyHealthProvider {
           cancellationToken: token,
           repositoriesComplete: normalizedRepositories.complete,
           onProgress: (patchMap, meta = {}) => {
+            if (meta.terminal === true && meta.outcome === "cancelled") {
+              return;
+            }
             if (meta.total > 0) {
+              const terminalPartial = meta.terminal === true && meta.outcome === "partial";
+              const inspected = Number.isFinite(meta.inspected)
+                ? meta.inspected
+                : meta.completed;
               progress.report({
-                message: `Checking upstream coverage... ${meta.completed}/${meta.total}`,
+                message: meta.terminal === true
+                  ? terminalPartial
+                    ? `Upstream coverage incomplete: ${inspected}/${meta.total} repositories checked`
+                    : `Upstream coverage checked: ${meta.completed}/${meta.total}`
+                  : `Checking upstream coverage... ${meta.completed}/${meta.total}`,
               });
+              if (terminalPartial) {
+                appendUniqueWarning(this._warnings, UPSTREAM_COVERAGE_INCOMPLETE_WARNING);
+              }
             }
             handler.onProgress(patchMap);
           },

@@ -634,7 +634,14 @@ class RepositoryNode {
       || generation !== this._generation
     ) return [];
 
-    const children = [...metadata];
+    const terminalNode = this._activePackageLoad
+      ? null
+      : this._createPackageTerminalNode(packages);
+    // Package authority is the repository expansion's primary outcome. Put
+    // incomplete/cancelled truth before retained rows, keep complete rows next,
+    // and leave supplementary metadata last so a constrained viewport cannot
+    // look complete while hiding the actual package outcome.
+    const children = terminalNode ? [terminalNode, ...packages] : [...packages];
 
     if (this._activePackageLoad && this._packageState.initialized) {
       const loadingKind = this._packageDescriptor?.mode === "groups"
@@ -648,15 +655,6 @@ class RepositoryNode {
       ));
     }
 
-    for (const node of packages) {
-      children.push(node);
-    }
-
-    const terminalNode = this._activePackageLoad
-      ? null
-      : this._createPackageTerminalNode(packages);
-    if (terminalNode) children.push(terminalNode);
-
     if (this._packageState.continuation && !this._activePackageLoad && !terminalNode) {
       children.push(new RepositoryLoadMoreNode(this, {
         kind: this._packageDescriptor?.mode === "groups" ? "package groups" : "packages",
@@ -666,6 +664,8 @@ class RepositoryNode {
           && ["cancelled", "request_failed"].includes(this._packageState.termination),
       }));
     }
+
+    children.push(...metadata);
 
     return isAccountCurrent(this._connectionManager, account) ? children : [];
   }

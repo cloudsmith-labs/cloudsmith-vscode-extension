@@ -7,6 +7,7 @@ const { formatApiError } = require("../util/errorFormatter");
 const { replaceCollectionItems } = require("../util/paginatedFetch");
 const { fetchWorkspaces, normalizedWorkspaceName } = require("../util/workspaceFetcher");
 const { getWorkspaceContextProjector } = require("../util/workspaceContextProjector");
+const { RepositoryTerminalNode } = require("../models/repositoryTerminalNode");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
 function workspaceSuccess(items) {
@@ -860,6 +861,11 @@ suite("CloudsmithProvider", () => {
     assert.ok(items.some(item => item.label === "valid-package"));
     const terminal = items.find(item => item.contextValue === "repositoryPackagesPartial");
     assert.ok(terminal, "one rejected package projection must publish partial state");
+    assert.strictEqual(
+      items[0],
+      terminal,
+      "partial package authority must precede supplementary repository metadata"
+    );
     assert.strictEqual(terminal.description, "Retry");
     assert.strictEqual(JSON.stringify(terminal).includes("private package projection detail"), false);
 
@@ -876,14 +882,30 @@ suite("CloudsmithProvider", () => {
       initialized: true,
       nodes: Object.freeze([rejectedOnly]),
     });
-    allRejected.getChildren = async () => [metadata, rejectedOnly];
+    allRejected.getChildren = async () => [
+      metadata,
+      rejectedOnly,
+      new RepositoryTerminalNode("partial", allRejected),
+    ];
 
     const contained = await provider.getChildren(allRejected);
     assert.ok(contained.includes(metadata), "valid metadata remains visible");
     assert.strictEqual(contained.includes(rejectedOnly), false);
+    assert.strictEqual(
+      provider.getTreeItem(contained[0]).contextValue,
+      "repositoryPackagesFailed",
+      "failed package authority must precede supplementary repository metadata"
+    );
     assert.ok(contained.some(child => (
       provider.getTreeItem(child).contextValue === "repositoryPackagesFailed"
     )), "metadata-only publication must gain a failed package terminal row");
+    assert.strictEqual(
+      contained.some(child => (
+        provider.getTreeItem(child).contextValue === "repositoryPackagesPartial"
+      )),
+      false,
+      "zero projected packages cannot retain copy claiming loaded packages are shown"
+    );
   });
 
   test("FUX-002 active zero-row load-more publishes loading without a false failure", async () => {
@@ -989,6 +1011,105 @@ suite("CloudsmithProvider", () => {
         entry.phase === "treeItem"
         && entry.contextValue === "repositoryPackagesFailed"
       )), `real TreeView did not publish the terminal item: ${JSON.stringify(ledger)}`);
+    } finally {
+      treeView.dispose();
+      publication.dispose();
+      provider.dispose();
+    }
+  });
+
+  test("real Extension Host publishes package content before repository metadata", async () => {
+    assert.match(vscode.version, /^\d+\.\d+\.\d+/);
+    let packageRequests = 0;
+    const provider = createProvider(async () => {
+      packageRequests += 1;
+      return apiSuccess([{
+        namespace: "workspace-a",
+        repository: "repo-a",
+        name: "package-a",
+        format: "npm",
+        slug: "package-a",
+        slug_perm: "package-a",
+        version: "1.0.0",
+        status_str: "Completed",
+      }], {
+        headers: {
+          "x-pagination-page": "1",
+          "x-pagination-pagetotal": "1",
+          "x-pagination-pagesize": "1",
+          "x-pagination-count": "1",
+        },
+      });
+    }, {
+      upstreamInventory: {
+        async getAllUpstreamData() {
+          return {
+            upstreams: [],
+            failedFormats: [],
+            failures: [],
+            unsupportedFormats: [],
+            uninspectedFormats: [],
+            state: "complete",
+            complete: true,
+          };
+        },
+      },
+    });
+    const repository = provider._createRepositoryNode(
+      {
+        slug: "repo-a",
+        slug_perm: "repo-a",
+        name: "Repo A",
+        storage_region: "us-ohio",
+      },
+      "workspace-a"
+    );
+    const publication = new vscode.EventEmitter();
+    const childPublications = [];
+    const treeView = vscode.window.createTreeView("cloudsmithView", {
+      showCollapseAll: true,
+      treeDataProvider: {
+        onDidChangeTreeData: publication.event,
+        getParent(element) {
+          return element === repository ? undefined : provider.getParent(element);
+        },
+        getChildren(element) {
+          if (!element) return [repository];
+          return Promise.resolve(provider.getChildren(element)).then((children) => {
+            if (element === repository) childPublications.push(children);
+            return children;
+          });
+        },
+        getTreeItem(element) {
+          return provider.getTreeItem(element);
+        },
+      },
+    });
+
+    try {
+      await originalExecuteCommand("workbench.view.extension.cloudsmithSideBar");
+      publication.fire(undefined);
+      for (let attempt = 0; attempt < 8 && childPublications.length === 0; attempt += 1) {
+        await treeView.reveal(repository, { expand: 1, focus: false, select: false });
+        publication.fire(repository);
+        for (let turn = 0; turn < 4 && childPublications.length === 0; turn += 1) {
+          await new Promise(resolve => setImmediate(resolve));
+        }
+      }
+
+      assert.ok(childPublications.length > 0, "real TreeView did not request repository children");
+      const children = childPublications.at(-1);
+      const packageIndex = children.findIndex(child => repository.ownsPackageSelection(child));
+      const metadataIndex = children.findIndex(child => (
+        !repository.ownsPackageSelection(child) && !child.terminalOutcome
+      ));
+      assert.ok(packageIndex >= 0, "the actual package collection did not reach host publication");
+      assert.ok(metadataIndex >= 0, "the fixture did not publish repository metadata");
+      assert.ok(
+        packageIndex < metadataIndex,
+        "package content must precede supplementary metadata so a constrained view cannot look metadata-only"
+      );
+      assert.strictEqual(packageRequests, 1);
     } finally {
       treeView.dispose();
       publication.dispose();
