@@ -112,6 +112,39 @@ function registerVulnerabilityCommands(deps) {
     }
   }
 
+  function currentWebviewPackage(value, callerIsCurrent, options = {}) {
+    if (typeof callerIsCurrent !== "function" || callerIsCurrent() !== true) return null;
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope) return null;
+    const isCurrent = () => Boolean(
+      isCommandAccountCurrent(accountScope)
+      && callerIsCurrent() === true
+    );
+    if (!isCurrent()) return null;
+    let pkg;
+    try {
+      pkg = packageDomain.assertExactPackage(value);
+    } catch {
+      if (isCurrent()) {
+        vscode.window.showWarningMessage(
+          options.invalidMessage || "Could not determine package details."
+        );
+      }
+      return null;
+    }
+    if (typeof options.predicate === "function" && !options.predicate(pkg)) {
+      if (isCurrent()) {
+        vscode.window.showWarningMessage(
+          options.invalidStateMessage || "This package is not available for this action."
+        );
+      }
+      return null;
+    }
+    return isCurrent()
+      ? Object.freeze({ accountScope, package: pkg, isCurrent })
+      : null;
+  }
+
   async function findSafeVersion(item, options = {}) {
     const accountScope = captureCommandAccount(deps.workspaceAccess);
     if (!accountScope) return;
@@ -175,6 +208,16 @@ function registerVulnerabilityCommands(deps) {
       );
     };
     const source = safeVersionSelection.exactPackage;
+    return runFindSafeVersion(source, accountScope, isFindCurrent);
+  }
+
+  async function runFindSafeVersion(source, accountScope, callerIsCurrent) {
+    const isFindCurrent = () => Boolean(
+      isCommandAccountCurrent(accountScope)
+      && typeof callerIsCurrent === "function"
+      && callerIsCurrent() === true
+    );
+    if (!isFindCurrent()) return;
     if (
       !vulnerabilityStateService
       || typeof vulnerabilityStateService.prime !== "function"
@@ -392,6 +435,58 @@ function registerVulnerabilityCommands(deps) {
     }
   }
 
+  async function findSafeVersionFromWebview(value, callerIsCurrent) {
+    const selected = currentWebviewPackage(value, callerIsCurrent);
+    if (!selected) return;
+    let safeVersionSelection;
+    try {
+      safeVersionSelection = adaptRepositoryResolutionSelection(
+        packageAdapters,
+        packageDomain,
+        selected.package
+      );
+    } catch {
+      if (selected.isCurrent()) {
+        vscode.window.showWarningMessage("Could not determine package details.");
+      }
+      return;
+    }
+    if (!safeVersionSelection.exactPackage || !selected.isCurrent()) {
+      if (selected.isCurrent()) {
+        vscode.window.showWarningMessage("Could not determine package details.");
+      }
+      return;
+    }
+    return runFindSafeVersion(
+      safeVersionSelection.exactPackage,
+      selected.accountScope,
+      selected.isCurrent
+    );
+  }
+
+  async function showVulnerabilitiesFromWebview(value, callerIsCurrent) {
+    const selected = currentWebviewPackage(value, callerIsCurrent);
+    if (!selected) return;
+    const { package: pkg, isCurrent } = selected;
+    if (!isCurrent()) return;
+    await vulnerabilityProvider.show(pkg);
+    if (!isCurrent()) return;
+    recentPackages.add(pkg);
+  }
+
+  async function explainQuarantineFromWebview(value, callerIsCurrent) {
+    const selected = currentWebviewPackage(value, callerIsCurrent, {
+      predicate: isQuarantinedPackage,
+      invalidStateMessage: "Quarantine details are available only for quarantined packages.",
+    });
+    if (!selected) return;
+    const { package: pkg, isCurrent } = selected;
+    if (!isCurrent()) return;
+    await quarantineExplainProvider.show(pkg);
+    if (!isCurrent()) return;
+    recentPackages.add(pkg);
+  }
+
   async function openCVE(item) {
     const accountScope = captureCommandAccount(deps.workspaceAccess);
     if (!accountScope || !ownsSelection("isCurrentSelection", item)) return;
@@ -522,7 +617,7 @@ function registerVulnerabilityCommands(deps) {
     recentPackages.add(pkg);
   }
 
-  return registerCommands(registerCommand, [
+  const registrations = registerCommands(registerCommand, [
     ["cloudsmith-vsc.findSafeVersion", findSafeVersion],
     ["cloudsmith-vsc.openCVE", openCVE],
     ["cloudsmith-vsc.showVulnerabilities", showVulnerabilities],
@@ -531,6 +626,15 @@ function registerVulnerabilityCommands(deps) {
     ["cloudsmith-vsc.filterVulnerabilities", filterVulnerabilities],
     ["cloudsmith-vsc.explainQuarantine", explainQuarantine],
   ], deps);
+  const webviewActions = Object.freeze({
+    explainQuarantine: explainQuarantineFromWebview,
+    findSafeVersion: findSafeVersionFromWebview,
+    showVulnerabilities: showVulnerabilitiesFromWebview,
+  });
+  return Object.freeze({
+    dispose() { registrations.dispose(); },
+    webviewActions,
+  });
 }
 
 function isCompleteVulnerabilityState(state) {

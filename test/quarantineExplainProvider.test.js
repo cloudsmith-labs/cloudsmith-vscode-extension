@@ -334,7 +334,11 @@ suite("QuarantineExplainProvider", () => {
     const provider = providerWith(panelHarness, {
       async get() { return apiSuccess(freshPackage({ repository: "repo-b" })); },
       async getV2() { throw new Error("must not dispatch"); },
-    }, {}, { executeCommand: async (...args) => { effects.push(args); } });
+    }, {}, {
+      packageActions: {
+        findSafeVersion: async (...args) => { effects.push(args); },
+      },
+    });
     await provider.show(exactPackage());
     assert.match(panelHarness.panel.webview.html, /Could not load quarantine details/);
     await panelHarness.send({ command: "findSafeVersion" });
@@ -385,7 +389,7 @@ suite("QuarantineExplainProvider", () => {
 
   test("routes only exact messages after refresh and produces a causal report", async () => {
     const panelHarness = createWebviewPanelHarness();
-    const effects = { commands: [], clipboard: [], external: [], information: [], warning: [] };
+    const effects = { actions: [], clipboard: [], external: [], information: [], warning: [] };
     const provider = providerWith(panelHarness, {
       async get() { return apiSuccess(freshPackage()); },
       async getV2(endpoint) {
@@ -397,7 +401,12 @@ suite("QuarantineExplainProvider", () => {
       information: async value => { effects.information.push(value); },
       warning: async value => { effects.warning.push(value); },
     }, {
-      executeCommand: async (...args) => { effects.commands.push(args); },
+      packageActions: {
+        findSafeVersion: async (...args) => { effects.actions.push(["findSafeVersion", ...args]); },
+        showVulnerabilities: async (...args) => {
+          effects.actions.push(["showVulnerabilities", ...args]);
+        },
+      },
       openExternal: async value => { effects.external.push(value); },
       writeClipboard: async value => { effects.clipboard.push(value); },
     });
@@ -406,10 +415,12 @@ suite("QuarantineExplainProvider", () => {
     for (const command of ["findSafeVersion", "showVulnerabilities", "openInCloudsmith", "copyReport"]) {
       await panelHarness.send({ command });
     }
-    assert.deepStrictEqual(effects.commands.map(value => value[0]), [
-      "cloudsmith-vsc.findSafeVersion",
-      "cloudsmith-vsc.showVulnerabilities",
+    assert.deepStrictEqual(effects.actions.map(value => value[0]), [
+      "findSafeVersion",
+      "showVulnerabilities",
     ]);
+    assert(effects.actions.every(value => value[1] === provider._operation.package));
+    assert(effects.actions.every(value => typeof value[2] === "function" && value[2]() === true));
     assert.strictEqual(effects.external.length, 1);
     assert.match(effects.external[0], /^https:\/\/app\.cloudsmith\.com\//);
     assert.strictEqual(effects.clipboard.length, 1);
@@ -518,9 +529,57 @@ suite("QuarantineExplainProvider", () => {
     assert.doesNotMatch(harnesses[1].panel.webview.html, /Dependency policy/);
   });
 
+  test("a newer retry remains authoritative when an older retry settles last", async () => {
+    const panelHarness = createWebviewPanelHarness();
+    let packageRequest = 0;
+    let resolveOlder;
+    let resolveNewer;
+    const olderGate = new Promise(resolve => { resolveOlder = resolve; });
+    const newerGate = new Promise(resolve => { resolveNewer = resolve; });
+    const provider = providerWith(panelHarness, {
+      async get() {
+        packageRequest += 1;
+        if (packageRequest === 2) {
+          await olderGate;
+          return apiSuccess(freshPackage({
+            status_reason: "Quarantined by Older policy. Older rule matched.",
+          }));
+        }
+        if (packageRequest === 3) {
+          await newerGate;
+          return apiSuccess(freshPackage({
+            status_reason: "Quarantined by Newer policy. Newer rule matched.",
+          }));
+        }
+        return apiSuccess(freshPackage({
+          status_reason: "Quarantined by Initial policy. Initial rule matched.",
+        }));
+      },
+      async getV2() { throw new Error("must not dispatch"); },
+    });
+    await provider.show(exactPackage());
+
+    const older = panelHarness.send({ command: "retry" });
+    await tick();
+    assert.strictEqual(packageRequest, 2);
+    const newer = panelHarness.send({ command: "retry" });
+    await tick();
+    assert.strictEqual(packageRequest, 3);
+
+    resolveNewer();
+    await newer;
+    assert.match(panelHarness.panel.webview.html, /Newer rule matched/);
+    resolveOlder();
+    await older;
+
+    assert.match(panelHarness.panel.webview.html, /Newer rule matched/);
+    assert.doesNotMatch(panelHarness.panel.webview.html, /Older rule matched/);
+    assert.match(provider._operation.package.statusReason, /Newer rule matched/);
+  });
+
   test("commands remain inert until current identity and status are confirmed", async () => {
     const panelHarness = createWebviewPanelHarness();
-    const commands = [];
+    const actions = [];
     let resolveFetch;
     const gate = new Promise(resolve => { resolveFetch = resolve; });
     const provider = providerWith(panelHarness, {
@@ -530,15 +589,19 @@ suite("QuarantineExplainProvider", () => {
           ? apiFailure("not_found", { status: 404 })
           : emptyDecisionPage();
       },
-    }, {}, { executeCommand: async (...args) => { commands.push(args); } });
+    }, {}, {
+      packageActions: {
+        findSafeVersion: async (...args) => { actions.push(args); },
+      },
+    });
     const pending = provider.show(exactPackage());
     await tick();
     await panelHarness.send({ command: "findSafeVersion" });
-    assert.deepStrictEqual(commands, []);
+    assert.deepStrictEqual(actions, []);
     resolveFetch();
     await pending;
     await panelHarness.send({ command: "findSafeVersion" });
-    assert.strictEqual(commands.length, 1);
+    assert.strictEqual(actions.length, 1);
   });
 
   function providerWith(panelHarness, cloudsmithAPI, notifications = {}, overrides = {}) {

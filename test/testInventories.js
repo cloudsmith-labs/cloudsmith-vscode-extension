@@ -99,6 +99,7 @@ const VSCODE_CORE_TESTS = Object.freeze([
   "test/upstreamPullService.test.js",
   "test/vulnerabilityProvider.test.js",
   "test/vulnerabilitySummaryNode.test.js",
+  "test/webviewPackageActionFlow.test.js",
   "test/workspaceNode.test.js",
   "test/workspaceFetcher.test.js",
   "test/workspaceRepositoryFetcher.test.js",

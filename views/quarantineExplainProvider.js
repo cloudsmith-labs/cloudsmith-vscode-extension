@@ -43,7 +43,7 @@ class QuarantineExplainProvider {
     this._createWebviewPanel = options.createWebviewPanel || ((...args) => (
       vscode.window.createWebviewPanel(...args)
     ));
-    this._executeCommand = options.executeCommand || ((...args) => vscode.commands.executeCommand(...args));
+    this._packageActions = options.packageActions || null;
     this._writeClipboard = options.writeClipboard || (value => vscode.env.clipboard.writeText(value));
     this._openExternal = options.openExternal || (value => vscode.env.openExternal(vscode.Uri.parse(value)));
     this._notifications = options.notifications || {
@@ -92,6 +92,8 @@ class QuarantineExplainProvider {
       messageSubscription: null,
       nonce: this._getNonce(),
       panel,
+      packageActionGeneration: 0,
+      refreshGeneration: 0,
       trace: this._initialTrace(caller, locator),
       version: ++this._operationVersion,
     };
@@ -102,7 +104,12 @@ class QuarantineExplainProvider {
     ));
 
     this._render(operation);
-    await this._refreshOperation(operation, this._cloudsmithAPI || new CloudsmithAPI(this.context));
+    const refreshGeneration = ++operation.refreshGeneration;
+    await this._refreshOperation(
+      operation,
+      this._cloudsmithAPI || new CloudsmithAPI(this.context),
+      refreshGeneration
+    );
   }
 
   _normalizeCallerPackage(pkg, locator) {
@@ -134,9 +141,14 @@ class QuarantineExplainProvider {
     };
   }
 
-  async _refreshOperation(operation, api) {
-    const current = await this._fetchCurrentPackage(api, operation.locator, operation.controller.signal);
-    if (!this._isOperationCurrent(operation)) return;
+  async _refreshOperation(operation, api, refreshGeneration) {
+    const current = await this._fetchCurrentPackage(
+      api,
+      operation.locator,
+      operation.controller.signal,
+      operation.package
+    );
+    if (!this._isRefreshCurrent(operation, refreshGeneration)) return;
     if (current === CURRENT_PACKAGE_MISSING) {
       operation.trace = { ...operation.trace, error: "missing", refreshed: true };
       this._render(operation);
@@ -165,17 +177,19 @@ class QuarantineExplainProvider {
     const parsedPolicySlug = operation.trace.parsedReason?.policySlug || null;
     const work = [];
     if (current.uploadedAt && (!usefulStatusReason(current.statusReason) || parsedPolicySlug)) {
-      work.push(this._loadDecision(operation, api, parsedPolicySlug));
+      work.push(this._loadDecision(operation, api, parsedPolicySlug, refreshGeneration));
     } else if (current.statusReason && !parsedPolicySlug) {
       this._diagnostic("decision_policy_identity_unavailable");
     } else {
       this._diagnostic("decision_time_boundary_unavailable");
     }
-    if (parsedPolicySlug) work.push(this._loadPolicyDescription(operation, api, parsedPolicySlug));
+    if (parsedPolicySlug) {
+      work.push(this._loadPolicyDescription(operation, api, parsedPolicySlug, refreshGeneration));
+    }
     await Promise.allSettled(work);
   }
 
-  async _fetchCurrentPackage(api, locator, signal) {
+  async _fetchCurrentPackage(api, locator, signal, sourcePackage) {
     if (!api || typeof api.get !== "function") return null;
     let endpoint;
     try {
@@ -192,13 +206,13 @@ class QuarantineExplainProvider {
       });
       if (signal.aborted) return null;
       if (!result.ok) return result.status === 404 ? CURRENT_PACKAGE_MISSING : null;
-      return normalizeCurrentPackage(result.data, locator);
+      return normalizeCurrentPackage(result.data, locator, sourcePackage);
     } catch {
       return null;
     }
   }
 
-  async _loadDecision(operation, api, policySlug) {
+  async _loadDecision(operation, api, policySlug, refreshGeneration) {
     let collection;
     try {
       collection = await fetchPackageDecisionLogs(
@@ -208,10 +222,12 @@ class QuarantineExplainProvider {
         { policySlug, signal: operation.controller.signal }
       );
     } catch {
-      this._diagnostic("decision_collection_failed");
+      if (this._isRefreshCurrent(operation, refreshGeneration)) {
+        this._diagnostic("decision_collection_failed");
+      }
       return;
     }
-    if (!this._isOperationCurrent(operation)) return;
+    if (!this._isRefreshCurrent(operation, refreshGeneration)) return;
     const exactItems = collection.items.filter(item => (
       item.packageSlugPerm === operation.locator.packageSlugPerm
       && item.repositorySlug === operation.locator.repository
@@ -232,13 +248,15 @@ class QuarantineExplainProvider {
       const detail = await fetchDecisionLogDetail(api, operation.locator, summary, {
         signal: operation.controller.signal,
       });
-      if (!this._isOperationCurrent(operation) || !detail) {
-        this._diagnostic("decision_detail_unavailable");
+      if (!this._isRefreshCurrent(operation, refreshGeneration) || !detail) {
+        if (this._isRefreshCurrent(operation, refreshGeneration)) {
+          this._diagnostic("decision_detail_unavailable");
+        }
         return;
       }
       decision = detail;
     }
-    if (!this._isOperationCurrent(operation)) return;
+    if (!this._isRefreshCurrent(operation, refreshGeneration)) return;
     if (
       policySlug
       && operation.trace.parsedReason?.policySlug
@@ -250,11 +268,16 @@ class QuarantineExplainProvider {
     operation.trace = { ...operation.trace, decision };
     this._render(operation);
     if (!policySlug && decision.policySlugPerm) {
-      await this._loadPolicyDescription(operation, api, decision.policySlugPerm);
+      await this._loadPolicyDescription(
+        operation,
+        api,
+        decision.policySlugPerm,
+        refreshGeneration
+      );
     }
   }
 
-  async _loadPolicyDescription(operation, api, policySlug) {
+  async _loadPolicyDescription(operation, api, policySlug, refreshGeneration) {
     if (!api || typeof api.getV2 !== "function" || !policySlug) return;
     let endpoint;
     try {
@@ -269,7 +292,7 @@ class QuarantineExplainProvider {
         retry: "never",
         signal: operation.controller.signal,
       });
-      if (!this._isOperationCurrent(operation) || !result.ok) return;
+      if (!this._isRefreshCurrent(operation, refreshGeneration) || !result.ok) return;
       const returnedSlug = displayString(result.data.slug_perm, 512);
       const description = displayString(result.data.description, 1024);
       if (returnedSlug !== policySlug || !description) {
@@ -281,7 +304,9 @@ class QuarantineExplainProvider {
       operation.trace = { ...operation.trace, policyDescription: description };
       this._render(operation);
     } catch {
-      this._diagnostic("policy_description_unavailable");
+      if (this._isRefreshCurrent(operation, refreshGeneration)) {
+        this._diagnostic("policy_description_unavailable");
+      }
     }
   }
 
@@ -299,9 +324,15 @@ class QuarantineExplainProvider {
     }
     try {
       if (parsed.command === "findSafeVersion") {
-        await this._executeCommand("cloudsmith-vsc.findSafeVersion", operation.package);
+        await this._runCurrentPackageAction(
+          operation,
+          this._packageActions?.findSafeVersion
+        );
       } else if (parsed.command === "showVulnerabilities") {
-        await this._executeCommand("cloudsmith-vsc.showVulnerabilities", operation.package);
+        await this._runCurrentPackageAction(
+          operation,
+          this._packageActions?.showVulnerabilities
+        );
       } else if (parsed.command === "openInCloudsmith" && trace.packageUrl) {
         await this._openExternal(trace.packageUrl);
       } else if (parsed.command === "copyReport") {
@@ -317,14 +348,42 @@ class QuarantineExplainProvider {
     }
   }
 
+  async _runCurrentPackageAction(operation, action) {
+    if (typeof action !== "function") {
+      throw new TypeError("The package action is unavailable.");
+    }
+    const pkg = operation.package;
+    const generation = operation.packageActionGeneration;
+    const isCurrent = () => Boolean(
+      this._isOperationCurrent(operation)
+      && operation.package === pkg
+      && operation.packageActionGeneration === generation
+      && operation.trace.refreshed === true
+      && operation.trace.current?.confirmed === true
+      && operation.trace.current.status === STATUS_QUARANTINED
+    );
+    if (!isCurrent()) return;
+    try {
+      await action(pkg, isCurrent);
+    } catch (error) {
+      if (isCurrent()) throw error;
+    }
+  }
+
   async _retry(operation) {
     if (!this._isOperationCurrent(operation)) return;
+    operation.packageActionGeneration += 1;
+    const refreshGeneration = ++operation.refreshGeneration;
     const caller = this._normalizeCallerPackage(operation.package, operation.locator);
     operation.trace = this._initialTrace(caller, operation.locator);
     operation.retryFocus = "pending";
     this._render(operation);
-    await this._refreshOperation(operation, this._cloudsmithAPI || new CloudsmithAPI(this.context));
-    if (!this._isOperationCurrent(operation)) return;
+    await this._refreshOperation(
+      operation,
+      this._cloudsmithAPI || new CloudsmithAPI(this.context),
+      refreshGeneration
+    );
+    if (!this._isRefreshCurrent(operation, refreshGeneration)) return;
     operation.retryFocus = "settled";
     this._render(operation);
     operation.retryFocus = null;
@@ -505,6 +564,13 @@ class QuarantineExplainProvider {
     );
   }
 
+  _isRefreshCurrent(operation, refreshGeneration) {
+    return Boolean(
+      this._isOperationCurrent(operation)
+      && operation.refreshGeneration === refreshGeneration
+    );
+  }
+
   resetForAccountChange() {
     if (this._operation) {
       this._disposeOperation(this._operation, true);
@@ -531,10 +597,12 @@ class QuarantineExplainProvider {
   }
 }
 
-function normalizeCurrentPackage(value, locator) {
+function normalizeCurrentPackage(value, locator, sourcePackage) {
   let pkg;
   try {
     pkg = fromApiPackageRecord(value, {
+      coordinateName: sourcePackage?.coordinateName,
+      coordinateQualifiers: sourcePackage?.qualifiers,
       expectedWorkspace: locator.workspace,
       expectedRepository: locator.repository,
     });

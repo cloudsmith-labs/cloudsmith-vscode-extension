@@ -294,6 +294,27 @@ function activateOwned(context, own, observe) {
   let promotionProvider = null;
   let vulnerabilityProvider = null;
   let quarantineExplainProvider = null;
+  let packageWebviewActions = null;
+  const packageWebviewActionProxy = Object.freeze({
+    explainQuarantine(...args) {
+      if (typeof packageWebviewActions?.explainQuarantine !== "function") {
+        throw new TypeError("The quarantine package action is unavailable.");
+      }
+      return packageWebviewActions.explainQuarantine(...args);
+    },
+    findSafeVersion(...args) {
+      if (typeof packageWebviewActions?.findSafeVersion !== "function") {
+        throw new TypeError("The remediation package action is unavailable.");
+      }
+      return packageWebviewActions.findSafeVersion(...args);
+    },
+    showVulnerabilities(...args) {
+      if (typeof packageWebviewActions?.showVulnerabilities !== "function") {
+        throw new TypeError("The vulnerability package action is unavailable.");
+      }
+      return packageWebviewActions.showVulnerabilities(...args);
+    },
+  });
   let upstreamPreviewProvider = null;
   let upstreamDetailProvider = null;
   const projectConnectionPresentation = state => extensionContextBinding.project(state);
@@ -333,6 +354,7 @@ function activateOwned(context, own, observe) {
   // Create vulnerability WebView provider
   vulnerabilityProvider = new VulnerabilityProvider(context, {
     connectionManager,
+    packageActions: packageWebviewActionProxy,
     vulnerabilityStateService,
   });
   own({ dispose: () => vulnerabilityProvider.dispose() });
@@ -342,7 +364,10 @@ function activateOwned(context, own, observe) {
   own({ dispose: () => complianceReportProvider.dispose() });
 
   // Create quarantine explanation WebView provider
-  quarantineExplainProvider = new QuarantineExplainProvider(context, { connectionManager });
+  quarantineExplainProvider = new QuarantineExplainProvider(context, {
+    connectionManager,
+    packageActions: packageWebviewActionProxy,
+  });
   own({ dispose: () => quarantineExplainProvider.dispose() });
 
   // Create upstream preview WebView provider
@@ -487,7 +512,7 @@ function activateOwned(context, own, observe) {
     FILTER_MODES,
     SORT_MODES,
   }));
-  own(registerVulnerabilityCommands({
+  const vulnerabilityRegistration = registerVulnerabilityCommands({
     ...sharedCommandDependencies,
     RemediationHelper,
     InstallCommandBuilder,
@@ -495,7 +520,9 @@ function activateOwned(context, own, observe) {
     buildPackageUrl,
     vulnerabilityProvider,
     quarantineExplainProvider,
-  }));
+  });
+  packageWebviewActions = vulnerabilityRegistration.webviewActions;
+  own(vulnerabilityRegistration);
   own(registerPromotionCommands({
     ...sharedCommandDependencies,
     promotionProvider,
