@@ -193,7 +193,9 @@ class CloudsmithProvider {
     let packageCount = 0;
     let packageProjectionFailures = 0;
     for (const child of children) {
-      if (!child || typeof child !== "object") continue;
+      if (!child || typeof child !== "object") {
+        throw new TypeError("Invalid repository child projection.");
+      }
       const packageCandidate = repository.ownsPackageSelection(child);
       if (packageCandidate) packageCandidates += 1;
       try {
@@ -202,8 +204,9 @@ class CloudsmithProvider {
         this._treeItemFallbacks.delete(child);
         published.push(child);
         if (packageCandidate) packageCount += 1;
-      } catch {
-        if (packageCandidate) packageProjectionFailures += 1;
+      } catch (error) {
+        if (!packageCandidate) throw error;
+        packageProjectionFailures += 1;
       }
     }
 

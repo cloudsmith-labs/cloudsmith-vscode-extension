@@ -712,6 +712,93 @@ suite("CloudsmithProvider", () => {
     subscription.dispose();
   });
 
+  test("invalid tree elements fail at provider validation without weak-state mutation", () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const invalidElements = [undefined, null, "string", 42, false, Object.freeze({})];
+
+    for (const element of invalidElements) {
+      assert.throws(
+        () => provider.getTreeItem(element),
+        error => (
+          error instanceof TypeError
+          && error.message === "Invalid tree item projection."
+        )
+      );
+      assert.strictEqual(provider.getParent(element), undefined);
+      assert.strictEqual(provider._treeItemFallbacks.has(element), false);
+    }
+  });
+
+  test("stale package projection errors cannot repopulate repository fallback state", async () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const repository = provider._createRepositoryNode(
+      { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
+      "workspace-a"
+    );
+    let projectionError = null;
+    const packageNode = {
+      getTreeItem() {
+        if (projectionError) throw projectionError;
+        return new vscode.TreeItem("package-a");
+      },
+      getChildren() { return []; },
+    };
+    repository._packageState = Object.freeze({
+      ...repository._packageState,
+      initialized: true,
+      nodes: Object.freeze([packageNode]),
+    });
+    repository.getChildren = async () => [packageNode];
+
+    assert.deepStrictEqual(await provider.getChildren(repository), [packageNode]);
+    projectionError = new Error("stale package projection");
+    provider.refresh();
+
+    assert.strictEqual(provider.getParent(packageNode), repository);
+    assert.throws(() => provider.getTreeItem(packageNode), error => error === projectionError);
+    assert.strictEqual(provider._treeItemFallbacks.has(packageNode), false);
+    assert.strictEqual(provider._repositoryProjectionState.has(repository), false);
+  });
+
+  test("repository publication rethrows unrelated child projection errors", async () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const repository = provider._createRepositoryNode(
+      { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
+      "workspace-a"
+    );
+    const projectionError = new Error("unrelated metadata projection");
+    const metadataNode = {
+      getTreeItem() { throw projectionError; },
+      getChildren() { return []; },
+    };
+    repository.getChildren = async () => [metadataNode];
+
+    await assert.rejects(
+      provider.getChildren(repository),
+      error => error === projectionError
+    );
+    assert.strictEqual(provider._treeItemFallbacks.has(metadataNode), false);
+    assert.strictEqual(provider._repositoryProjectionState.has(repository), false);
+  });
+
+  test("repository publication rejects malformed child values", async () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const repository = provider._createRepositoryNode(
+      { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
+      "workspace-a"
+    );
+    repository.getChildren = async () => [null, 42];
+
+    await assert.rejects(
+      provider.getChildren(repository),
+      error => (
+        error instanceof TypeError
+        && error.message === "Invalid repository child projection."
+      )
+    );
+    assert.strictEqual(provider._repositoryProjectionState.has(repository), false);
+  });
+
   test("FUX-002 contains current repository child rejection with a retryable terminal outcome", async () => {
     const provider = createProvider(async () => workspaceSuccess([]));
     const repository = provider._createRepositoryNode(
