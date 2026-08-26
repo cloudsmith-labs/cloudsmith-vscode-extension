@@ -360,6 +360,43 @@ suite("Command registrars", () => {
     assert.strictEqual(loginCalls, 0);
   });
 
+  test("QH-052 registered CLI-import callback owns the operation and propagates its result", async () => {
+    const recorder = recordingRegistration();
+    const operation = Object.freeze({ id: "cli-import" });
+    const importResult = Object.freeze({ ok: true, source: "cloudsmith-cli" });
+    const importedOperations = [];
+    const handledResults = [];
+    let beginCalls = 0;
+    registerAuthenticationCommands({
+      ...baseDependencies(recorder),
+      connectionManager: {
+        beginCredentialOperation() {
+          beginCalls += 1;
+          return operation;
+        },
+        isOperationCurrent: value => value === operation,
+      },
+      credentialManager: {},
+      ssoManager: {
+        async importFromCLI(value) {
+          importedOperations.push(value);
+          return importResult;
+        },
+      },
+      async handleAuthenticationResult(result) {
+        handledResults.push(result);
+      },
+    });
+
+    const callback = recorder.handlers.get("cloudsmith-vsc.importCLICredentials");
+    assert.strictEqual(typeof callback, "function");
+    await callback();
+
+    assert.strictEqual(beginCalls, 1);
+    assert.deepStrictEqual(importedOperations, [operation]);
+    assert.deepStrictEqual(handledResults, [importResult]);
+  });
+
   test("SSO prompt rechecks operation ownership before starting login services", async () => {
     const recorder = recordingRegistration();
     const operation = Object.freeze({ id: 1 });
@@ -1535,6 +1572,94 @@ suite("Command registrars", () => {
       query: "format:npm",
       page: 1,
     }]);
+  });
+
+  test("QH-051 registered license-search callback searches, records history, and focuses results", async () => {
+    const recorder = recordingRegistration();
+    const selectedLicense = Object.freeze({
+      label: "Apache-2.0",
+      query: "license:Apache-2.0",
+    });
+    const descriptors = [];
+    const executions = [];
+    const history = [];
+    const focusCalls = [];
+    const recentConstructions = [];
+    const context = Object.freeze({ kind: "extension-context" });
+    const authoritativeResult = Object.freeze({ status: "complete", count: 2 });
+    const execution = deferred();
+    class RecentSearches {
+      constructor(value, workspace) {
+        recentConstructions.push({ context: value, workspace });
+      }
+
+      async add(entry) {
+        history.push(entry);
+      }
+    }
+    registerSearchCommands({
+      ...baseDependencies(recorder),
+      context,
+      vscode: {
+        QuickPickItemKind: { Separator: 1 },
+        commands: {
+          async executeCommand(...args) {
+            focusCalls.push(args);
+          },
+        },
+        workspace: { getConfiguration: () => ({ get: () => "" }) },
+        window: {
+          async showQuickPick(items, options) {
+            assert.strictEqual(options.placeHolder, "Select a license to search for");
+            assert.ok(items.includes(selectedLicense));
+            return selectedLicense;
+          },
+        },
+      },
+      workspaceAccess: workspaceCollectionHarness().access,
+      LicenseClassifier: {
+        getSearchQuickPickItems: () => [selectedLicense],
+        buildRestrictiveQuery: () => "license:restrictive",
+        buildLicenseQuery() { throw new Error("selected canonical query must be used"); },
+      },
+      RecentSearches,
+      searchProvider: {
+        beginSearch(descriptor) {
+          descriptors.push(descriptor);
+          return Object.freeze({ descriptor });
+        },
+        executeSearch(operation) {
+          executions.push(operation);
+          return execution.promise;
+        },
+      },
+    });
+
+    const callback = recorder.handlers.get("cloudsmith-vsc.searchByLicense");
+    assert.strictEqual(typeof callback, "function");
+    const pendingSearch = callback();
+    await new Promise(resolve => setImmediate(resolve));
+
+    const expectedDescriptor = {
+      kind: "workspace",
+      workspace: "workspace-a",
+      query: "license:Apache-2.0",
+      page: 1,
+    };
+    assert.deepStrictEqual(descriptors, [expectedDescriptor]);
+    assert.strictEqual(executions.length, 1);
+    assert.deepStrictEqual(executions[0].descriptor, expectedDescriptor);
+    assert.deepStrictEqual(recentConstructions, [{ context, workspace: "workspace-a" }]);
+    assert.deepStrictEqual(history, [{
+      workspace: "workspace-a",
+      query: "license:Apache-2.0",
+      scope: { kind: "workspace" },
+    }]);
+    assert.deepStrictEqual(focusCalls, []);
+
+    execution.resolve(authoritativeResult);
+    assert.strictEqual(await pendingSearch, undefined);
+    assert.deepStrictEqual(focusCalls, [["cloudsmithSearchView.focus"]]);
   });
 
   test("guided search cancellation stops before repository or provider work", async () => {

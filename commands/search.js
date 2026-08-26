@@ -317,6 +317,8 @@ function registerSearchCommands(deps) {
       kind: "workspace", workspace, query, page: 1,
     }, { recentSearches, record: true, isCurrent: account.isCurrent });
     if (!isCommandAccountCurrent(account)) return;
+    await vscode.commands.executeCommand("cloudsmithSearchView.focus");
+    if (!isCommandAccountCurrent(account)) return;
   }
 
   async function filterVulnerable(item) {

@@ -1,5 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
+const fs = require("fs");
+const path = require("path");
 const { spawnSync } = require("child_process");
 const {
   ROOT,
@@ -51,6 +53,15 @@ function validateMutationBaseline(baseline, options = {}) {
     }
     validTargets.push(target);
     const sourceFile = mutationTargetFile(target);
+    let sourceStat = null;
+    try {
+      sourceStat = fs.lstatSync(path.join(root, sourceFile));
+    } catch {
+      // The stable error below covers missing and unreadable target paths.
+    }
+    if (!sourceStat?.isFile() || sourceStat.isSymbolicLink()) {
+      errors.push(`Mutation baseline target ${target} must exist as a regular repository file.`);
+    }
     if (sourceFiles.has(sourceFile)) {
       errors.push(`Mutation baseline scope declares multiple targets for ${sourceFile}.`);
     }

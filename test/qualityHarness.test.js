@@ -31,6 +31,7 @@ const {
 const {
   changedMutationTargets,
   filterMutationReport,
+  gitChangedFiles,
   perFileCounts,
   validateMutationSummary,
   workingTreeFingerprint,
@@ -246,7 +247,7 @@ function validMutationBaseline() {
   return {
     thresholds: { break: 90 },
     files: {
-      "domain/packageActionCapabilities.js": { score: 90 },
+      "domain/packageActionCapabilities.js": { mutants: 10, score: 90 },
     },
   };
 }
@@ -931,6 +932,26 @@ suite("Quality mutation and UI harness boundaries", () => {
     ));
   });
 
+  test("rejects a stale mutation target after its source file is renamed", () => {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-mutation-rename-"));
+    const baseline = validTrackedMutationBaseline();
+    try {
+      fs.mkdirSync(path.join(temporaryRoot, "domain"), { recursive: true });
+      fs.mkdirSync(path.join(temporaryRoot, "util"), { recursive: true });
+      fs.writeFileSync(path.join(temporaryRoot, "domain", "renamedAuthCapabilities.js"), "// renamed\n");
+      fs.writeFileSync(path.join(temporaryRoot, "util", "externalNavigation.js"), "// unchanged\n");
+
+      assert.ok(validateMutationBaseline(baseline, {
+        root: temporaryRoot,
+        commitIsAncestor: () => true,
+      }).errors.includes(
+        "Mutation baseline target domain/authCapabilities.js must exist as a regular repository file."
+      ));
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   test("rejects missing, duplicate, extra, and miscounted survivor classifications", () => {
     const missing = validTrackedMutationBaseline();
     missing.survivorClassifications.pop();
@@ -1018,6 +1039,41 @@ suite("Quality mutation and UI harness boundaries", () => {
     );
   });
 
+  test("keeps the configured source side of a staged rename in changed mutation selection", () => {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-mutation-git-rename-"));
+    const source = "domain/owned.js";
+    const destination = "domain/renamed.js";
+    const runGit = argumentsList => require("child_process").spawnSync(
+      "git",
+      argumentsList,
+      { cwd: temporaryRoot, encoding: "utf8", stdio: "ignore" }
+    );
+    try {
+      assert.strictEqual(runGit(["init"]).status, 0);
+      fs.mkdirSync(path.join(temporaryRoot, "domain"), { recursive: true });
+      fs.writeFileSync(path.join(temporaryRoot, source), "export const owned = true;\n");
+      assert.strictEqual(runGit(["add", source]).status, 0);
+      assert.strictEqual(runGit([
+        "-c", "user.name=Quality Fixture",
+        "-c", "user.email=quality@example.invalid",
+        "commit", "-m", "fixture",
+      ]).status, 0);
+      fs.renameSync(path.join(temporaryRoot, source), path.join(temporaryRoot, destination));
+      assert.strictEqual(runGit(["add", "--all"]).status, 0);
+
+      const changed = gitChangedFiles("HEAD", temporaryRoot);
+      assert.deepStrictEqual(changed, [source, destination]);
+      assert.deepStrictEqual(
+        changedMutationTargets([source], ["--files", changed.join(",")], {
+          [source]: { testFiles: ["test/owned.test.js"] },
+        }),
+        [source]
+      );
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   test("filters incremental mutation reports to the selected target", () => {
     const mutant = status => ({ status });
     const report = {
@@ -1091,7 +1147,7 @@ suite("Quality mutation and UI harness boundaries", () => {
       }),
       {
         thresholds: { break: null },
-        files: { "domain/packageActionCapabilities.js": { score: 0 } },
+        files: { "domain/packageActionCapabilities.js": { mutants: 10, score: 0 } },
       },
       "changed"
     ));
@@ -1103,7 +1159,7 @@ suite("Quality mutation and UI harness boundaries", () => {
         mutationSummaryAt80(),
         {
           thresholds: { break: 81 },
-          files: { "domain/packageActionCapabilities.js": { score: 90 } },
+          files: { "domain/packageActionCapabilities.js": { mutants: 10, score: 90 } },
         },
         "core"
       ),
@@ -1114,7 +1170,7 @@ suite("Quality mutation and UI harness boundaries", () => {
         mutationSummaryAt80(),
         {
           thresholds: { break: null },
-          files: { "domain/packageActionCapabilities.js": { score: 81 } },
+          files: { "domain/packageActionCapabilities.js": { mutants: 10, score: 81 } },
         },
         "changed"
       ),
@@ -1124,10 +1180,41 @@ suite("Quality mutation and UI harness boundaries", () => {
       mutationSummaryAt80(),
       {
         thresholds: { break: 95 },
-        files: { "domain/packageActionCapabilities.js": { score: 80 } },
+        files: { "domain/packageActionCapabilities.js": { mutants: 10, score: 80 } },
       },
       "changed"
     ));
+  });
+
+  test("rejects a perfect-score mutation run when the measured target population collapses", () => {
+    const target = "domain/authCapabilities.js";
+    const collapsed = validMutationSummary({
+      targets: [target],
+      mutants: 1,
+      killed: 1,
+      survived: 0,
+      score: 100,
+      files: {
+        [target]: validMutationFile(100, {
+          mutants: 1,
+          killed: 1,
+          survived: 0,
+        }),
+      },
+      survivors: [],
+    });
+
+    assert.throws(
+      () => validateMutationSummary(
+        collapsed,
+        {
+          thresholds: { break: 90 },
+          files: { [target]: { mutants: 80, score: 90 } },
+        },
+        "changed"
+      ),
+      /produced 1 mutants; measured baseline requires exactly 80/u
+    );
   });
 
   test("rejects zero-mutant, timeout, and uncovered mutation runs", () => {
@@ -1540,6 +1627,94 @@ suite("Release checklist and deterministic quality report", () => {
     assert.strictEqual(report.workflowCoverage[0].layerStatuses["live-protocol"], "failed");
     assert.strictEqual(report.status, "failed");
     assert.strictEqual(hasDeterministicReportFailure(report), true);
+  });
+
+  test("rejects a stale passed live status when the release checklist receipt failed", () => {
+    const plan = getGatePlan("release");
+    const receipts = plan.map(step => passedReceipt(step));
+    const checklistReceipt = receipts.find(receipt => receipt.stepId === "release-checklist");
+    checklistReceipt.status = "failed";
+    checklistReceipt.exitCode = 1;
+    checklistReceipt.reason = "fixture checklist failure";
+    const report = generateReport({
+      source: SOURCE_IDENTITY,
+      profile: "release",
+      plan,
+      receipts,
+      impact: validImpact(),
+      ...validMutationEvidence(),
+      ui: { status: "passed", source: SOURCE_IDENTITY, tests: ["fixture"] },
+      liveQualification: {
+        status: "passed",
+        source: SOURCE_IDENTITY,
+        authenticatedAcceptance: "recorded",
+        verdict: "TEAM-TEST READY",
+        requiredWorkflowIds: [],
+        passedWorkflowIds: [],
+        missingWorkflowIds: [],
+        visibleEnabledActions: { status: "passed", silentNoOpCount: 0 },
+        errors: [],
+      },
+      findings: [],
+      findingsStatus: "passed",
+      workflows: { workflows: [] },
+      inventories,
+    });
+
+    const checklistStep = report.deterministicGates.steps.find(step => (
+      step.stepId === "release-checklist"
+    ));
+    assert.strictEqual(checklistStep.status, "failed");
+    assert.strictEqual(report.deterministicGates.status, "passed");
+    assert.strictEqual(report.liveQualification.status, "failed");
+    assert.strictEqual(report.liveQualification.authenticatedAcceptance, "not-recorded");
+    assert.strictEqual(report.releaseReadiness.verdict, null);
+    assert.strictEqual(report.status, "failed");
+    assert.strictEqual(hasDeterministicReportFailure(report), true);
+  });
+
+  test("rejects stale live status after a source-bound release checklist receipt passed", () => {
+    const plan = getGatePlan("release");
+    const liveQualification = {
+      status: "passed",
+      source: SOURCE_IDENTITY,
+      authenticatedAcceptance: "recorded",
+      verdict: "TEAM-TEST READY",
+      requiredWorkflowIds: [],
+      passedWorkflowIds: [],
+      missingWorkflowIds: [],
+      visibleEnabledActions: { status: "passed", silentNoOpCount: 0 },
+      errors: [],
+    };
+    const common = {
+      source: SOURCE_IDENTITY,
+      profile: "release",
+      plan,
+      receipts: plan.map(step => passedReceipt(step)),
+      impact: validImpact(),
+      ...validMutationEvidence(),
+      ui: { status: "passed", source: SOURCE_IDENTITY, tests: ["fixture"] },
+      findings: [],
+      findingsStatus: "passed",
+      workflows: { workflows: [] },
+      inventories,
+    };
+    const matching = generateReport({ ...common, liveQualification });
+    const stale = generateReport({
+      ...common,
+      liveQualification: {
+        ...liveQualification,
+        source: { sha: BASE_SHA, fingerprint: SOURCE_IDENTITY.fingerprint },
+      },
+    });
+
+    assert.strictEqual(matching.liveQualification.status, "passed");
+    assert.strictEqual(matching.status, "passed");
+    assert.strictEqual(stale.liveQualification.status, "failed");
+    assert.strictEqual(stale.liveQualification.authenticatedAcceptance, "not-recorded");
+    assert.strictEqual(stale.releaseReadiness.verdict, null);
+    assert.strictEqual(stale.status, "failed");
+    assert.strictEqual(hasDeterministicReportFailure(stale), true);
   });
 
   test("rejects truncated, explicit, and stale-fingerprint impact evidence", () => {

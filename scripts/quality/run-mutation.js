@@ -102,16 +102,16 @@ function optionValue(argumentsList, option) {
   return inline ? inline.slice(prefix.length) : null;
 }
 
-function gitChangedFiles(base = "origin/main") {
+function gitChangedFiles(base = "origin/main", root = ROOT) {
   const commands = [
-    ["diff", "--name-only", "--diff-filter=ACMRD", `${base}...HEAD`],
-    ["diff", "--name-only", "--diff-filter=ACMRD", "HEAD"],
-    ["diff", "--name-only", "--diff-filter=ACMRD", "--cached"],
+    ["diff", "--name-only", "--no-renames", "--diff-filter=ACMRD", `${base}...HEAD`],
+    ["diff", "--name-only", "--no-renames", "--diff-filter=ACMRD", "HEAD"],
+    ["diff", "--name-only", "--no-renames", "--diff-filter=ACMRD", "--cached"],
     ["ls-files", "--others", "--exclude-standard"],
   ];
   const files = [];
   for (const args of commands) {
-    const result = spawnSync("git", args, { cwd: ROOT, encoding: "utf8" });
+    const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
     if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed while selecting mutation targets.`);
     files.push(...result.stdout.split(/\r?\n/u).filter(Boolean));
   }
@@ -190,6 +190,9 @@ function validateMutationSummary(summary, baseline, mode) {
     if (!expected || !Number.isFinite(expected.score)) {
       throw new Error(`Mutation target ${target} has no measured per-target baseline.`);
     }
+    if (!Number.isInteger(expected.mutants) || expected.mutants <= 0) {
+      throw new Error(`Mutation target ${target} has no measured mutant population baseline.`);
+    }
     if (!actual) {
       throw new Error(`Mutation target ${target} produced no scoped evidence.`);
     }
@@ -199,6 +202,13 @@ function validateMutationSummary(summary, baseline, mode) {
     }
     if (!Number.isFinite(actual.score)) {
       throw new Error(`Mutation target ${target} produced no scoped score.`);
+    }
+    if (actual.mutants !== expected.mutants) {
+      throw new Error(
+        `Mutation target ${target} produced ${actual.mutants} mutants; `
+        + `measured baseline requires exactly ${expected.mutants}. `
+        + "Update quality/mutation-baseline.json only after an explicit full mutation remeasurement."
+      );
     }
     for (const failure of ["timeout", "runtimeError", "compileError", "noCoverage"]) {
       if (actual[failure] > 0) {
@@ -333,6 +343,7 @@ if (require.main === module) {
 module.exports = {
   changedMutationTargets,
   filterMutationReport,
+  gitChangedFiles,
   mutationTargetFile,
   perFileCounts,
   survivorFingerprint,

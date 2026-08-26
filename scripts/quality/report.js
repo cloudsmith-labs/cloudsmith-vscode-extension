@@ -61,7 +61,10 @@ function generateReport(options = {}) {
     source,
     options.uiArtifacts || []
   );
-  const liveQualification = summarizeLiveQualification(options.liveQualification, source);
+  const liveQualification = summarizeLiveQualification(options.liveQualification, source, {
+    requireChecklistReceipt: profile === "release",
+    checklistReceipt: receiptById.get("release-checklist"),
+  });
   const findings = summarizeFindings(
     options.findings || [],
     options.findingsStatus || "passed",
@@ -372,40 +375,80 @@ function emptyUi(status, artifacts = [], reason = null) {
   };
 }
 
-function summarizeLiveQualification(value, source) {
+function summarizeLiveQualification(value, source, options = {}) {
+  let summary;
   if (!value) {
-    return {
-      status: "not-run",
-      authenticatedAcceptance: "not-recorded",
-      verdict: null,
-      requiredWorkflowIds: [],
-      passedWorkflowIds: [],
-      missingWorkflowIds: [],
-      visibleEnabledActions: { status: "not-run", silentNoOpCount: null },
-      errors: [],
+    summary = emptyLiveQualification("not-run");
+  } else {
+    let status = EVIDENCE_STATUSES.includes(value.status) ? value.status : "failed";
+    if (value.source?.sha !== source.sha
+      || value.source?.fingerprint !== source.fingerprint) status = "blocked";
+    const passedWorkflowIds = status === "passed"
+      ? uniqueSorted(value.passedWorkflowIds || [])
+      : [];
+    const requiredWorkflowIds = uniqueSorted(value.requiredWorkflowIds || []);
+    summary = {
+      status,
+      authenticatedAcceptance: status === "passed"
+        ? value.authenticatedAcceptance
+        : "not-recorded",
+      verdict: status === "passed" ? value.verdict : null,
+      requiredWorkflowIds,
+      passedWorkflowIds,
+      missingWorkflowIds: requiredWorkflowIds.filter(id => !passedWorkflowIds.includes(id)),
+      visibleEnabledActions: value.visibleEnabledActions || {
+        status: "not-run",
+        silentNoOpCount: null,
+      },
+      errors: uniqueSorted(value.errors || []),
     };
   }
-  let status = EVIDENCE_STATUSES.includes(value.status) ? value.status : "failed";
-  if (value.source?.sha !== source.sha
-    || value.source?.fingerprint !== source.fingerprint) status = "blocked";
-  const passedWorkflowIds = status === "passed"
-    ? uniqueSorted(value.passedWorkflowIds || [])
-    : [];
-  const requiredWorkflowIds = uniqueSorted(value.requiredWorkflowIds || []);
+  if (!options.requireChecklistReceipt) return summary;
+  return bindLiveQualificationToChecklist(summary, options.checklistReceipt);
+}
+
+function emptyLiveQualification(status) {
   return {
     status,
-    authenticatedAcceptance: status === "passed"
-      ? value.authenticatedAcceptance
-      : "not-recorded",
-    verdict: status === "passed" ? value.verdict : null,
-    requiredWorkflowIds,
-    passedWorkflowIds,
-    missingWorkflowIds: requiredWorkflowIds.filter(id => !passedWorkflowIds.includes(id)),
-    visibleEnabledActions: value.visibleEnabledActions || {
-      status: "not-run",
-      silentNoOpCount: null,
-    },
-    errors: uniqueSorted(value.errors || []),
+    authenticatedAcceptance: "not-recorded",
+    verdict: null,
+    requiredWorkflowIds: [],
+    passedWorkflowIds: [],
+    missingWorkflowIds: [],
+    visibleEnabledActions: { status: "not-run", silentNoOpCount: null },
+    errors: [],
+  };
+}
+
+function bindLiveQualificationToChecklist(summary, receipt) {
+  if (receipt?.present && receipt.status === "passed") {
+    if (summary.status === "passed") return summary;
+    return rejectUnboundLiveQualification(
+      summary,
+      "failed",
+      `Release checklist passed but its live-status evidence is ${summary.status}.`
+    );
+  }
+  const status = receipt?.present && receipt.status === "blocked" ? "blocked" : "failed";
+  const receiptStatus = receipt?.present ? receipt.status : "missing";
+  const detail = receipt?.reason ? ` (${receipt.reason})` : "";
+  return rejectUnboundLiveQualification(
+    summary,
+    status,
+    `Release checklist receipt is ${receiptStatus}${detail}; live-status evidence is not trusted.`
+  );
+}
+
+function rejectUnboundLiveQualification(summary, status, error) {
+  return {
+    ...summary,
+    status,
+    authenticatedAcceptance: "not-recorded",
+    verdict: null,
+    passedWorkflowIds: [],
+    missingWorkflowIds: [...summary.requiredWorkflowIds],
+    visibleEnabledActions: { status: "not-run", silentNoOpCount: null },
+    errors: uniqueSorted([...summary.errors, error]),
   };
 }
 
