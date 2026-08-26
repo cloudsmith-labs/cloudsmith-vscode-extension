@@ -7,9 +7,21 @@ const {
   ROOT,
   removeOutputFile,
   resolveExistingRepositoryFile,
+  uniqueSorted,
   writeJson,
 } = require("./common");
 const { aggregateStatuses, fingerprint, sourceIdentity } = require("./evidence");
+const {
+  STANDALONE_NODE_TESTS,
+  VSCODE_CORE_TESTS,
+  VSCODE_SMOKE_TESTS,
+} = require("../../test/testInventories");
+
+const TEST_INVENTORIES_BY_SUITE = Object.freeze({
+  "standalone-tests": STANDALONE_NODE_TESTS,
+  "extension-host-core": VSCODE_CORE_TESTS,
+  "extension-host-smoke": VSCODE_SMOKE_TESTS,
+});
 
 const PHASE_STEPS = Object.freeze({
   fast: Object.freeze([
@@ -133,6 +145,8 @@ const STEP_CATALOG = Object.freeze({
       "node",
       ["scripts/quality/release-checklist.js"]
     ),
+    artifactPath: ".quality/gates/live-qualification-status.json",
+    artifactSubtree: ".quality/gates",
     blockedExitCodes: Object.freeze([2]),
     runWhenBlocked: true,
   }),
@@ -252,6 +266,8 @@ function runGate(options = {}) {
       id: step.id,
       category: step.category,
       command: step.command,
+      artifactPath: step.artifactPath || null,
+      evidencePath: step.evidencePath || null,
       runWhenBlocked: step.runWhenBlocked === true,
     }))),
     steps: receipts,
@@ -306,7 +322,7 @@ function completedReceipt(profile, step, source, execution = {}) {
   const evidenceError = status === "passed" && step.evidencePath
     ? validateTestEvidence(execution.testEvidence, step, source)
     : null;
-  const artifactError = status === "passed" && step.artifactPath
+  const artifactError = ["passed", "blocked"].includes(status) && step.artifactPath
     && !/^[a-f0-9]{64}$/u.test(execution.artifactFingerprint || "")
     ? "missing-or-invalid-artifact-fingerprint"
     : null;
@@ -338,7 +354,7 @@ function executeCommand(step, context = {}) {
     subtree: ".quality/test-results",
   });
   if (step.artifactPath) removeOutputFile(step.artifactPath, root, {
-    subtree: ".quality/mutation",
+    subtree: step.artifactSubtree || ".quality/mutation",
   });
   const result = spawnSync(executable, step.args, {
     cwd: root,
@@ -361,7 +377,7 @@ function executeCommand(step, context = {}) {
       const artifact = fs.readFileSync(resolveExistingRepositoryFile(
         step.artifactPath,
         root,
-        { subtree: ".quality/mutation" }
+        { subtree: step.artifactSubtree || ".quality/mutation" }
       ));
       artifactFingerprint = crypto.createHash("sha256").update(artifact).digest("hex");
     } catch (error) {
@@ -403,6 +419,7 @@ function validateTestEvidence(value, step, source) {
   if (value?.suite !== step.id) return "suite-mismatch";
   if (!Array.isArray(value.tests) || value.tests.length === 0) return "zero-tests";
   const seen = new Set();
+  const seenFiles = new Set();
   for (const test of value.tests) {
     if (!/^test\/[A-Za-z0-9_./-]+\.test\.js$/u.test(test?.file || "")
       || typeof test?.title !== "string"
@@ -413,6 +430,7 @@ function validateTestEvidence(value, step, source) {
     const key = `${test.file}\0${test.fullTitle}`;
     if (seen.has(key)) return "duplicate-test-record";
     seen.add(key);
+    seenFiles.add(test.file);
   }
   const counted = {
     passed: value.tests.filter(test => test.status === "passed").length,
@@ -422,6 +440,9 @@ function validateTestEvidence(value, step, source) {
   for (const name of Object.keys(counted)) {
     if (value.counts?.[name] !== counted[name]) return "count-mismatch";
   }
+  const expectedFiles = TEST_INVENTORIES_BY_SUITE[step.id];
+  if (expectedFiles && JSON.stringify(uniqueSorted([...seenFiles]))
+    !== JSON.stringify(uniqueSorted(expectedFiles))) return "suite-inventory-mismatch";
   if (counted.failed > 0 || counted.pending > 0) return "nonpassing-test-record";
   return null;
 }

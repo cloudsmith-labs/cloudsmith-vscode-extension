@@ -6,6 +6,7 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 const {
   ROOT,
+  gitVisibleFiles,
   prepareOutputDirectory,
   readJson,
   removeOutputFile,
@@ -23,6 +24,7 @@ function main() {
     throw new Error(`Unknown mutation mode: ${mode}`);
   }
   const baseline = readJson("quality/mutation-baseline.json");
+  assertMutationTestOwners(baseline);
   const targets = mode === "core"
     ? baseline.scope
     : changedMutationTargets(baseline.scope, process.argv.slice(3), baseline.files);
@@ -88,6 +90,32 @@ function changedMutationTargets(scope, argumentsList = [], fileBaselines = {}) {
     changedSet.has(mutationTargetFile(file))
     || (fileBaselines[file]?.testFiles || []).some(testFile => changedSet.has(testFile))
   )));
+}
+
+function assertMutationTestOwners(baseline, root = ROOT, repositoryFiles = gitVisibleFiles(root)) {
+  const visible = new Set(repositoryFiles);
+  for (const target of baseline?.scope || []) {
+    const owners = baseline?.files?.[target]?.testFiles;
+    if (!Array.isArray(owners) || owners.length === 0) {
+      throw new Error(`Mutation target ${String(target)} has no test owners.`);
+    }
+    for (const owner of owners) {
+      const targetPath = path.join(root, String(owner));
+      let stat = null;
+      try {
+        stat = fs.lstatSync(targetPath);
+      } catch {
+        // The stable failure below covers missing or unreadable owner paths.
+      }
+      if (!/^test\/[A-Za-z0-9_./-]+\.test\.js$/u.test(owner)
+        || !visible.has(owner) || !stat?.isFile() || stat.isSymbolicLink()) {
+        throw new Error(
+          `Mutation target ${String(target)} test owner ${String(owner)} `
+          + "must exist as a Git-visible regular test file."
+        );
+      }
+    }
+  }
 }
 
 function mutationTargetFile(target) {
@@ -208,6 +236,14 @@ function validateMutationSummary(summary, baseline, mode) {
         `Mutation target ${target} produced ${actual.mutants} mutants; `
         + `measured baseline requires exactly ${expected.mutants}. `
         + "Update quality/mutation-baseline.json only after an explicit full mutation remeasurement."
+      );
+    }
+    const expectedIgnored = Number.isInteger(expected.ignored) ? expected.ignored : 0;
+    if (actual.ignored !== expectedIgnored
+      || actual.mutants - actual.ignored !== expected.mutants - expectedIgnored) {
+      throw new Error(
+        `Mutation target ${target} ignored population drifted from ${expectedIgnored} `
+        + `to ${actual.ignored}; measured scored population must remain exact.`
       );
     }
     for (const failure of ["timeout", "runtimeError", "compileError", "noCoverage"]) {
@@ -341,6 +377,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  assertMutationTestOwners,
   changedMutationTargets,
   filterMutationReport,
   gitChangedFiles,

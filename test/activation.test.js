@@ -130,6 +130,28 @@ suite("Extension activation smoke", () => {
     assert.match(expectedVersion || "", /^\d+\.\d+\.\d+$/);
     assert.strictEqual(vscode.version, expectedVersion);
 
+    const credentialCapableExtensionIds = new Set([
+      "github.copilot",
+      "github.copilot-chat",
+      "vscode.git",
+      "vscode.github",
+      "vscode.github-authentication",
+      "vscode.microsoft-authentication",
+    ]);
+    const activeCredentialExtensions = vscode.extensions.all
+      .filter(extension => credentialCapableExtensionIds.has(extension.id.toLowerCase()))
+      .filter(extension => extension.isActive)
+      .map(extension => extension.id)
+      .sort();
+    assert.deepStrictEqual(
+      activeCredentialExtensions,
+      [],
+      "Credential-capable built-in and AI extensions must remain inactive"
+    );
+    const chatConfiguration = vscode.workspace.getConfiguration("chat");
+    assert.strictEqual(chatConfiguration.get("disableAIFeatures"), true);
+    assert.strictEqual(chatConfiguration.get("enabled"), false);
+
     const harnessExtension = vscode.extensions.getExtension(TEST_HARNESS_ID);
     assert.ok(harnessExtension, "The credential-free test harness extension was not loaded");
     assert.strictEqual(harnessExtension.isActive, false, "The inert harness must not autoactivate");

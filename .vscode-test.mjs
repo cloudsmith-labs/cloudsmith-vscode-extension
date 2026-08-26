@@ -6,7 +6,12 @@ import path from "path";
 import { fileURLToPath } from "url";
 import testInventories from "./test/testInventories.js";
 
-const { VSCODE_CORE_TESTS, VSCODE_SMOKE_TESTS } = testInventories;
+const {
+  VSCODE_CORE_TESTS,
+  VSCODE_SMOKE_TESTS,
+  createIsolatedQualificationRoot,
+  removeIsolatedQualificationRoot,
+} = testInventories;
 const repositoryRoot = path.dirname(fileURLToPath(import.meta.url));
 const TEST_HARNESS_EXTENSION_PATH = path.join(repositoryRoot, "test", "harness-extension");
 
@@ -36,7 +41,8 @@ const common = {
 };
 
 function isolatedHost(label) {
-  const runRoot = path.join(os.tmpdir(), `cloudsmith-vsc-${label}-${process.pid}`);
+  const runRoot = createIsolatedQualificationRoot(label, os.tmpdir());
+  process.once("exit", () => removeIsolatedQualificationRoot(runRoot));
   const extensionsDir = path.join(runRoot, "extensions");
   const userDataDir = path.join(runRoot, "user-data");
   const userSettingsDir = path.join(userDataDir, "User");

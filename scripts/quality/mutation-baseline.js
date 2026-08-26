@@ -6,6 +6,7 @@ const { spawnSync } = require("child_process");
 const {
   ROOT,
   assertRepositoryRelativePath,
+  gitVisibleFiles,
   isPlainObject,
   requireNonEmptyString,
   uniqueSorted,
@@ -26,6 +27,10 @@ const OPTIONAL_ZERO_COUNT_FIELDS = new Set([
 function validateMutationBaseline(baseline, options = {}) {
   const root = options.root || ROOT;
   const commitIsAncestor = options.commitIsAncestor || isAncestorCommit;
+  const repositoryFiles = new Set(options.repositoryFiles
+    || (fs.existsSync(path.join(root, ".git")) ? gitVisibleFiles(root) : []));
+  const enforceGitVisibility = options.repositoryFiles !== undefined
+    || fs.existsSync(path.join(root, ".git"));
   const errors = [];
   if (!isPlainObject(baseline)) {
     return { errors: ["Mutation baseline must be an object."] };
@@ -59,7 +64,8 @@ function validateMutationBaseline(baseline, options = {}) {
     } catch {
       // The stable error below covers missing and unreadable target paths.
     }
-    if (!sourceStat?.isFile() || sourceStat.isSymbolicLink()) {
+    if (!sourceStat?.isFile() || sourceStat.isSymbolicLink()
+      || (enforceGitVisibility && !repositoryFiles.has(sourceFile))) {
       errors.push(`Mutation baseline target ${target} must exist as a regular repository file.`);
     }
     if (sourceFiles.has(sourceFile)) {
@@ -100,6 +106,22 @@ function validateMutationBaseline(baseline, options = {}) {
       || testFiles.some(file => !validRepositoryPath(file))
       || uniqueSorted(testFiles).length !== testFiles.length) {
       errors.push(`Mutation baseline target ${target} must have unique normalized testFiles.`);
+    }
+    for (const testFile of testFiles.filter(file => validRepositoryPath(file))) {
+      let testStat = null;
+      try {
+        testStat = fs.lstatSync(path.join(root, testFile));
+      } catch {
+        // The stable error below covers missing and unreadable owner paths.
+      }
+      if (!/^test\/[A-Za-z0-9_./-]+\.test\.js$/u.test(testFile)
+        || !testStat?.isFile() || testStat.isSymbolicLink()
+        || (enforceGitVisibility && !repositoryFiles.has(testFile))) {
+        errors.push(
+          `Mutation baseline target ${target} test owner ${testFile} `
+          + "must exist as a Git-visible regular test file."
+        );
+      }
     }
   }
 

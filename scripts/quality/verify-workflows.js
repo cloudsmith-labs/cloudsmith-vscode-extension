@@ -55,6 +55,7 @@ function verifyQualityContracts(options = {}) {
   errors.push(...validateMutationBaseline(mutationBaseline, {
     root,
     commitIsAncestor: options.mutationBaselineCommitIsAncestor,
+    repositoryFiles,
   }).errors);
   verifyTaxonomy(taxonomy, findingSchema, errors);
   verifyExtensionHostHarness(root, repositoryFiles, sourceOverrides, errors);
@@ -313,6 +314,11 @@ function verifyExtensionHostHarness(root, repositoryFiles, sourceOverrides, erro
   }
   if (!configSource.includes("--extensions-dir=")) {
     errors.push("VS Code test configuration must isolate the installed-extension directory per run.");
+  }
+  if (!configSource.includes("createIsolatedQualificationRoot(label, os.tmpdir())")
+    || !configSource.includes("process.once(\"exit\", () => removeIsolatedQualificationRoot(runRoot))")
+    || configSource.includes("cloudsmith-vsc-${label}-${process.pid}")) {
+    errors.push("VS Code test configuration must atomically create and exactly clean private per-run host roots.");
   }
   let manifest;
   try {

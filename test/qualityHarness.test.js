@@ -29,6 +29,7 @@ const {
   runGate,
 } = require("../scripts/quality/gate");
 const {
+  assertMutationTestOwners,
   changedMutationTargets,
   filterMutationReport,
   gitChangedFiles,
@@ -56,6 +57,7 @@ const {
   validateImpactArtifact,
 } = require("../scripts/quality/report");
 const { verifyQualityContracts } = require("../scripts/quality/verify-workflows");
+const TEST_INVENTORIES = require("./testInventories");
 
 const root = path.resolve(__dirname, "..");
 const SOURCE_SHA = "1111111111111111111111111111111111111111";
@@ -104,17 +106,41 @@ function passedReceipt(step, source = SOURCE_IDENTITY) {
 }
 
 function testEvidence(step, source = SOURCE_IDENTITY) {
+  const inventory = {
+    "standalone-tests": TEST_INVENTORIES.STANDALONE_NODE_TESTS,
+    "extension-host-core": TEST_INVENTORIES.VSCODE_CORE_TESTS,
+    "extension-host-smoke": TEST_INVENTORIES.VSCODE_SMOKE_TESTS,
+  }[step.id] || ["test/placeholder.test.js"];
+  const tests = inventory.map(file => ({
+    file,
+    title: `fixture for ${file}`,
+    fullTitle: `fixture suite fixture for ${file}`,
+    status: "passed",
+  }));
   return {
     schemaVersion: 1,
     source,
     suite: step.id,
-    counts: { passed: 1, failed: 0, pending: 0 },
-    tests: [{
-      file: "test/placeholder.test.js",
-      title: "placeholder",
-      fullTitle: "placeholder",
-      status: "passed",
-    }],
+    counts: { passed: tests.length, failed: 0, pending: 0 },
+    tests,
+  };
+}
+
+function validLiveStatus(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    source: SOURCE_IDENTITY,
+    inputPath: "internal_docs/quality/live-qualification.json",
+    status: "passed",
+    authenticatedAcceptance: "recorded",
+    verdict: "TEAM-TEST READY",
+    requiredWorkflowIds: [],
+    passedWorkflowIds: [],
+    missingWorkflowIds: [],
+    visibleEnabledActions: { status: "passed", silentNoOpCount: 0 },
+    reason: null,
+    errors: [],
+    ...overrides,
   };
 }
 
@@ -643,6 +669,10 @@ suite("Quality gate runner", () => {
       "release-checklist",
       "quality-report",
     ]);
+    assert.strictEqual(
+      release.find(step => step.id === "release-checklist").artifactPath,
+      ".quality/gates/live-qualification-status.json"
+    );
   });
 
   test("writes receipts and cannot turn a nonzero command into a passing gate", () => {
@@ -952,6 +982,23 @@ suite("Quality mutation and UI harness boundaries", () => {
     }
   });
 
+  test("rejects a missing or non-Git-visible mutation test owner", () => {
+    const baseline = validTrackedMutationBaseline();
+    const target = baseline.scope[0];
+    baseline.files[target].testFiles = ["test/removedOwner.test.js"];
+    assert.ok(validateMutationBaseline(baseline, {
+      root,
+      commitIsAncestor: () => true,
+    }).errors.includes(
+      `Mutation baseline target ${target} test owner test/removedOwner.test.js `
+      + "must exist as a Git-visible regular test file."
+    ));
+    assert.throws(
+      () => assertMutationTestOwners(baseline, root),
+      /test owner test\/removedOwner\.test\.js must exist as a Git-visible regular test file/u
+    );
+  });
+
   test("rejects missing, duplicate, extra, and miscounted survivor classifications", () => {
     const missing = validTrackedMutationBaseline();
     missing.survivorClassifications.pop();
@@ -1214,6 +1261,35 @@ suite("Quality mutation and UI harness boundaries", () => {
         "changed"
       ),
       /produced 1 mutants; measured baseline requires exactly 80/u
+    );
+
+    const ignoredCollapse = validMutationSummary({
+      targets: [target],
+      mutants: 10,
+      killed: 1,
+      survived: 0,
+      ignored: 9,
+      score: 100,
+      files: {
+        [target]: validMutationFile(100, {
+          mutants: 10,
+          killed: 1,
+          survived: 0,
+          ignored: 9,
+        }),
+      },
+      survivors: [],
+    });
+    assert.throws(
+      () => validateMutationSummary(
+        ignoredCollapse,
+        {
+          thresholds: { break: 90 },
+          files: { [target]: { mutants: 10, ignored: 0, score: 90 } },
+        },
+        "changed"
+      ),
+      /ignored population drifted from 0 to 9/u
     );
   });
 
@@ -1511,7 +1587,11 @@ suite("Release checklist and deterministic quality report", () => {
       receipt.stepId === "standalone-tests"
     )).testEvidence;
     failedEvidence.tests[0].status = "failed";
-    failedEvidence.counts = { passed: 0, failed: 1, pending: 0 };
+    failedEvidence.counts = {
+      passed: failedEvidence.tests.length - 1,
+      failed: 1,
+      pending: 0,
+    };
     const failedRecord = generateReport({
       ...baseOptions,
       receipts: failedRecordReceipts,
@@ -1521,6 +1601,31 @@ suite("Release checklist and deterministic quality report", () => {
     ));
     assert.strictEqual(failedRecordStep.status, "failed");
     assert.match(failedRecordStep.reason, /test-evidence:nonpassing-test-record/u);
+
+    const fullPlan = getGatePlan("full");
+    const crossedReceipts = fullPlan.map(step => passedReceipt(step));
+    const coreEvidence = crossedReceipts.find(receipt => (
+      receipt.stepId === "extension-host-core"
+    )).testEvidence;
+    coreEvidence.tests = [{
+      file: "test/activation.test.js",
+      title: "smoke-only fixture",
+      fullTitle: "smoke-only fixture",
+      status: "passed",
+    }];
+    coreEvidence.counts = { passed: 1, failed: 0, pending: 0 };
+    const crossed = generateReport({
+      ...baseOptions,
+      profile: "full",
+      plan: fullPlan,
+      receipts: crossedReceipts,
+      ...validMutationEvidence(),
+    });
+    const coreStep = crossed.deterministicGates.steps.find(step => (
+      step.stepId === "extension-host-core"
+    ));
+    assert.strictEqual(coreStep.status, "failed");
+    assert.match(coreStep.reason, /test-evidence:suite-inventory-mismatch/u);
   });
 
   test("binds the exact mutation artifact and independently rejects invalid summaries", () => {
@@ -1644,17 +1749,7 @@ suite("Release checklist and deterministic quality report", () => {
       impact: validImpact(),
       ...validMutationEvidence(),
       ui: { status: "passed", source: SOURCE_IDENTITY, tests: ["fixture"] },
-      liveQualification: {
-        status: "passed",
-        source: SOURCE_IDENTITY,
-        authenticatedAcceptance: "recorded",
-        verdict: "TEAM-TEST READY",
-        requiredWorkflowIds: [],
-        passedWorkflowIds: [],
-        missingWorkflowIds: [],
-        visibleEnabledActions: { status: "passed", silentNoOpCount: 0 },
-        errors: [],
-      },
+      liveQualification: validLiveStatus(),
       findings: [],
       findingsStatus: "passed",
       workflows: { workflows: [] },
@@ -1675,17 +1770,7 @@ suite("Release checklist and deterministic quality report", () => {
 
   test("rejects stale live status after a source-bound release checklist receipt passed", () => {
     const plan = getGatePlan("release");
-    const liveQualification = {
-      status: "passed",
-      source: SOURCE_IDENTITY,
-      authenticatedAcceptance: "recorded",
-      verdict: "TEAM-TEST READY",
-      requiredWorkflowIds: [],
-      passedWorkflowIds: [],
-      missingWorkflowIds: [],
-      visibleEnabledActions: { status: "passed", silentNoOpCount: 0 },
-      errors: [],
-    };
+    const liveQualification = validLiveStatus();
     const common = {
       source: SOURCE_IDENTITY,
       profile: "release",
@@ -1698,8 +1783,18 @@ suite("Release checklist and deterministic quality report", () => {
       findingsStatus: "passed",
       workflows: { workflows: [] },
       inventories,
+      liveQualificationArtifactFingerprint: mutationArtifactFingerprint(validMutationSummary()),
     };
     const matching = generateReport({ ...common, liveQualification });
+    const mismatchedBytes = generateReport({
+      ...common,
+      liveQualification,
+      liveQualificationArtifactFingerprint: "c".repeat(64),
+    });
+    const invalidSchema = generateReport({
+      ...common,
+      liveQualification: { ...liveQualification, schemaVersion: 0 },
+    });
     const stale = generateReport({
       ...common,
       liveQualification: {
@@ -1710,6 +1805,10 @@ suite("Release checklist and deterministic quality report", () => {
 
     assert.strictEqual(matching.liveQualification.status, "passed");
     assert.strictEqual(matching.status, "passed");
+    assert.strictEqual(mismatchedBytes.liveQualification.status, "failed");
+    assert.strictEqual(mismatchedBytes.releaseReadiness.verdict, null);
+    assert.strictEqual(invalidSchema.liveQualification.status, "failed");
+    assert.strictEqual(invalidSchema.releaseReadiness.verdict, null);
     assert.strictEqual(stale.liveQualification.status, "failed");
     assert.strictEqual(stale.liveQualification.authenticatedAcceptance, "not-recorded");
     assert.strictEqual(stale.releaseReadiness.verdict, null);
@@ -2175,6 +2274,24 @@ suite("Quality contract verifier fixtures", () => {
     });
     assert.ok(sharedExtensions.errors.includes(
       "VS Code test configuration must isolate the installed-extension directory per run."
+    ));
+
+    const reusableHostRoot = verifyQualityContracts({
+      root,
+      sourceOverrides: {
+        [configPath]: configSource
+          .replace(
+            "createIsolatedQualificationRoot(label, os.tmpdir())",
+            "path.join(os.tmpdir(), `cloudsmith-vsc-${label}-${process.pid}`)"
+          )
+          .replace(
+            "process.once(\"exit\", () => removeIsolatedQualificationRoot(runRoot));",
+            ""
+          ),
+      },
+    });
+    assert.ok(reusableHostRoot.errors.includes(
+      "VS Code test configuration must atomically create and exactly clean private per-run host roots."
     ));
 
     const credentialReading = verifyQualityContracts({

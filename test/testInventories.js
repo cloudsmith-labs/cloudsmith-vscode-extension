@@ -1,4 +1,8 @@
+const fs = require("fs");
+const os = require("os");
 const path = require("path");
+
+const isolatedQualificationRoots = new Map();
 
 const STANDALONE_NODE_TESTS = Object.freeze([
   "test/accountOperation.test.js",
@@ -136,6 +140,13 @@ const QUALIFICATION_ENVIRONMENT_ALLOWLIST = Object.freeze([
   "PROCESSOR_ARCHITECTURE",
   "NUMBER_OF_PROCESSORS",
   "LANG",
+  "LC_ALL",
+  "LC_COLLATE",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "LC_MONETARY",
+  "LC_NUMERIC",
+  "LC_TIME",
   "TERM",
   "COLORTERM",
   "FORCE_COLOR",
@@ -196,14 +207,6 @@ function sanitizeQualificationEnvironment(environment, isolatedHome) {
       sanitized[name] = value;
     }
   }
-  for (const [name, value] of sourceEntries) {
-    if (/^LC_[A-Z0-9_]{1,64}$/u.test(name)
-      && typeof value === "string"
-      && value.length <= 1024
-      && !value.includes("\u0000")) {
-      sanitized[name] = value;
-    }
-  }
   Object.assign(sanitized, {
     HOME: isolatedHome,
     USERPROFILE: isolatedHome,
@@ -215,6 +218,61 @@ function sanitizeQualificationEnvironment(environment, isolatedHome) {
     LOCALAPPDATA: path.join(isolatedHome, "AppData", "Local"),
   });
   return Object.freeze(sanitized);
+}
+
+function createIsolatedQualificationRoot(label, temporaryParent = os.tmpdir()) {
+  if (!new Set(["core", "smoke"]).has(label)) {
+    throw new Error("Qualification host label must be core or smoke.");
+  }
+  if (typeof temporaryParent !== "string" || !path.isAbsolute(temporaryParent)) {
+    throw new Error("Qualification temporary parent must be an absolute path.");
+  }
+  const parent = fs.realpathSync(temporaryParent);
+  const parentStat = fs.lstatSync(parent);
+  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+    throw new Error("Qualification temporary parent must resolve to a real directory.");
+  }
+
+  const runRoot = fs.mkdtempSync(path.join(
+    parent,
+    `csv-${label === "core" ? "c" : "s"}-`
+  ));
+  try {
+    fs.chmodSync(runRoot, 0o700);
+    const stat = fs.lstatSync(runRoot);
+    if (!stat.isDirectory() || stat.isSymbolicLink()
+      || (process.platform !== "win32" && (stat.mode & 0o077) !== 0)) {
+      throw new Error("Qualification host root must be a private real directory.");
+    }
+    isolatedQualificationRoots.set(runRoot, Object.freeze({
+      device: stat.dev,
+      inode: stat.ino,
+      parent,
+    }));
+    return runRoot;
+  } catch (error) {
+    fs.rmSync(runRoot, { force: true, recursive: true });
+    throw error;
+  }
+}
+
+function removeIsolatedQualificationRoot(runRoot) {
+  const resolved = typeof runRoot === "string" ? path.resolve(runRoot) : "";
+  const identity = isolatedQualificationRoots.get(resolved);
+  if (!identity || path.dirname(resolved) !== identity.parent) {
+    throw new Error("Qualification cleanup refuses a directory it did not create.");
+  }
+  if (!fs.existsSync(resolved)) {
+    isolatedQualificationRoots.delete(resolved);
+    return;
+  }
+  const stat = fs.lstatSync(resolved);
+  if (!stat.isDirectory() || stat.isSymbolicLink()
+    || stat.dev !== identity.device || stat.ino !== identity.inode) {
+    throw new Error("Qualification cleanup refuses a replaced host root.");
+  }
+  fs.rmSync(resolved, { force: true, maxRetries: 3, recursive: true });
+  isolatedQualificationRoots.delete(resolved);
 }
 
 const QUALIFICATION_REQUIRED_ENV = Object.freeze(
@@ -229,5 +287,7 @@ module.exports = {
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,
   assertCredentialFreeRequiredEnvironment,
+  createIsolatedQualificationRoot,
+  removeIsolatedQualificationRoot,
   sanitizeQualificationEnvironment,
 };

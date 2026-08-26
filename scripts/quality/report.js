@@ -62,6 +62,7 @@ function generateReport(options = {}) {
     options.uiArtifacts || []
   );
   const liveQualification = summarizeLiveQualification(options.liveQualification, source, {
+    artifactFingerprint: options.liveQualificationArtifactFingerprint,
     requireChecklistReceipt: profile === "release",
     checklistReceipt: receiptById.get("release-checklist"),
   });
@@ -165,7 +166,7 @@ function normalizeGateReceipt(receipt, step, source) {
     const evidenceError = validateTestEvidence(receipt.testEvidence, step, source);
     if (evidenceError) integrityErrors.push(`test-evidence:${evidenceError}`);
   }
-  if (receipt.status === "passed" && step.artifactPath
+  if (["passed", "blocked"].includes(receipt.status) && step.artifactPath
     && !/^[a-f0-9]{64}$/u.test(receipt.artifactFingerprint || "")) {
     integrityErrors.push("missing-or-invalid-artifact-fingerprint");
   }
@@ -380,8 +381,10 @@ function summarizeLiveQualification(value, source, options = {}) {
   if (!value) {
     summary = emptyLiveQualification("not-run");
   } else {
+    const artifactErrors = validateDerivedLiveStatus(value);
     let status = EVIDENCE_STATUSES.includes(value.status) ? value.status : "failed";
-    if (value.source?.sha !== source.sha
+    if (artifactErrors.length > 0) status = "failed";
+    else if (value.source?.sha !== source.sha
       || value.source?.fingerprint !== source.fingerprint) status = "blocked";
     const passedWorkflowIds = status === "passed"
       ? uniqueSorted(value.passedWorkflowIds || [])
@@ -400,11 +403,87 @@ function summarizeLiveQualification(value, source, options = {}) {
         status: "not-run",
         silentNoOpCount: null,
       },
-      errors: uniqueSorted(value.errors || []),
+      errors: uniqueSorted([...(value.errors || []), ...artifactErrors]),
     };
   }
   if (!options.requireChecklistReceipt) return summary;
-  return bindLiveQualificationToChecklist(summary, options.checklistReceipt);
+  return bindLiveQualificationToChecklist(
+    summary,
+    options.checklistReceipt,
+    options.artifactFingerprint
+  );
+}
+
+function validateDerivedLiveStatus(value) {
+  const errors = [];
+  const exactKeys = [
+    "authenticatedAcceptance", "errors", "inputPath", "missingWorkflowIds",
+    "passedWorkflowIds", "reason", "requiredWorkflowIds", "schemaVersion",
+    "source", "status", "verdict", "visibleEnabledActions",
+  ];
+  if (!isPlainObject(value)) return ["Live status artifact must be an object."];
+  if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(exactKeys)) {
+    errors.push("Live status artifact fields do not match schemaVersion 1.");
+  }
+  if (value.schemaVersion !== 1) errors.push("Live status artifact schemaVersion must be 1.");
+  if (!isPlainObject(value.source)
+    || JSON.stringify(Object.keys(value.source).sort()) !== JSON.stringify(["fingerprint", "sha"])
+    || !/^[a-f0-9]{40}$/u.test(value.source?.sha || "")
+    || !/^[a-f0-9]{64}$/u.test(value.source?.fingerprint || "")) {
+    errors.push("Live status artifact has invalid source identity.");
+  }
+  if (typeof value.inputPath !== "string"
+    || !/^internal_docs\/quality\/[A-Za-z0-9._-]+\.json$/u.test(value.inputPath)) {
+    errors.push("Live status artifact has an invalid input path.");
+  }
+  if (!["passed", "failed", "blocked", "not-run"].includes(value.status)) {
+    errors.push("Live status artifact has an invalid status.");
+  }
+  for (const field of ["requiredWorkflowIds", "passedWorkflowIds", "missingWorkflowIds"]) {
+    if (!Array.isArray(value[field])
+      || value[field].some(id => !/^WF-[A-Z0-9-]+$/u.test(id))
+      || JSON.stringify(value[field]) !== JSON.stringify(uniqueSorted(value[field]))) {
+      errors.push(`Live status artifact has invalid ${field}.`);
+    }
+  }
+  const expectedMissing = (value.requiredWorkflowIds || [])
+    .filter(id => !(value.passedWorkflowIds || []).includes(id));
+  if (JSON.stringify(value.missingWorkflowIds) !== JSON.stringify(expectedMissing)) {
+    errors.push("Live status artifact missingWorkflowIds do not reconcile.");
+  }
+  if (!isPlainObject(value.visibleEnabledActions)
+    || JSON.stringify(Object.keys(value.visibleEnabledActions).sort())
+      !== JSON.stringify(["silentNoOpCount", "status"])
+    || !["passed", "failed", "blocked", "not-run"].includes(
+      value.visibleEnabledActions?.status
+    )
+    || !(value.visibleEnabledActions?.silentNoOpCount === null
+      || (Number.isInteger(value.visibleEnabledActions?.silentNoOpCount)
+        && value.visibleEnabledActions.silentNoOpCount >= 0))) {
+    errors.push("Live status artifact has invalid visibleEnabledActions.");
+  }
+  if (!(value.reason === null || (typeof value.reason === "string" && value.reason.length > 0))
+    || !Array.isArray(value.errors)
+    || value.errors.some(error => typeof error !== "string" || error.length === 0)) {
+    errors.push("Live status artifact has invalid reason or errors.");
+  }
+  if (value.status === "passed") {
+    if (value.authenticatedAcceptance !== "recorded"
+      || !new Set([
+        "TEAM-TEST READY",
+        "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS",
+      ]).has(value.verdict)
+      || (value.passedWorkflowIds || []).length !== (value.requiredWorkflowIds || []).length
+      || value.visibleEnabledActions?.status !== "passed"
+      || value.visibleEnabledActions?.silentNoOpCount !== 0
+      || (value.errors || []).length !== 0) {
+      errors.push("Passed live status artifact is internally inconsistent.");
+    }
+  } else if (value.authenticatedAcceptance !== "not-recorded"
+    || value.verdict !== null || (value.passedWorkflowIds || []).length !== 0) {
+    errors.push("Non-passing live status artifact claims authenticated acceptance.");
+  }
+  return uniqueSorted(errors);
 }
 
 function emptyLiveQualification(status) {
@@ -420,7 +499,17 @@ function emptyLiveQualification(status) {
   };
 }
 
-function bindLiveQualificationToChecklist(summary, receipt) {
+function bindLiveQualificationToChecklist(summary, receipt, artifactFingerprint) {
+  if (receipt?.present && ["passed", "blocked"].includes(receipt.status)) {
+    if (!/^[a-f0-9]{64}$/u.test(artifactFingerprint || "")
+      || receipt.artifactFingerprint !== artifactFingerprint) {
+      return rejectUnboundLiveQualification(
+        summary,
+        "failed",
+        "Release checklist receipt does not bind the exact live-status artifact."
+      );
+    }
+  }
   if (receipt?.present && receipt.status === "passed") {
     if (summary.status === "passed") return summary;
     return rejectUnboundLiveQualification(
@@ -732,6 +821,11 @@ function loadReportInputs(options = {}) {
     root,
     ".quality/mutation"
   );
+  const liveArtifact = readOptionalRepositoryJsonArtifact(
+    DEFAULT_LIVE_STATUS,
+    root,
+    ".quality/gates"
+  );
   return {
     root,
     source,
@@ -744,11 +838,8 @@ function loadReportInputs(options = {}) {
     mutationBaseline: readJson("quality/mutation-baseline.json", root),
     ui: readOptionalRepositoryJson(DEFAULT_UI_RESULT, root, ".quality/ui"),
     uiArtifacts: discoverUiArtifacts(root),
-    liveQualification: readOptionalRepositoryJson(
-      DEFAULT_LIVE_STATUS,
-      root,
-      ".quality/gates"
-    ),
+    liveQualification: liveArtifact?.value || null,
+    liveQualificationArtifactFingerprint: liveArtifact?.fingerprint || null,
     findings,
     findingsStatus,
     findingsErrors,

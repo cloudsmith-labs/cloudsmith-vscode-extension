@@ -1,5 +1,6 @@
 const assert = require("assert");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const {
   CREDENTIAL_BOUNDARY_EXCLUDED_TESTS,
@@ -9,6 +10,8 @@ const {
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,
   assertCredentialFreeRequiredEnvironment,
+  createIsolatedQualificationRoot,
+  removeIsolatedQualificationRoot,
   sanitizeQualificationEnvironment,
 } = require("./testInventories");
 
@@ -112,6 +115,9 @@ suite("test runner inventories", () => {
       CLOUDSMITH_QUALITY_SOURCE_SHA: "a".repeat(40),
       CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT: "b".repeat(64),
       CLOUDSMITH_QUALITY_TEST_SUITE: "extension-host-core",
+      LC_CTYPE: "en_US.UTF-8",
+      LC_API_KEY: "synthetic-secret",
+      LC_TOKEN: "synthetic-token",
       CLOUDSMITH_API_KEY: "synthetic-secret",
       ACCESS_TOKEN: "synthetic-secret",
       SSH_AUTH_SOCK: "/private/synthetic-agent.sock",
@@ -130,6 +136,7 @@ suite("test runner inventories", () => {
         CLOUDSMITH_QUALITY_SOURCE_SHA: sanitized.CLOUDSMITH_QUALITY_SOURCE_SHA,
         CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT: sanitized.CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT,
         CLOUDSMITH_QUALITY_TEST_SUITE: sanitized.CLOUDSMITH_QUALITY_TEST_SUITE,
+        LC_CTYPE: sanitized.LC_CTYPE,
       },
       {
         PATH: "/safe/bin",
@@ -140,11 +147,14 @@ suite("test runner inventories", () => {
         CLOUDSMITH_QUALITY_SOURCE_SHA: "a".repeat(40),
         CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT: "b".repeat(64),
         CLOUDSMITH_QUALITY_TEST_SUITE: "extension-host-core",
+        LC_CTYPE: "en_US.UTF-8",
       }
     );
     for (const name of [
       "CLOUDSMITH_API_KEY",
       "ACCESS_TOKEN",
+      "LC_API_KEY",
+      "LC_TOKEN",
       "SSH_AUTH_SOCK",
       "NODE_OPTIONS",
     ]) {
@@ -158,6 +168,46 @@ suite("test runner inventories", () => {
       Object.values(sanitized).includes("synthetic-secret"),
       false
     );
+  });
+
+  test("qualification host roots are atomic, private, unique, and exactly cleaned", () => {
+    const temporaryParent = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-host-root-test-"));
+    try {
+      const predictableRoot = path.join(temporaryParent, `cloudsmith-vsc-core-${process.pid}`);
+      const rogueExtension = path.join(predictableRoot, "extensions", "rogue", "package.json");
+      fs.mkdirSync(path.dirname(rogueExtension), { recursive: true });
+      fs.writeFileSync(rogueExtension, "{}\n");
+
+      const runRoot = createIsolatedQualificationRoot("core", temporaryParent);
+      assert.notStrictEqual(runRoot, predictableRoot);
+      assert.strictEqual(path.dirname(runRoot), fs.realpathSync(temporaryParent));
+      assert.match(path.basename(runRoot), /^csv-c-[A-Za-z0-9]{6}$/);
+      assert.ok(runRoot.length <= fs.realpathSync(temporaryParent).length + 13);
+      assert.deepStrictEqual(fs.readdirSync(runRoot), []);
+      const stat = fs.lstatSync(runRoot);
+      assert.strictEqual(stat.isDirectory(), true);
+      assert.strictEqual(stat.isSymbolicLink(), false);
+      if (process.platform !== "win32") assert.strictEqual(stat.mode & 0o077, 0);
+
+      assert.throws(
+        () => removeIsolatedQualificationRoot(predictableRoot),
+        /refuses a directory it did not create/
+      );
+      removeIsolatedQualificationRoot(runRoot);
+      assert.strictEqual(fs.existsSync(runRoot), false);
+      assert.strictEqual(fs.existsSync(rogueExtension), true);
+    } finally {
+      fs.rmSync(temporaryParent, { force: true, recursive: true });
+    }
+  });
+
+  test("qualification host roots preserve the macOS IPC socket length budget", () => {
+    const runRoot = createIsolatedQualificationRoot("smoke", os.tmpdir());
+    try {
+      assert.ok(path.join(runRoot, "user-data", "1.13-main.sock").length <= 103);
+    } finally {
+      removeIsolatedQualificationRoot(runRoot);
+    }
   });
 
   test("credential-bearing live suites are inventoried only as excluded inputs", () => {
@@ -218,6 +268,9 @@ suite("test runner inventories", () => {
     }
     assert.match(config, /"chat\.disableAIFeatures": true/);
     assert.match(config, /"chat\.enabled": false/);
+    assert.match(config, /createIsolatedQualificationRoot\(label, os\.tmpdir\(\)\)/);
+    assert.match(config, /process\.once\("exit", \(\) => removeIsolatedQualificationRoot\(runRoot\)\)/);
+    assert.doesNotMatch(config, /cloudsmith-vsc-\$\{label\}-\$\{process\.pid\}/);
 
     const harnessRoot = path.join(root, "test", "harness-extension");
     assert.notStrictEqual(fs.realpathSync(harnessRoot), fs.realpathSync(root));
