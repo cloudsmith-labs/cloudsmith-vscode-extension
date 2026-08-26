@@ -17,7 +17,7 @@
     "util/vulnerabilityStateService.js:616-718",
     "util/installCommandBuilder.js:650-830"
   ],
-  "measuredAtSha": null,
+  "measuredAtSha": "8e9985d51ed34b3022f8276b6c9034ecaa4291c8",
   "metrics": {
     "mutants": 1570,
     "killed": 1405,

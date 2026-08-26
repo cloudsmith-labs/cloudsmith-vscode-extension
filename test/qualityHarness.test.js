@@ -1751,8 +1751,11 @@ suite("Release checklist and deterministic quality report", () => {
 });
 
 suite("Quality contract verifier fixtures", () => {
-  test("rejects the unmeasured tracked mutation baseline before its provenance commit", () => {
-    assert.ok(verifyQualityContracts({ root }).errors.includes(
+  test("rejects an unmeasured mutation baseline", () => {
+    const mutationBaseline = clone(require("../quality/mutation-baseline.json"));
+    mutationBaseline.measuredAtSha = null;
+
+    assert.ok(verifyQualityContracts({ root, mutationBaseline }).errors.includes(
       "Mutation baseline measuredAtSha must be a full 40-hex commit."
     ));
   });
