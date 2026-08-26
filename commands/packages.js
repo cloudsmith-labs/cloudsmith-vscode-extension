@@ -8,10 +8,11 @@ const {
   captureCommandAccount,
   createFilterPresets,
   firstCollectionFailureMessage,
-  isQuarantinedPackage,
+  installGuidanceCopiedMessage,
+  isInstallablePackage,
   pickInstallCommandVariant,
   pickRecentPackage,
-  commentCommandNote,
+  renderInstallCommandGuidance,
   isCommandAccountCurrent,
   showAccountInputBox,
   showAccountQuickPick,
@@ -54,7 +55,6 @@ function registerPackageCommands(deps) {
     packageCollectionIdentity,
     SearchQueryBuilder,
     LicenseClassifier,
-    InstallCommandBuilder,
     buildPackageUrl,
     buildPackageGroupUrl,
     filterState,
@@ -218,6 +218,14 @@ function registerPackageCommands(deps) {
         expectedWorkspace: pkg.workspace,
         expectedRepository: pkg.repository,
       });
+      if (
+        inspectedPackage.packageIdentifier !== pkg.packageIdentifier
+        || inspectedPackage.name !== pkg.name
+        || inspectedPackage.version !== pkg.version
+        || inspectedPackage.format !== pkg.format
+      ) {
+        throw new TypeError("The inspection response did not match the selected package.");
+      }
       jsonContent = serializePackageInspection(inspectedPackage);
     } catch {
       vscode.window.showErrorMessage("Could not safely inspect the package response.");
@@ -472,7 +480,7 @@ function registerPackageCommands(deps) {
     const accountScope = captureCommandAccount(deps.workspaceAccess);
     if (!accountScope) return;
     const selected = await selectedPackage(item, accountScope, {
-      predicate: pkg => pkg.copyable === true && !isQuarantinedPackage(pkg),
+      predicate: isInstallablePackage,
       invalidMessage: "Could not determine package details for install command.",
       invalidStateMessage: "Install commands are available only for copyable, non-quarantined packages.",
       emptyMessage: "No recent installable packages. Open or search for a package, then try again.",
@@ -482,17 +490,12 @@ function registerPackageCommands(deps) {
     if (!isCurrent()) return;
     const result = buildInstallCommand(deps, pkg);
     if (!result) return;
+    const chosenCommand = await pickInstallCommandVariant(deps, result, { accountScope });
+    if (!chosenCommand || !isCurrent()) return;
+    const content = renderInstallCommandGuidance(deps, result, chosenCommand);
     if (showDocument) {
-      let content = result.command;
-      if (result.alternatives && result.alternatives.length > 0) {
-        for (const alternative of result.alternatives) {
-          content += `\n\n# Alternative: ${alternative.label}\n${alternative.command}`;
-        }
-      }
-      if (result.note) content += `\n\n# Note\n${commentCommandNote(result.note)}`;
-      if (!isCurrent()) return;
       const document = await vscode.workspace.openTextDocument({
-        language: pkg.format === "maven" ? "xml" : "shellscript",
+        language: result.language || "shellscript",
         content,
       });
       if (!isCurrent()) return;
@@ -501,14 +504,9 @@ function registerPackageCommands(deps) {
       recentPackages.add(pkg);
       return;
     }
-    const chosenCommand = await pickInstallCommandVariant(deps, result, { accountScope });
-    if (!chosenCommand) return;
+    await vscode.env.clipboard.writeText(content);
     if (!isCurrent()) return;
-    await vscode.env.clipboard.writeText(
-      InstallCommandBuilder.toClipboardCommand(chosenCommand)
-    );
-    if (!isCurrent()) return;
-    vscode.window.showInformationMessage("Install command copied.");
+    vscode.window.showInformationMessage(installGuidanceCopiedMessage(result));
     if (!isCurrent()) return;
     recentPackages.add(pkg);
   }

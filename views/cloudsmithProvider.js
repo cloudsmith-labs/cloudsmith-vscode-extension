@@ -21,6 +21,10 @@ const {
 const { WorkspaceInfoNode } = require("../models/workspaceInfoNode");
 const WorkspaceNode = require("../models/workspaceNode");
 const RepositoryNode = require("../models/repositoryNode");
+const {
+  RepositoryTerminalNode,
+  isRepositoryTerminalNode,
+} = require("../models/repositoryTerminalNode");
 const workspaceFetcher = require("../util/workspaceFetcher");
 const workspaceRepositoryFetcher = require("../util/workspaceRepositoryFetcher");
 const { getWorkspaceContextProjector } = require("../util/workspaceContextProjector");
@@ -52,6 +56,8 @@ class CloudsmithProvider {
     this._vulnerabilityStateService = options.vulnerabilityStateService || null;
     this._vulnerabilitySummaries = new Map();
     this._treeParents = new WeakMap();
+    this._treeItemFallbacks = new WeakMap();
+    this._repositoryProjectionState = new WeakMap();
     this._vulnerabilityRefreshTimers = new Map();
     this._vulnerabilityStateSubscription = this._vulnerabilityStateService?.onDidChange?.(
       event => this._publishVulnerabilityState(event)
@@ -101,7 +107,27 @@ class CloudsmithProvider {
   }
 
   getTreeItem(element) {
-    return element.getTreeItem();
+    const fallback = this._treeItemFallbacks.get(element);
+    if (fallback) return fallback.getTreeItem();
+    try {
+      const item = element?.getTreeItem?.();
+      if (!isRenderableTreeItem(item)) throw new TypeError("Invalid tree item projection.");
+      return item;
+    } catch (error) {
+      const repository = this._treeParents.get(element);
+      if (
+        !this._isCurrentRepository(repository)
+        || !repository.ownsPackageSelection(element)
+      ) throw error;
+      const state = this._repositoryProjectionState.get(repository);
+      const remainingPackages = Math.max(0, (state?.packageCount || 1) - 1);
+      const terminal = new RepositoryTerminalNode(
+        remainingPackages > 0 ? "partial" : "failed",
+        repository
+      );
+      this._treeItemFallbacks.set(element, terminal);
+      return terminal.getTreeItem();
+    }
   }
 
   getParent(element) {
@@ -128,11 +154,110 @@ class CloudsmithProvider {
       return this.getWorkspaces();
     }
     if (connectionNodes) return [];
-    const children = element.getChildren();
-    if (children && typeof children.then === "function") {
-      return children.then(result => this._ownChildren(element, result));
+    if (element instanceof RepositoryNode && !this._isCurrentRepository(element)) return [];
+    let children;
+    try {
+      children = element.getChildren();
+    } catch (error) {
+      if (this._isCurrentRepository(element)) {
+        return this._repositoryFailureChildren(element);
+      }
+      throw error;
     }
-    return this._ownChildren(element, children);
+    if (children && typeof children.then === "function") {
+      return children.then(
+        result => this._publishChildren(element, result),
+        (error) => {
+          if (this._isCurrentRepository(element)) {
+            return this._repositoryFailureChildren(element);
+          }
+          throw error;
+        }
+      );
+    }
+    return this._publishChildren(element, children);
+  }
+
+  _publishChildren(parent, children) {
+    if (this._isCurrentRepository(parent)) {
+      return this._publishRepositoryChildren(parent, children);
+    }
+    return this._ownChildren(parent, children);
+  }
+
+  _publishRepositoryChildren(repository, children) {
+    if (!this._isCurrentRepository(repository)) return [];
+    if (!Array.isArray(children)) return this._repositoryFailureChildren(repository);
+    const published = [];
+    let packageCandidates = 0;
+    let packageCount = 0;
+    let packageProjectionFailures = 0;
+    for (const child of children) {
+      if (!child || typeof child !== "object") {
+        throw new TypeError("Invalid repository child projection.");
+      }
+      const packageCandidate = repository.ownsPackageSelection(child);
+      if (packageCandidate) packageCandidates += 1;
+      try {
+        const item = child.getTreeItem?.();
+        if (!isRenderableTreeItem(item)) throw new TypeError("Invalid tree item projection.");
+        this._treeItemFallbacks.delete(child);
+        published.push(child);
+        if (packageCandidate) packageCount += 1;
+      } catch (error) {
+        if (!packageCandidate) throw error;
+        packageProjectionFailures += 1;
+      }
+    }
+
+    if (packageProjectionFailures > 0) {
+      for (let index = published.length - 1; index >= 0; index -= 1) {
+        if (isRepositoryTerminalNode(published[index])) published.splice(index, 1);
+      }
+      insertRepositoryTerminal(published, new RepositoryTerminalNode(
+        packageCount > 0 ? "partial" : "failed",
+        repository
+      ));
+    }
+
+    const hasTerminal = published.some(isRepositoryTerminalNode);
+    let packageLoadActive = false;
+    try {
+      packageLoadActive = repository.isPackageLoadActive?.() === true;
+    } catch {
+      packageLoadActive = false;
+    }
+    if (packageCount === 0 && !hasTerminal && !packageLoadActive) {
+      insertRepositoryTerminal(
+        published,
+        new RepositoryTerminalNode("failed", repository)
+      );
+    }
+    this._repositoryProjectionState.set(repository, Object.freeze({
+      packageCandidates,
+      packageCount,
+      packageProjectionFailures,
+    }));
+    return this._ownChildren(repository, published);
+  }
+
+  _repositoryFailureChildren(repository) {
+    if (!this._isCurrentRepository(repository)) return [];
+    this._repositoryProjectionState.set(repository, Object.freeze({
+      packageCandidates: 0,
+      packageCount: 0,
+      packageProjectionFailures: 0,
+    }));
+    return this._ownChildren(repository, [new RepositoryTerminalNode("failed", repository)]);
+  }
+
+  _isCurrentRepository(repository) {
+    return Boolean(
+      !this._disposed
+      && repository
+      && this._repositoryNodes.has(repository)
+      && repository.ownsRepositoryContextSelection(repository)
+    );
   }
 
   _ownChildren(parent, children) {
@@ -320,6 +445,8 @@ class CloudsmithProvider {
     }
     this._repositoryNodes.clear();
     this._workspaceNodes.clear();
+    this._treeItemFallbacks = new WeakMap();
+    this._repositoryProjectionState = new WeakMap();
     this._vulnerabilitySummaries.clear();
     this._clearVulnerabilityRefreshTimers();
   }
@@ -672,6 +799,16 @@ function vulnerabilityEventIdentity(event) {
   if (typeof event === "string") return event;
   if (typeof event?.identity === "string") return event.identity;
   return null;
+}
+
+function insertRepositoryTerminal(children, terminal) {
+  children.unshift(terminal);
+}
+
+function isRenderableTreeItem(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+  const label = typeof item.label === "string" ? item.label : item.label?.label;
+  return typeof label === "string" && label.trim().length > 0;
 }
 
 module.exports = { CloudsmithProvider };

@@ -65,6 +65,10 @@ function completeRepositoryState(entriesByFormat) {
 }
 
 suite("UpstreamPullService", () => {
+  function apiKeyCapabilities() {
+    return { pullThroughAvailable: true };
+  }
+
   function createRuntime(reader = null) {
     const upstreamReader = reader || {
       async getRepositoryUpstreamStateForFormats() {
@@ -122,7 +126,17 @@ suite("UpstreamPullService", () => {
         complete: true,
         stale: false,
       }));
-      super(context, { ...options, upstreamRuntime, checkPackageAbsence });
+      const connectionManager = options.connectionManager || {
+        getAuthenticationCapabilities() {
+          return { pullThroughAvailable: true };
+        },
+      };
+      super(context, {
+        ...options,
+        connectionManager,
+        upstreamRuntime,
+        checkPackageAbsence,
+      });
     }
   }
 
@@ -135,11 +149,19 @@ suite("UpstreamPullService", () => {
 
   test("an SSO session is never sent to an upstream registry", async () => {
     let fetches = 0;
+    let absenceChecks = 0;
     const errors = [];
     const service = new UpstreamPullService({}, {
+      connectionManager: {
+        getAuthenticationCapabilities() { return { pullThroughAvailable: false }; },
+      },
       credentialManager: {
         async getApiKey() { return null; },
         getCredentialKind() { return "sso"; },
+      },
+      checkPackageAbsence: async () => {
+        absenceChecks += 1;
+        return { absent: true, present: false, complete: true, stale: false };
       },
       fetchImpl: async () => { fetches += 1; throw new Error("registry request must not run"); },
       showErrorMessage: async message => { errors.push(message); },
@@ -161,8 +183,133 @@ suite("UpstreamPullService", () => {
     });
     assert.strictEqual(result, null);
     assert.strictEqual(fetches, 0);
+    assert.strictEqual(absenceChecks, 0);
     assert.deepStrictEqual(errors, [
-      "Upstream registry pull currently requires a Cloudsmith API key. Your SSO session was not sent to the registry.",
+      "Pull-through requires a Cloudsmith API key. Sign in with an API key to continue.",
+    ]);
+  });
+
+  test("final API-key retrieval blocks registry dispatch when the capability disappears", async () => {
+    let pullThroughAvailable = true;
+    let absenceChecks = 0;
+    let credentialCalls = 0;
+    let registryDispatches = 0;
+    const errors = [];
+    const service = new UpstreamPullService({}, {
+      connectionManager: {
+        getAuthenticationCapabilities() { return { pullThroughAvailable }; },
+      },
+      credentialManager: {
+        async getApiKey() {
+          credentialCalls += 1;
+          pullThroughAvailable = false;
+          return null;
+        },
+      },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        absenceChecks += 1;
+        return {
+          workspace,
+          repository,
+          absent: true,
+          present: false,
+          complete: true,
+          stale: false,
+        };
+      },
+      showErrorMessage: async message => { errors.push(message); },
+      showInformationMessage: async () => {},
+      showWarningMessage: async () => {},
+    });
+    service._pullDependency = async () => {
+      registryDispatches += 1;
+      throw new Error("registry dispatch must not run without the final API key");
+    };
+
+    const result = await service.execute({
+      workspace: "workspace",
+      repository: { slug: "repository" },
+      plan: {
+        pullableDependencies: [{
+          name: "dependency",
+          version: "1.0.0",
+          format: "npm",
+          cloudsmithStatus: "NOT_FOUND",
+        }],
+        skippedDependencies: [],
+      },
+    });
+
+    assert.strictEqual(result, null);
+    assert.strictEqual(absenceChecks, 1);
+    assert.strictEqual(credentialCalls, 1);
+    assert.strictEqual(registryDispatches, 0);
+    assert.deepStrictEqual(errors, [
+      "Pull-through requires a Cloudsmith API key. Sign in with an API key to continue.",
+    ]);
+  });
+
+  test("SSO preparation rejects bulk and single pulls before every preflight", async () => {
+    let repositoryFetches = 0;
+    let upstreamInspections = 0;
+    let absenceChecks = 0;
+    let quickPicks = 0;
+    const errors = [];
+    const service = new UpstreamPullService({}, {
+      connectionManager: {
+        getAuthenticationCapabilities() { return { pullThroughAvailable: false }; },
+      },
+      fetchRepositories: async () => {
+        repositoryFetches += 1;
+        return { items: [{ slug: "repository" }], complete: true };
+      },
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
+          upstreamInspections += 1;
+          return completeRepositoryState({ npm: [safeUpstream("npm", "npm-upstream")] });
+        },
+      },
+      checkPackageAbsence: async () => {
+        absenceChecks += 1;
+        return { absent: true, present: false, complete: true, stale: false };
+      },
+      showQuickPick: async items => {
+        quickPicks += 1;
+        return items[0];
+      },
+      showErrorMessage: async message => { errors.push(message); },
+      showInformationMessage: async () => {},
+      showWarningMessage: async () => {},
+    });
+    const dependency = {
+      name: "dependency",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "NOT_FOUND",
+    };
+
+    assert.strictEqual(await service.prepare({
+      workspace: "workspace",
+      dependencies: [dependency],
+    }), null);
+    assert.strictEqual(await service.prepareSingle({
+      workspace: "workspace",
+      dependency,
+    }), null);
+    assert.deepStrictEqual({
+      absenceChecks,
+      quickPicks,
+      repositoryFetches,
+      upstreamInspections,
+    }, {
+      absenceChecks: 0,
+      quickPicks: 0,
+      repositoryFetches: 0,
+      upstreamInspections: 0,
+    });
+    assert.deepStrictEqual(errors, [
+      "Pull-through requires a Cloudsmith API key. Sign in with an API key to continue.",
+      "Pull-through requires a Cloudsmith API key. Sign in with an API key to continue.",
     ]);
   });
 
@@ -1040,7 +1187,10 @@ suite("UpstreamPullService", () => {
     };
     let calls = 0;
     const service = new UpstreamPullService({}, {
-      connectionManager: { getState() { return { ...state }; } },
+      connectionManager: {
+        getState() { return { ...state }; },
+        getAuthenticationCapabilities: apiKeyCapabilities,
+      },
       api: {
         async get() {
           calls += 1;
@@ -1080,8 +1230,14 @@ suite("UpstreamPullService", () => {
   test("pull-all verifies exact target absence before confirmation and again before write", async () => {
     const absenceCalls = [];
     const confirmations = [];
+    const events = [];
     const service = new UpstreamPullService({}, {
-      credentialManager: { async getApiKey() { return "api-key"; } },
+      credentialManager: {
+        async getApiKey() {
+          events.push("credential");
+          return "api-key";
+        },
+      },
       fetchRepositories: async () => ({
         items: [{ slug: "repo-b", name: "Repo B" }],
         complete: true,
@@ -1095,6 +1251,7 @@ suite("UpstreamPullService", () => {
       },
       checkPackageAbsence: async ({ workspace, repository, dependency }) => {
         absenceCalls.push({ workspace, repository, name: dependency.name });
+        events.push(`absence-${absenceCalls.length}`);
         return {
           workspace,
           repository,
@@ -1104,20 +1261,27 @@ suite("UpstreamPullService", () => {
           stale: false,
         };
       },
-      showQuickPick: async items => items[0],
+      showQuickPick: async items => {
+        events.push("repository-pick");
+        return items[0];
+      },
       showWarningMessage: async (message, _options, action) => {
         confirmations.push(message);
+        events.push("confirm");
         return action;
       },
       showErrorMessage: async () => {},
       showInformationMessage: async () => {},
     });
-    service._pullDependency = async (_workspace, _repository, dependency) => ({
-      dependency,
-      status: "cached",
-      errorMessage: null,
-      networkError: false,
-    });
+    service._pullDependency = async (_workspace, _repository, dependency) => {
+      events.push("registry-write");
+      return {
+        dependency,
+        status: "cached",
+        errorMessage: null,
+        networkError: false,
+      };
+    };
 
     const result = await service.run({
       workspace: "workspace",
@@ -1137,6 +1301,14 @@ suite("UpstreamPullService", () => {
       { workspace: "workspace", repository: "repo-b", name: "target-package" },
     ]);
     assert.strictEqual(confirmations.length, 1);
+    assert.deepStrictEqual(events, [
+      "repository-pick",
+      "absence-1",
+      "confirm",
+      "absence-2",
+      "credential",
+      "registry-write",
+    ]);
   });
 
   test("pull-all and pull-single repository picks bound and neutralize hostile names", async () => {
@@ -1688,7 +1860,10 @@ suite("UpstreamPullService", () => {
     let exactChecks = 0;
     const statuses = [];
     const service = new UpstreamPullService({}, {
-      connectionManager: { getState() { return { ...accountState }; } },
+      connectionManager: {
+        getState() { return { ...accountState }; },
+        getAuthenticationCapabilities: apiKeyCapabilities,
+      },
       credentialManager: { async getApiKey() { return "api-key"; } },
       checkPackageAbsence: async ({ workspace, repository }) => {
         exactChecks += 1;
@@ -2903,7 +3078,10 @@ suite("UpstreamPullService", () => {
     const apiKey = deferred();
     let pulls = 0;
     const service = new UpstreamPullService({}, {
-      connectionManager: { getState() { return { ...accountState }; } },
+      connectionManager: {
+        getState() { return { ...accountState }; },
+        getAuthenticationCapabilities: apiKeyCapabilities,
+      },
       credentialManager: { async getApiKey() { return apiKey.promise; } },
       showErrorMessage: async () => {},
       showInformationMessage: async () => {},
@@ -2943,7 +3121,10 @@ suite("UpstreamPullService", () => {
     };
     const calls = [];
     const service = new UpstreamPullService({}, {
-      connectionManager: { getState() { return { ...accountState }; } },
+      connectionManager: {
+        getState() { return { ...accountState }; },
+        getAuthenticationCapabilities: apiKeyCapabilities,
+      },
       credentialManager: { async getApiKey() { return "api-key"; } },
       fetchImpl: async (url) => {
         calls.push(url);
@@ -2995,7 +3176,10 @@ suite("UpstreamPullService", () => {
       let inspectionCalls = 0;
       const uiCalls = [];
       const service = new UpstreamPullService({}, {
-        connectionManager: { getState() { return { ...state }; } },
+        connectionManager: {
+          getState() { return { ...state }; },
+          getAuthenticationCapabilities: apiKeyCapabilities,
+        },
         fetchRepositories: async () => ({
           items: [{ slug: "repo", name: "Repo" }],
           complete: true,
@@ -3236,7 +3420,10 @@ suite("UpstreamPullService", () => {
     const repositories = deferred();
     let inspectionCalls = 0;
     const service = new UpstreamPullService({}, {
-      connectionManager: { getState() { return { ...state }; } },
+      connectionManager: {
+        getState() { return { ...state }; },
+        getAuthenticationCapabilities: apiKeyCapabilities,
+      },
       fetchRepositories: async (_workspace, operation) => {
         assert.deepStrictEqual(operation.account, {
           activationId: "account-a",
@@ -3281,6 +3468,7 @@ suite("UpstreamPullService", () => {
     const pickerStarted = deferred();
     const connectionManager = {
       getState() { return { ...state }; },
+      getAuthenticationCapabilities: apiKeyCapabilities,
       onDidChange(listener) {
         listeners.add(listener);
         return { dispose() { listeners.delete(listener); } };
@@ -3340,7 +3528,10 @@ suite("UpstreamPullService", () => {
     const absence = deferred();
     let confirmations = 0;
     const service = new UpstreamPullService({}, {
-      connectionManager: { getState() { return { ...state }; } },
+      connectionManager: {
+        getState() { return { ...state }; },
+        getAuthenticationCapabilities: apiKeyCapabilities,
+      },
       fetchRepositories: async () => ({
         items: [{ slug: "repo-b", name: "Repo B" }],
         complete: true,
@@ -3416,6 +3607,7 @@ suite("UpstreamPullService", () => {
       getState() {
         return { activationId: "account-a", accountEpoch: 1, sessionConnected: true };
       },
+      getAuthenticationCapabilities: apiKeyCapabilities,
     };
     const checker = new UpstreamChecker({}, {
       connectionManager: account,

@@ -69,6 +69,9 @@ suite("ConnectionManager Test Suite", () => {
 
     assert.strictEqual(result.ok, true);
     assert.strictEqual(result.status, CONNECTION_STATUSES.CONNECTED);
+    assert.deepStrictEqual(manager.getAuthenticationCapabilities(), {
+      pullThroughAvailable: true,
+    });
     assert.deepStrictEqual(manager.getState(), {
       activationId: "test-activation",
       status: CONNECTION_STATUSES.CONNECTED,
@@ -971,6 +974,9 @@ suite("ConnectionManager Test Suite", () => {
     assert.strictEqual(manager.getState().status, CONNECTION_STATUSES.FAILED);
     assert.strictEqual(manager.getState().credentialPresent, true);
     assert.strictEqual(manager.getState().sessionConnected, false);
+    assert.deepStrictEqual(manager.getAuthenticationCapabilities(), {
+      pullThroughAvailable: false,
+    });
   });
 
   test("registry access is activation-bound and fails closed after unbind", async () => {

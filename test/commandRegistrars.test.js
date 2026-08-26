@@ -78,12 +78,30 @@ function baseDependencies(recorder) {
   };
 }
 
+function completeVulnerableStateService() {
+  const state = Object.freeze({
+    status: "complete-vulnerable",
+    complete: true,
+    stale: false,
+    count: 1,
+    records: Object.freeze([Object.freeze({ vulnerability_id: "CVE-2026-0001" })]),
+  });
+  return {
+    prime() { return state; },
+    async resolve() { return state; },
+  };
+}
+
 function currentAccountAccess(overrides = {}) {
   return accountAccessHarness(overrides).access;
 }
 
 function accountAccessHarness(overrides = {}) {
-  const connectionManager = overrides.connectionManager || {};
+  const connectionManager = overrides.connectionManager || {
+    getAuthenticationCapabilities() {
+      return { pullThroughAvailable: true };
+    },
+  };
   const account = Object.freeze({ activationId: "activation-a", accountEpoch: 1 });
   let current = true;
   const access = {
@@ -447,12 +465,76 @@ suite("Command registrars", () => {
     await recorder.handlers.get("cloudsmith-vsc.configureCredentials")();
     const ssoItem = pickerItems.find(item => item.method === "sso-browser");
     assert.deepStrictEqual(ssoItem, {
+      id: "sso-browser",
       label: "$(globe) Sign in with SSO",
       description: "Sign in through your organization's identity provider",
       method: "sso-browser",
     });
     assert.deepStrictEqual(browserLogins, [{ workspace: "workspace-a", operation }]);
     assert.deepStrictEqual(handled, [serviceResult]);
+  });
+
+  test("authentication picker keeps API-key methods first and preserves input context", async () => {
+    const expected = [
+      ["personal-api-key", "$(key) Enter API key", "Enter a Cloudsmith personal API key"],
+      ["service-account-api-key", "$(server) Enter service account API key", "Enter a Cloudsmith service account API key"],
+    ];
+
+    for (const [selectedId, expectedLabel, expectedPrompt] of expected) {
+      const recorder = recordingRegistration();
+      const operation = Object.freeze({ id: selectedId });
+      let pickerItems;
+      let inputOptions;
+      registerAuthenticationCommands({
+        ...baseDependencies(recorder),
+        vscode: {
+          window: {
+            async showQuickPick(items) {
+              pickerItems = items;
+              return items.find(item => item.id === selectedId);
+            },
+            async showInputBox(options) {
+              inputOptions = options;
+              return undefined;
+            },
+          },
+        },
+        connectionManager: {
+          beginCredentialOperation: () => operation,
+          isOperationCurrent: value => value === operation,
+        },
+        credentialManager: {
+          async storeApiKey(_operation, options) {
+            await options.showInputBox({
+              prompt: "Enter a Cloudsmith API key",
+              password: true,
+              ignoreFocusOut: true,
+            });
+            return { ok: false, status: "cancelled" };
+          },
+        },
+        ssoManager: {},
+        async handleAuthenticationResult() {},
+      });
+
+      await recorder.handlers.get("cloudsmith-vsc.configureCredentials")();
+
+      assert.deepStrictEqual(
+        pickerItems.map(item => [item.id, item.label]),
+        [
+          ["personal-api-key", "$(key) Enter API key"],
+          ["service-account-api-key", "$(server) Enter service account API key"],
+          ["cloudsmith-cli", "$(folder-opened) Import API key from Cloudsmith CLI"],
+          ["sso-browser", "$(globe) Sign in with SSO"],
+        ]
+      );
+      assert.strictEqual(
+        pickerItems.find(item => item.id === selectedId).label,
+        expectedLabel
+      );
+      assert.strictEqual(inputOptions.prompt, expectedPrompt);
+      assert.strictEqual(inputOptions.password, true);
+    }
   });
 
   test("authentication method cancellation closes its credential operation", async () => {
@@ -1658,6 +1740,55 @@ suite("Command registrars", () => {
     assert.strictEqual(scanCalls, 0);
   });
 
+  test("SSO pull command callbacks stop before provider or selection adaptation", async () => {
+    const recorder = recordingRegistration();
+    const errors = [];
+    let bulkCalls = 0;
+    let singleCalls = 0;
+    let adapterCalls = 0;
+    registerDependencyHealthCommands({
+      ...baseDependencies(recorder),
+      vscode: {
+        window: {
+          showErrorMessage(message) { errors.push(message); },
+        },
+      },
+      workspaceAccess: currentAccountAccess({
+        connectionManager: {
+          getAuthenticationCapabilities() {
+            return { pullThroughAvailable: false };
+          },
+        },
+      }),
+      packageAdapters: {
+        fromDependencyHealthNode() {
+          adapterCalls += 1;
+          throw new Error("selection adaptation must not run");
+        },
+      },
+      dependencyHealthProvider: {
+        hasSuccessfulScan: () => true,
+        isScanRunning: () => false,
+        isDependencyOperationRunning: () => false,
+        async pullDependencies() { bulkCalls += 1; },
+        async pullSingleDependency() { singleCalls += 1; },
+      },
+    });
+
+    await recorder.handlers.get("cloudsmith-vsc.pullDependencies")();
+    await recorder.handlers.get("cloudsmith-vsc.pullSingleDependency")({});
+
+    assert.deepStrictEqual({ adapterCalls, bulkCalls, singleCalls }, {
+      adapterCalls: 0,
+      bulkCalls: 0,
+      singleCalls: 0,
+    });
+    assert.deepStrictEqual(errors, [
+      "Pull-through requires a Cloudsmith API key. Sign in with an API key to continue.",
+      "Pull-through requires a Cloudsmith API key. Sign in with an API key to continue.",
+    ]);
+  });
+
   test("dependency callbacks contain scan failures and pass only canonical pull coordinates", async () => {
     const recorder = recordingRegistration();
     const scanFailure = Object.freeze({ ok: false, error: "scan unavailable" });
@@ -1857,7 +1988,11 @@ suite("Command registrars", () => {
     const information = [];
     const shown = [];
     let recent = [];
-    const quarantined = Object.freeze({ status: "Quarantined", name: "widget" });
+    const quarantined = Object.freeze({
+      identityState: "exact",
+      status: "Quarantined",
+      name: "widget",
+    });
     registerVulnerabilityCommands({
       ...baseDependencies(recorder),
       vscode: {
@@ -1914,6 +2049,12 @@ suite("Command registrars", () => {
     });
     const matchedNode = {
       getTreeItem: () => ({ contextValue: "dependencyHealthVulnerable" }),
+      getActionCapabilities: () => ({
+        actions: {
+          findSafeVersion: true,
+          showVulnerabilities: true,
+        },
+      }),
       package: exactPackage,
       cloudsmithMatch: exactPackage,
       declarationName: "declared-widget",
@@ -1930,6 +2071,7 @@ suite("Command registrars", () => {
     };
     const unmatchedNode = {
       getTreeItem: () => ({ contextValue: "dependencyHealthVulnerable" }),
+      getActionCapabilities: () => ({ actions: {} }),
       declarationName: "declared-other",
       name: "normalized-other",
       declaredVersion: "^3.0.0",
@@ -1937,6 +2079,24 @@ suite("Command registrars", () => {
       versionState: "resolved",
       cloudsmithStatus: "NOT_FOUND",
       format: "python",
+    };
+    const showOnlyNode = {
+      ...matchedNode,
+      getActionCapabilities: () => ({
+        actions: {
+          findSafeVersion: false,
+          showVulnerabilities: true,
+        },
+      }),
+    };
+    const findOnlyNode = {
+      ...matchedNode,
+      getActionCapabilities: () => ({
+        actions: {
+          findSafeVersion: true,
+          showVulnerabilities: false,
+        },
+      }),
     };
     const shown = [];
     const safeCalls = [];
@@ -1964,6 +2124,7 @@ suite("Command registrars", () => {
       RemediationHelper,
       formatApiError: error => error.message,
       vulnerabilityProvider: { async show(value) { shown.push(value); } },
+      vulnerabilityStateService: completeVulnerableStateService(),
       dependencyHealthProvider: {
         getLastSuccessfulScope: () => ({
           workspace: "workspace-a",
@@ -1974,12 +2135,18 @@ suite("Command registrars", () => {
 
     await recorder.handlers.get("cloudsmith-vsc.showDepVulnerabilities")(matchedNode);
     await recorder.handlers.get("cloudsmith-vsc.findDepSafeVersion")(matchedNode);
+    await recorder.handlers.get("cloudsmith-vsc.showDepVulnerabilities")(showOnlyNode);
+    await recorder.handlers.get("cloudsmith-vsc.findDepSafeVersion")(showOnlyNode);
+    await recorder.handlers.get("cloudsmith-vsc.showDepVulnerabilities")(findOnlyNode);
     await recorder.handlers.get("cloudsmith-vsc.findDepSafeVersion")(unmatchedNode);
-    assert.deepStrictEqual(shown, [exactPackage]);
+    assert.deepStrictEqual(shown, [exactPackage, exactPackage]);
     assert.deepStrictEqual(safeCalls, [
-      ["workspace-a", "repo-a", "canonical-widget", "npm"],
+      ["workspace-a", "repo-a", "canonical-widget", "npm", {
+        currentVersion: "2.0.0",
+        fixedVersions: [],
+      }],
     ]);
-    assert.deepStrictEqual(recent, [exactPackage]);
+    assert.deepStrictEqual(recent, [exactPackage, exactPackage]);
     assert.deepStrictEqual(errors, [
       "Could not find safe versions. remediation unavailable",
     ]);
@@ -1990,7 +2157,25 @@ suite("Command registrars", () => {
     const errors = [];
     const warnings = [];
     const shown = [];
-    const pkg = Object.freeze({
+    const pkg = packageDomain.createExactPackage({
+      workspace: "workspace-a",
+      repository: "repo-a",
+      packageIdentifier: "package-one",
+      name: "widget",
+      version: "1.0.0",
+      format: "python",
+      status: "Completed",
+    });
+    const otherPkg = packageDomain.createExactPackage({
+      workspace: "workspace-b",
+      repository: "repo-b",
+      packageIdentifier: "package-two",
+      name: "other-widget",
+      version: "2.0.0",
+      format: "npm",
+      status: "Completed",
+    });
+    const malformedBase = Object.freeze({
       namespace: "workspace-a",
       repository: "repo-a",
       name: "widget",
@@ -2019,43 +2204,45 @@ suite("Command registrars", () => {
       RemediationHelper,
       formatApiError: error => error.message,
       vulnerabilityProvider: { show: value => shown.push(value) },
+      vulnerabilityStateService: completeVulnerableStateService(),
     });
 
     const handler = recorder.handlers.get("cloudsmith-vsc.findSafeVersion");
     await handler(pkg);
+    await handler(otherPkg);
     await handler({
-      cloudsmithWorkspace: "workspace-b",
-      cloudsmithRepo: "repo-b",
-      name: "other-widget",
-      format: "npm",
-    });
-    await handler({
-      ...pkg,
+      ...malformedBase,
       version: "1.0.0",
       slug_perm: "package-one",
       slug_perm_raw: "package-two",
     });
     await handler({
-      ...pkg,
+      ...malformedBase,
       version: "",
       slug_perm: "package-one",
     });
     await handler({
-      ...pkg,
+      ...malformedBase,
       slug_perm: "",
     });
     await handler({
-      ...pkg,
+      ...malformedBase,
       version: "",
     });
     await handler({
-      ...pkg,
+      ...malformedBase,
       version: "1.0.0",
       declaredVersion: "2.0.0",
     });
     assert.deepStrictEqual(calls, [
-      ["workspace-a", "repo-a", "widget", "python"],
-      ["workspace-b", "repo-b", "other-widget", "npm"],
+      ["workspace-a", "repo-a", "widget", "python", {
+        currentVersion: "1.0.0",
+        fixedVersions: [],
+      }],
+      ["workspace-b", "repo-b", "other-widget", "npm", {
+        currentVersion: "2.0.0",
+        fixedVersions: [],
+      }],
     ]);
     assert.deepStrictEqual(errors, [
       "Could not find safe versions. remediation unavailable",
@@ -2077,6 +2264,7 @@ suite("Command registrars", () => {
     const recent = [];
     const promoted = [];
     const exactPackage = Object.freeze({
+      identityState: "exact",
       workspace: "workspace-a",
       repository: "repo-a",
       name: "widget",
@@ -2086,6 +2274,17 @@ suite("Command registrars", () => {
       copyable: true,
       status: "Completed",
     });
+    const quarantinedPackage = Object.freeze({
+      ...exactPackage,
+      packageIdentifier: "pkg-quarantined",
+      status: "Quarantined",
+    });
+    const nonCopyablePackage = Object.freeze({
+      ...exactPackage,
+      packageIdentifier: "pkg-non-copyable",
+      copyable: false,
+    });
+    const validPackages = new Set([exactPackage, quarantinedPackage, nonCopyablePackage]);
     registerPromotionCommands({
       ...baseDependencies(recorder),
       vscode: {
@@ -2093,13 +2292,13 @@ suite("Command registrars", () => {
       },
       packageAdapters: {
         fromPackageSelection(value) {
-          if (value !== exactPackage) throw new TypeError("invalid package");
+          if (!validPackages.has(value)) throw new TypeError("invalid package");
           return value;
         },
       },
       packageDomain: {
         assertExactPackage(value) {
-          if (value !== exactPackage) throw new TypeError("invalid package");
+          if (!validPackages.has(value)) throw new TypeError("invalid package");
           return value;
         },
       },
@@ -2115,8 +2314,14 @@ suite("Command registrars", () => {
 
     const handler = recorder.handlers.get("cloudsmith-vsc.promotePackage");
     await handler({ legacy: true });
+    await handler(quarantinedPackage);
+    await handler(nonCopyablePackage);
     await handler(exactPackage);
-    assert.deepStrictEqual(warnings, ["Could not determine package details."]);
+    assert.deepStrictEqual(warnings, [
+      "Could not determine package details.",
+      "This package is not eligible for promotion.",
+      "This package is not eligible for promotion.",
+    ]);
     assert.deepStrictEqual(recent, []);
     assert.strictEqual(promoted.length, 1);
     assert.strictEqual(promoted[0].value, exactPackage);

@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const vscode = require("vscode");
+const { deriveAuthenticationCapabilities } = require("../domain/authCapabilities");
 const { ContextKeyProjector } = require("./contextKeyProjector");
 const { CredentialMutationLock } = require("./credentialMutationLock");
 const {
@@ -383,6 +384,13 @@ class ConnectionManager {
 
   getCredentialKind() {
     return this._credential ? this._credential.kind : null;
+  }
+
+  getAuthenticationCapabilities() {
+    return deriveAuthenticationCapabilities({
+      credentialKind: this._credential ? this._credential.kind : null,
+      sessionConnected: this._state.sessionConnected,
+    });
   }
 
   async getAPIKeyForRegistry() {

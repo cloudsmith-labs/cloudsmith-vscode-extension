@@ -7,6 +7,7 @@ const { formatApiError } = require("../util/errorFormatter");
 const { replaceCollectionItems } = require("../util/paginatedFetch");
 const { fetchWorkspaces, normalizedWorkspaceName } = require("../util/workspaceFetcher");
 const { getWorkspaceContextProjector } = require("../util/workspaceContextProjector");
+const { RepositoryTerminalNode } = require("../models/repositoryTerminalNode");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
 function workspaceSuccess(items) {
@@ -710,6 +711,410 @@ suite("CloudsmithProvider", () => {
     provider.refresh();
     assert.strictEqual(node._disposed, true);
     subscription.dispose();
+  });
+
+  test("invalid tree elements fail at provider validation without weak-state mutation", () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const invalidElements = [undefined, null, "string", 42, false, Object.freeze({})];
+
+    for (const element of invalidElements) {
+      assert.throws(
+        () => provider.getTreeItem(element),
+        error => (
+          error instanceof TypeError
+          && error.message === "Invalid tree item projection."
+        )
+      );
+      assert.strictEqual(provider.getParent(element), undefined);
+      assert.strictEqual(provider._treeItemFallbacks.has(element), false);
+    }
+  });
+
+  test("stale package projection errors cannot repopulate repository fallback state", async () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const repository = provider._createRepositoryNode(
+      { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
+      "workspace-a"
+    );
+    let projectionError = null;
+    const packageNode = {
+      getTreeItem() {
+        if (projectionError) throw projectionError;
+        return new vscode.TreeItem("package-a");
+      },
+      getChildren() { return []; },
+    };
+    repository._packageState = Object.freeze({
+      ...repository._packageState,
+      initialized: true,
+      nodes: Object.freeze([packageNode]),
+    });
+    repository.getChildren = async () => [packageNode];
+
+    assert.deepStrictEqual(await provider.getChildren(repository), [packageNode]);
+    projectionError = new Error("stale package projection");
+    provider.refresh();
+
+    assert.strictEqual(provider.getParent(packageNode), repository);
+    assert.throws(() => provider.getTreeItem(packageNode), error => error === projectionError);
+    assert.strictEqual(provider._treeItemFallbacks.has(packageNode), false);
+    assert.strictEqual(provider._repositoryProjectionState.has(repository), false);
+  });
+
+  test("repository publication rethrows unrelated child projection errors", async () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const repository = provider._createRepositoryNode(
+      { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
+      "workspace-a"
+    );
+    const projectionError = new Error("unrelated metadata projection");
+    const metadataNode = {
+      getTreeItem() { throw projectionError; },
+      getChildren() { return []; },
+    };
+    repository.getChildren = async () => [metadataNode];
+
+    await assert.rejects(
+      provider.getChildren(repository),
+      error => error === projectionError
+    );
+    assert.strictEqual(provider._treeItemFallbacks.has(metadataNode), false);
+    assert.strictEqual(provider._repositoryProjectionState.has(repository), false);
+  });
+
+  test("repository publication rejects malformed child values", async () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const repository = provider._createRepositoryNode(
+      { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
+      "workspace-a"
+    );
+    repository.getChildren = async () => [null, 42];
+
+    await assert.rejects(
+      provider.getChildren(repository),
+      error => (
+        error instanceof TypeError
+        && error.message === "Invalid repository child projection."
+      )
+    );
+    assert.strictEqual(provider._repositoryProjectionState.has(repository), false);
+  });
+
+  test("FUX-002 contains current repository child rejection with a retryable terminal outcome", async () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const repository = provider._createRepositoryNode(
+      { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
+      "workspace-a"
+    );
+    repository.getChildren = async () => {
+      throw new Error("private upstream response detail");
+    };
+
+    const children = await provider.getChildren(repository);
+    assert.strictEqual(children.length, 1);
+    const item = provider.getTreeItem(children[0]);
+    assert.strictEqual(item.contextValue, "repositoryPackagesFailed");
+    assert.strictEqual(item.description, "Retry");
+    assert.strictEqual(item.command.command, "cloudsmith-vsc.refreshView");
+    assert.strictEqual(JSON.stringify(item).includes("private upstream response detail"), false);
+
+    provider.refresh();
+    assert.deepStrictEqual(
+      await provider.getChildren(repository),
+      [],
+      "an invalidated repository must not publish a stale terminal row"
+    );
+  });
+
+  test("FUX-002 contains package projection rejection and preserves valid package rows", async () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const repository = provider._createRepositoryNode(
+      { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
+      "workspace-a"
+    );
+    const metadata = {
+      getTreeItem() { return new vscode.TreeItem("Upstreams: 1 active"); },
+      getChildren() { return []; },
+    };
+    const validPackage = {
+      name: "valid-package",
+      getTreeItem() { return new vscode.TreeItem("valid-package"); },
+      getChildren() { return []; },
+    };
+    const rejectedPackage = {
+      name: "rejected-package",
+      getTreeItem() { throw new Error("private package projection detail"); },
+      getChildren() { return []; },
+    };
+    repository._packageState = Object.freeze({
+      ...repository._packageState,
+      initialized: true,
+      nodes: Object.freeze([validPackage, rejectedPackage]),
+    });
+    repository.getChildren = async () => [metadata, validPackage, rejectedPackage];
+
+    const children = await provider.getChildren(repository);
+    assert.ok(children.includes(metadata));
+    assert.ok(children.includes(validPackage));
+    assert.strictEqual(children.includes(rejectedPackage), false);
+    const items = children.map(child => provider.getTreeItem(child));
+    assert.ok(items.some(item => item.label === "valid-package"));
+    const terminal = items.find(item => item.contextValue === "repositoryPackagesPartial");
+    assert.ok(terminal, "one rejected package projection must publish partial state");
+    assert.strictEqual(
+      items[0],
+      terminal,
+      "partial package authority must precede supplementary repository metadata"
+    );
+    assert.strictEqual(terminal.description, "Retry");
+    assert.strictEqual(JSON.stringify(terminal).includes("private package projection detail"), false);
+
+    const allRejected = provider._createRepositoryNode(
+      { slug: "repo-b", slug_perm: "repo-b", name: "Repo B" },
+      "workspace-a"
+    );
+    const rejectedOnly = {
+      getTreeItem() { return { label: "" }; },
+      getChildren() { return []; },
+    };
+    allRejected._packageState = Object.freeze({
+      ...allRejected._packageState,
+      initialized: true,
+      nodes: Object.freeze([rejectedOnly]),
+    });
+    allRejected.getChildren = async () => [
+      metadata,
+      rejectedOnly,
+      new RepositoryTerminalNode("partial", allRejected),
+    ];
+
+    const contained = await provider.getChildren(allRejected);
+    assert.ok(contained.includes(metadata), "valid metadata remains visible");
+    assert.strictEqual(contained.includes(rejectedOnly), false);
+    assert.strictEqual(
+      provider.getTreeItem(contained[0]).contextValue,
+      "repositoryPackagesFailed",
+      "failed package authority must precede supplementary repository metadata"
+    );
+    assert.ok(contained.some(child => (
+      provider.getTreeItem(child).contextValue === "repositoryPackagesFailed"
+    )), "metadata-only publication must gain a failed package terminal row");
+    assert.strictEqual(
+      contained.some(child => (
+        provider.getTreeItem(child).contextValue === "repositoryPackagesPartial"
+      )),
+      false,
+      "zero projected packages cannot retain copy claiming loaded packages are shown"
+    );
+  });
+
+  test("FUX-002 active zero-row load-more publishes loading without a false failure", async () => {
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const repository = provider._createRepositoryNode(
+      { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
+      "workspace-a"
+    );
+    const loading = {
+      getTreeItem() {
+        return new vscode.TreeItem("Loading more packages...");
+      },
+      getChildren() { return []; },
+    };
+    repository.getChildren = async () => [loading];
+    repository.isPackageLoadActive = () => true;
+
+    const children = await provider.getChildren(repository);
+    const items = children.map(child => provider.getTreeItem(child));
+
+    assert.deepStrictEqual(items.map(item => item.label), ["Loading more packages..."]);
+    assert.strictEqual(items.some(item => (
+      item.contextValue === "repositoryPackagesFailed"
+    )), false);
+  });
+
+  test("FUX-002 real Extension Host tree publication ledger cannot settle blank", async () => {
+    assert.match(vscode.version, /^\d+\.\d+\.\d+/);
+    const provider = createProvider(async () => workspaceSuccess([]));
+    const repository = provider._createRepositoryNode(
+      { slug: "ledger-repo", slug_perm: "ledger-repo", name: "Ledger Repo" },
+      "workspace-a"
+    );
+    const collectedPackage = {
+      name: "collected-package",
+      getTreeItem() { return new vscode.TreeItem("collected-package"); },
+      getChildren() { return []; },
+    };
+    repository._packageState = Object.freeze({
+      ...repository._packageState,
+      initialized: true,
+      nodes: Object.freeze([collectedPackage]),
+      complete: true,
+      termination: "exhausted",
+    });
+    assert.strictEqual(repository.ownsPackageSelection(collectedPackage), true);
+    // Simulate the audited boundary: a successful package collection was
+    // retained by the model, but its provider child publication was suppressed.
+    repository.getChildren = async () => [];
+    const ledger = [];
+    const publication = new vscode.EventEmitter();
+    const treeView = vscode.window.createTreeView("cloudsmithView", {
+      showCollapseAll: true,
+      treeDataProvider: {
+        onDidChangeTreeData: publication.event,
+        getParent(element) {
+          return element === repository ? undefined : provider.getParent(element);
+        },
+        getChildren(element) {
+          if (!element) {
+            ledger.push({ phase: "root", count: 1 });
+            return [repository];
+          }
+          const result = Promise.resolve(provider.getChildren(element));
+          return result.then((children) => {
+            ledger.push({ phase: "children", count: children.length });
+            return children;
+          });
+        },
+        getTreeItem(element) {
+          const item = provider.getTreeItem(element);
+          ledger.push({
+            phase: "treeItem",
+            label: typeof item.label === "string" ? item.label : item.label?.label,
+            contextValue: item.contextValue || null,
+          });
+          return item;
+        },
+      },
+    });
+
+    try {
+      await originalExecuteCommand("workbench.view.extension.cloudsmithSideBar");
+      publication.fire(undefined);
+      for (let attempt = 0; attempt < 8 && !ledger.some(entry => (
+        entry.phase === "children"
+      )); attempt += 1) {
+        await treeView.reveal(repository, { expand: 1, focus: false, select: false });
+        // VS Code may resolve the first reveal while its view render is still
+        // being scheduled. Refresh the now-materialized repository so an
+        // expanded host must ask the real provider for its children.
+        publication.fire(repository);
+        for (let turn = 0; turn < 4 && !ledger.some(entry => (
+          entry.phase === "children"
+        )); turn += 1) {
+          await new Promise(resolve => setImmediate(resolve));
+        }
+      }
+      const childResolution = ledger.find(entry => entry.phase === "children");
+      assert.ok(childResolution, `real TreeView did not request children: ${JSON.stringify(ledger)}`);
+      assert.strictEqual(childResolution.count, 1);
+      assert.ok(ledger.some(entry => (
+        entry.phase === "treeItem"
+        && entry.contextValue === "repositoryPackagesFailed"
+      )), `real TreeView did not publish the terminal item: ${JSON.stringify(ledger)}`);
+    } finally {
+      treeView.dispose();
+      publication.dispose();
+      provider.dispose();
+    }
+  });
+
+  test("real Extension Host publishes package content before repository metadata", async () => {
+    assert.match(vscode.version, /^\d+\.\d+\.\d+/);
+    let packageRequests = 0;
+    const provider = createProvider(async () => {
+      packageRequests += 1;
+      return apiSuccess([{
+        namespace: "workspace-a",
+        repository: "repo-a",
+        name: "package-a",
+        format: "npm",
+        slug: "package-a",
+        slug_perm: "package-a",
+        version: "1.0.0",
+        status_str: "Completed",
+      }], {
+        headers: {
+          "x-pagination-page": "1",
+          "x-pagination-pagetotal": "1",
+          "x-pagination-pagesize": "1",
+          "x-pagination-count": "1",
+        },
+      });
+    }, {
+      upstreamInventory: {
+        async getAllUpstreamData() {
+          return {
+            upstreams: [],
+            failedFormats: [],
+            failures: [],
+            unsupportedFormats: [],
+            uninspectedFormats: [],
+            state: "complete",
+            complete: true,
+          };
+        },
+      },
+    });
+    const repository = provider._createRepositoryNode(
+      {
+        slug: "repo-a",
+        slug_perm: "repo-a",
+        name: "Repo A",
+        storage_region: "us-ohio",
+      },
+      "workspace-a"
+    );
+    const publication = new vscode.EventEmitter();
+    const childPublications = [];
+    const treeView = vscode.window.createTreeView("cloudsmithView", {
+      showCollapseAll: true,
+      treeDataProvider: {
+        onDidChangeTreeData: publication.event,
+        getParent(element) {
+          return element === repository ? undefined : provider.getParent(element);
+        },
+        getChildren(element) {
+          if (!element) return [repository];
+          return Promise.resolve(provider.getChildren(element)).then((children) => {
+            if (element === repository) childPublications.push(children);
+            return children;
+          });
+        },
+        getTreeItem(element) {
+          return provider.getTreeItem(element);
+        },
+      },
+    });
+
+    try {
+      await originalExecuteCommand("workbench.view.extension.cloudsmithSideBar");
+      publication.fire(undefined);
+      for (let attempt = 0; attempt < 8 && childPublications.length === 0; attempt += 1) {
+        await treeView.reveal(repository, { expand: 1, focus: false, select: false });
+        publication.fire(repository);
+        for (let turn = 0; turn < 4 && childPublications.length === 0; turn += 1) {
+          await new Promise(resolve => setImmediate(resolve));
+        }
+      }
+
+      assert.ok(childPublications.length > 0, "real TreeView did not request repository children");
+      const children = childPublications.at(-1);
+      const packageIndex = children.findIndex(child => repository.ownsPackageSelection(child));
+      const metadataIndex = children.findIndex(child => (
+        !repository.ownsPackageSelection(child) && !child.terminalOutcome
+      ));
+      assert.ok(packageIndex >= 0, "the actual package collection did not reach host publication");
+      assert.ok(metadataIndex >= 0, "the fixture did not publish repository metadata");
+      assert.ok(
+        packageIndex < metadataIndex,
+        "package content must precede supplementary metadata so a constrained view cannot look metadata-only"
+      );
+      assert.strictEqual(packageRequests, 1);
+    } finally {
+      treeView.dispose();
+      publication.dispose();
+      provider.dispose();
+    }
   });
 
   test("vulnerability publication refreshes only the owned stable summary", async () => {

@@ -360,24 +360,34 @@ suite("RepositoryNode Test Suite", () => {
       { connectionManager }
     );
 
-    repositoryNode.getPackages = async () => [
+    const packages = [
       { format: "python" },
       { format: "python" },
       { formats: ["docker", "unknown"] },
     ];
-    repositoryNode._packageState = { ...repositoryNode._packageState, pageCount: 1 };
+    repositoryNode.getPackages = async () => packages;
+    repositoryNode._packageState = {
+      ...repositoryNode._packageState,
+      initialized: true,
+      nodes: packages,
+      complete: true,
+      termination: "exhausted",
+      pageCount: 1,
+    };
 
     const children = await repositoryNode.getChildren();
 
     assert.strictEqual(allFormatCalls, 1);
     assert.strictEqual(targetedCalls.length, 0);
-    assert.ok(children[0] instanceof UpstreamIndicatorNode);
-    assert.strictEqual(children[0].upstreams.length, 6);
+    const indicator = children.find(child => child instanceof UpstreamIndicatorNode);
+    assert.strictEqual(children[0], packages[0]);
+    assert.ok(indicator);
+    assert.strictEqual(indicator.upstreams.length, 6);
     assert.deepStrictEqual(
-      new Set(children[0].upstreams.map(upstream => upstream.format)),
+      new Set(indicator.upstreams.map(upstream => upstream.format)),
       new Set(["docker", "python", "ruby", "maven", "nuget", "npm"])
     );
-    assert.strictEqual(children[0].getTreeItem().label, "Upstreams: 5 active of 6 configured");
+    assert.strictEqual(indicator.getTreeItem().label, "Upstreams: 5 active of 6 configured");
 
   });
 
@@ -450,16 +460,26 @@ suite("RepositoryNode Test Suite", () => {
       { connectionManager }
     );
 
-    repositoryNode.getPackages = async () => [{ format: "python" }];
-    repositoryNode._packageState = { ...repositoryNode._packageState, pageCount: 1 };
+    const packageNode = { format: "python" };
+    repositoryNode.getPackages = async () => [packageNode];
+    repositoryNode._packageState = {
+      ...repositoryNode._packageState,
+      initialized: true,
+      nodes: [packageNode],
+      complete: true,
+      termination: "exhausted",
+      pageCount: 1,
+    };
     repositoryNode.getUpstreamState = async () => completeUpstreamState([
       { name: "PyPI", upstream_url: "https://pypi.org/", is_active: true },
     ]);
 
     const children = await repositoryNode.getChildren();
 
-    assert.ok(children[0] instanceof UpstreamIndicatorNode);
-    assert.strictEqual(children[0].getTreeItem().label, "Upstreams: 1 active of 1 configured");
+    const indicator = children.find(child => child instanceof UpstreamIndicatorNode);
+    assert.strictEqual(children[0], packageNode);
+    assert.ok(indicator);
+    assert.strictEqual(indicator.getTreeItem().label, "Upstreams: 1 active of 1 configured");
   });
 
   test("loads upstreams through the exact RepositoryNode production aggregation path", async () => {
@@ -487,17 +507,27 @@ suite("RepositoryNode Test Suite", () => {
       context,
       { connectionManager, upstreamInventory: createProductionUpstreamInventory() }
     );
-    repositoryNode.getPackages = async () => [{ format: "python" }];
-    repositoryNode._packageState = { ...repositoryNode._packageState, pageCount: 1 };
+    const packageNode = { format: "python" };
+    repositoryNode.getPackages = async () => [packageNode];
+    repositoryNode._packageState = {
+      ...repositoryNode._packageState,
+      initialized: true,
+      nodes: [packageNode],
+      complete: true,
+      termination: "exhausted",
+      pageCount: 1,
+    };
 
     const children = await repositoryNode.getChildren();
 
     assert.strictEqual(upstreamRequests, 20);
-    assert.ok(children[0] instanceof UpstreamIndicatorNode);
-    assert.strictEqual(children[0].complete, true);
-    assert.strictEqual(children[0].upstreams.length, 1);
-    assert.strictEqual(children[0].upstreams[0].slug_perm, "pypi");
-    assert.strictEqual(children[0].upstreams[0].origin, "https://pypi.org");
+    const indicator = children.find(child => child instanceof UpstreamIndicatorNode);
+    assert.strictEqual(children[0], packageNode);
+    assert.ok(indicator);
+    assert.strictEqual(indicator.complete, true);
+    assert.strictEqual(indicator.upstreams.length, 1);
+    assert.strictEqual(indicator.upstreams[0].slug_perm, "pypi");
+    assert.strictEqual(indicator.upstreams[0].origin, "https://pypi.org");
   });
 
   test("retains production-path upstream data when another format fails", async () => {
@@ -1030,11 +1060,23 @@ suite("RepositoryNode Test Suite", () => {
     assert.strictEqual(repositoryNode._packageState.nodes.length, 2);
     assert.strictEqual(repositoryNode._packageState.failures.length, 1);
     assert.ok(repositoryNode._packageState.continuation);
+    let children = await repositoryNode.getChildren();
+    const partial = children.find(child => (
+      child.getTreeItem().contextValue === "repositoryPackagesPartial"
+    ));
+    assert.ok(partial);
+    assert.strictEqual(partial.getTreeItem().command.command, "cloudsmith-vsc.loadMoreRepositoryPackages");
+    assert.strictEqual(children.filter(child => repositoryNode.ownsPackageSelection(child)).length, 2);
+    assert.strictEqual(children.some(child => (
+      child.getTreeItem().contextValue === "repositoryLoadMore"
+    )), false);
 
     await repositoryNode.loadMorePackages();
     assert.strictEqual(repositoryNode._packageState.nodes.length, 3);
     assert.strictEqual(repositoryNode._packageState.failures.length, 0);
     assert.strictEqual(repositoryNode._packageState.complete, true);
+    children = await repositoryNode.getChildren();
+    assert.strictEqual(children.some(child => child.terminalOutcome), false);
   });
 
   test("fails closed on a duplicate cross-page identity", async () => {
@@ -1143,9 +1185,224 @@ suite("RepositoryNode Test Suite", () => {
     const children = await repositoryNode.getChildren();
     const labels = children.map(child => child.getTreeItem().label);
 
-    assert.ok(labels.includes("Package loading cancelled"));
+    assert.ok(labels.includes("Package loading canceled"));
     assert.strictEqual(labels.includes("Repository is empty"), false);
     assert.strictEqual(repositoryNode._packageState.complete, false);
+  });
+
+  test("FUX-002 publishes machine-readable empty, failed, and cancelled package outcomes", async () => {
+    const cases = [
+      {
+        name: "empty",
+        result: makeCollectionResult({ complete: true }),
+        contextValue: "repositoryPackagesEmpty",
+        action: "none",
+        authoritative: true,
+      },
+      {
+        name: "failed",
+        result: makeCollectionResult({
+          failures: [collectionFailure(1, "timeout")],
+          termination: "request_failed",
+          requestCount: 1,
+        }),
+        contextValue: "repositoryPackagesFailed",
+        action: "retry",
+        authoritative: false,
+      },
+      {
+        name: "cancelled",
+        result: makeCollectionResult({
+          cancelled: true,
+          termination: "cancelled",
+          requestCount: 1,
+        }),
+        contextValue: "repositoryPackagesCancelled",
+        action: "retry",
+        authoritative: false,
+      },
+    ];
+
+    for (const expected of cases) {
+      const repositoryNode = new RepositoryNode(
+        {
+          slug: `packages-${expected.name}`,
+          slug_perm: `packages-${expected.name}`,
+          name: "Packages",
+          storage_region: "us-ohio",
+        },
+        "acme",
+        context,
+        {
+          connectionManager,
+          createPaginatedFetch: () => ({
+            async fetchCollection() { return expected.result; },
+          }),
+        }
+      );
+
+      const children = await repositoryNode.getChildren();
+      const terminal = children.find(child => (
+        child.getTreeItem().contextValue === expected.contextValue
+      ));
+      assert.ok(terminal, `${expected.name} must publish an explicit terminal row`);
+      assert.strictEqual(children[0], terminal, `${expected.name} truth must precede metadata`);
+      assert.ok(
+        children.some(child => child.getTreeItem().label === "Storage Region"),
+        `${expected.name} fixture must exercise terminal publication beside metadata`
+      );
+      assert.deepStrictEqual(terminal.terminalOutcome, {
+        kind: expected.name,
+        scope: "repository",
+        authoritative: expected.authoritative,
+        action: expected.action,
+      });
+      assert.strictEqual(
+        children.some(child => child.getTreeItem().contextValue === "repositoryPackagesEmpty"),
+        expected.name === "empty",
+        `${expected.name} must not become a false empty state`
+      );
+      const item = terminal.getTreeItem();
+      if (expected.action === "retry") {
+        assert.strictEqual(item.description, "Retry");
+        assert.strictEqual(item.command.command, "cloudsmith-vsc.refreshView");
+        assert.strictEqual(JSON.stringify(item).includes("The page request failed."), false);
+      } else {
+        assert.strictEqual(item.command, undefined);
+      }
+    }
+  });
+
+  test("FUX-002 preserves packages beside partial and cancelled package outcomes", async () => {
+    const cases = [
+      {
+        name: "partial",
+        result: makeCollectionResult({
+          items: [makePackage("partial-package", { repository: "partial" })],
+          failures: [collectionFailure(1, "timeout")],
+          termination: "request_failed",
+          pageCount: 1,
+          requestCount: 1,
+          pagination: makePagination(1, 1, 30, 1),
+        }),
+        contextValue: "repositoryPackagesPartial",
+      },
+      {
+        name: "cancelled",
+        result: makeCollectionResult({
+          items: [makePackage("cancelled-package", { repository: "cancelled" })],
+          cancelled: true,
+          termination: "cancelled",
+          pageCount: 1,
+          requestCount: 1,
+          pagination: makePagination(1, 1, 30, 1),
+        }),
+        contextValue: "repositoryPackagesCancelled",
+      },
+    ];
+
+    for (const expected of cases) {
+      const repositoryNode = new RepositoryNode(
+        {
+          slug: expected.name,
+          slug_perm: expected.name,
+          name: "Packages",
+          storage_region: "us-ohio",
+        },
+        "acme",
+        context,
+        {
+          connectionManager,
+          createPaginatedFetch: () => ({
+            async fetchCollection() { return expected.result; },
+          }),
+        }
+      );
+
+      const children = await repositoryNode.getChildren();
+      const packageNodes = children.filter(child => repositoryNode.ownsPackageSelection(child));
+      const terminal = children.find(child => (
+        child.getTreeItem().contextValue === expected.contextValue
+      ));
+      assert.deepStrictEqual(packageNodes.map(node => node.name), [`${expected.name}-package`]);
+      assert.ok(
+        children.some(child => child instanceof UpstreamIndicatorNode),
+        "metadata must coexist with retained package and terminal rows"
+      );
+      assert.ok(terminal, `${expected.name} must remain explicit beside retained packages`);
+      const terminalIndex = children.indexOf(terminal);
+      const packageIndex = children.indexOf(packageNodes[0]);
+      const metadataIndex = children.findIndex(child => (
+        child.getTreeItem().label === "Storage Region"
+      ));
+      assert.strictEqual(terminalIndex, 0, `${expected.name} truth must be immediately visible`);
+      assert.ok(packageIndex > terminalIndex, "retained packages must follow terminal truth");
+      assert.ok(metadataIndex > packageIndex, "metadata must follow package authority");
+      assert.strictEqual(terminal.terminalOutcome.kind, expected.name);
+      assert.strictEqual(terminal.terminalOutcome.authoritative, false);
+      assert.strictEqual(terminal.getTreeItem().description, "Retry");
+      assert.strictEqual(terminal.getTreeItem().command.command, "cloudsmith-vsc.refreshView");
+    }
+  });
+
+  test("active continuation publishes retained packages and loading before metadata", async () => {
+    vscode.workspace.getConfiguration = () => ({
+      get(key) { return key === "showMaxPackages" ? 1 : false; },
+    });
+    const nextPage = deferred();
+    const fake = {
+      async fetchCollection(_endpoint, options) {
+        if (!options.resume) {
+          return makeCollectionResult({
+            items: [makePackage("one")],
+            continuation: makeContinuation(options.descriptor, {
+              anchor: makePagination(1, 2, 1, 2),
+              itemCount: 1,
+            }),
+            pagination: makePagination(1, 2, 1, 2),
+          });
+        }
+        return nextPage.promise;
+      },
+    };
+    const repositoryNode = new RepositoryNode(
+      {
+        slug: "packages",
+        slug_perm: "packages",
+        name: "Packages",
+        storage_region: "us-ohio",
+      },
+      "acme",
+      context,
+      {
+        connectionManager,
+        createPaginatedFetch: () => fake,
+        withProgress: async (_options, task) => task({}, { isCancellationRequested: false }),
+      }
+    );
+    await repositoryNode.getPackages();
+
+    const loading = repositoryNode.loadMorePackages();
+    const children = await repositoryNode.getChildren();
+    const packageIndex = children.findIndex(child => repositoryNode.ownsPackageSelection(child));
+    const loadingIndex = children.findIndex(child => (
+      child.getTreeItem().label === "Loading more packages..."
+    ));
+    const metadataIndex = children.findIndex(child => (
+      child.getTreeItem().label === "Storage Region"
+    ));
+    assert.ok(packageIndex >= 0, "retained package authority must remain visible while loading");
+    assert.ok(loadingIndex > packageIndex, "loading must follow retained package authority");
+    assert.ok(metadataIndex > loadingIndex, "metadata must not obscure active loading truth");
+
+    nextPage.resolve(makeCollectionResult({
+      items: [makePackage("two")],
+      complete: true,
+      pageCount: 2,
+      requestCount: 2,
+      pagination: makePagination(2, 2, 1, 2),
+    }));
+    await loading;
   });
 
   test("stops exposing continuation at the cumulative page cap", async () => {
@@ -1200,7 +1457,11 @@ suite("RepositoryNode Test Suite", () => {
     assert.strictEqual(repositoryNode._packageState.nodes.length, 20);
     assert.strictEqual(repositoryNode._packageState.capReached, true);
     assert.strictEqual(repositoryNode._packageState.continuation, null);
-    assert.ok(children.some(child => child.getTreeItem().label === "Package loading limit reached"));
+    const terminal = children.find(child => (
+      child.getTreeItem().contextValue === "repositoryPackagesPartial"
+    ));
+    assert.strictEqual(terminal.getTreeItem().label, "Some packages are not shown");
+    assert.strictEqual(terminal.terminalOutcome.action, "change-filter");
     assert.strictEqual(children.some(child => (
       child.getTreeItem().contextValue === "repositoryLoadMore"
     )), false);
@@ -1260,6 +1521,14 @@ suite("RepositoryNode Test Suite", () => {
       repositoryNode._packageState.nodes.map(node => `${node.format}:${node.name}`),
       ["npm:shared", "python:shared"]
     );
+    const children = await repositoryNode.getChildren();
+    assert.deepStrictEqual(
+      children
+        .filter(child => repositoryNode.ownsPackageSelection(child))
+        .map(child => child.getTreeItem().contextValue),
+      ["packageGroup", "packageGroup"]
+    );
+    assert.strictEqual(children.some(child => child.terminalOutcome), false);
   });
 
   test("rejects contradictory continuation metadata without another request", async () => {

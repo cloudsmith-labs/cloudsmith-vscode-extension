@@ -19,6 +19,7 @@ const { activeFilters } = require("../util/filterState");
 const InfoNode = require("./infoNode");
 const { EntitlementSummaryNode } = require("./entitlementNode");
 const RepositoryLoadMoreNode = require("./repositoryLoadMoreNode");
+const { RepositoryTerminalNode } = require("./repositoryTerminalNode");
 const {
   captureAccount,
   isAccountCurrent,
@@ -214,6 +215,10 @@ class RepositoryNode {
     const descriptor = this._packageDescriptor;
     if (!descriptor) return Promise.resolve();
     return this._startPackageLoad(descriptor, this._packageState.continuation, true);
+  }
+
+  isPackageLoadActive() {
+    return Boolean(!this._disposed && this._activePackageLoad);
   }
 
   _readPackageDescriptor() {
@@ -629,81 +634,28 @@ class RepositoryNode {
       || generation !== this._generation
     ) return [];
 
-    const children = [...metadata];
-
-    if (packages.length === 0) {
-      const activeFilter = this._getActiveFilter();
-      let placeholderNode;
-      if (this._packageState.failures.length > 0) {
-        placeholderNode = new InfoNode(
-          "Failed to load packages",
-          "Check your connection and try refreshing",
-          collectionFailureMessage(this._packageState.failures.at(-1)),
-          "warning"
-        );
-      } else if (!this._packageState.complete) {
-        const cancelled = this._packageState.termination === "cancelled";
-        placeholderNode = new InfoNode(
-          cancelled ? "Package loading cancelled" : "Package results are incomplete",
-          cancelled ? "Refresh to try again" : "Completeness could not be proven",
-          "No empty-repository claim is being made because package enumeration did not complete.",
-          "warning"
-        );
-      } else if (activeFilter) {
-        const filterLabel = activeFilter.label || "custom query";
-        placeholderNode = new InfoNode(
-          "No packages match filter",
-          filterLabel,
-          "Select to change or clear the filter",
-          "filter",
-          undefined,
-          { command: "cloudsmith-vsc.changeFilter", title: "Change Filter", arguments: [this] }
-        );
-      } else {
-        placeholderNode = new InfoNode(
-          "Repository is empty",
-          "",
-          "This repository does not contain any packages.",
-          "info"
-        );
-      }
-      children.push(placeholderNode);
-    }
+    const terminalNode = this._activePackageLoad
+      ? null
+      : this._createPackageTerminalNode(packages);
+    // Package authority is the repository expansion's primary outcome. Put
+    // incomplete/cancelled truth before retained rows, keep complete rows next,
+    // and leave supplementary metadata last so a constrained viewport cannot
+    // look complete while hiding the actual package outcome.
+    const children = terminalNode ? [terminalNode, ...packages] : [...packages];
 
     if (this._activePackageLoad && this._packageState.initialized) {
+      const loadingKind = this._packageDescriptor?.mode === "groups"
+        ? "package groups"
+        : "packages";
       children.push(new InfoNode(
-        this._packageDescriptor?.mode === "groups"
-          ? "Loading more package groups..."
-          : "Loading more packages...",
-        "The next page is still loading.",
-        "Only one package page is loaded at a time.",
+        `Loading more ${loadingKind}...`,
+        "",
+        `Loading more ${loadingKind}.`,
         "loading~spin"
       ));
     }
 
-    if (packages.length > 0 && this._packageState.failures.length > 0) {
-      children.push(new InfoNode(
-        "Package results are incomplete",
-        collectionProgressDescription(this._packageState),
-        collectionFailureMessage(this._packageState.failures.at(-1)),
-        "warning"
-      ));
-    } else if (packages.length > 0 && this._packageState.capReached) {
-      children.push(new InfoNode(
-        this._packageDescriptor?.mode === "groups"
-          ? "Package group loading limit reached"
-          : "Package loading limit reached",
-        collectionProgressDescription(this._packageState),
-        "Refine the repository filter or refresh before loading more results.",
-        "info"
-      ));
-    }
-
-    for (const node of packages) {
-      children.push(node);
-    }
-
-    if (this._packageState.continuation && !this._activePackageLoad) {
+    if (this._packageState.continuation && !this._activePackageLoad && !terminalNode) {
       children.push(new RepositoryLoadMoreNode(this, {
         kind: this._packageDescriptor?.mode === "groups" ? "package groups" : "packages",
         loadedCount: packages.length,
@@ -713,7 +665,77 @@ class RepositoryNode {
       }));
     }
 
+    children.push(...metadata);
+
     return isAccountCurrent(this._connectionManager, account) ? children : [];
+  }
+
+  _createPackageTerminalNode(packages) {
+    const state = this._packageState;
+    const activeFilter = this._getActiveFilter();
+    if (packages.length === 0) {
+      if (state.complete) {
+        if (activeFilter) {
+          return new RepositoryTerminalNode("empty", this, {
+            scope: "filter",
+            description: activeFilter.label || "Custom filter",
+          });
+        }
+        return new RepositoryTerminalNode("empty", this);
+      }
+      if (state.termination === "cancelled") {
+        return new RepositoryTerminalNode("cancelled", this, {
+          command: this._packageRetryCommand(),
+        });
+      }
+      if (state.failures.length > 0) {
+        return new RepositoryTerminalNode("failed", this, {
+          command: this._packageRetryCommand(),
+        });
+      }
+      return new RepositoryTerminalNode("partial", this, {
+        command: this._packageRetryCommand(),
+      });
+    }
+
+    if (state.termination === "cancelled") {
+      return new RepositoryTerminalNode("cancelled", this, {
+        command: this._packageRetryCommand(),
+      });
+    }
+    if (state.failures.length > 0 || (!state.complete && !state.continuation)) {
+      if (state.capReached) {
+        return new RepositoryTerminalNode("partial", this, {
+          action: "change-filter",
+          label: this._packageDescriptor?.mode === "groups"
+            ? "Some package groups are not shown"
+            : "Some packages are not shown",
+          command: {
+            command: "cloudsmith-vsc.changeFilter",
+            title: "Change filter",
+            arguments: [this],
+          },
+        });
+      }
+      return new RepositoryTerminalNode("partial", this, {
+        command: this._packageRetryCommand(),
+      });
+    }
+    return null;
+  }
+
+  _packageRetryCommand() {
+    if (this._packageState.continuation) {
+      return {
+        command: "cloudsmith-vsc.loadMoreRepositoryPackages",
+        title: "Retry",
+        arguments: [this],
+      };
+    }
+    return {
+      command: "cloudsmith-vsc.refreshView",
+      title: "Retry",
+    };
   }
 
   _getMetadataChildren(packages, account, generation, descriptor) {
@@ -1207,13 +1229,6 @@ function collectionFailureMessage(failure) {
   } catch {
     return "The collection could not be verified.";
   }
-}
-
-function collectionProgressDescription(state) {
-  const loaded = state.nodes.length.toLocaleString();
-  return state.pagination?.countAuthoritative
-    ? `Showing ${loaded} of ${state.pagination.count.toLocaleString()}`
-    : `${loaded} loaded; completeness could not be verified`;
 }
 
 module.exports = RepositoryNode;

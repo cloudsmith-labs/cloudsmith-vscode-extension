@@ -1290,7 +1290,14 @@ function parseScopedWhen(expression, requireContextValue) {
     const pattern = conjunct.match(
       /^viewItem\s*=~\s*\/\^\(([A-Za-z][A-Za-z0-9._-]*(?:\|[A-Za-z][A-Za-z0-9._-]*)*)\)\$\/$/,
     );
-    if (pattern) contextValues.push(...pattern[1].split("|"));
+    if (pattern) {
+      contextValues.push(...pattern[1].split("|"));
+      continue;
+    }
+    const capabilityPattern = conjunct.match(
+      /^viewItem\s*=~\s*\/\^([A-Za-z][A-Za-z0-9]*)\(\?:\\\.\[A-Za-z\]\[A-Za-z0-9\]\*\)\*\\\.([A-Za-z][A-Za-z0-9]*)\(\?:\\\.\|\$\)\/$/,
+    );
+    if (capabilityPattern) contextValues.push(capabilityPattern[1]);
   }
   if (requireContextValue && contextValues.length === 0) return null;
   return { contextValues, view: views[0] };

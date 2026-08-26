@@ -49,6 +49,10 @@ const {
   enrichVulnerabilities,
 } = require("../util/dependencyVulnEnricher");
 const {
+  REPORT_VULNERABILITY_STATES,
+  projectVulnerabilityForReport,
+} = require("../util/vulnerabilityReportProjection");
+const {
   getPackagePolicyFlags,
   getPackageVulnerabilityState,
 } = require("../util/packageVulnerabilities");
@@ -75,6 +79,10 @@ const {
 } = require("../util/connectionPresentation");
 const { packageCollectionIdentity } = require("../util/collectionIdentity");
 const { fromApiPackageRecord } = require("../domain/packageAdapters");
+const {
+  PULL_THROUGH_API_KEY_MESSAGE,
+  isPullThroughAvailable,
+} = require("../domain/authCapabilities");
 const { captureAccount, isAccountCurrent } = require("../util/accountOperation");
 const { ContextKeyProjector } = require("../util/contextKeyProjector");
 
@@ -89,6 +97,7 @@ const LOOKUP_MAX_PACKAGE_VERSION_LENGTH = 2048;
 const COVERAGE_MATCH_BATCH_SIZE = 50;
 const ENRICHMENT_PROGRESS_DEBOUNCE_MS = 500;
 const LOOKUP_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
+const UPSTREAM_COVERAGE_INCOMPLETE_WARNING = "Upstream coverage is incomplete. Positive matches are shown; missing coverage remains unknown.";
 
 const CLOUDSMITH_COVERAGE_STATUS = Object.freeze({
   CHECKING: "CHECKING",
@@ -505,12 +514,27 @@ class DependencyHealthProvider {
 
   async _storeReportData(scanDate) {
     this._lastScanTimestamp = normalizeReportTimestamp(scanDate);
-    this._reportData = buildComplianceReportData(
+    this._reportData = this._buildComplianceReportData(this._lastScanTimestamp);
+    await this._updateContexts();
+  }
+
+  _buildComplianceReportData(scanDate) {
+    return buildComplianceReportData(
       path.basename(this.getProjectFolder() || "workspace"),
       this._fullTrees.flatMap((tree) => tree.dependencies),
-      { scanDate: this._lastScanTimestamp }
+      {
+        scanDate,
+        vulnerabilityStateFor: dependency => {
+          const pkg = dependency && dependency.cloudsmithPackage;
+          if (!pkg || !this._vulnerabilityStateService) return null;
+          try {
+            return this._vulnerabilityStateService.prime(pkg);
+          } catch {
+            return null;
+          }
+        },
+      }
     );
-    await this._updateContexts();
   }
 
   getProjectFolder() {
@@ -1465,7 +1489,7 @@ class DependencyHealthProvider {
     if (!normalizedRepositories.complete) {
       appendUniqueWarning(
         this._warnings,
-        "Repository enumeration for upstream analysis was incomplete. Positive proxy matches are retained, but missing proxy coverage is shown as unknown."
+        UPSTREAM_COVERAGE_INCOMPLETE_WARNING
       );
     }
 
@@ -1497,10 +1521,24 @@ class DependencyHealthProvider {
           cancellationToken: token,
           repositoriesComplete: normalizedRepositories.complete,
           onProgress: (patchMap, meta = {}) => {
+            if (meta.terminal === true && meta.outcome === "cancelled") {
+              return;
+            }
             if (meta.total > 0) {
+              const terminalPartial = meta.terminal === true && meta.outcome === "partial";
+              const inspected = Number.isFinite(meta.inspected)
+                ? meta.inspected
+                : meta.completed;
               progress.report({
-                message: `Checking upstream coverage... ${meta.completed}/${meta.total}`,
+                message: meta.terminal === true
+                  ? terminalPartial
+                    ? `Upstream coverage incomplete: ${inspected}/${meta.total} repositories checked`
+                    : `Upstream coverage checked: ${meta.completed}/${meta.total}`
+                  : `Checking upstream coverage... ${meta.completed}/${meta.total}`,
               });
+              if (terminalPartial) {
+                appendUniqueWarning(this._warnings, UPSTREAM_COVERAGE_INCOMPLETE_WARNING);
+              }
             }
             handler.onProgress(patchMap);
           },
@@ -1629,6 +1667,7 @@ class DependencyHealthProvider {
 
   async pullDependencies() {
     if (this._disposed) return;
+    if (!await this._requirePullThroughCapability()) return;
     if (this._pendingAccountIdentity) return;
     if (this.isScanRunning() || this._isDependencyOperationRunning()) {
       this._userInteraction.showWarningMessage("Wait for the current dependency operation to finish.");
@@ -1740,6 +1779,7 @@ class DependencyHealthProvider {
 
   async pullSingleDependency(value, options = {}) {
     if (this._disposed) return;
+    if (!await this._requirePullThroughCapability()) return;
     if (this._pendingAccountIdentity) return;
     if (this.isScanRunning() || this._isDependencyOperationRunning()) {
       this._userInteraction.showWarningMessage("Wait for the current dependency operation to finish.");
@@ -1924,6 +1964,12 @@ class DependencyHealthProvider {
         this.refresh();
       }
     }
+  }
+
+  async _requirePullThroughCapability() {
+    if (isPullThroughAvailable(this._connectionManager)) return true;
+    await this._userInteraction.showErrorMessage(PULL_THROUGH_API_KEY_MESSAGE);
+    return false;
   }
 
   async _refreshCoverageAfterPull(
@@ -2331,6 +2377,13 @@ class DependencyHealthProvider {
   }
 
   _publishVulnerabilityState(event) {
+    if (
+      !this._disposed
+      && this._reportData
+      && event?.state?.status !== REPORT_VULNERABILITY_STATES.LOADING
+    ) {
+      this._reportData = this._buildComplianceReportData(this._lastScanTimestamp);
+    }
     const identity = typeof event?.identity === "string" ? event.identity : null;
     const entries = identity ? this._vulnerabilitySummaries.get(identity) : null;
     if (!entries || this._disposed) return;
@@ -2776,6 +2829,8 @@ async function lookupExactDependency({
           canonicalMatch = fromApiPackageRecord(match, {
             expectedWorkspace: cloudsmithWorkspace,
             expectedRepository: cloudsmithRepo,
+            coordinateName: dependency.name,
+            coordinateQualifiers: dependency.qualifiers,
           });
         } catch {
           return createCoverageLookupResult(
@@ -4642,6 +4697,15 @@ function normalizeReportTimestamp(value) {
   return date.toISOString();
 }
 
+function vulnerabilityStateForReport(options, dependency) {
+  if (!options || typeof options.vulnerabilityStateFor !== "function") return null;
+  try {
+    return options.vulnerabilityStateFor(dependency) || null;
+  } catch {
+    return null;
+  }
+}
+
 function buildComplianceReportData(projectName, dependencies, options = {}) {
   const uniqueDependencies = dedupeComplianceDependencies(dependencies);
   const occurrenceTotal = Array.isArray(dependencies) ? dependencies.length : 0;
@@ -4652,27 +4716,31 @@ function buildComplianceReportData(projectName, dependencies, options = {}) {
     ecosystemBreakdown[ecosystem] = (ecosystemBreakdown[ecosystem] || 0) + 1;
   }
 
-  const vulnerableDeps = uniqueDependencies
+  const vulnerabilityEvidence = uniqueDependencies
     .filter((dependency) => dependency.cloudsmithStatus === "FOUND")
-    .map((dependency) => {
-      const vulnerabilities = getDependencyVulnerabilityData(dependency);
-      if (!vulnerabilities || (!hasDetectedVulnerabilities(vulnerabilities) && !vulnerabilities.unknown)) {
-        return null;
-      }
+    .map((dependency) => ({
+      dependency,
+      evidence: projectVulnerabilityForReport(
+        getDependencyVulnerabilityData(dependency),
+        vulnerabilityStateForReport(options, dependency)
+      ),
+    }));
 
-      const fixEntry = Array.isArray(vulnerabilities.entries)
-        ? vulnerabilities.entries.find((entry) => entry && entry.fixVersion)
-        : null;
+  const vulnerableDeps = vulnerabilityEvidence
+    .map(({ dependency, evidence }) => {
+      if (evidence.state === REPORT_VULNERABILITY_STATES.COMPLETE_CLEAN) return null;
 
       return {
         ...complianceRowProvenance(dependency),
         name: dependency.name,
         version: dependency.version || "",
         isDirect: Boolean(dependency.isDirect),
-        maxSeverity: vulnerabilities.maxSeverity || null,
-        cveCount: vulnerabilities.countKnown === true ? vulnerabilities.count : null,
-        vulnerabilityStatus: hasDetectedVulnerabilities(vulnerabilities) ? "Detected" : "Unknown",
-        hasFixAvailable: Boolean(fixEntry || vulnerabilities.hasFixAvailable),
+        maxSeverity: evidence.maxSeverity,
+        cveCount: evidence.countKnown ? evidence.count : null,
+        vulnerabilityStatus: evidence.detected ? "Detected" : "Unknown",
+        vulnerabilityState: evidence.state,
+        fixAvailability: evidence.fixAvailability,
+        hasFixAvailable: evidence.hasFixAvailable,
       };
     })
     .filter(Boolean)
@@ -4686,6 +4754,16 @@ function buildComplianceReportData(projectName, dependencies, options = {}) {
     const severity = dependency.maxSeverity || "Unknown";
     severityCounts[severity] = (severityCounts[severity] || 0) + 1;
   }
+  const allApplicableDependenciesFound = uniqueDependencies.every((dependency) => (
+    dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.FOUND
+    || dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.NOT_APPLICABLE
+  ));
+  const vulnerabilityCoverageComplete = vulnerabilityEvidence.length > 0
+    && allApplicableDependenciesFound
+    && vulnerabilityEvidence.every(({ evidence }) => evidence.complete === true);
+  const vulnIncompleteCount = vulnerabilityEvidence.filter(({ evidence }) => (
+    evidence.complete !== true
+  )).length;
 
   const restrictiveLicenseDeps = uniqueDependencies
     .filter((dependency) => dependency.cloudsmithStatus === "FOUND")
@@ -4792,6 +4870,9 @@ function buildComplianceReportData(projectName, dependencies, options = {}) {
       coveragePct: coverageDenominator === 0 ? 0 : Math.round((found / coverageDenominator) * 100),
       vulnCount: detectedVulnerableDeps.length,
       vulnUnknownCount: vulnerableDeps.length - detectedVulnerableDeps.length,
+      vulnDetectedUnknownSeverityCount: severityCounts.Unknown || 0,
+      vulnIncompleteCount,
+      vulnerabilityCoverageComplete,
       criticalCount: severityCounts.Critical || 0,
       highCount: severityCounts.High || 0,
       mediumCount: severityCounts.Medium || 0,

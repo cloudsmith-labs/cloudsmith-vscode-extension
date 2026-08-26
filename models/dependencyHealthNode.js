@@ -17,6 +17,11 @@ const {
 } = require("../domain/packageAdapters");
 const { PackageDomainError } = require("../domain/package");
 const { markSelection } = require("../util/selectionProvenance");
+const {
+  PACKAGE_ACTION_SURFACES,
+  derivePackageActionCapabilities,
+  encodePackageActionContext,
+} = require("../domain/packageActionCapabilities");
 
 const UNEXPECTED_PACKAGE_MATCH_WARNING =
   "[Cloudsmith] Unexpected dependency package match validation failure.";
@@ -259,6 +264,19 @@ class DependencyHealthNode {
     return config.get("flagRestrictiveLicenses") !== false;
   }
 
+  getActionCapabilities() {
+    return derivePackageActionCapabilities({
+      surface: PACKAGE_ACTION_SURFACES.DEPENDENCY_HEALTH,
+      found: this.cloudsmithStatus === "FOUND" && this.package?.identityState === "exact",
+      exact: this.package?.identityState === "exact",
+      copyable: this.package?.copyable === true,
+      vulnerable: this._hasVulnerabilities(),
+      quarantined: this._isQuarantined(),
+      policyViolation: this._hasPolicyViolation(),
+      restrictiveLicense: this._hasRestrictiveLicense(),
+    });
+  }
+
   _getContextValue() {
     if (this.cloudsmithStatus === "CHECKING") {
       return "dependencyHealthSyncing";
@@ -284,15 +302,10 @@ class DependencyHealthNode {
       return "dependencyHealthUnknown";
     }
 
-    if (this._isQuarantined()) {
-      return "dependencyHealthQuarantined";
-    }
-
-    if (this._hasVulnerabilities()) {
-      return "dependencyHealthVulnerable";
-    }
-
-    return "dependencyHealthFound";
+    return encodePackageActionContext(
+      "dependencyHealthActions",
+      this.getActionCapabilities()
+    ) || "dependencyHealthUnknown";
   }
 
   _getStateIcon() {
@@ -406,22 +419,24 @@ class DependencyHealthNode {
       detail = "Checking coverage";
     } else if (this.cloudsmithStatus !== "FOUND") {
       detail = this._buildMissingDescription();
-    } else if (this._isQuarantined()) {
-      detail = "Quarantined";
-    } else if (this._hasVulnerabilities() || this._hasVulnerabilityUncertainty()) {
-      detail = this._buildVulnerabilityDescription();
-    } else if (this._shouldFlagRestrictiveLicenses() && this._hasRestrictiveLicense()) {
-      detail = this._getLicenseLabel()
-        ? `Restrictive license (${this._getLicenseLabel()})`
-        : "Restrictive license";
-    } else if (this._hasWeakCopyleftLicense()) {
-      detail = this._getLicenseLabel()
-        ? `Weak copyleft license (${this._getLicenseLabel()})`
-        : "Weak copyleft license";
-    } else if (this._hasPolicyViolation()) {
-      detail = "Policy violation";
     } else {
-      detail = "No issues found";
+      const materialStates = [];
+      if (this._isQuarantined()) materialStates.push("Quarantined");
+      if (this._hasVulnerabilities() || this._hasVulnerabilityUncertainty()) {
+        const vulnerabilityDescription = this._buildVulnerabilityDescription();
+        if (vulnerabilityDescription) materialStates.push(vulnerabilityDescription);
+      }
+      if (this._shouldFlagRestrictiveLicenses() && this._hasRestrictiveLicense()) {
+        materialStates.push(this._getLicenseLabel()
+          ? `Restrictive license (${this._getLicenseLabel()})`
+          : "Restrictive license");
+      } else if (this._hasWeakCopyleftLicense()) {
+        materialStates.push(this._getLicenseLabel()
+          ? `Weak copyleft license (${this._getLicenseLabel()})`
+          : "Weak copyleft license");
+      }
+      if (this._hasPolicyViolation()) materialStates.push("Policy violation");
+      detail = materialStates.length > 0 ? materialStates.join(" · ") : "No issues found";
     }
 
     if (this._dimmedForFilter && this.cloudsmithStatus === "FOUND") {
@@ -677,8 +692,8 @@ class DependencyHealthNode {
     const status = this.package.status;
     const quarantined = status === "Quarantined";
     const denied = quarantined || this.package.policy.denyViolated;
-    const violated = denied
-      || this.package.policy.violated
+    const violated = this.package.policy.violated
+      || this.package.policy.denyViolated
       || this.package.policy.licenseViolated
       || this.package.policy.vulnerabilityViolated;
 
@@ -744,7 +759,10 @@ function canonicalMatchedPackage(dep, explicitMatch) {
       : null;
     const explicitPackage = explicitMatch === null || explicitMatch === undefined
       ? null
-      : fromApiPackageRecord(explicitMatch);
+      : fromApiPackageRecord(explicitMatch, {
+        coordinateName: dep.name,
+        coordinateQualifiers: dep.qualifiers,
+      });
     if (dependencyPackage && explicitPackage) {
       return fromDependencyHealthNode({
         cloudsmithPackage: dependencyPackage,

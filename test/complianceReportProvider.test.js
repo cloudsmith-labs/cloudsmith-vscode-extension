@@ -234,8 +234,425 @@ suite("ComplianceReportProvider", () => {
 
     assert.match(html, /CVE count \/ status/);
     assert.match(html, />Unknown<\/td>/);
-    assert.match(html, /1 Unknown/);
+    assert.match(html, /1 status unavailable/);
     assert.doesNotMatch(html, /unknown-package[\s\S]*?<td>0<\/td>/);
+  });
+
+  test("positive vulnerability indicators never render false-clean compliance copy", () => {
+    const reportData = buildComplianceReportData("fixture", Array.from(
+      { length: 4 },
+      (_value, index) => ({
+        name: `vulnerable-${index}`,
+        version: "1.0.0",
+        format: "npm",
+        isDirect: index === 0,
+        cloudsmithStatus: "FOUND",
+        cloudsmithPackage: { repository: "prod", status_str: "Completed" },
+        vulnerabilities: {
+          count: 1,
+          countKnown: true,
+          countAuthoritative: true,
+          detected: true,
+          unknown: false,
+          detailsLoaded: false,
+          maxSeverity: null,
+          entries: [],
+        },
+      })
+    ));
+
+    assert.strictEqual(reportData.summary.vulnCount, 4);
+    assert.strictEqual(reportData.summary.vulnDetectedUnknownSeverityCount, 4);
+    assert.strictEqual(reportData.summary.vulnIncompleteCount, 4);
+    assert.strictEqual(reportData.summary.vulnerabilityCoverageComplete, false);
+    assert.strictEqual(reportData.vulnerableDeps.length, 4);
+    assert.ok(reportData.vulnerableDeps.every(row => row.vulnerabilityStatus === "Detected"));
+    assert.ok(reportData.vulnerableDeps.every(row => (
+      row.fixAvailability === "unknown" && row.hasFixAvailable === null
+    )));
+
+    const html = new ComplianceReportProvider({})._getHtml(reportData);
+    assert.match(html, /4 severity unknown/);
+    assert.doesNotMatch(html, /No known vulnerabilities/);
+  });
+
+  test("a contradictory complete-clean detail state cannot erase a positive indicator", () => {
+    const reportData = buildComplianceReportData("fixture", [{
+      name: "contradictory-package",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: { repository: "prod", status_str: "Completed" },
+      vulnerabilities: {
+        count: 1,
+        countKnown: true,
+        countAuthoritative: true,
+        detected: true,
+        unknown: false,
+        detailsLoaded: false,
+        entries: [],
+      },
+    }], {
+      vulnerabilityStateFor: () => ({
+        status: "complete-clean",
+        complete: true,
+        stale: false,
+        count: 0,
+        records: [],
+      }),
+    });
+
+    assert.strictEqual(reportData.summary.vulnCount, 1);
+    assert.strictEqual(reportData.summary.vulnerabilityCoverageComplete, false);
+    assert.strictEqual(reportData.vulnerableDeps[0].vulnerabilityStatus, "Detected");
+    assert.doesNotMatch(
+      new ComplianceReportProvider({})._getHtml(reportData),
+      /No known vulnerabilities|No compliance issues detected/
+    );
+  });
+
+  test("canonical vulnerability detail drives compliance severity, count, and fix parity", () => {
+    const reportData = buildComplianceReportData("fixture", [{
+      name: "js-yaml",
+      version: "3.14.2",
+      format: "npm",
+      isDirect: false,
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: { repository: "prod", status_str: "Completed" },
+      vulnerabilities: {
+        count: 1,
+        countKnown: true,
+        detected: true,
+        detailsLoaded: false,
+      },
+    }], {
+      vulnerabilityStateFor: () => Object.freeze({
+        status: "complete-vulnerable",
+        complete: true,
+        stale: false,
+        count: 1,
+        maxSeverity: "Medium",
+        records: Object.freeze([Object.freeze({
+          vulnerability_id: "CVE-2026-53550",
+          severity: "Medium",
+          fixed_version: Object.freeze({ version: "4.2.0" }),
+        })]),
+      }),
+    });
+
+    assert.strictEqual(reportData.summary.vulnCount, 1);
+    assert.strictEqual(reportData.summary.mediumCount, 1);
+    assert.strictEqual(reportData.summary.vulnIncompleteCount, 0);
+    assert.strictEqual(reportData.summary.vulnerabilityCoverageComplete, true);
+    assert.deepStrictEqual(reportData.vulnerableDeps.map(row => ({
+      maxSeverity: row.maxSeverity,
+      cveCount: row.cveCount,
+      hasFixAvailable: row.hasFixAvailable,
+    })), [{ maxSeverity: "Medium", cveCount: 1, hasFixAvailable: true }]);
+
+    const html = new ComplianceReportProvider({})._getHtml(reportData);
+    assert.match(html, /1 Medium/);
+    assert.doesNotMatch(html, /No known vulnerabilities/);
+  });
+
+  test("global clean copy requires explicit complete-clean evidence", () => {
+    const dependency = {
+      name: "clean-package",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: { repository: "prod", status_str: "Completed" },
+      vulnerabilities: {
+        count: 0,
+        countKnown: true,
+        countAuthoritative: true,
+        detected: false,
+        unknown: false,
+        detailsLoaded: false,
+      },
+    };
+    const complete = buildComplianceReportData("fixture", [dependency], {
+      vulnerabilityStateFor: () => ({
+        status: "complete-clean",
+        complete: true,
+        stale: false,
+        count: 0,
+        records: [],
+      }),
+    });
+    const unknown = buildComplianceReportData("fixture", [{
+      ...dependency,
+      vulnerabilities: {
+        count: 0,
+        countKnown: false,
+        countAuthoritative: false,
+        detected: false,
+        unknown: true,
+        detailsLoaded: false,
+      },
+    }], {
+      vulnerabilityStateFor: () => ({
+        status: "unknown",
+        complete: false,
+        stale: false,
+        count: null,
+        detected: false,
+        records: [],
+      }),
+    });
+    const contradictoryUnknown = buildComplianceReportData("fixture", [dependency], {
+      vulnerabilityStateFor: () => ({
+        status: "unknown",
+        complete: false,
+        stale: false,
+        count: null,
+        detected: false,
+        records: [],
+      }),
+    });
+
+    assert.strictEqual(complete.summary.vulnerabilityCoverageComplete, true);
+    assert.match(new ComplianceReportProvider({})._getHtml(complete), /No known vulnerabilities/);
+    assert.strictEqual(unknown.summary.vulnerabilityCoverageComplete, false);
+    assert.doesNotMatch(
+      new ComplianceReportProvider({})._getHtml(unknown),
+      /No known vulnerabilities|No compliance issues detected/
+    );
+    assert.strictEqual(contradictoryUnknown.summary.vulnerabilityCoverageComplete, false);
+    assert.doesNotMatch(
+      new ComplianceReportProvider({})._getHtml(contradictoryUnknown),
+      /No known vulnerabilities|No compliance issues detected/
+    );
+  });
+
+  test("global vulnerability coverage requires every applicable lookup to be found", () => {
+    const reportData = buildComplianceReportData("fixture", [
+      {
+        name: "clean-npm",
+        version: "1.0.0",
+        format: "npm",
+        cloudsmithStatus: "FOUND",
+        cloudsmithPackage: { repository: "prod", status_str: "Completed" },
+        vulnerabilities: {
+          count: 0,
+          countKnown: true,
+          countAuthoritative: true,
+          detected: false,
+          unknown: false,
+          detailsLoaded: false,
+        },
+      },
+      {
+        name: "failed-python",
+        version: "2.0.0",
+        format: "python",
+        cloudsmithStatus: "LOOKUP_FAILED",
+      },
+    ], {
+      vulnerabilityStateFor: dependency => dependency.cloudsmithStatus === "FOUND"
+        ? {
+          status: "complete-clean",
+          complete: true,
+          stale: false,
+          count: 0,
+          records: [],
+        }
+        : null,
+    });
+
+    assert.strictEqual(reportData.summary.found, 1);
+    assert.strictEqual(reportData.summary.lookupFailed, 1);
+    assert.strictEqual(reportData.summary.vulnerabilityCoverageComplete, false);
+    const html = new ComplianceReportProvider({})._getHtml(reportData);
+    assert.match(html, /Compliance status incomplete/);
+    assert.doesNotMatch(
+      html,
+      /No known vulnerabilities|No compliance issues detected/
+    );
+  });
+
+  test("mixed complete, partial, failed, and unknown vulnerability states stay distinct", () => {
+    const dependencies = [
+      ["complete-no-fix", "1.0.0"],
+      ["partial-with-fix", "2.0.0"],
+      ["failed-scan", "3.0.0"],
+      ["unknown-scan", "4.0.0"],
+    ].map(([name, version]) => ({
+      name,
+      version,
+      format: "npm",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: { repository: "prod", status_str: "Completed" },
+      vulnerabilities: {
+        detected: false,
+        count: null,
+        countKnown: false,
+        countAuthoritative: false,
+        unknown: true,
+        detailsLoaded: false,
+      },
+    }));
+    const states = new Map([
+      ["complete-no-fix", {
+        status: "complete-vulnerable",
+        complete: true,
+        stale: false,
+        count: 2,
+        records: [
+          { vulnerability_id: "CVE-2026-1", severity: "Critical" },
+          { vulnerability_id: "CVE-2026-2", severity: "High" },
+        ],
+      }],
+      ["partial-with-fix", {
+        status: "partial",
+        complete: false,
+        stale: false,
+        detected: true,
+        reportedCount: 2,
+        records: [{
+          vulnerability_id: "CVE-2026-3",
+          severity: "Medium",
+          fixed_version: { version: "2.1.0" },
+        }],
+      }],
+      ["failed-scan", {
+        status: "failed",
+        complete: false,
+        stale: false,
+        detected: false,
+        records: [],
+      }],
+      ["unknown-scan", {
+        status: "unknown",
+        complete: false,
+        stale: false,
+        detected: false,
+        records: [],
+      }],
+    ]);
+
+    const reportData = buildComplianceReportData("fixture", dependencies, {
+      vulnerabilityStateFor: dependency => states.get(dependency.name),
+    });
+
+    assert.strictEqual(reportData.summary.vulnerabilityCoverageComplete, false);
+    assert.deepStrictEqual({
+      vulnCount: reportData.summary.vulnCount,
+      vulnUnknownCount: reportData.summary.vulnUnknownCount,
+      vulnDetectedUnknownSeverityCount:
+        reportData.summary.vulnDetectedUnknownSeverityCount,
+      vulnIncompleteCount: reportData.summary.vulnIncompleteCount,
+      criticalCount: reportData.summary.criticalCount,
+      highCount: reportData.summary.highCount,
+      mediumCount: reportData.summary.mediumCount,
+      lowCount: reportData.summary.lowCount,
+    }, {
+      vulnCount: 2,
+      vulnUnknownCount: 2,
+      vulnDetectedUnknownSeverityCount: 0,
+      vulnIncompleteCount: 3,
+      criticalCount: 1,
+      highCount: 0,
+      mediumCount: 1,
+      lowCount: 0,
+    });
+    assert.deepStrictEqual(reportData.vulnerableDeps.map(row => ({
+      name: row.name,
+      state: row.vulnerabilityState,
+      severity: row.maxSeverity,
+      fixAvailability: row.fixAvailability,
+      hasFixAvailable: row.hasFixAvailable,
+    })), [
+      {
+        name: "complete-no-fix",
+        state: "complete-vulnerable",
+        severity: "Critical",
+        fixAvailability: "no",
+        hasFixAvailable: false,
+      },
+      {
+        name: "partial-with-fix",
+        state: "partial",
+        severity: "Medium",
+        fixAvailability: "yes",
+        hasFixAvailable: true,
+      },
+      {
+        name: "failed-scan",
+        state: "failed",
+        severity: null,
+        fixAvailability: "unknown",
+        hasFixAvailable: null,
+      },
+      {
+        name: "unknown-scan",
+        state: "unknown",
+        severity: null,
+        fixAvailability: "unknown",
+        hasFixAvailable: null,
+      },
+    ]);
+    const html = new ComplianceReportProvider({})._getHtml(reportData);
+    assert.match(html, /Dependency vulnerability status/);
+    const vulnerabilityRow = name => {
+      const fragment = html.split("<tr>").find(row => (
+        row.includes(`<strong>${name}</strong>`)
+      ));
+      assert(fragment, name);
+      return fragment.split("</tr>")[0];
+    };
+    assert.match(
+      vulnerabilityRow("complete-no-fix"),
+      /<span class="badge severity-critical">Critical<\/span>[\s\S]*<td>2<\/td>[\s\S]*<td>No<\/td>/u
+    );
+    assert.match(
+      vulnerabilityRow("partial-with-fix"),
+      /<span class="badge severity-medium">Medium<\/span>[\s\S]*<td>2<\/td>[\s\S]*<td>Yes<\/td>/u
+    );
+    for (const name of ["failed-scan", "unknown-scan"]) {
+      assert.match(
+        vulnerabilityRow(name),
+        /<span class="badge status-default">Unknown<\/span>[\s\S]*<td>Unknown<\/td>[\s\S]*<td>Unknown<\/td>/u
+      );
+    }
+    assert.match(
+      html,
+      /<div class="summary-card vulnerabilities"[\s\S]*?<div class="summary-value">2<\/div>[\s\S]*?<div class="summary-label">Vulnerable<\/div>[\s\S]*?<div class="summary-detail">1 Critical, 1 Medium, 2 status unavailable<\/div>/u
+    );
+    assert.doesNotMatch(html, /Dependencies with known vulnerabilities/);
+  });
+
+  test("zero vulnerability evidence cannot establish a clean compliance result", () => {
+    const reportData = buildComplianceReportData("fixture", []);
+
+    assert.strictEqual(reportData.summary.vulnerabilityCoverageComplete, false);
+    const html = new ComplianceReportProvider({})._getHtml(reportData);
+    assert.match(html, /Compliance status unavailable/);
+    assert.doesNotMatch(html, /No known vulnerabilities|No compliance issues detected/);
+  });
+
+  test("zero count without explicit authority cannot establish clean coverage", () => {
+    const reportData = buildComplianceReportData("fixture", [{
+      name: "authority-unknown",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: { repository: "prod", status_str: "Completed" },
+      vulnerabilities: {
+        count: 0,
+        countKnown: true,
+        detected: false,
+        unknown: false,
+        detailsLoaded: false,
+      },
+    }]);
+
+    assert.strictEqual(reportData.summary.vulnerabilityCoverageComplete, false);
+    assert.strictEqual(reportData.vulnerableDeps[0].vulnerabilityStatus, "Unknown");
+    assert.doesNotMatch(
+      new ComplianceReportProvider({})._getHtml(reportData),
+      /No known vulnerabilities|No compliance issues detected/
+    );
   });
 
   test("does not render an incomplete lookup set as clean or unreachable", () => {
@@ -260,6 +677,29 @@ suite("ComplianceReportProvider", () => {
     });
     assert.match(upstreamHtml, /Reachability unknown/);
     assert.doesNotMatch(upstreamHtml, /<h3>Not reachable<\/h3>/);
+  });
+
+  test("lookup-incomplete notice renders alongside unrelated report sections", () => {
+    const html = new ComplianceReportProvider({})._getHtml({
+      projectName: "fixture",
+      summary: {
+        total: 2,
+        found: 1,
+        lookupFailed: 1,
+        restrictiveLicenseCount: 1,
+        vulnerabilityCoverageComplete: false,
+      },
+      restrictiveLicenseDeps: [{
+        name: "licensed-package",
+        version: "1.0.0",
+        spdx: "GPL-3.0-only",
+        classification: "Restrictive",
+      }],
+    });
+
+    assert.match(html, /Compliance status incomplete/);
+    assert.match(html, /License summary/);
+    assert.doesNotMatch(html, /No known vulnerabilities|No compliance issues detected/);
   });
 
   test("coverage label omits missing and zero not-applicable counts", () => {
@@ -363,7 +803,8 @@ suite("ComplianceReportProvider", () => {
     });
 
     assert.match(html, /3 of 5 applicable artifacts served by Cloudsmith \(60%\)/);
-    assert.match(html, /No known vulnerabilities/);
+    assert.match(html, /Vulnerability status unavailable/);
+    assert.doesNotMatch(html, /No known vulnerabilities|No compliance issues detected/);
     assert.doesNotMatch(html, /\[object Object\]|undefined|0 Critical|0 High/);
   });
 

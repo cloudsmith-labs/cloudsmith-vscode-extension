@@ -1,6 +1,8 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const assert = require("assert");
+const vscode = require("vscode");
+const { registerSearchCommands } = require("../commands/search");
 const { SearchProvider } = require("../views/searchProvider");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { PaginatedFetch } = require("../util/paginatedFetch");
@@ -497,6 +499,49 @@ suite("SearchProvider atomic search state", () => {
 
     assert.strictEqual(provider.state.committed, null);
     assert.deepStrictEqual(provider.searchResults, []);
+  });
+
+  test("account replacement and disposal settle a continuation whose reader ignores abort", async function () {
+    this.timeout(1500);
+    for (const invalidation of ["account", "dispose"]) {
+      const neverSettles = deferred();
+      const connectionManager = createConnectionManager();
+      let continuationSignal = null;
+      const { provider } = createProvider({
+        connectionManager,
+        fetchPage: async (_endpoint, requestedPage, _size, _query, options) => {
+          if (requestedPage === 1) {
+            return page([pkg("one"), pkg("two")], {
+              pageTotal: 2,
+              count: 3,
+              pageSize: 2,
+            });
+          }
+          continuationSignal = options.signal;
+          return neverSettles.promise;
+        },
+      });
+      await provider.search("workspace-a", `invalidation-${invalidation}`);
+      const loading = provider.loadNextPage();
+      while (!continuationSignal) await nextTurn();
+
+      if (invalidation === "account") {
+        connectionManager.update({ activationId: "activation-b" });
+      } else {
+        provider.dispose();
+      }
+      const outcome = await Promise.race([
+        loading.then(() => "settled"),
+        new Promise(resolve => setTimeout(() => resolve("watchdog"), 200)),
+      ]);
+
+      assert.strictEqual(outcome, "settled", `${invalidation} left Load More pending`);
+      assert.strictEqual(continuationSignal.aborted, true);
+      if (invalidation === "account") {
+        assert.strictEqual(provider.state.committed, null);
+        assert.strictEqual(provider.state.pending, null);
+      }
+    }
   });
 
   test("does not dispatch a search while disconnected", async () => {
@@ -1234,6 +1279,76 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.searchResults.length, 3);
   });
 
+  test("an empty authoritative final page exhausts continuation without losing prior results", async () => {
+    let calls = 0;
+    const { provider } = createProvider({
+      pageSize: 2,
+      fetchPage: async (_endpoint, requestedPage) => {
+        calls += 1;
+        return requestedPage === 1
+          ? page([pkg("one"), pkg("two")], {
+            pageTotal: 2,
+            count: null,
+            countAuthoritative: false,
+            pageSize: 2,
+          })
+          : page([], {
+            requestedPage: 2,
+            pageTotal: 2,
+            count: null,
+            countAuthoritative: false,
+            pageSize: 2,
+          });
+      },
+    });
+    await provider.search("workspace-a", "name:artifact");
+
+    await provider.loadNextPage();
+
+    assert.strictEqual(calls, 2);
+    assert.strictEqual(provider.currentPage, 2);
+    assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["one", "two"]);
+    assert.strictEqual(provider.state.pending, null);
+    assert.strictEqual(provider.state.failure, null);
+    assert.strictEqual(provider.state.committed.pageable, false);
+    const items = (await provider.getChildren()).map(node => node.getTreeItem());
+    assert.strictEqual(items.some(item => item.contextValue === "loadMore"), false);
+  });
+
+  test("a duplicate-only non-final page becomes a bounded truthful terminal failure", async () => {
+    let calls = 0;
+    const { provider, messages } = createProvider({
+      pageSize: 1,
+      fetchPage: async (_endpoint, requestedPage) => {
+        calls += 1;
+        return requestedPage === 1
+          ? page([pkg("one")], { pageTotal: 3, count: 3, pageSize: 1 })
+          : page([pkg("one")], {
+            requestedPage: 2,
+            pageTotal: 3,
+            count: 3,
+            pageSize: 1,
+          });
+      },
+    });
+    await provider.search("workspace-a", "name:artifact");
+
+    await provider.loadNextPage();
+
+    assert.strictEqual(calls, 2);
+    assert.strictEqual(provider.currentPage, 1);
+    assert.deepStrictEqual(provider.searchResults.map(node => node.name), ["one"]);
+    assert.strictEqual(provider.state.pending, null);
+    assert.strictEqual(provider.state.failure.kind, "invalid_response");
+    assert.strictEqual(provider.state.committed.pageable, false);
+    assert.match(provider.state.failure.message, /Rerun the search\.$/);
+    const items = (await provider.getChildren()).map(node => node.getTreeItem());
+    const failureItem = items.find(item => item.label === "Could not load more results");
+    assert.match(failureItem.description, /Rerun the search\.$/);
+    assert.strictEqual(messages.error.at(-1), provider.state.failure.message);
+    assert.strictEqual(items.some(item => item.contextValue === "loadMore"), false);
+  });
+
   test("typed continuation timeout retains validated results and the exact retry target", async () => {
     let pageTwoCalls = 0;
     const { provider } = createProvider({
@@ -1255,11 +1370,243 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.state.failure.kind, "timeout");
     assert.strictEqual(provider.state.committed.pageable, true);
     assert.strictEqual(provider.state.pending, null);
+    assert.match(provider.state.failure.message, /Try loading the page again\.$/);
+    assert.doesNotMatch(provider.state.failure.message, /Rerun the search\.$/);
+    let items = (await provider.getChildren()).map(node => node.getTreeItem());
+    assert(items.some(item => item.contextValue === "loadMore"));
 
     await provider.loadNextPage();
     assert.strictEqual(pageTwoCalls, 2);
     assert.strictEqual(provider.currentPage, 2);
     assert.strictEqual(provider.searchResults.length, 3);
+  });
+
+  test("registered Load More command bounds a non-settling page and publishes a retryable timeout", async function () {
+    this.timeout(1000);
+    const latePage = deferred();
+    const unhandled = [];
+    const onUnhandled = reason => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    let continuationSignal = null;
+    const { provider } = createProvider({
+      pageOperationTimeoutMs: 20,
+      fetchPage: async (_endpoint, requestedPage, _size, _query, options) => {
+        if (requestedPage === 1) {
+          return page(Array.from({ length: 10 }, (_, index) => pkg(`first-${index}`)), {
+            pageTotal: 2,
+            count: 12,
+            pageSize: 10,
+          });
+        }
+        continuationSignal = options.signal;
+        return latePage.promise;
+      },
+    });
+    await provider.search("workspace-a", "name:flask");
+
+    const registration = registerSearchNextPageCommand(provider);
+    const renderedLoadMore = (await provider.getChildren())
+      .map(node => node.getTreeItem())
+      .find(item => item.contextValue === "loadMore");
+    assert.strictEqual(renderedLoadMore.command.command, "cloudsmith-vsc.searchNextPage");
+    const continuationClaim = renderedLoadMore.command.arguments[0];
+    const publication = await createSearchPublicationHarness(provider);
+    const publicationStart = publication.publications.length;
+    const eventStart = publication.statePublications.length;
+    try {
+      const outcome = await Promise.race([
+        vscode.commands.executeCommand(registration.id, continuationClaim).then(() => "settled"),
+        new Promise(resolve => setTimeout(() => resolve("watchdog"), 200)),
+      ]);
+
+      assert.strictEqual(
+        outcome,
+        "settled",
+        "Load More remained active instead of reaching a bounded terminal state"
+      );
+      assert.strictEqual(continuationSignal?.aborted, true);
+      assert.strictEqual(provider.state.pending, null);
+      assert.strictEqual(provider.state.failure?.kind, "timeout");
+      assert.strictEqual(provider.currentPage, 1);
+      assert.strictEqual(provider.searchResults.length, 10);
+      assert.strictEqual(provider.state.committed.pageable, true);
+      assert.ok(publication.statePublications.slice(eventStart).some(state => (
+        state.pendingKind === null
+        && state.failureKind === "timeout"
+        && state.page === 1
+        && state.resultCount === 10
+      )), "the provider must emit its terminal timeout state after Load More starts");
+      const items = await publication.waitFor(
+        candidate => candidate.some(item => item.label === "Could not load more results"),
+        publicationStart
+      );
+      assert.strictEqual(items.some(item => item.label === "Search in progress"), false);
+      assert(items.some(item => item.contextValue === "loadMore"));
+      const terminalState = provider.state;
+      latePage.reject(new Error("late private continuation failure"));
+      await nextTurn();
+      await nextTurn();
+      assert.strictEqual(provider.state, terminalState);
+      assert.deepStrictEqual(unhandled, []);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+      publication.dispose();
+      registration.dispose();
+    }
+  });
+
+  test("registered Load More command appends the authoritative final page", async () => {
+    const { provider } = createProvider({
+      fetchPage: async (_endpoint, requestedPage) => requestedPage === 1
+        ? page(Array.from({ length: 10 }, (_, index) => pkg(`first-${index}`)), {
+          pageTotal: 2,
+          count: 12,
+          pageSize: 10,
+        })
+        : page([pkg("eleven"), pkg("twelve")], {
+          requestedPage: 2,
+          pageTotal: 2,
+          count: 12,
+          pageSize: 10,
+        }),
+    });
+    await provider.search("workspace-a", "name:flask");
+
+    const registration = registerSearchNextPageCommand(provider);
+    const renderedLoadMore = (await provider.getChildren())
+      .map(node => node.getTreeItem())
+      .find(item => item.contextValue === "loadMore");
+    assert.strictEqual(renderedLoadMore.command.command, "cloudsmith-vsc.searchNextPage");
+    const publication = await createSearchPublicationHarness(provider);
+    const publicationStart = publication.publications.length;
+    const eventStart = publication.statePublications.length;
+    try {
+      await vscode.commands.executeCommand(
+        registration.id,
+        renderedLoadMore.command.arguments[0]
+      );
+
+      assert.strictEqual(provider.state.pending, null);
+      assert.strictEqual(provider.state.failure, null);
+      assert.strictEqual(provider.currentPage, 2);
+      assert.strictEqual(provider.searchResults.length, 12);
+      assert.strictEqual(provider.state.committed.pageable, false);
+      assert.ok(publication.statePublications.slice(eventStart).some(state => (
+        state.pendingKind === null
+        && state.failureKind === null
+        && state.page === 2
+        && state.resultCount === 12
+      )), "the provider must emit its authoritative appended state after Load More starts");
+      const items = await publication.waitFor(
+        candidate => (
+          candidate.some(item => item.label === "eleven")
+          && candidate.some(item => item.label === "twelve")
+          && candidate.some(item => String(item.description).includes("12 packages"))
+        ),
+        publicationStart
+      );
+      assert.match(items[0].description, /12 packages/);
+      assert.strictEqual(items.some(item => item.contextValue === "loadMore"), false);
+      assert.strictEqual(items.some(item => item.label === "Search in progress"), false);
+    } finally {
+      publication.dispose();
+      registration.dispose();
+    }
+  });
+
+  test("a stale rendered Load More claim cannot paginate a replacement search", async () => {
+    let continuationCalls = 0;
+    const { provider } = createProvider({
+      fetchPage: async (_endpoint, requestedPage, _size, query) => {
+        if (requestedPage === 1) {
+          return page(Array.from({ length: 10 }, (_, index) => pkg(`${query}-${index}`)), {
+            pageTotal: 2,
+            count: 11,
+            pageSize: 10,
+          });
+        }
+        continuationCalls += 1;
+        return page([pkg(`${query}-final`)], {
+          requestedPage: 2,
+          pageTotal: 2,
+          count: 11,
+          pageSize: 10,
+        });
+      },
+    });
+    const registration = registerSearchNextPageCommand(provider);
+    try {
+      await provider.search("workspace-a", "old");
+      const oldLoadMore = (await provider.getChildren())
+        .map(node => node.getTreeItem())
+        .find(item => item.contextValue === "loadMore");
+      const oldClaim = oldLoadMore.command.arguments[0];
+
+      await provider.search("workspace-a", "new");
+      await vscode.commands.executeCommand(registration.id, oldClaim);
+      assert.strictEqual(continuationCalls, 0);
+      assert.strictEqual(provider.currentQuery, "new");
+      assert.strictEqual(provider.currentPage, 1);
+
+      const currentLoadMore = (await provider.getChildren())
+        .map(node => node.getTreeItem())
+        .find(item => item.contextValue === "loadMore");
+      await vscode.commands.executeCommand(
+        registration.id,
+        currentLoadMore.command.arguments[0]
+      );
+      assert.strictEqual(continuationCalls, 1);
+      assert.strictEqual(provider.currentQuery, "new");
+      assert.strictEqual(provider.currentPage, 2);
+    } finally {
+      registration.dispose();
+    }
+  });
+
+  test("continuation cancellation settles even when the page reader ignores its token", async function () {
+    this.timeout(1000);
+    const latePage = deferred();
+    const pageToken = cancellationToken();
+    let invocation = 0;
+    let continuationSignal = null;
+    const { provider } = createProvider({
+      withProgress: (_options, task) => {
+        invocation += 1;
+        return task({ report() {} }, invocation === 2 ? pageToken : cancellationToken());
+      },
+      fetchPage: async (_endpoint, requestedPage, _size, _query, options) => {
+        if (requestedPage === 1) {
+          return page(Array.from({ length: 10 }, (_, index) => pkg(`first-${index}`)), {
+            pageTotal: 2,
+            count: 11,
+            pageSize: 10,
+          });
+        }
+        continuationSignal = options.signal;
+        return latePage.promise;
+      },
+    });
+    await provider.search("workspace-a", "name:flask");
+
+    const loading = provider.loadNextPage();
+    while (!continuationSignal) await nextTurn();
+    pageToken.cancel();
+    await loading;
+
+    assert.strictEqual(continuationSignal.aborted, true);
+    assert.strictEqual(provider.state.pending, null);
+    assert.strictEqual(provider.state.failure, null);
+    assert.strictEqual(provider.currentPage, 1);
+    assert.strictEqual(provider.searchResults.length, 10);
+    assert.strictEqual(provider.state.committed.pageable, true);
+    latePage.resolve(page([pkg("late")], {
+      requestedPage: 2,
+      pageTotal: 2,
+      count: 11,
+      pageSize: 10,
+    }));
+    await nextTurn();
+    assert.strictEqual(provider.currentPage, 1);
   });
 
   test("a thrown continuation releases its guard and terminates without an unhandled rejection", async () => {
@@ -1280,6 +1627,40 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.state.pending, null);
     assert.strictEqual(provider.state.failure.kind, "unexpected");
     assert.strictEqual(provider.state.committed.pageable, false);
+    assert.match(provider.state.failure.message, /Rerun the search\.$/);
+  });
+
+  test("an unexpected continuation-processing exception cannot strand pending state", async () => {
+    const { provider } = createProvider({
+      fetchPage: async (_endpoint, requestedPage) => {
+        if (requestedPage === 1) {
+          return page([pkg("one"), pkg("two")], {
+            pageTotal: 2,
+            count: 3,
+            pageSize: 2,
+          });
+        }
+        return {
+          data: [pkg("three")],
+          get pagination() { throw new Error("private pagination accessor failure"); },
+          error: null,
+        };
+      },
+    });
+    await provider.search("workspace-a", "name:artifact");
+
+    await provider.loadNextPage();
+
+    assert.strictEqual(provider.currentPage, 1);
+    assert.strictEqual(provider.searchResults.length, 2);
+    assert.strictEqual(provider.state.pending, null);
+    assert.strictEqual(provider.state.failure.kind, "unexpected");
+    assert.strictEqual(provider.state.committed.pageable, false);
+    assert.match(provider.state.failure.message, /Rerun the search\.$/);
+    assert.strictEqual(
+      JSON.stringify(provider.state).includes("private pagination accessor failure"),
+      false
+    );
   });
 
   test("a new root search prevents an older page from appending", async () => {
@@ -1440,6 +1821,9 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(provider.state.committed.diagnostics.requestCount, 24);
     assert.strictEqual(provider.state.committed.diagnostics.requestLimitReached, true);
     assert.strictEqual(provider.state.committed.pageable, false);
+    assert.match(provider.state.failure.message, /Rerun the search\.$/);
+    const items = (await provider.getChildren()).map(node => node.getTreeItem());
+    assert.strictEqual(items.some(item => item.contextValue === "loadMore"), false);
   });
 
   test("workspace and repository searches use a fixed ten-item request independent of aggregation configuration", async () => {
@@ -1937,6 +2321,7 @@ suite("SearchProvider atomic search state", () => {
         getAggregationPageSize: () => options.pageSize || 50,
         vulnerabilityStateService: options.vulnerabilityStateService,
         executeCommand: options.executeCommand,
+        pageOperationTimeoutMs: options.pageOperationTimeoutMs,
       }
     );
     providers.push(provider);
@@ -2051,6 +2436,85 @@ function deferred() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+let testCommandGeneration = 0;
+
+function registerSearchNextPageCommand(searchProvider) {
+  const commandIds = new Map();
+  const prefix = `cloudsmith-vsc.test.search-provider-${++testCommandGeneration}`;
+  const registrations = registerSearchCommands({
+    registerCommand(id, handler) {
+      const testId = `${prefix}.${id}`;
+      commandIds.set(id, testId);
+      return vscode.commands.registerCommand(testId, handler);
+    },
+    vscode,
+    searchProvider,
+    RecentSearches: class {},
+    SearchQueryBuilder: class {},
+    LicenseClassifier: { buildRestrictiveQuery: () => "license:restrictive" },
+    FORMAT_OPTIONS: [],
+  });
+  return {
+    id: commandIds.get("cloudsmith-vsc.searchNextPage"),
+    dispose() { registrations.dispose(); },
+  };
+}
+
+async function createSearchPublicationHarness(provider) {
+  const relay = new vscode.EventEmitter();
+  const publications = [];
+  const statePublications = [];
+  const providerSubscription = provider.onDidChangeTreeData((element) => {
+    statePublications.push({
+      pendingKind: provider.state.pending?.kind || null,
+      failureKind: provider.state.failure?.kind || null,
+      page: provider.currentPage,
+      resultCount: provider.searchResults.length,
+    });
+    relay.fire(element);
+  });
+  const treeView = vscode.window.createTreeView("cloudsmithSearchView", {
+    treeDataProvider: {
+      onDidChangeTreeData: relay.event,
+      getParent(element) { return provider.getParent(element); },
+      getTreeItem(element) { return provider.getTreeItem(element); },
+      getChildren(element) {
+        return Promise.resolve(provider.getChildren(element)).then((children) => {
+          if (!element) {
+            publications.push(children.map(child => provider.getTreeItem(child)));
+          }
+          return children;
+        });
+      },
+    },
+  });
+
+  await vscode.commands.executeCommand("cloudsmithSearchView.focus");
+  relay.fire(undefined);
+  await waitForPublication(publications, () => true, 0);
+  return {
+    publications,
+    statePublications,
+    waitFor(predicate, startIndex = 0) {
+      return waitForPublication(publications, predicate, startIndex);
+    },
+    dispose() {
+      treeView.dispose();
+      providerSubscription.dispose();
+      relay.dispose();
+    },
+  };
+}
+
+async function waitForPublication(publications, predicate, startIndex) {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const match = publications.slice(startIndex).find(predicate);
+    if (match) return match;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  throw new Error("The real Search TreeView did not publish the expected terminal state.");
 }
 
 function cancellationToken() {

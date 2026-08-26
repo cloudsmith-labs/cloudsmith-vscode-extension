@@ -59,6 +59,7 @@ const {
 } = require("./util/connectionPresentation");
 const packageAdapters = require("./domain/packageAdapters");
 const packageDomain = require("./domain/package");
+const { authenticationCapabilitiesFor } = require("./domain/authCapabilities");
 const { registerAuthenticationCommands } = require("./commands/authentication");
 const { registerSettingsHelpCommands } = require("./commands/settingsHelp");
 const { registerPackageCommands } = require("./commands/packages");
@@ -80,6 +81,30 @@ const {
 let activeActivationOwner = null;
 
 const FORMAT_OPTIONS = SUPPORTED_UPSTREAM_FORMATS;
+
+function createExtensionContextBinding(options) {
+  const {
+    connectionManager,
+    contextProjector,
+    getDefaultWorkspace: readDefaultWorkspace,
+    connectionSetupAvailable: readConnectionSetupAvailable = connectionSetupAvailable,
+  } = options;
+  const project = (state = connectionManager.getState()) => contextProjector.project({
+    "cloudsmith.hasDefaultWorkspace": Boolean(readDefaultWorkspace()),
+    "cloudsmith.connectionSetupAvailable": readConnectionSetupAvailable(state),
+    "cloudsmith.credentialsPresent": state?.credentialPresent === true,
+    "cloudsmith.pullThroughAvailable": authenticationCapabilitiesFor(
+      connectionManager
+    ).pullThroughAvailable,
+  });
+  const subscription = connectionManager.onDidChange(state => {
+    void Promise.resolve(project(state)).catch(() => {});
+  });
+  return Object.freeze({
+    project,
+    dispose() { subscription?.dispose?.(); },
+  });
+}
 
 /**
  * Helper: read the defaultWorkspace setting.
@@ -131,18 +156,18 @@ function activateOwned(context, own, observe) {
       "cloudsmith.hasDefaultWorkspace": false,
       "cloudsmith.connectionSetupAvailable": false,
       "cloudsmith.credentialsPresent": false,
+      "cloudsmith.pullThroughAvailable": false,
     },
     authorityScope: context,
   });
   own(extensionContextProjector);
-  const projectExtensionContexts = (state = connectionManager.getState()) => (
-    extensionContextProjector.project({
-      "cloudsmith.hasDefaultWorkspace": Boolean(getDefaultWorkspace()),
-      "cloudsmith.connectionSetupAvailable": connectionSetupAvailable(state),
-      "cloudsmith.credentialsPresent": state?.credentialPresent === true,
-    })
-  );
-  const updateDefaultWorkspaceContext = () => projectExtensionContexts(
+  const extensionContextBinding = createExtensionContextBinding({
+    connectionManager,
+    contextProjector: extensionContextProjector,
+    getDefaultWorkspace,
+  });
+  own(extensionContextBinding);
+  const updateDefaultWorkspaceContext = () => extensionContextBinding.project(
     connectionManager.getState()
   );
   const upstreamRuntime = new UpstreamRuntime(context, { connectionManager });
@@ -269,13 +294,31 @@ function activateOwned(context, own, observe) {
   let promotionProvider = null;
   let vulnerabilityProvider = null;
   let quarantineExplainProvider = null;
+  let packageWebviewActions = null;
+  const packageWebviewActionProxy = Object.freeze({
+    explainQuarantine(...args) {
+      if (typeof packageWebviewActions?.explainQuarantine !== "function") {
+        throw new TypeError("The quarantine package action is unavailable.");
+      }
+      return packageWebviewActions.explainQuarantine(...args);
+    },
+    findSafeVersion(...args) {
+      if (typeof packageWebviewActions?.findSafeVersion !== "function") {
+        throw new TypeError("The remediation package action is unavailable.");
+      }
+      return packageWebviewActions.findSafeVersion(...args);
+    },
+    showVulnerabilities(...args) {
+      if (typeof packageWebviewActions?.showVulnerabilities !== "function") {
+        throw new TypeError("The vulnerability package action is unavailable.");
+      }
+      return packageWebviewActions.showVulnerabilities(...args);
+    },
+  });
   let upstreamPreviewProvider = null;
   let upstreamDetailProvider = null;
-  const projectConnectionPresentation = (state) => {
-    return projectExtensionContexts(state);
-  };
+  const projectConnectionPresentation = state => extensionContextBinding.project(state);
   const connectionSubscription = connectionManager.onDidChange(state => {
-    void projectConnectionPresentation(state).catch(() => {});
     if (
       state.accountEpoch !== projectedAccountIdentity.accountEpoch
       || state.activationId !== projectedAccountIdentity.activationId
@@ -311,6 +354,7 @@ function activateOwned(context, own, observe) {
   // Create vulnerability WebView provider
   vulnerabilityProvider = new VulnerabilityProvider(context, {
     connectionManager,
+    packageActions: packageWebviewActionProxy,
     vulnerabilityStateService,
   });
   own({ dispose: () => vulnerabilityProvider.dispose() });
@@ -320,7 +364,10 @@ function activateOwned(context, own, observe) {
   own({ dispose: () => complianceReportProvider.dispose() });
 
   // Create quarantine explanation WebView provider
-  quarantineExplainProvider = new QuarantineExplainProvider(context, { connectionManager });
+  quarantineExplainProvider = new QuarantineExplainProvider(context, {
+    connectionManager,
+    packageActions: packageWebviewActionProxy,
+  });
   own({ dispose: () => quarantineExplainProvider.dispose() });
 
   // Create upstream preview WebView provider
@@ -382,6 +429,7 @@ function activateOwned(context, own, observe) {
     cloudsmithProvider,
     searchProvider,
     dependencyHealthProvider,
+    vulnerabilityStateService,
     treeView,
     connectionManager,
     CloudsmithAPI,
@@ -464,7 +512,7 @@ function activateOwned(context, own, observe) {
     FILTER_MODES,
     SORT_MODES,
   }));
-  own(registerVulnerabilityCommands({
+  const vulnerabilityRegistration = registerVulnerabilityCommands({
     ...sharedCommandDependencies,
     RemediationHelper,
     InstallCommandBuilder,
@@ -472,7 +520,9 @@ function activateOwned(context, own, observe) {
     buildPackageUrl,
     vulnerabilityProvider,
     quarantineExplainProvider,
-  }));
+  });
+  packageWebviewActions = vulnerabilityRegistration.webviewActions;
+  own(vulnerabilityRegistration);
   own(registerPromotionCommands({
     ...sharedCommandDependencies,
     promotionProvider,
@@ -543,4 +593,4 @@ async function deactivate() {
   }
 }
 
-module.exports = { activate, deactivate };
+module.exports = { activate, createExtensionContextBinding, deactivate };

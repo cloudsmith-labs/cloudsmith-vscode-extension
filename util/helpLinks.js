@@ -4,7 +4,7 @@ const HELP_LINKS = Object.freeze([
   Object.freeze({
     id: "extensionDocs",
     label: "Read extension documentation",
-    url: "https://docs.cloudsmith.com/developer-tools/vscode",
+    url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/blob/main/README.md",
     icon: "external",
   }),
   Object.freeze({

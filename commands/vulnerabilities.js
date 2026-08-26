@@ -1,15 +1,21 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const { registerCommands } = require("./registrar");
+const { PACKAGE_ACTIONS } = require("../domain/packageActionCapabilities");
 const {
   adaptPackageSelection,
   adaptRepositoryResolutionSelection,
   buildInstallCommand,
   captureCommandAccount,
+  isDependencyActionAvailable,
   isCommandAccountCurrent,
+  isInstallablePackage,
+  installGuidanceCopiedMessage,
   isQuarantinedPackage,
   pickInstallCommandVariant,
   pickRecentPackage,
+  renderInstallCommandGuidance,
+  safeDisplayName,
   showAccountInputBox,
   showAccountQuickPick,
 } = require("./support");
@@ -24,13 +30,13 @@ function registerVulnerabilityCommands(deps) {
     recentPackages,
     CloudsmithAPI,
     RemediationHelper,
-    InstallCommandBuilder,
     buildPackageUrl,
     vulnerabilityProvider,
     quarantineExplainProvider,
     cloudsmithProvider,
     searchProvider,
     dependencyHealthProvider,
+    vulnerabilityStateService,
     normalizeCvssScore,
   } = deps;
   const recentSupport = { ...deps, recentPackages, packageAdapters, vscode };
@@ -47,13 +53,9 @@ function registerVulnerabilityCommands(deps) {
     return isCommandAccountCurrent(accountScope) && ownsSelection(kind, item);
   }
 
-  function isVulnerableDependencySelection(item) {
+  function isVulnerableDependencySelection(item, action) {
     if (!ownsSelection("isCurrentDependencySelection", item)) return false;
-    try {
-      return item?.getTreeItem?.().contextValue === "dependencyHealthVulnerable";
-    } catch {
-      return false;
-    }
+    return isDependencyActionAvailable(item, action);
   }
 
   async function selectedPackage(item, accountScope, options = {}) {
@@ -110,12 +112,48 @@ function registerVulnerabilityCommands(deps) {
     }
   }
 
+  function currentWebviewPackage(value, callerIsCurrent, options = {}) {
+    if (typeof callerIsCurrent !== "function" || callerIsCurrent() !== true) return null;
+    const accountScope = captureCommandAccount(deps.workspaceAccess);
+    if (!accountScope) return null;
+    const isCurrent = () => Boolean(
+      isCommandAccountCurrent(accountScope)
+      && callerIsCurrent() === true
+    );
+    if (!isCurrent()) return null;
+    let pkg;
+    try {
+      pkg = packageDomain.assertExactPackage(value);
+    } catch {
+      if (isCurrent()) {
+        vscode.window.showWarningMessage(
+          options.invalidMessage || "Could not determine package details."
+        );
+      }
+      return null;
+    }
+    if (typeof options.predicate === "function" && !options.predicate(pkg)) {
+      if (isCurrent()) {
+        vscode.window.showWarningMessage(
+          options.invalidStateMessage || "This package is not available for this action."
+        );
+      }
+      return null;
+    }
+    return isCurrent()
+      ? Object.freeze({ accountScope, package: pkg, isCurrent })
+      : null;
+  }
+
   async function findSafeVersion(item, options = {}) {
     const accountScope = captureCommandAccount(deps.workspaceAccess);
     if (!accountScope) return;
     let selection = item;
     if (options.dependencyOnly) {
-      if (!selection || !isVulnerableDependencySelection(selection)) return;
+      if (
+        !selection
+        || !isVulnerableDependencySelection(selection, PACKAGE_ACTIONS.FIND_SAFE_VERSION)
+      ) return;
     } else if (!selection) {
       selection = await pickRecentPackage(recentSupport, {
         accountScope,
@@ -136,7 +174,10 @@ function registerVulnerabilityCommands(deps) {
       vscode.window.showWarningMessage("Could not determine package details.");
       return;
     }
-    if (options.dependencyOnly && !safeVersionSelection.exactPackage) return;
+    if (!safeVersionSelection.exactPackage) {
+      vscode.window.showWarningMessage("Could not determine package details.");
+      return;
+    }
     const dependencyScope = options.dependencyOnly
       ? dependencyHealthProvider.getLastSuccessfulScope?.()
       : null;
@@ -156,7 +197,9 @@ function registerVulnerabilityCommands(deps) {
       if (!options.dependencyOnly) {
         return ownsSelection("isCurrentPackageSelection", selection);
       }
-      if (!isVulnerableDependencySelection(selection)) return false;
+      if (!isVulnerableDependencySelection(selection, PACKAGE_ACTIONS.FIND_SAFE_VERSION)) {
+        return false;
+      }
       const currentScope = dependencyHealthProvider.getLastSuccessfulScope?.();
       return Boolean(
         currentScope
@@ -164,17 +207,59 @@ function registerVulnerabilityCommands(deps) {
         && (currentScope.repository || null) === (dependencyScope.repository || null)
       );
     };
-    const source = safeVersionSelection.resolution;
+    const source = safeVersionSelection.exactPackage;
+    return runFindSafeVersion(source, accountScope, isFindCurrent);
+  }
+
+  async function runFindSafeVersion(source, accountScope, callerIsCurrent) {
+    const isFindCurrent = () => Boolean(
+      isCommandAccountCurrent(accountScope)
+      && typeof callerIsCurrent === "function"
+      && callerIsCurrent() === true
+    );
+    if (!isFindCurrent()) return;
+    if (
+      !vulnerabilityStateService
+      || typeof vulnerabilityStateService.prime !== "function"
+      || typeof vulnerabilityStateService.resolve !== "function"
+    ) {
+      vscode.window.showWarningMessage("Could not verify safe versions. Retry.");
+      return;
+    }
+    let sourceVulnerabilityState;
+    try {
+      vulnerabilityStateService.prime(source);
+      sourceVulnerabilityState = await vulnerabilityStateService.resolve(source);
+    } catch {
+      sourceVulnerabilityState = null;
+    }
+    if (!isFindCurrent()) return;
+    if (!isCompleteVulnerabilityState(sourceVulnerabilityState)) {
+      vscode.window.showWarningMessage("Could not verify safe versions. Retry.");
+      return;
+    }
+    if (isCompleteCleanVulnerabilityState(sourceVulnerabilityState)) {
+      vscode.window.showInformationMessage(
+        `No known vulnerabilities were found for "${source.name}" ${source.version}.`
+      );
+      return;
+    }
+    const fixedVersions = sourceVulnerabilityState.status === "complete-vulnerable"
+      ? vulnerabilityFixVersions(sourceVulnerabilityState)
+      : [];
     const helper = new RemediationHelper(new CloudsmithAPI(context));
     if (!isFindCurrent()) return;
-    let result = await helper.findSafeVersions(
+    const result = await helper.findSafeVersions(
       source.workspace,
       source.repository,
       source.name,
-      source.format
+      source.format,
+      {
+        currentVersion: source.version,
+        fixedVersions,
+      }
     );
     if (!isFindCurrent()) return;
-    let crossRepo = false;
     if (!result.success) {
       if (!isFindCurrent()) return;
       vscode.window.showErrorMessage(
@@ -184,30 +269,13 @@ function registerVulnerabilityCommands(deps) {
     }
     if (result.versions.length === 0) {
       if (!isFindCurrent()) return;
-      result = await helper.findSafeVersionsAcrossRepos(
-        source.workspace,
-        source.name,
-        source.format
-      );
-      if (!isFindCurrent()) return;
-      crossRepo = true;
-      if (!result.success) {
-        if (!isFindCurrent()) return;
-        vscode.window.showErrorMessage(
-          `Could not find safe versions. ${deps.formatApiError(result.error)}`
-        );
-        return;
-      }
-    }
-    if (result.versions.length === 0) {
-      if (!isFindCurrent()) return;
       if (result.absenceProven) {
         vscode.window.showInformationMessage(
-          `No safe versions found for "${source.name}" in ${crossRepo ? "the workspace" : source.repository}.`
+          `No compatible safe version for "${source.name}" is available in ${source.repository}.${reportedFixCopy(fixedVersions)}`
         );
       } else {
         vscode.window.showWarningMessage(
-          `Safe-version results were incomplete; no absence claim can be made for "${source.name}".`
+          "Could not verify whether compatible safe versions are available. Retry."
         );
       }
       return;
@@ -216,42 +284,75 @@ function registerVulnerabilityCommands(deps) {
     const versions = [];
     try {
       for (const record of result.versions) {
-        versions.push(packageDomain.assertExactPackage(
-          packageAdapters.fromApiPackageRecord(record)
-        ));
+        const candidate = packageAdapters.fromSafeVersionApiRecord(record, {
+          expectedWorkspace: source.workspace,
+          expectedRepository: source.repository,
+        });
+        if (!candidate) continue;
+        const pkg = packageDomain.assertExactPackage(candidate);
+        if (
+          pkg.workspace !== source.workspace
+          || pkg.repository !== source.repository
+          || pkg.name !== source.name
+          || pkg.format !== source.format
+          || !sameRemediationIdentity(source, pkg)
+          || pkg.version === source.version
+          || definitelyViolatesCompatibility(
+            pkg.version,
+            source.version,
+            fixedVersions,
+            source.format
+          )
+        ) {
+          throw new TypeError("Safe-version result escaped its selected package scope.");
+        }
+        if (isRejectedSafeVersionCandidate(pkg)) continue;
+        versions.push(pkg);
       }
     } catch {
       if (!isFindCurrent()) return;
       vscode.window.showErrorMessage("Could not safely interpret the available package versions.");
       return;
     }
-    const quickPickItems = versions.map(pkg => {
-      const policyIcon = pkg.policy.violated ? "$(warning)" : "$(check)";
-      const repositoryLabel = crossRepo ? ` [${pkg.repository}]` : "";
-      let detail = "No policy violations";
-      if (pkg.policy.violated) detail = "Policy violations found";
-      if (pkg.vulnerability.count > 0) {
-        detail = `${pkg.vulnerability.count} vulnerabilit${pkg.vulnerability.count === 1 ? "y" : "ies"} (${pkg.vulnerability.maxSeverity || "Unknown"})`;
+    const verification = await Promise.all(versions.map(async pkg => {
+      try {
+        vulnerabilityStateService.prime(pkg);
+        const state = await vulnerabilityStateService.resolve(pkg);
+        return isCompleteCleanVulnerabilityState(state) ? pkg : null;
+      } catch {
+        return null;
       }
+    }));
+    if (!isFindCurrent()) return;
+    const verifiedVersions = verification.filter(Boolean);
+    if (verifiedVersions.length === 0) {
+      vscode.window.showWarningMessage("Could not verify safe versions. Retry.");
+      return;
+    }
+    const quickPickItems = verifiedVersions.map(pkg => {
+      const policyIcon = pkg.policy.violated ? "$(warning)" : "$(check)";
+      const verificationDetail = pkg.policy.violated
+        ? "Policy violations found"
+        : "No known vulnerabilities";
+      const packageIdentity = safeDisplayName(
+        pkg.packageIdentifier,
+        "unknown-package",
+        512
+      );
       return {
         label: `${policyIcon} ${source.name} ${pkg.version}`,
-        description: `${pkg.repository || source.repository} — ${pkg.status}${repositoryLabel}`,
-        detail,
+        description: [pkg.repository || source.repository, pkg.status]
+          .filter(Boolean)
+          .join(" — "),
+        detail: `${verificationDetail} — ${safeDisplayName(
+          pkg.format,
+          "unknown-format",
+          64
+        )} — ${packageIdentity}`,
         package: pkg,
       };
     });
-    if (!result.complete) {
-      const countDetail = result.totalCount === null
-        ? `${versions.length} loaded`
-        : `showing newest ${versions.length} of ${result.totalCount}`;
-      quickPickItems.unshift({
-        label: `Safe-version preview incomplete (${countDetail})`,
-        kind: vscode.QuickPickItemKind.Separator,
-      });
-    }
-    const title = crossRepo
-      ? `Newest safe versions of "${source.name}" (${source.format}) in the workspace`
-      : `Newest safe versions of "${source.name}" (${source.format}) in ${source.repository}`;
+    const title = `Verified safe versions of "${source.name}" (${source.format}) in ${source.repository}`;
     const selected = await showAccountQuickPick(
       deps,
       accountScope,
@@ -265,10 +366,15 @@ function registerVulnerabilityCommands(deps) {
       || !isFindCurrent()
     ) return;
     const pkg = selected.package;
-    const installEligible = pkg.copyable === true && !isQuarantinedPackage(pkg);
+    const installEligible = isInstallablePackage(pkg);
     const actionItems = [
       ...(installEligible
-        ? [{ label: "$(clippy) Copy install command", id: "install" }]
+        ? [{
+          label: pkg.format === "maven"
+            ? "$(file-code) Copy Maven setup guidance"
+            : "$(clippy) Copy install command",
+          id: "install",
+        }]
         : []),
       { label: "$(shield) Show vulnerabilities", id: "vulns" },
       { label: "$(globe) View in Cloudsmith", id: "open" },
@@ -291,10 +397,10 @@ function registerVulnerabilityCommands(deps) {
       if (!chosenCommand) return;
       if (!isFindCurrent()) return;
       await vscode.env.clipboard.writeText(
-        InstallCommandBuilder.toClipboardCommand(chosenCommand)
+        renderInstallCommandGuidance(deps, installResult, chosenCommand)
       );
       if (!isFindCurrent()) return;
-      vscode.window.showInformationMessage("Install command copied.");
+      vscode.window.showInformationMessage(installGuidanceCopiedMessage(installResult));
     } else if (action.id === "vulns") {
       if (!isFindCurrent()) return;
       await vulnerabilityProvider.show(pkg);
@@ -329,6 +435,58 @@ function registerVulnerabilityCommands(deps) {
     }
   }
 
+  async function findSafeVersionFromWebview(value, callerIsCurrent) {
+    const selected = currentWebviewPackage(value, callerIsCurrent);
+    if (!selected) return;
+    let safeVersionSelection;
+    try {
+      safeVersionSelection = adaptRepositoryResolutionSelection(
+        packageAdapters,
+        packageDomain,
+        selected.package
+      );
+    } catch {
+      if (selected.isCurrent()) {
+        vscode.window.showWarningMessage("Could not determine package details.");
+      }
+      return;
+    }
+    if (!safeVersionSelection.exactPackage || !selected.isCurrent()) {
+      if (selected.isCurrent()) {
+        vscode.window.showWarningMessage("Could not determine package details.");
+      }
+      return;
+    }
+    return runFindSafeVersion(
+      safeVersionSelection.exactPackage,
+      selected.accountScope,
+      selected.isCurrent
+    );
+  }
+
+  async function showVulnerabilitiesFromWebview(value, callerIsCurrent) {
+    const selected = currentWebviewPackage(value, callerIsCurrent);
+    if (!selected) return;
+    const { package: pkg, isCurrent } = selected;
+    if (!isCurrent()) return;
+    await vulnerabilityProvider.show(pkg);
+    if (!isCurrent()) return;
+    recentPackages.add(pkg);
+  }
+
+  async function explainQuarantineFromWebview(value, callerIsCurrent) {
+    const selected = currentWebviewPackage(value, callerIsCurrent, {
+      predicate: isQuarantinedPackage,
+      invalidStateMessage: "Quarantine details are available only for quarantined packages.",
+    });
+    if (!selected) return;
+    const { package: pkg, isCurrent } = selected;
+    if (!isCurrent()) return;
+    await quarantineExplainProvider.show(pkg);
+    if (!isCurrent()) return;
+    recentPackages.add(pkg);
+  }
+
   async function openCVE(item) {
     const accountScope = captureCommandAccount(deps.workspaceAccess);
     if (!accountScope || !ownsSelection("isCurrentSelection", item)) return;
@@ -355,13 +513,16 @@ function registerVulnerabilityCommands(deps) {
   async function showVulnerabilities(item, options = {}) {
     const accountScope = captureCommandAccount(deps.workspaceAccess);
     if (!accountScope) return;
-    if (options.dependencyOnly && !isVulnerableDependencySelection(item)) return;
+    const canShowDependencyVulnerabilities = candidate => (
+      isVulnerableDependencySelection(candidate, PACKAGE_ACTIONS.SHOW_VULNERABILITIES)
+    );
+    if (options.dependencyOnly && !canShowDependencyVulnerabilities(item)) return;
     const selected = await selectedPackage(item, accountScope, {
       ...options,
       selectionValidator: options.dependencyOnly
         ? "isCurrentDependencySelection"
         : "isCurrentPackageSelection",
-      currentSelection: options.dependencyOnly ? isVulnerableDependencySelection : undefined,
+      currentSelection: options.dependencyOnly ? canShowDependencyVulnerabilities : undefined,
     });
     if (!selected) return;
     const { package: pkg, isCurrent } = selected;
@@ -456,7 +617,7 @@ function registerVulnerabilityCommands(deps) {
     recentPackages.add(pkg);
   }
 
-  return registerCommands(registerCommand, [
+  const registrations = registerCommands(registerCommand, [
     ["cloudsmith-vsc.findSafeVersion", findSafeVersion],
     ["cloudsmith-vsc.openCVE", openCVE],
     ["cloudsmith-vsc.showVulnerabilities", showVulnerabilities],
@@ -465,6 +626,222 @@ function registerVulnerabilityCommands(deps) {
     ["cloudsmith-vsc.filterVulnerabilities", filterVulnerabilities],
     ["cloudsmith-vsc.explainQuarantine", explainQuarantine],
   ], deps);
+  const webviewActions = Object.freeze({
+    explainQuarantine: explainQuarantineFromWebview,
+    findSafeVersion: findSafeVersionFromWebview,
+    showVulnerabilities: showVulnerabilitiesFromWebview,
+  });
+  return Object.freeze({
+    dispose() { registrations.dispose(); },
+    webviewActions,
+  });
+}
+
+function isCompleteVulnerabilityState(state) {
+  return isCompleteCleanVulnerabilityState(state)
+    || isCompleteVulnerableState(state);
+}
+
+function isCompleteCleanVulnerabilityState(state) {
+  return Boolean(
+    state
+    && state.status === "complete-clean"
+    && state.complete === true
+    && state.stale === false
+    && state.refreshing !== true
+    && !state.refreshFailure
+    && state.count === 0
+    && Array.isArray(state.records)
+    && state.records.length === 0
+  );
+}
+
+function isCompleteVulnerableState(state) {
+  return Boolean(
+    state
+    && state.status === "complete-vulnerable"
+    && state.complete === true
+    && state.stale === false
+    && state.refreshing !== true
+    && !state.refreshFailure
+    && Number.isSafeInteger(state.count)
+    && state.count > 0
+    && Array.isArray(state.records)
+    && state.records.length === state.count
+  );
+}
+
+function vulnerabilityFixVersions(state) {
+  if (!isCompleteVulnerableState(state)) return [];
+  const seen = new Set();
+  const versions = [];
+  for (const record of state.records) {
+    const raw = record && (record.fixed_version || record.fixVersion);
+    const candidate = raw && typeof raw === "object" && !Array.isArray(raw)
+      ? raw.version || raw.raw_version
+      : raw;
+    if (typeof candidate !== "string" && typeof candidate !== "number") continue;
+    const version = String(candidate);
+    if (
+      version.length === 0
+      || version.length > 2048
+      || version.trim() !== version
+      || /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u.test(version)
+      || seen.has(version)
+    ) continue;
+    seen.add(version);
+    versions.push(version);
+  }
+  return versions;
+}
+
+function isRejectedSafeVersionCandidate(pkg) {
+  return String(pkg.status || "").trim().toLowerCase() === "quarantined"
+    || pkg.policy.denyViolated === true;
+}
+
+function sameRemediationIdentity(source, candidate) {
+  if (candidate.coordinateName !== source.coordinateName) return false;
+  const format = String(source.format || "").trim().toLowerCase();
+  if (format === "maven") {
+    const sourceCoordinate = source.coordinateName.split(":");
+    const candidateCoordinate = candidate.coordinateName.split(":");
+    return sourceCoordinate.length === 2
+      && candidateCoordinate.length === 2
+      && sourceCoordinate.every(Boolean)
+      && candidateCoordinate.every(Boolean)
+      && (source.qualifiers.type || "jar") === (candidate.qualifiers.type || "jar")
+      && (source.qualifiers.classifier || null) === (candidate.qualifiers.classifier || null);
+  }
+  if (format === "conda") {
+    return typeof source.qualifiers.subdir === "string"
+      && typeof candidate.qualifiers.subdir === "string"
+      && source.qualifiers.subdir.length > 0
+      && source.qualifiers.subdir === candidate.qualifiers.subdir;
+  }
+  if (format === "rpm") {
+    return typeof source.qualifiers.architecture === "string"
+      && typeof candidate.qualifiers.architecture === "string"
+      && source.qualifiers.architecture.length > 0
+      && source.qualifiers.architecture === candidate.qualifiers.architecture;
+  }
+  if (format === "ruby") {
+    return (source.qualifiers.platform || "ruby") === (candidate.qualifiers.platform || "ruby");
+  }
+  return true;
+}
+
+function definitelyViolatesCompatibility(
+  candidateVersion,
+  currentVersion,
+  fixedVersions,
+  format
+) {
+  const compareVersions = String(format).trim().toLowerCase() === "npm"
+    ? compareNpmSemver
+    : compareSimpleNumericVersions;
+  const currentComparison = compareVersions(candidateVersion, currentVersion);
+  if (String(format).trim().toLowerCase() === "npm" && currentComparison === null) return true;
+  if (currentComparison !== null && currentComparison <= 0) return true;
+  return fixedVersions.some(fixedVersion => {
+    const fixComparison = compareVersions(candidateVersion, fixedVersion);
+    if (String(format).trim().toLowerCase() === "npm" && fixComparison === null) return true;
+    return fixComparison !== null && fixComparison < 0;
+  });
+}
+
+function compareNpmSemver(left, right) {
+  const leftVersion = parseNpmSemver(left);
+  const rightVersion = parseNpmSemver(right);
+  if (!leftVersion || !rightVersion) return null;
+  for (let index = 0; index < 3; index += 1) {
+    const comparison = compareNumericVersionPart(
+      leftVersion.core.at(index),
+      rightVersion.core.at(index)
+    );
+    if (comparison !== 0) return comparison;
+  }
+  if (leftVersion.prerelease.length === 0 || rightVersion.prerelease.length === 0) {
+    if (leftVersion.prerelease.length === rightVersion.prerelease.length) return 0;
+    return leftVersion.prerelease.length === 0 ? 1 : -1;
+  }
+  const count = Math.max(leftVersion.prerelease.length, rightVersion.prerelease.length);
+  for (let index = 0; index < count; index += 1) {
+    const leftPart = leftVersion.prerelease.at(index);
+    const rightPart = rightVersion.prerelease.at(index);
+    if (leftPart === undefined || rightPart === undefined) {
+      return leftPart === undefined ? -1 : 1;
+    }
+    const leftNumeric = /^\d+$/u.test(leftPart);
+    const rightNumeric = /^\d+$/u.test(rightPart);
+    if (leftNumeric && rightNumeric) {
+      const comparison = compareNumericVersionPart(leftPart, rightPart);
+      if (comparison !== 0) return comparison;
+    } else if (leftNumeric !== rightNumeric) {
+      return leftNumeric ? -1 : 1;
+    } else if (leftPart !== rightPart) {
+      return leftPart < rightPart ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+function parseNpmSemver(value) {
+  const normalized = typeof value === "string" || typeof value === "number"
+    ? String(value)
+    : "";
+  const match = normalized.match(
+    /^[vV]?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u
+  );
+  if (!match) return null;
+  const prerelease = match[4] ? match[4].split(".") : [];
+  if (prerelease.some(part => /^\d+$/u.test(part) && part.length > 1 && part.startsWith("0"))) {
+    return null;
+  }
+  return { core: match.slice(1, 4), prerelease };
+}
+
+function compareNumericVersionPart(left, right) {
+  const normalizedLeft = normalizedNumericPart(left);
+  const normalizedRight = normalizedNumericPart(right);
+  if (normalizedLeft.length !== normalizedRight.length) {
+    return normalizedLeft.length < normalizedRight.length ? -1 : 1;
+  }
+  if (normalizedLeft === normalizedRight) return 0;
+  return normalizedLeft < normalizedRight ? -1 : 1;
+}
+
+function compareSimpleNumericVersions(left, right) {
+  const leftValue = typeof left === "string" || typeof left === "number" ? String(left) : "";
+  const rightValue = typeof right === "string" || typeof right === "number" ? String(right) : "";
+  const simpleNumericVersion = /^[vV]?\d+(?:\.\d+)*$/u;
+  if (!simpleNumericVersion.test(leftValue) || !simpleNumericVersion.test(rightValue)) {
+    return null;
+  }
+  const leftParts = leftValue.replace(/^[vV]/u, "").split(".");
+  const rightParts = rightValue.replace(/^[vV]/u, "").split(".");
+  const count = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < count; index += 1) {
+    const leftPart = normalizedNumericPart(leftParts.at(index) || "0");
+    const rightPart = normalizedNumericPart(rightParts.at(index) || "0");
+    if (leftPart.length !== rightPart.length) {
+      return leftPart.length < rightPart.length ? -1 : 1;
+    }
+    if (leftPart !== rightPart) return leftPart < rightPart ? -1 : 1;
+  }
+  return 0;
+}
+
+function normalizedNumericPart(value) {
+  return value.replace(/^0+(?=\d)/u, "");
+}
+
+function reportedFixCopy(fixedVersions) {
+  if (fixedVersions.length === 0) return "";
+  if (fixedVersions.length === 1) return ` The reported fix is ${fixedVersions[0]}.`;
+  const last = fixedVersions.at(-1);
+  const prefix = fixedVersions.slice(0, -1).join(", ");
+  return ` The reported fixes are ${prefix} and ${last}.`;
 }
 
 module.exports = { registerVulnerabilityCommands };

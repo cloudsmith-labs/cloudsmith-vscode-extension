@@ -28,11 +28,25 @@ const SEMANTIC_FIELDS = Object.freeze([
   "slug_perm_raw",
   "slug",
   "name",
+  "coordinateName",
   "version",
   "declaredVersion",
   "resolvedVersion",
   "format",
   "qualifiers",
+  "identifiers",
+  "architectures",
+  "architecture",
+  "build",
+  "build_string",
+  "subdir",
+  "extension",
+  "filepath",
+  "release",
+  "epoch",
+  "classifier",
+  "packaging",
+  "ruby_platform",
   "status",
   "status_str",
   "status_str_raw",
@@ -328,23 +342,96 @@ function fromExactPackageSelectionIfPresent(value) {
 
 function fromApiPackageRecord(record, options = {}) {
   try {
+    requireRecord(options, "package adapter options", { plain: true });
     if (isExactPackage(record)) {
-      validateExpectedScope(record, options);
-      return record;
+      const coordinateName = readOwn(options, "coordinateName");
+      const coordinateQualifiers = readOwn(options, "coordinateQualifiers");
+      const result = enrichExactPackageCoordinate(
+        record,
+        coordinateName,
+        coordinateQualifiers
+      );
+      validateExpectedScope(result, options);
+      return result;
     }
     requireRecord(record, "API package", { plain: true });
     const result = adaptFlatExactRecord(record, {
       allowNumericVersion: true,
+      allowMissingVersionless: true,
       allowWrappers: false,
       apiStatusTextOnly: true,
       downloadsDefault: null,
       source: "API package",
+      coordinateName: readOwn(options, "coordinateName"),
+      coordinateQualifiers: readOwn(options, "coordinateQualifiers"),
     });
     validateExpectedScope(result, options);
     return result;
   } catch (error) {
     throw asAdapterError(error, "invalid_api_package", "API package");
   }
+}
+
+function fromSafeVersionApiRecord(record, options = {}) {
+  try {
+    requireRecord(record, "safe-version API package", { plain: true });
+    const status = consensusString(record, ["status_str"], "status", {
+      required: false,
+      unwrapDepth: 0,
+    });
+    const denyPolicyViolated = consensusBoolean(
+      record,
+      ["deny_policy_violated"],
+      "denyPolicyViolated",
+      { required: false, unwrapDepth: 0 }
+    );
+    if (status !== "Completed" || denyPolicyViolated !== false) {
+      return null;
+    }
+    return fromApiPackageRecord(record, options);
+  } catch (error) {
+    throw asAdapterError(
+      error,
+      "invalid_safe_version_api_package",
+      "safe-version API package"
+    );
+  }
+}
+
+function enrichExactPackageCoordinate(record, suppliedName, suppliedQualifiers) {
+  const hasSuppliedName = suppliedName !== undefined && suppliedName !== null;
+  const hasSuppliedQualifiers = suppliedQualifiers !== undefined && suppliedQualifiers !== null;
+  if (!hasSuppliedName && !hasSuppliedQualifiers) return record;
+
+  let coordinateName = record.coordinateName;
+  if (hasSuppliedName) {
+    if (coordinateName !== record.name && suppliedName !== coordinateName) {
+      throw adapterError(
+        "conflicting_aliases",
+        "coordinateName",
+        "The native package coordinate names conflict."
+      );
+    }
+    if (coordinateName === record.name) coordinateName = suppliedName;
+  }
+
+  let qualifiers = record.qualifiers;
+  if (hasSuppliedQualifiers) {
+    const mergedQualifiers = mergeCoordinateQualifierSources([
+      record.qualifiers,
+      suppliedQualifiers,
+    ]);
+    qualifiers = JSON.stringify(mergedQualifiers) === JSON.stringify(record.qualifiers)
+      ? record.qualifiers
+      : mergedQualifiers;
+  }
+
+  if (coordinateName === record.coordinateName && qualifiers === record.qualifiers) return record;
+  return createExactPackage({
+    ...record,
+    coordinateName,
+    qualifiers,
+  });
 }
 
 function fromPackageNode(node) {
@@ -475,6 +562,7 @@ function fromRecentPackageRecord(record) {
     }
     return adaptFlatExactRecord(record, {
       allowNumericVersion: true,
+      allowMissingVersionless: true,
       allowWrappers: true,
       declaredVersionFallback: true,
       downloadsDefault: null,
@@ -609,12 +697,20 @@ function isRecentSelection(value) {
 }
 
 function isApiSelection(value) {
-  const required = ["namespace", "repository", "slug_perm", "name", "version", "format"];
+  const required = ["namespace", "repository", "slug_perm", "format"];
   if (!required.every(field => hasOwnDataValue(value, field))) return false;
   const slugPerm = readOwn(value, "slug_perm");
   const version = readOwn(value, "version");
+  const format = readOwn(value, "format");
+  const versionlessFormat = typeof format === "string"
+    && ["generic", "raw"].includes(format.trim().toLowerCase());
+  if (!versionlessFormat && !hasOwnDataValue(value, "name")) return false;
   return typeof slugPerm === "string"
-    && (typeof version === "string" || (typeof version === "number" && Number.isFinite(version)));
+    && (
+      typeof version === "string"
+      || (typeof version === "number" && Number.isFinite(version))
+      || (versionlessFormat && version == null)
+    );
 }
 
 function isFlatPresentationSelection(value) {
@@ -644,29 +740,57 @@ function adaptDependencyMatch(match) {
 
 function adaptFlatExactRecord(record, options) {
   const unwrapDepth = options.allowWrappers ? MAX_WRAPPER_DEPTH : 0;
+  const format = consensusString(record, ["format"], "format", { required: true, unwrapDepth });
+  const name = resolveApiPackageName(record, format, unwrapDepth);
+  const workspace = consensusString(record, [
+    "workspace",
+    "namespace",
+    "cloudsmithWorkspace",
+  ], "workspace", { required: true, unwrapDepth });
+  const repository = consensusString(record, [
+    "repository",
+    "cloudsmithRepo",
+  ], "repository", { required: true, unwrapDepth });
   const version = recordVersion(record, {
     allowNumber: options.allowNumericVersion,
+    allowVersionless: ["generic", "raw"].includes(format.trim().toLowerCase()),
+    allowMissingVersionless: options.allowMissingVersionless === true,
     declaredVersionFallback: options.declaredVersionFallback,
     unwrapDepth,
   });
+  const mavenArtifactId = canonicalMavenFormat(format)
+    ? resolveMavenArtifactId(name)
+    : null;
+  const coordinateName = resolveCoordinateName(
+    record,
+    options,
+    name,
+    format,
+    unwrapDepth,
+    mavenArtifactId
+  );
+  const qualifiers = resolveCoordinateQualifiers(record, options, {
+    format,
+    name,
+    mavenArtifactId,
+    workspace,
+    repository,
+    version,
+    unwrapDepth,
+  });
   return createExactPackage({
-    workspace: consensusString(record, [
-      "workspace",
-      "namespace",
-      "cloudsmithWorkspace",
-    ], "workspace", { required: true, unwrapDepth }),
-    repository: consensusString(record, [
-      "repository",
-      "cloudsmithRepo",
-    ], "repository", { required: true, unwrapDepth }),
+    workspace,
+    repository,
     packageIdentifier: consensusString(record, [
       "packageIdentifier",
       "slug_perm",
       "slug_perm_raw",
     ], "packageIdentifier", { required: true, unwrapDepth }),
-    name: consensusString(record, ["name"], "name", { required: true, unwrapDepth }),
+    name,
+    coordinateName,
     version,
-    format: consensusString(record, ["format"], "format", { required: true, unwrapDepth }),
+    format,
+    qualifiers,
     slug: consensusString(record, ["slug"], "slug", { required: false, unwrapDepth }),
     status: consensusString(
       record,
@@ -716,6 +840,372 @@ function adaptFlatExactRecord(record, options) {
   });
 }
 
+function resolveApiPackageName(record, format, unwrapDepth) {
+  const nameDescriptor = Object.getOwnPropertyDescriptor(record, "name");
+  const name = consensusString(record, ["name"], "name", { required: false, unwrapDepth });
+  if (name !== null) return name;
+  const fileFallbackAllowed = !nameDescriptor
+    || ("value" in nameDescriptor && nameDescriptor.value === null);
+  if (
+    fileFallbackAllowed
+    && ["generic", "raw"].includes(String(format).trim().toLowerCase())
+  ) {
+    for (const field of ["filepath", "filename"]) {
+      const fallback = consensusString(record, [field], "name", {
+        required: false,
+        unwrapDepth,
+      });
+      if (fallback !== null) return fallback;
+    }
+  }
+  throw adapterError("missing_field", "name", "The name value is required.");
+}
+
+function resolveCoordinateName(record, options, name, format, unwrapDepth, mavenArtifactId) {
+  const persisted = consensusString(record, ["coordinateName"], "coordinateName", {
+    required: false,
+    unwrapDepth,
+  });
+  const suppliedValue = options.coordinateName;
+  const supplied = suppliedValue === undefined || suppliedValue === null
+    ? null
+    : boundaryString(suppliedValue, "coordinateName", 2048, { trim: false });
+  const contextual = consensusPrimitive(
+    [persisted, supplied].filter(value => value !== null),
+    "coordinateName"
+  );
+  if (canonicalMavenFormat(format)) {
+    const identifiers = readOwn(record, "identifiers");
+    if (identifiers !== undefined && identifiers !== null) {
+      requireRecord(identifiers, "package identifiers", { plain: true });
+      const groupId = consensusString(identifiers, ["group_id"], "identifiers.group_id", {
+        required: false,
+        unwrapDepth: 0,
+      });
+      if (groupId) {
+        const apiCoordinate = `${groupId}:${mavenArtifactId}`;
+        return consensusPrimitive(
+          [
+            ...(name.includes(":") ? [name] : []),
+            ...(contextual === null ? [] : [contextual]),
+            apiCoordinate,
+          ],
+          "coordinateName"
+        );
+      }
+    }
+  }
+  return contextual === null ? name : contextual;
+}
+
+function resolveCoordinateQualifiers(record, options, coordinate) {
+  const persisted = readOwn(record, "qualifiers");
+  const supplied = options.coordinateQualifiers;
+  const existing = mergeCoordinateQualifierSources([persisted, supplied]);
+  const derived = deriveApiCoordinateQualifiers(record, {
+    ...coordinate,
+    existingQualifiers: existing,
+  });
+  return mergeCoordinateQualifierSources([existing, derived]);
+}
+
+function mergeCoordinateQualifierSources(sources) {
+  const merged = {};
+  for (const candidate of sources) {
+    if (candidate === undefined || candidate === null) continue;
+    const canonical = createPackageCoordinate({
+      workspace: "coordinate-validation",
+      repository: "coordinate-validation",
+      name: "coordinate-validation",
+      version: "1",
+      format: "raw",
+      qualifiers: candidate,
+    }).qualifiers;
+    for (const [key, value] of Object.entries(canonical)) {
+      if (
+        Object.prototype.hasOwnProperty.call(merged, key)
+        && JSON.stringify(merged[key]) !== JSON.stringify(value)
+      ) {
+        throw adapterError(
+          "conflicting_aliases",
+          "qualifiers",
+          "The native package coordinate qualifiers conflict."
+        );
+      }
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+function deriveApiCoordinateQualifiers(record, coordinate) {
+  const format = String(coordinate.format || "").trim().toLowerCase();
+  const identifiersValue = readOwn(record, "identifiers");
+  let identifiers = null;
+  if (identifiersValue !== undefined && identifiersValue !== null) {
+    identifiers = requireRecord(identifiersValue, "package identifiers", { plain: true });
+  }
+  const qualifier = {};
+  const evidence = (recordAliases, identifierAliases, field, settings = {}) => {
+    const values = [];
+    if (recordAliases.length > 0) {
+      const direct = consensusString(record, recordAliases, field, {
+        required: false,
+        unwrapDepth: coordinate.unwrapDepth,
+        allowNumber: settings.allowNumber === true,
+      });
+      if (direct !== null) values.push(direct);
+    }
+    if (identifiers && identifierAliases.length > 0) {
+      const nested = consensusString(identifiers, identifierAliases, field, {
+        required: false,
+        unwrapDepth: 0,
+        allowNumber: settings.allowNumber === true,
+      });
+      if (nested !== null) values.push(nested);
+    }
+    return consensusPrimitive(values, field);
+  };
+  const architecture = () => {
+    const values = [];
+    const nested = evidence([], ["architecture"], "architecture");
+    if (nested) values.push(nested);
+    const listed = singleArchitectureName(record);
+    if (listed) values.push(listed);
+    return consensusPrimitive(values, "architecture");
+  };
+
+  if (format === "maven") {
+    const extension = evidence(
+      ["extension"],
+      ["extension", "packaging", "type"],
+      "extension"
+    );
+    const type = extension ? extension.replace(/^\./, "") : null;
+    const explicitClassifier = evidence(["classifier"], ["classifier"], "classifier");
+    const filenameClassifier = deriveMavenClassifierEvidence(
+      record,
+      coordinate.mavenArtifactId,
+      coordinate.version,
+      extension
+    );
+    let classifierEvidence = explicitClassifier === null
+      ? { present: false, value: null }
+      : { present: true, value: explicitClassifier };
+    if (filenameClassifier.present) {
+      if (
+        classifierEvidence.present
+        && classifierEvidence.value !== filenameClassifier.value
+      ) {
+        throw adapterError(
+          "conflicting_aliases",
+          "classifier",
+          "The Maven classifier aliases conflict."
+        );
+      }
+      classifierEvidence = filenameClassifier;
+    }
+    const hasExistingClassifier = Object.prototype.hasOwnProperty.call(
+      coordinate.existingQualifiers,
+      "classifier"
+    );
+    if (
+      classifierEvidence.present
+      && hasExistingClassifier
+      && coordinate.existingQualifiers.classifier !== classifierEvidence.value
+    ) {
+      throw adapterError(
+        "conflicting_aliases",
+        "qualifiers",
+        "The native package coordinate qualifiers conflict."
+      );
+    }
+    if (type && !coordinate.existingQualifiers.type) qualifier.type = type;
+    if (
+      classifierEvidence.present
+      && classifierEvidence.value
+      && !hasExistingClassifier
+    ) {
+      qualifier.classifier = classifierEvidence.value;
+    }
+  }
+
+  if (format === "conda") {
+    const build = evidence(
+      ["build", "build_string"],
+      ["build", "build_string"],
+      "Conda build"
+    ) || deriveCondaBuild(record, coordinate.name, coordinate.version);
+    const directSubdir = evidence(["subdir"], ["subdir"], "Conda subdir");
+    const urlSubdir = deriveCondaSubdir(record, coordinate);
+    const architectureSubdir = architecture();
+    const subdir = consensusPrimitive(
+      [directSubdir, urlSubdir, architectureSubdir].filter(Boolean),
+      "Conda subdir"
+    );
+    if (build) qualifier.build = build;
+    if (subdir) qualifier.subdir = subdir;
+  }
+
+  if (format === "rpm") {
+    const release = evidence(["release"], ["release"], "RPM release");
+    const epoch = evidence(["epoch"], ["epoch"], "RPM epoch", { allowNumber: true });
+    const rpmArchitecture = architecture();
+    if (release) qualifier.release = release;
+    if (epoch) qualifier.epoch = epoch;
+    if (rpmArchitecture) qualifier.architecture = rpmArchitecture;
+    const nativeVersion = deriveRpmNativeVersion(
+      record,
+      coordinate.name,
+      coordinate.version,
+      release,
+      rpmArchitecture,
+      coordinate.unwrapDepth
+    );
+    if (nativeVersion) qualifier.nativeVersion = nativeVersion;
+  }
+
+  if (format === "ruby") {
+    const platform = evidence([], ["ruby_platform", "platform"], "Ruby platform")
+      || architecture();
+    if (platform) qualifier.platform = platform;
+  }
+
+  return qualifier;
+}
+
+function singleArchitectureName(record) {
+  const value = readOwn(record, "architectures");
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > 64) {
+    throw adapterError("invalid_array", "architectures", "The architectures value is invalid.");
+  }
+  assertNoSymbolProperties(value, "architectures");
+  assertNoOwnAccessors(value, "architectures");
+  const names = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !("value" in descriptor)) {
+      throw adapterError("invalid_array", "architectures", "The architectures value is invalid.");
+    }
+    const item = requireRecord(descriptor.value, "architecture", { plain: true });
+    names.push(consensusString(item, ["name"], "architecture", {
+      required: true,
+      unwrapDepth: 0,
+    }));
+  }
+  return names.length === 1 ? names[0] : null;
+}
+
+function deriveMavenClassifierEvidence(record, artifactId, version, extension) {
+  const filename = consensusString(record, ["filename"], "filename", {
+    required: false,
+    unwrapDepth: 0,
+  });
+  if (!filename || !extension) return { present: false, value: null };
+  const normalizedExtension = extension.startsWith(".") ? extension : `.${extension}`;
+  const prefix = `${artifactId}-${version}`;
+  if (filename === `${prefix}${normalizedExtension}`) {
+    return { present: true, value: null };
+  }
+  if (!filename.startsWith(`${prefix}-`) || !filename.endsWith(normalizedExtension)) {
+    return { present: false, value: null };
+  }
+  const classifier = filename.slice(prefix.length + 1, -normalizedExtension.length);
+  return classifier
+    ? { present: true, value: classifier }
+    : { present: false, value: null };
+}
+
+function deriveCondaBuild(record, name, version) {
+  const filename = consensusString(record, ["filename"], "filename", {
+    required: false,
+    unwrapDepth: 0,
+  });
+  if (!filename) return null;
+  const stem = filename.endsWith(".tar.bz2")
+    ? filename.slice(0, -8)
+    : filename.endsWith(".conda")
+      ? filename.slice(0, -6)
+      : null;
+  const prefix = `${name}-${version}-`;
+  return stem && stem.startsWith(prefix) && stem.length > prefix.length
+    ? stem.slice(prefix.length)
+    : null;
+}
+
+function deriveCondaSubdir(record, coordinate) {
+  const cdnUrl = consensusString(record, ["cdnUrl", "cdn_url"], "cdnUrl", {
+    required: false,
+    unwrapDepth: coordinate.unwrapDepth,
+  });
+  if (!cdnUrl) return null;
+  try {
+    const parsed = new URL(cdnUrl);
+    if (
+      parsed.protocol !== "https:"
+      || parsed.hostname !== "dl.cloudsmith.io"
+      || parsed.port
+      || parsed.username
+      || parsed.password
+      || parsed.search
+      || parsed.hash
+    ) {
+      throw adapterError("invalid_alias", "cdnUrl", "The cdnUrl value is invalid.");
+    }
+    const workspace = encodeURIComponent(coordinate.workspace);
+    const repository = encodeURIComponent(coordinate.repository);
+    const scopes = [
+      `/basic/${workspace}/${repository}/conda/`,
+      `/public/${workspace}/${repository}/conda/`,
+    ];
+    const scope = scopes.find(candidate => parsed.pathname.startsWith(candidate));
+    if (!scope) {
+      throw adapterError("unexpected_scope", "cdnUrl", "The cdnUrl value has an unexpected scope.");
+    }
+    const path = parsed.pathname.slice(scope.length).split("/");
+    if (path.length < 2 || !path[0] || !path[1]) {
+      throw adapterError("invalid_alias", "cdnUrl", "The cdnUrl value is invalid.");
+    }
+    return boundaryString(decodeURIComponent(path[0]), "Conda subdir", 4096);
+  } catch (error) {
+    if (PackageAdapterError.isTrusted(error)) throw error;
+    throw adapterError("invalid_alias", "cdnUrl", "The cdnUrl value is invalid.");
+  }
+}
+
+function deriveRpmNativeVersion(record, name, version, release, architecture, unwrapDepth) {
+  if (!release || !version.endsWith(`-${release}`)) return null;
+  const filename = consensusString(record, ["filename"], "filename", {
+    required: false,
+    unwrapDepth,
+  });
+  const extension = consensusString(record, ["extension"], "extension", {
+    required: false,
+    unwrapDepth,
+  }) || ".rpm";
+  if (!filename || !architecture) return null;
+  const normalizedExtension = extension.startsWith(".") ? extension : `.${extension}`;
+  const expected = `${name}-${version}.${architecture}${normalizedExtension}`;
+  return filename === expected ? version.slice(0, -(release.length + 1)) : null;
+}
+
+function canonicalMavenFormat(format) {
+  return String(format || "").trim().toLowerCase() === "maven";
+}
+
+function resolveMavenArtifactId(name) {
+  const parts = name.split(":");
+  if (parts.length > 2 || parts.some(part => part.length === 0)) {
+    throw adapterError(
+      "invalid_string",
+      "coordinateName",
+      "The Maven package name cannot provide an artifact identity."
+    );
+  }
+  return parts.length === 2 ? parts[1] : name;
+}
+
 function readCanonicalPackage(record, options = {}) {
   const candidate = readOwn(record, "package");
   if (candidate === undefined || candidate === null) return null;
@@ -748,7 +1238,10 @@ function validateEmbeddedPackageEvidence(record, canonical) {
   }
   const serializedCanonical = JSON.stringify(canonical);
   for (const value of values) {
-    const pkg = isExactPackage(value) ? value : fromApiPackageRecord(value);
+    const pkg = isExactPackage(value) ? value : fromApiPackageRecord(value, {
+      coordinateName: canonical.coordinateName,
+      coordinateQualifiers: canonical.qualifiers,
+    });
     if (JSON.stringify(pkg) !== serializedCanonical) {
       throw adapterError(
         "conflicting_canonical_projection",
@@ -765,6 +1258,7 @@ function validateCanonicalProjection(record, pkg) {
   // presentation values and are deliberately excluded from this boundary check.
   const stringFields = [
     ["name", ["name"]],
+    ["coordinateName", ["coordinateName"]],
     ["version", ["version"]],
     ["format", ["format"]],
     ["slug", ["slug"]],
@@ -892,17 +1386,23 @@ function recordVersion(record, options) {
     unwrapDepth: options.unwrapDepth,
   });
   if (primary.supplied && primary.value !== "") return primary.value;
+  if (options.allowVersionless && primary.supplied) return "";
+  if (options.declaredVersionFallback) {
+    const declared = consensusString(record, ["declaredVersion"], "version", {
+      required: !options.allowMissingVersionless,
+      unwrapDepth: options.unwrapDepth,
+      allowNumber: options.allowNumber,
+    });
+    if (declared !== null) return declared;
+  }
+  if (options.allowVersionless && options.allowMissingVersionless) return "";
   if (!options.declaredVersionFallback) {
     if (primary.supplied) {
       throw adapterError("invalid_string", "version", "The version value is invalid.");
     }
     throw adapterError("missing_field", "version", "The version value is required.");
   }
-  return consensusString(record, ["declaredVersion"], "version", {
-    required: true,
-    unwrapDepth: options.unwrapDepth,
-    allowNumber: options.allowNumber,
-  });
+  throw adapterError("missing_field", "version", "The version value is required.");
 }
 
 function dependencyCoordinateVersion(record) {
@@ -940,7 +1440,7 @@ function normalizeTags(value) {
 
 function normalizeTagField(value, field) {
   if (value === undefined || value === null) return [];
-  const values = Array.isArray(value) ? readArrayData(value, field) : [value];
+  const values = Array.isArray(value) ? readArrayData(value, field, 100) : [value];
   if (values.length > 100 || values.some(item => typeof item !== "string")) {
     throw adapterError("invalid_tags", field, `The ${field} value is invalid.`);
   }
@@ -1309,14 +1809,25 @@ function consensusStructured(candidates, field, fallback) {
   return candidates[0];
 }
 
-function readArrayData(value, field) {
-  assertNoSymbolProperties(value, field);
-  assertNoOwnAccessors(value, field);
+function readArrayData(value, field, maximumLength) {
   if (Object.getPrototypeOf(value) !== Array.prototype) {
     throw adapterError("invalid_array", field, `The ${field} value is invalid.`);
   }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  const length = lengthDescriptor && "value" in lengthDescriptor
+    ? lengthDescriptor.value
+    : null;
+  if (
+    !Number.isSafeInteger(length)
+    || length < 0
+    || (Number.isSafeInteger(maximumLength) && length > maximumLength)
+  ) {
+    throw adapterError("invalid_array", field, `The ${field} value is invalid.`);
+  }
+  assertNoSymbolProperties(value, field);
+  assertNoOwnAccessors(value, field);
   const result = [];
-  for (let index = 0; index < value.length; index += 1) {
+  for (let index = 0; index < length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
     if (!descriptor || !("value" in descriptor)) {
       throw adapterError("accessor_property", field, `The ${field} value is invalid.`);
@@ -1511,6 +2022,7 @@ function snapshotPackageDomainError(error) {
 module.exports = {
   PackageAdapterError,
   fromApiPackageRecord,
+  fromSafeVersionApiRecord,
   fromDependencyHealthNode,
   fromExactPackageSelectionIfPresent,
   fromPackageDetailNode,

@@ -5,6 +5,7 @@ const {
 const { UpstreamChecker } = require("../util/upstreamChecker");
 const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
+const { createCancellationSource, deferred } = require("./helpers/asyncControl");
 
 suite("upstreamGapAnalyzer", () => {
   const TEST_ACCOUNT = Object.freeze({ activationId: "activation-a", accountEpoch: 1 });
@@ -14,11 +15,16 @@ suite("upstreamGapAnalyzer", () => {
       createOperationScope(options = {}) {
         const controller = new AbortController();
         const scheduler = options.scheduler || new UpstreamOperationScheduler();
+        const cancellation = options.cancellationToken?.onCancellationRequested?.(() => {
+          controller.abort();
+          scheduler.cancel();
+        });
         return Object.freeze({
           scheduler,
           signal: controller.signal,
           account: options.account || TEST_ACCOUNT,
           dispose() {
+            cancellation?.dispose?.();
             controller.abort();
             scheduler.cancel();
           },
@@ -91,6 +97,7 @@ suite("upstreamGapAnalyzer", () => {
       },
     ];
 
+    const progressEvents = [];
     const enriched = await analyzeUpstreamGaps(dependencies, "workspace-a", ["production"], {
       account: TEST_ACCOUNT,
       upstreamRuntime: createRuntime({
@@ -98,10 +105,15 @@ suite("upstreamGapAnalyzer", () => {
           return createState();
         },
       }),
+      onProgress(_patchMap, meta) { progressEvents.push(meta); },
     });
 
     assert.strictEqual(enriched[0].upstreamStatus, "no_proxy");
     assert.strictEqual(enriched[0].upstreamDetail, "No upstream proxy configured for python");
+    assert.deepStrictEqual(
+      pickTerminalProgress(progressEvents.at(-1)),
+      { completed: 1, inspected: 1, total: 1, terminal: true, outcome: "complete" }
+    );
   });
 
   test("classifies unsupported formats as unreachable", async () => {
@@ -459,17 +471,217 @@ suite("upstreamGapAnalyzer", () => {
     }
   });
 
+  test("settles terminally when one repository runtime operation never returns", async () => {
+    const repositories = Array.from({ length: 13 }, (_value, index) => `repo-${index + 1}`);
+    const progressEvents = [];
+    const unhandled = [];
+    let repositorySignal;
+    let rejectLate;
+    const onUnhandled = reason => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      const enriched = await Promise.race([
+        analyzeUpstreamGaps(
+          [{ name: "missing", version: "1.0.0", format: "npm", cloudsmithStatus: "ABSENT" }],
+          "workspace-a",
+          repositories,
+          {
+            account: TEST_ACCOUNT,
+            repositoryOperationTimeoutMs: 5,
+            upstreamRuntime: createRuntime({
+              async getRepositoryUpstreamStateForFormats(_workspace, repo, _formats, options) {
+                if (repo === "repo-13") {
+                  repositorySignal = options.signal;
+                  return new Promise((_resolve, reject) => {
+                    rejectLate = reject;
+                  });
+                }
+                return createState();
+              },
+            }),
+            onProgress(_patchMap, meta) { progressEvents.push(meta); },
+          }
+        ),
+        new Promise((_resolve, reject) => {
+          setTimeout(() => reject(new Error("repository runtime boundary did not settle")), 250);
+        }),
+      ]);
+
+      assert.strictEqual(enriched[0].upstreamStatus, "unknown");
+      assert.match(enriched[0].upstreamDetail, /could not be inspected completely/);
+      assert.ok(progressEvents.some(event => (
+        event.completed === repositories.length - 1
+        && event.total === repositories.length
+        && event.terminal !== true
+      )));
+      assert.strictEqual(progressEvents.filter(event => event.terminal === true).length, 1);
+      assert.deepStrictEqual(pickTerminalProgress(progressEvents.at(-1)), {
+        completed: repositories.length,
+        inspected: repositories.length,
+        total: repositories.length,
+        terminal: true,
+        outcome: "partial",
+      });
+      assert.strictEqual(repositorySignal?.aborted, true);
+
+      const settledSnapshot = JSON.stringify(enriched);
+      rejectLate(new Error("late repository runtime failure"));
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.strictEqual(JSON.stringify(enriched), settledSnapshot);
+      assert.deepStrictEqual(unhandled, []);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
+  });
+
+  test("accounts for terminal repository work when the final upstream request opens the rate-limit circuit", async () => {
+    const repositories = Array.from({ length: 13 }, (_value, index) => `repo-${index + 1}`);
+    const inspectedRepositories = [];
+    const progressEvents = [];
+
+    const enriched = await Promise.race([
+      analyzeUpstreamGaps(
+        [{
+          name: "missing-python-package",
+          version: "1.0.0",
+          format: "python",
+          cloudsmithStatus: "ABSENT",
+        }],
+        "workspace-a",
+        repositories,
+        {
+          account: TEST_ACCOUNT,
+          upstreamRuntime: createRuntime({
+            async getRepositoryUpstreamStateForFormats(_workspace, repo, _formats, options) {
+              inspectedRepositories.push(repo);
+              if (repo === "repo-13") {
+                await options.scheduler.run(async () => (
+                  apiFailure("rate_limited", { status: 429 })
+                ));
+                return {
+                  groupedUpstreams: new Map(),
+                  complete: false,
+                  failedFormats: ["python"],
+                  uninspectedFormats: [],
+                };
+              }
+              return createState();
+            },
+          }),
+          onProgress(_patchMap, meta) {
+            progressEvents.push(meta);
+          },
+        }
+      ),
+      new Promise((_resolve, reject) => {
+        setTimeout(() => reject(new Error("rate-limited repository pool did not settle")), 250);
+      }),
+    ]);
+
+    assert.strictEqual(inspectedRepositories.length, repositories.length);
+    assert.strictEqual(enriched[0].upstreamStatus, "unknown");
+    assert.deepStrictEqual(
+      pickTerminalProgress(progressEvents.at(-1)),
+      {
+        completed: repositories.length,
+        inspected: repositories.length,
+        total: repositories.length,
+        terminal: true,
+        outcome: "partial",
+      },
+      "a settled partial upstream result must not leave the final progress label at 12/13"
+    );
+  });
+
+  test("thrown, null, and malformed repository states settle terminally as unknown", async () => {
+    const cases = [
+      { name: "thrown", read() { throw new Error("private repository failure"); } },
+      { name: "null", read() { return null; } },
+      { name: "malformed", read() { return { groupedUpstreams: {} }; } },
+    ];
+
+    for (const expected of cases) {
+      const progressEvents = [];
+      const enriched = await analyzeUpstreamGaps([{
+        name: `missing-${expected.name}`,
+        version: "1.0.0",
+        format: "python",
+        cloudsmithStatus: "ABSENT",
+      }], "workspace-a", ["repo-a"], {
+        account: TEST_ACCOUNT,
+        upstreamRuntime: createRuntime({
+          async getRepositoryUpstreamStateForFormats() { return expected.read(); },
+        }),
+        onProgress(_patchMap, meta) { progressEvents.push(meta); },
+      });
+
+      assert.strictEqual(enriched[0].upstreamStatus, "unknown", expected.name);
+      assert.deepStrictEqual(
+        pickTerminalProgress(progressEvents.at(-1)),
+        { completed: 1, inspected: 1, total: 1, terminal: true, outcome: "partial" },
+        expected.name
+      );
+    }
+  });
+
+  test("cancellation publishes no terminal partial coverage result", async () => {
+    const source = createCancellationSource();
+    const started = deferred();
+    const progressEvents = [];
+    try {
+      const analysis = analyzeUpstreamGaps([{
+        name: "cancelled-package",
+        version: "1.0.0",
+        format: "npm",
+        cloudsmithStatus: "ABSENT",
+      }], "workspace-a", ["repo-a"], {
+        account: TEST_ACCOUNT,
+        cancellationToken: source.token,
+        upstreamRuntime: createRuntime({
+          async getRepositoryUpstreamStateForFormats(_workspace, _repo, _formats, options) {
+            started.resolve();
+            await new Promise((resolve) => {
+              if (options.operationScope.signal.aborted) {
+                resolve();
+                return;
+              }
+              options.operationScope.signal.addEventListener("abort", resolve, { once: true });
+            });
+            return createState({ npm: [{ name: "npm", is_active: true }] });
+          },
+        }),
+        onProgress(_patchMap, meta) { progressEvents.push(meta); },
+      });
+
+      await started.promise;
+      source.cancel();
+      const enriched = await analysis;
+
+      assert.strictEqual(enriched[0].upstreamStatus, "unknown");
+      assert.strictEqual(progressEvents.some(event => event.terminal === true), false);
+    } finally {
+      source.dispose();
+    }
+  });
+
   test("stops repository fan-out structurally when the shared request budget is exhausted", async () => {
     const scheduler = new UpstreamOperationScheduler({ concurrency: 1, maxRequests: 1 });
     let repositoryCalls = 0;
+    const progressEvents = [];
+    const repositories = Array.from({ length: 1000 }, (_, index) => `repo-${index}`);
     const enriched = await analyzeUpstreamGaps([{
       name: "package-a",
       version: "1.0.0",
       format: "npm",
       cloudsmithStatus: "ABSENT",
-    }], "workspace-a", Array.from({ length: 1000 }, (_, index) => `repo-${index}`), {
+    }], "workspace-a", repositories, {
       scheduler,
       account: TEST_ACCOUNT,
+      onProgress(_patchMap, meta) {
+        progressEvents.push(meta);
+      },
       upstreamRuntime: createRuntime({
         async getRepositoryUpstreamStateForFormats(_workspace, _repo, _formats, options) {
           repositoryCalls += 1;
@@ -482,5 +694,23 @@ suite("upstreamGapAnalyzer", () => {
     assert.strictEqual(repositoryCalls, 1);
     assert.strictEqual(scheduler.requestCount, 1);
     assert.strictEqual(enriched[0].upstreamStatus, "unknown");
+    assert.deepStrictEqual(pickTerminalProgress(progressEvents.at(-1)), {
+      completed: repositories.length,
+      inspected: 1,
+      total: repositories.length,
+      terminal: true,
+      outcome: "partial",
+    });
+    assert.ok(progressEvents.length <= 3, "terminal accounting must not amplify progress events");
   });
 });
+
+function pickTerminalProgress(meta) {
+  return {
+    completed: meta.completed,
+    inspected: meta.inspected,
+    total: meta.total,
+    terminal: meta.terminal,
+    outcome: meta.outcome,
+  };
+}

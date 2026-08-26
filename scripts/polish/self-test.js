@@ -26,6 +26,11 @@ function runSelfTests() {
           default: false,
           deprecationMessage: "This setting has no effect and is retained only so existing configuration remains valid.",
         },
+        "cloudsmith-vsc.showDockerDigestCommand": {
+          type: "boolean",
+          default: false,
+          deprecationMessage: "This setting has no effect and is retained only so existing configuration remains valid.",
+        },
         "cloudsmith-vsc.showRepoMetrics": {
           type: "boolean",
           default: false,
@@ -39,7 +44,7 @@ function runSelfTests() {
   for (let index = 0; index < 19; index += 1) {
     manifest.contributes.configuration.properties[`cloudsmith-vsc.filler${index}`] = { type: "boolean", default: false };
   }
-  const readme = `### Active settings\n| Setting | Default | Constraints | Purpose |\n|---|---|---|---|\n| \`cloudsmith-vsc.example\` | \`3\` | Integer, 1-5 | Example. |\n${active}\n### Deprecated compatibility settings\n| Setting | Default | Status | Purpose |\n|---|---|---|---|\n| \`cloudsmith-vsc.autoScanOnOpen\` | \`false\` | Deprecated | No effect. |\n| \`cloudsmith-vsc.showRepoMetrics\` | \`false\` | Deprecated | No effect. |\n## Command surfaces\n| Surface | Command ID | Command | Purpose |\n|---|---|---|---|\n| Command Palette | \`cloudsmith-vsc.example\` | \`Example command\` | Example. |`;
+  const readme = `### Active settings\n| Setting | Default | Constraints | Purpose |\n|---|---|---|---|\n| \`cloudsmith-vsc.example\` | \`3\` | Integer, 1-5 | Example. |\n${active}\n### Deprecated compatibility settings\n| Setting | Default | Status | Purpose |\n|---|---|---|---|\n| \`cloudsmith-vsc.autoScanOnOpen\` | \`false\` | Deprecated | No effect. |\n| \`cloudsmith-vsc.showDockerDigestCommand\` | \`false\` | Deprecated | No effect. |\n| \`cloudsmith-vsc.showRepoMetrics\` | \`false\` | Deprecated | No effect. |\n## Command surfaces\n| Surface | Command ID | Command | Purpose |\n|---|---|---|---|\n| Command Palette | \`cloudsmith-vsc.example\` | \`Example command\` | Example. |`;
   const architecture = { commandUx: { classifications: { global: ["cloudsmith-vsc.example"], recoverable: [], contextOnly: [] } } };
 
   assert.doesNotThrow(() => validateSettingsDocs(manifest, readme));
@@ -51,18 +56,32 @@ function runSelfTests() {
   expectFailure(() => validateCommandDocs(manifest, {
     commandUx: { classifications: { global: [], recoverable: [], contextOnly: ["cloudsmith-vsc.example"] } },
   }, readme), /misclassifies/);
-  assert.doesNotThrow(() => validateHelpLinks([
-    { url: "https://docs.cloudsmith.com/developer-tools/vscode" },
-    { url: "https://docs.cloudsmith.com/" },
-    { url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues" },
-    { url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues/new/choose" },
-  ], [
-    "https://docs.cloudsmith.com/developer-tools/vscode",
+  const extensionHomepage =
+    "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/blob/main/README.md";
+  const helpLinks = [
+    { id: "extensionDocs", label: "Read extension documentation", url: extensionHomepage, icon: "external" },
+    { id: "gettingStarted", label: "Get started with Cloudsmith", url: "https://docs.cloudsmith.com/", icon: "cloudsmith" },
+    { id: "viewIssues", label: "View issues", url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues", icon: "github" },
+    { id: "reportIssue", label: "Report an issue", url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues/new/choose", icon: "github" },
+  ];
+  const helpReadme = [
+    extensionHomepage,
     "https://docs.cloudsmith.com/",
     "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues",
     "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/issues/new/choose",
-  ].join("\n")));
-  expectFailure(() => validateHelpLinks([{ url: "http://example.com" }], "http://example.com"), /verified destinations/);
+  ].join("\n");
+  assert.doesNotThrow(() => validateHelpLinks(
+    helpLinks,
+    helpReadme,
+    { homepage: extensionHomepage }
+  ));
+  expectFailure(() => validateHelpLinks([
+    { ...helpLinks[0], url: "https://docs.cloudsmith.com/developer-tools/vscode" },
+    ...helpLinks.slice(1),
+  ], helpReadme, { homepage: extensionHomepage }), /retired extension documentation URL/);
+  expectFailure(() => validateHelpLinks(helpLinks, helpReadme, {
+    homepage: "http://example.com",
+  }), /homepage must target/);
 
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-polish-self-test-"));
   try {

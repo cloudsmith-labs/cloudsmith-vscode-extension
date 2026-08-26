@@ -7,7 +7,7 @@ const {
   firstCollectionFailureMessage,
   pickRecentPackage,
   isCommandAccountCurrent,
-  isQuarantinedPackage,
+  isInstallablePackage,
 } = require("./support");
 
 function registerPromotionCommands(deps) {
@@ -172,7 +172,7 @@ function registerPromotionCommands(deps) {
     const accountScope = captureCommandAccount(deps.workspaceAccess);
     if (!accountScope) return;
     const pkg = await selectedPackage(item, accountScope, {
-      predicate: pkg => pkg.copyable === true && !isQuarantinedPackage(pkg),
+      predicate: isInstallablePackage,
       emptyMessage: "No recent promotable packages. Open or search for an eligible package, then try again.",
       invalidStateMessage: "This package is not eligible for promotion.",
     });

@@ -33,6 +33,7 @@ const {
   serializePackageCollectionInspection,
   serializePackageInspection,
 } = require("../util/packageInspection");
+const { InstallCommandBuilder } = require("../util/installCommandBuilder");
 
 suite("Canonical package domain", () => {
   function apiRecord(overrides = {}) {
@@ -251,21 +252,473 @@ suite("Canonical package domain", () => {
     assert.ok(Object.isFrozen(repositoryCoordinate.qualifiers));
   });
 
+  test("Maven API identity survives exact-package to native-coordinate round trip", () => {
+    const exact = fromApiPackageRecord(apiRecord({
+      name: "guava",
+      format: "maven",
+      version: "33.4.0-jre",
+      identifiers: { group_id: "com.google.guava" },
+    }));
+    const coordinate = packageCoordinateFromExact(exact);
+
+    assert.strictEqual(coordinate.name, "com.google.guava:guava");
+    assert.strictEqual(coordinate.version, "33.4.0-jre");
+    assert.strictEqual(coordinate.format, "maven");
+  });
+
+  test("API-native qualifiers survive exact-package and install-guidance round trips", () => {
+    const cases = [
+      {
+        record: apiRecord({
+          name: "demo",
+          format: "maven",
+          version: "1.2.3",
+          extension: ".jar",
+          filename: "demo-1.2.3-tests.jar",
+          identifiers: { group_id: "com.example", classifier: "tests" },
+        }),
+        assertCoordinate(coordinate) {
+          assert.strictEqual(coordinate.name, "com.example:demo");
+          assert.deepStrictEqual(coordinate.qualifiers, {
+            classifier: "tests",
+            type: "jar",
+          });
+          const result = InstallCommandBuilder.build(
+            coordinate.format,
+            coordinate.name,
+            coordinate.version,
+            coordinate.workspace,
+            coordinate.repository,
+            { qualifiers: coordinate.qualifiers }
+          );
+          assert.match(result.command, /<type>jar<\/type>/);
+          assert.match(result.command, /<classifier>tests<\/classifier>/);
+        },
+      },
+      {
+        record: apiRecord({
+          name: "numpy",
+          format: "conda",
+          version: "1.24.0",
+          filename: "numpy-1.24.0-py311h123_0.conda",
+          cdn_url: "https://dl.cloudsmith.io/public/Workspace/Repository/conda/linux-64/numpy-1.24.0-py311h123_0.conda",
+          identifiers: { build_string: "py311h123_0", subdir: "linux-64" },
+        }),
+        assertCoordinate(coordinate) {
+          assert.deepStrictEqual(coordinate.qualifiers, {
+            build: "py311h123_0",
+            subdir: "linux-64",
+          });
+          const result = InstallCommandBuilder.build(
+            coordinate.format,
+            coordinate.name,
+            coordinate.version,
+            coordinate.workspace,
+            coordinate.repository,
+            { qualifiers: coordinate.qualifiers }
+          );
+          assert.doesNotMatch(result.command, /--platform/u);
+          assert.match(result.command, /numpy==1\.24\.0=py311h123_0\[subdir=linux-64\]/);
+        },
+      },
+      {
+        record: apiRecord({
+          name: "cloudsmith-redhat-example",
+          format: "rpm",
+          version: "1.0.17592050512201-1",
+          release: "1",
+          epoch: null,
+          architectures: [{ name: "noarch", description: null }],
+          filename: "cloudsmith-redhat-example-1.0.17592050512201-1.noarch.rpm",
+          identifiers: { architecture: "noarch" },
+        }),
+        assertCoordinate(coordinate) {
+          assert.strictEqual(coordinate.version, "1.0.17592050512201-1");
+          assert.deepStrictEqual(coordinate.qualifiers, {
+            architecture: "noarch",
+            nativeVersion: "1.0.17592050512201",
+            release: "1",
+          });
+          const result = InstallCommandBuilder.build(
+            coordinate.format,
+            coordinate.name,
+            coordinate.version,
+            coordinate.workspace,
+            coordinate.repository,
+            { qualifiers: coordinate.qualifiers }
+          );
+          assert.match(
+            result.command,
+            /cloudsmith-redhat-example-1\.0\.17592050512201-1\.noarch/
+          );
+          assert.doesNotMatch(result.command, /-1-1\.noarch/);
+        },
+      },
+      {
+        record: apiRecord({
+          name: "native-gem",
+          format: "ruby",
+          version: "1.0.0",
+          architectures: [{ name: "x86_64-linux", description: null }],
+          identifiers: { ruby_platform: "x86_64-linux" },
+        }),
+        assertCoordinate(coordinate) {
+          assert.deepStrictEqual(coordinate.qualifiers, { platform: "x86_64-linux" });
+        },
+      },
+    ];
+
+    for (const { record, assertCoordinate } of cases) {
+      const coordinate = packageCoordinateFromExact(fromApiPackageRecord(record));
+      assertCoordinate(coordinate);
+    }
+  });
+
+  test("public Raw and versionless Generic API records retain authoritative CDN identity", () => {
+    const raw = fromApiPackageRecord(apiRecord({
+      format: "raw",
+      name: "artifact.tar.gz",
+      version: "1.0.0",
+      cdn_url: "https://dl.cloudsmith.io/public/Workspace/Repository/raw/versions/1.0.0/artifact.tar.gz",
+    }));
+    const generic = fromApiPackageRecord(apiRecord({
+      format: "generic",
+      name: null,
+      version: null,
+      filepath: "releases/stable/artifact.bin",
+      cdn_url: "https://dl.cloudsmith.io/public/Workspace/Repository/generic/files/artifact.bin",
+    }));
+
+    assert.strictEqual(generic.version, "");
+    assert.strictEqual(generic.coordinateName, "releases/stable/artifact.bin");
+    for (const pkg of [raw, generic]) {
+      const coordinate = packageCoordinateFromExact(pkg);
+      const result = InstallCommandBuilder.build(
+        coordinate.format,
+        coordinate.name,
+        coordinate.version,
+        coordinate.workspace,
+        coordinate.repository,
+        { cdnUrl: pkg.cdnUrl, qualifiers: coordinate.qualifiers }
+      );
+      assert.match(result.command, /^# Verify package details before running\ncurl -fL -O /);
+      assert.match(result.command, /\/public\/Workspace\/Repository\//);
+    }
+  });
+
+  test("Generic and Raw API records derive an omitted name from file metadata", () => {
+    const fixtures = [
+      { format: "generic", filepath: "releases/stable/artifact.bin" },
+      { format: "raw", filename: "artifact.tar.gz" },
+    ];
+
+    for (const fixture of fixtures) {
+      const record = apiRecord({
+        format: fixture.format,
+        version: null,
+        ...fixture,
+      });
+      delete record.name;
+
+      const pkg = fromApiPackageRecord(record);
+      const expectedName = fixture.filepath || fixture.filename;
+      assert.strictEqual(pkg.name, expectedName);
+      assert.strictEqual(pkg.coordinateName, expectedName);
+      assert.strictEqual(
+        exactPackageIdentity(fromPackageSelection(record)),
+        exactPackageIdentity(pkg)
+      );
+
+      const recentRecord = {
+        cloudsmithWorkspace: "Workspace",
+        cloudsmithRepo: "Repository",
+        slug_perm_raw: `recent-${fixture.format}`,
+        format: fixture.format,
+        ...fixture,
+      };
+      const recent = fromRecentPackageRecord(recentRecord);
+      assert.strictEqual(recent.name, expectedName);
+      assert.strictEqual(recent.version, "");
+      assert.strictEqual(
+        exactPackageIdentity(fromPackageSelection(recentRecord)),
+        exactPackageIdentity(recent)
+      );
+    }
+
+    const nullNamed = apiRecord({
+      format: "generic",
+      name: null,
+      version: null,
+      filepath: "releases/null-name/artifact.bin",
+    });
+    assert.strictEqual(
+      exactPackageIdentity(fromPackageSelection(nullNamed)),
+      exactPackageIdentity(fromApiPackageRecord(nullNamed))
+    );
+
+    const undefinedNamed = {
+      ...nullNamed,
+      name: undefined,
+    };
+    assert.throws(() => fromApiPackageRecord(undefinedNamed), PackageAdapterError);
+    assert.throws(() => fromPackageSelection(undefinedNamed), PackageAdapterError);
+    assert.throws(() => fromRecentPackageRecord({
+      cloudsmithWorkspace: "Workspace",
+      cloudsmithRepo: "Repository",
+      slug_perm_raw: "recent-undefined-name",
+      format: "generic",
+      name: undefined,
+      filepath: "releases/undefined-name/artifact.bin",
+    }), PackageAdapterError);
+
+    const declaredRecent = fromRecentPackageRecord({
+      cloudsmithWorkspace: "Workspace",
+      cloudsmithRepo: "Repository",
+      slug_perm_raw: "recent-declared-version",
+      format: "generic",
+      filepath: "releases/declared-version/artifact.bin",
+      declaredVersion: "2.0.0",
+    });
+    assert.strictEqual(declaredRecent.version, "2.0.0");
+  });
+
+  test("dependency coordinate context enriches an already exact API package", () => {
+    const exact = fromApiPackageRecord(apiRecord({
+      name: "demo",
+      format: "maven",
+      version: "1.2.3",
+    }));
+    const enriched = fromApiPackageRecord(exact, {
+      coordinateName: "com.example:demo",
+      coordinateQualifiers: { type: "test-jar", classifier: "tests", scope: "test" },
+    });
+    const coordinate = packageCoordinateFromExact(enriched);
+
+    assert.strictEqual(coordinate.name, "com.example:demo");
+    assert.deepStrictEqual(coordinate.qualifiers, {
+      classifier: "tests",
+      scope: "test",
+      type: "test-jar",
+    });
+  });
+
+  test("Maven extension defaults do not overwrite authoritative dependency type", () => {
+    const raw = apiRecord({
+      name: "demo",
+      format: "maven",
+      version: "1.2.3",
+      extension: ".jar",
+      filename: "demo-1.2.3-tests.jar",
+      identifiers: { group_id: "com.example", classifier: "tests" },
+    });
+    const enriched = fromApiPackageRecord(raw, {
+      coordinateQualifiers: { type: "test-jar", classifier: "tests", scope: "test" },
+    });
+    assert.deepStrictEqual(enriched.qualifiers, {
+      classifier: "tests",
+      scope: "test",
+      type: "test-jar",
+    });
+
+    const exact = fromApiPackageRecord(apiRecord({
+      qualifiers: { type: "jar" },
+    }));
+    const subset = fromApiPackageRecord(exact, {
+      coordinateQualifiers: { type: "jar", scope: "test" },
+    });
+    assert.deepStrictEqual(subset.qualifiers, { scope: "test", type: "jar" });
+  });
+
+  test("unbranded Maven coordinates require native API identity consensus", () => {
+    const mavenRecord = overrides => apiRecord({
+      name: "demo",
+      format: "maven",
+      version: "1.2.3",
+      identifiers: { group_id: "com.example" },
+      ...overrides,
+    });
+    for (const [record, options] of [
+      [mavenRecord({ coordinateName: "org.other:demo" }), undefined],
+      [mavenRecord({ coordinateName: "com.example:other" }), undefined],
+      [mavenRecord({}), { coordinateName: "org.other:demo" }],
+      [mavenRecord({}), { coordinateName: "com.example:other" }],
+      [mavenRecord({ name: "org.other:demo" }), undefined],
+    ]) {
+      assert.throws(() => fromApiPackageRecord(record, options), error => (
+        error instanceof PackageAdapterError
+        && error.code === "conflicting_aliases"
+        && error.field === "coordinateName"
+      ));
+    }
+
+    assert.strictEqual(
+      fromApiPackageRecord(mavenRecord({ coordinateName: "com.example:demo" })).coordinateName,
+      "com.example:demo"
+    );
+    assert.strictEqual(
+      fromApiPackageRecord(mavenRecord({}), {
+        coordinateName: "com.example:demo",
+      }).coordinateName,
+      "com.example:demo"
+    );
+    const withoutApiGroup = mavenRecord({ coordinateName: "persisted.example:demo" });
+    delete withoutApiGroup.identifiers;
+    assert.strictEqual(
+      fromApiPackageRecord(withoutApiGroup).coordinateName,
+      "persisted.example:demo"
+    );
+  });
+
+  test("Maven classifier context requires exact API artifact consensus", () => {
+    const mavenRecord = overrides => apiRecord({
+      name: "demo",
+      format: "maven",
+      version: "1.2.3",
+      extension: ".jar",
+      filename: "demo-1.2.3-tests.jar",
+      identifiers: { group_id: "com.example", classifier: "tests" },
+      ...overrides,
+    });
+    for (const [record, options] of [
+      [mavenRecord({ qualifiers: { classifier: "sources" } }), undefined],
+      [mavenRecord({}), {
+        coordinateQualifiers: { type: "test-jar", classifier: "sources" },
+      }],
+      [mavenRecord({
+        qualifiers: { classifier: "sources" },
+        identifiers: { group_id: "com.example" },
+      }), undefined],
+      [mavenRecord({
+        name: "com.example:demo",
+        qualifiers: { classifier: "sources" },
+        identifiers: { group_id: "com.example" },
+      }), undefined],
+      [mavenRecord({
+        filename: "demo-1.2.3.jar",
+        identifiers: { group_id: "com.example" },
+      }), {
+        coordinateQualifiers: { type: "test-jar", classifier: "tests" },
+      }],
+      [mavenRecord({
+        name: "com.example:demo",
+        filename: "demo-1.2.3.jar",
+        identifiers: { group_id: "com.example" },
+      }), {
+        coordinateQualifiers: { type: "test-jar", classifier: "tests" },
+      }],
+    ]) {
+      assert.throws(() => fromApiPackageRecord(record, options), error => (
+        error instanceof PackageAdapterError
+        && error.code === "conflicting_aliases"
+        && error.field === "qualifiers"
+      ));
+    }
+
+    const matched = fromApiPackageRecord(mavenRecord({}), {
+      coordinateQualifiers: { type: "test-jar", classifier: "tests", scope: "test" },
+    });
+    assert.deepStrictEqual(matched.qualifiers, {
+      classifier: "tests",
+      scope: "test",
+      type: "test-jar",
+    });
+
+    const qualified = fromApiPackageRecord(mavenRecord({
+      name: "com.example:demo",
+      identifiers: { group_id: "com.example" },
+    }), {
+      coordinateQualifiers: { type: "test-jar", classifier: "tests", scope: "test" },
+    });
+    assert.strictEqual(qualified.coordinateName, "com.example:demo");
+    assert.deepStrictEqual(qualified.qualifiers, {
+      classifier: "tests",
+      scope: "test",
+      type: "test-jar",
+    });
+
+    const mainArtifact = fromApiPackageRecord(mavenRecord({
+      filename: "demo-1.2.3.jar",
+      identifiers: { group_id: "com.example" },
+    }));
+    assert.deepStrictEqual(mainArtifact.qualifiers, { type: "jar" });
+  });
+
+  test("Conda CDN qualifier derivation uses the exact selected scope", () => {
+    const scoped = fromApiPackageRecord(apiRecord({
+      namespace: "conda",
+      repository: "conda",
+      name: "numpy",
+      format: "conda",
+      version: "1.24.0",
+      filename: "numpy-1.24.0-build_0.conda",
+      cdn_url: "https://dl.cloudsmith.io/public/conda/conda/conda/linux-64/numpy-1.24.0-build_0.conda",
+      identifiers: { build_string: "build_0" },
+    }));
+    assert.deepStrictEqual(scoped.qualifiers, { build: "build_0", subdir: "linux-64" });
+
+    assert.throws(() => fromApiPackageRecord(apiRecord({
+      name: "numpy",
+      format: "conda",
+      version: "1.24.0",
+      filename: "numpy-1.24.0-build_0.conda",
+      cdn_url: "https://dl.cloudsmith.io/public/Other/Repository/conda/linux-64/numpy-1.24.0-build_0.conda",
+      identifiers: { build_string: "build_0" },
+    })), PackageAdapterError);
+  });
+
+  test("dependency context cannot replace authoritative exact-package coordinates", () => {
+    const exact = fromApiPackageRecord(apiRecord({
+      name: "artifact",
+      coordinateName: "com.trusted:artifact",
+      format: "maven",
+      version: "1.2.3",
+      qualifiers: { type: "test-jar", classifier: "trusted", scope: "test" },
+    }));
+
+    assert.throws(() => fromApiPackageRecord(exact, {
+      coordinateName: "com.other:artifact",
+    }), error => (
+      error instanceof PackageAdapterError
+      && error.code === "conflicting_aliases"
+      && error.field === "coordinateName"
+    ));
+    assert.throws(() => fromApiPackageRecord(exact, {
+      coordinateName: "com.trusted:artifact",
+      coordinateQualifiers: { type: "test-jar", classifier: "other", scope: "test" },
+    }), error => (
+      error instanceof PackageAdapterError
+      && error.code === "conflicting_aliases"
+      && error.field === "qualifiers"
+    ));
+
+    const same = fromApiPackageRecord(exact, {
+      coordinateName: "com.trusted:artifact",
+      coordinateQualifiers: { scope: "test", classifier: "trusted", type: "test-jar" },
+    });
+    assert.strictEqual(same, exact);
+  });
+
   test("snapshots bounded dependency qualifiers into canonical pull coordinates", () => {
     const configurations = ["compile", "runtime"];
     const qualifiers = {
       alias: "declared-alias",
+      architecture: "x86_64",
+      build: "build_0",
       classifier: "sources",
       configurations,
       digest: "sha256:abcdef",
       environment: "production",
+      epoch: "1",
+      nativeVersion: "1.0",
       platform: "x86_64-linux",
       pullPolicy: "always",
+      release: "2.el9",
       repository: "registry.example.test",
       scope: "com.example",
       section: "dependencies",
       service: "api",
       stage: "builder",
+      subdir: "linux-64",
       tag: "latest",
       targetFramework: "net8.0",
       type: "jar",
@@ -283,17 +736,23 @@ suite("Canonical package domain", () => {
     configurations.push("test");
     assert.deepStrictEqual(coordinate.qualifiers, {
       alias: "declared-alias",
+      architecture: "x86_64",
+      build: "build_0",
       classifier: "sources",
       configurations: ["compile", "runtime"],
       digest: "sha256:abcdef",
       environment: "production",
+      epoch: "1",
+      nativeVersion: "1.0",
       platform: "x86_64-linux",
       pullPolicy: "always",
+      release: "2.el9",
       repository: "registry.example.test",
       scope: "com.example",
       section: "dependencies",
       service: "api",
       stage: "builder",
+      subdir: "linux-64",
       tag: "latest",
       targetFramework: "net8.0",
       type: "jar",
@@ -841,6 +1300,26 @@ suite("Canonical package domain", () => {
       policy: Object.create({ violated: false }),
     });
     assert.throws(() => fromPackageSelection(inheritedNested), PackageAdapterError);
+  });
+
+  test("rejects oversized tag arrays before enumerating their indexes", () => {
+    let ownKeysCalls = 0;
+    let indexDescriptorReads = 0;
+    const oversized = new Proxy(new Array(1_000_000), {
+      ownKeys() {
+        ownKeysCalls += 1;
+        return Reflect.ownKeys(new Array(1_000_000));
+      },
+      getOwnPropertyDescriptor(target, property) {
+        if (property !== "length") indexDescriptorReads += 1;
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
+    });
+    const record = apiRecord({ tags: { info: oversized, version: [] } });
+
+    assert.throws(() => fromApiPackageRecord(record), PackageAdapterError);
+    assert.strictEqual(ownKeysCalls, 0);
+    assert.strictEqual(indexDescriptorReads, 0);
   });
 
   test("deeply frozen nested values reject mutation attempts", () => {

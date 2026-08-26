@@ -1,6 +1,10 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const vscode = require("vscode");
 const { fromApiPackageRecord } = require("../domain/packageAdapters");
+const {
+  PULL_THROUGH_API_KEY_MESSAGE,
+  isPullThroughAvailable,
+} = require("../domain/authCapabilities");
 const { CloudsmithAPI } = require("./cloudsmithAPI");
 const { CredentialManager } = require("./credentialManager");
 const { apiEndpoint } = require("./apiEndpoint");
@@ -122,6 +126,7 @@ class UpstreamPullService {
     this._showWarningMessage = options.showWarningMessage || vscode.window.showWarningMessage.bind(vscode.window);
     this._upstreamRuntime = options.upstreamRuntime;
     this._connectionManager = resolveConnectionManager(context, options.connectionManager);
+    this._authenticationCapabilitySource = options.connectionManager || this._connectionManager;
     this._checkPackageAbsence = typeof options.checkPackageAbsence === "function"
       ? options.checkPackageAbsence
       : this._checkExactPackageAbsence.bind(this);
@@ -150,6 +155,12 @@ class UpstreamPullService {
     };
   }
 
+  async _requirePullThroughCapability() {
+    if (isPullThroughAvailable(this._authenticationCapabilitySource)) return true;
+    await this._showErrorMessage(PULL_THROUGH_API_KEY_MESSAGE);
+    return false;
+  }
+
   async prepare({
     workspace,
     repositoryHint,
@@ -159,6 +170,7 @@ class UpstreamPullService {
     signal = null,
     account = null,
   }) {
+    if (!await this._requirePullThroughCapability()) return null;
     const operation = this._createPreparationOperation(
       cancellationToken || token,
       signal,
@@ -306,6 +318,7 @@ class UpstreamPullService {
     signal = null,
     account = null,
   }) {
+    if (!await this._requirePullThroughCapability()) return null;
     const operation = this._createPreparationOperation(
       cancellationToken || token,
       signal,
@@ -430,6 +443,7 @@ class UpstreamPullService {
   }
 
   async execute(prepared, options = {}) {
+    if (!await this._requirePullThroughCapability()) return null;
     if (!this._isPreparedAccountCurrent(prepared)) {
       return { canceled: true, stale: true };
     }
@@ -497,9 +511,9 @@ class UpstreamPullService {
       return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
     }
     if (!apiKey) {
-      const message = this._credentialManager.getCredentialKind?.() === "sso"
-        ? "Upstream registry pull currently requires a Cloudsmith API key. Your SSO session was not sent to the registry."
-        : "Authentication failed. Check your API key in Cloudsmith settings.";
+      const message = isPullThroughAvailable(this._authenticationCapabilitySource)
+        ? "Authentication failed. Check your API key in Cloudsmith settings."
+        : PULL_THROUGH_API_KEY_MESSAGE;
       await this._showErrorMessage(message);
       return null;
     }

@@ -322,4 +322,59 @@ suite("Dependency command runtime state", () => {
       harness.dispose();
     }
   });
+
+  test("sort and filter picker ignores a second accept while the first mutation is pending", async () => {
+    const acceptListeners = new Set();
+    const hideListeners = new Set();
+    const subscribe = listeners => listener => {
+      listeners.add(listener);
+      return { dispose() { listeners.delete(listener); } };
+    };
+    const quickPick = {
+      items: [],
+      selectedItems: [],
+      busy: false,
+      onDidAccept: subscribe(acceptListeners),
+      onDidHide: subscribe(hideListeners),
+      show() {},
+      hide() { for (const listener of [...hideListeners]) listener(); },
+      dispose() {},
+    };
+    const harness = createHarness({
+      successful: true,
+      createQuickPick: () => quickPick,
+    });
+    const mutation = deferred();
+    let filterMode = null;
+    let setCalls = 0;
+    let clearCalls = 0;
+    harness.provider.getSortMode = () => "alphabetical";
+    harness.provider.getFilterMode = () => filterMode;
+    harness.provider.setFilterMode = async value => {
+      setCalls += 1;
+      filterMode = value;
+      await mutation.promise;
+    };
+    harness.provider.clearFilter = async () => { clearCalls += 1; };
+
+    const picker = harness.handlers.get("cloudsmith-vsc.depSortFilter")();
+    await Promise.resolve();
+    quickPick.selectedItems = [quickPick.items.find(item => (
+      item.action === "filter" && item.value === "vulnerable"
+    ))];
+    const accept = [...acceptListeners][0];
+    const first = accept();
+    await Promise.resolve();
+    const second = accept();
+    mutation.resolve();
+    await Promise.all([first, second]);
+
+    assert.strictEqual(setCalls, 1);
+    assert.strictEqual(clearCalls, 0);
+    assert.strictEqual(filterMode, "vulnerable");
+    assert.strictEqual(quickPick.busy, false);
+    quickPick.hide();
+    await picker;
+    harness.dispose();
+  });
 });

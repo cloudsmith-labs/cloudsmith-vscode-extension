@@ -3,11 +3,12 @@
 const vscode = require("vscode");
 
 class LoadMoreNode {
-    constructor(currentPage, totalPages, totalCount, loadedCount = null) {
+    constructor(currentPage, totalPages, totalCount, loadedCount = null, continuationClaim = null) {
         this.currentPage = currentPage;
         this.totalPages = totalPages;
         this.totalCount = totalCount;
         this.loadedCount = loadedCount;
+        this.continuationClaim = continuationClaim;
     }
 
     getTreeItem() {
@@ -23,6 +24,7 @@ class LoadMoreNode {
             command: {
                 command: 'cloudsmith-vsc.searchNextPage',
                 title: 'Load more results',
+                ...(this.continuationClaim ? { arguments: [this.continuationClaim] } : {}),
             },
         };
     }

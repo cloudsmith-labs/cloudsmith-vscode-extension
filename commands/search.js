@@ -366,7 +366,7 @@ function registerSearchCommands(deps) {
   return registerCommands(registerCommand, [
     ["cloudsmith-vsc.searchPackages", searchPackages],
     ["cloudsmith-vsc.clearSearch", () => searchProvider.clear()],
-    ["cloudsmith-vsc.searchNextPage", () => searchProvider.loadNextPage()],
+    ["cloudsmith-vsc.searchNextPage", claim => searchProvider.loadNextPage(claim)],
     ["cloudsmith-vsc.searchInWorkspace", searchInWorkspace],
     ["cloudsmith-vsc.guidedSearch", guidedSearch],
     ["cloudsmith-vsc.filterVulnerable", filterVulnerable],

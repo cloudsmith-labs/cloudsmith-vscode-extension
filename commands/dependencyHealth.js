@@ -3,6 +3,10 @@
 const { aggregateDisposables, registerCommands } = require("./registrar");
 const { runDependencyScan } = require("../util/dependencyScanOrchestration");
 const {
+  PULL_THROUGH_API_KEY_MESSAGE,
+  isPullThroughAvailable,
+} = require("../domain/authCapabilities");
+const {
   captureCommandAccount,
   isCommandAccountCurrent,
   resolveCommandRepository,
@@ -119,7 +123,9 @@ async function showDependencySortFilterPicker(
     quickPick.matchOnDescription = true;
     quickPick.ignoreFocusOut = true;
     refreshItems();
+    let accepting = false;
     disposables.push(quickPick.onDidAccept(async () => {
+      if (accepting) return;
       if (closed || !account.isCurrent() || !isApplicable()) {
         close(true);
         return;
@@ -129,6 +135,7 @@ async function showDependencySortFilterPicker(
         quickPick.hide();
         return;
       }
+      accepting = true;
       quickPick.busy = true;
       try {
         if (!account.isCurrent() || !isApplicable()) {
@@ -151,6 +158,7 @@ async function showDependencySortFilterPicker(
         }
         refreshItems();
       } finally {
+        accepting = false;
         if (!closed) quickPick.busy = false;
       }
     }));
@@ -200,6 +208,12 @@ function registerDependencyHealthCommands(deps) {
     if (!account) return undefined;
     if (!isCommandAccountCurrent(account) || !isDependencyCommandApplicable()) return undefined;
     return mutation(account);
+  };
+
+  const requirePullThroughCapability = async () => {
+    if (isPullThroughAvailable(deps.workspaceAccess?.connectionManager)) return true;
+    await vscode.window.showErrorMessage(PULL_THROUGH_API_KEY_MESSAGE);
+    return false;
   };
 
   const getOpenProjectFolders = () => (vscode.workspace.workspaceFolders || [])
@@ -387,6 +401,7 @@ function registerDependencyHealthCommands(deps) {
     );
   };
   const pullSingleDependency = async (item) => {
+    if (!await requirePullThroughCapability()) return;
     const account = captureApplicableAccount();
     if (!account || deps.isCurrentDependencySelection?.(item) !== true) return;
     let coordinate;
@@ -448,9 +463,10 @@ function registerDependencyHealthCommands(deps) {
     ["cloudsmith-vsc.scanDependenciesComplete", scanDependencies],
     ["cloudsmith-vsc.rescanDependencies", scanDependencies],
     ["cloudsmith-vsc.changeDependencyScanScope", changeDependencyScanScope],
-    ["cloudsmith-vsc.pullDependencies", () => runApplicableMutation(
-      () => dependencyHealthProvider.pullDependencies()
-    )],
+    ["cloudsmith-vsc.pullDependencies", async () => {
+      if (!await requirePullThroughCapability()) return undefined;
+      return runApplicableMutation(() => dependencyHealthProvider.pullDependencies());
+    }],
     ["cloudsmith-vsc.pullSingleDependency", pullSingleDependency],
     ["cloudsmith-vsc.cycleDepView", cycleDepView],
     ["cloudsmith-vsc.cycleDepViewDirect", cycleDepView],

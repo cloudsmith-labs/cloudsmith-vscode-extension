@@ -27,6 +27,8 @@ const {
 } = require("../util/dependencyRecord");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { bindConnectionManager } = require("../util/connectionManager");
+const { analyzeUpstreamGaps } = require("../util/upstreamGapAnalyzer");
+const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
 const { createPackageCoordinate, isExactPackage } = require("../domain/package");
 const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const {
@@ -85,7 +87,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     }
   }
 
-  function createContext(isConnected = "true") {
+  function createContext(isConnected = "true", credentialKind = "api-key") {
     const context = {
       secrets: {
         onDidChange() {},
@@ -108,6 +110,11 @@ suite("DependencyHealthProvider Test Suite", () => {
           sessionConnected: connected,
           status: connected ? "connected" : "absent",
         });
+      },
+      getAuthenticationCapabilities() {
+        return {
+          pullThroughAvailable: connected && credentialKind === "api-key",
+        };
       },
     };
     bindConnectionManager(context, connectionManager);
@@ -1345,6 +1352,354 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(provider.getReportData(), priorReport);
     assert.strictEqual(diagnostics.current, priorDiagnostics);
     assert.strictEqual(diagnostics.replacements.length, 1);
+  });
+
+  test("real upstream analysis times out a nonsettling repository before a truthful scan terminal", async function () {
+    this.timeout(2000);
+    const repositories = Array.from({ length: 13 }, (_value, index) => `repo-${index + 1}`);
+    const thirteenthStarted = deferred();
+    const progressMessages = [];
+    const publicationSequence = [];
+    let progressActive = false;
+
+    const upstreamGapRuntime = {
+      createOperationScope(options = {}) {
+        const controller = new AbortController();
+        const scheduler = new UpstreamOperationScheduler();
+        const cancellation = options.cancellationToken?.onCancellationRequested?.(() => {
+          controller.abort();
+          scheduler.cancel();
+        });
+        return Object.freeze({
+          scheduler,
+          signal: controller.signal,
+          account: options.account,
+          dispose() {
+            cancellation?.dispose?.();
+            controller.abort();
+            scheduler.cancel();
+          },
+        });
+      },
+      async getRepositoryUpstreamStateForFormats(_workspace, repo, _formats, options) {
+        if (repo === "repo-13") {
+          thirteenthStarted.resolve();
+          await new Promise((resolve) => {
+            if (options.operationScope.signal.aborted) {
+              resolve();
+              return;
+            }
+            options.operationScope.signal.addEventListener("abort", resolve, { once: true });
+          });
+          return {
+            groupedUpstreams: new Map(),
+            complete: false,
+            failedFormats: [],
+            uninspectedFormats: ["python"],
+          };
+        }
+        return {
+          groupedUpstreams: new Map(),
+          complete: true,
+          failedFormats: [],
+          uninspectedFormats: [],
+        };
+      },
+    };
+    const provider = new DependencyHealthProvider(
+      createContext(),
+      createDiagnosticsPublisher(),
+      {
+        ...currentProjectOptions(),
+        upstreamGapRuntime,
+        analyzeUpstreamGaps(dependencies, workspace, repositoryItems, options) {
+          return analyzeUpstreamGaps(dependencies, workspace, repositoryItems, {
+            ...options,
+            repositoryOperationTimeoutMs: 5,
+          });
+        },
+        fetchRepositories: async () => ({ items: repositories, complete: true }),
+        enrichVulnerabilities: async () => {},
+        enrichLicenses: async () => {},
+        enrichPolicies: async () => {},
+        userInteraction: createUserInteraction({
+          async withProgress(_options, task) {
+            const source = createCancellationSource();
+            progressActive = true;
+            try {
+              return await task({
+                report(update) {
+                  if (!update?.message) return;
+                  progressMessages.push(update.message);
+                  publicationSequence.push(`progress:${update.message}`);
+                },
+              }, source.token);
+            } finally {
+              progressActive = false;
+              source.dispose();
+            }
+          },
+        }),
+      }
+    );
+    try {
+      provider.onDidChangeTreeData(() => {
+        publicationSequence.push(provider.isScanRunning() ? "tree:running" : "tree:terminal");
+      });
+      provider._performScan = async function (workspace, repository, _folder, progress, token) {
+        const dependency = createProblemDependency(
+          "missing-python-package",
+          "1.0.0",
+          "/project-a/pyproject.toml",
+          "python"
+        );
+        this._lastManifests = [{ filePath: "/project-a/pyproject.toml", format: "python" }];
+        this._fullTrees = [{
+          ecosystem: "python",
+          sourceFile: "pyproject.toml",
+          dependencies: [dependency],
+        }];
+        this._displayTrees = cloneTrees(this._fullTrees);
+        this._warnings = [];
+        this._rebuildSummary();
+        await DependencyHealthProviderImplementation.prototype._runEnrichmentPasses.call(
+          this,
+          workspace,
+          repository,
+          progress,
+          token
+        );
+        if (token.isCancellationRequested) return { canceled: true };
+        this._rebuildSummary();
+        await this._storeReportData(new Date("2026-08-25T12:00:00.000Z"));
+        return { canceled: false };
+      };
+
+      const scan = provider.scan("workspace-a", null, "/project-a");
+      await thirteenthStarted.promise;
+      for (let attempt = 0; attempt < 20 && !progressMessages.some(message => (
+        message === "Checking upstream coverage... 12/13"
+      )); attempt += 1) {
+        await waitForTurn();
+      }
+      assert.ok(progressMessages.includes("Checking upstream coverage... 12/13"));
+      assert.strictEqual(provider.isScanRunning(), true);
+      assert.strictEqual(progressActive, true);
+      const runningItems = (await provider.getChildren()).map(node => node.getTreeItem());
+      assert.strictEqual(runningItems[0].label, "Scanning dependencies");
+
+      const result = await Promise.race([
+        scan,
+        new Promise((_resolve, reject) => {
+          setTimeout(() => reject(new Error("dependency scan did not settle upstream coverage")), 250);
+        }),
+      ]);
+
+      const terminalProgress = "Upstream coverage incomplete: 13/13 repositories checked";
+      assert.strictEqual(result.status, SCAN_STATES.SUCCEEDED);
+      assert.ok(progressMessages.includes(terminalProgress));
+      assert.strictEqual(progressActive, false);
+      assert.strictEqual(provider.isScanRunning(), false);
+      assert.strictEqual(provider.dependencies[0].upstreamStatus, "unknown");
+      assert.match(provider.dependencies[0].upstreamDetail, /could not be inspected completely/);
+      assert.ok(provider._warnings.includes(
+        "Upstream coverage is incomplete. Positive matches are shown; missing coverage remains unknown."
+      ));
+      const report = provider.getReportData();
+      assert.ok(report);
+      assert.strictEqual(report.uncoveredDeps[0].upstreamStatus, "unknown");
+      assert.match(report.uncoveredDeps[0].upstreamDetail, /could not be inspected completely/);
+      assert.strictEqual(report.summary.upstreamNoProxy, 0);
+      assert.strictEqual(progressMessages.filter(message => message === terminalProgress).length, 1);
+      const terminalProgressIndex = publicationSequence.indexOf(`progress:${terminalProgress}`);
+      const terminalTreeIndex = publicationSequence.lastIndexOf("tree:terminal");
+      assert.ok(terminalProgressIndex >= 0 && terminalTreeIndex > terminalProgressIndex);
+      const terminalItems = (await provider.getChildren()).map(node => node.getTreeItem());
+      assert.strictEqual(terminalItems.some(item => item.label === "Scanning dependencies"), false);
+      assert.strictEqual(terminalItems[0].contextValue, "dependencyHealthSummary");
+      assert.ok(terminalItems.some(item => (
+        item.contextValue === "statusMessage"
+        && item.label === "Upstream coverage is incomplete. Positive matches are shown; missing coverage remains unknown."
+      )));
+    } finally {
+      await provider.dispose();
+    }
+  });
+
+  test("complete upstream terminal reports checked coverage without an incomplete warning", async () => {
+    const progressMessages = [];
+    const dependency = createProblemDependency(
+      "complete-upstream-package",
+      "1.0.0",
+      "/project-a/package.json"
+    );
+    const provider = new DependencyHealthProvider(
+      createContext(),
+      createDiagnosticsPublisher(),
+      {
+        ...currentProjectOptions(),
+        async analyzeUpstreamGaps(_dependencies, _workspace, _repositories, { onProgress }) {
+          onProgress(new Map(), {
+            completed: 1,
+            inspected: 1,
+            total: 1,
+            terminal: true,
+            outcome: "complete",
+          });
+        },
+      }
+    );
+    try {
+      provider._fullTrees = [{ ecosystem: "npm", sourceFile: "package.json", dependencies: [dependency] }];
+      provider._displayTrees = cloneTrees(provider._fullTrees);
+      provider._warnings = [];
+      const source = createCancellationSource();
+      try {
+        await provider._runUpstreamGapAnalysis(
+          [dependency],
+          "workspace-a",
+          "repo-a",
+          { report(update) { if (update?.message) progressMessages.push(update.message); } },
+          source.token
+        );
+      } finally {
+        source.dispose();
+      }
+
+      assert.deepStrictEqual(progressMessages, ["Upstream coverage checked: 1/1"]);
+      assert.strictEqual(provider._warnings.some(warning => warning.includes("incomplete")), false);
+    } finally {
+      await provider.dispose();
+    }
+  });
+
+  test("real upstream cancellation closes progress without publishing partial state", async function () {
+    this.timeout(2000);
+    const diagnostics = createDiagnosticsPublisher();
+    const upstreamStarted = deferred();
+    const progressMessages = [];
+    let progressActive = false;
+    let progressSource = null;
+    let scanNumber = 0;
+
+    const upstreamGapRuntime = {
+      createOperationScope(options = {}) {
+        const controller = new AbortController();
+        const scheduler = new UpstreamOperationScheduler();
+        const cancellation = options.cancellationToken?.onCancellationRequested?.(() => {
+          controller.abort();
+          scheduler.cancel();
+        });
+        return Object.freeze({
+          scheduler,
+          signal: controller.signal,
+          account: options.account,
+          dispose() {
+            cancellation?.dispose?.();
+            controller.abort();
+            scheduler.cancel();
+          },
+        });
+      },
+      async getRepositoryUpstreamStateForFormats(_workspace, _repo, _formats, options) {
+        upstreamStarted.resolve();
+        await new Promise((resolve) => {
+          if (options.operationScope.signal.aborted) {
+            resolve();
+            return;
+          }
+          options.operationScope.signal.addEventListener("abort", resolve, { once: true });
+        });
+        return {
+          groupedUpstreams: new Map(),
+          complete: true,
+          failedFormats: [],
+          uninspectedFormats: [],
+        };
+      },
+    };
+    const provider = new DependencyHealthProvider(
+      createContext(),
+      diagnostics,
+      {
+        ...currentProjectOptions(),
+        upstreamGapRuntime,
+        analyzeUpstreamGaps,
+        fetchRepositories: async () => ({ items: ["repo-a"], complete: true }),
+        enrichVulnerabilities: async () => {},
+        enrichLicenses: async () => {},
+        enrichPolicies: async () => {},
+        userInteraction: createUserInteraction({
+          async withProgress(_options, task) {
+            const source = createCancellationSource();
+            progressSource = source;
+            progressActive = true;
+            try {
+              return await task({
+                report(update) {
+                  if (update?.message) progressMessages.push(update.message);
+                },
+              }, source.token);
+            } finally {
+              progressActive = false;
+              source.dispose();
+            }
+          },
+        }),
+      }
+    );
+    try {
+      provider._performScan = async function (workspace, repository, _folder, progress, token) {
+        scanNumber += 1;
+        const dependency = createProblemDependency(
+          scanNumber === 1 ? "known-good" : "cancelled-replacement",
+          "1.0.0",
+          "/project-a/package.json"
+        );
+        this._lastManifests = [{ filePath: "/project-a/package.json", format: "npm" }];
+        this._fullTrees = [{ ecosystem: "npm", sourceFile: "package.json", dependencies: [dependency] }];
+        this._displayTrees = cloneTrees(this._fullTrees);
+        this._warnings = [];
+        this._rebuildSummary();
+        if (scanNumber > 1) {
+          await DependencyHealthProviderImplementation.prototype._runEnrichmentPasses.call(
+            this,
+            workspace,
+            repository,
+            progress,
+            token
+          );
+          if (token.isCancellationRequested) return { canceled: true };
+        }
+        await this._storeReportData(new Date("2026-08-25T12:00:00.000Z"));
+        return { canceled: false };
+      };
+
+      assert.strictEqual(
+        (await provider.scan("workspace-a", null, "/project-a")).status,
+        SCAN_STATES.SUCCEEDED
+      );
+      const priorDependencies = provider.dependencies;
+      const priorReport = provider.getReportData();
+      const priorDiagnostics = diagnostics.current;
+      progressMessages.length = 0;
+
+      const rescan = provider.rescan();
+      await upstreamStarted.promise;
+      assert.strictEqual(progressActive, true);
+      progressSource.cancel();
+      const result = await rescan;
+
+      assert.strictEqual(result.status, SCAN_STATES.CANCELLED);
+      assert.strictEqual(progressActive, false);
+      assert.strictEqual(progressMessages.some(message => message.startsWith("Upstream coverage incomplete")), false);
+      assert.strictEqual(provider.dependencies, priorDependencies);
+      assert.strictEqual(provider.getReportData(), priorReport);
+      assert.strictEqual(diagnostics.current, priorDiagnostics);
+      assert.strictEqual(provider._warnings.some(warning => warning.includes("Upstream coverage is incomplete")), false);
+    } finally {
+      await provider.dispose();
+    }
   });
 
   test("successful retry clears the failed operation state", async () => {
@@ -3792,6 +4147,71 @@ suite("DependencyHealthProvider Test Suite", () => {
     provider.dispose();
   });
 
+  test("terminal canonical vulnerability publication refreshes stored compliance truth", () => {
+    let listener = null;
+    let state = Object.freeze({
+      status: "unknown",
+      complete: false,
+      stale: false,
+      detected: true,
+      reportedCount: 1,
+      count: null,
+      records: Object.freeze([]),
+    });
+    const vulnerabilityStateService = {
+      onDidChange(value) { listener = value; return { dispose() { listener = null; } }; },
+      prime() { return state; },
+    };
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      vulnerabilityStateService,
+    });
+    provider._fullTrees = [{
+      ecosystem: "npm",
+      sourceFile: "package-lock.json",
+      dependencies: [{
+        ...createFoundDependency("left-pad", "1.0.0"),
+        vulnerabilities: {
+          count: 1,
+          countKnown: true,
+          countAuthoritative: true,
+          detected: true,
+          unknown: false,
+          detailsLoaded: false,
+          entries: [],
+        },
+      }],
+    }];
+    provider._lastScanTimestamp = "2026-08-09T12:00:00.000Z";
+    provider._reportData = provider._buildComplianceReportData(provider._lastScanTimestamp);
+
+    assert.strictEqual(provider.getReportData().summary.vulnerabilityCoverageComplete, false);
+    assert.strictEqual(provider.getReportData().vulnerableDeps[0].maxSeverity, null);
+
+    state = Object.freeze({
+      status: "complete-vulnerable",
+      complete: true,
+      stale: false,
+      count: 1,
+      maxSeverity: "Medium",
+      records: Object.freeze([Object.freeze({
+        vulnerability_id: "CVE-2026-53550",
+        severity: "Medium",
+        fixed_version: Object.freeze({ version: "2.0.0" }),
+      })]),
+    });
+    listener(Object.freeze({ identity: "left-pad", state }));
+
+    const report = provider.getReportData();
+    assert.strictEqual(report.summary.vulnerabilityCoverageComplete, true);
+    assert.strictEqual(report.summary.mediumCount, 1);
+    assert.deepStrictEqual(report.vulnerableDeps.map(row => ({
+      count: row.cveCount,
+      severity: row.maxSeverity,
+      hasFixAvailable: row.hasFixAvailable,
+    })), [{ count: 1, severity: "Medium", hasFixAvailable: true }]);
+    provider.dispose();
+  });
+
   test("_runLicenseEnrichment flushes multiple progress patches in one refresh", async () => {
     const provider = new DependencyHealthProvider(createContext(), null, {
       enrichLicenses: async (_dependencies, options = {}) => {
@@ -3830,6 +4250,56 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(refreshCount, 1);
     assert.strictEqual(provider._fullTrees[0].dependencies[0].license.spdx, "Apache-2.0");
     assert.strictEqual(provider._displayTrees[0].dependencies[0].license.spdx, "Apache-2.0");
+  });
+
+  test("SSO pull entry points stop before progress, preparation, or execution", async () => {
+    let progressCalls = 0;
+    let bulkCalls = 0;
+    let singlePreparationCalls = 0;
+    let executionCalls = 0;
+    const errors = [];
+    const provider = new DependencyHealthProvider(createContext("true", "sso"), null, {
+      userInteraction: createUserInteraction({
+        async withProgress() {
+          progressCalls += 1;
+          throw new Error("progress must not start");
+        },
+        showErrorMessage(message) { errors.push(message); },
+      }),
+      upstreamPullService: {
+        async run() { bulkCalls += 1; },
+        async prepareSingle() { singlePreparationCalls += 1; },
+        async execute() { executionCalls += 1; },
+      },
+    });
+    provider.lastWorkspace = "workspace-a";
+    provider.lastRepo = "repo-a";
+    provider._projectFolderPath = "/project";
+    provider._hasSuccessfulScan = true;
+    provider._fullTrees = [{ dependencies: [createProblemDependency(
+      "dependency",
+      "1.0.0",
+      "/project/package.json"
+    )] }];
+
+    await provider.pullDependencies();
+    await provider.pullSingleDependency(null);
+
+    assert.deepStrictEqual({
+      bulkCalls,
+      executionCalls,
+      progressCalls,
+      singlePreparationCalls,
+    }, {
+      bulkCalls: 0,
+      executionCalls: 0,
+      progressCalls: 0,
+      singlePreparationCalls: 0,
+    });
+    assert.deepStrictEqual(errors, [
+      "Pull-through requires a Cloudsmith API key. Sign in with an API key to continue.",
+      "Pull-through requires a Cloudsmith API key. Sign in with an API key to continue.",
+    ]);
   });
 
   test("pullDependencies transports per-artifact verification receipts into bulk refresh", async () => {
@@ -4262,6 +4732,9 @@ suite("DependencyHealthProvider Test Suite", () => {
     const listeners = new Set();
     const connectionManager = {
       getState: () => Object.freeze({ ...state }),
+      getAuthenticationCapabilities() {
+        return { pullThroughAvailable: state.sessionConnected };
+      },
       onDidChange(listener) {
         listeners.add(listener);
         return { dispose() { listeners.delete(listener); } };

@@ -12,6 +12,11 @@ const { fromApiPackageRecord } = require("../domain/packageAdapters");
 const VulnerabilitySummaryNode = require("./vulnerabilitySummaryNode");
 const { markSelection } = require("../util/selectionProvenance");
 const { buildPackageRowDescription } = require("../util/packageTreePresentation");
+const {
+    PACKAGE_ACTION_SURFACES,
+    derivePackageActionCapabilities,
+    encodePackageActionContext,
+} = require("../domain/packageActionCapabilities");
 
 class SearchResultNode {
     constructor(pkg, context, options = {}) {
@@ -163,10 +168,31 @@ class SearchResultNode {
         if (this.vulnerability_policy_violated) {
             parts.push("Vulnerability policy violated");
         }
-        if (this.status_str_raw === "Quarantined" || this.policy_violated || this.deny_policy_violated) {
+        if (this.status_str_raw === "Quarantined") {
             parts.push("Open the context menu to explain quarantine or find a safe version");
+        } else if (this.policy_violated || this.deny_policy_violated) {
+            parts.push("Review policy findings in package details");
         }
         return parts.join(" — ");
+    }
+
+    getActionCapabilities() {
+        return derivePackageActionCapabilities({
+            surface: PACKAGE_ACTION_SURFACES.PACKAGE,
+            found: this.package?.identityState === "exact",
+            exact: this.package?.identityState === "exact",
+            copyable: this.package?.copyable === true,
+            vulnerable: Boolean(this.package?.vulnerability && (
+                this.package.vulnerability.detected === true
+                || (
+                    Number.isInteger(this.package.vulnerability.count)
+                    && this.package.vulnerability.count > 0
+                )
+            )),
+            quarantined: this.package?.status === "Quarantined",
+            policyViolation: this.package?.policy?.violated === true,
+            restrictiveLicense: this.licenseInfo?.tier === "restrictive",
+        });
     }
 
     getTreeItem() {
@@ -207,9 +233,10 @@ class SearchResultNode {
             description,
             tooltip: this._buildTooltip(),
             collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
-            contextValue: status === "Quarantined"
-                ? "packageQuarantined"
-                : this.is_copyable === true ? "package" : "packageNotCopyable",
+            contextValue: encodePackageActionContext(
+                "packageActions",
+                this.getActionCapabilities()
+            ),
             iconPath: iconPath,
         };
     }
