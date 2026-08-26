@@ -104,6 +104,14 @@ suite("M9 release gate helpers", () => {
       path.join(__dirname, "../.github/workflows/deep-quality.yml"),
       "utf8"
     );
+    const coreMutationJob = workflow.slice(
+      workflow.indexOf("  core-mutation:"),
+      workflow.indexOf("  black-box-ui-boundary:")
+    );
+    const blockedUiJob = workflow.slice(workflow.indexOf("  black-box-ui-boundary:"));
+    assert.match(coreMutationJob, /fetch-depth:\s+0/);
+    assert.match(blockedUiJob, /- name: Checkout exact source[\s\S]*persist-credentials:\s+false/);
+    assert.match(blockedUiJob, /- name: Set up exact Node\.js[\s\S]*node-version:\s+\$\{\{ env\.NODE_VERSION \}\}/);
     assert.match(workflow, /node scripts\/quality\/run-ui-smoke\.js/);
     assert.match(workflow, /\[\[ "\$status" -ne 2 \]\]/);
     assert.doesNotMatch(workflow, /fs\.writeFileSync|CLOUDSMITH_UI_SECRET_BOUNDARY_ACK/);
@@ -111,7 +119,8 @@ suite("M9 release gate helpers", () => {
 
   test("CI retains the minimum VS Code contract and current stable 1.134.0 matrix", () => {
     const workflow = fs.readFileSync(path.join(__dirname, "../.github/workflows/main.yml"), "utf8");
-    assert.match(workflow, /vscode: 1\.99\.0[\s\S]*label: core/);
+    assert.match(workflow, /- os: [^\n]+\n\s+vscode: 1\.99\.0\n\s+label: core/);
+    assert.match(workflow, /- os: [^\n]+\n\s+vscode: 1\.99\.0\n\s+label: smoke/);
     for (const os of ["ubuntu-24.04", "windows-2025", "macos-15"]) {
       assert.match(workflow, new RegExp(`os: ${os}[\\s\\S]*?vscode: 1\\.134\\.0`));
     }

@@ -1,5 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 import { defineConfig } from "@vscode/test-cli";
+import fs from "fs";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -37,14 +38,27 @@ const common = {
 function isolatedHost(label) {
   const runRoot = path.join(os.tmpdir(), `cloudsmith-vsc-${label}-${process.pid}`);
   const extensionsDir = path.join(runRoot, "extensions");
+  const userDataDir = path.join(runRoot, "user-data");
+  const userSettingsDir = path.join(userDataDir, "User");
+  fs.mkdirSync(userSettingsDir, { recursive: true });
+  fs.writeFileSync(path.join(userSettingsDir, "settings.json"), `${JSON.stringify({
+    "chat.disableAIFeatures": true,
+    "chat.enabled": false,
+  }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   return {
     env: {
       EXPECTED_EXTENSIONS_DIR: extensionsDir,
       EXPECTED_VSCODE_VERSION: version,
     },
     launchArgs: [
-      `--user-data-dir=${path.join(runRoot, "user-data")}`,
+      `--user-data-dir=${userDataDir}`,
       `--extensions-dir=${extensionsDir}`,
+      "--disable-extension=vscode.git",
+      "--disable-extension=vscode.github",
+      "--disable-extension=vscode.github-authentication",
+      "--disable-extension=vscode.microsoft-authentication",
+      "--disable-extension=GitHub.copilot",
+      "--disable-extension=GitHub.copilot-chat",
     ],
   };
 }

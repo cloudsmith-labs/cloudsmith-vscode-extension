@@ -25,6 +25,11 @@ function isWithin(candidatePath, rootPath) {
     || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
+function isAllowedNonHarnessExtensionPath(candidatePath, expectedExtensionsDir, appRoot) {
+  return isWithin(candidatePath, expectedExtensionsDir)
+    || isWithin(candidatePath, appRoot);
+}
+
 function deferred() {
   let resolve;
   const promise = new Promise(res => { resolve = res; });
@@ -145,10 +150,25 @@ suite("Extension activation smoke", () => {
     assert.strictEqual(path.isAbsolute(expectedExtensionsDirValue), true);
     const expectedExtensionsDir = fs.realpathSync(expectedExtensionsDirValue);
     const vscodeTestRoot = fs.realpathSync(path.join(PRODUCT_ROOT, ".vscode-test"));
+    const appRoot = fs.realpathSync(vscode.env.appRoot);
+    assert.strictEqual(
+      isWithin(appRoot, vscodeTestRoot),
+      true,
+      "The tested editor application must come from the controlled repository-local download"
+    );
+    assert.strictEqual(
+      isAllowedNonHarnessExtensionPath(
+        path.join(vscodeTestRoot, "extensions"),
+        expectedExtensionsDir,
+        appRoot
+      ),
+      false,
+      "A persistent repository-local extensions directory must not be trusted as editor-bundled provenance"
+    );
     const repositoryExtensions = vscode.extensions.all
       .filter(extension => (
         isWithin(extension.extensionPath, PRODUCT_ROOT)
-        && !isWithin(extension.extensionPath, vscodeTestRoot)
+        && !isWithin(extension.extensionPath, appRoot)
       ))
       .map(extension => extension.id)
       .sort();
@@ -162,8 +182,11 @@ suite("Extension activation smoke", () => {
         .filter(extension => (
           !extension.isBuiltin
           && extension.id !== TEST_HARNESS_ID
-          && !isWithin(extension.extensionPath, expectedExtensionsDir)
-          && !isWithin(extension.extensionPath, vscodeTestRoot)
+          && !isAllowedNonHarnessExtensionPath(
+            extension.extensionPath,
+            expectedExtensionsDir,
+            appRoot
+          )
         ))
         .map(extension => extension.id)
         .sort(),

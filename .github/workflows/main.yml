@@ -117,6 +117,9 @@ jobs:
             vscode: 1.99.0
             label: core
           - os: ubuntu-24.04
+            vscode: 1.99.0
+            label: smoke
+          - os: ubuntu-24.04
             vscode: 1.134.0
             label: core
           - os: windows-2025

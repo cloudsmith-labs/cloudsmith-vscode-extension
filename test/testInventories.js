@@ -1,3 +1,5 @@
+const path = require("path");
+
 const STANDALONE_NODE_TESTS = Object.freeze([
   "test/accountOperation.test.js",
   "test/apiEndpoint.test.js",
@@ -125,6 +127,38 @@ const CREDENTIAL_BOUNDARY_EXCLUDED_TESTS = Object.freeze([
 
 const CREDENTIAL_BOUNDARY_SKIP_REASON = "Credential-bearing automated live suites are excluded from qualification; live acceptance may use only an existing authenticated session and sanitized evidence.";
 const CREDENTIAL_LIKE_ENVIRONMENT = /(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSCODE|MFA|CREDENTIAL|KEYCHAIN|ONEPASSWORD|1PASSWORD|PRIVATE_?KEY|ACCESS_?KEY|REFRESH_?TOKEN)/iu;
+const QUALIFICATION_ENVIRONMENT_ALLOWLIST = Object.freeze([
+  "PATH",
+  "PATHEXT",
+  "SYSTEMROOT",
+  "WINDIR",
+  "COMSPEC",
+  "PROCESSOR_ARCHITECTURE",
+  "NUMBER_OF_PROCESSORS",
+  "LANG",
+  "TERM",
+  "COLORTERM",
+  "FORCE_COLOR",
+  "NO_COLOR",
+  "CI",
+  "GITHUB_ACTIONS",
+  "RUNNER_OS",
+  "RUNNER_ARCH",
+  "DISPLAY",
+  "WAYLAND_DISPLAY",
+  "XAUTHORITY",
+  "DBUS_SESSION_BUS_ADDRESS",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "USER",
+  "LOGNAME",
+  "USERNAME",
+  "SHELL",
+  "VSCODE_TEST_VERSION",
+  "VSCODE_TEST_LABEL",
+  "CLOUDSMITH_QUALITY_TEST_EVIDENCE",
+]);
 
 function assertCredentialFreeRequiredEnvironment(names) {
   if (!Array.isArray(names)) {
@@ -140,6 +174,46 @@ function assertCredentialFreeRequiredEnvironment(names) {
   return names;
 }
 
+function sanitizeQualificationEnvironment(environment, isolatedHome) {
+  if (!environment || typeof environment !== "object" || Array.isArray(environment)) {
+    throw new TypeError("Qualification environment must be an object.");
+  }
+  if (typeof isolatedHome !== "string" || !isolatedHome || !path.isAbsolute(isolatedHome)) {
+    throw new Error("Qualification isolated home must be an absolute path.");
+  }
+  const sourceEntries = Object.entries(environment);
+  const readCaseInsensitive = expectedName => {
+    const entry = sourceEntries.find(([name]) => name.toUpperCase() === expectedName);
+    return entry?.[1];
+  };
+  const sanitized = {};
+  for (const name of QUALIFICATION_ENVIRONMENT_ALLOWLIST) {
+    const value = readCaseInsensitive(name);
+    if (typeof value === "string" && value.length <= 32768 && !value.includes("\u0000")) {
+      sanitized[name] = value;
+    }
+  }
+  for (const [name, value] of sourceEntries) {
+    if (/^LC_[A-Z0-9_]{1,64}$/u.test(name)
+      && typeof value === "string"
+      && value.length <= 1024
+      && !value.includes("\u0000")) {
+      sanitized[name] = value;
+    }
+  }
+  Object.assign(sanitized, {
+    HOME: isolatedHome,
+    USERPROFILE: isolatedHome,
+    XDG_CONFIG_HOME: path.join(isolatedHome, ".config"),
+    XDG_CACHE_HOME: path.join(isolatedHome, ".cache"),
+    XDG_DATA_HOME: path.join(isolatedHome, ".local", "share"),
+    XDG_STATE_HOME: path.join(isolatedHome, ".local", "state"),
+    APPDATA: path.join(isolatedHome, "AppData", "Roaming"),
+    LOCALAPPDATA: path.join(isolatedHome, "AppData", "Local"),
+  });
+  return Object.freeze(sanitized);
+}
+
 const QUALIFICATION_REQUIRED_ENV = Object.freeze(
   assertCredentialFreeRequiredEnvironment([])
 );
@@ -152,4 +226,5 @@ module.exports = {
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,
   assertCredentialFreeRequiredEnvironment,
+  sanitizeQualificationEnvironment,
 };

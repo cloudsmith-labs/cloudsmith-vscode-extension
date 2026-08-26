@@ -1,9 +1,12 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
+const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
 const {
   QUALIFICATION_REQUIRED_ENV,
   assertCredentialFreeRequiredEnvironment,
+  sanitizeQualificationEnvironment,
 } = require("../test/testInventories");
 
 const root = path.resolve(__dirname, "..");
@@ -22,6 +25,8 @@ if (!label || !["core", "smoke"].includes(label)) {
   throw new Error("The VS Code qualification label must be core or smoke; credential-bearing live automation is excluded");
 }
 assertCredentialFreeRequiredEnvironment(QUALIFICATION_REQUIRED_ENV);
+const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-vsc-host-home-"));
+const qualificationEnvironment = sanitizeQualificationEnvironment(process.env, isolatedHome);
 
 const cliArguments = [
   "--label",
@@ -51,12 +56,12 @@ if (!zeroProbe) {
   // shim there.
   if (!isWindows) {
     process.chdir(root);
-    process.execve(command, [command, ...commandArguments], process.env);
+    process.execve(command, [command, ...commandArguments], qualificationEnvironment);
     throw new Error("Failed to replace the VS Code test launcher");
   }
   const result = spawnSync(command, commandArguments, {
     cwd: root,
-    env: process.env,
+    env: qualificationEnvironment,
     shell: true,
     stdio: "inherit",
   });
@@ -71,7 +76,7 @@ if (!zeroProbe) {
 const result = spawnSync(command, commandArguments, {
   cwd: root,
   encoding: "utf8",
-  env: process.env,
+  env: qualificationEnvironment,
   shell: isWindows,
   stdio: "pipe",
 });

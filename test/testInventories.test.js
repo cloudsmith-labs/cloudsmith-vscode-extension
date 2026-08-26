@@ -9,6 +9,7 @@ const {
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,
   assertCredentialFreeRequiredEnvironment,
+  sanitizeQualificationEnvironment,
 } = require("./testInventories");
 
 const root = path.resolve(__dirname, "..");
@@ -100,6 +101,56 @@ suite("test runner inventories", () => {
     );
   });
 
+  test("qualification child environment drops ambient credentials and isolates home paths", () => {
+    const isolatedHome = path.join(root, ".quality", "synthetic-host-home");
+    const sanitized = sanitizeQualificationEnvironment({
+      PATH: "/safe/bin",
+      LANG: "en_US.UTF-8",
+      DISPLAY: ":99",
+      VSCODE_TEST_VERSION: "1.99.0",
+      CLOUDSMITH_QUALITY_TEST_EVIDENCE: "1",
+      CLOUDSMITH_API_KEY: "synthetic-secret",
+      ACCESS_TOKEN: "synthetic-secret",
+      SSH_AUTH_SOCK: "/private/synthetic-agent.sock",
+      HOME: "/private/synthetic-real-home",
+      USERPROFILE: "C:\\Users\\synthetic-real-home",
+      NODE_OPTIONS: "--require=/private/synthetic-hook.js",
+    }, isolatedHome);
+
+    assert.deepStrictEqual(
+      {
+        PATH: sanitized.PATH,
+        LANG: sanitized.LANG,
+        DISPLAY: sanitized.DISPLAY,
+        VSCODE_TEST_VERSION: sanitized.VSCODE_TEST_VERSION,
+        CLOUDSMITH_QUALITY_TEST_EVIDENCE: sanitized.CLOUDSMITH_QUALITY_TEST_EVIDENCE,
+      },
+      {
+        PATH: "/safe/bin",
+        LANG: "en_US.UTF-8",
+        DISPLAY: ":99",
+        VSCODE_TEST_VERSION: "1.99.0",
+        CLOUDSMITH_QUALITY_TEST_EVIDENCE: "1",
+      }
+    );
+    for (const name of [
+      "CLOUDSMITH_API_KEY",
+      "ACCESS_TOKEN",
+      "SSH_AUTH_SOCK",
+      "NODE_OPTIONS",
+    ]) {
+      assert.strictEqual(Object.hasOwn(sanitized, name), false);
+    }
+    assert.strictEqual(sanitized.HOME, isolatedHome);
+    assert.strictEqual(sanitized.USERPROFILE, isolatedHome);
+    assert.strictEqual(sanitized.XDG_CONFIG_HOME, path.join(isolatedHome, ".config"));
+    assert.strictEqual(sanitized.APPDATA, path.join(isolatedHome, "AppData", "Roaming"));
+    assert.strictEqual(
+      Object.values(sanitized).includes("synthetic-secret"),
+      false
+    );
+  });
+
   test("credential-bearing live suites are inventoried only as excluded inputs", () => {
     assert.deepStrictEqual(CREDENTIAL_BOUNDARY_EXCLUDED_TESTS, [
       "test/integration/policyDecisionLogs.test.js",
@@ -142,6 +193,22 @@ suite("test runner inventories", () => {
     assert.doesNotMatch(config, /extensionDevelopmentPath: repositoryRoot/);
     assert.match(config, /skipExtensionDependencies: true/);
     assert.doesNotMatch(config, /installExtensions\s*:/);
+    for (const extensionId of [
+      "vscode.git",
+      "vscode.github",
+      "vscode.github-authentication",
+      "vscode.microsoft-authentication",
+      "GitHub.copilot",
+      "GitHub.copilot-chat",
+    ]) {
+      assert.match(
+        config,
+        new RegExp(`--disable-extension=${extensionId.replaceAll(".", "\\.")}`),
+        `Credential-capable built-in extension remains enabled: ${extensionId}`
+      );
+    }
+    assert.match(config, /"chat\.disableAIFeatures": true/);
+    assert.match(config, /"chat\.enabled": false/);
 
     const harnessRoot = path.join(root, "test", "harness-extension");
     assert.notStrictEqual(fs.realpathSync(harnessRoot), fs.realpathSync(root));
