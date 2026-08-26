@@ -1,5 +1,8 @@
 const assert = require('assert');
-const { InstallCommandBuilder } = require('../../util/installCommandBuilder');
+const {
+  InstallCommandBuilder,
+  InstallCommandValidationError,
+} = require('../../util/installCommandBuilder');
 
 suite('Integration: Install Command Builder', function () {
 
@@ -71,10 +74,12 @@ suite('Integration: Install Command Builder', function () {
       'Should split artifactId from colon-separated name');
   });
 
-  test('unknown format returns comment fallback', function () {
-    const result = InstallCommandBuilder.build('unknown-fmt', 'pkg', '1.0', 'ws', 'repo');
-    assert.ok(result.command.startsWith('#'), 'Unknown format command should start with #');
-    assert.ok(result.note, 'Unknown format should have a note with web app link');
+  test('unknown format fails closed instead of returning comment-only guidance', function () {
+    assert.throws(
+      () => InstallCommandBuilder.build('unknown-fmt', 'pkg', '1.0', 'ws', 'repo'),
+      error => error instanceof InstallCommandValidationError
+        && error.field === 'Package format'
+    );
   });
 
   test('private-repo formats include auth notes', function () {

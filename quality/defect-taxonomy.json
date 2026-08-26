@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "idPattern": "^QH-[0-9]{3,}$",
+  "requiredFields": [
+    "id",
+    "severity",
+    "status",
+    "surface",
+    "workflowContract",
+    "failureClasses",
+    "customerImpact",
+    "reproductionConfidence",
+    "authoritativeExpectedOutcome",
+    "observedOutcome",
+    "firstKnownBadSha",
+    "evidence",
+    "rootCauseStatus",
+    "testLayerThatShouldHaveCaughtIt",
+    "whyItEscaped",
+    "regressionTest",
+    "mutationProof",
+    "fixedSha",
+    "liveVerification",
+    "releaseBlocking"
+  ],
+  "severities": {
+    "P0": {
+      "releaseBlocking": true,
+      "definition": "Credential or secret exposure, destructive or corrupting behavior, or an extension that is broadly unusable."
+    },
+    "P1": {
+      "releaseBlocking": true,
+      "definition": "A broken core advertised workflow, false clean/success/complete state, wrong identity, dead primary action, unbounded core operation, or security-boundary bypass."
+    },
+    "P2": {
+      "releaseBlockingWhenCore": true,
+      "definition": "A material recoverable defect, important cross-surface inconsistency, major discoverability/feedback problem, or significant accessibility issue."
+    },
+    "P3": {
+      "releaseBlocking": false,
+      "definition": "Minor polish, low-impact accessibility, or another non-blocking presentation defect."
+    }
+  },
+  "statuses": [
+    "open",
+    "fixed-pending-verification",
+    "fixed",
+    "blocked",
+    "deferred",
+    "closed-non-issue"
+  ],
+  "failureClasses": [
+    "contract-mismatch",
+    "provenance",
+    "canonical-identity",
+    "async-authority",
+    "stale-publication",
+    "terminal-state",
+    "pagination",
+    "boundedness",
+    "error-normalization",
+    "validation/security",
+    "auth-capability",
+    "cross-surface-parity",
+    "capability-composition",
+    "format-native-semantics",
+    "false-green-test",
+    "accessibility",
+    "documentation-drift"
+  ],
+  "reproductionConfidences": [
+    "confirmed-repeatable",
+    "confirmed-once",
+    "strong-static-evidence",
+    "suspected",
+    "blocked"
+  ],
+  "rootCauseStatuses": [
+    "unknown",
+    "suspected",
+    "proven"
+  ],
+  "testLayers": [
+    "unit",
+    "contract",
+    "extension-host",
+    "live-protocol",
+    "black-box-ui",
+    "documentation"
+  ],
+  "evidenceStatuses": [
+    "not-started",
+    "red-confirmed",
+    "green-confirmed",
+    "mutation-killed",
+    "live-pass",
+    "live-fail",
+    "partial",
+    "blocked",
+    "not-applicable"
+  ]
+}

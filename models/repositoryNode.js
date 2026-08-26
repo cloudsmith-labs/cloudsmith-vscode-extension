@@ -92,6 +92,7 @@ class RepositoryNode {
     this._metadataPromise = null;
     this._metadataChildren = [];
     this._metadataLoaded = false;
+    this._metadataRefreshOnSettle = false;
     this._entitlementNodes = new WeakSet();
   }
 
@@ -105,6 +106,7 @@ class RepositoryNode {
     this._metadataPromise = null;
     this._metadataChildren = [];
     this._metadataLoaded = false;
+    this._metadataRefreshOnSettle = false;
     this._entitlementNodes = new WeakSet();
   }
 
@@ -257,6 +259,7 @@ class RepositoryNode {
     this._metadataPromise = null;
     this._metadataChildren = [];
     this._metadataLoaded = false;
+    this._metadataRefreshOnSettle = false;
     this._entitlementNodes = new WeakSet();
   }
 
@@ -627,7 +630,12 @@ class RepositoryNode {
     if (!isAccountCurrent(this._connectionManager, account) || this._disposed) return [];
     const generation = this._generation;
     const descriptor = this._packageDescriptor;
-    const metadata = await this._getMetadataChildren(packages, account, generation, descriptor);
+    const metadata = await this._getMetadataForPublication(
+      packages,
+      account,
+      generation,
+      descriptor
+    );
     if (
       !isAccountCurrent(this._connectionManager, account)
       || this._disposed
@@ -668,6 +676,32 @@ class RepositoryNode {
     children.push(...metadata);
 
     return isAccountCurrent(this._connectionManager, account) ? children : [];
+  }
+
+  async _getMetadataForPublication(packages, account, generation, descriptor) {
+    if (this._metadataLoaded) return this._metadataChildren;
+    const metadataPromise = this._getMetadataChildren(
+      packages,
+      account,
+      generation,
+      descriptor
+    );
+    const result = await Promise.race([
+      metadataPromise.then(children => ({ settled: true, children })),
+      new Promise(resolve => {
+        setImmediate(() => resolve({ settled: false }));
+      }),
+    ]);
+    if (result.settled) return result.children;
+
+    // A network-backed supplement must not hold the primary package authority
+    // hostage. If it settles after this turn, publish packages now and ask the
+    // owning provider for one guarded refresh when the supplement is ready.
+    if (this._metadataLoaded) return this._metadataChildren;
+    if (this._isMetadataCurrent(account, generation, descriptor)) {
+      this._metadataRefreshOnSettle = true;
+    }
+    return [];
   }
 
   _createPackageTerminalNode(packages) {
@@ -741,7 +775,36 @@ class RepositoryNode {
   _getMetadataChildren(packages, account, generation, descriptor) {
     if (this._metadataLoaded) return Promise.resolve(this._metadataChildren);
     if (this._metadataPromise) return this._metadataPromise;
-    const promise = this._loadMetadataChildren(packages, account, generation, descriptor)
+    const promise = Promise.resolve()
+      .then(() => this._loadMetadataChildren(packages, account, generation, descriptor))
+      .catch(() => {
+        if (!this._isMetadataCurrent(account, generation, descriptor)) return [];
+        this._metadataChildren = Object.freeze([new InfoNode(
+          "Repository metadata: failed to load",
+          "Supplementary repository information is unavailable",
+          "Package results remain available.",
+          "warning"
+        )]);
+        this._metadataLoaded = true;
+        return this._metadataChildren;
+      })
+      .then(children => {
+        if (
+          this._metadataPromise === promise
+          && this._metadataRefreshOnSettle
+          && this._isMetadataCurrent(account, generation, descriptor)
+        ) {
+          this._metadataRefreshOnSettle = false;
+          try {
+            void Promise.resolve(this._requestRefresh(this)).catch(() => {});
+          } catch {
+            // Refresh observers are outside metadata ownership. A failing
+            // observer must not turn a settled supplement into an unhandled
+            // rejection or invalidate authoritative package rows.
+          }
+        }
+        return children;
+      })
       .finally(() => {
         if (this._metadataPromise === promise) this._metadataPromise = null;
       });

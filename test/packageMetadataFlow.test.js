@@ -241,7 +241,10 @@ suite("Package Metadata Flow Test Suite", () => {
       maxSeverity: "High",
       complete: true,
       detailed: true,
+      refreshFailure: null,
+      refreshing: false,
       revision: 1,
+      stale: false,
     });
     const vulnerabilityStateService = {
       prime() { return cachedVulnerable; },
@@ -786,6 +789,7 @@ suite("Package Metadata Flow Test Suite", () => {
     for (const [stateName, evidence] of states) {
       const record = {
         ...pkg,
+        format: "npm",
         status_str: evidence.quarantined ? "Quarantined" : "Completed",
         is_copyable: true,
         policy_violated: evidence.policyViolation === true,
@@ -824,6 +828,7 @@ suite("Package Metadata Flow Test Suite", () => {
           copyable: true,
           exact: true,
           found: true,
+          installGuidance: packageSurface || !evidence.quarantined,
           policyViolation: evidence.policyViolation === true,
           quarantined: evidence.quarantined === true,
           restrictiveLicense: evidence.restrictiveLicense === true,
@@ -835,6 +840,47 @@ suite("Package Metadata Flow Test Suite", () => {
           `${stateName} context on ${surfaceName}`
         );
       }
+    }
+  });
+
+  test("unsupported formats and incomplete native evidence hide Install on every package surface", () => {
+    const fixtures = [
+      ["unsupported format", { format: "swift", name: "widget", version: "1.2.3" }],
+      ["Maven groupId", { format: "maven", name: "widget", version: "1.2.3", identifiers: null }],
+      ["Conda qualifiers", { format: "conda", name: "numpy", version: "1.24.0", filename: null, cdn_url: null }],
+      ["RPM qualifiers", { format: "rpm", name: "httpd", version: "2.4.57", filename: null }],
+      ["Raw URL", { format: "raw", name: "artifact.tar.gz", version: "1.2.3", cdn_url: null }],
+      ["Generic URL", { format: "generic", name: "artifact.bin", version: "", cdn_url: null }],
+    ];
+
+    for (const [evidence, overrides] of fixtures) {
+      const record = {
+        ...pkg,
+        ...overrides,
+        slug_perm: `missing-${overrides.format}`,
+        status_str: "Completed",
+        is_copyable: true,
+      };
+      const surfaces = [
+        new PackageNode(record, {}),
+        new SearchResultNode(record, {}),
+        new DependencyHealthNode({
+          name: record.name,
+          version: record.version,
+          format: record.format,
+          cloudsmithStatus: "FOUND",
+          cloudsmithPackage: record,
+        }, null, {}),
+      ];
+
+      for (const node of surfaces) {
+        const capabilities = node.getActionCapabilities();
+        assert.strictEqual(capabilities.evidence.installGuidance, false, evidence);
+        assert.strictEqual(capabilities.actions.install, false, evidence);
+        assert.doesNotMatch(node.getTreeItem().contextValue, /\.install(?:\.|$)/u, evidence);
+      }
+      assert.strictEqual(surfaces[0].getActionCapabilities().actions.promote, true, evidence);
+      assert.strictEqual(surfaces[1].getActionCapabilities().actions.promote, true, evidence);
     }
   });
 

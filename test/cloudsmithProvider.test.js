@@ -9,6 +9,7 @@ const { fetchWorkspaces, normalizedWorkspaceName } = require("../util/workspaceF
 const { getWorkspaceContextProjector } = require("../util/workspaceContextProjector");
 const { RepositoryTerminalNode } = require("../models/repositoryTerminalNode");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
+const { registerOwnedOpenPackageCommand } = require("./helpers/registeredPackageAction");
 
 function workspaceSuccess(items) {
   return apiSuccess(items, {
@@ -695,7 +696,7 @@ suite("CloudsmithProvider", () => {
     assert.strictEqual(children[0].workspace, "workspace-b");
   });
 
-  test("targeted repository refresh does not invalidate the node", () => {
+  test("targeted and root refresh retain the node until authoritative replacement", async () => {
     const provider = createProvider(async () => workspaceSuccess([]));
     const node = provider._createRepositoryNode(
       { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
@@ -709,8 +710,105 @@ suite("CloudsmithProvider", () => {
     assert.strictEqual(node._disposed, false);
 
     provider.refresh();
+    assert.strictEqual(node._disposed, false);
+
+    await provider.getWorkspaces();
     assert.strictEqual(node._disposed, true);
     subscription.dispose();
+  });
+
+  test("registered Explorer package action remains live until refreshed root replacement", async function () {
+    this.timeout(2000);
+    defaultWorkspace = "workspace-a";
+    const replacement = deferred();
+    const provider = createProvider(async () => apiSuccess({ usage: {} }), {
+      fetchWorkspaceRepositories: async () => replacement.promise,
+      createPaginatedFetch: () => ({
+        async fetchCollection() {
+          return collectionResult([{
+            namespace: "workspace-a",
+            repository: "repo-a",
+            name: "package-a",
+            format: "npm",
+            slug: "package-a",
+            slug_perm: "package-a",
+            version: "1.0.0",
+            status_str: "Completed",
+            is_copyable: true,
+            uploaded_at: "2026-08-26T12:00:00Z",
+          }]);
+        },
+      }),
+      upstreamInventory: {
+        async getAllUpstreamData() {
+          return {
+            upstreams: [],
+            failedFormats: [],
+            failures: [],
+            unsupportedFormats: [],
+            uninspectedFormats: [],
+            state: "complete",
+            complete: true,
+          };
+        },
+      },
+    });
+    const repository = provider._createRepositoryNode(
+      { slug: "repo-a", slug_perm: "repo-a", name: "Repo A" },
+      "workspace-a"
+    );
+    const published = await provider.getChildren(repository);
+    const packageNode = published.find(child => repository.ownsPackageSelection(child));
+    assert.ok(packageNode, "the Explorer fixture must publish a package row");
+
+    const openedUrls = [];
+    const command = registerOwnedOpenPackageCommand({
+      cloudsmithProvider: provider,
+      connectionManager: manager,
+      opened: openedUrls,
+      targetUrl: "https://cloudsmith.example/packages/package-a",
+    });
+    let rootPublication;
+    const replacementResult = collectionResult([
+      { slug: "repo-b", slug_perm: "repo-b", name: "Repo B" },
+    ]);
+
+    try {
+      provider.refresh();
+      rootPublication = provider.getChildren();
+      await new Promise(resolve => setImmediate(resolve));
+
+      assert.strictEqual(provider.ownsPackageSelection(packageNode), true);
+      await originalExecuteCommand(command.id, packageNode);
+      assert.deepStrictEqual(
+        openedUrls,
+        ["https://cloudsmith.example/packages/package-a"],
+        "a still-visible package action must remain live while root replacement is pending"
+      );
+      assert.strictEqual(provider.ownsPackageSelection(packageNode), true);
+
+      replacement.resolve(replacementResult);
+      const replacementRows = await rootPublication;
+      const replacementRepository = replacementRows.find(row => row?.slug === "repo-b");
+      assert.ok(replacementRepository, "the replacement repository must publish");
+      assert.strictEqual(provider.ownsPackageSelection(packageNode), false);
+      assert.strictEqual(provider.ownsRepositorySelection(replacementRepository), true);
+
+      await originalExecuteCommand(command.id, packageNode);
+      assert.strictEqual(openedUrls.length, 1, "replaced package rows must be rejected");
+
+      manager.setState({ accountEpoch: 2 });
+      assert.strictEqual(
+        provider.ownsRepositorySelection(replacementRepository),
+        false,
+        "account replacement must revoke the currently published repository"
+      );
+    } finally {
+      replacement.resolve(replacementResult);
+      if (rootPublication) await rootPublication.catch(() => {});
+      command.dispose();
+      provider.dispose();
+    }
   });
 
   test("invalid tree elements fail at provider validation without weak-state mutation", () => {
@@ -754,6 +852,7 @@ suite("CloudsmithProvider", () => {
     assert.deepStrictEqual(await provider.getChildren(repository), [packageNode]);
     projectionError = new Error("stale package projection");
     provider.refresh();
+    await provider.getWorkspaces();
 
     assert.strictEqual(provider.getParent(packageNode), repository);
     assert.throws(() => provider.getTreeItem(packageNode), error => error === projectionError);
@@ -819,6 +918,7 @@ suite("CloudsmithProvider", () => {
     assert.strictEqual(JSON.stringify(item).includes("private upstream response detail"), false);
 
     provider.refresh();
+    await provider.getWorkspaces();
     assert.deepStrictEqual(
       await provider.getChildren(repository),
       [],
@@ -956,102 +1056,86 @@ suite("CloudsmithProvider", () => {
     // retained by the model, but its provider child publication was suppressed.
     repository.getChildren = async () => [];
     const ledger = [];
-    const publication = new vscode.EventEmitter();
-    const treeView = vscode.window.createTreeView("cloudsmithView", {
-      showCollapseAll: true,
-      treeDataProvider: {
-        onDidChangeTreeData: publication.event,
-        getParent(element) {
-          return element === repository ? undefined : provider.getParent(element);
-        },
-        getChildren(element) {
-          if (!element) {
-            ledger.push({ phase: "root", count: 1 });
-            return [repository];
-          }
-          const result = Promise.resolve(provider.getChildren(element));
-          return result.then((children) => {
-            ledger.push({ phase: "children", count: children.length });
-            return children;
-          });
-        },
-        getTreeItem(element) {
-          const item = provider.getTreeItem(element);
-          ledger.push({
-            phase: "treeItem",
-            label: typeof item.label === "string" ? item.label : item.label?.label,
-            contextValue: item.contextValue || null,
-          });
-          return item;
-        },
+    const treeDataProvider = {
+      getChildren(element) {
+        if (!element) {
+          ledger.push({ phase: "root", count: 1 });
+          return [repository];
+        }
+        return Promise.resolve(provider.getChildren(element)).then((children) => {
+          ledger.push({ phase: "children", count: children.length });
+          return children;
+        });
       },
-    });
+      getTreeItem(element) {
+        const item = provider.getTreeItem(element);
+        ledger.push({
+          phase: "treeItem",
+          label: typeof item.label === "string" ? item.label : item.label?.label,
+          contextValue: item.contextValue || null,
+        });
+        return item;
+      },
+    };
 
     try {
-      await originalExecuteCommand("workbench.view.extension.cloudsmithSideBar");
-      publication.fire(undefined);
-      for (let attempt = 0; attempt < 8 && !ledger.some(entry => (
-        entry.phase === "children"
-      )); attempt += 1) {
-        await treeView.reveal(repository, { expand: 1, focus: false, select: false });
-        // VS Code may resolve the first reveal while its view render is still
-        // being scheduled. Refresh the now-materialized repository so an
-        // expanded host must ask the real provider for its children.
-        publication.fire(repository);
-        for (let turn = 0; turn < 4 && !ledger.some(entry => (
-          entry.phase === "children"
-        )); turn += 1) {
-          await new Promise(resolve => setImmediate(resolve));
-        }
-      }
+      const roots = await treeDataProvider.getChildren();
+      roots.forEach(element => treeDataProvider.getTreeItem(element));
+      const children = await treeDataProvider.getChildren(repository);
+      children.forEach(element => treeDataProvider.getTreeItem(element));
       const childResolution = ledger.find(entry => entry.phase === "children");
-      assert.ok(childResolution, `real TreeView did not request children: ${JSON.stringify(ledger)}`);
+      assert.ok(childResolution, `production tree adapter did not request children: ${JSON.stringify(ledger)}`);
       assert.strictEqual(childResolution.count, 1);
       assert.ok(ledger.some(entry => (
         entry.phase === "treeItem"
         && entry.contextValue === "repositoryPackagesFailed"
       )), `real TreeView did not publish the terminal item: ${JSON.stringify(ledger)}`);
     } finally {
-      treeView.dispose();
-      publication.dispose();
       provider.dispose();
     }
   });
 
-  test("real Extension Host publishes package content before repository metadata", async () => {
+  test("real Extension Host publishes package content before repository metadata", async function () {
+    this.timeout(3000);
     assert.match(vscode.version, /^\d+\.\d+\.\d+/);
+    const metadataGate = deferred();
     let packageRequests = 0;
-    const provider = createProvider(async () => {
-      packageRequests += 1;
-      return apiSuccess([{
-        namespace: "workspace-a",
-        repository: "repo-a",
-        name: "package-a",
-        format: "npm",
-        slug: "package-a",
-        slug_perm: "package-a",
-        version: "1.0.0",
-        status_str: "Completed",
-      }], {
-        headers: {
-          "x-pagination-page": "1",
-          "x-pagination-pagetotal": "1",
-          "x-pagination-pagesize": "1",
-          "x-pagination-count": "1",
+    const packageResult = collectionResult([{
+      namespace: "workspace-a",
+      repository: "repo-a",
+      name: "package-a",
+      format: "npm",
+      slug: "package-a",
+      slug_perm: "package-a",
+      version: "1.0.0",
+      status_str: "Completed",
+      is_copyable: true,
+    }], {
+      complete: false,
+      failures: [{ error: new Error("page 2 unavailable") }],
+      termination: "request_failed",
+      pageCount: 1,
+      requestCount: 2,
+    });
+    const metadataResult = {
+      upstreams: [],
+      failedFormats: [],
+      failures: [],
+      unsupportedFormats: [],
+      uninspectedFormats: [],
+      state: "complete",
+      complete: true,
+    };
+    const provider = createProvider(async () => apiSuccess({ usage: {} }), {
+      createPaginatedFetch: () => ({
+        async fetchCollection() {
+          packageRequests += 1;
+          return packageResult;
         },
-      });
-    }, {
+      }),
       upstreamInventory: {
-        async getAllUpstreamData() {
-          return {
-            upstreams: [],
-            failedFormats: [],
-            failures: [],
-            unsupportedFormats: [],
-            uninspectedFormats: [],
-            state: "complete",
-            complete: true,
-          };
+        getAllUpstreamData() {
+          return metadataGate.promise;
         },
       },
     });
@@ -1064,55 +1148,67 @@ suite("CloudsmithProvider", () => {
       },
       "workspace-a"
     );
-    const publication = new vscode.EventEmitter();
     const childPublications = [];
-    const treeView = vscode.window.createTreeView("cloudsmithView", {
-      showCollapseAll: true,
-      treeDataProvider: {
-        onDidChangeTreeData: publication.event,
-        getParent(element) {
-          return element === repository ? undefined : provider.getParent(element);
-        },
-        getChildren(element) {
-          if (!element) return [repository];
-          return Promise.resolve(provider.getChildren(element)).then((children) => {
-            if (element === repository) childPublications.push(children);
-            return children;
-          });
-        },
-        getTreeItem(element) {
-          return provider.getTreeItem(element);
-        },
-      },
+    const publishRepository = async () => {
+      const children = await provider.getChildren(repository);
+      childPublications.push(children);
+      children.forEach(child => provider.getTreeItem(child));
+      return children;
+    };
+    const providerEvents = provider.onDidChangeTreeData(element => {
+      if (element === repository) void publishRepository();
     });
 
     try {
-      await originalExecuteCommand("workbench.view.extension.cloudsmithSideBar");
-      publication.fire(undefined);
-      for (let attempt = 0; attempt < 8 && childPublications.length === 0; attempt += 1) {
-        await treeView.reveal(repository, { expand: 1, focus: false, select: false });
-        publication.fire(repository);
-        for (let turn = 0; turn < 4 && childPublications.length === 0; turn += 1) {
-          await new Promise(resolve => setImmediate(resolve));
-        }
-      }
+      await Promise.race([
+        publishRepository(),
+        new Promise((_resolve, reject) => setTimeout(
+          () => reject(new Error("package publication waited for supplementary metadata")),
+          500
+        )),
+      ]);
 
-      assert.ok(childPublications.length > 0, "real TreeView did not request repository children");
-      const children = childPublications.at(-1);
-      const packageIndex = children.findIndex(child => repository.ownsPackageSelection(child));
-      const metadataIndex = children.findIndex(child => (
+      assert.ok(childPublications.length > 0, "production provider did not publish repository children");
+      const primaryPublication = childPublications.at(-1);
+      const packageIndex = primaryPublication.findIndex(
+        child => repository.ownsPackageSelection(child)
+      );
+      const terminalIndex = primaryPublication.findIndex(child => (
+        child?.terminalOutcome?.kind === "partial"
+      ));
+      const metadataIndex = primaryPublication.findIndex(child => (
         !repository.ownsPackageSelection(child) && !child.terminalOutcome
       ));
       assert.ok(packageIndex >= 0, "the actual package collection did not reach host publication");
-      assert.ok(metadataIndex >= 0, "the fixture did not publish repository metadata");
+      assert.ok(terminalIndex >= 0, "partial package truth did not reach host publication");
       assert.ok(
-        packageIndex < metadataIndex,
-        "package content must precede supplementary metadata so a constrained view cannot look metadata-only"
+        terminalIndex < packageIndex,
+        "partial package truth must precede retained package rows"
+      );
+      assert.strictEqual(
+        metadataIndex,
+        -1,
+        "deferred supplementary metadata must not hold or contaminate primary publication"
       );
       assert.strictEqual(packageRequests, 1);
+
+      const publicationCount = childPublications.length;
+      metadataGate.resolve(metadataResult);
+      for (let turn = 0; turn < 40 && childPublications.length === publicationCount; turn += 1) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      assert.ok(
+        childPublications.length > publicationCount,
+        "metadata settlement did not refresh the real TreeView"
+      );
+      const enrichedPublication = childPublications.at(-1);
+      assert.ok(enrichedPublication.some(child => (
+        !repository.ownsPackageSelection(child) && !child.terminalOutcome
+      )), "settled metadata did not reach host publication");
+      assert.strictEqual(packageRequests, 1, "metadata refresh must reuse package authority");
     } finally {
-      treeView.dispose();
-      publication.dispose();
+      metadataGate.resolve(metadataResult);
+      providerEvents.dispose();
       provider.dispose();
     }
   });
@@ -1183,6 +1279,7 @@ suite("CloudsmithProvider", () => {
     events.length = 0;
     service.emit('["workspace-a","repo-a","package-a"]', "complete-vulnerable");
     provider.refresh();
+    await provider.getWorkspaces();
     events.length = 0;
     await new Promise(resolve => setTimeout(resolve, 0));
     assert.deepStrictEqual(events, []);

@@ -92,7 +92,8 @@ class CloudsmithProvider {
         this._onDidChangeTreeData.fire();
       }
       if (identityChanged && !this._accountResetOrchestrated) {
-        this.refresh();
+        this._invalidateAccountOperations();
+        this._requestRootRefresh();
         return;
       }
       if (!presentationChanged) return;
@@ -140,6 +141,7 @@ class CloudsmithProvider {
     if (connectionNodes) this._clearLoading();
     if (!element) {
       if (connectionNodes) {
+        this._invalidateRepositoryNodes();
         if (connectionNodes.length === 0) return connectionNodes;
         return this._projectMultipleWorkspaces(false)
           .then(() => connectionNodes, () => connectionNodes);
@@ -272,7 +274,11 @@ class CloudsmithProvider {
     if (options.suppressMissingCredentialsWarning) {
       this._suppressMissingCredentialsWarningOnce = true;
     }
-    this._invalidateAccountOperations();
+    this._supersedeOperations();
+    this._requestRootRefresh();
+  }
+
+  _requestRootRefresh() {
     void this._projectMultipleWorkspaces(
       Boolean(captureAccount(this._connectionManager))
     ).catch(() => {});
@@ -302,7 +308,6 @@ class CloudsmithProvider {
   }
 
   _beginOperation() {
-    this._invalidateRepositoryNodes();
     this._abortActiveOperation();
     const account = captureAccount(this._connectionManager);
     if (!account) return null;
@@ -336,6 +341,10 @@ class CloudsmithProvider {
 
   _invalidateAccountOperations() {
     this._invalidateRepositoryNodes();
+    this._supersedeOperations();
+  }
+
+  _supersedeOperations() {
     this._abortActiveOperation();
     this._operationId += 1;
     this._clearLoading();
@@ -600,12 +609,14 @@ class CloudsmithProvider {
     this._consumeMissingCredentialsWarningSuppression();
     const connectionNodes = this._connectionRootNodes();
     if (connectionNodes) {
+      this._invalidateRepositoryNodes();
       this._clearLoading();
       if (connectionNodes.length > 0) await this._projectMultipleWorkspaces(false);
       return connectionNodes;
     }
     const operation = this._beginOperation();
     if (!operation) {
+      this._invalidateRepositoryNodes();
       if (this._treeView) this._treeView.message = undefined;
       await this._projectMultipleWorkspaces(false);
       return [createConnectionStatusNode(CONNECTION_PRESENTATIONS.UNAVAILABLE)];
@@ -618,6 +629,7 @@ class CloudsmithProvider {
         if (!this._isOperationCurrent(operation)) return [];
         await this._projectMultipleWorkspaces(cached.length > 1, operation);
         if (!this._isOperationCurrent(operation)) return [];
+        this._invalidateRepositoryNodes();
         return this._createWorkspaceNodes(cached, operation.signal);
       }
 
@@ -641,6 +653,7 @@ class CloudsmithProvider {
       if (!this._isOperationCurrent(operation)) return [];
       if (result.complete) this._workspaceCache.set(workspaces, operation.account);
 
+      this._invalidateRepositoryNodes();
       const nodes = this._createWorkspaceNodes(workspaces, operation.signal);
       if (incomplete) nodes.push(this._incompleteCollectionNode("workspaces", result));
       return nodes;
@@ -651,9 +664,9 @@ class CloudsmithProvider {
       } catch {
         // Loading cleanup and the fixed failure node remain authoritative.
       }
-      return this._isOperationCurrent(operation)
-        ? [this._loadFailureNode("workspaces")]
-        : [];
+      if (!this._isOperationCurrent(operation)) return [];
+      this._invalidateRepositoryNodes();
+      return [this._loadFailureNode("workspaces")];
     } finally {
       this._finishLoading(operation);
     }
@@ -671,11 +684,13 @@ class CloudsmithProvider {
     this._consumeMissingCredentialsWarningSuppression();
     const connectionNodes = this._connectionRootNodes();
     if (connectionNodes) {
+      this._invalidateRepositoryNodes();
       this._clearLoading();
       return connectionNodes;
     }
     const operation = this._beginOperation();
     if (!operation) {
+      this._invalidateRepositoryNodes();
       if (this._treeView) this._treeView.message = undefined;
       return [createConnectionStatusNode(CONNECTION_PRESENTATIONS.UNAVAILABLE)];
     }
@@ -690,10 +705,12 @@ class CloudsmithProvider {
       if (!this._isOperationCurrent(operation) || result.stale) return [];
 
       if (!Array.isArray(result.items)) {
+        this._invalidateRepositoryNodes();
         return [this._loadFailureNode("repositories")];
       }
       if (result.cancelled === true) {
         if (result.items.length === 0) {
+          this._invalidateRepositoryNodes();
           return [new InfoNode(
             "Repository loading cancelled",
             "No workspace fallback or quota request was started",
@@ -701,6 +718,7 @@ class CloudsmithProvider {
             "warning"
           )];
         }
+        this._invalidateRepositoryNodes();
         const cancelledNodes = [new WorkspaceInfoNode(workspaceSlug, null)];
         for (const repo of result.items) {
           cancelledNodes.push(this._createRepositoryNode(repo, workspaceSlug));
@@ -736,6 +754,7 @@ class CloudsmithProvider {
       }
       if (!this._isOperationCurrent(operation)) return [];
 
+      this._invalidateRepositoryNodes();
       const RepositoryNodes = [
         new WorkspaceInfoNode(workspaceSlug, quotaData),
       ];
@@ -748,9 +767,9 @@ class CloudsmithProvider {
       }
       return RepositoryNodes;
     } catch {
-      return this._isOperationCurrent(operation)
-        ? [this._loadFailureNode("repositories")]
-        : [];
+      if (!this._isOperationCurrent(operation)) return [];
+      this._invalidateRepositoryNodes();
+      return [this._loadFailureNode("repositories")];
     } finally {
       this._finishLoading(operation);
     }

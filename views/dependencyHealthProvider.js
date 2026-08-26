@@ -845,6 +845,9 @@ class DependencyHealthProvider {
     if (!this._isCurrentScan(operationId, accountEpoch)) {
       return;
     }
+    // Selection authority follows committed scan snapshots. Presentation-only
+    // refreshes keep the prior rows visible and must not make their actions inert.
+    this._selectionGeneration += 1;
     this.lastWorkspace = scope.workspace;
     this.lastRepo = scope.repository;
     this._warnings = scanWorker._warnings;
@@ -2229,7 +2232,7 @@ class DependencyHealthProvider {
       return [
         new InfoNode(
           "Scan dependencies",
-          "Select the play button above to start.",
+          "Run Scan dependencies from the view toolbar.",
           "Scans lockfiles and manifests, resolves direct and transitive dependencies, and checks each one against Cloudsmith.",
           "folder",
           "dependencyHealthWelcome"
@@ -2296,7 +2299,6 @@ class DependencyHealthProvider {
 
   refresh() {
     if (this._disposed) return;
-    this._selectionGeneration += 1;
     this._vulnerabilityTreeGeneration += 1;
     this._vulnerabilitySummaries.clear();
     this._clearVulnerabilityRefreshTimers();
@@ -4670,7 +4672,7 @@ function buildSingleDependencyPullNotification(dependency, repositorySlug, detai
     case PULL_STATUS.AUTH_FAILED:
       return {
         level: "error",
-        message: "Authentication failed. Check your API key in Cloudsmith settings.",
+        message: "Authentication failed. Check Cloudsmith authentication in Settings and retry.",
       };
     default:
       return {

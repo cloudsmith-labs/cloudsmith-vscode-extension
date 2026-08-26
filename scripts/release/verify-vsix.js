@@ -41,8 +41,15 @@ const sensitivePatterns = Object.freeze([
   { id: "developer-home-posix", expression: /\/(?:Users|home)\/[A-Za-z0-9._-]+\// },
   { id: "developer-home-windows", expression: /[A-Za-z]:\\Users\\[A-Za-z0-9._-]+\\/ },
   { id: "private-key", expression: /-----BEGIN (?:EC |OPENSSH |RSA )?PRIVATE KEY-----/ },
+  { id: "ssh-private-key", expression: /(?:PuTTY-User-Key-File-[23]:|---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----)/ },
+  { id: "url-userinfo", expression: /[a-z][a-z0-9+.-]{1,20}:\/\/[^\s/:@]{1,128}:[^\s/@]{1,256}@/i },
+  { id: "authorization-header", expression: /\bauthorization\s*:\s*(?:basic|bearer)\s+[A-Za-z0-9._~+/=-]{8,}/i },
   { id: "cloudsmith-token", expression: /csa_[A-Za-z0-9]{20,}/ },
   { id: "github-token", expression: /(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}/ },
+  { id: "npm-token", expression: /\bnpm_[A-Za-z0-9]{20,}/ },
+  { id: "gitlab-token", expression: /\bglpat-[A-Za-z0-9_-]{20,}/ },
+  { id: "azure-devops-token", expression: /\b[A-Za-z0-9]{75}AZDO[A-Za-z0-9]{5}\b/ },
+  { id: "gcp-api-key", expression: /\bAIza[A-Za-z0-9_-]{35}\b/ },
   { id: "openai-token", expression: /sk-[A-Za-z0-9]{20,}/ },
   { id: "slack-token", expression: /xox[baprs]-[A-Za-z0-9-]{20,}/ },
   { id: "aws-access-key", expression: /AKIA[0-9A-Z]{16}/ },
@@ -110,6 +117,17 @@ function buildExpectedInventory({ sourceSha = null } = {}) {
     ? runGit(["ls-tree", "-r", "-z", sourceSha], null)
     : runGit(["ls-files", "-s", "-z"], null);
   const tracked = parseGitEntries(output, sourceSha);
+  if (!sourceSha) {
+    const untracked = runGit(["ls-files", "--others", "--exclude-standard", "-z"], null)
+      .toString("utf8")
+      .split("\0")
+      .filter(Boolean);
+    for (const sourcePath of untracked) {
+      if (isApprovedSourcePath(sourcePath) && !tracked.has(sourcePath)) {
+        tracked.set(sourcePath, { mode: "100644", oid: null, untracked: true });
+      }
+    }
+  }
   const expected = new Map();
   for (const [sourcePath, metadata] of tracked) {
     if (!isApprovedSourcePath(sourcePath)) {
@@ -125,7 +143,9 @@ function buildExpectedInventory({ sourceSha = null } = {}) {
     expected.set(sourceToArchivePath(sourcePath), { sourcePath, ...metadata });
   }
   for (const required of ["package.json", "extension.js", "README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTORS.md"] ) {
-    if (!tracked.has(required) || !expected.has(sourceToArchivePath(required))) {
+    if (!tracked.has(required)
+      || tracked.get(required).untracked
+      || !expected.has(sourceToArchivePath(required))) {
       throw new Error(`Required packaged source is not tracked: ${required}`);
     }
   }
@@ -554,8 +574,63 @@ function validateSidecars(filePath, verification, {
   return { checksumPath, provenancePath, provenance };
 }
 
+function artifactSourceSha(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const provenance = JSON.parse(fs.readFileSync(`${filePath}.provenance.json`, "utf8"));
+    return /^[0-9a-f]{40,64}$/.test(provenance?.sourceSha || "")
+      ? provenance.sourceSha
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function selectArtifactPath({ releasePath, developmentPath, expectedSourceSha }) {
+  if (!/^[0-9a-f]{40,64}$/.test(expectedSourceSha || "")) {
+    throw new Error("Default VSIX selection requires an exact expected source SHA");
+  }
+  const candidates = [releasePath, developmentPath].filter(candidate => fs.existsSync(candidate));
+  if (candidates.length === 0) {
+    throw new Error("No release or development VSIX artifact exists for the current package");
+  }
+  const matches = candidates.filter(candidate => artifactSourceSha(candidate) === expectedSourceSha);
+  if (matches.length === 0) {
+    throw new Error("No VSIX artifact has valid provenance for the expected source SHA");
+  }
+  if (matches.length > 1) {
+    throw new Error("VSIX artifact selection is ambiguous for the expected source SHA");
+  }
+  return matches[0];
+}
+
+function resolveExpectedSourceSha(options, currentSourceSha) {
+  if (options.currentSource
+    && !/^[0-9a-f]{40,64}$/.test(currentSourceSha || "")) {
+    throw new Error("Could not resolve the exact current source SHA");
+  }
+  if (options.currentSource
+    && options.expectedSourceSha
+    && options.expectedSourceSha !== currentSourceSha) {
+    throw new Error("Explicit expected source SHA does not match the current checkout");
+  }
+  return options.expectedSourceSha || currentSourceSha || null;
+}
+
+function verificationSourceSha(provenance, {
+  currentSource = false,
+  currentSourceDirty = false,
+} = {}) {
+  if (currentSourceDirty && !currentSource) {
+    throw new Error("Dirty-worktree verification state requires --current-source");
+  }
+  if (!provenance?.sourceClean || (currentSource && currentSourceDirty)) return null;
+  return provenance.sourceSha;
+}
+
 function parseCliArguments(arguments_) {
   const options = {
+    currentSource: false,
     expectedSourceSha: null,
     explicitPath: null,
     list: false,
@@ -566,6 +641,8 @@ function parseCliArguments(arguments_) {
     const argument = arguments_[index];
     if (argument === "--require-sidecars") {
       options.requireSidecars = true;
+    } else if (argument === "--current-source") {
+      options.currentSource = true;
     } else if (argument === "--require-publishable") {
       options.requirePublishable = true;
     } else if (argument === "--list") {
@@ -584,6 +661,12 @@ function parseCliArguments(arguments_) {
   if (options.expectedSourceSha !== null && !/^[0-9a-f]{40,64}$/.test(options.expectedSourceSha || "")) {
     throw new Error("--expected-source-sha requires a full hexadecimal commit SHA");
   }
+  if ((options.currentSource || options.expectedSourceSha) && !options.requireSidecars) {
+    throw new Error("VSIX source binding requires --require-sidecars");
+  }
+  if (!options.explicitPath && !options.currentSource && !options.expectedSourceSha) {
+    throw new Error("VSIX verification requires an explicit artifact path or source binding");
+  }
   if (options.requirePublishable && !options.requireSidecars) {
     throw new Error("--require-publishable requires --require-sidecars");
   }
@@ -596,16 +679,28 @@ async function main() {
   const filename = `${manifest.name}-${manifest.version}.vsix`;
   const releasePath = path.join(root, "out", "release", filename);
   const developmentPath = path.join(root, "out", "development", filename);
-  const filePath = path.resolve(options.explicitPath || (fs.existsSync(releasePath) ? releasePath : developmentPath));
+  const currentSourceSha = options.currentSource
+    ? runGit(["rev-parse", "--verify", "HEAD^{commit}"]).trim()
+    : null;
+  const currentSourceDirty = options.currentSource
+    ? runGit(["status", "--porcelain=v1", "--untracked-files=all"]).length > 0
+    : false;
+  const expectedSourceSha = resolveExpectedSourceSha(options, currentSourceSha);
+  const filePath = options.explicitPath
+    ? path.resolve(root, options.explicitPath)
+    : selectArtifactPath({ releasePath, developmentPath, expectedSourceSha });
   let sourceSha = null;
   if (options.requireSidecars) {
     const provenance = JSON.parse(fs.readFileSync(`${filePath}.provenance.json`, "utf8"));
-    sourceSha = provenance.sourceClean ? provenance.sourceSha : null;
+    sourceSha = verificationSourceSha(provenance, {
+      currentSource: options.currentSource,
+      currentSourceDirty,
+    });
   }
   const verification = await verifyVsix(filePath, { sourceSha });
   if (options.requireSidecars) {
     validateSidecars(filePath, verification, {
-      expectedSourceSha: options.expectedSourceSha,
+      expectedSourceSha,
       requirePublishable: options.requirePublishable,
     });
   }
@@ -632,7 +727,10 @@ module.exports = {
   limits,
   parseCentralDirectory,
   parseCliArguments,
+  resolveExpectedSourceSha,
   scanSensitiveBytes,
+  selectArtifactPath,
+  verificationSourceSha,
   validateArchivePath,
   validateSidecars,
   verifyVsix,

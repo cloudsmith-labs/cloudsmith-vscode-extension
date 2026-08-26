@@ -38,6 +38,7 @@ function registerVulnerabilityCommands(deps) {
     dependencyHealthProvider,
     vulnerabilityStateService,
     normalizeCvssScore,
+    openExternalWithFeedback,
   } = deps;
   const recentSupport = { ...deps, recentPackages, packageAdapters, vscode };
 
@@ -366,7 +367,7 @@ function registerVulnerabilityCommands(deps) {
       || !isFindCurrent()
     ) return;
     const pkg = selected.package;
-    const installEligible = isInstallablePackage(pkg);
+    const installEligible = isInstallablePackage(pkg, deps);
     const actionItems = [
       ...(installEligible
         ? [{
@@ -417,7 +418,13 @@ function registerVulnerabilityCommands(deps) {
       );
       if (url) {
         if (!isFindCurrent()) return;
-        await vscode.env.openExternal(vscode.Uri.parse(url));
+        await openExternalWithFeedback({
+          target: vscode.Uri.parse(url),
+          openExternal: target => vscode.env.openExternal(target),
+          showWarningMessage: message => vscode.window.showWarningMessage(message),
+          failureMessage: "Could not open this package in Cloudsmith.",
+          isCurrent: isFindCurrent,
+        });
       } else {
         if (!isFindCurrent()) return;
         vscode.window.showWarningMessage("Could not open this package in Cloudsmith.");
@@ -490,6 +497,7 @@ function registerVulnerabilityCommands(deps) {
   async function openCVE(item) {
     const accountScope = captureCommandAccount(deps.workspaceAccess);
     if (!accountScope || !ownsSelection("isCurrentSelection", item)) return;
+    const isCurrent = () => currentSelection(accountScope, "isCurrentSelection", item);
     const cveId = item && item.cveId;
     if (
       typeof cveId !== "string"
@@ -506,8 +514,14 @@ function registerVulnerabilityCommands(deps) {
     const url = cveId.startsWith("GHSA-")
       ? `https://github.com/advisories/${encodedIdentifier}`
       : `https://nvd.nist.gov/vuln/detail/${encodedIdentifier}`;
-    if (!isCommandAccountCurrent(accountScope)) return;
-    await vscode.env.openExternal(vscode.Uri.parse(url));
+    if (!isCurrent()) return;
+    await openExternalWithFeedback({
+      target: vscode.Uri.parse(url),
+      openExternal: target => vscode.env.openExternal(target),
+      showWarningMessage: message => vscode.window.showWarningMessage(message),
+      failureMessage: "Could not open the vulnerability reference.",
+      isCurrent,
+    });
   }
 
   async function showVulnerabilities(item, options = {}) {

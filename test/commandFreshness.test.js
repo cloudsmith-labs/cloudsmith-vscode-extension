@@ -3,6 +3,7 @@ const assert = require("assert");
 const manifest = require("../package.json");
 const { registerPackageCommands } = require("../commands/packages");
 const { registerVulnerabilityCommands } = require("../commands/vulnerabilities");
+const { isInstallablePackage } = require("../commands/support");
 const packageAdapters = require("../domain/packageAdapters");
 const packageDomain = require("../domain/package");
 const {
@@ -346,6 +347,146 @@ suite("Command selection freshness", () => {
     }
   });
 
+  test("an advertised install capability produces usable native guidance through registered Show and Copy handlers", async () => {
+    const fixtures = [
+      ["npm", exactPackage({ format: "npm", name: "@scope/widget", version: "1.2.3" }), /npm install .*--registry=https:\/\/npm\.cloudsmith\.io\/workspace-a\/repo-a\//u],
+      ["python", exactPackage({ format: "python", name: "widget", version: "1.2.3" }), /pip install .*--index-url https:\/\/dl\.cloudsmith\.io\/basic\/workspace-a\/repo-a\/python\/simple\//u],
+      ["maven", exactPackage({
+        format: "maven",
+        name: "widget",
+        coordinateName: "com.example:widget",
+        version: "1.2.3",
+        qualifiers: { type: "test-jar", classifier: "tests" },
+      }), /<dependency>[\s\S]*<groupId>com\.example<\/groupId>[\s\S]*<artifactId>widget<\/artifactId>[\s\S]*<classifier>tests<\/classifier>/u],
+      ["nuget", exactPackage({ format: "nuget", name: "Widget.Core", version: "1.2.3" }), /dotnet add package 'Widget\.Core' --version '\[1\.2\.3\]'/u],
+      ["helm", exactPackage({ format: "helm", name: "widget", version: "1.2.3" }), /helm install .*--repo https:\/\/dl\.cloudsmith\.io\/basic\/workspace-a\/repo-a\/helm\/charts\//u],
+      ["cargo", exactPackage({ format: "cargo", name: "widget", version: "1.2.3" }), /cargo add 'widget@=1\.2\.3' --registry/u],
+      ["go", exactPackage({ format: "go", name: "example.test/widget", version: "1.2.3" }), /go get 'example\.test\/widget@v1\.2\.3'/u],
+      ["ruby", exactPackage({
+        format: "ruby",
+        name: "widget",
+        version: "1.2.3",
+        qualifiers: { platform: "x86_64-linux" },
+      }), /gem install 'widget'.*--platform 'x86_64-linux'/u],
+      ["conda", exactPackage({
+        format: "conda",
+        name: "numpy",
+        version: "1.24.0",
+        qualifiers: { build: "py311h123_0", subdir: "linux-64" },
+      }), /conda install .*'numpy==1\.24\.0=py311h123_0\[subdir=linux-64\]'/u],
+      ["composer", exactPackage({ format: "composer", name: "vendor/widget", version: "1.2.3" }), /composer require 'vendor\/widget:1\.2\.3'/u],
+      ["dart", exactPackage({ format: "dart", name: "widget", version: "1.2.3" }), /dart pub add 'widget:1\.2\.3'.*dart\.cloudsmith\.io\/workspace-a\/repo-a\//u],
+      ["docker", exactPackage({ format: "docker", name: "team/widget", version: "stable" }), /docker pull docker\.cloudsmith\.io\/workspace-a\/repo-a\/team\/widget:stable/u],
+      ["rpm", exactPackage({
+        format: "rpm",
+        name: "httpd",
+        version: "2.4.57",
+        qualifiers: { release: "1.el9", architecture: "x86_64" },
+      }), /dnf install-nevra 'httpd-2\.4\.57-1\.el9\.x86_64'.*--enablerepo='workspace-a-repo-a'/u],
+      ["raw", exactPackage({
+        format: "raw",
+        name: "artifact.tar.gz",
+        version: "1.2.3",
+        cdnUrl: "https://dl.cloudsmith.io/basic/workspace-a/repo-a/raw/files/artifact.tar.gz",
+      }), /curl .*https:\/\/dl\.cloudsmith\.io\/basic\/workspace-a\/repo-a\/raw\/files\/artifact\.tar\.gz/u],
+      ["generic", exactPackage({
+        format: "generic",
+        name: "artifact.bin",
+        version: "",
+        cdnUrl: "https://generic.cloudsmith.io/workspace-a/repo-a/files/artifact.bin",
+      }), /curl .*https:\/\/generic\.cloudsmith\.io\/workspace-a\/repo-a\/files\/artifact\.bin/u],
+    ];
+
+    for (const [format, pkg, nativeGuidance] of fixtures) {
+      const registration = recorder();
+      let shown = null;
+      let copied = null;
+      const deps = packageDeps(registration, {
+        InstallCommandBuilder: ProductionInstallCommandBuilder,
+        InstallCommandValidationError: ProductionInstallCommandValidationError,
+        vscode: {
+          workspace: {
+            getConfiguration: () => ({ get: () => false }),
+            async openTextDocument(options) {
+              shown = options.content;
+              return options;
+            },
+          },
+          env: { clipboard: { async writeText(value) { copied = value; } } },
+          window: {
+            showInformationMessage() {},
+            showWarningMessage() {},
+            showErrorMessage() {},
+            async showQuickPick(items) { return items[0]; },
+            async showTextDocument() {},
+          },
+        },
+      });
+      registerPackageCommands(deps);
+
+      assert.strictEqual(isInstallablePackage(pkg, deps), true, `${format} capability`);
+      await registration.handlers.get("cloudsmith-vsc.showInstallCommand")(pkg);
+      await registration.handlers.get("cloudsmith-vsc.copyInstallCommand")(pkg);
+
+      assert.strictEqual(shown, copied, `${format} Show and Copy bytes`);
+      assert.match(shown, nativeGuidance, `${format} native semantics`);
+      assert.doesNotMatch(shown, /No install command template/u, `${format} fallback`);
+      if (format === "maven") {
+        assert.match(shown, /```xml/u, "Maven publishes mergeable XML");
+      } else {
+        assert(
+          shown.split(/\r?\n/u).some(line => line.trim() && !/^\s*(?:#|REM\b)/iu.test(line)),
+          `${format} guidance must contain a non-comment command`
+        );
+      }
+    }
+  });
+
+  test("unsupported formats and missing native identity evidence withhold Install and never publish guidance", async () => {
+    const fixtures = [
+      ["unsupported format", exactPackage({ format: "swift", name: "widget", version: "1.2.3" })],
+      ["valid Docker tag or digest", exactPackage({ format: "docker", name: "team/widget", version: "not a tag" })],
+      ["Maven groupId", exactPackage({ format: "maven", name: "widget", version: "1.2.3" })],
+      ["Conda build and subdir", exactPackage({ format: "conda", name: "numpy", version: "1.24.0" })],
+      ["RPM release and architecture", exactPackage({ format: "rpm", name: "httpd", version: "2.4.57" })],
+      ["Raw authoritative URL", exactPackage({ format: "raw", name: "artifact.tar.gz", version: "1.2.3" })],
+      ["Generic authoritative URL", exactPackage({ format: "generic", name: "artifact.bin", version: "" })],
+    ];
+
+    for (const [evidence, pkg] of fixtures) {
+      const registration = recorder();
+      const published = [];
+      const deps = packageDeps(registration, {
+        InstallCommandBuilder: ProductionInstallCommandBuilder,
+        InstallCommandValidationError: ProductionInstallCommandValidationError,
+        vscode: {
+          workspace: {
+            getConfiguration: () => ({ get: () => false }),
+            async openTextDocument(options) {
+              published.push(["show", options.content]);
+              return options;
+            },
+          },
+          env: { clipboard: { async writeText(value) { published.push(["copy", value]); } } },
+          window: {
+            showInformationMessage() {},
+            showWarningMessage() {},
+            showErrorMessage() {},
+            async showTextDocument() {},
+          },
+        },
+      });
+      registerPackageCommands(deps);
+
+      const advertised = isInstallablePackage(pkg, deps);
+      await registration.handlers.get("cloudsmith-vsc.showInstallCommand")(pkg);
+      await registration.handlers.get("cloudsmith-vsc.copyInstallCommand")(pkg);
+
+      assert.strictEqual(advertised, false, `${evidence} must not advertise Install`);
+      assert.deepStrictEqual(published, [], `${evidence} must not publish Show or Copy output`);
+    }
+  });
+
   test("API package identity and qualifiers survive registered Show and Copy handlers", async () => {
     const fixtures = [
       {
@@ -398,6 +539,27 @@ suite("Command selection freshness", () => {
           /workspace-api\/repo-api\/ruby\//u,
         ],
       },
+      {
+        record: apiPackageRecord({
+          slug_perm: "raw-api-id",
+          name: "artifact.tar.gz",
+          version: "1.2.3",
+          format: "raw",
+          filename: "artifact.tar.gz",
+          cdn_url: "https://dl.cloudsmith.io/basic/workspace-api/repo-api/raw/files/artifact.tar.gz",
+        }),
+        expectedPrefix: [
+          "raw",
+          "artifact.tar.gz",
+          "1.2.3",
+          "workspace-api",
+          "repo-api",
+        ],
+        expectedQualifiers: {},
+        outputPatterns: [
+          /curl -fL -O --no-clobber --proto '=https' --proto-redir '=https' 'https:\/\/dl\.cloudsmith\.io\/basic\/workspace-api\/repo-api\/raw\/files\/artifact\.tar\.gz'/u,
+        ],
+      },
     ];
 
     for (const fixture of fixtures) {
@@ -436,7 +598,7 @@ suite("Command selection freshness", () => {
       await registration.handlers.get("cloudsmith-vsc.showInstallCommand")(fixture.record);
       await registration.handlers.get("cloudsmith-vsc.copyInstallCommand")(fixture.record);
 
-      assert.strictEqual(buildCalls.length, 2);
+      assert.strictEqual(buildCalls.length, 4);
       for (const args of buildCalls) {
         assert.deepStrictEqual(args.slice(0, 5), fixture.expectedPrefix);
         assert.deepStrictEqual(args[5].qualifiers, fixture.expectedQualifiers);
@@ -449,6 +611,7 @@ suite("Command selection freshness", () => {
   test("API-produced mixed Docker tag arrays fail safely before Show or Copy publication", async () => {
     const registration = recorder();
     const errors = [];
+    const warnings = [];
     let shown = false;
     let copied = false;
     registerPackageCommands(packageDeps(registration, {
@@ -465,7 +628,7 @@ suite("Command selection freshness", () => {
         env: { clipboard: { async writeText() { copied = true; } } },
         window: {
           showInformationMessage() {},
-          showWarningMessage() {},
+          showWarningMessage(message) { warnings.push(message); },
           showErrorMessage(message) { errors.push(message); },
           async showTextDocument() {},
         },
@@ -483,9 +646,11 @@ suite("Command selection freshness", () => {
 
     assert.strictEqual(shown, false);
     assert.strictEqual(copied, false);
-    assert.strictEqual(errors.length, 2);
-    assert(errors.every(message => message.includes("Docker tag")));
-    assert(errors.every(message => !message.includes("bad tag")));
+    assert.deepStrictEqual(errors, []);
+    assert.deepStrictEqual(warnings, [
+      "Install guidance is not available for this package.",
+      "Install guidance is not available for this package.",
+    ]);
   });
 
   test("API-produced empty Docker version tags preserve digest-only Show and Copy output", async () => {
@@ -537,7 +702,7 @@ suite("Command selection freshness", () => {
     await registration.handlers.get("cloudsmith-vsc.showInstallCommand")(record);
     await registration.handlers.get("cloudsmith-vsc.copyInstallCommand")(record);
 
-    assert.strictEqual(buildCalls.length, 2);
+    assert.strictEqual(buildCalls.length, 4);
     for (const args of buildCalls) {
       assert.deepStrictEqual(args.slice(0, 5), [
         "docker",

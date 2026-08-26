@@ -1,0 +1,484 @@
+{
+  "schemaVersion": 1,
+  "tool": {
+    "core": "@stryker-mutator/core",
+    "version": "10.0.0",
+    "runner": "@stryker-mutator/mocha-runner",
+    "runnerVersion": "10.0.0"
+  },
+  "scope": [
+    "domain/authCapabilities.js",
+    "domain/installGuidanceSupport.js",
+    "domain/packageActionCapabilities.js",
+    "util/searchQueryBuilder.js",
+    "util/vulnerabilityReportProjection.js",
+    "util/externalNavigation.js",
+    "util/upstreamOperationScheduler.js:141-219",
+    "util/vulnerabilityStateService.js:616-718",
+    "util/installCommandBuilder.js:650-830"
+  ],
+  "measuredAtSha": null,
+  "metrics": {
+    "mutants": 1570,
+    "killed": 1405,
+    "survived": 61,
+    "timeout": 0,
+    "noCoverage": 0,
+    "ignored": 104,
+    "score": 95.84
+  },
+  "files": {
+    "domain/authCapabilities.js": {
+      "testFiles": ["test/authCapabilities.test.js"],
+      "mutants": 80,
+      "killed": 72,
+      "survived": 8,
+      "ignored": 0,
+      "score": 90
+    },
+    "domain/installGuidanceSupport.js": {
+      "testFiles": ["test/installCommandBuilder.test.js", "test/installGuidanceSupport.test.js"],
+      "mutants": 233,
+      "killed": 146,
+      "survived": 4,
+      "ignored": 83,
+      "score": 97.33
+    },
+    "domain/packageActionCapabilities.js": {
+      "testFiles": ["test/packageActionCapabilities.test.js"],
+      "mutants": 156,
+      "killed": 128,
+      "survived": 11,
+      "ignored": 17,
+      "score": 92.09
+    },
+    "util/searchQueryBuilder.js": {
+      "testFiles": ["test/searchQueryBuilder.test.js"],
+      "mutants": 138,
+      "killed": 130,
+      "survived": 6,
+      "ignored": 2,
+      "score": 95.59
+    },
+    "util/vulnerabilityReportProjection.js": {
+      "testFiles": ["test/vulnerabilityReportProjection.test.js"],
+      "mutants": 420,
+      "killed": 407,
+      "survived": 13,
+      "ignored": 0,
+      "score": 96.9
+    },
+    "util/externalNavigation.js": {
+      "testFiles": ["test/externalNavigation.test.js"],
+      "mutants": 53,
+      "killed": 50,
+      "survived": 2,
+      "ignored": 1,
+      "score": 96.15
+    },
+    "util/upstreamOperationScheduler.js:141-219": {
+      "testFiles": ["test/upstreamOperationScheduler.test.js"],
+      "mutants": 83,
+      "killed": 78,
+      "survived": 5,
+      "ignored": 0,
+      "score": 93.98
+    },
+    "util/vulnerabilityStateService.js:616-718": {
+      "testFiles": ["test/vulnerabilityStateService.test.js"],
+      "mutants": 236,
+      "killed": 226,
+      "survived": 9,
+      "ignored": 1,
+      "score": 96.17
+    },
+    "util/installCommandBuilder.js:650-830": {
+      "testFiles": ["test/installCommandBuilder.test.js"],
+      "mutants": 171,
+      "killed": 168,
+      "survived": 3,
+      "ignored": 0,
+      "score": 98.25
+    }
+  },
+  "equivalentSurvivorClasses": [
+    {
+      "class": "primitive-own-property-fast-path",
+      "count": 11,
+      "reason": "Primitive descriptors are undefined or nullish access throws into the same catch; functions never satisfy the shortcut."
+    },
+    {
+      "class": "data-descriptor-shape",
+      "count": 6,
+      "reason": "GetOwnPropertyDescriptor yields undefined or a truthy descriptor. Data descriptors return the same value; missing and accessor cases remain undefined or caught."
+    },
+    {
+      "class": "implicit-undefined-catch",
+      "count": 3,
+      "reason": "The empty catch and explicit return undefined have the same observable result."
+    },
+    {
+      "class": "deny-all-action-shortcut",
+      "count": 1,
+      "reason": "Without the shortcut, every known action still reads missing guarded evidence as false and unknown actions still take the false default."
+    },
+    {
+      "class": "unreachable-context-length-boundary",
+      "count": 2,
+      "reason": "The finite allowlisted action vocabulary can produce at most 126 characters, so the 256-character defensive boundary cannot be reached."
+    },
+    {
+      "class": "idempotent-string-normalization",
+      "count": 2,
+      "reason": "String(value) is identical for already-string values and is already required for every non-string value."
+    },
+    {
+      "class": "redundant-trim-empty-check",
+      "count": 1,
+      "reason": "The following exact-trim comparison rejects every nonempty whitespace-only value; empty input is rejected by either expression."
+    },
+    {
+      "class": "nested-leading-modifier-anchors",
+      "count": 3,
+      "reason": "The outer anchored matcher only supplies an offset-zero run of plus or minus symbols, making the nested offset and anchors redundant."
+    },
+    {
+      "class": "canonical-unknown-state-coupling",
+      "count": 3,
+      "reason": "A canonical unknown projection is necessarily undetected; every detected canonical state is projected before this fallback branch."
+    },
+    {
+      "class": "positive-summary-count-coupling",
+      "count": 2,
+      "reason": "A known zero count cannot also satisfy detected truth, while every known positive count is detected before complete-detail projection."
+    },
+    {
+      "class": "clean-zero-count-coupling",
+      "count": 2,
+      "reason": "Unknown counts normalize to null and positive known counts imply detection, so the remaining clean-authority predicates preserve the same reachable branch."
+    },
+    {
+      "class": "internal-fix-availability-normalization",
+      "count": 3,
+      "reason": "All internal producers supply yes, no, or unknown; alternate empty-string mutations normalize back to unknown at the private projection boundary."
+    },
+    {
+      "class": "upstream-normalized-count",
+      "count": 2,
+      "reason": "Every reachable count is already a nonnegative safe integer or null before the private projection boundary."
+    },
+    {
+      "class": "unobservable-private-array-copy",
+      "count": 1,
+      "reason": "Projection receives only fresh normalized arrays or an already-frozen fallback array; the private intermediate array identity is not observable."
+    },
+    {
+      "class": "overwritten-navigation-default",
+      "count": 1,
+      "reason": "Both the fulfilled and rejected external-open paths overwrite the initializer before it is observed."
+    },
+    {
+      "class": "idempotent-navigation-catch-reset",
+      "count": 1,
+      "reason": "The navigation catch assignment repeats the existing false default."
+    },
+    {
+      "class": "normalized-positive-count-guard",
+      "count": 5,
+      "reason": "Count is null or a nonnegative safe integer; surrounding zero branches and short-circuiting preserve the same positive classification."
+    },
+    {
+      "class": "declared-kind-gates-record-consistency",
+      "count": 2,
+      "reason": "The mutations affect record consistency only when declaredKind is null; authority and retention both independently require declaredKind."
+    },
+    {
+      "class": "presentation-control-flow-dominance",
+      "count": 2,
+      "reason": "Loading is handled by an earlier branch, and positive record length is handled by the earlier partial branch."
+    },
+    {
+      "class": "renderer-partitioned-unused-shell-fallback",
+      "count": 2,
+      "reason": "The mutated fallback is reachable only for non-shell formats whose selected renderers never read safeName or safeVersion."
+    },
+    {
+      "class": "format-partitioned-npm-scope-option",
+      "count": 1,
+      "reason": "For npm the guard remains effectively true; for every other format the computed npm-only option is unused."
+    },
+    {
+      "class": "post-settlement-cleanup-exception",
+      "count": 2,
+      "reason": "This path requires synchronous cancellation, which retires and rejects the entry before inspecting the returned disposable; a missing optional guard can only throw inside an already-settled Promise executor."
+    },
+    {
+      "class": "delegated-retirement-idempotence",
+      "count": 1,
+      "reason": "A repeated cancellation reaches _retireQueued, whose intact retired guard still prevents effects."
+    },
+    {
+      "class": "queued-membership-invariant",
+      "count": 1,
+      "reason": "A non-retired, non-active registered entry is necessarily still in the queue, so its index cannot be -1."
+    },
+    {
+      "class": "unreachable-repeat-queued-retirement",
+      "count": 1,
+      "reason": "Production callers supply unique non-retired queued entries; cancellation and reentrancy are stopped by earlier retired guards."
+    }
+  ],
+  "survivorClassifications": [
+    {
+      "fingerprint": "a02627838609e86b9009f3226255dd9c06a58ae21e8b8026cb9cac2d43e03d66",
+      "class": "primitive-own-property-fast-path"
+    },
+    {
+      "fingerprint": "a3380c54877c6a9d3d00ae228de2246673a6572830f310db602a1e57b605d4ac",
+      "class": "primitive-own-property-fast-path"
+    },
+    {
+      "fingerprint": "c7bf76e6f7d9b58b309499c3baca1bd832111f6374318e3549e14d10584e8580",
+      "class": "primitive-own-property-fast-path"
+    },
+    {
+      "fingerprint": "df7324132aad00438e330ac87730980d3016d45a8d431c2c00e27780a429c691",
+      "class": "primitive-own-property-fast-path"
+    },
+    {
+      "fingerprint": "0c48a19e980c7583296d0dce307f1ce6b07b031a86fd69be36321f90d8671a3c",
+      "class": "primitive-own-property-fast-path"
+    },
+    {
+      "fingerprint": "2a4a75d530369d4f129f0a3832896b0f84bf7d04c19a4c015ce2d8f15dfd4abc",
+      "class": "primitive-own-property-fast-path"
+    },
+    {
+      "fingerprint": "b5ff1287c9ff0e8650677be3e48308ca4b15321ca6ba7292b55017cbe3193180",
+      "class": "primitive-own-property-fast-path"
+    },
+    {
+      "fingerprint": "f2046a2e594938cb848c72171d38da982b1966fd8bfc49ea54c0f8b30aef874d",
+      "class": "primitive-own-property-fast-path"
+    },
+    {
+      "fingerprint": "f64f086ca302653f8db5497c57cefc12934daa59de4d115a7e1313d7828aa8a5",
+      "class": "primitive-own-property-fast-path"
+    },
+    {
+      "fingerprint": "09aa40a7b89a3c4ef5d97e5b23b7d8dde8c182314c3de66580caa5db29faaaf4",
+      "class": "primitive-own-property-fast-path"
+    },
+    {
+      "fingerprint": "fed2ec812d938eace8893efd48bfb849022b65eeed2d020093b17cdb020bc665",
+      "class": "primitive-own-property-fast-path"
+    },
+    {
+      "fingerprint": "e313fe07a90de82a62899dac400808a3b431d0d4150df1707851a32fd2bf8e8d",
+      "class": "data-descriptor-shape"
+    },
+    {
+      "fingerprint": "5a0caa102a37c6731b7306413140f0686cdd63936bb9de641b0abe620337097f",
+      "class": "data-descriptor-shape"
+    },
+    {
+      "fingerprint": "f7ed4b5727947983b76de3c05c6a04249ab3fbad1667e06a27e2189f1a23c83b",
+      "class": "data-descriptor-shape"
+    },
+    {
+      "fingerprint": "44316b5eeb1c02a7401de299f1738c25d815ae3d4a813617c44c85c1a6725c57",
+      "class": "data-descriptor-shape"
+    },
+    {
+      "fingerprint": "ff71ce205f6e336057287053577633ab00df67a9a8fe394d02574fd9ab1e0713",
+      "class": "data-descriptor-shape"
+    },
+    {
+      "fingerprint": "1cf2c7ebad717e005acbd6e4c1c471e5fc2d2e2d0da8b6993d1d0a112d9fdb14",
+      "class": "data-descriptor-shape"
+    },
+    {
+      "fingerprint": "eb8c6ba43d6cf8e44096a4dd3e24ba0f168b93d65591b03da99abdd783f13074",
+      "class": "implicit-undefined-catch"
+    },
+    {
+      "fingerprint": "93598143582eac2935d3554a30ba0fefba252aaf0a2f5ba5998992c18781bb67",
+      "class": "implicit-undefined-catch"
+    },
+    {
+      "fingerprint": "569fee666b36f9f9a66321e78c9b1fdaf8b30fc06ffb11a2abb5e24455417ce0",
+      "class": "implicit-undefined-catch"
+    },
+    {
+      "fingerprint": "8ef5f2532ead0abb45f489d1a1b4bab6991e222bb708529b7005e3bc5adad1b7",
+      "class": "deny-all-action-shortcut"
+    },
+    {
+      "fingerprint": "2e3281f24eec767992d39453bfc235d7e18d26407976abedcf117a7cfc5b5801",
+      "class": "unreachable-context-length-boundary"
+    },
+    {
+      "fingerprint": "e9c4af1228c75c38e08521ec842e50b8550d76b5b2def55d7d7cf1a2fe8ee308",
+      "class": "unreachable-context-length-boundary"
+    },
+    {
+      "fingerprint": "86675997905d3c58dd3135d7974bb27705d8357aade75ecd0700ce1640164672",
+      "class": "idempotent-string-normalization"
+    },
+    {
+      "fingerprint": "d8627f8aabc7610b01a3e7f804d5b9085a6ef13939fb792a58c6a819f6392018",
+      "class": "idempotent-string-normalization"
+    },
+    {
+      "fingerprint": "b3dce98d457269e0572bbf47c8575767b33fda7677131b90efc53687ac6e6e07",
+      "class": "redundant-trim-empty-check"
+    },
+    {
+      "fingerprint": "04dbdcc8900000084f7f2ed2555cb76526c88d5aaaa7331ff567742182f8a12e",
+      "class": "nested-leading-modifier-anchors"
+    },
+    {
+      "fingerprint": "4a8f74b5ad16c3ca4e46ab985bce0096a6ab03dfe4f472015f586d425f346766",
+      "class": "nested-leading-modifier-anchors"
+    },
+    {
+      "fingerprint": "7a00fd6c7e9a573b2e8d622b43937a1b12fb8e40da14045daaebed6b8ac47ead",
+      "class": "nested-leading-modifier-anchors"
+    },
+    {
+      "fingerprint": "efdb9253c979b7054c3e08e53ad9c1ae4a3896bbd3acf2842197d291d03ae31b",
+      "class": "canonical-unknown-state-coupling"
+    },
+    {
+      "fingerprint": "7f7a23ebfcdbc044c3da37545bcb7be683145b4cbead085de1415558834fa75a",
+      "class": "canonical-unknown-state-coupling"
+    },
+    {
+      "fingerprint": "53bd734f2c21a2e3a31f9f609e1a1817b9c90afbebf38c17a26b778da2298d38",
+      "class": "canonical-unknown-state-coupling"
+    },
+    {
+      "fingerprint": "ab039efba4cd8bf92d38b33a38cbc88a99de40623f7f05d1b8e4ebe121f52707",
+      "class": "positive-summary-count-coupling"
+    },
+    {
+      "fingerprint": "de1c433bef667dd508ec566de219dda4967ceec39f2b59eb2217a5c862161a94",
+      "class": "positive-summary-count-coupling"
+    },
+    {
+      "fingerprint": "2c44318031ac57c7e5fd453b82eedec504c10263108937fd3400263016019759",
+      "class": "clean-zero-count-coupling"
+    },
+    {
+      "fingerprint": "3731f1ebf63d327ae2f2e59478443b5f7cbb8c00d5d8157185e06d225210a585",
+      "class": "clean-zero-count-coupling"
+    },
+    {
+      "fingerprint": "38fabbde917535870a0dd0d628c3f0eee32e1880542cd9c724fd92ec768439fb",
+      "class": "internal-fix-availability-normalization"
+    },
+    {
+      "fingerprint": "b1175b44a00b658b733e9ecd93ed1370cf3ebcc143229540b3d6899b2d7bf21d",
+      "class": "internal-fix-availability-normalization"
+    },
+    {
+      "fingerprint": "de7d1a2d7a702a616c210dbec46b3f46b27d6268645b46c0949e62575c2c7845",
+      "class": "internal-fix-availability-normalization"
+    },
+    {
+      "fingerprint": "aa05227c57ea088a75d848071f596bfc9a217b0ac8b5919def07dcab0500bd41",
+      "class": "upstream-normalized-count"
+    },
+    {
+      "fingerprint": "877ebb798d50b63db6ada0d3127b5836c2b878f002c2aff90a48f637bc47f4e5",
+      "class": "upstream-normalized-count"
+    },
+    {
+      "fingerprint": "012bbdf1d5e0529cd20749dfd167742adca6c56ea36add206f3aa6e4612fcc70",
+      "class": "unobservable-private-array-copy"
+    },
+    {
+      "fingerprint": "62e2f389f9839e02a31e3d1471ede7cec848d64b584c930ff8d56556725b43f2",
+      "class": "overwritten-navigation-default"
+    },
+    {
+      "fingerprint": "eab82d0f5fd6dbfbc335d6157ab3fdb4652a586c0655e3d474399b24a4410d38",
+      "class": "idempotent-navigation-catch-reset"
+    },
+    {
+      "fingerprint": "bc4559a7726ef4101a12f889b299fb0977144c57803887b8f4cc88442b070994",
+      "class": "normalized-positive-count-guard"
+    },
+    {
+      "fingerprint": "ac867f08c38fa58a5454242e7629b8bfb2acefb7a469d13f3155068f48f3aabe",
+      "class": "normalized-positive-count-guard"
+    },
+    {
+      "fingerprint": "34b42b5427ce9e924c8936c90226b23076d862a69c9a6fabb7512ffc4a4fd9cd",
+      "class": "normalized-positive-count-guard"
+    },
+    {
+      "fingerprint": "b48dcef6dd81bc21a56dffa95b52f444ceac9f20359f8cccf95d47035102dc78",
+      "class": "normalized-positive-count-guard"
+    },
+    {
+      "fingerprint": "ee4ffc7d6c59af11c4616717c17020e2571d1e629ac23ba257c5dc0a175019f8",
+      "class": "normalized-positive-count-guard"
+    },
+    {
+      "fingerprint": "00050e7a3e909139b7ad05b24bfc9fcf3d69869709fba19a057ce4067d32849b",
+      "class": "declared-kind-gates-record-consistency"
+    },
+    {
+      "fingerprint": "4a114aa9a71532ecf60d4b92931ed49c1aa1e5b742b471bf600a0bb62ae74f57",
+      "class": "declared-kind-gates-record-consistency"
+    },
+    {
+      "fingerprint": "c5d96b6f6b1d6dd06e8eab7b54039c96964c81af31fc18d7312490674c4e7021",
+      "class": "presentation-control-flow-dominance"
+    },
+    {
+      "fingerprint": "b7dbb0819b7cb07f8efd7c2c60058da4bf6d5c20e82d5c5048a406ea46824b29",
+      "class": "presentation-control-flow-dominance"
+    },
+    {
+      "fingerprint": "c8b040b0a9f27dbfcaa3f8d4372e53d623480a8f0b2bf643a40a27f3a7e1db0e",
+      "class": "renderer-partitioned-unused-shell-fallback"
+    },
+    {
+      "fingerprint": "cdccd0a76e513c7e53ff7805a04892434f4e7afc9e99799c3664e840264373c3",
+      "class": "renderer-partitioned-unused-shell-fallback"
+    },
+    {
+      "fingerprint": "21fbbfb3a750d7d031a76517faae9f96fbd05b2531e9a29045c42b6e7d654517",
+      "class": "format-partitioned-npm-scope-option"
+    },
+    {
+      "fingerprint": "96482ec27ac8fe2dcf10de4441b9636c8a7ca56d0f89eb1619229a58f87ac766",
+      "class": "post-settlement-cleanup-exception"
+    },
+    {
+      "fingerprint": "ba9e2a4c497f606097269275dbee0fc68286c075e4a2a043ad99f40965764736",
+      "class": "post-settlement-cleanup-exception"
+    },
+    {
+      "fingerprint": "cc111c5614e008ecd6731d167e5f2487c949d1c2c44463325513a44bb2e7749b",
+      "class": "delegated-retirement-idempotence"
+    },
+    {
+      "fingerprint": "ab1054548625a5fccb01dffcafaedd5b760c3b027e777b8efb5ccbcd12319e45",
+      "class": "queued-membership-invariant"
+    },
+    {
+      "fingerprint": "e4fd245b4411ee78a98b65cee262bf726fd06a24f1fb469aed2f70f424e5ed07",
+      "class": "unreachable-repeat-queued-retirement"
+    }
+  ],
+  "meaningfulSurvivors": [],
+  "thresholds": {
+    "high": 95,
+    "low": 90,
+    "break": 95.84
+  },
+  "policy": "Core mutation may not fall below the measured aggregate score. Changed mode enforces every selected target's measured score because per-target baselines legitimately differ. Timeout, runtime-error, compile-error, uncovered, missing-target, and no-mutant results fail automatically. Every surviving mutant must retain its exact reviewed fingerprint and an allowed equivalent classification; a new, changed, or meaningful survivor fails closed."
+}

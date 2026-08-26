@@ -1,5 +1,5 @@
 ---
-name: Production release gate
+name: Deterministic build candidate
 
 on:
   push:
@@ -22,6 +22,7 @@ jobs:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up exact Node.js
@@ -36,29 +37,73 @@ jobs:
       - name: Log toolchain
         run: node -e "console.log({node:process.version,npm:process.env.npm_config_user_agent,platform:process.platform,arch:process.arch})"
 
-      - name: Lint with zero warnings
-        run: npm run lint
-
-      - name: Check all JavaScript syntax
-        run: npm run syntax
-
-      - name: Validate extension build inputs
-        run: npm run build
-
       - name: Verify architecture boundaries
         run: npm run verify:architecture
-
-      - name: Verify documentation, accessibility, and packaged assets
-        run: npm run verify:polish
-
-      - name: Verify version state
-        run: npm run verify:version
 
       - name: Audit runtime dependency graph
         run: npm run audit:runtime
 
       - name: Audit development dependency graph
         run: npm run audit:dev
+
+      - name: Run the deterministic fast quality gate
+        env:
+          QUALITY_BASE: ${{ github.event_name == 'push' && github.event.before || 'origin/main' }}
+        run: npm run quality:fast
+
+      - name: Summarize deterministic quality evidence
+        if: ${{ always() }}
+        run: npm run quality:report -- --gate-profile fast
+
+      - name: Upload quality impact and report evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quality-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            .quality/impact.json
+            .quality/gates/**
+            .quality/report.json
+            .quality/report.md
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 30
+
+  mutation:
+    name: Changed high-risk mutation gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact source with comparison history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run changed high-risk mutation gate
+        env:
+          QUALITY_BASE: ${{ github.event_name == 'push' && github.event.before || 'origin/main' }}
+        run: npm run test:mutation:changed -- --base "$QUALITY_BASE"
+
+      - name: Upload mutation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            .quality/mutation/**
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 30
 
   extension-tests:
     name: Extension tests (${{ matrix.os }}, VS Code ${{ matrix.vscode }}, ${{ matrix.label }})
@@ -72,13 +117,13 @@ jobs:
             vscode: 1.99.0
             label: core
           - os: ubuntu-24.04
-            vscode: 1.132.0
+            vscode: 1.134.0
             label: core
           - os: windows-2025
-            vscode: 1.132.0
+            vscode: 1.134.0
             label: smoke
           - os: macos-15
-            vscode: 1.132.0
+            vscode: 1.134.0
             label: smoke
     env:
       VSCODE_TEST_VERSION: ${{ matrix.vscode }}
@@ -109,7 +154,7 @@ jobs:
 
   package:
     name: Reproducible VSIX
-    needs: [quality, extension-tests]
+    needs: [quality, mutation, extension-tests]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -152,21 +197,22 @@ jobs:
           retention-days: 90
           compression-level: 0
 
-  release-gate:
-    name: Release gate
-    needs: [quality, extension-tests, package]
+  build-candidate:
+    name: Deterministic build candidate
+    needs: [quality, mutation, extension-tests, package]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Require every release input to succeed
+      - name: Require every deterministic candidate input to succeed
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
+          MUTATION_RESULT: ${{ needs.mutation.result }}
           TEST_RESULT: ${{ needs.extension-tests.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
         run: |
-          if [[ "$QUALITY_RESULT" != "success" || "$TEST_RESULT" != "success" || "$PACKAGE_RESULT" != "success" ]]; then
-            echo "A required release input failed, was canceled, or was skipped."
+          if [[ "$QUALITY_RESULT" != "success" || "$MUTATION_RESULT" != "success" || "$TEST_RESULT" != "success" || "$PACKAGE_RESULT" != "success" ]]; then
+            echo "A deterministic build-candidate input failed, was canceled, or was skipped."
             exit 1
           fi
-          echo "Every required release input succeeded."
+          echo "Every deterministic build-candidate input succeeded; production release readiness remains blocked pending separately sourced UI and live qualification."

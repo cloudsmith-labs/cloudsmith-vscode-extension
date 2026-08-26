@@ -16,6 +16,9 @@ const {
   fromDependencyHealthNode,
 } = require("../domain/packageAdapters");
 const { PackageDomainError } = require("../domain/package");
+const packageDomain = require("../domain/package");
+const { InstallCommandBuilder } = require("../util/installCommandBuilder");
+const { hasInstallGuidanceForPackage } = require("../domain/installGuidanceSupport");
 const { markSelection } = require("../util/selectionProvenance");
 const {
   PACKAGE_ACTION_SURFACES,
@@ -265,13 +268,20 @@ class DependencyHealthNode {
   }
 
   getActionCapabilities() {
+    const denied = this._isQuarantined();
+    const quarantined = this._getPolicyData()?.quarantined === true;
     return derivePackageActionCapabilities({
       surface: PACKAGE_ACTION_SURFACES.DEPENDENCY_HEALTH,
       found: this.cloudsmithStatus === "FOUND" && this.package?.identityState === "exact",
       exact: this.package?.identityState === "exact",
       copyable: this.package?.copyable === true,
+      installGuidance: !denied && hasInstallGuidanceForPackage(
+        packageDomain,
+        InstallCommandBuilder,
+        this.package
+      ),
       vulnerable: this._hasVulnerabilities(),
-      quarantined: this._isQuarantined(),
+      quarantined,
       policyViolation: this._hasPolicyViolation(),
       restrictiveLicense: this._hasRestrictiveLicense(),
     });

@@ -1,7 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const path = require("path");
 const { spawnSync } = require("child_process");
-const { LIVE_TEST_SKIP_REASON } = require("../test/testInventories");
+const { CREDENTIAL_BOUNDARY_SKIP_REASON } = require("../test/testInventories");
 
 const root = path.resolve(__dirname, "..");
 const label = process.env.VSCODE_TEST_LABEL || "core";
@@ -29,4 +29,4 @@ function run(script, args = []) {
 
 run("run-node-tests.js", zeroProbe ? ["--zero-probe"] : []);
 run("run-vscode-tests.js", ["--label", label, ...(zeroProbe ? ["--zero-probe"] : [])]);
-if (!zeroProbe) console.log(`Live tests skipped: ${LIVE_TEST_SKIP_REASON}`);
+if (!zeroProbe) console.log(`Live automation excluded: ${CREDENTIAL_BOUNDARY_SKIP_REASON}`);

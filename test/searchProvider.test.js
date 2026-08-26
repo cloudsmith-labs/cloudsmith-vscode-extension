@@ -3,6 +3,7 @@
 const assert = require("assert");
 const vscode = require("vscode");
 const { registerSearchCommands } = require("../commands/search");
+const { registerOwnedOpenPackageCommand } = require("./helpers/registeredPackageAction");
 const { SearchProvider } = require("../views/searchProvider");
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { PaginatedFetch } = require("../util/paginatedFetch");
@@ -81,7 +82,7 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(connectionManager.additionalCallerState, "still mutable");
   });
 
-  test("projects search state and owns only selections rendered in the current generation", async () => {
+  test("presentation refresh preserves ownership for rows in the current committed result", async () => {
     const contextValues = new Map();
     const { provider, connectionManager } = createProvider({
       executeCommand: async (command, key, value) => {
@@ -112,7 +113,7 @@ suite("SearchProvider atomic search state", () => {
     assert.deepStrictEqual(events, [summary]);
 
     provider.refresh();
-    assert.strictEqual(provider.ownsPackageSelection(packageNode), false);
+    assert.strictEqual(provider.ownsPackageSelection(packageNode), true);
     await provider.getChildren();
     assert.strictEqual(provider.ownsPackageSelection(packageNode), true);
 
@@ -125,6 +126,82 @@ suite("SearchProvider atomic search state", () => {
     await provider.dispose();
     assert.strictEqual(contextValues.get("cloudsmith.searchActive"), false);
     assert.strictEqual(contextValues.get("cloudsmith.searchCanLoadMore"), false);
+  });
+
+  test("retained first-page actions stay current while Load More is pending publication", async () => {
+    const secondPage = deferred();
+    const { provider } = createProvider({
+      pageSize: 1,
+      fetchPage: async (_endpoint, pageNumber) => pageNumber === 1
+        ? page([pkg("first")], { pageSize: 1, pageTotal: 2, count: 2 })
+        : secondPage.promise,
+    });
+
+    await provider.search("workspace-a", "artifact");
+    const firstPageNode = provider.searchResults[0];
+    await provider.getChildren();
+    assert.strictEqual(provider.ownsPackageSelection(firstPageNode), true);
+
+    const pending = provider.loadNextPage();
+    await nextTurn();
+    assert.strictEqual(
+      provider.ownsPackageSelection(firstPageNode),
+      true,
+      "a visible retained row must remain actionable before VS Code requests the refreshed children"
+    );
+
+    secondPage.resolve(page([pkg("second")], {
+      requestedPage: 2,
+      pageSize: 1,
+      pageTotal: 2,
+      count: 2,
+    }));
+    await pending;
+    assert.strictEqual(provider.ownsPackageSelection(firstPageNode), true);
+    await provider.getChildren();
+    assert.strictEqual(provider.ownsPackageSelection(firstPageNode), true);
+  });
+
+  test("registered package action accepts the retained Search row while Load More is deferred", async () => {
+    const secondPage = deferred();
+    const { provider, connectionManager } = createProvider({
+      pageSize: 1,
+      fetchPage: async (_endpoint, pageNumber) => pageNumber === 1
+        ? page([pkg("first", { format: "npm", is_copyable: true })], {
+          pageSize: 1,
+          pageTotal: 2,
+          count: 2,
+        })
+        : secondPage.promise,
+    });
+
+    await provider.search("workspace-a", "artifact");
+    const firstPageNode = provider.searchResults[0];
+    await provider.getChildren();
+    const opened = [];
+    const command = registerOwnedOpenPackageCommand({
+      connectionManager,
+      opened,
+      searchProvider: provider,
+      targetUrl: "https://cloudsmith.example/search-package",
+    });
+
+    try {
+      const pending = provider.loadNextPage();
+      await nextTurn();
+      await vscode.commands.executeCommand(command.id, firstPageNode);
+      assert.deepStrictEqual(opened, ["https://cloudsmith.example/search-package"]);
+
+      secondPage.resolve(page([pkg("second", { format: "npm", is_copyable: true })], {
+        requestedPage: 2,
+        pageSize: 1,
+        pageTotal: 2,
+        count: 2,
+      }));
+      await pending;
+    } finally {
+      command.dispose();
+    }
   });
 
   test("vulnerability publication targets the stable summary and ignores replaced search owners", async () => {
@@ -2275,6 +2352,7 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(refreshes, 1);
     item = (await provider.getChildren())[0].getTreeItem();
     assert.strictEqual(item.label, "Connection failed");
+    assert.strictEqual(item.description, "Check Cloudsmith authentication and retry.");
 
     connectionManager.update({ status: "absent", credentialPresent: false });
     assert.strictEqual(refreshes, 2);
@@ -2289,6 +2367,10 @@ suite("SearchProvider atomic search state", () => {
     assert.strictEqual(refreshes, 3);
     item = (await provider.getChildren())[0].getTreeItem();
     assert.strictEqual(item.label, "Search packages across a Cloudsmith workspace");
+    assert.strictEqual(
+      item.description,
+      "Run Search packages from the view toolbar or Command Palette."
+    );
 
     provider.dispose();
     connectionManager.update({ status: "disposed", sessionConnected: false });
@@ -2463,9 +2545,14 @@ function registerSearchNextPageCommand(searchProvider) {
 }
 
 async function createSearchPublicationHarness(provider) {
-  const relay = new vscode.EventEmitter();
   const publications = [];
   const statePublications = [];
+  let disposed = false;
+  const capturePublication = async (element) => {
+    if (element || disposed) return;
+    const children = await provider.getChildren();
+    if (!disposed) publications.push(children.map(child => provider.getTreeItem(child)));
+  };
   const providerSubscription = provider.onDidChangeTreeData((element) => {
     statePublications.push({
       pendingKind: provider.state.pending?.kind || null,
@@ -2473,26 +2560,9 @@ async function createSearchPublicationHarness(provider) {
       page: provider.currentPage,
       resultCount: provider.searchResults.length,
     });
-    relay.fire(element);
+    void capturePublication(element);
   });
-  const treeView = vscode.window.createTreeView("cloudsmithSearchView", {
-    treeDataProvider: {
-      onDidChangeTreeData: relay.event,
-      getParent(element) { return provider.getParent(element); },
-      getTreeItem(element) { return provider.getTreeItem(element); },
-      getChildren(element) {
-        return Promise.resolve(provider.getChildren(element)).then((children) => {
-          if (!element) {
-            publications.push(children.map(child => provider.getTreeItem(child)));
-          }
-          return children;
-        });
-      },
-    },
-  });
-
-  await vscode.commands.executeCommand("cloudsmithSearchView.focus");
-  relay.fire(undefined);
+  await capturePublication(undefined);
   await waitForPublication(publications, () => true, 0);
   return {
     publications,
@@ -2501,9 +2571,8 @@ async function createSearchPublicationHarness(provider) {
       return waitForPublication(publications, predicate, startIndex);
     },
     dispose() {
-      treeView.dispose();
+      disposed = true;
       providerSubscription.dispose();
-      relay.dispose();
     },
   };
 }
@@ -2514,7 +2583,7 @@ async function waitForPublication(publications, predicate, startIndex) {
     if (match) return match;
     await new Promise(resolve => setTimeout(resolve, 5));
   }
-  throw new Error("The real Search TreeView did not publish the expected terminal state.");
+  throw new Error("The Search provider did not publish the expected terminal state.");
 }
 
 function cancellationToken() {

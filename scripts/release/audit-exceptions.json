@@ -1,50 +1,74 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "exceptions": [
     {
       "advisoryId": "GHSA-73rr-hh4g-fpgx",
       "package": "diff",
       "severity": "low",
       "owner": "release-engineering",
-      "reviewedOn": "2026-08-11",
-      "expiresOn": "2026-09-10",
+      "reviewedOn": "2026-08-26",
+      "expiresOn": "2026-09-25",
       "rationale": "Development-only Mocha diff rendering; untrusted patches are not processed by the shipped extension.",
-      "rejectedFix": {
-        "name": "@vscode/test-cli",
-        "version": "0.0.11",
-        "isSemVerMajor": true,
-        "reason": "npm proposes a breaking test-runner downgrade whose Mocha range still resolves the affected dependency graph."
-      }
+      "rejectedFixes": [
+        {
+          "name": "@vscode/test-cli",
+          "version": "0.0.11",
+          "isSemVerMajor": true,
+          "reason": "npm proposes a breaking VS Code test-runner downgrade that does not update the explicitly pinned Mocha dependency."
+        },
+        {
+          "name": "mocha",
+          "version": "11.3.0",
+          "isSemVerMajor": true,
+          "reason": "npm proposes downgrading the explicitly pinned Mocha 11.8.0 test runner to 11.3.0; that regression is outside the supported locked toolchain and is not a forward security update."
+        }
+      ]
     },
     {
       "advisoryId": "GHSA-5c6j-r48x-rmvq",
       "package": "serialize-javascript",
       "severity": "high",
       "owner": "release-engineering",
-      "reviewedOn": "2026-08-11",
-      "expiresOn": "2026-09-10",
-      "rationale": "Development-only Mocha reporter serialization; no attacker-controlled values reach this package in CI or the shipped extension.",
-      "rejectedFix": {
-        "name": "@vscode/test-cli",
-        "version": "0.0.11",
-        "isSemVerMajor": true,
-        "reason": "npm proposes a breaking test-runner downgrade whose Mocha range still resolves the affected dependency graph."
-      }
+      "reviewedOn": "2026-08-26",
+      "expiresOn": "2026-09-25",
+      "rationale": "Development-only Mocha parallel-worker option serialization; the reviewed test commands do not enable Mocha parallel mode, so this path is not reached in CI or the shipped extension.",
+      "rejectedFixes": [
+        {
+          "name": "@vscode/test-cli",
+          "version": "0.0.11",
+          "isSemVerMajor": true,
+          "reason": "npm proposes a breaking VS Code test-runner downgrade that does not update the explicitly pinned Mocha dependency."
+        },
+        {
+          "name": "mocha",
+          "version": "11.3.0",
+          "isSemVerMajor": true,
+          "reason": "npm proposes downgrading the explicitly pinned Mocha 11.8.0 test runner to 11.3.0; that regression is outside the supported locked toolchain and still carries the same serializer dependency family."
+        }
+      ]
     },
     {
       "advisoryId": "GHSA-qj8w-gfj5-8c6v",
       "package": "serialize-javascript",
       "severity": "moderate",
       "owner": "release-engineering",
-      "reviewedOn": "2026-08-11",
-      "expiresOn": "2026-09-10",
-      "rationale": "Development-only Mocha reporter serialization; no attacker-controlled array-like values reach this package in CI or the shipped extension.",
-      "rejectedFix": {
-        "name": "@vscode/test-cli",
-        "version": "0.0.11",
-        "isSemVerMajor": true,
-        "reason": "npm proposes a breaking test-runner downgrade whose Mocha range still resolves the affected dependency graph."
-      }
+      "reviewedOn": "2026-08-26",
+      "expiresOn": "2026-09-25",
+      "rationale": "Development-only Mocha parallel-worker option serialization; the reviewed test commands do not enable Mocha parallel mode, so attacker-controlled array-like values do not reach this path in CI or the shipped extension.",
+      "rejectedFixes": [
+        {
+          "name": "@vscode/test-cli",
+          "version": "0.0.11",
+          "isSemVerMajor": true,
+          "reason": "npm proposes a breaking VS Code test-runner downgrade that does not update the explicitly pinned Mocha dependency."
+        },
+        {
+          "name": "mocha",
+          "version": "11.3.0",
+          "isSemVerMajor": true,
+          "reason": "npm proposes downgrading the explicitly pinned Mocha 11.8.0 test runner to 11.3.0; that regression is outside the supported locked toolchain and still carries the same serializer dependency family."
+        }
+      ]
     }
   ]
 }

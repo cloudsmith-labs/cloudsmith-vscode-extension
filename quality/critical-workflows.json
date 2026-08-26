@@ -1,0 +1,456 @@
+{
+  "schemaVersion": 1,
+  "criticalityValues": ["release-critical", "high", "standard"],
+  "layerValues": ["unit", "contract", "extension-host", "live-protocol", "black-box-ui"],
+  "proofValues": ["auth-capability", "authoritative-outcome", "boundedness", "canonical-identity", "canonical-query", "cross-surface-parity", "documentation", "false-clean-prevention", "format-matrix", "format-native-semantics", "freshness", "manifest-parity", "negative-path", "pagination", "producer-consumer", "provenance", "publication-order", "security-boundary", "stale-state", "state-transition", "terminal-state", "validation", "visible-publication"],
+  "interactionModeValues": ["synthetic-host-message", "rendered-dom-activation"],
+  "extensionHostExecutionModeValues": ["manual-production-composition"],
+  "productionFileRoots": ["extension.js", "package.json", "commands", "domain", "models", "util", "views"],
+  "workflows": [
+    {
+      "id": "WF-ACTIVATION-STARTUP",
+      "criticality": "release-critical",
+      "surface": "Extension Host / Activity Bar",
+      "authoritativeOutcome": "Production activation is manually composed inside a real VS Code host against an explicit in-memory context, returns promptly, registers contributed commands, and never installs or host-activates the production manifest.",
+      "riskClasses": ["async-authority", "stale-publication", "terminal-state", "false-green-test"],
+      "requiredLayers": ["contract", "extension-host", "black-box-ui"],
+      "testFiles": ["test/activation.test.js", "test/extension.test.js", "ui-test/smoke.test.js"],
+      "evidence": [
+        { "layer": "extension-host", "executionMode": "manual-production-composition", "testFile": "test/activation.test.js", "testNames": ["manually composes production activation in a real host with an in-memory credential boundary", "registers commands and returns before held background readiness"], "proves": ["producer-consumer", "boundedness", "security-boundary"] },
+        { "layer": "contract", "testFile": "test/extension.test.js", "testNames": ["activation owner observes asynchronous cleanup without blocking reload"], "proves": ["terminal-state", "stale-state"] },
+        { "layer": "black-box-ui", "interactionMode": "rendered-dom-activation", "testFile": "ui-test/smoke.test.js", "testNames": ["installs, activates, and exposes the Cloudsmith Activity Bar container"], "proves": ["authoritative-outcome", "visible-publication"] }
+      ],
+      "productionAreas": ["extension.js", "package.json", "util/activationOwner.js", "util/accountLifecycle.js", "views/cloudsmithProvider.js"],
+      "targetCommands": ["npm run test:vscode", "npm run test:ui:smoke"],
+      "liveFixture": { "required": true, "kind": "existing-authenticated-profile", "description": "Existing authorized Extension Development Host profile; three reloads; never read SecretStorage.", "destructive": false },
+      "destructive": false
+    },
+    {
+      "id": "WF-AUTH-STATE",
+      "criticality": "release-critical",
+      "surface": "Authentication / connection presentation",
+      "authoritativeOutcome": "The extension presents the actual current credential/session capability, survives stored-session startup, clears stale account data on replacement, and never reuses SSO credentials for registry pull-through.",
+      "riskClasses": ["auth-capability", "validation/security", "async-authority", "stale-publication", "false-green-test"],
+      "requiredLayers": ["unit", "contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/authCapabilities.test.js", "test/authSessionManager.test.js", "test/commandRegistrars.test.js"],
+      "evidence": [
+        { "layer": "unit", "testFile": "test/authCapabilities.test.js", "testNames": ["only a connected API-key session grants pull-through", "hostile accessors, proxies, symbols, and inherited grants fail closed"], "proves": ["security-boundary", "negative-path"] },
+        { "layer": "extension-host", "testFile": "test/authSessionManager.test.js", "testNames": ["runs discovery, callback, validation, commit, ordinary bearer API, and refresh end to end", "connected SSO remains unavailable to registry pull-through"], "proves": ["producer-consumer", "authoritative-outcome", "freshness"] },
+        { "layer": "contract", "testFile": "test/commandRegistrars.test.js", "testNames": ["SSO pull command callbacks stop before provider or selection adaptation"], "proves": ["auth-capability", "negative-path"] }
+      ],
+      "productionAreas": ["commands/authentication.js", "commands/dependencyHealth.js", "domain/authCapabilities.js", "models/connectionStatusNode.js", "util/connectionManager.js", "util/connectionPresentation.js", "util/credentialEnvelope.js", "util/ssoAuthManager.js", "package.json"],
+      "targetCommands": ["npm run test:node", "npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "existing-authenticated-profile", "description": "Existing API-key session; SSO only when already authenticated. Do not open credential stores or login UI during automated qualification.", "destructive": false },
+      "destructive": false
+    },
+    {
+      "id": "WF-EXPLORER-PUBLICATION",
+      "criticality": "release-critical",
+      "surface": "Workspaces / Repository Explorer",
+      "authoritativeOutcome": "Expanding a repository visibly publishes package/group rows or an explicit typed empty, partial, failed/retry, or cancelled package terminal; supplementary metadata never becomes the package terminal and never delays verified package publication.",
+      "riskClasses": ["async-authority", "stale-publication", "terminal-state", "pagination", "boundedness", "false-green-test"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol", "black-box-ui"],
+      "testFiles": ["test/cloudsmithProvider.test.js", "test/repositoryNode.test.js", "ui-test/smoke.test.js"],
+      "evidence": [
+        { "layer": "extension-host", "testFile": "test/cloudsmithProvider.test.js", "testNames": ["FUX-002 real Extension Host tree publication ledger cannot settle blank", "real Extension Host publishes package content before repository metadata"], "proves": ["producer-consumer", "authoritative-outcome", "publication-order"] },
+        { "layer": "contract", "testFile": "test/repositoryNode.test.js", "testNames": ["FUX-002 publishes machine-readable empty, failed, and cancelled package outcomes", "active continuation publishes retained packages and loading before metadata"], "proves": ["terminal-state", "pagination", "negative-path"] },
+        { "layer": "black-box-ui", "interactionMode": "rendered-dom-activation", "testFile": "ui-test/smoke.test.js", "testNames": ["opens every extension-owned view without a blank container"], "proves": ["visible-publication"] }
+      ],
+      "productionAreas": ["views/cloudsmithProvider.js", "models/repositoryNode.js", "models/repositoryTerminalNode.js", "models/repositoryLoadMoreNode.js", "models/packageGroupsNode.js", "models/packageNode.js", "models/workspaceNode.js", "commands/packages.js", "util/externalNavigation.js", "package.json"],
+      "targetCommands": ["npm run test:vscode", "npm run test:ui:smoke"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "dl-technology-consulting/common-testing and common-dependencies, both known to contain packages.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-EXPLORER-INSPECT-PACKAGE", "ACT-EXPLORER-SHOW-INSTALL", "ACT-EXPLORER-OPEN-PACKAGE", "ACT-EXPLORER-OPEN-PACKAGE-GROUP", "ACT-EXPLORER-OPEN-LICENSE"]
+    },
+    {
+      "id": "WF-SEARCH-FIRST-PAGE",
+      "criticality": "release-critical",
+      "surface": "Package search",
+      "authoritativeOutcome": "The current canonical query owns a bounded first-page result, explicit authoritative empty state, or actionable failure without erasing the last verified result.",
+      "riskClasses": ["contract-mismatch", "async-authority", "stale-publication", "terminal-state", "boundedness"],
+      "requiredLayers": ["unit", "contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/searchProvider.test.js", "test/searchQueryBuilder.test.js"],
+      "evidence": [
+        { "layer": "unit", "testFile": "test/searchQueryBuilder.test.js", "testNames": ["field methods escape special query characters"], "proves": ["validation", "canonical-query"] },
+        { "layer": "contract", "testFile": "test/searchProvider.test.js", "testNames": ["typed first-page timeout is a failure for the requested query, never an empty result"], "proves": ["terminal-state", "negative-path"] },
+        { "layer": "extension-host", "testFile": "test/searchProvider.test.js", "testNames": ["composes SearchProvider, PaginatedFetch, and CloudsmithAPI into one encoded first-page dispatch", "typed first-page timeout is a failure for the requested query, never an empty result"], "proves": ["producer-consumer", "authoritative-outcome", "negative-path"] }
+      ],
+      "productionAreas": ["views/searchProvider.js", "commands/search.js", "commands/packages.js", "util/searchIntent.js", "util/searchQueryBuilder.js", "util/externalNavigation.js", "models/searchResultNode.js", "package.json"],
+      "targetCommands": ["npm run test:node", "npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "Known populated, empty, guided, workspace-wide, and repository-scoped queries in dl-technology-consulting.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-SEARCH-INSPECT-PACKAGE", "ACT-SEARCH-SHOW-INSTALL", "ACT-SEARCH-OPEN-PACKAGE", "ACT-SEARCH-OPEN-LICENSE"]
+    },
+    {
+      "id": "WF-SEARCH-PAGINATION",
+      "criticality": "release-critical",
+      "surface": "Package search / Load More",
+      "authoritativeOutcome": "Load More appends only new canonical rows for the owned generation, or reaches a bounded truthful retry/exhausted terminal while retaining prior verified rows.",
+      "riskClasses": ["pagination", "boundedness", "async-authority", "stale-publication", "terminal-state", "false-green-test"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/searchProvider.test.js"],
+      "evidence": [
+        { "layer": "contract", "testFile": "test/searchProvider.test.js", "testNames": ["a duplicate-only non-final page becomes a bounded truthful terminal failure"], "proves": ["pagination", "negative-path"] },
+        { "layer": "extension-host", "testFile": "test/searchProvider.test.js", "testNames": ["registered Load More command bounds a non-settling page and publishes a retryable timeout", "registered Load More command appends the authoritative final page", "a duplicate-only non-final page becomes a bounded truthful terminal failure"], "proves": ["producer-consumer", "authoritative-outcome", "boundedness", "negative-path"] }
+      ],
+      "productionAreas": ["views/searchProvider.js", "commands/search.js", "models/loadMoreNode.js", "util/paginatedFetch.js", "package.json"],
+      "targetCommands": ["npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "A stable query with more than one page, plus exhaustion and supersession checks.", "destructive": false },
+      "destructive": false
+    },
+    {
+      "id": "WF-SEARCH-SUPERSESSION",
+      "criticality": "release-critical",
+      "surface": "Package search",
+      "authoritativeOutcome": "A replacement query immediately owns the view; earlier root or continuation completions cannot publish rows, errors, or progress as current.",
+      "riskClasses": ["async-authority", "stale-publication", "pagination", "terminal-state"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/searchProvider.test.js"],
+      "evidence": [
+        { "layer": "contract", "testFile": "test/searchProvider.test.js", "testNames": ["beginSearch synchronously supersedes the prior intent before either executes"], "proves": ["freshness", "negative-path"] },
+        { "layer": "extension-host", "testFile": "test/searchProvider.test.js", "testNames": ["beginSearch synchronously supersedes the prior intent before either executes", "an in-flight old continuation cannot publish success or failure after a new root owns the view"], "proves": ["freshness", "negative-path", "authoritative-outcome"] }
+      ],
+      "productionAreas": ["views/searchProvider.js", "commands/search.js", "util/searchIntent.js"],
+      "targetCommands": ["npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "Rapid format:npm to format:python replacement and Load More superseded by a new query.", "destructive": false },
+      "destructive": false
+    },
+    {
+      "id": "WF-DEPENDENCY-RESOLUTION",
+      "criticality": "release-critical",
+      "surface": "Dependency health / resolver inventory",
+      "authoritativeOutcome": "Every registered resolver family reaches a bounded terminal result and preserves exact dependency identity, provenance, qualifiers, directness, and resolution completeness without manufacturing registry evidence.",
+      "riskClasses": ["canonical-identity", "format-native-semantics", "boundedness", "validation/security", "terminal-state"],
+      "requiredLayers": ["unit", "contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/dependencyAdapterRegistry.test.js", "test/dependencyHealthProvider.test.js", "test/lockfileResolver.test.js"],
+      "evidence": [
+        { "layer": "unit", "testFile": "test/dependencyAdapterRegistry.test.js", "testNames": ["returns canonical records for supported manifest dependencies", "preserves the workspace trust boundary on adapter detections"], "proves": ["canonical-identity", "security-boundary", "negative-path"] },
+        { "layer": "contract", "testFile": "test/dependencyHealthProvider.test.js", "testNames": ["compliance dedup preserves occurrences and uncertainty over absence"], "proves": ["producer-consumer", "authoritative-outcome"] },
+        { "layer": "extension-host", "testFile": "test/lockfileResolver.test.js", "testNames": ["secondary parser fixtures can be resolved through the registry"], "proves": ["format-matrix", "terminal-state"] }
+      ],
+      "productionAreas": ["views/dependencyHealthProvider.js", "util/dependencyAdapterRegistry.js", "util/dependencyRecord.js", "util/dependencyManifestDiscovery.js", "util/lockfileResolver.js", "util/lockfileParsers/**", "util/manifestParser.js", "models/dependencyHealthNode.js", "models/dependencySourceGroupNode.js"],
+      "targetCommands": ["npm run test:node", "npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "local-project-fixtures", "description": "Established cloudsmith-*-demo projects under the Projects root; connected read-only enrichment.", "destructive": false },
+      "destructive": false,
+      "formatContracts": [
+        { "format": "npm", "identity": "scope/name, exact version, installed-path occurrence" },
+        { "format": "python", "identity": "normalized distribution, exact version, markers/source" },
+        { "format": "maven", "identity": "groupId:artifactId, type, classifier, scope" },
+        { "format": "gradle", "identity": "Maven coordinate and configuration membership" },
+        { "format": "go", "identity": "case-sensitive module, semantic major, +incompatible, replacement" },
+        { "format": "cargo", "identity": "crate, exact version, registry source" },
+        { "format": "ruby", "identity": "gem, exact version, platform, source" },
+        { "format": "docker", "identity": "image, tag/digest, platform, stage/service" },
+        { "format": "nuget", "identity": "package casing, exact version, framework" },
+        { "format": "dart", "identity": "package, version, hosted/path/git source" },
+        { "format": "composer", "identity": "vendor/name, version, packages section" },
+        { "format": "helm", "identity": "chart, version, repository, alias" },
+        { "format": "swift", "identity": "registry scope or source URL, branch, revision" },
+        { "format": "hex", "identity": "package, version, environment, source" }
+      ]
+    },
+    {
+      "id": "WF-DEPENDENCY-COVERAGE-SETTLEMENT",
+      "criticality": "release-critical",
+      "surface": "Dependency health / Cloudsmith coverage and enrichment",
+      "authoritativeOutcome": "Coverage and optional enrichment settle within explicit budgets; progress, report publication, and operation state converge on complete, partial, failed, cancelled, or timed-out truth without loading-as-empty or intermediate-as-final publication.",
+      "riskClasses": ["async-authority", "terminal-state", "boundedness", "error-normalization", "stale-publication", "false-green-test"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/dependencyHealthProvider.test.js", "test/upstreamGapAnalyzer.test.js", "test/upstreamOperationScheduler.test.js"],
+      "evidence": [
+        { "layer": "extension-host", "testFile": "test/dependencyHealthProvider.test.js", "testNames": ["real upstream analysis times out a nonsettling repository before a truthful scan terminal", "real upstream cancellation closes progress without publishing partial state"], "proves": ["authoritative-outcome", "boundedness", "terminal-state"] },
+        { "layer": "contract", "testFile": "test/upstreamGapAnalyzer.test.js", "testNames": ["settles terminally when one repository runtime operation never returns"], "proves": ["boundedness", "negative-path"] },
+        { "layer": "unit", "testFile": "test/upstreamOperationScheduler.test.js", "testNames": ["bounds 100 repository-format requests to four active operations"], "proves": ["boundedness"] }
+      ],
+      "productionAreas": ["views/dependencyHealthProvider.js", "util/dependencyScanOrchestration.js", "util/upstreamGapAnalyzer.js", "util/upstreamOperationScheduler.js", "util/upstreamChecker.js", "util/dependencyVulnEnricher.js", "util/dependencyPolicyEnricher.js", "util/dependencyLicenseEnricher.js"],
+      "targetCommands": ["npm run test:node", "npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "local-project-fixtures", "description": "npm and Python established projects plus one additional format; record duration and final progress state.", "destructive": false },
+      "destructive": false
+    },
+    {
+      "id": "WF-DEPENDENCY-PROJECTIONS",
+      "criticality": "release-critical",
+      "surface": "Dependency health / Direct, Flat, Tree, filters",
+      "authoritativeOutcome": "Direct, Flat, and Tree are faithful projections of the same current scan and filters/sorts never change canonical identity, coverage truth, or stale-operation ownership.",
+      "riskClasses": ["canonical-identity", "cross-surface-parity", "stale-publication", "capability-composition"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/dependencyHealthProvider.test.js", "test/treeVisualization.test.js"],
+      "evidence": [
+        { "layer": "extension-host", "testFile": "test/dependencyHealthProvider.test.js", "testNames": ["first successful scan atomically commits results, scope, report data, and diagnostics"], "proves": ["authoritative-outcome", "cross-surface-parity"] },
+        { "layer": "contract", "testFile": "test/treeVisualization.test.js", "testNames": ["tree mode expands direct dependencies and collapses duplicate diamonds"], "proves": ["canonical-identity", "boundedness"] }
+      ],
+      "productionAreas": ["views/dependencyHealthProvider.js", "models/dependencyHealthNode.js", "models/dependencySourceGroupNode.js", "models/dependencySummaryNode.js", "commands/packages.js", "util/externalNavigation.js", "package.json"],
+      "targetCommands": ["npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "local-project-fixtures", "description": "Completed npm/Python scan with Direct, Flat, Tree, vulnerable, uncovered, clear, and sort controls.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-DEPENDENCY-FIND-SAFE", "ACT-DEPENDENCY-SHOW-VULNERABILITIES", "ACT-DEPENDENCY-SHOW-INSTALL", "ACT-DEPENDENCY-OPEN-PACKAGE", "ACT-DEPENDENCY-OPEN-LICENSE"]
+    },
+    {
+      "id": "WF-VULNERABILITY-TRUTH",
+      "criticality": "release-critical",
+      "surface": "Dependency/package vulnerability summary and detail WebView",
+      "authoritativeOutcome": "Clean, vulnerable, partial, failed, and refreshing states remain distinct for the exact package; count, severity, identifiers, affected versions, fixes, rows, copy, and links agree when authoritative.",
+      "riskClasses": ["canonical-identity", "async-authority", "false-green-test", "validation/security", "terminal-state"],
+      "requiredLayers": ["unit", "contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/vulnerabilityProvider.test.js", "test/vulnerabilityStateService.test.js", "test/vulnerabilitySummaryNode.test.js"],
+      "evidence": [
+        { "layer": "unit", "testFile": "test/vulnerabilityStateService.test.js", "testNames": ["new positive list evidence invalidates an older seeded clean result"], "proves": ["authoritative-outcome", "state-transition"] },
+        { "layer": "contract", "testFile": "test/vulnerabilityProvider.test.js", "testNames": ["renders complete vulnerable, partial, failed, and refresh-failed states truthfully"], "proves": ["terminal-state", "cross-surface-parity"] },
+        { "layer": "extension-host", "testFile": "test/vulnerabilityProvider.test.js", "testNames": ["renders complete vulnerable, partial, failed, and refresh-failed states truthfully", "uses exact bounded message contracts and blocks hostile or stale effects"], "proves": ["authoritative-outcome", "negative-path", "security-boundary"] },
+        { "layer": "extension-host", "testFile": "test/vulnerabilitySummaryNode.test.js", "testNames": ["service uncertainty and positive evidence override older clean fallbacks"], "proves": ["false-clean-prevention"] }
+      ],
+      "productionAreas": ["views/vulnerabilityProvider.js", "util/vulnerabilityStateService.js", "util/vulnerabilityReportProjection.js", "util/packageVulnerabilities.js", "util/vulnerabilitySeverity.js", "util/externalNavigation.js", "models/vulnerabilitySummaryNode.js", "models/vulnerabilityNode.js", "commands/vulnerabilities.js"],
+      "targetCommands": ["npm run test:node", "npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "Representative clean, vulnerable, quarantined, and vulnerable+quarantined exact packages.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-VULNERABILITY-FIND-SAFE", "ACT-VULNERABILITY-EXPLAIN-QUARANTINE", "ACT-VULNERABILITY-COPY", "ACT-VULNERABILITY-OPEN-REFERENCE", "ACT-VULNERABILITY-OPEN-CVE", "ACT-VULNERABILITY-RETRY"]
+    },
+    {
+      "id": "WF-COMPLIANCE-PARITY",
+      "criticality": "release-critical",
+      "surface": "Dependency health / Compliance WebView",
+      "authoritativeOutcome": "Compliance counts, row states, severity detail, and copied report agree with the exact current Dependency Health and Vulnerability evidence; detected or unknown data never renders as clean.",
+      "riskClasses": ["cross-surface-parity", "async-authority", "false-green-test", "terminal-state"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/complianceReportProvider.test.js", "test/dependencyHealthProvider.test.js"],
+      "evidence": [
+        { "layer": "contract", "testFile": "test/complianceReportProvider.test.js", "testNames": ["positive vulnerability indicators never render false-clean compliance copy", "canonical vulnerability detail drives compliance severity, count, and fix parity"], "proves": ["authoritative-outcome", "cross-surface-parity", "false-clean-prevention"] },
+        { "layer": "extension-host", "testFile": "test/dependencyHealthProvider.test.js", "testNames": ["terminal canonical vulnerability publication refreshes stored compliance truth"], "proves": ["producer-consumer", "state-transition"] }
+      ],
+      "productionAreas": ["views/complianceReportProvider.js", "views/dependencyHealthProvider.js", "util/vulnerabilityReportProjection.js", "util/vulnerabilityStateService.js", "commands/dependencyHealth.js"],
+      "targetCommands": ["npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "Completed scan with vulnerable rows; compare summary, Compliance, and Vulnerability detail.", "destructive": false },
+      "destructive": false
+    },
+    {
+      "id": "WF-QUARANTINE-EXPLANATION",
+      "criticality": "release-critical",
+      "surface": "Quarantine explanation WebView",
+      "authoritativeOutcome": "The current exact package is freshly confirmed quarantined and renders truthful policy/reason evidence or a bounded actionable terminal; stale panels cannot act.",
+      "riskClasses": ["provenance", "canonical-identity", "async-authority", "stale-publication", "terminal-state"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/quarantineExplainProvider.test.js", "test/webviewMessage.test.js", "test/webviewPackageActionFlow.test.js"],
+      "evidence": [
+        { "layer": "extension-host", "testFile": "test/quarantineExplainProvider.test.js", "testNames": ["account reset aborts stale loading before it can render", "renders a focused status-reason explanation without backend-gap copy"], "proves": ["freshness", "negative-path", "authoritative-outcome"] },
+        { "layer": "contract", "testFile": "test/webviewMessage.test.js", "testNames": ["enforces exact command boundaries and control-character rejection"], "proves": ["security-boundary", "negative-path"] },
+        { "layer": "extension-host", "interactionMode": "synthetic-host-message", "testFile": "test/webviewPackageActionFlow.test.js", "testNames": ["disposed WebView messages cannot enter package workflows"], "proves": ["producer-consumer", "stale-state"] }
+      ],
+      "productionAreas": ["views/quarantineExplainProvider.js", "commands/vulnerabilities.js", "util/policyDecisionLogs.js", "util/webviewMessage.js", "util/externalNavigation.js"],
+      "targetCommands": ["npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "Known quarantined exact package, plus panel replacement/disposal.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-QUARANTINE-FIND-SAFE", "ACT-QUARANTINE-SHOW-VULNERABILITIES", "ACT-QUARANTINE-OPEN", "ACT-QUARANTINE-COPY", "ACT-QUARANTINE-RETRY"]
+    },
+    {
+      "id": "WF-QUARANTINE-TO-VULNERABILITIES",
+      "criticality": "release-critical",
+      "surface": "Quarantine WebView to Vulnerability WebView",
+      "authoritativeOutcome": "Show vulnerabilities accepts current WebView exact-package provenance and opens vulnerability evidence for the same canonical identity; command dispatch alone is not success.",
+      "riskClasses": ["contract-mismatch", "provenance", "canonical-identity", "cross-surface-parity", "false-green-test"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/webviewMessage.test.js", "test/webviewPackageActionFlow.test.js"],
+      "evidence": [
+        { "layer": "contract", "testFile": "test/webviewMessage.test.js", "testNames": ["enforces exact command boundaries and control-character rejection"], "proves": ["security-boundary", "negative-path"] },
+        { "layer": "extension-host", "interactionMode": "synthetic-host-message", "testFile": "test/webviewPackageActionFlow.test.js", "testNames": ["Quarantine Show vulnerabilities reaches the real target without tree provenance"], "proves": ["provenance", "producer-consumer", "authoritative-outcome", "canonical-identity"] }
+      ],
+      "productionAreas": ["views/quarantineExplainProvider.js", "views/vulnerabilityProvider.js", "commands/vulnerabilities.js", "domain/packageAdapters.js", "util/webviewMessage.js"],
+      "targetCommands": ["npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "Known vulnerable+quarantined exact package; click through and compare all identity fields.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-QUARANTINE-SHOW-VULNERABILITIES"]
+    },
+    {
+      "id": "WF-VULNERABILITY-TO-QUARANTINE",
+      "criticality": "release-critical",
+      "surface": "Vulnerability WebView to Quarantine WebView",
+      "authoritativeOutcome": "View quarantine details is offered only for freshly quarantined current evidence and opens the explanation for the same canonical package; stale or non-quarantined operations cannot act.",
+      "riskClasses": ["contract-mismatch", "provenance", "canonical-identity", "async-authority", "cross-surface-parity"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/webviewMessage.test.js", "test/webviewPackageActionFlow.test.js"],
+      "evidence": [
+        { "layer": "contract", "testFile": "test/webviewMessage.test.js", "testNames": ["enforces exact command boundaries and control-character rejection"], "proves": ["security-boundary", "negative-path"] },
+        { "layer": "extension-host", "interactionMode": "synthetic-host-message", "testFile": "test/webviewPackageActionFlow.test.js", "testNames": ["Vulnerability WebView actions use current panel provenance in both directions", "current unsupported reciprocal action is unavailable and explains direct messages"], "proves": ["provenance", "producer-consumer", "authoritative-outcome", "negative-path"] }
+      ],
+      "productionAreas": ["views/vulnerabilityProvider.js", "views/quarantineExplainProvider.js", "commands/vulnerabilities.js", "domain/packageAdapters.js", "util/webviewMessage.js"],
+      "targetCommands": ["npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "Known vulnerable+quarantined exact package and a vulnerable-only package.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-VULNERABILITY-EXPLAIN-QUARANTINE"]
+    },
+    {
+      "id": "WF-FIND-SAFE-VERSION",
+      "criticality": "release-critical",
+      "surface": "Explorer / Search / Dependency health / WebViews",
+      "authoritativeOutcome": "The selected exact vulnerable package yields a freshly verified compatible clean candidate in the same repository scope, or a truthful no-candidate/error result; out-of-scope and incomplete evidence fail closed.",
+      "riskClasses": ["provenance", "canonical-identity", "validation/security", "async-authority", "cross-surface-parity", "false-green-test"],
+      "requiredLayers": ["unit", "contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/remediationHelper.test.js", "test/commandFreshness.test.js", "test/webviewMessage.test.js", "test/webviewPackageActionFlow.test.js"],
+      "evidence": [
+        { "layer": "unit", "testFile": "test/remediationHelper.test.js", "testNames": ["rejects safe-version results outside every exact requested scope field"], "proves": ["security-boundary", "negative-path"] },
+        { "layer": "contract", "testFile": "test/commandFreshness.test.js", "testNames": ["safe-version picker publishes only canonically verified complete-clean candidates", "known fix absent from the selected repository is truthful and never widens scope"], "proves": ["authoritative-outcome", "canonical-identity", "freshness"] },
+        { "layer": "contract", "testFile": "test/webviewMessage.test.js", "testNames": ["enforces exact command boundaries and control-character rejection"], "proves": ["security-boundary", "negative-path"] },
+        { "layer": "extension-host", "interactionMode": "synthetic-host-message", "testFile": "test/webviewPackageActionFlow.test.js", "testNames": ["Quarantine Find safe version reaches a truthful shared-workflow result"], "proves": ["producer-consumer", "cross-surface-parity"] }
+      ],
+      "productionAreas": ["commands/vulnerabilities.js", "util/remediationHelper.js", "util/externalNavigation.js", "domain/packageAdapters.js", "views/quarantineExplainProvider.js", "views/vulnerabilityProvider.js", "models/dependencyHealthNode.js", "models/packageNode.js", "models/searchResultNode.js", "package.json"],
+      "targetCommands": ["npm run test:node", "npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "Known fix in scope if available; known fix absent from scope; out-of-scope same name; no compatible candidate.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-DEPENDENCY-FIND-SAFE", "ACT-QUARANTINE-FIND-SAFE", "ACT-VULNERABILITY-FIND-SAFE"]
+    },
+    {
+      "id": "WF-INSTALL-GUIDANCE",
+      "criticality": "release-critical",
+      "surface": "Explorer / Search / Dependency health Show and Copy",
+      "authoritativeOutcome": "Show and Copy agree for the exact canonical package and produce format-native guidance that actually targets the selected Cloudsmith repository, retains required qualifiers, and contains no secret.",
+      "riskClasses": ["canonical-identity", "format-native-semantics", "provenance", "validation/security", "cross-surface-parity", "false-green-test"],
+      "requiredLayers": ["unit", "contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/installCommandBuilder.test.js", "test/integration/installCommand.test.js", "test/commandFreshness.test.js", "test/commandRegistrars.test.js"],
+      "evidence": [
+        { "layer": "unit", "testFile": "test/installCommandBuilder.test.js", "testNames": ["every secondary command preserves its selected Cloudsmith target and native identity", "all generated command formats reject newlines in package metadata"], "proves": ["format-matrix", "security-boundary", "canonical-identity"] },
+        { "layer": "contract", "testFile": "test/integration/installCommand.test.js", "testNames": ["formats with public defaults explicitly suppress or replace them"], "proves": ["authoritative-outcome", "format-native-semantics"] },
+        { "layer": "contract", "testFile": "test/commandFreshness.test.js", "testNames": ["Show and Copy publish identical selected guidance across the required formats", "API package identity and qualifiers survive registered Show and Copy handlers"], "proves": ["cross-surface-parity", "canonical-identity"] },
+        { "layer": "extension-host", "testFile": "test/commandRegistrars.test.js", "testNames": ["registered install command publishes usable guidance through real host dispatch"], "proves": ["producer-consumer", "authoritative-outcome", "format-native-semantics"] }
+      ],
+      "productionAreas": ["util/installCommandBuilder.js", "commands/packages.js", "commands/support.js", "domain/installGuidanceSupport.js", "domain/packageAdapters.js", "domain/packageActionCapabilities.js", "models/packageNode.js", "models/searchResultNode.js", "models/dependencyHealthNode.js", "package.json"],
+      "targetCommands": ["npm run test:node", "npm run test:vscode", "npm run test:mutation:changed"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "Current InstallCommandBuilder format inventory using existing exact packages; Show, Copy, paste, semantic comparison, and secret scan.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-EXPLORER-SHOW-INSTALL", "ACT-SEARCH-SHOW-INSTALL", "ACT-DEPENDENCY-SHOW-INSTALL"],
+      "formatContracts": [
+        { "format": "python", "identity": "distribution==version and selected index semantics" },
+        { "format": "npm", "identity": "scoped/unscoped package@version and selected registry" },
+        { "format": "maven", "identity": "groupId, artifactId, version, type, classifier and exclusive mirror" },
+        { "format": "nuget", "identity": "package ID/version and selected v3 source" },
+        { "format": "helm", "identity": "chart/version and selected chart repository" },
+        { "format": "cargo", "identity": "crate exact version and explicit named Cloudsmith registry" },
+        { "format": "go", "identity": "module@version with command-scoped Cloudsmith GOPROXY" },
+        { "format": "ruby", "identity": "gem/version/platform with only the selected source" },
+        { "format": "conda", "identity": "name/version/build/subdir MatchSpec and selected channel" },
+        { "format": "composer", "identity": "vendor/name:version with public default disabled" },
+        { "format": "dart", "identity": "package:version and selected hosted repository" },
+        { "format": "docker", "identity": "image plus exact digest/tag and selected registry" },
+        { "format": "rpm", "identity": "NEVRA and selected repository" },
+        { "format": "raw", "identity": "authoritative exact download URL" },
+        { "format": "generic", "identity": "authoritative exact download URL via raw contract" }
+      ]
+    },
+    {
+      "id": "WF-UPSTREAM-INVENTORY",
+      "criticality": "release-critical",
+      "surface": "Repository upstream inventory WebView",
+      "authoritativeOutcome": "The current safe per-format upstream inventory reaches complete, empty, or truthful partial/error state; retry retains verified cards and never exposes credentials or raw unsafe URLs.",
+      "riskClasses": ["terminal-state", "boundedness", "error-normalization", "validation/security", "async-authority"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/upstreamChecker.test.js", "test/upstreamDetailProvider.test.js"],
+      "evidence": [
+        { "layer": "contract", "testFile": "test/upstreamChecker.test.js", "testNames": ["bounds aggregate concurrency at four and settles the operation deadline"], "proves": ["boundedness", "terminal-state"] },
+        { "layer": "extension-host", "testFile": "test/upstreamDetailProvider.test.js", "testNames": ["shows successful upstreams together with a truthful partial warning", "retains a verified format over an incomplete Retry page", "accepts only the exact Retry message and disposes its listener"], "proves": ["authoritative-outcome", "producer-consumer", "security-boundary"] }
+      ],
+      "productionAreas": ["views/upstreamDetailProvider.js", "util/upstreamChecker.js", "util/upstreamRuntime.js", "util/upstreamFormats.js", "util/upstreamPresentation.js", "commands/upstream.js"],
+      "targetCommands": ["npm run test:node", "npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "common-testing and common-dependencies current upstream inventories.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-UPSTREAM-RETRY"]
+    },
+    {
+      "id": "WF-UPSTREAM-PREVIEW",
+      "criticality": "release-critical",
+      "surface": "Dependency health / Upstream preview WebView",
+      "authoritativeOutcome": "The exact absent dependency and selected repository show authoritative local absence plus current matching upstream evidence, or a truthful no-match/partial/error result without policy claims or secret-bearing diagnostics.",
+      "riskClasses": ["canonical-identity", "terminal-state", "error-normalization", "validation/security", "provenance"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/upstreamPreviewProvider.test.js", "test/commandRegistrars.test.js"],
+      "evidence": [
+        { "layer": "extension-host", "testFile": "test/upstreamPreviewProvider.test.js", "testNames": ["renders the real safe preview producer contract without raw URL fallback", "fails incomplete on contradictory counts and malformed configurations"], "proves": ["producer-consumer", "authoritative-outcome", "negative-path"] },
+        { "layer": "contract", "testFile": "test/commandRegistrars.test.js", "testNames": ["upstream preview is latest-wins within the same account"], "proves": ["freshness", "provenance"] }
+      ],
+      "productionAreas": ["views/upstreamPreviewProvider.js", "commands/upstream.js", "util/upstreamChecker.js", "util/upstreamPresentation.js", "domain/packageAdapters.js", "models/dependencyHealthNode.js", "package.json"],
+      "targetCommands": ["npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "One upstream-reachable exact absent package and one no-match/no-upstream package.", "destructive": false },
+      "destructive": false
+    },
+    {
+      "id": "WF-PULL-THROUGH",
+      "criticality": "release-critical",
+      "surface": "Dependency health / Pull dependency",
+      "authoritativeOutcome": "After exact absence, explicit target/confirmation, and a native registry trigger, the immutable exact artifact appears in the selected repository and the originating dependency row refreshes to covered; request acceptance alone is never success.",
+      "riskClasses": ["auth-capability", "canonical-identity", "format-native-semantics", "async-authority", "boundedness", "validation/security", "false-green-test"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/upstreamPullService.test.js", "test/commandRegistrars.test.js"],
+      "evidence": [
+        { "layer": "contract", "testFile": "test/upstreamPullService.test.js", "testNames": ["2xx, 304, and 409 registry responses wait for delayed exact presence before cached", "successful registry trigger with permanent exact absence returns a non-cached error", "rejects redirects to untrusted hosts before forwarding credentials"], "proves": ["authoritative-outcome", "security-boundary", "negative-path"] },
+        { "layer": "extension-host", "testFile": "test/commandRegistrars.test.js", "testNames": ["dependency callbacks contain scan failures and pass only canonical pull coordinates", "SSO pull command callbacks stop before provider or selection adaptation"], "proves": ["producer-consumer", "canonical-identity", "auth-capability"] }
+      ],
+      "productionAreas": ["util/upstreamPullService.js", "util/registryEndpoints.js", "util/exactPackageEvidence.js", "domain/authCapabilities.js", "commands/dependencyHealth.js", "views/dependencyHealthProvider.js", "models/dependencyHealthNode.js", "package.json"],
+      "targetCommands": ["npm run test:node", "npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-authorized-cache-write", "description": "Use existing exact presence evidence first; limited safe pull only in authorized common-testing. No delete or configuration mutation.", "destructive": false },
+      "destructive": true,
+      "formatContracts": [
+        { "format": "cargo", "identity": "crate archive after sparse metadata" },
+        { "format": "dart", "identity": "hosted archive" },
+        { "format": "docker", "identity": "manifest and referenced blobs" },
+        { "format": "go", "identity": ".info, .mod, and .zip" },
+        { "format": "maven", "identity": "POM and qualifier-selected artifact" },
+        { "format": "npm", "identity": "packument-selected tarball" },
+        { "format": "nuget", "identity": "v3 package-base nupkg" },
+        { "format": "python", "identity": "exact compatible wheel or sdist" },
+        { "format": "ruby", "identity": "platform-qualified gem" }
+      ]
+    },
+    {
+      "id": "WF-PROMOTION-PREFLIGHT",
+      "criticality": "release-critical",
+      "surface": "Package promotion",
+      "authoritativeOutcome": "A fresh exact eligible source and fresh absent target reach a reviewable preflight; no write occurs before final confirmation and success is published only after exact target presence and requested tag evidence.",
+      "riskClasses": ["canonical-identity", "async-authority", "stale-publication", "validation/security", "terminal-state"],
+      "requiredLayers": ["contract", "extension-host", "live-protocol"],
+      "testFiles": ["test/promotionProvider.test.js", "test/commandRegistrars.test.js"],
+      "evidence": [
+        { "layer": "extension-host", "testFile": "test/promotionProvider.test.js", "testNames": ["no write occurs while final confirmation is pending", "full success uses fresh canonical identity, confirms, writes once per stage, and verifies", "post-confirmation target drift invalidates approval before every write"], "proves": ["authoritative-outcome", "freshness", "negative-path"] },
+        { "layer": "contract", "testFile": "test/commandRegistrars.test.js", "testNames": ["promotion callbacks reject invalid selections and pass canonical packages locally"], "proves": ["producer-consumer", "canonical-identity"] }
+      ],
+      "productionAreas": ["views/promotionProvider.js", "commands/promotion.js", "util/promotionContracts.js", "domain/packageAdapters.js", "models/packageNode.js", "models/searchResultNode.js", "package.json"],
+      "targetCommands": ["npm run test:node", "npm run test:vscode"],
+      "liveFixture": { "required": true, "kind": "cloudsmith-preflight-only", "description": "Eligible existing package; choose target, inspect preflight/status, cancel before final mutation unless separately authorized.", "destructive": false },
+      "destructive": true
+    },
+    {
+      "id": "WF-SETTINGS",
+      "criticality": "release-critical",
+      "surface": "VS Code Settings",
+      "authoritativeOutcome": "The Settings action opens current Cloudsmith settings with truthful defaults, constraints, and deprecations; removed settings are absent and state-changing settings publish only after successful current-context updates.",
+      "riskClasses": ["contract-mismatch", "stale-publication", "documentation-drift", "accessibility"],
+      "requiredLayers": ["contract", "extension-host", "black-box-ui"],
+      "testFiles": ["test/commandRegistrars.test.js", "test/polishGate.test.js", "ui-test/smoke.test.js"],
+      "evidence": [
+        { "layer": "extension-host", "testFile": "test/commandRegistrars.test.js", "testNames": ["settings/help callbacks invoke only their injected platform services", "settings selection becomes inert when its captured account turns stale"], "proves": ["producer-consumer", "freshness"] },
+        { "layer": "contract", "testFile": "test/polishGate.test.js", "testNames": ["production repository satisfies the closed documentation and media contract"], "proves": ["manifest-parity", "documentation"] },
+        { "layer": "black-box-ui", "interactionMode": "rendered-dom-activation", "testFile": "ui-test/smoke.test.js", "testNames": ["opens Cloudsmith settings through the real Command Palette action"], "proves": ["authoritative-outcome", "visible-publication"] }
+      ],
+      "productionAreas": ["commands/settingsHelp.js", "package.json", "extension.js", "util/contextKeyProjector.js", "README.md"],
+      "targetCommands": ["npm run test:vscode", "npm run test:ui:smoke"],
+      "liveFixture": { "required": true, "kind": "local-ui", "description": "Current Extension Development Host settings editor; no secret values opened.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-SETTINGS-OPEN"]
+    },
+    {
+      "id": "WF-HELP-NAVIGATION",
+      "criticality": "release-critical",
+      "surface": "Help and feedback",
+      "authoritativeOutcome": "Help renders current destinations and each enabled navigation action opens the advertised extension-owned documentation, issue list, or issue form without stale product claims.",
+      "riskClasses": ["contract-mismatch", "documentation-drift", "validation/security", "accessibility"],
+      "requiredLayers": ["contract", "extension-host", "black-box-ui", "live-protocol"],
+      "testFiles": ["test/commandRegistrars.test.js", "test/polishGate.test.js", "ui-test/smoke.test.js"],
+      "evidence": [
+        { "layer": "extension-host", "testFile": "test/commandRegistrars.test.js", "testNames": ["settings/help callbacks invoke only their injected platform services"], "proves": ["producer-consumer"] },
+        { "layer": "contract", "testFile": "test/polishGate.test.js", "testNames": ["production repository satisfies the closed documentation and media contract"], "proves": ["documentation", "manifest-parity"] },
+        { "layer": "black-box-ui", "interactionMode": "rendered-dom-activation", "testFile": "ui-test/smoke.test.js", "testNames": ["opens every extension-owned view without a blank container", "lists release-critical commands in the real Command Palette"], "proves": ["authoritative-outcome", "visible-publication"] }
+      ],
+      "productionAreas": ["views/helpProvider.js", "models/helpNode.js", "commands/settingsHelp.js", "util/helpLinks.js", "util/externalNavigation.js", "package.json", "README.md"],
+      "targetCommands": ["npm run test:vscode", "npm run test:ui:smoke"],
+      "liveFixture": { "required": true, "kind": "browser-navigation", "description": "Open current destinations using existing browser session; no credentials required.", "destructive": false },
+      "destructive": false,
+      "actionContractIds": ["ACT-HELP-DOCUMENTATION", "ACT-HELP-TREE-LINK"]
+    }
+  ]
+}

@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/quality/finding.schema.json",
+  "title": "Cloudsmith VS Code quality finding",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "severity",
+    "status",
+    "surface",
+    "workflowContract",
+    "failureClasses",
+    "customerImpact",
+    "reproductionConfidence",
+    "authoritativeExpectedOutcome",
+    "observedOutcome",
+    "firstKnownBadSha",
+    "evidence",
+    "rootCauseStatus",
+    "testLayerThatShouldHaveCaughtIt",
+    "whyItEscaped",
+    "regressionTest",
+    "mutationProof",
+    "fixedSha",
+    "liveVerification",
+    "releaseBlocking"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^QH-[0-9]{3,}$" },
+    "severity": { "enum": ["P0", "P1", "P2", "P3"] },
+    "status": {
+      "enum": [
+        "open",
+        "fixed-pending-verification",
+        "fixed",
+        "blocked",
+        "deferred",
+        "closed-non-issue"
+      ]
+    },
+    "surface": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "workflowContract": { "type": "string", "pattern": "^WF-[A-Z0-9-]+$" },
+    "failureClasses": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "contract-mismatch",
+          "provenance",
+          "canonical-identity",
+          "async-authority",
+          "stale-publication",
+          "terminal-state",
+          "pagination",
+          "boundedness",
+          "error-normalization",
+          "validation/security",
+          "auth-capability",
+          "cross-surface-parity",
+          "capability-composition",
+          "format-native-semantics",
+          "false-green-test",
+          "accessibility",
+          "documentation-drift"
+        ]
+      }
+    },
+    "customerImpact": { "type": "string", "minLength": 1 },
+    "reproductionConfidence": {
+      "enum": [
+        "confirmed-repeatable",
+        "confirmed-once",
+        "strong-static-evidence",
+        "suspected",
+        "blocked"
+      ]
+    },
+    "authoritativeExpectedOutcome": { "type": "string", "minLength": 1 },
+    "observedOutcome": { "type": "string", "minLength": 1 },
+    "firstKnownBadSha": { "type": ["string", "null"], "pattern": "^[a-f0-9]{7,40}$" },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "location", "summary"],
+        "properties": {
+          "kind": { "enum": ["test", "live-ui", "log", "screenshot", "source", "protocol"] },
+          "location": { "type": "string", "minLength": 1 },
+          "summary": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "rootCauseStatus": { "enum": ["unknown", "suspected", "proven"] },
+    "rootCause": { "type": ["string", "null"] },
+    "testLayerThatShouldHaveCaughtIt": {
+      "enum": ["unit", "contract", "extension-host", "live-protocol", "black-box-ui", "documentation"]
+    },
+    "whyItEscaped": { "type": "string", "minLength": 1 },
+    "appearedCoveredBy": { "type": ["string", "null"] },
+    "falseGreenBoundary": { "type": ["string", "null"] },
+    "regressionTest": { "type": ["string", "null"] },
+    "mutationProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary"],
+      "properties": {
+        "status": {
+          "enum": ["not-started", "red-confirmed", "green-confirmed", "mutation-killed", "partial", "blocked", "not-applicable"]
+        },
+        "summary": { "type": "string" }
+      }
+    },
+    "fixedSha": { "type": ["string", "null"], "pattern": "^[a-f0-9]{7,40}$" },
+    "liveVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary"],
+      "properties": {
+        "status": { "enum": ["not-started", "live-pass", "live-fail", "partial", "blocked", "not-applicable"] },
+        "summary": { "type": "string" }
+      }
+    },
+    "releaseBlocking": { "type": "boolean" }
+  }
+}

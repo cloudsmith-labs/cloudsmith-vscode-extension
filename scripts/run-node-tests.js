@@ -31,6 +31,9 @@ const args = [
   "--forbid-pending",
   "--ui", "tdd",
   "--timeout", "20000",
+  ...(process.env.CLOUDSMITH_QUALITY_TEST_EVIDENCE
+    ? ["--reporter", path.join(root, "scripts", "quality", "mocha-evidence-reporter.js")]
+    : []),
   ...(zeroProbe ? ["--grep", "__m10_node_zero_test_probe_no_match__"] : []),
   ...STANDALONE_NODE_TESTS,
 ];

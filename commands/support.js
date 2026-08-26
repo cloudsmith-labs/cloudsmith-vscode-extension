@@ -11,6 +11,10 @@ const {
   derivePackageActionCapabilities,
   hasPackageAction,
 } = require("../domain/packageActionCapabilities");
+const {
+  buildInstallGuidanceForPackage,
+  hasInstallGuidanceForPackage,
+} = require("../domain/installGuidanceSupport");
 
 const DISPLAY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/gu;
 const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
@@ -611,20 +615,29 @@ async function pickRecentPackage(deps, options = {}) {
   return selected.package;
 }
 
-function packageActionCapabilitiesForPackage(pkg) {
+function packageActionCapabilitiesForPackage(pkg, deps) {
   try {
     const vulnerability = pkg && pkg.vulnerability;
     const license = pkg && pkg.license;
+    const exact = Boolean(pkg && pkg.identityState === "exact");
+    const copyable = pkg?.copyable === true;
+    const quarantined = pkg?.status === "Quarantined";
     return derivePackageActionCapabilities({
       surface: PACKAGE_ACTION_SURFACES.PACKAGE,
-      found: Boolean(pkg && pkg.identityState === "exact"),
-      exact: Boolean(pkg && pkg.identityState === "exact"),
-      copyable: pkg?.copyable === true,
+      found: exact,
+      exact,
+      copyable,
+      installGuidance: exact && copyable && !quarantined
+        && hasInstallGuidanceForPackage(
+          deps?.packageDomain,
+          deps?.InstallCommandBuilder,
+          pkg
+        ),
       vulnerable: Boolean(vulnerability && (
         vulnerability.detected === true
         || (Number.isInteger(vulnerability.count) && vulnerability.count > 0)
       )),
-      quarantined: pkg?.status === "Quarantined",
+      quarantined,
       policyViolation: pkg?.policy?.violated === true,
       restrictiveLicense: license?.classification === "restrictive"
         || license?.tier === "restrictive",
@@ -634,8 +647,12 @@ function packageActionCapabilitiesForPackage(pkg) {
   }
 }
 
-function isPackageActionAvailable(pkg, action) {
-  return hasPackageAction(packageActionCapabilitiesForPackage(pkg), action);
+function isPackageActionAvailable(pkg, action, deps) {
+  const capabilityDependencies = action === PACKAGE_ACTIONS.INSTALL ? deps : undefined;
+  return hasPackageAction(
+    packageActionCapabilitiesForPackage(pkg, capabilityDependencies),
+    action
+  );
 }
 
 function isDependencyActionAvailable(item, action) {
@@ -646,34 +663,24 @@ function isDependencyActionAvailable(item, action) {
   }
 }
 
-function isInstallablePackage(pkg) {
-  return isPackageActionAvailable(pkg, PACKAGE_ACTIONS.INSTALL);
+function isInstallablePackage(pkg, deps) {
+  return isPackageActionAvailable(pkg, PACKAGE_ACTIONS.INSTALL, deps);
+}
+
+function isPromotablePackage(pkg, deps) {
+  return isPackageActionAvailable(pkg, PACKAGE_ACTIONS.PROMOTE, deps);
 }
 
 function isQuarantinedPackage(pkg) {
   return isPackageActionAvailable(pkg, PACKAGE_ACTIONS.EXPLAIN_QUARANTINE);
 }
 
-function installOptions(pkg, coordinate) {
-  const options = { qualifiers: coordinate.qualifiers };
-  if (pkg.tags && (pkg.tags.info.length > 0 || pkg.tags.version.length > 0)) {
-    options.tags = pkg.tags;
-  }
-  if (pkg.cdnUrl) options.cdnUrl = pkg.cdnUrl;
-  if (pkg.filename) options.filename = pkg.filename;
-  return options;
-}
-
 function buildInstallCommand(deps, pkg) {
   try {
-    const coordinate = deps.packageDomain.packageCoordinateFromExact(pkg);
-    return deps.InstallCommandBuilder.build(
-      coordinate.format,
-      coordinate.name,
-      coordinate.version,
-      coordinate.workspace,
-      coordinate.repository,
-      installOptions(pkg, coordinate)
+    return buildInstallGuidanceForPackage(
+      deps.packageDomain,
+      deps.InstallCommandBuilder,
+      pkg
     );
   } catch (error) {
     if (error instanceof deps.InstallCommandValidationError) {
@@ -811,6 +818,7 @@ module.exports = {
   getWorkspaceRepositories,
   isDependencyActionAvailable,
   isInstallablePackage,
+  isPromotablePackage,
   installGuidanceCopiedMessage,
   isPackageActionAvailable,
   isQuarantinedPackage,

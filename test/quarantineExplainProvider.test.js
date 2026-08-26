@@ -407,7 +407,7 @@ suite("QuarantineExplainProvider", () => {
           effects.actions.push(["showVulnerabilities", ...args]);
         },
       },
-      openExternal: async value => { effects.external.push(value); },
+      openExternal: async value => { effects.external.push(value); return true; },
       writeClipboard: async value => { effects.clipboard.push(value); },
     });
     await provider.show(exactPackage());
@@ -439,6 +439,33 @@ suite("QuarantineExplainProvider", () => {
     ]) await panelHarness.send(message);
     assert.strictEqual(effects.clipboard.length, 1);
     assert.strictEqual(effects.external.length, 1);
+  });
+
+  test("quarantine WebView navigation reports refused and rejected external opens", async () => {
+    const panelHarness = createWebviewPanelHarness();
+    const warnings = [];
+    const outcomes = [false, new Error("platform rejected")];
+    const provider = providerWith(panelHarness, {
+      async get() { return apiSuccess(freshPackage()); },
+      async getV2() { return emptyDecisionPage(); },
+    }, {
+      information: async () => {},
+      warning: async message => { warnings.push(message); },
+    }, {
+      openExternal: async () => {
+        const outcome = outcomes.shift();
+        if (outcome instanceof Error) throw outcome;
+        return outcome;
+      },
+    });
+    await provider.show(exactPackage());
+
+    await panelHarness.send({ command: "openInCloudsmith" });
+    await panelHarness.send({ command: "openInCloudsmith" });
+    assert.deepStrictEqual(warnings, [
+      "Could not open this package in Cloudsmith.",
+      "Could not open this package in Cloudsmith.",
+    ]);
   });
 
   test("report normalizes controls and formula-leading dynamic lines", () => {

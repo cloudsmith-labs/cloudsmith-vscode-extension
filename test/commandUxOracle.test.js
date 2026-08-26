@@ -133,6 +133,7 @@ const ITEM_PLACEMENTS = Object.freeze([
   ["cloudsmith-vsc.showInstallCommand", "view == cloudsmithDependencyHealthView && viewItem =~ /^dependencyHealthActions(?:\\.[A-Za-z][A-Za-z0-9]*)*\\.install(?:\\.|$)/", "navigation"],
   ["cloudsmith-vsc.openLicenseUrl", "view == cloudsmithView && viewItem == licenseDetailWithUrl", "navigation"],
   ["cloudsmith-vsc.openLicenseUrl", "view == cloudsmithSearchView && viewItem == licenseDetailWithUrl", "navigation"],
+  ["cloudsmith-vsc.openLicenseUrl", "view == cloudsmithDependencyHealthView && viewItem == licenseDetailWithUrl", "navigation"],
   ["cloudsmith-vsc.previewUpstreamResolution", "view == cloudsmithDependencyHealthView && viewItem =~ /^(dependencyHealthMissing|dependencyHealthUpstreamReachable|dependencyHealthUpstreamUnreachable)$/", "navigation"],
   ["cloudsmith-vsc.pullSingleDependency", "view == cloudsmithDependencyHealthView && cloudsmith.pullThroughAvailable && viewItem =~ /^(dependencyHealthMissing|dependencyHealthUpstreamReachable)$/", "inline"],
   ["cloudsmith-vsc.pullSingleDependency", "view == cloudsmithDependencyHealthView && cloudsmith.pullThroughAvailable && viewItem =~ /^(dependencyHealthMissing|dependencyHealthUpstreamReachable)$/", "1_pull"],

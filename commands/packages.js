@@ -20,6 +20,7 @@ const {
 
 const MAX_FILTER_INPUT_LENGTH = 2048;
 const QUERY_CONTROL_OR_BIDI_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/;
+const TRUSTED_LICENSE_HOSTS = new Set(["spdx.org", "www.spdx.org"]);
 
 function filterInputValidationMessage(value) {
   if (typeof value !== "string") return "Enter a filter query.";
@@ -60,6 +61,7 @@ function registerPackageCommands(deps) {
     filterState,
     serializePackageCollectionInspection,
     serializePackageInspection,
+    openExternalWithFeedback,
   } = deps;
   const filterPresets = createFilterPresets(LicenseClassifier);
   const recentSupport = { ...deps, recentPackages, packageAdapters, vscode };
@@ -366,8 +368,14 @@ function registerPackageCommands(deps) {
       return;
     }
     if (!isCurrent()) return;
-    await vscode.env.openExternal(vscode.Uri.parse(url));
-    if (!isCurrent()) return;
+    const opened = await openExternalWithFeedback({
+      target: vscode.Uri.parse(url),
+      openExternal: target => vscode.env.openExternal(target),
+      showWarningMessage: message => vscode.window.showWarningMessage(message),
+      failureMessage: "Could not open this package in Cloudsmith.",
+      isCurrent,
+    });
+    if (!opened || !isCurrent()) return;
     recentPackages.add(pkg);
   }
 
@@ -392,7 +400,13 @@ function registerPackageCommands(deps) {
       return;
     }
     if (!isCurrent()) return;
-    await vscode.env.openExternal(vscode.Uri.parse(url));
+    await openExternalWithFeedback({
+      target: vscode.Uri.parse(url),
+      openExternal: target => vscode.env.openExternal(target),
+      showWarningMessage: message => vscode.window.showWarningMessage(message),
+      failureMessage: "Could not open this package group in Cloudsmith.",
+      isCurrent,
+    });
   }
 
   async function loadMoreRepositoryPackages(item) {
@@ -480,9 +494,9 @@ function registerPackageCommands(deps) {
     const accountScope = captureCommandAccount(deps.workspaceAccess);
     if (!accountScope) return;
     const selected = await selectedPackage(item, accountScope, {
-      predicate: isInstallablePackage,
+      predicate: pkg => isInstallablePackage(pkg, deps),
       invalidMessage: "Could not determine package details for install command.",
-      invalidStateMessage: "Install commands are available only for copyable, non-quarantined packages.",
+      invalidStateMessage: "Install guidance is not available for this package.",
       emptyMessage: "No recent installable packages. Open or search for a package, then try again.",
     });
     if (!selected) return;
@@ -539,15 +553,31 @@ function registerPackageCommands(deps) {
       return;
     }
     if (
-      (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:")
+      parsedUrl.protocol !== "https:"
       || parsedUrl.username
       || parsedUrl.password
     ) {
-      vscode.window.showWarningMessage("Could not open the license URL. Unsupported protocol.");
+      vscode.window.showWarningMessage("Could not open the license URL. Only HTTPS links are supported.");
       return;
     }
     if (!isCurrent()) return;
-    await vscode.env.openExternal(vscode.Uri.parse(parsedUrl.toString()));
+    const trustedHost = TRUSTED_LICENSE_HOSTS.has(parsedUrl.hostname.toLowerCase())
+      && (parsedUrl.port === "" || parsedUrl.port === "443");
+    if (!trustedHost) {
+      const choice = await vscode.window.showWarningMessage(
+        `Open a license page on ${parsedUrl.hostname}? Continue only if you trust this site.`,
+        { modal: true },
+        "Open"
+      );
+      if (choice !== "Open" || !isCurrent()) return;
+    }
+    await openExternalWithFeedback({
+      target: vscode.Uri.parse(parsedUrl.toString()),
+      openExternal: target => vscode.env.openExternal(target),
+      showWarningMessage: message => vscode.window.showWarningMessage(message),
+      failureMessage: "Could not open the license URL.",
+      isCurrent,
+    });
   }
 
   async function copyEntitlementToken(item) {

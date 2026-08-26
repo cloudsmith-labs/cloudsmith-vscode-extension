@@ -1,0 +1,12 @@
+{
+  "name": "cloudsmith-vsc-test-harness",
+  "displayName": "Cloudsmith Test Harness",
+  "publisher": "cloudsmith-test",
+  "version": "0.0.0",
+  "private": true,
+  "engines": {
+    "vscode": "^1.99.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": []
+}

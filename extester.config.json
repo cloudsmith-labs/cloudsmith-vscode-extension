@@ -1,0 +1,28 @@
+{
+  "$schema": "./node_modules/vscode-extension-tester/resources/extester.schema.json",
+  "setup": {
+    "vscodeVersion": "1.134.0",
+    "type": "stable",
+    "installDependencies": false,
+    "noCache": false,
+    "packageOptions": {
+      "useYarn": false,
+      "followSymlinks": false
+    }
+  },
+  "run": {
+    "testFiles": [
+      "./ui-test/smoke.test.js"
+    ],
+    "vscodeVersion": "1.134.0",
+    "type": "stable",
+    "settings": "./ui-test/settings.json",
+    "cleanup": true,
+    "mochaConfig": "./ui-test/mocha.config.json",
+    "logLevel": "Info",
+    "offline": false,
+    "coverage": false,
+    "resources": [],
+    "locale": ""
+  }
+}

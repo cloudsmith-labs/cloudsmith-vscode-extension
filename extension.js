@@ -38,6 +38,8 @@ const { LicenseClassifier } = require("./util/licenseClassifier");
 const { generateTerraformConfig } = require("./util/terraformExporter");
 const { SUPPORTED_UPSTREAM_FORMATS } = require("./util/upstreamFormats");
 const { buildPackageGroupUrl, buildPackageUrl } = require("./util/webAppUrls");
+const { openExternalWithFeedback } = require("./util/externalNavigation");
+const { HELP_LINKS } = require("./util/helpLinks");
 const recentPackages = require("./util/recentPackages");
 const filterState = require("./util/filterState");
 const { VulnerabilityStateService } = require("./util/vulnerabilityStateService");
@@ -103,6 +105,43 @@ function createExtensionContextBinding(options) {
   return Object.freeze({
     project,
     dispose() { subscription?.dispose?.(); },
+  });
+}
+
+function createSelectionOwnership(options) {
+  const {
+    cloudsmithProvider,
+    dependencyHealthProvider,
+    recentPackages: recentPackageStore,
+    searchProvider,
+  } = options;
+  return Object.freeze({
+    isCurrentSelection: selection => Boolean(
+      isSelectionCurrent(selection)
+      && (
+        cloudsmithProvider.ownsSelection(selection)
+        || searchProvider.ownsSelection(selection)
+        || dependencyHealthProvider.ownsSelection(selection)
+      )
+    ),
+    isCurrentPackageSelection: selection => Boolean(
+      recentPackageStore.getAll().includes(selection)
+      || cloudsmithProvider.ownsPackageSelection(selection)
+      || searchProvider.ownsPackageSelection(selection)
+      || dependencyHealthProvider.ownsDependencySelection(selection)
+    ),
+    isCurrentPackageGroupSelection: selection => cloudsmithProvider.ownsSelection(selection),
+    isCurrentRepositorySelection: selection => (
+      cloudsmithProvider.ownsRepositoryContextSelection(selection)
+    ),
+    isCurrentWorkspaceSelection: selection => cloudsmithProvider.ownsWorkspaceSelection(selection),
+    isCurrentDependencySelection: selection => (
+      dependencyHealthProvider.ownsDependencySelection(selection)
+    ),
+    isCurrentEntitlementSelection: selection => Boolean(
+      isSelectionCurrent(selection)
+      && cloudsmithProvider.ownsEntitlementSelection(selection)
+    ),
   });
 }
 
@@ -436,30 +475,13 @@ function activateOwned(context, own, observe) {
     apiEndpoint,
     formatApiError,
     normalizeCvssScore,
-    isCurrentSelection: selection => Boolean(
-      isSelectionCurrent(selection)
-      && (
-        cloudsmithProvider.ownsSelection(selection)
-        || searchProvider.ownsSelection(selection)
-        || dependencyHealthProvider.ownsSelection(selection)
-      )
-    ),
-    isCurrentPackageSelection: selection => Boolean(
-      recentPackages.getAll().includes(selection)
-      || cloudsmithProvider.ownsPackageSelection(selection)
-      || searchProvider.ownsPackageSelection(selection)
-      || dependencyHealthProvider.ownsDependencySelection(selection)
-    ),
-    isCurrentPackageGroupSelection: selection => cloudsmithProvider.ownsSelection(selection),
-    isCurrentRepositorySelection: selection => (
-      cloudsmithProvider.ownsRepositoryContextSelection(selection)
-    ),
-    isCurrentWorkspaceSelection: selection => cloudsmithProvider.ownsWorkspaceSelection(selection),
-    isCurrentDependencySelection: selection => dependencyHealthProvider.ownsDependencySelection(selection),
-    isCurrentEntitlementSelection: selection => Boolean(
-      isSelectionCurrent(selection)
-      && cloudsmithProvider.ownsEntitlementSelection(selection)
-    ),
+    openExternalWithFeedback,
+    ...createSelectionOwnership({
+      cloudsmithProvider,
+      dependencyHealthProvider,
+      recentPackages,
+      searchProvider,
+    }),
   };
 
   const handleAuthenticationResult = createAuthenticationResultHandler({
@@ -481,6 +503,7 @@ function activateOwned(context, own, observe) {
   }));
   own(registerSettingsHelpCommands({
     ...sharedCommandDependencies,
+    helpLinks: HELP_LINKS,
     updateDefaultWorkspaceContext,
   }));
   own(registerPackageCommands({
@@ -593,4 +616,9 @@ async function deactivate() {
   }
 }
 
-module.exports = { activate, createExtensionContextBinding, deactivate };
+module.exports = {
+  activate,
+  createExtensionContextBinding,
+  createSelectionOwnership,
+  deactivate,
+};

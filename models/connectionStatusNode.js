@@ -24,8 +24,8 @@ function createConnectionStatusNode(presentation) {
     case CONNECTION_PRESENTATIONS.FAILED:
       return new InfoNode(
         "Connection failed",
-        "Check the API key in settings.",
-        "Connection failed. Check the API key in settings.",
+        "Check Cloudsmith authentication and retry.",
+        "Connection failed. Check Cloudsmith authentication and retry.",
         "warning",
         undefined,
         { command: "cloudsmith-vsc.configureCredentials", title: "Set up authentication" }

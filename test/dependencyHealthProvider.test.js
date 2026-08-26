@@ -3,10 +3,14 @@
 const assert = require("assert");
 const path = require("path");
 const vscode = require("vscode");
+const packageAdapters = require("../domain/packageAdapters");
+const packageDomain = require("../domain/package");
 const {
   CLOUDSMITH_COVERAGE_STATUS,
   DependencyHealthProvider: DependencyHealthProviderImplementation,
+  FILTER_MODES,
   SCAN_STATES,
+  SORT_MODES,
   buildComplianceReportData,
   getConcreteDependencyVersion,
   getLookupPaginationDirective,
@@ -29,13 +33,20 @@ const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { bindConnectionManager } = require("../util/connectionManager");
 const { analyzeUpstreamGaps } = require("../util/upstreamGapAnalyzer");
 const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
-const { createPackageCoordinate, isExactPackage } = require("../domain/package");
-const { fromApiPackageRecord } = require("../domain/packageAdapters");
+const { createPackageCoordinate, isExactPackage } = packageDomain;
+const { fromApiPackageRecord } = packageAdapters;
 const {
   createCancellationSource,
   createManualClock,
 } = require("./helpers/asyncControl");
 const { FakeMemento } = require("./helpers/fakeMemento");
+const { registerOwnedOpenPackageCommand } = require("./helpers/registeredPackageAction");
+const {
+  PACKAGE_ACTION_CONTEXT_FAMILIES,
+  PACKAGE_ACTIONS,
+  encodePackageActionContext,
+  hasPackageAction,
+} = require("../domain/packageActionCapabilities");
 
 suite("DependencyHealthProvider Test Suite", () => {
   let originalWithProgress;
@@ -1811,7 +1822,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     }
   });
 
-  test("projects report availability and owns only current rendered dependency selections", async () => {
+  test("presentation changes retain registered actions until replacement, reset, or disposal", async () => {
     let state = Object.freeze({
       activationId: "dependency-selection",
       accountEpoch: 1,
@@ -1820,6 +1831,32 @@ suite("DependencyHealthProvider Test Suite", () => {
       status: "connected",
     });
     const listeners = new Set();
+    const vulnerabilityListeners = new Set();
+    const unknownVulnerabilityState = Object.freeze({
+      status: "unknown",
+      complete: false,
+      count: null,
+      records: Object.freeze([]),
+    });
+    const vulnerabilityStateService = {
+      prime() { return unknownVulnerabilityState; },
+      peek() { return unknownVulnerabilityState; },
+      onDidChange(listener) {
+        vulnerabilityListeners.add(listener);
+        return { dispose() { vulnerabilityListeners.delete(listener); } };
+      },
+      publish(identity) {
+        const state = Object.freeze({
+          status: "complete-vulnerable",
+          complete: true,
+          count: 1,
+          records: Object.freeze([Object.freeze({ vulnerability_id: "CVE-2026-1" })]),
+        });
+        for (const listener of [...vulnerabilityListeners]) {
+          listener(Object.freeze({ identity, state, presentation: state }));
+        }
+      },
+    };
     const connectionManager = {
       getState: () => state,
       onDidChange(listener) {
@@ -1834,6 +1871,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     const contextValues = new Map();
     const provider = new DependencyHealthProvider(createContext(), null, {
       connectionManager,
+      vulnerabilityStateService,
       executeCommand: async (command, key, value) => {
         if (command === "setContext") contextValues.set(key, value);
       },
@@ -1849,7 +1887,15 @@ suite("DependencyHealthProvider Test Suite", () => {
     const tree = {
       ecosystem: "npm",
       sourceFile: "package-lock.json",
-      dependencies: [createFoundDependency("left-pad", "1.0.0")],
+      dependencies: [{
+        ...createFoundDependency("left-pad", "1.0.0"),
+        vulnerabilities: {
+          count: 1,
+          countKnown: true,
+          detected: true,
+          maxSeverity: "High",
+        },
+      }],
     };
     const firstNode = provider.buildDependencyNodesForTree(tree)[0];
     assert.strictEqual(provider.ownsDependencySelection(firstNode), true);
@@ -1859,18 +1905,88 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.deepStrictEqual(events, [firstNode]);
 
     provider.refresh();
-    assert.strictEqual(provider.ownsDependencySelection(firstNode), false);
+    assert.strictEqual(provider.ownsDependencySelection(firstNode), true);
+    await provider.setFilterMode(FILTER_MODES.VULNERABLE);
+    assert.strictEqual(provider.ownsDependencySelection(firstNode), true);
+    provider.setSortMode(SORT_MODES.SEVERITY);
+    assert.strictEqual(provider.ownsDependencySelection(firstNode), true);
+    const vulnerabilitySummary = firstNode.getChildren().find(
+      child => child.getTreeItem().contextValue === "vulnerabilitySummary"
+    );
+    assert(vulnerabilitySummary);
+    vulnerabilityStateService.publish(vulnerabilitySummary.identity);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.strictEqual(provider.ownsDependencySelection(firstNode), true);
     const secondNode = provider.buildDependencyNodesForTree(tree)[0];
     assert.strictEqual(provider.ownsDependencySelection(secondNode), true);
+
+    const opened = [];
+    const command = registerOwnedOpenPackageCommand({
+      connectionManager,
+      dependencyHealthProvider: provider,
+      opened,
+      targetUrl: "https://cloudsmith.example/dependency-package",
+    });
+    await vscode.commands.executeCommand(command.id, firstNode);
+    assert.deepStrictEqual(opened, ["https://cloudsmith.example/dependency-package"]);
+
+    const replacementTree = {
+      ecosystem: "npm",
+      sourceFile: "package-lock.json",
+      dependencies: [{
+        ...createFoundDependency("replacement", "2.0.0"),
+        vulnerabilities: tree.dependencies[0].vulnerabilities,
+      }],
+    };
+    const replacementOperationId = 41;
+    provider._scanOperation = {
+      status: SCAN_STATES.RUNNING,
+      id: replacementOperationId,
+      accountEpoch: 1,
+      startedAt: 1,
+      scope: {},
+    };
+    provider._commitSuccessfulScan({
+      _warnings: [],
+      _lastManifests: [],
+      _projectFolderPath: "/project",
+      _noManifestsFolder: null,
+      _fullTrees: [replacementTree],
+      _displayTrees: [replacementTree],
+      _reportData: null,
+      _lastScanTimestamp: null,
+    }, {
+      workspace: "workspace",
+      repository: "repo",
+      projectFolder: "/project",
+    }, replacementOperationId, 1);
+    assert.strictEqual(provider.ownsDependencySelection(firstNode), false);
+    assert.strictEqual(provider.ownsDependencySelection(secondNode), false);
+    await vscode.commands.executeCommand(command.id, secondNode);
+    assert.strictEqual(opened.length, 1);
+
+    const replacementNode = provider.buildDependencyNodesForTree(replacementTree)[0];
+    assert.strictEqual(provider.ownsDependencySelection(replacementNode), true);
+    await vscode.commands.executeCommand(command.id, replacementNode);
+    assert.deepStrictEqual(opened, [
+      "https://cloudsmith.example/dependency-package",
+      "https://cloudsmith.example/dependency-package",
+    ]);
 
     connectionManager.update({ accountEpoch: 2 });
     await waitForTurn();
     await waitForTurn();
-    assert.strictEqual(provider.ownsDependencySelection(secondNode), false);
+    assert.strictEqual(provider.ownsDependencySelection(replacementNode), false);
+    await vscode.commands.executeCommand(command.id, replacementNode);
+    assert.strictEqual(opened.length, 2);
     assert.strictEqual(contextValues.get("cloudsmith.depReportAvailable"), false);
     assert.strictEqual(contextValues.get("cloudsmith.depScanSucceeded"), false);
 
+    const postResetNode = provider.buildDependencyNodesForTree(replacementTree)[0];
+    assert.strictEqual(provider.ownsDependencySelection(postResetNode), true);
     await provider.dispose();
+    assert.strictEqual(provider.ownsDependencySelection(postResetNode), false);
+    command.dispose();
     assert.strictEqual(contextValues.get("cloudsmith.depReportAvailable"), false);
   });
 
@@ -1921,6 +2037,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(refreshes, 1);
     item = (await provider.getChildren())[0].getTreeItem();
     assert.strictEqual(item.label, "Connection failed");
+    assert.strictEqual(item.description, "Check Cloudsmith authentication and retry.");
 
     connectionManager.update({ status: "absent", credentialPresent: false });
     assert.strictEqual(refreshes, 2);
@@ -1935,6 +2052,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(refreshes, 3);
     item = (await provider.getChildren())[0].getTreeItem();
     assert.strictEqual(item.label, "Scan dependencies");
+    assert.strictEqual(item.description, "Run Scan dependencies from the view toolbar.");
 
     const staleChild = { getChildren: () => ["private result"] };
     connectionManager.update({
@@ -3930,6 +4048,45 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.strictEqual(result.node.declaredVersion, "4.18.2");
   });
 
+  test("deny-only dependency evidence never advertises Explain Quarantine and context matches capabilities", () => {
+    const dependency = createDependency("deny-only-package", "1.0.0");
+    const node = new DependencyHealthNode({
+      ...dependency,
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: fromApiPackageRecord({
+        namespace: "workspace",
+        repository: "repo",
+        slug_perm: "deny-only-package-1.0.0",
+        name: "deny-only-package",
+        version: "1.0.0",
+        format: "npm",
+        status_str: "Completed",
+        is_copyable: true,
+        policy_violated: true,
+        deny_policy_violated: true,
+      }),
+    }, {});
+
+    const capabilities = node.getActionCapabilities();
+    const contextValue = node.getTreeItem().contextValue;
+
+    assert.strictEqual(capabilities.evidence.policyViolation, true);
+    assert.strictEqual(capabilities.evidence.quarantined, false);
+    assert.strictEqual(
+      hasPackageAction(capabilities, PACKAGE_ACTIONS.EXPLAIN_QUARANTINE),
+      false
+    );
+    assert.strictEqual(hasPackageAction(capabilities, PACKAGE_ACTIONS.INSTALL), false);
+    assert.strictEqual(
+      contextValue,
+      encodePackageActionContext(
+        PACKAGE_ACTION_CONTEXT_FAMILIES.DEPENDENCY_HEALTH,
+        capabilities
+      )
+    );
+    assert.doesNotMatch(contextValue, /(?:^|\.)explainQuarantine(?:\.|$)/);
+  });
+
   test("Python fixture flows from lock resolution through exact lookup to health node", async () => {
     const result = await runFixtureThroughLookupAndNode(
       "python",
@@ -4006,6 +4163,9 @@ suite("DependencyHealthProvider Test Suite", () => {
       count: 1,
       maxSeverity: "High",
       complete: true,
+      stale: false,
+      refreshing: false,
+      refreshFailure: null,
       revision: 1,
     });
     const calls = { prime: 0, resolve: 0, register: 0 };

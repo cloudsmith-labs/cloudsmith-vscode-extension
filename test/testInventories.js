@@ -5,7 +5,6 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/authCapabilities.test.js",
   "test/commandFreshness.test.js",
   "test/commandRecovery.test.js",
-  "test/commandRegistrars.test.js",
   "test/commandUxOracle.test.js",
   "test/collectionIdentity.test.js",
   "test/connectionPresentation.test.js",
@@ -15,19 +14,24 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/dependencyManifestDiscovery.test.js",
   "test/dependencyPolicyEnricher.test.js",
   "test/dependencyRecord.test.js",
+  "test/externalNavigation.test.js",
   "test/foundDependencyKey.test.js",
   "test/formatIconInventory.test.js",
   "test/installCommandBuilder.test.js",
+  "test/installGuidanceSupport.test.js",
   "test/manifestParser.test.js",
   "test/packageDomain.test.js",
   "test/packageActionCapabilities.test.js",
   "test/packageQuery.test.js",
   "test/packageVulnerabilities.test.js",
   "test/vulnerabilityStateService.test.js",
+  "test/vulnerabilityReportProjection.test.js",
   "test/paginatedFetch.test.js",
   "test/policyDecisionLogs.test.js",
   "test/polishGate.test.js",
   "test/promotionContracts.test.js",
+  "test/qualityHarness.test.js",
+  "test/releaseChecklistTrust.test.js",
   "test/recentPackages.test.js",
   "test/registryEndpoints.test.js",
   "test/releaseGate.test.js",
@@ -68,6 +72,7 @@ const VSCODE_CORE_TESTS = Object.freeze([
   "test/authSessionManager.test.js",
   "test/cloudsmithAPI.test.js",
   "test/cloudsmithProvider.test.js",
+  "test/commandRegistrars.test.js",
   "test/complianceReportProvider.test.js",
   "test/connectionManager.test.js",
   "test/contextKeyProjector.test.js",
@@ -110,39 +115,41 @@ const VSCODE_SMOKE_TESTS = Object.freeze([
   "test/activation.test.js",
 ]);
 
-const LIVE_TESTS = Object.freeze([
+const CREDENTIAL_BOUNDARY_EXCLUDED_TESTS = Object.freeze([
   "test/integration/policyDecisionLogs.test.js",
   "test/integration/search.test.js",
   "test/integration/upstreams.test.js",
   "test/integration/vulnerabilities.test.js",
-]);
-
-const SSO_LIVE_TESTS = Object.freeze([
   "test/integration/ssoAuthentication.test.js",
 ]);
 
-const SSO_LIVE_REQUIRED_ENV = Object.freeze([
-  "CLOUDSMITH_SSO_LIVE_TESTS",
-  "CLOUDSMITH_SSO_TEST_WORKSPACE",
-]);
+const CREDENTIAL_BOUNDARY_SKIP_REASON = "Credential-bearing automated live suites are excluded from qualification; live acceptance may use only an existing authenticated session and sanitized evidence.";
+const CREDENTIAL_LIKE_ENVIRONMENT = /(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSCODE|MFA|CREDENTIAL|KEYCHAIN|ONEPASSWORD|1PASSWORD|PRIVATE_?KEY|ACCESS_?KEY|REFRESH_?TOKEN)/iu;
 
-const LIVE_TEST_SKIP_REASON = "Live Cloudsmith tests are optional and excluded from the default test gate because they require explicitly controlled account fixtures.";
-const LIVE_REQUIRED_ENV = Object.freeze([
-  "CLOUDSMITH_TEST_API_KEY",
-  "CLOUDSMITH_TEST_WORKSPACE",
-  "CLOUDSMITH_TEST_REPOSITORY",
-  "CLOUDSMITH_TEST_PACKAGE_NAME",
-  "CLOUDSMITH_TEST_QUARANTINED_PACKAGE_NAME",
-  "CLOUDSMITH_TEST_VULNERABLE_PACKAGE_SLUG",
-]);
+function assertCredentialFreeRequiredEnvironment(names) {
+  if (!Array.isArray(names)) {
+    throw new TypeError("Qualification required environment must be an array.");
+  }
+  for (const name of names) {
+    if (typeof name !== "string"
+      || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(name)
+      || CREDENTIAL_LIKE_ENVIRONMENT.test(name)) {
+      throw new Error(`Qualification cannot require credential-like environment input: ${String(name)}`);
+    }
+  }
+  return names;
+}
+
+const QUALIFICATION_REQUIRED_ENV = Object.freeze(
+  assertCredentialFreeRequiredEnvironment([])
+);
 
 module.exports = {
-  LIVE_REQUIRED_ENV,
-  LIVE_TEST_SKIP_REASON,
-  LIVE_TESTS,
-  SSO_LIVE_REQUIRED_ENV,
-  SSO_LIVE_TESTS,
+  CREDENTIAL_BOUNDARY_EXCLUDED_TESTS,
+  CREDENTIAL_BOUNDARY_SKIP_REASON,
+  QUALIFICATION_REQUIRED_ENV,
   STANDALONE_NODE_TESTS,
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,
+  assertCredentialFreeRequiredEnvironment,
 };

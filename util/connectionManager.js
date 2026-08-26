@@ -53,7 +53,7 @@ function createPublicError(kind, message) {
 
 function validationAPIError(error) {
   const messages = {
-    unauthorized: "Authentication failed. Sign in again or check the API key.",
+    unauthorized: "Authentication failed. Sign in again or verify the configured credential.",
     forbidden: "The credential does not have permission to access Cloudsmith.",
     rate_limited: "Cloudsmith rate limited the authentication check. Try again shortly.",
     server_error: "Cloudsmith could not complete the authentication check. Try again later.",

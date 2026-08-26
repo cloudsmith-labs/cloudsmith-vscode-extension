@@ -1,0 +1,355 @@
+{
+  "schemaVersion": 1,
+  "provenanceClasses": [
+    "context-free",
+    "current-workspace-selection",
+    "current-repository-selection",
+    "current-explorer-package-selection",
+    "current-explorer-package-group-selection",
+    "current-search-package-selection",
+    "current-dependency-selection",
+    "current-owned-tree-selection",
+    "webview-exact-package",
+    "recent-canonical-package",
+    "explicit-context-recovery",
+    "current-webview-operation"
+  ],
+  "canonicalArgumentTypes": [
+    "none",
+    "canonical-exact-package",
+    "canonical-package-group",
+    "canonical-dependency-package",
+    "canonical-repository",
+    "validated-external-url",
+    "current-webview-operation"
+  ],
+  "actions": [
+    {
+      "id": "ACT-QUARANTINE-FIND-SAFE",
+      "workflow": "WF-FIND-SAFE-VERSION",
+      "producer": { "surface": "Quarantine WebView", "actionId": "findSafeVersion", "provenance": "webview-exact-package" },
+      "consumer": { "kind": "shared-workflow", "target": "webviewActions.findSafeVersion", "acceptedProvenance": ["webview-exact-package"] },
+      "canonicalArgumentType": "canonical-exact-package",
+      "freshnessOwner": "QuarantineExplainProvider operation and package-action generation",
+      "authoritativeOutcome": "A visible same-repository safe candidate or truthful no-candidate/error result for the exact WebView package.",
+      "requiredTest": { "file": "test/webviewPackageActionFlow.test.js", "name": "Quarantine Find safe version reaches a truthful shared-workflow result" }
+    },
+    {
+      "id": "ACT-QUARANTINE-SHOW-VULNERABILITIES",
+      "workflow": "WF-QUARANTINE-TO-VULNERABILITIES",
+      "producer": { "surface": "Quarantine WebView", "actionId": "showVulnerabilities", "provenance": "webview-exact-package" },
+      "consumer": { "kind": "shared-workflow", "target": "webviewActions.showVulnerabilities", "acceptedProvenance": ["webview-exact-package"] },
+      "canonicalArgumentType": "canonical-exact-package",
+      "freshnessOwner": "QuarantineExplainProvider operation and package-action generation",
+      "authoritativeOutcome": "Vulnerability detail visibly opens for the same exact canonical package.",
+      "requiredTest": { "file": "test/webviewPackageActionFlow.test.js", "name": "Quarantine Show vulnerabilities reaches the real target without tree provenance" }
+    },
+    {
+      "id": "ACT-QUARANTINE-OPEN",
+      "workflow": "WF-QUARANTINE-EXPLANATION",
+      "producer": { "surface": "Quarantine WebView", "actionId": "openInCloudsmith", "provenance": "current-webview-operation" },
+      "consumer": { "kind": "provider-internal", "target": "QuarantineExplainProvider._openExternal", "acceptedProvenance": ["current-webview-operation"] },
+      "canonicalArgumentType": "validated-external-url",
+      "freshnessOwner": "QuarantineExplainProvider current confirmed operation",
+      "authoritativeOutcome": "The exact package page opens on the approved Cloudsmith application origin, or refusal/rejection produces a truthful warning.",
+      "requiredTest": { "file": "test/quarantineExplainProvider.test.js", "name": "quarantine WebView navigation reports refused and rejected external opens" }
+    },
+    {
+      "id": "ACT-QUARANTINE-COPY",
+      "workflow": "WF-QUARANTINE-EXPLANATION",
+      "producer": { "surface": "Quarantine WebView", "actionId": "copyReport", "provenance": "current-webview-operation" },
+      "consumer": { "kind": "provider-internal", "target": "QuarantineExplainProvider._writeClipboard", "acceptedProvenance": ["current-webview-operation"] },
+      "canonicalArgumentType": "current-webview-operation",
+      "freshnessOwner": "QuarantineExplainProvider current confirmed operation",
+      "authoritativeOutcome": "A bounded non-secret report for the exact current package reaches the clipboard and a visible confirmation appears.",
+      "requiredTest": { "file": "test/quarantineExplainProvider.test.js", "name": "routes only exact messages after refresh and produces a causal report" }
+    },
+    {
+      "id": "ACT-QUARANTINE-RETRY",
+      "workflow": "WF-QUARANTINE-EXPLANATION",
+      "producer": { "surface": "Quarantine WebView", "actionId": "retry", "provenance": "current-webview-operation" },
+      "consumer": { "kind": "provider-internal", "target": "QuarantineExplainProvider._retry", "acceptedProvenance": ["current-webview-operation"] },
+      "canonicalArgumentType": "current-webview-operation",
+      "freshnessOwner": "QuarantineExplainProvider refresh generation",
+      "authoritativeOutcome": "The current package refresh reaches a new truthful settled state and revokes earlier action completions.",
+      "requiredTest": { "file": "test/webviewPackageActionFlow.test.js", "name": "Quarantine retry revokes remediation started from the prior package evidence" }
+    },
+    {
+      "id": "ACT-VULNERABILITY-FIND-SAFE",
+      "workflow": "WF-FIND-SAFE-VERSION",
+      "producer": { "surface": "Vulnerability WebView", "actionId": "findSafeVersion", "provenance": "webview-exact-package" },
+      "consumer": { "kind": "shared-workflow", "target": "webviewActions.findSafeVersion", "acceptedProvenance": ["webview-exact-package"] },
+      "canonicalArgumentType": "canonical-exact-package",
+      "freshnessOwner": "VulnerabilityProvider operation and vulnerability-request generation",
+      "authoritativeOutcome": "A visible same-repository safe candidate or truthful no-candidate/error result for the exact WebView package.",
+      "requiredTest": { "file": "test/webviewPackageActionFlow.test.js", "name": "Vulnerability WebView actions use current panel provenance in both directions" }
+    },
+    {
+      "id": "ACT-VULNERABILITY-EXPLAIN-QUARANTINE",
+      "workflow": "WF-VULNERABILITY-TO-QUARANTINE",
+      "producer": { "surface": "Vulnerability WebView", "actionId": "explainQuarantine", "provenance": "webview-exact-package" },
+      "consumer": { "kind": "shared-workflow", "target": "webviewActions.explainQuarantine", "acceptedProvenance": ["webview-exact-package"] },
+      "canonicalArgumentType": "canonical-exact-package",
+      "freshnessOwner": "VulnerabilityProvider operation and vulnerability-request generation",
+      "authoritativeOutcome": "Quarantine detail visibly opens for the same freshly quarantined exact package.",
+      "requiredTest": { "file": "test/webviewPackageActionFlow.test.js", "name": "Vulnerability WebView actions use current panel provenance in both directions" }
+    },
+    {
+      "id": "ACT-VULNERABILITY-COPY",
+      "workflow": "WF-VULNERABILITY-TRUTH",
+      "producer": { "surface": "Vulnerability WebView", "actionId": "copyReport", "provenance": "current-webview-operation" },
+      "consumer": { "kind": "provider-internal", "target": "VulnerabilityProvider._writeClipboard", "acceptedProvenance": ["current-webview-operation"] },
+      "canonicalArgumentType": "current-webview-operation",
+      "freshnessOwner": "VulnerabilityProvider current non-failed operation",
+      "authoritativeOutcome": "A bounded non-secret report containing the current authoritative vulnerability evidence reaches the clipboard.",
+      "requiredTest": { "file": "test/vulnerabilityProvider.test.js", "name": "keeps the on-demand clipboard report independent from inline display bounds" }
+    },
+    {
+      "id": "ACT-VULNERABILITY-OPEN-REFERENCE",
+      "workflow": "WF-VULNERABILITY-TRUTH",
+      "producer": { "surface": "Vulnerability WebView", "actionId": "openExternal", "provenance": "current-webview-operation" },
+      "consumer": { "kind": "provider-internal", "target": "VulnerabilityProvider._openExternal", "acceptedProvenance": ["current-webview-operation"] },
+      "canonicalArgumentType": "validated-external-url",
+      "freshnessOwner": "VulnerabilityProvider current operation",
+      "authoritativeOutcome": "The exact validated CVE/GHSA reference opens only on an approved HTTPS origin, or refusal/rejection produces a truthful warning.",
+      "requiredTest": { "file": "test/vulnerabilityProvider.test.js", "name": "vulnerability WebView navigation reports refused and rejected external opens" }
+    },
+    {
+      "id": "ACT-VULNERABILITY-RETRY",
+      "workflow": "WF-VULNERABILITY-TRUTH",
+      "producer": { "surface": "Vulnerability WebView", "actionId": "retry", "provenance": "current-webview-operation" },
+      "consumer": { "kind": "provider-internal", "target": "VulnerabilityProvider._retry", "acceptedProvenance": ["current-webview-operation"] },
+      "canonicalArgumentType": "current-webview-operation",
+      "freshnessOwner": "VulnerabilityProvider vulnerability-request generation",
+      "authoritativeOutcome": "The current exact package reaches a new truthful vulnerability state and older work cannot overwrite it.",
+      "requiredTest": { "file": "test/webviewPackageActionFlow.test.js", "name": "Vulnerability retry revokes remediation started from the prior result generation" }
+    },
+    {
+      "id": "ACT-DEPENDENCY-FIND-SAFE",
+      "workflow": "WF-FIND-SAFE-VERSION",
+      "producer": { "surface": "Dependency health row", "actionId": "cloudsmith-vsc.findDepSafeVersion", "provenance": "current-dependency-selection" },
+      "consumer": { "kind": "registered-command", "target": "findSafeVersion dependency-only workflow", "acceptedProvenance": ["current-dependency-selection"] },
+      "canonicalArgumentType": "canonical-dependency-package",
+      "freshnessOwner": "DependencyHealthProvider current successful scan and command selection ledger",
+      "authoritativeOutcome": "A visible scoped safe-version result belongs to the exact current dependency row.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "dependency vulnerability commands accept exact matches and reject unmatched nodes" }
+    },
+    {
+      "id": "ACT-DEPENDENCY-SHOW-VULNERABILITIES",
+      "workflow": "WF-VULNERABILITY-TRUTH",
+      "producer": { "surface": "Dependency health row", "actionId": "cloudsmith-vsc.showDepVulnerabilities", "provenance": "current-dependency-selection" },
+      "consumer": { "kind": "registered-command", "target": "showVulnerabilities dependency-only workflow", "acceptedProvenance": ["current-dependency-selection"] },
+      "canonicalArgumentType": "canonical-dependency-package",
+      "freshnessOwner": "DependencyHealthProvider current successful scan and command selection ledger",
+      "authoritativeOutcome": "Vulnerability detail visibly opens for the exact current dependency package.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "dependency vulnerability commands accept exact matches and reject unmatched nodes" }
+    },
+    {
+      "id": "ACT-DEPENDENCY-SHOW-INSTALL",
+      "workflow": "WF-INSTALL-GUIDANCE",
+      "producer": { "surface": "Dependency health row", "actionId": "cloudsmith-vsc.showInstallCommand", "provenance": "current-dependency-selection" },
+      "consumer": { "kind": "registered-command", "target": "InstallCommandBuilder workflow", "acceptedProvenance": ["current-dependency-selection"] },
+      "canonicalArgumentType": "canonical-dependency-package",
+      "freshnessOwner": "DependencyHealthProvider current successful scan and command selection ledger",
+      "authoritativeOutcome": "A visible format-native command targets the exact current dependency and selected Cloudsmith repository.",
+      "requiredTest": { "file": "test/commandFreshness.test.js", "name": "Show and Copy publish identical selected guidance across the required formats" }
+    },
+    {
+      "id": "ACT-SEARCH-INSPECT-PACKAGE",
+      "workflow": "WF-SEARCH-FIRST-PAGE",
+      "producer": { "surface": "Search package row", "actionId": "cloudsmith-vsc.inspectPackage", "provenance": "current-search-package-selection" },
+      "consumer": { "kind": "registered-command", "target": "package inspection workflow", "acceptedProvenance": ["current-search-package-selection", "recent-canonical-package", "explicit-context-recovery"] },
+      "canonicalArgumentType": "canonical-exact-package",
+      "freshnessOwner": "SearchProvider current committed generation and selection ledger",
+      "authoritativeOutcome": "The exact selected package detail payload visibly publishes or an actionable failure appears.",
+      "requiredTest": { "file": "test/commandFreshness.test.js", "name": "package inspection rejects a same-repository response for a different package" }
+    },
+    {
+      "id": "ACT-SEARCH-SHOW-INSTALL",
+      "workflow": "WF-INSTALL-GUIDANCE",
+      "producer": { "surface": "Search package row", "actionId": "cloudsmith-vsc.showInstallCommand", "provenance": "current-search-package-selection" },
+      "consumer": { "kind": "registered-command", "target": "InstallCommandBuilder workflow", "acceptedProvenance": ["current-search-package-selection", "recent-canonical-package", "explicit-context-recovery"] },
+      "canonicalArgumentType": "canonical-exact-package",
+      "freshnessOwner": "SearchProvider current committed generation and selection ledger",
+      "authoritativeOutcome": "A visible format-native command targets the exact Search package and selected Cloudsmith repository.",
+      "requiredTest": { "file": "test/commandFreshness.test.js", "name": "API package identity and qualifiers survive registered Show and Copy handlers" }
+    },
+    {
+      "id": "ACT-EXPLORER-INSPECT-PACKAGE",
+      "workflow": "WF-EXPLORER-PUBLICATION",
+      "producer": { "surface": "Explorer package row", "actionId": "cloudsmith-vsc.inspectPackage", "provenance": "current-explorer-package-selection" },
+      "consumer": { "kind": "registered-command", "target": "package inspection workflow", "acceptedProvenance": ["current-explorer-package-selection", "recent-canonical-package", "explicit-context-recovery"] },
+      "canonicalArgumentType": "canonical-exact-package",
+      "freshnessOwner": "CloudsmithProvider current account and selection ledger",
+      "authoritativeOutcome": "The exact selected Explorer package detail visibly publishes or an actionable failure appears.",
+      "requiredTest": { "file": "test/commandFreshness.test.js", "name": "package inspection rejects a same-repository response for a different package" }
+    },
+    {
+      "id": "ACT-EXPLORER-SHOW-INSTALL",
+      "workflow": "WF-INSTALL-GUIDANCE",
+      "producer": { "surface": "Explorer package row", "actionId": "cloudsmith-vsc.showInstallCommand", "provenance": "current-explorer-package-selection" },
+      "consumer": { "kind": "registered-command", "target": "InstallCommandBuilder workflow", "acceptedProvenance": ["current-explorer-package-selection", "recent-canonical-package", "explicit-context-recovery"] },
+      "canonicalArgumentType": "canonical-exact-package",
+      "freshnessOwner": "CloudsmithProvider current account and selection ledger",
+      "authoritativeOutcome": "A visible format-native command targets the exact Explorer package and selected Cloudsmith repository.",
+      "requiredTest": { "file": "test/commandFreshness.test.js", "name": "API package identity and qualifiers survive registered Show and Copy handlers" }
+    },
+    {
+      "id": "ACT-EXPLORER-OPEN-PACKAGE",
+      "workflow": "WF-EXPLORER-PUBLICATION",
+      "producer": { "surface": "Explorer package row", "actionId": "cloudsmith-vsc.openPackage", "provenance": "current-explorer-package-selection" },
+      "consumer": { "kind": "registered-command", "target": "validated Cloudsmith package navigation", "acceptedProvenance": ["current-explorer-package-selection", "recent-canonical-package", "explicit-context-recovery"] },
+      "canonicalArgumentType": "canonical-exact-package",
+      "freshnessOwner": "CloudsmithProvider current account and selection ledger",
+      "authoritativeOutcome": "The exact current Explorer package opens, or refusal/rejection produces a truthful warning without adding recent history.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "package and package-group navigation report refused and rejected opens and record only confirmed history" }
+    },
+    {
+      "id": "ACT-SEARCH-OPEN-PACKAGE",
+      "workflow": "WF-SEARCH-FIRST-PAGE",
+      "producer": { "surface": "Search package row", "actionId": "cloudsmith-vsc.openPackage", "provenance": "current-search-package-selection" },
+      "consumer": { "kind": "registered-command", "target": "validated Cloudsmith package navigation", "acceptedProvenance": ["current-search-package-selection", "recent-canonical-package", "explicit-context-recovery"] },
+      "canonicalArgumentType": "canonical-exact-package",
+      "freshnessOwner": "SearchProvider current committed generation and selection ledger",
+      "authoritativeOutcome": "The exact current Search package opens, or refusal/rejection produces a truthful warning without adding recent history.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "package and package-group navigation report refused and rejected opens and record only confirmed history" }
+    },
+    {
+      "id": "ACT-DEPENDENCY-OPEN-PACKAGE",
+      "workflow": "WF-DEPENDENCY-PROJECTIONS",
+      "producer": { "surface": "Dependency health package row", "actionId": "cloudsmith-vsc.openPackage", "provenance": "current-dependency-selection" },
+      "consumer": { "kind": "registered-command", "target": "validated Cloudsmith package navigation", "acceptedProvenance": ["current-dependency-selection"] },
+      "canonicalArgumentType": "canonical-dependency-package",
+      "freshnessOwner": "DependencyHealthProvider current successful scan and selection ledger",
+      "authoritativeOutcome": "The exact current matched dependency package opens, or refusal/rejection produces a truthful warning without adding recent history.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "package and package-group navigation report refused and rejected opens and record only confirmed history" }
+    },
+    {
+      "id": "ACT-EXPLORER-OPEN-PACKAGE-GROUP",
+      "workflow": "WF-EXPLORER-PUBLICATION",
+      "producer": { "surface": "Explorer package-group row", "actionId": "cloudsmith-vsc.openPackageGroup", "provenance": "current-explorer-package-group-selection" },
+      "consumer": { "kind": "registered-command", "target": "validated Cloudsmith package-group navigation", "acceptedProvenance": ["current-explorer-package-group-selection"] },
+      "canonicalArgumentType": "canonical-package-group",
+      "freshnessOwner": "CloudsmithProvider current account and selection ledger",
+      "authoritativeOutcome": "The exact current Explorer package group opens, or refusal/rejection produces a truthful warning.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "package and package-group navigation report refused and rejected opens and record only confirmed history" }
+    },
+    {
+      "id": "ACT-VULNERABILITY-OPEN-CVE",
+      "workflow": "WF-VULNERABILITY-TRUTH",
+      "producer": { "surface": "Explorer, Search, or Dependency vulnerability row", "actionId": "cloudsmith-vsc.openCVE", "provenance": "current-owned-tree-selection" },
+      "consumer": { "kind": "registered-command", "target": "validated NVD or GitHub Advisory navigation", "acceptedProvenance": ["current-owned-tree-selection"] },
+      "canonicalArgumentType": "validated-external-url",
+      "freshnessOwner": "Current provider-owned vulnerability selection",
+      "authoritativeOutcome": "The bounded current CVE or GHSA reference opens on its approved HTTPS origin, or refusal/rejection produces a truthful warning.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "CVE navigation reports refused and rejected external opens" }
+    },
+    {
+      "id": "ACT-EXPLORER-OPEN-LICENSE",
+      "workflow": "WF-EXPLORER-PUBLICATION",
+      "producer": { "surface": "Explorer license row", "actionId": "cloudsmith-vsc.openLicenseUrl", "provenance": "current-owned-tree-selection" },
+      "consumer": { "kind": "registered-command", "target": "HTTPS license navigation with host trust confirmation", "acceptedProvenance": ["current-owned-tree-selection"] },
+      "canonicalArgumentType": "validated-external-url",
+      "freshnessOwner": "CloudsmithProvider current account and selection ledger",
+      "authoritativeOutcome": "The current HTTPS license URL opens directly only for an allowlisted host; other hosts require an explicit hostname trust confirmation and failures remain visible.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "license navigation confirms non-allowlisted HTTPS hosts and reports refused opens" }
+    },
+    {
+      "id": "ACT-SEARCH-OPEN-LICENSE",
+      "workflow": "WF-SEARCH-FIRST-PAGE",
+      "producer": { "surface": "Search license row", "actionId": "cloudsmith-vsc.openLicenseUrl", "provenance": "current-owned-tree-selection" },
+      "consumer": { "kind": "registered-command", "target": "HTTPS license navigation with host trust confirmation", "acceptedProvenance": ["current-owned-tree-selection"] },
+      "canonicalArgumentType": "validated-external-url",
+      "freshnessOwner": "SearchProvider current committed generation and selection ledger",
+      "authoritativeOutcome": "The current HTTPS license URL opens directly only for an allowlisted host; other hosts require an explicit hostname trust confirmation and failures remain visible.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "license navigation confirms non-allowlisted HTTPS hosts and reports refused opens" }
+    },
+    {
+      "id": "ACT-DEPENDENCY-OPEN-LICENSE",
+      "workflow": "WF-DEPENDENCY-PROJECTIONS",
+      "producer": { "surface": "Dependency Health license row", "actionId": "cloudsmith-vsc.openLicenseUrl", "provenance": "current-owned-tree-selection" },
+      "consumer": { "kind": "registered-command", "target": "HTTPS license navigation with host trust confirmation", "acceptedProvenance": ["current-owned-tree-selection"] },
+      "canonicalArgumentType": "validated-external-url",
+      "freshnessOwner": "DependencyHealthProvider current successful scan and selection ledger",
+      "authoritativeOutcome": "The current HTTPS license URL opens directly only for an allowlisted host; other hosts require an explicit hostname trust confirmation and failures remain visible.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "license navigation confirms non-allowlisted HTTPS hosts and reports refused opens" }
+    },
+    {
+      "id": "ACT-UPSTREAM-RETRY",
+      "workflow": "WF-UPSTREAM-INVENTORY",
+      "producer": { "surface": "Upstream inventory WebView", "actionId": "retry", "provenance": "current-webview-operation" },
+      "consumer": { "kind": "provider-internal", "target": "UpstreamDetailProvider.retry", "acceptedProvenance": ["current-webview-operation"] },
+      "canonicalArgumentType": "canonical-repository",
+      "freshnessOwner": "UpstreamDetailProvider current repository scope and request generation",
+      "authoritativeOutcome": "Unavailable formats retry, verified cards remain, and the current repository reaches a new truthful settled state.",
+      "requiredTest": { "file": "test/upstreamDetailProvider.test.js", "name": "targets Retry to unavailable formats and retains success per format" }
+    },
+    {
+      "id": "ACT-SETTINGS-OPEN",
+      "workflow": "WF-SETTINGS",
+      "producer": { "surface": "Command Palette / view title", "actionId": "cloudsmith-vsc.openSettings", "provenance": "context-free" },
+      "consumer": { "kind": "registered-command", "target": "vscode.commands.executeCommand(workbench.action.openSettings)", "acceptedProvenance": ["context-free"] },
+      "canonicalArgumentType": "none",
+      "freshnessOwner": "VS Code workbench",
+      "authoritativeOutcome": "The Cloudsmith-filtered Settings editor is visibly open.",
+      "requiredTest": { "file": "ui-test/smoke.test.js", "name": "opens Cloudsmith settings through the real Command Palette action" }
+    },
+    {
+      "id": "ACT-HELP-DOCUMENTATION",
+      "workflow": "WF-HELP-NAVIGATION",
+      "producer": { "surface": "Command Palette", "actionId": "cloudsmith-vscode-extension.cloudsmithDocs", "provenance": "context-free" },
+      "consumer": { "kind": "registered-command", "target": "vscode.env.openExternal(current extension documentation)", "acceptedProvenance": ["context-free"] },
+      "canonicalArgumentType": "validated-external-url",
+      "freshnessOwner": "Static validated help-link inventory",
+      "authoritativeOutcome": "The current extension-owned README documentation opens on the approved GitHub origin.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "settings/help callbacks invoke only their injected platform services" }
+    },
+    {
+      "id": "ACT-HELP-TREE-LINK",
+      "workflow": "WF-HELP-NAVIGATION",
+      "producer": { "surface": "Help tree", "actionId": "cloudsmith-vscode-extension.cloudsmithDocs", "provenance": "context-free" },
+      "consumer": { "kind": "registered-command", "target": "HELP_LINKS ID lookup and truthful external navigation", "acceptedProvenance": ["context-free"] },
+      "canonicalArgumentType": "validated-external-url",
+      "freshnessOwner": "Static validated help-link inventory",
+      "authoritativeOutcome": "Each advertised Help-tree destination is resolved by stable HELP_LINKS ID and opens, or refusal/rejection produces a truthful warning.",
+      "requiredTest": { "file": "test/commandRegistrars.test.js", "name": "Help tree items route authoritative link IDs through the truthful navigation command" }
+    }
+  ],
+  "scriptedWebviews": [
+    {
+      "id": "WEBVIEW-QUARANTINE",
+      "provider": "views/quarantineExplainProvider.js",
+      "rendererKind": "data-command",
+      "parser": "QUARANTINE_MESSAGE_CONTRACTS",
+      "commands": [
+        { "message": "retry", "renderPattern": "data-command=\"retry\"", "parserPattern": "retry: Object.freeze([])", "handlerPattern": "parsed.command === \"retry\"", "targetPattern": "this._retry(operation)", "actionContract": "ACT-QUARANTINE-RETRY" },
+        { "message": "findSafeVersion", "renderPattern": "data-command=\"findSafeVersion\"", "parserPattern": "findSafeVersion: Object.freeze([])", "handlerPattern": "parsed.command === \"findSafeVersion\"", "targetPattern": "this._packageActions?.findSafeVersion", "actionContract": "ACT-QUARANTINE-FIND-SAFE" },
+        { "message": "showVulnerabilities", "renderPattern": "data-command=\"showVulnerabilities\"", "parserPattern": "showVulnerabilities: Object.freeze([])", "handlerPattern": "parsed.command === \"showVulnerabilities\"", "targetPattern": "this._packageActions?.showVulnerabilities", "actionContract": "ACT-QUARANTINE-SHOW-VULNERABILITIES" },
+        { "message": "openInCloudsmith", "renderPattern": "data-command=\"openInCloudsmith\"", "parserPattern": "openInCloudsmith: Object.freeze([])", "handlerPattern": "parsed.command === \"openInCloudsmith\"", "targetPattern": "openExternal: target => this._openExternal(target)", "actionContract": "ACT-QUARANTINE-OPEN" },
+        { "message": "copyReport", "renderPattern": "data-command=\"copyReport\"", "parserPattern": "copyReport: Object.freeze([])", "handlerPattern": "parsed.command === \"copyReport\"", "targetPattern": "this._writeClipboard(this._buildPlainTextReport(trace))", "actionContract": "ACT-QUARANTINE-COPY" }
+      ]
+    },
+    {
+      "id": "WEBVIEW-VULNERABILITY",
+      "provider": "views/vulnerabilityProvider.js",
+      "rendererKind": "data-command",
+      "parser": "VULNERABILITY_MESSAGE_CONTRACTS",
+      "commands": [
+        { "message": "findSafeVersion", "renderPattern": "data-command=\"findSafeVersion\"", "parserPattern": "findSafeVersion: Object.freeze([])", "handlerPattern": "parsed.command === \"findSafeVersion\"", "targetPattern": "this._packageActions?.findSafeVersion", "actionContract": "ACT-VULNERABILITY-FIND-SAFE" },
+        { "message": "explainQuarantine", "renderPattern": "data-command=\"explainQuarantine\"", "parserPattern": "explainQuarantine: Object.freeze([])", "handlerPattern": "parsed.command === \"explainQuarantine\"", "targetPattern": "this._packageActions?.explainQuarantine", "actionContract": "ACT-VULNERABILITY-EXPLAIN-QUARANTINE" },
+        { "message": "copyReport", "renderPattern": "data-command=\"copyReport\"", "parserPattern": "copyReport: Object.freeze([])", "handlerPattern": "parsed.command === \"copyReport\"", "targetPattern": "this._writeClipboard(report)", "actionContract": "ACT-VULNERABILITY-COPY" },
+        { "message": "openExternal", "renderChannel": "data-url", "renderPattern": "postMsg({ command: \"openExternal\"", "parserPattern": "openExternal: Object.freeze([\"url\"])", "handlerPattern": "parsed.command === \"openExternal\"", "targetPattern": "openExternal: target => this._openExternal(target)", "actionContract": "ACT-VULNERABILITY-OPEN-REFERENCE" },
+        { "message": "retry", "renderPattern": "data-command=\"retry\"", "parserPattern": "retry: Object.freeze([])", "handlerPattern": "parsed.command === \"retry\"", "targetPattern": "this._retry(operation)", "actionContract": "ACT-VULNERABILITY-RETRY" }
+      ]
+    },
+    {
+      "id": "WEBVIEW-UPSTREAM-INVENTORY",
+      "provider": "views/upstreamDetailProvider.js",
+      "rendererKind": "post-message",
+      "parser": "inline exact own-property contract",
+      "commands": [
+        { "message": "retry", "renderPattern": "vscode.postMessage({ command: \"retry\" })", "parserPattern": "message.command === \"retry\"", "handlerPattern": "if (!validRetry) return", "targetPattern": "void this.retry()", "actionContract": "ACT-UPSTREAM-RETRY" }
+      ]
+    }
+  ]
+}

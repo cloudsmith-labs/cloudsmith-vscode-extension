@@ -21,6 +21,7 @@ class UpstreamOperationScheduler {
     this.maxActiveCount = 0;
     this._queue = [];
     this._activeEntries = new Set();
+    this._signalRegistrations = new Map();
     this._circuitError = null;
     this._cancelled = false;
   }
@@ -52,7 +53,7 @@ class UpstreamOperationScheduler {
         reject,
         state: "queued",
         retired: false,
-        abortListener: null,
+        signalRegistration: null,
         cancellationDisposable: null,
         completion: null,
       };
@@ -141,15 +142,30 @@ class UpstreamOperationScheduler {
     const options = entry.options;
     const cancelEntry = () => this._cancelEntry(entry);
     if (typeof options.signal?.addEventListener === "function") {
-      entry.abortListener = cancelEntry;
-      options.signal.addEventListener("abort", cancelEntry, { once: true });
+      let registration = this._signalRegistrations.get(options.signal);
+      if (!registration) {
+        const signal = options.signal;
+        registration = {
+          entries: new Set(),
+          listener: null,
+          signal,
+        };
+        registration.listener = () => {
+          for (const watchedEntry of [...registration.entries]) {
+            this._cancelEntry(watchedEntry);
+          }
+        };
+        this._signalRegistrations.set(signal, registration);
+        signal.addEventListener("abort", registration.listener, { once: true });
+      }
+      registration.entries.add(entry);
+      entry.signalRegistration = registration;
     }
     if (typeof options.cancellationToken?.onCancellationRequested === "function") {
       const disposable = options.cancellationToken.onCancellationRequested(cancelEntry);
       if (entry.retired) disposable?.dispose?.();
       else entry.cancellationDisposable = disposable;
     }
-    if (!entry.retired && isCancelled(options)) cancelEntry();
   }
 
   _cancelEntry(entry) {
@@ -162,7 +178,6 @@ class UpstreamOperationScheduler {
     const index = this._queue.indexOf(entry);
     if (index !== -1) this._queue.splice(index, 1);
     this._retireQueued(entry, error);
-    this._drain();
   }
 
   _retireQueued(entry, error) {
@@ -190,9 +205,14 @@ class UpstreamOperationScheduler {
   }
 
   _disposeCancellation(entry) {
-    if (entry.abortListener) {
-      entry.options.signal?.removeEventListener?.("abort", entry.abortListener);
-      entry.abortListener = null;
+    if (entry.signalRegistration) {
+      const registration = entry.signalRegistration;
+      entry.signalRegistration = null;
+      registration.entries.delete(entry);
+      if (registration.entries.size === 0) {
+        registration.signal.removeEventListener?.("abort", registration.listener);
+        this._signalRegistrations.delete(registration.signal);
+      }
     }
     entry.cancellationDisposable?.dispose?.();
     entry.cancellationDisposable = null;
