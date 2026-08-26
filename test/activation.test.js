@@ -208,7 +208,24 @@ suite("Extension activation smoke", () => {
         `Expected compatibility command ${compatibilityCommand} to be registered`
       );
     }
-    await vscode.commands.executeCommand("cloudsmith-vsc.openSettings");
+    const originalExecuteCommand = vscode.commands.executeCommand;
+    const settingsTargets = [];
+    vscode.commands.executeCommand = async (command, ...args) => {
+      if (command === "workbench.action.openSettings") {
+        settingsTargets.push({ command, args });
+        return undefined;
+      }
+      return originalExecuteCommand.call(vscode.commands, command, ...args);
+    };
+    try {
+      await originalExecuteCommand.call(vscode.commands, "cloudsmith-vsc.openSettings");
+    } finally {
+      vscode.commands.executeCommand = originalExecuteCommand;
+    }
+    assert.deepStrictEqual(settingsTargets, [{
+      command: "workbench.action.openSettings",
+      args: ["@ext:Cloudsmith.cloudsmith-vsc"],
+    }]);
 
     const viewIds = (PRODUCT_MANIFEST.contributes?.views?.cloudsmithSideBar || [])
       .map((entry) => entry.id);
@@ -246,6 +263,7 @@ suite("Extension activation smoke", () => {
     let secretReadStarted = false;
     let contextProjectionStarted = false;
     let commandsAtFirstContextProjection = null;
+    const settingsTargets = [];
     const activationRegistrations = new Set();
     const context = createActivationContext(PRODUCT_ROOT, () => {});
     const originalSecretGet = context.secrets.get.bind(context.secrets);
@@ -270,6 +288,10 @@ suite("Extension activation smoke", () => {
         contextProjectionStarted = true;
         commandsAtFirstContextProjection ||= new Set(activationRegistrations);
         return contextProjection.promise;
+      }
+      if (id === "workbench.action.openSettings") {
+        settingsTargets.push({ command: id, args });
+        return Promise.resolve(undefined);
       }
       return originalExecuteCommand.call(vscode.commands, id, ...args);
     };
@@ -303,6 +325,10 @@ suite("Extension activation smoke", () => {
         );
       }
       await vscode.commands.executeCommand("cloudsmith-vsc.openSettings");
+      assert.deepStrictEqual(settingsTargets, [{
+        command: "workbench.action.openSettings",
+        args: ["@ext:Cloudsmith.cloudsmith-vsc"],
+      }]);
       const guardedResults = await Promise.race([
         Promise.all([
           vscode.commands.executeCommand("cloudsmith-vsc.searchPackages"),
