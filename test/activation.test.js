@@ -16,6 +16,15 @@ const PRODUCT_MANIFEST = JSON.parse(fs.readFileSync(
 const TEST_HARNESS_ID = "cloudsmith-test.cloudsmith-vsc-test-harness";
 const TEST_HARNESS_ROOT = path.join(PRODUCT_ROOT, "test", "harness-extension");
 
+function isWithin(candidatePath, rootPath) {
+  const relative = path.relative(
+    fs.realpathSync(rootPath),
+    fs.realpathSync(candidatePath)
+  );
+  return relative === ""
+    || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
 function deferred() {
   let resolve;
   const promise = new Promise(res => { resolve = res; });
@@ -132,13 +141,34 @@ suite("Extension activation smoke", () => {
       undefined,
       "The production manifest must not be installed or host-activated by the test runner"
     );
+    const expectedExtensionsDirValue = process.env.EXPECTED_EXTENSIONS_DIR || "";
+    assert.strictEqual(path.isAbsolute(expectedExtensionsDirValue), true);
+    const expectedExtensionsDir = fs.realpathSync(expectedExtensionsDirValue);
+    const vscodeTestRoot = fs.realpathSync(path.join(PRODUCT_ROOT, ".vscode-test"));
+    const repositoryExtensions = vscode.extensions.all
+      .filter(extension => (
+        isWithin(extension.extensionPath, PRODUCT_ROOT)
+        && !isWithin(extension.extensionPath, vscodeTestRoot)
+      ))
+      .map(extension => extension.id)
+      .sort();
+    assert.deepStrictEqual(
+      repositoryExtensions,
+      [TEST_HARNESS_ID],
+      "Only the inert harness may be loaded from this repository"
+    );
     assert.deepStrictEqual(
       vscode.extensions.all
-        .filter(extension => !extension.isBuiltin)
+        .filter(extension => (
+          !extension.isBuiltin
+          && extension.id !== TEST_HARNESS_ID
+          && !isWithin(extension.extensionPath, expectedExtensionsDir)
+          && !isWithin(extension.extensionPath, vscodeTestRoot)
+        ))
         .map(extension => extension.id)
         .sort(),
-      [TEST_HARNESS_ID],
-      "The isolated host may load only the tracked inert harness as a non-builtin extension"
+      [],
+      "Non-builtin seeded defaults must remain inside the unique temporary extensions directory"
     );
     const extensionModule = require("../extension");
     let inMemoryCredentialReads = 0;

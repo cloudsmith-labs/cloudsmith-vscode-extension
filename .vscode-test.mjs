@@ -31,32 +31,36 @@ function mochaOptions(timeout) {
 const common = {
   version,
   extensionDevelopmentPath: TEST_HARNESS_EXTENSION_PATH,
-  env: {
-    EXPECTED_VSCODE_VERSION: version,
-  },
   skipExtensionDependencies: true,
 };
 
-function userDataLaunchArgs(label) {
+function isolatedHost(label) {
   const runRoot = path.join(os.tmpdir(), `cloudsmith-vsc-${label}-${process.pid}`);
-  return [
-    `--user-data-dir=${path.join(runRoot, "user-data")}`,
-    `--extensions-dir=${path.join(runRoot, "extensions")}`,
-  ];
+  const extensionsDir = path.join(runRoot, "extensions");
+  return {
+    env: {
+      EXPECTED_EXTENSIONS_DIR: extensionsDir,
+      EXPECTED_VSCODE_VERSION: version,
+    },
+    launchArgs: [
+      `--user-data-dir=${path.join(runRoot, "user-data")}`,
+      `--extensions-dir=${extensionsDir}`,
+    ],
+  };
 }
 
 export default defineConfig([
   {
     ...common,
+    ...isolatedHost("core"),
     label: "core",
-    launchArgs: userDataLaunchArgs("core"),
     files: VSCODE_CORE_TESTS,
     mocha: mochaOptions(20000),
   },
   {
     ...common,
+    ...isolatedHost("smoke"),
     label: "smoke",
-    launchArgs: userDataLaunchArgs("smoke"),
     files: VSCODE_SMOKE_TESTS,
     mocha: mochaOptions(20000),
   },
