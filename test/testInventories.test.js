@@ -109,6 +109,9 @@ suite("test runner inventories", () => {
       DISPLAY: ":99",
       VSCODE_TEST_VERSION: "1.99.0",
       CLOUDSMITH_QUALITY_TEST_EVIDENCE: "1",
+      CLOUDSMITH_QUALITY_SOURCE_SHA: "a".repeat(40),
+      CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT: "b".repeat(64),
+      CLOUDSMITH_QUALITY_TEST_SUITE: "extension-host-core",
       CLOUDSMITH_API_KEY: "synthetic-secret",
       ACCESS_TOKEN: "synthetic-secret",
       SSH_AUTH_SOCK: "/private/synthetic-agent.sock",
@@ -124,6 +127,9 @@ suite("test runner inventories", () => {
         DISPLAY: sanitized.DISPLAY,
         VSCODE_TEST_VERSION: sanitized.VSCODE_TEST_VERSION,
         CLOUDSMITH_QUALITY_TEST_EVIDENCE: sanitized.CLOUDSMITH_QUALITY_TEST_EVIDENCE,
+        CLOUDSMITH_QUALITY_SOURCE_SHA: sanitized.CLOUDSMITH_QUALITY_SOURCE_SHA,
+        CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT: sanitized.CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT,
+        CLOUDSMITH_QUALITY_TEST_SUITE: sanitized.CLOUDSMITH_QUALITY_TEST_SUITE,
       },
       {
         PATH: "/safe/bin",
@@ -131,6 +137,9 @@ suite("test runner inventories", () => {
         DISPLAY: ":99",
         VSCODE_TEST_VERSION: "1.99.0",
         CLOUDSMITH_QUALITY_TEST_EVIDENCE: "1",
+        CLOUDSMITH_QUALITY_SOURCE_SHA: "a".repeat(40),
+        CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT: "b".repeat(64),
+        CLOUDSMITH_QUALITY_TEST_SUITE: "extension-host-core",
       }
     );
     for (const name of [
