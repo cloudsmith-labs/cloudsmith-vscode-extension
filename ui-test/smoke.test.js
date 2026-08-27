@@ -17,6 +17,10 @@ const HELP_ROWS = Object.freeze([
   "Report an issue",
 ]);
 const SIGNED_OUT_COMMANDS = Object.freeze([
+  Object.freeze({ label: "Cloudsmith: Focus on Dependency health View", enabled: true }),
+  Object.freeze({ label: "Cloudsmith: Focus on Help and feedback View", enabled: true }),
+  Object.freeze({ label: "Cloudsmith: Focus on Package search View", enabled: true }),
+  Object.freeze({ label: "Cloudsmith: Focus on Workspaces View", enabled: true }),
   Object.freeze({ label: "Cloudsmith: Import API key from Cloudsmith CLI", enabled: true }),
   Object.freeze({ label: "Cloudsmith: Open Cloudsmith settings", enabled: true }),
   Object.freeze({ label: "Cloudsmith: Set up Cloudsmith authentication", enabled: true }),
