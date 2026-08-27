@@ -8,6 +8,7 @@ const {
   assertRepositoryRelativePath,
   gitVisibleFiles,
   isPlainObject,
+  readJson,
   requireNonEmptyString,
   uniqueSorted,
 } = require("./common");
@@ -15,6 +16,7 @@ const {
   mutationTargetFile,
   validateMutationCounts,
 } = require("./run-mutation");
+const { validateMutationToolchain } = require("./mutation-toolchain");
 
 const COUNT_FIELDS = [
   "mutants", "killed", "survived", "timeout", "noCoverage",
@@ -39,6 +41,19 @@ function validateMutationBaseline(baseline, options = {}) {
   if (baseline.schemaVersion !== 1) {
     errors.push("Mutation baseline schemaVersion must be 1.");
   }
+  let manifest = options.manifest;
+  let lockfile = options.lockfile;
+  try {
+    manifest ||= readJson("package.json", root);
+  } catch {
+    // The validator below emits the stable unavailable-document error.
+  }
+  try {
+    lockfile ||= readJson("package-lock.json", root);
+  } catch {
+    // The validator below emits the stable unavailable-document error.
+  }
+  errors.push(...validateMutationToolchain(baseline, manifest, lockfile));
   if (!/^[a-f0-9]{40}$/u.test(baseline.measuredAtSha || "")) {
     errors.push("Mutation baseline measuredAtSha must be a full 40-hex commit.");
   } else if (!commitIsAncestor(baseline.measuredAtSha, root)) {
@@ -145,6 +160,15 @@ function validateMutationBaseline(baseline, options = {}) {
   if (metricsAreValid && baseline.thresholds?.break !== metrics.score) {
     errors.push("Mutation baseline break threshold must equal its measured aggregate score.");
   }
+  if (!isPlainObject(baseline.thresholds)
+    || !Number.isFinite(baseline.thresholds.high)
+    || !Number.isFinite(baseline.thresholds.low)
+    || baseline.thresholds.high < 0
+    || baseline.thresholds.high > 100
+    || baseline.thresholds.low < 0
+    || baseline.thresholds.low > baseline.thresholds.high) {
+    errors.push("Mutation baseline high and low thresholds must define a valid exact range.");
+  }
 
   const meaningfulSurvivors = baseline.meaningfulSurvivors;
   if (!Array.isArray(meaningfulSurvivors)) {
@@ -249,10 +273,12 @@ function validateClassifications(value, classDefinitions, metrics, metricsAreVal
 
 function validMutationTarget(value) {
   if (!requireNonEmptyString(value) || value !== value.trim()) return false;
-  const sourceFile = mutationTargetFile(value);
+  const range = /^(.+):(\d+)-(\d+)$/u.exec(value);
+  if (value.includes(":") && !range) return false;
+  const sourceFile = range ? range[1] : value;
   if (!validRepositoryPath(sourceFile)) return false;
-  return value === sourceFile
-    || new RegExp(`^${escapeRegExp(sourceFile)}:\\d+(?::\\d+)?-\\d+(?::\\d+)?$`, "u").test(value);
+  return value === sourceFile || (Number(range[2]) > 0
+    && Number(range[3]) >= Number(range[2]));
 }
 
 function validRepositoryPath(value) {
@@ -262,10 +288,6 @@ function validRepositoryPath(value) {
   } catch {
     return false;
   }
-}
-
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 
 function isAncestorCommit(sha, root = ROOT) {

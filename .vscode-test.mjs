@@ -9,11 +9,29 @@ import testInventories from "./test/testInventories.js";
 const {
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,
+  adoptIsolatedQualificationRoot,
   createIsolatedQualificationRoot,
   removeIsolatedQualificationRoot,
 } = testInventories;
 const repositoryRoot = path.dirname(fileURLToPath(import.meta.url));
 const TEST_HARNESS_EXTENSION_PATH = path.join(repositoryRoot, "test", "harness-extension");
+
+const launcherHome = process.env.CLOUDSMITH_QUALITY_LAUNCHER_HOME;
+const launcherProof = process.env.CLOUDSMITH_QUALITY_LAUNCHER_PROOF;
+if ((launcherHome === undefined) !== (launcherProof === undefined)) {
+  throw new Error("VS Code qualification launcher ownership evidence is incomplete");
+}
+if (launcherHome !== undefined) {
+  const adoptedLauncherHome = adoptIsolatedQualificationRoot(
+    launcherHome,
+    launcherProof,
+    process.env.VSCODE_TEST_LABEL,
+    os.tmpdir()
+  );
+  process.once("exit", () => removeIsolatedQualificationRoot(adoptedLauncherHome));
+  delete process.env.CLOUDSMITH_QUALITY_LAUNCHER_HOME;
+  delete process.env.CLOUDSMITH_QUALITY_LAUNCHER_PROOF;
+}
 
 const version = process.env.VSCODE_TEST_VERSION || "1.134.0";
 if (!/^\d+\.\d+\.\d+$/.test(version)) {
@@ -65,6 +83,8 @@ function isolatedHost(label) {
       "--disable-extension=vscode.microsoft-authentication",
       "--disable-extension=GitHub.copilot",
       "--disable-extension=GitHub.copilot-chat",
+      "--disable-extension=TypeScriptTeam.jsts-chat-features",
+      "--disable-extension=vscode.mermaid-markdown-features",
     ],
   };
 }

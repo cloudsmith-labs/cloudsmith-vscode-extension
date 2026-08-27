@@ -6,6 +6,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const Mocha = require("mocha");
+const yaml = require("js-yaml");
 const {
   gitVisibleFiles,
   uniqueSorted,
@@ -22,27 +23,40 @@ const {
   requireMappedRuntime,
 } = require("../scripts/quality/impact");
 const {
+  artifactFingerprintForStep,
   completedReceipt,
   executeCommand,
+  gatePlanFingerprint,
   getGatePlan,
   receiptPath,
   runGate,
+  validateArtifactBinding,
 } = require("../scripts/quality/gate");
+const { aggregateStatuses, fingerprint, sourceIdentity } = require("../scripts/quality/evidence");
 const {
+  assertValidMutationBaseline,
   assertMutationTestOwners,
+  assertCanonicalMutationRuntime,
+  assertMutationGateArguments,
   changedMutationTargets,
+  deriveMutationEvidence,
   filterMutationReport,
+  fullMutationSelection,
   gitChangedFiles,
   perFileCounts,
+  receipt: mutationReceipt,
   validateMutationSummary,
+  validateMutationTestOwnership,
   workingTreeFingerprint,
 } = require("../scripts/quality/run-mutation");
 const {
   isAncestorCommit,
   validateMutationBaseline,
 } = require("../scripts/quality/mutation-baseline");
+const { validateMutationToolchain } = require("../scripts/quality/mutation-toolchain");
 const {
   attestationReviewDigest,
+  evaluateDiskLiveQualification,
   evaluateLiveQualification,
   parseArguments: parseChecklistArguments,
   requiredLiveWorkflowIds,
@@ -55,8 +69,13 @@ const {
   validateFindingRecord,
   validateFindings,
   validateImpactArtifact,
+  writeReport,
 } = require("../scripts/quality/report");
 const { verifyQualityContracts } = require("../scripts/quality/verify-workflows");
+const { verifyEvidenceHandoff } = require("../scripts/quality/verify-handoff");
+const {
+  validateMutationEvidenceArtifacts,
+} = require("../scripts/quality/verify-mutation-handoff");
 const TEST_INVENTORIES = require("./testInventories");
 
 const root = path.resolve(__dirname, "..");
@@ -89,6 +108,13 @@ function clone(value) {
 }
 
 function passedReceipt(step, source = SOURCE_IDENTITY) {
+  const artifactFingerprints = {
+    "change-impact": mutationArtifactFingerprint(validImpact()),
+    "changed-mutation": mutationArtifactFingerprint(validMutationSummary()),
+    "black-box-ui-smoke": mutationArtifactFingerprint(validUiResult()),
+    "release-checklist": mutationArtifactFingerprint(validLiveStatus()),
+    "quality-report": "e".repeat(64),
+  };
   return {
     stepId: step.id,
     category: step.category,
@@ -96,10 +122,11 @@ function passedReceipt(step, source = SOURCE_IDENTITY) {
     status: "passed",
     exitCode: 0,
     signal: null,
+    reason: null,
     testCounts: null,
     testEvidence: step.evidencePath ? testEvidence(step, source) : null,
-    artifactFingerprint: step.artifactPath
-      ? mutationArtifactFingerprint(validMutationSummary())
+    artifactFingerprint: step.artifactPath || step.artifactPaths
+      ? artifactFingerprints[step.id]
       : null,
     source,
   };
@@ -119,6 +146,14 @@ function testEvidence(step, source = SOURCE_IDENTITY) {
   }));
   return {
     schemaVersion: 1,
+    tool: {
+      core: "@stryker-mutator/core",
+      version: "10.0.0",
+      runner: "@stryker-mutator/mocha-runner",
+      runnerVersion: "10.0.0",
+      engine: "mocha",
+      engineVersion: "11.8.0",
+    },
     source,
     suite: step.id,
     counts: { passed: tests.length, failed: 0, pending: 0 },
@@ -137,6 +172,13 @@ function validLiveStatus(overrides = {}) {
     requiredWorkflowIds: [],
     passedWorkflowIds: [],
     missingWorkflowIds: [],
+    attestationFingerprint: "c".repeat(64),
+    evidenceManifest: [{
+      path: "internal_docs/quality/findings.jsonl",
+      sha256: crypto.createHash("sha256").update("[]").digest("hex"),
+    }],
+    findingsFingerprint: crypto.createHash("sha256").update("[]").digest("hex"),
+    openReleaseBlockerCount: 0,
     visibleEnabledActions: { status: "passed", silentNoOpCount: 0 },
     reason: null,
     errors: [],
@@ -144,12 +186,80 @@ function validLiveStatus(overrides = {}) {
   };
 }
 
-function passedLiveAttestation(source = SOURCE_IDENTITY) {
+function validUiResult(tests = ["fixture"], overrides = {}) {
+  const sortedTests = uniqueSorted(tests);
+  return {
+    schemaVersion: 1,
+    status: "passed",
+    source: SOURCE_IDENTITY,
+    sourceSha: SOURCE_SHA,
+    tool: "vscode-extension-tester",
+    toolVersion: "8.24.0",
+    vscodeVersion: "1.134.0",
+    platform: "darwin",
+    architecture: "arm64",
+    launchAttempted: true,
+    tests: sortedTests,
+    results: sortedTests.map(name => ({ name, status: "passed" })),
+    reason: null,
+    ...overrides,
+  };
+}
+
+function blockedUiResult(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    status: "blocked",
+    source: SOURCE_IDENTITY,
+    sourceSha: SOURCE_SHA,
+    tool: null,
+    toolVersion: null,
+    vscodeVersion: null,
+    platform: null,
+    architecture: null,
+    launchAttempted: false,
+    tests: [],
+    results: [],
+    reason: "Production activation reads VS Code SecretStorage; automated UI qualification is not authorized.",
+    ...overrides,
+  };
+}
+
+function blackBoxFixtureWorkflows() {
+  return {
+    workflows: [{
+      id: "WF-BLACK-BOX-FIXTURE",
+      criticality: "release-critical",
+      surface: "fixture",
+      authoritativeOutcome: "fixture",
+      requiredLayers: ["black-box-ui"],
+      evidence: [{
+        layer: "black-box-ui",
+        interactionMode: "rendered-dom-activation",
+        testFile: "ui-test/smoke.test.js",
+        testNames: ["fixture"],
+      }],
+    }],
+  };
+}
+
+function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW) {
   const workflows = require("../quality/critical-workflows.json");
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-live-receipt-"));
-  const capturedAt = "2026-08-26T00:00:00.000Z";
-  const completedAt = "2026-08-26T00:01:00.000Z";
-  const reviewedAt = "2026-08-26T00:02:00.000Z";
+  fs.mkdirSync(path.join(fixtureRoot, "quality"), { recursive: true });
+  for (const filename of [
+    "critical-workflows.json",
+    "defect-taxonomy.json",
+    "finding.schema.json",
+  ]) {
+    fs.copyFileSync(
+      path.join(root, "quality", filename),
+      path.join(fixtureRoot, "quality", filename)
+    );
+  }
+  const capturedAt = new Date(now.getTime() - 3 * 60 * 1000).toISOString();
+  const completedAt = new Date(now.getTime() - 2 * 60 * 1000).toISOString();
+  const reviewedAt = new Date(now.getTime() - 60 * 1000).toISOString();
   const evidenceReference = (relativePath, content, timestamp) => {
     const target = path.join(fixtureRoot, relativePath);
     fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -170,16 +280,43 @@ function passedLiveAttestation(source = SOURCE_IDENTITY) {
     "independent review fixture\n",
     reviewedAt
   );
+  const findingsEvidence = evidenceReference(
+    "internal_docs/quality/findings.jsonl",
+    `${JSON.stringify({
+      id: "QH-900",
+      severity: "P3",
+      status: "deferred",
+      surface: "fixture",
+      workflowContract: "WF-AUTH-STATE",
+      failureClasses: ["false-green-test"],
+      customerImpact: "Fixture-only non-blocking impact.",
+      reproductionConfidence: "strong-static-evidence",
+      authoritativeExpectedOutcome: "The fixture ledger validates strictly.",
+      observedOutcome: "No live customer defect is claimed by this fixture.",
+      firstKnownBadSha: null,
+      evidence: [{ kind: "protocol", location: "fixture", summary: "Synthetic fixture." }],
+      rootCauseStatus: "suspected",
+      testLayerThatShouldHaveCaughtIt: "live-protocol",
+      whyItEscaped: "This is a schema-valid trust fixture.",
+      regressionTest: null,
+      mutationProof: { status: "not-started", summary: "Not applicable to the fixture." },
+      fixedSha: null,
+      liveVerification: { status: "blocked", summary: "Fixture only." },
+      releaseBlocking: false,
+    })}\n`,
+    capturedAt
+  );
   const document = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     source,
     status: "passed",
     authenticatedAcceptance: true,
     checklistConfirmed: true,
     operatorId: "fixture-qualification-operator",
     completedAt,
-    verdict: "TEAM-TEST READY",
-    evidence: [qualificationEvidence],
+    verdict: "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS",
+    evidence: [qualificationEvidence, findingsEvidence],
+    findingsFingerprint: findingsEvidence.sha256,
     openReleaseBlockerCount: 0,
     workflowResults: requiredLiveWorkflowIds(workflows).map(id => ({
       id,
@@ -204,6 +341,7 @@ function passedLiveAttestation(source = SOURCE_IDENTITY) {
   return {
     cleanup: () => fs.rmSync(fixtureRoot, { force: true, recursive: true }),
     document,
+    attestationFingerprint: mutationArtifactFingerprint(document),
     root: fixtureRoot,
   };
 }
@@ -227,7 +365,7 @@ function validMutationSummary(overrides = {}) {
     files: {
       "domain/packageActionCapabilities.js": validMutationFile(90),
     },
-    survivors: [{ fingerprint: "c".repeat(64) }],
+    survivors: mutationSurvivors(1),
     ...overrides,
   };
 }
@@ -247,9 +385,16 @@ function validMutationFile(score, overrides = {}) {
   };
 }
 
-function mutationSurvivors(count) {
+function mutationSurvivors(
+  count,
+  target = "domain/packageActionCapabilities.js"
+) {
   return Array.from({ length: count }, (_value, index) => ({
     fingerprint: index.toString(16).padStart(64, "0"),
+    target,
+    file: target.replace(/:\d+(?::\d+)?-\d+(?::\d+)?$/u, ""),
+    line: index + 1,
+    mutator: "FixtureMutator",
   }));
 }
 
@@ -283,6 +428,15 @@ function validTrackedMutationBaseline() {
   const secondTarget = "util/externalNavigation.js";
   return {
     schemaVersion: 1,
+    tool: {
+      core: "@stryker-mutator/core",
+      version: "10.0.0",
+      runner: "@stryker-mutator/mocha-runner",
+      runnerVersion: "10.0.0",
+      engine: "mocha",
+      engineVersion: "11.8.0",
+      nodeVersion: "22.23.2",
+    },
     measuredAtSha: SOURCE_SHA,
     scope: [firstTarget, secondTarget],
     metrics: {
@@ -336,6 +490,211 @@ function validTrackedMutationBaseline() {
   };
 }
 
+function rawMutationReport(baseline, targets, values) {
+  const owners = uniqueSorted(baseline.scope.flatMap(
+    target => baseline.files[target].testFiles
+  ));
+  const thresholds = {
+    high: baseline.thresholds.high,
+    low: baseline.thresholds.low,
+    break: 0,
+  };
+  const report = {
+    schemaVersion: "1.0",
+    projectRoot: root,
+    thresholds,
+    framework: {
+      name: "StrykerJS",
+      version: baseline.tool.version,
+      dependencies: {
+        [baseline.tool.engine]: baseline.tool.engineVersion,
+        [baseline.tool.runner]: baseline.tool.runnerVersion,
+      },
+    },
+    config: {
+      allowConsoleColors: true,
+      appendPlugins: [],
+      checkerNodeArgs: [],
+      checkers: [],
+      cleanTempDir: "always",
+      clearTextReporter: {},
+      commandRunner: { command: "npm test" },
+      concurrency: 4,
+      configFile: "stryker.config.mjs",
+      mutate: [...targets],
+      testRunner: "mocha",
+      testFiles: owners,
+      mochaOptions: {
+        ui: "tdd",
+        spec: owners,
+        "no-config": true,
+        "no-package": true,
+        "no-opts": true,
+      },
+      coverageAnalysis: "perTest",
+      dashboard: {},
+      disableBail: false,
+      disableTypeChecks: true,
+      dryRunOnly: false,
+      dryRunTimeoutMinutes: 5,
+      eventReporter: {},
+      fileLogLevel: "off",
+      force: false,
+      htmlReporter: { fileName: ".quality/mutation/mutation.html" },
+      ignorePatterns: [
+        ".vscode-test",
+        ".quality",
+        "internal_docs",
+        "out",
+        "coverage",
+        "*.vsix",
+      ],
+      ignoreStatic: true,
+      ignorers: [],
+      inPlace: false,
+      incremental: false,
+      incrementalFile: ".quality/mutation/stryker-incremental.json",
+      jsonReporter: { fileName: ".quality/mutation/mutation.json" },
+      logLevel: "info",
+      maxConcurrentTestRunners: Number.MAX_SAFE_INTEGER,
+      maxTestRunnerReuse: 0,
+      mutator: { plugins: null, excludedMutations: [] },
+      plugins: ["@stryker-mutator/*"],
+      reporters: ["clear-text", "progress", "json", "html"],
+      symlinkNodeModules: true,
+      tempDirName: ".stryker-tmp",
+      testRunnerNodeArgs: [],
+      allowEmpty: false,
+      thresholds,
+      timeoutFactor: 1.5,
+      timeoutMS: 10_000,
+      tsconfigFile: "tsconfig.json",
+      warnings: true,
+    },
+    ...values,
+  };
+  for (const [file, value] of Object.entries(report.files || {})) {
+    value.source ||= fs.readFileSync(path.join(root, file), "utf8");
+    for (const mutant of value.mutants || []) {
+      mutant.static ??= mutant.status === "Ignored";
+      mutant.coveredBy ||= [];
+      if (mutant.status === "Killed") {
+        mutant.statusReason ||= "The mutation was rejected by its exact owner test.";
+        mutant.testsCompleted ??= Math.max(1, mutant.killedBy?.length || 0);
+      } else if (mutant.status === "Survived") {
+        mutant.testsCompleted ??= mutant.coveredBy.length;
+      } else if (mutant.status === "Ignored") {
+        mutant.statusReason ||= "Static mutant (and \"ignoreStatic\" was enabled)";
+      }
+    }
+  }
+  for (const [file, value] of Object.entries(report.testFiles || {})) {
+    value.source ||= fs.readFileSync(path.join(root, file), "utf8");
+  }
+  return report;
+}
+
+function mutationHandoffFixture(options = {}) {
+  const mode = options.mode || "changed";
+  const applicable = options.applicable !== false;
+  const measured = require("../quality/mutation-baseline.json");
+  const target = measured.scope[0];
+  const sourceFile = target.replace(/:\d+-\d+$/u, "");
+  const owner = measured.files[target].testFiles[0];
+  const baseline = {
+    tool: clone(measured.tool),
+    scope: [target],
+    files: {
+      [target]: {
+        testFiles: [owner],
+        mutants: 1,
+        killed: 1,
+        survived: 0,
+        timeout: 0,
+        noCoverage: 0,
+        runtimeError: 0,
+        compileError: 0,
+        ignored: 0,
+        score: 100,
+      },
+    },
+    survivorClassifications: [],
+    equivalentSurvivorClasses: [],
+    meaningfulSurvivors: [],
+    thresholds: { high: 95, low: 90, break: 100 },
+  };
+  const source = sourceIdentity(root);
+  const changedFiles = applicable ? [sourceFile] : ["README.md"];
+  const selection = mode === "core" ? fullMutationSelection(root) : {
+    mode: "explicit-files",
+    base: null,
+    baseSha: null,
+    mergeBaseSha: null,
+    changedFiles,
+    fingerprint: workingTreeFingerprint(root, changedFiles),
+  };
+  if (!applicable) {
+    const summary = mutationReceipt(mode, [], {
+      status: "not-applicable",
+      reason: "no-configured-mutation-target-changed",
+      mutants: 0,
+      killed: 0,
+      survived: 0,
+      timeout: 0,
+      noCoverage: 0,
+      runtimeError: 0,
+      compileError: 0,
+      ignored: 0,
+      score: null,
+      files: {},
+      survivors: [],
+      strykerExitCode: null,
+    }, { source, selection, rawReportFingerprint: null });
+    return { baseline, rawReportArtifact: null, selection, source, summary, target };
+  }
+  const rawReport = rawMutationReport(baseline, [target], {
+    testFiles: { [owner]: { tests: [{ id: "mutation-owner-test" }] } },
+    files: {
+      [sourceFile]: {
+        mutants: [{
+          id: "mutation-handoff-mutant",
+          status: "Killed",
+          mutatorName: "StringLiteral",
+          replacement: "\"handoff\"",
+          static: false,
+          statusReason: "The exact owner test rejected the mutation.",
+          testsCompleted: 1,
+          coveredBy: ["mutation-owner-test"],
+          killedBy: ["mutation-owner-test"],
+          location: {
+            start: { line: 1, column: 0 },
+            end: { line: 1, column: 1 },
+          },
+        }],
+      },
+    },
+  });
+  rawReport.config.incremental = mode === "changed";
+  rawReport.config.force = mode === "changed";
+  const rawReportArtifact = mutationRawArtifact(rawReport);
+  const rawFingerprint = rawReportArtifact.fingerprint;
+  const summary = mutationReceipt(mode, [target], {
+    status: "passed",
+    ...deriveMutationEvidence(rawReport, [target]),
+    strykerExitCode: 0,
+  }, { source, selection, rawReportFingerprint: rawFingerprint });
+  return { baseline, rawReportArtifact, selection, source, summary, target };
+}
+
+function mutationRawArtifact(value) {
+  const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+  return {
+    bytes,
+    fingerprint: crypto.createHash("sha256").update(bytes).digest("hex"),
+    value,
+  };
+}
+
 function mutationArtifactFingerprint(value) {
   return crypto.createHash("sha256")
     .update(`${JSON.stringify(value, null, 2)}\n`)
@@ -348,6 +707,14 @@ function validMutationEvidence(overrides = {}) {
     mutation,
     mutationArtifactFingerprint: mutationArtifactFingerprint(mutation),
     mutationBaseline: validMutationBaseline(),
+  };
+}
+
+function validImpactEvidence(overrides = {}) {
+  const impact = validImpact(overrides);
+  return {
+    impact,
+    impactArtifactFingerprint: mutationArtifactFingerprint(impact),
   };
 }
 
@@ -411,6 +778,108 @@ function validFinding(overrides = {}) {
     liveVerification: { status: "not-started", summary: "Not run." },
     releaseBlocking: true,
     ...overrides,
+  };
+}
+
+function createEvidenceHandoffFixture(options = {}) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-handoff-"));
+  const profile = "fast";
+  const source = SOURCE_IDENTITY;
+  const plan = getGatePlan(profile);
+  fs.mkdirSync(path.join(fixtureRoot, "quality"), { recursive: true });
+  fs.mkdirSync(path.join(fixtureRoot, "test"), { recursive: true });
+  for (const filename of ["critical-workflows.json", "mutation-baseline.json"]) {
+    fs.copyFileSync(
+      path.join(root, "quality", filename),
+      path.join(fixtureRoot, "quality", filename)
+    );
+  }
+  fs.writeFileSync(
+    path.join(fixtureRoot, "test", "testInventories.js"),
+    `module.exports = ${JSON.stringify(TEST_INVENTORIES)};\n`
+  );
+  const impact = validImpact();
+  writeJson(".quality/impact.json", impact, fixtureRoot);
+  const impactArtifactFingerprint = mutationArtifactFingerprint(impact);
+  let blocker = null;
+  const receipts = plan.map(step => {
+    if (blocker && !step.runWhenBlocked) {
+      return {
+        schemaVersion: 1,
+        profile,
+        sequence: step.sequence,
+        stepId: step.id,
+        category: step.category,
+        command: step.command,
+        source,
+        status: "not-run",
+        exitCode: null,
+        signal: null,
+        reason: `blocked-by:${blocker}`,
+        testCounts: null,
+        artifactFingerprint: null,
+      };
+    }
+    const failed = options.failedStep === step.id;
+    if (failed) blocker = step.id;
+    return {
+      schemaVersion: 1,
+      profile,
+      sequence: step.sequence,
+      stepId: step.id,
+      category: step.category,
+      command: step.command,
+      source,
+      status: failed ? "failed" : "passed",
+      exitCode: failed ? 1 : 0,
+      signal: null,
+      reason: null,
+      testCounts: null,
+      outputFingerprint: "d".repeat(64),
+      testEvidence: step.evidencePath ? testEvidence(step) : null,
+      artifactFingerprint: step.id === "change-impact"
+        ? impactArtifactFingerprint
+        : null,
+    };
+  });
+  const workflows = require("../quality/critical-workflows.json");
+  const report = generateReport({
+    source,
+    profile,
+    plan,
+    receipts,
+    impact,
+    impactArtifactFingerprint,
+    mutationBaseline: require("../quality/mutation-baseline.json"),
+    findings: [],
+    findingsStatus: "not-run",
+    workflows,
+    inventories: TEST_INVENTORIES,
+  });
+  writeReport(report, { root: fixtureRoot });
+  const reportStep = plan.find(step => step.id === "quality-report");
+  const reportReceipt = receipts.find(receipt => receipt.stepId === "quality-report");
+  reportReceipt.status = hasDeterministicReportFailure(report) ? "failed" : "passed";
+  reportReceipt.exitCode = hasDeterministicReportFailure(report) ? 1 : 0;
+  reportReceipt.artifactFingerprint = artifactFingerprintForStep(reportStep, fixtureRoot);
+  for (const receipt of receipts) writeJson(receiptPath(receipt), receipt, fixtureRoot);
+  const summary = {
+    schemaVersion: 1,
+    profile,
+    source,
+    status: aggregateStatuses(receipts.map(receipt => receipt.status)),
+    planFingerprint: gatePlanFingerprint(plan),
+    steps: receipts,
+  };
+  summary.key = { sha: source.sha, fingerprint: fingerprint(summary) };
+  writeJson(`.quality/gates/${profile}.json`, summary, fixtureRoot);
+  return {
+    cleanup: () => fs.rmSync(fixtureRoot, { force: true, recursive: true }),
+    profile,
+    report,
+    root: fixtureRoot,
+    source,
+    summary,
   };
 }
 
@@ -641,8 +1110,12 @@ suite("Quality gate runner", () => {
       "change-impact",
       "repository-check",
       "standalone-tests",
+      "quality-report",
     ]);
-    assert.deepStrictEqual(full.slice(0, fast.length).map(step => step.id), fastIds);
+    assert.deepStrictEqual(
+      fullWithoutReport.slice(0, fast.length - 1).map(step => step.id),
+      fastIds.slice(0, -1)
+    );
     assert.deepStrictEqual(
       releaseWithoutFinalizers.map(step => step.id),
       fullWithoutReport.map(step => step.id)
@@ -678,6 +1151,12 @@ suite("Quality gate runner", () => {
   test("writes receipts and cannot turn a nonzero command into a passing gate", () => {
     const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-quality-gate-"));
     try {
+      const staleReceipt = path.join(
+        temporaryRoot,
+        ".quality/gates/fast/99-obsolete-plan-receipt.json"
+      );
+      fs.mkdirSync(path.dirname(staleReceipt), { recursive: true });
+      fs.writeFileSync(staleReceipt, "stale receipt\n");
       const summary = runGate({
         root: temporaryRoot,
         profile: "fast",
@@ -689,6 +1168,9 @@ suite("Quality gate runner", () => {
             stdout: step.id === "repository-check" ? "1 failing\n" : "2 passing\n",
             stderr: "",
             testEvidence: step.evidencePath ? testEvidence(step) : null,
+            artifactFingerprint: step.artifactPath || step.artifactPaths
+              ? "b".repeat(64)
+              : null,
           };
         },
       });
@@ -702,6 +1184,7 @@ suite("Quality gate runner", () => {
       );
       const target = path.join(temporaryRoot, receiptPath(failed));
       assert.strictEqual(JSON.parse(fs.readFileSync(target, "utf8")).exitCode, 7);
+      assert.strictEqual(fs.existsSync(staleReceipt), false);
     } finally {
       fs.rmSync(temporaryRoot, { recursive: true, force: true });
     }
@@ -754,6 +1237,213 @@ suite("Quality gate runner", () => {
         completedReceipt("full", step, SOURCE_IDENTITY, produced).status,
         "passed"
       );
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("binds exact report JSON and Markdown bytes for handoff verification", () => {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-report-bundle-"));
+    const plan = getGatePlan("full");
+    const reportStep = plan.find(step => step.id === "quality-report");
+    const report = generateReport({
+      source: SOURCE_IDENTITY,
+      profile: "full",
+      plan,
+      receipts: plan.map(step => passedReceipt(step)),
+      ...validImpactEvidence(),
+      ...validMutationEvidence(),
+      liveQualification: null,
+      findings: [],
+      findingsStatus: "not-run",
+      workflows: { workflows: [] },
+      inventories: TEST_INVENTORIES,
+    });
+    try {
+      writeReport(report, { root: temporaryRoot });
+      const artifactFingerprint = artifactFingerprintForStep(reportStep, temporaryRoot);
+      const receipt = { artifactFingerprint };
+      assert.strictEqual(validateArtifactBinding(receipt, reportStep, temporaryRoot), null);
+
+      fs.appendFileSync(path.join(temporaryRoot, ".quality/report.json"), " ");
+      assert.strictEqual(
+        validateArtifactBinding(receipt, reportStep, temporaryRoot),
+        "artifact-fingerprint-mismatch"
+      );
+
+      writeReport(report, { root: temporaryRoot });
+      fs.appendFileSync(path.join(temporaryRoot, ".quality/report.md"), " ");
+      assert.strictEqual(
+        validateArtifactBinding(receipt, reportStep, temporaryRoot),
+        "artifact-fingerprint-mismatch"
+      );
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("verifies exact passing and trusted-failure evidence handoffs", () => {
+    for (const failedStep of [null, "repository-check"]) {
+      const fixture = createEvidenceHandoffFixture({ failedStep });
+      try {
+        const result = verifyEvidenceHandoff({
+          root: fixture.root,
+          profile: fixture.profile,
+          source: fixture.source,
+          readSource: () => fixture.source,
+        });
+        assert.strictEqual(
+          result.summary.status,
+          failedStep ? "failed" : "passed",
+          JSON.stringify(fixture.report.releaseReadiness)
+        );
+      } finally {
+        fixture.cleanup();
+      }
+    }
+  });
+
+  test("rejects one-byte report changes and missing report bundle members", () => {
+    const fixture = createEvidenceHandoffFixture();
+    try {
+      fs.appendFileSync(path.join(fixture.root, ".quality/report.json"), " ");
+      assert.throws(
+        () => verifyEvidenceHandoff({
+          root: fixture.root,
+          profile: fixture.profile,
+          source: fixture.source,
+          readSource: () => fixture.source,
+        }),
+        /artifact quality-report is untrusted|report bundle is untrusted|canonical form/u
+      );
+
+      writeReport(fixture.report, { root: fixture.root });
+      fs.appendFileSync(path.join(fixture.root, ".quality/report.md"), " ");
+      assert.throws(
+        () => verifyEvidenceHandoff({
+          root: fixture.root,
+          profile: fixture.profile,
+          source: fixture.source,
+          readSource: () => fixture.source,
+        }),
+        /artifact quality-report is untrusted|report bundle is untrusted|Markdown/u
+      );
+
+      writeReport(fixture.report, { root: fixture.root });
+      fs.rmSync(path.join(fixture.root, ".quality/report.md"));
+      assert.throws(
+        () => verifyEvidenceHandoff({
+          root: fixture.root,
+          profile: fixture.profile,
+          source: fixture.source,
+          readSource: () => fixture.source,
+        }),
+        /artifact quality-report is untrusted|report bundle is untrusted|missing/u
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("rejects stale, crossed, extra, and summary-divergent receipt evidence", () => {
+    const attacks = [
+      fixture => {
+        fixture.summary.key.fingerprint = "0".repeat(64);
+        writeJson(".quality/gates/fast.json", fixture.summary, fixture.root);
+      },
+      fixture => {
+        const first = fixture.summary.steps[0];
+        const second = fixture.summary.steps[1];
+        writeJson(receiptPath(first), second, fixture.root);
+        writeJson(receiptPath(second), first, fixture.root);
+      },
+      fixture => writeJson(
+        ".quality/gates/fast/99-extra.json",
+        { unexpected: true },
+        fixture.root
+      ),
+    ];
+    for (const attack of attacks) {
+      const fixture = createEvidenceHandoffFixture();
+      try {
+        attack(fixture);
+        assert.throws(() => verifyEvidenceHandoff({
+          root: fixture.root,
+          profile: fixture.profile,
+          source: fixture.source,
+          readSource: () => fixture.source,
+        }), /summary key|receipt files|differs from the signed summary/u);
+      } finally {
+        fixture.cleanup();
+      }
+    }
+
+    const stale = createEvidenceHandoffFixture();
+    try {
+      assert.throws(() => verifyEvidenceHandoff({
+        root: stale.root,
+        profile: stale.profile,
+        readSource: () => ({ ...stale.source, fingerprint: "f".repeat(64) }),
+      }), /current repository source/u);
+    } finally {
+      stale.cleanup();
+    }
+  });
+
+  test("rejects a report exit tuple that contradicts regenerated failure evidence", () => {
+    const fixture = createEvidenceHandoffFixture({ failedStep: "repository-check" });
+    try {
+      const reportReceipt = fixture.summary.steps.find(receipt => (
+        receipt.stepId === "quality-report"
+      ));
+      reportReceipt.status = "passed";
+      reportReceipt.exitCode = 0;
+      fixture.summary.status = aggregateStatuses(
+        fixture.summary.steps.map(receipt => receipt.status)
+      );
+      const unsigned = { ...fixture.summary };
+      delete unsigned.key;
+      fixture.summary.key = {
+        sha: fixture.source.sha,
+        fingerprint: fingerprint(unsigned),
+      };
+      writeJson(receiptPath(reportReceipt), reportReceipt, fixture.root);
+      writeJson(".quality/gates/fast.json", fixture.summary, fixture.root);
+
+      assert.throws(() => verifyEvidenceHandoff({
+        root: fixture.root,
+        profile: fixture.profile,
+        source: fixture.source,
+        readSource: () => fixture.source,
+      }), /does not match the report's deterministic outcome/u);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("binds the gate summary key to complete receipt evidence", () => {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-summary-key-"));
+    const plan = [{
+      id: "fixture-step",
+      category: "fixture",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      blockedExitCodes: [],
+      sequence: 1,
+    }];
+    try {
+      const run = stdout => runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan,
+        source: SOURCE_IDENTITY,
+        execute: () => ({ status: 0, signal: null, stdout, stderr: "" }),
+      });
+      const first = run("first output");
+      const second = run("second output");
+      assert.notStrictEqual(first.steps[0].outputFingerprint, second.steps[0].outputFingerprint);
+      assert.notStrictEqual(first.key.fingerprint, second.key.fingerprint);
     } finally {
       fs.rmSync(temporaryRoot, { recursive: true, force: true });
     }
@@ -843,7 +1533,9 @@ suite("Quality gate runner", () => {
             stdout: "",
             stderr: "",
             testEvidence: step.evidencePath ? testEvidence(step) : null,
-            artifactFingerprint: step.artifactPath ? "b".repeat(64) : null,
+            artifactFingerprint: step.artifactPath || step.artifactPaths
+              ? "b".repeat(64)
+              : null,
           };
         },
       });
@@ -884,6 +1576,366 @@ suite("Quality mutation and UI harness boundaries", () => {
 
     assert.deepStrictEqual(result.errors, []);
     assert.strictEqual(checkedSha, SOURCE_SHA);
+  });
+
+  test("binds measured mutation tool versions to both package manifests", () => {
+    const baseline = validTrackedMutationBaseline();
+    const manifest = require("../package.json");
+    const lockfile = require("../package-lock.json");
+    assert.deepStrictEqual(validateMutationToolchain(baseline, manifest, lockfile), []);
+
+    const packageDrift = clone(manifest);
+    packageDrift.devDependencies[baseline.tool.core] = "10.0.1";
+    assert.ok(validateMutationToolchain(baseline, packageDrift, lockfile).includes(
+      "Mutation baseline @stryker-mutator/core version must match package.json exactly."
+    ));
+
+    const lockDrift = clone(lockfile);
+    lockDrift.packages[`node_modules/${baseline.tool.runner}`].version = "10.0.1";
+    assert.ok(validateMutationToolchain(baseline, manifest, lockDrift).includes(
+      "Mutation baseline @stryker-mutator/mocha-runner version must match package-lock.json exactly."
+    ));
+
+    const measured = require("../quality/mutation-baseline.json");
+    assert.doesNotThrow(() => assertCanonicalMutationRuntime(
+      measured,
+      root,
+      { version: `v${measured.tool.nodeVersion}` }
+    ));
+    assert.throws(
+      () => assertCanonicalMutationRuntime(measured, root, { version: "v99.0.0" }),
+      /requires exact Node/u
+    );
+    const nodeDrift = clone(measured);
+    nodeDrift.tool.nodeVersion = "22.23.1";
+    assert.throws(
+      () => assertCanonicalMutationRuntime(nodeDrift, root, { version: "v22.23.1" }),
+      /from \.node-version/u
+    );
+  });
+
+  test("derives Stryker targets and both test inventories from the measured baseline", async () => {
+    const baseline = require("../quality/mutation-baseline.json");
+    const config = (await import("../stryker.config.mjs")).default;
+    const expectedOwners = uniqueSorted(baseline.scope.flatMap(
+      target => baseline.files[target].testFiles
+    ));
+
+    assert.deepStrictEqual(config.mutate, baseline.scope);
+    assert.deepStrictEqual([...config.testFiles], expectedOwners);
+    assert.strictEqual(config.testFiles, config.mochaOptions.spec);
+    assert.strictEqual(Object.isFrozen(config.testFiles), true);
+  });
+
+  test("direct mutation ownership validation rejects empty and mismatched baselines", () => {
+    const empty = { scope: [], files: {} };
+    assert.throws(
+      () => assertMutationTestOwners(empty, root),
+      /nonempty scope/u
+    );
+
+    const missing = validTrackedMutationBaseline();
+    delete missing.files[missing.scope[0]];
+    assert.throws(
+      () => assertMutationTestOwners(missing, root),
+      /exact target parity/u
+    );
+
+    const extra = validTrackedMutationBaseline();
+    extra.files["domain/invented.js"] = clone(extra.files[extra.scope[0]]);
+    assert.throws(
+      () => assertMutationTestOwners(extra, root),
+      /exact target parity/u
+    );
+
+    const duplicateOwner = validTrackedMutationBaseline();
+    duplicateOwner.files[duplicateOwner.scope[0]].testFiles.push(
+      duplicateOwner.files[duplicateOwner.scope[0]].testFiles[0]
+    );
+    assert.throws(
+      () => assertMutationTestOwners(duplicateOwner, root),
+      /unique test owners/u
+    );
+  });
+
+  test("direct mutation entrypoints enforce complete baseline provenance", () => {
+    const baseline = require("../quality/mutation-baseline.json");
+    assert.doesNotThrow(() => assertValidMutationBaseline(baseline, root));
+
+    const thresholdDrift = clone(baseline);
+    thresholdDrift.thresholds.break = null;
+    assert.throws(
+      () => assertValidMutationBaseline(thresholdDrift, root),
+      /break threshold must equal/u
+    );
+
+    const missingThreshold = clone(baseline);
+    delete missingThreshold.thresholds.high;
+    assert.throws(
+      () => assertValidMutationBaseline(missingThreshold, root),
+      /high and low thresholds/u
+    );
+
+    const unreachable = clone(baseline);
+    unreachable.measuredAtSha = "0".repeat(40);
+    assert.throws(
+      () => assertValidMutationBaseline(unreachable, root),
+      /reachable from current HEAD/u
+    );
+  });
+
+  test("reconciles canonical mutation owners with raw per-test Stryker coverage", () => {
+    const baseline = validTrackedMutationBaseline();
+    const [firstTarget, secondTarget] = baseline.scope;
+    const [firstOwner] = baseline.files[firstTarget].testFiles;
+    const [secondOwner] = baseline.files[secondTarget].testFiles;
+    const report = rawMutationReport(baseline, baseline.scope, {
+      testFiles: {
+        [firstOwner]: { tests: [{ id: "first-owner-test" }] },
+        [secondOwner]: { tests: [{ id: "second-owner-test" }] },
+      },
+      files: {
+        [firstTarget]: {
+          mutants: [{
+            id: "first-mutant",
+            status: "Killed",
+            mutatorName: "StringLiteral",
+            replacement: "\"first\"",
+            coveredBy: ["first-owner-test"],
+            killedBy: ["first-owner-test"],
+            location: { start: { line: 1, column: 0 }, end: { line: 1, column: 1 } },
+          }],
+        },
+        [secondTarget]: {
+          mutants: [{
+            id: "second-mutant",
+            status: "Killed",
+            mutatorName: "StringLiteral",
+            replacement: "\"second\"",
+            coveredBy: ["second-owner-test"],
+            killedBy: ["second-owner-test"],
+            location: { start: { line: 1, column: 0 }, end: { line: 1, column: 1 } },
+          }],
+        },
+      },
+    });
+    assert.doesNotThrow(() => validateMutationTestOwnership(
+      report,
+      baseline.scope,
+      baseline
+    ));
+
+    const swapped = clone(baseline);
+    swapped.files[firstTarget].testFiles = [secondOwner];
+    swapped.files[secondTarget].testFiles = [firstOwner];
+    assert.throws(
+      () => validateMutationTestOwnership(report, swapped.scope, swapped),
+      /observed test ownership/u
+    );
+
+    const unknown = clone(report);
+    unknown.files[firstTarget].mutants[0].coveredBy = ["unknown-test-id"];
+    unknown.files[firstTarget].mutants[0].killedBy = ["unknown-test-id"];
+    assert.throws(
+      () => validateMutationTestOwnership(unknown, baseline.scope, baseline),
+      /unknown Stryker test ID/u
+    );
+
+    const impossibleLocation = clone(report);
+    impossibleLocation.files[firstTarget].mutants[0].location.start.line = 999_999;
+    impossibleLocation.files[firstTarget].mutants[0].location.end.line = 999_999;
+    assert.throws(
+      () => validateMutationTestOwnership(impossibleLocation, baseline.scope, baseline),
+      /outside its declared range/u
+    );
+
+    const forgedFramework = clone(report);
+    forgedFramework.framework.version = "99.0.0";
+    assert.throws(
+      () => validateMutationTestOwnership(forgedFramework, baseline.scope, baseline),
+      /report provenance/u
+    );
+
+    const forgedScope = clone(report);
+    forgedScope.config.mutate = ["domain/invented.js"];
+    assert.throws(
+      () => validateMutationTestOwnership(forgedScope, baseline.scope, baseline),
+      /report provenance/u
+    );
+
+    const forgedEngine = clone(report);
+    forgedEngine.framework.dependencies.mocha = "99.0.0";
+    assert.throws(
+      () => validateMutationTestOwnership(forgedEngine, baseline.scope, baseline),
+      /report provenance/u
+    );
+
+    const hostileHook = clone(report);
+    hostileHook.config.mochaOptions.require = ["test/hostile-hook.js"];
+    assert.throws(
+      () => validateMutationTestOwnership(hostileHook, baseline.scope, baseline),
+      /report provenance/u
+    );
+
+    const incrementalCore = clone(report);
+    incrementalCore.config.incremental = true;
+    incrementalCore.config.force = true;
+    assert.throws(
+      () => validateMutationTestOwnership(incrementalCore, baseline.scope, baseline),
+      /report provenance/u
+    );
+    assert.doesNotThrow(() => validateMutationTestOwnership(
+      incrementalCore,
+      baseline.scope,
+      baseline,
+      root,
+      "changed"
+    ));
+
+    const duplicateMutant = clone(report);
+    duplicateMutant.files[firstTarget].mutants.push({
+      ...clone(duplicateMutant.files[firstTarget].mutants[0]),
+    });
+    assert.throws(
+      () => validateMutationTestOwnership(duplicateMutant, baseline.scope, baseline),
+      /duplicate raw mutant ID/u
+    );
+
+    duplicateMutant.files[firstTarget].mutants[1].id = "distinct-mutant-id";
+    const duplicateLocation = duplicateMutant.files[firstTarget].mutants[1].location;
+    duplicateMutant.files[firstTarget].mutants[1].location = {
+      end: {
+        column: duplicateLocation.end.column,
+        line: duplicateLocation.end.line,
+      },
+      start: {
+        column: duplicateLocation.start.column,
+        line: duplicateLocation.start.line,
+      },
+    };
+    assert.throws(
+      () => validateMutationTestOwnership(duplicateMutant, baseline.scope, baseline),
+      /duplicate raw mutant semantics/u
+    );
+
+    const hybridKilled = clone(report);
+    hybridKilled.files[firstTarget].mutants[0].static = true;
+    assert.doesNotThrow(() => validateMutationTestOwnership(
+      hybridKilled,
+      baseline.scope,
+      baseline
+    ));
+
+    const killedWithoutProof = clone(report);
+    delete killedWithoutProof.files[firstTarget].mutants[0].killedBy;
+    assert.throws(
+      () => validateMutationTestOwnership(killedWithoutProof, baseline.scope, baseline),
+      /status-specific raw mutant evidence/u
+    );
+  });
+
+  test("binds ranged mutation targets to raw mutant locations", () => {
+    const target = "util/upstreamOperationScheduler.js:141-219";
+    const owner = "test/upstreamOperationScheduler.test.js";
+    const baseline = {
+      tool: {
+        core: "@stryker-mutator/core",
+        version: "10.0.0",
+        runner: "@stryker-mutator/mocha-runner",
+        runnerVersion: "10.0.0",
+        engine: "mocha",
+        engineVersion: "11.8.0",
+        nodeVersion: "22.23.2",
+      },
+      scope: [target],
+      files: { [target]: { testFiles: [owner] } },
+      thresholds: { high: 95, low: 90 },
+    };
+    const report = rawMutationReport(baseline, [target], {
+      testFiles: { [owner]: { tests: [{ id: "range-owner" }] } },
+      files: {
+        "util/upstreamOperationScheduler.js": {
+          mutants: [{
+            id: "range-mutant",
+            status: "Killed",
+            mutatorName: "StringLiteral",
+            replacement: "\"range\"",
+            coveredBy: ["range-owner"],
+            killedBy: ["range-owner"],
+            location: {
+              start: { line: 141, column: 0 },
+              end: { line: 219, column: 1 },
+            },
+          }],
+        },
+      },
+    });
+    assert.doesNotThrow(() => validateMutationTestOwnership(report, [target], baseline));
+
+    const endLine = fs.readFileSync(
+      path.join(root, "util/upstreamOperationScheduler.js"),
+      "utf8"
+    ).split("\n")[218];
+    const onePastEnd = clone(report);
+    onePastEnd.files["util/upstreamOperationScheduler.js"]
+      .mutants[0].location.end.column = endLine.length + 1;
+    assert.doesNotThrow(() => validateMutationTestOwnership(
+      onePastEnd,
+      [target],
+      baseline
+    ));
+    onePastEnd.files["util/upstreamOperationScheduler.js"]
+      .mutants[0].location.end.column = endLine.length + 2;
+    assert.throws(
+      () => validateMutationTestOwnership(onePastEnd, [target], baseline),
+      /outside its declared range/u
+    );
+
+    const outside = clone(report);
+    outside.files["util/upstreamOperationScheduler.js"].mutants[0].location.start.line = 1;
+    assert.throws(
+      () => validateMutationTestOwnership(outside, [target], baseline),
+      /outside its declared range/u
+    );
+  });
+
+  test("rejects column-qualified mutation ranges instead of discarding their columns", () => {
+    const baseline = validTrackedMutationBaseline();
+    const original = baseline.scope[0];
+    const columnTarget = `${original}:1:2-1:8`;
+    baseline.scope[0] = columnTarget;
+    baseline.files[columnTarget] = baseline.files[original];
+    delete baseline.files[original];
+
+    assert.ok(validateMutationBaseline(baseline, {
+      root,
+      commitIsAncestor: () => true,
+    }).errors.some(error => /invalid target/u.test(error)));
+    assert.throws(
+      () => assertMutationTestOwners(baseline, root),
+      /must exist as a Git-visible regular source file/u
+    );
+
+    for (const invalidRange of [`${original}:0-10`, `${original}:20-10`]) {
+      const invalid = validTrackedMutationBaseline();
+      invalid.scope[0] = invalidRange;
+      invalid.files[invalidRange] = invalid.files[original];
+      delete invalid.files[original];
+      assert.ok(validateMutationBaseline(invalid, {
+        root,
+        commitIsAncestor: () => true,
+      }).errors.some(error => /invalid target/u.test(error)));
+    }
+
+    const traversal = validTrackedMutationBaseline();
+    const traversalTarget = "domain/../../outside.js";
+    traversal.scope[0] = traversalTarget;
+    traversal.files[traversalTarget] = traversal.files[original];
+    delete traversal.files[original];
+    assert.throws(
+      () => assertMutationTestOwners(traversal, root),
+      /Git-visible regular source file/u
+    );
   });
 
   test("rejects missing, abbreviated, and unreachable baseline provenance", () => {
@@ -1066,9 +2118,18 @@ suite("Quality mutation and UI harness boundaries", () => {
     assert.deepStrictEqual(
       changedMutationTargets(
         ["domain/a.js", "domain/b.js", "domain/c.js"],
-        ["--base", "must-not-be-used", "--files", "domain/c.js,domain/a.js,other.js"]
+        ["--files", "domain/c.js,domain/a.js,other.js"]
       ),
       ["domain/a.js", "domain/c.js"]
+    );
+  });
+
+  test("does not let the changed mutation gate trust caller-authored file selection", () => {
+    assert.doesNotThrow(() => assertMutationGateArguments("changed", []));
+    assert.doesNotThrow(() => assertMutationGateArguments("changed", ["--base", "origin/main"]));
+    assert.throws(
+      () => assertMutationGateArguments("changed", ["--files", "README.md"]),
+      /does not accept caller-authored --files selection/u
     );
   });
 
@@ -1121,6 +2182,41 @@ suite("Quality mutation and UI harness boundaries", () => {
     }
   });
 
+  test("includes staged Git type changes in mutation selection", () => {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-mutation-type-"));
+    const runGit = argumentsList => require("child_process").spawnSync(
+      "git",
+      argumentsList,
+      { cwd: temporaryRoot, encoding: "utf8", stdio: "ignore" }
+    );
+    try {
+      assert.strictEqual(runGit(["init"]).status, 0);
+      fs.writeFileSync(path.join(temporaryRoot, "stryker.config.mjs"), "export default {};\n");
+      fs.writeFileSync(path.join(temporaryRoot, "target.mjs"), "export default {};\n");
+      assert.strictEqual(runGit(["add", "stryker.config.mjs", "target.mjs"]).status, 0);
+      assert.strictEqual(runGit([
+        "-c", "user.name=Quality Fixture",
+        "-c", "user.email=quality@example.invalid",
+        "commit", "-m", "fixture",
+      ]).status, 0);
+      fs.rmSync(path.join(temporaryRoot, "stryker.config.mjs"));
+      fs.symlinkSync("target.mjs", path.join(temporaryRoot, "stryker.config.mjs"));
+      assert.strictEqual(runGit(["add", "stryker.config.mjs"]).status, 0);
+
+      assert.deepStrictEqual(gitChangedFiles("HEAD", temporaryRoot), ["stryker.config.mjs"]);
+      assert.deepStrictEqual(
+        changedMutationTargets(
+          ["domain/a.js", "domain/b.js"],
+          ["--files", "stryker.config.mjs"],
+          {}
+        ),
+        ["domain/a.js", "domain/b.js"]
+      );
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   test("filters incremental mutation reports to the selected target", () => {
     const mutant = status => ({ status });
     const report = {
@@ -1158,6 +2254,26 @@ suite("Quality mutation and UI harness boundaries", () => {
       changedMutationTargets(scope, ["--files", "stryker.config.mjs"], files),
       scope
     );
+    for (const owner of [
+      ".github/workflows/deep-quality.yml",
+      ".github/workflows/main.yml",
+      ".node-version",
+      "package.json",
+      "package-lock.json",
+      "scripts/quality/common.js",
+      "scripts/quality/evidence.js",
+      "scripts/quality/mutation-baseline.js",
+      "scripts/quality/mutation-toolchain.js",
+      "scripts/quality/verify-mutation-handoff.js",
+      "scripts/quality/verify-workflows.js",
+      "domain/package.js",
+      "util/accountOperation.js",
+      "util/packageVulnerabilities.js",
+      "util/vulnerabilitySeverity.js",
+      "commands/support.js",
+    ]) {
+      assert.deepStrictEqual(changedMutationTargets(scope, ["--files", owner], files), scope);
+    }
     assert.throws(
       () => changedMutationTargets(scope, ["--files", ""], files),
       /requires at least one/
@@ -1176,6 +2292,180 @@ suite("Quality mutation and UI harness boundaries", () => {
     } finally {
       fs.rmSync(temporaryRoot, { recursive: true, force: true });
     }
+  });
+
+  test("verifies exact changed, core, and not-applicable mutation handoffs", () => {
+    for (const mode of ["changed", "core"]) {
+      const fixture = mutationHandoffFixture({ mode });
+      const result = validateMutationEvidenceArtifacts({
+        ...fixture,
+        expectedExitCode: 0,
+        expectedRunOutcome: "success",
+        expectedSourceSha: fixture.source.sha,
+        mode,
+        root,
+      });
+      assert.strictEqual(result.status, "passed");
+      assert.deepStrictEqual(result.targets, [fixture.target]);
+    }
+
+    const notApplicable = mutationHandoffFixture({ applicable: false });
+    assert.strictEqual(validateMutationEvidenceArtifacts({
+      ...notApplicable,
+      expectedExitCode: 0,
+      expectedRunOutcome: "success",
+      expectedSourceSha: notApplicable.source.sha,
+      root,
+    }).status, "not-applicable");
+  });
+
+  test("rejects stale, crossed, source-forged, status-forged, and exit-forged mutation evidence", () => {
+    const fixture = mutationHandoffFixture();
+    const stale = mutationHandoffFixture({ applicable: false });
+    assert.throws(
+      () => validateMutationEvidenceArtifacts({
+        ...stale,
+        rawReportArtifact: fixture.rawReportArtifact,
+        root,
+      }),
+      /must not retain a raw report/u
+    );
+
+    const crossedBytes = {
+      ...fixture.rawReportArtifact,
+      bytes: Buffer.concat([fixture.rawReportArtifact.bytes, Buffer.from(" ")]),
+    };
+    assert.throws(
+      () => validateMutationEvidenceArtifacts({
+        ...fixture,
+        rawReportArtifact: crossedBytes,
+        root,
+      }),
+      /exact raw report bytes/u
+    );
+
+    const sourceForgedReport = clone(fixture.rawReportArtifact.value);
+    const sourceFile = fixture.target.replace(/:\d+-\d+$/u, "");
+    sourceForgedReport.files[sourceFile].source += "// forged\n";
+    const sourceForgedArtifact = mutationRawArtifact(sourceForgedReport);
+    const sourceForgedSummary = mutationReceipt("changed", [fixture.target], {
+      status: "passed",
+      ...deriveMutationEvidence(sourceForgedReport, [fixture.target]),
+      strykerExitCode: 0,
+    }, {
+      source: fixture.source,
+      selection: fixture.selection,
+      rawReportFingerprint: sourceForgedArtifact.fingerprint,
+    });
+    assert.throws(
+      () => validateMutationEvidenceArtifacts({
+        ...fixture,
+        rawReportArtifact: sourceForgedArtifact,
+        summary: sourceForgedSummary,
+        root,
+      }),
+      /does not bind current source bytes/u
+    );
+
+    const statusForgedReport = clone(fixture.rawReportArtifact.value);
+    const mutant = statusForgedReport.files[sourceFile].mutants[0];
+    mutant.status = "Survived";
+    delete mutant.killedBy;
+    delete mutant.statusReason;
+    mutant.testsCompleted = mutant.coveredBy.length;
+    const statusForgedArtifact = mutationRawArtifact(statusForgedReport);
+    const statusForgedSummary = mutationReceipt("changed", [fixture.target], {
+      status: "passed",
+      ...deriveMutationEvidence(statusForgedReport, [fixture.target]),
+      strykerExitCode: 0,
+    }, {
+      source: fixture.source,
+      selection: fixture.selection,
+      rawReportFingerprint: statusForgedArtifact.fingerprint,
+    });
+    assert.throws(
+      () => validateMutationEvidenceArtifacts({
+        ...fixture,
+        expectedExitCode: 0,
+        expectedRunOutcome: "success",
+        rawReportArtifact: statusForgedArtifact,
+        summary: statusForgedSummary,
+        root,
+      }),
+      /independently derived handoff evidence/u
+    );
+
+    assert.throws(
+      () => validateMutationEvidenceArtifacts({
+        ...fixture,
+        expectedExitCode: 42,
+        expectedRunOutcome: "success",
+        root,
+      }),
+      /independently captured process exit code/u
+    );
+  });
+
+  test("accepts only exactly reconciled trusted mutation failures", () => {
+    const fixture = mutationHandoffFixture();
+    const derived = deriveMutationEvidence(
+      fixture.rawReportArtifact.value,
+      [fixture.target]
+    );
+    const strykerFailure = mutationReceipt("changed", [fixture.target], {
+      status: "failed",
+      ...derived,
+      strykerExitCode: 7,
+      reason: "Stryker exited 7.",
+    }, {
+      source: fixture.source,
+      selection: fixture.selection,
+      rawReportFingerprint: fixture.rawReportArtifact.fingerprint,
+    });
+    assert.strictEqual(validateMutationEvidenceArtifacts({
+      ...fixture,
+      expectedExitCode: 7,
+      expectedRunOutcome: "failure",
+      root,
+      summary: strykerFailure,
+    }).status, "failed");
+    assert.throws(
+      () => validateMutationEvidenceArtifacts({
+        ...fixture,
+        expectedExitCode: 8,
+        expectedRunOutcome: "failure",
+        root,
+        summary: strykerFailure,
+      }),
+      /independently captured process exit code/u
+    );
+
+    const regressedBaseline = clone(fixture.baseline);
+    Object.assign(regressedBaseline.files[fixture.target], {
+      killed: 0,
+      survived: 1,
+      score: 0,
+    });
+    const policyReason = `Mutation target ${fixture.target} killed population drifted from 0 to 1; `
+      + "remeasure the explicit mutation baseline.";
+    const policyFailure = mutationReceipt("changed", [fixture.target], {
+      status: "failed",
+      ...derived,
+      strykerExitCode: 0,
+      reason: policyReason,
+    }, {
+      source: fixture.source,
+      selection: fixture.selection,
+      rawReportFingerprint: fixture.rawReportArtifact.fingerprint,
+    });
+    assert.strictEqual(validateMutationEvidenceArtifacts({
+      ...fixture,
+      baseline: regressedBaseline,
+      expectedExitCode: 1,
+      expectedRunOutcome: "failure",
+      root,
+      summary: policyFailure,
+    }).status, "failed");
   });
 
   test("does not invent a mutation floor when the baseline threshold is null", () => {
@@ -1203,7 +2493,7 @@ suite("Quality mutation and UI harness boundaries", () => {
   test("enforces explicit global and per-file mutation regressions", () => {
     assert.throws(
       () => validateMutationSummary(
-        mutationSummaryAt80(),
+        mutationSummaryAt80({ mode: "core" }),
         {
           thresholds: { break: 81 },
           files: { "domain/packageActionCapabilities.js": { mutants: 10, score: 90 } },
@@ -1231,6 +2521,54 @@ suite("Quality mutation and UI harness boundaries", () => {
       },
       "changed"
     ));
+  });
+
+  test("rejects invalid mutation modes and duplicate or crossed survivor identities", () => {
+    assert.throws(
+      () => validateMutationSummary(
+        validMutationSummary({ mode: "forged" }),
+        validMutationBaseline(),
+        "forged"
+      ),
+      /invalid mutation mode/u
+    );
+
+    const duplicatedSurvivor = mutationSurvivors(2)[0];
+    const duplicateSummary = validMutationSummary({
+      mutants: 10,
+      killed: 8,
+      survived: 2,
+      score: 80,
+      files: {
+        "domain/packageActionCapabilities.js": validMutationFile(80, {
+          killed: 8,
+          survived: 2,
+        }),
+      },
+      survivors: [duplicatedSurvivor, clone(duplicatedSurvivor)],
+    });
+    assert.throws(
+      () => validateMutationSummary(
+        duplicateSummary,
+        {
+          thresholds: { break: 80 },
+          files: { "domain/packageActionCapabilities.js": { mutants: 10, score: 80 } },
+        },
+        "changed"
+      ),
+      /duplicate survivor fingerprints/u
+    );
+
+    const crossedSummary = clone(validMutationSummary());
+    crossedSummary.survivors[0].file = "util/externalNavigation.js";
+    assert.throws(
+      () => validateMutationSummary(
+        crossedSummary,
+        validMutationBaseline(),
+        "changed"
+      ),
+      /incomplete survivor fingerprints/u
+    );
   });
 
   test("rejects a perfect-score mutation run when the measured target population collapses", () => {
@@ -1297,6 +2635,7 @@ suite("Quality mutation and UI harness boundaries", () => {
     assert.throws(
       () => validateMutationSummary(
         validMutationSummary({
+          mode: "core",
           mutants: 0,
           killed: 0,
           survived: 0,
@@ -1311,7 +2650,9 @@ suite("Quality mutation and UI harness boundaries", () => {
     );
     assert.throws(
       () => validateMutationSummary(
-        mutationSummaryAt80({ timeout: 1, noCoverage: 0, killed: 8, survived: 1 }),
+        mutationSummaryAt80({
+          mode: "core", timeout: 1, noCoverage: 0, killed: 8, survived: 1,
+        }),
         { thresholds: { break: null }, files: {} },
         "core"
       ),
@@ -1319,7 +2660,9 @@ suite("Quality mutation and UI harness boundaries", () => {
     );
     assert.throws(
       () => validateMutationSummary(
-        mutationSummaryAt80({ noCoverage: 1, timeout: 0, killed: 8, survived: 1 }),
+        mutationSummaryAt80({
+          mode: "core", noCoverage: 1, timeout: 0, killed: 8, survived: 1,
+        }),
         { thresholds: { break: null }, files: {} },
         "core"
       ),
@@ -1386,6 +2729,54 @@ suite("Quality mutation and UI harness boundaries", () => {
         }
       }
     }
+  });
+
+  test("rejects unbound or semantically forged black-box UI results", () => {
+    const plan = getGatePlan("release");
+    const liveFingerprint = mutationArtifactFingerprint(validLiveStatus());
+    const common = {
+      source: SOURCE_IDENTITY,
+      profile: "release",
+      plan,
+      receipts: plan.map(step => passedReceipt(step)),
+      ...validImpactEvidence(),
+      ...validMutationEvidence(),
+      liveQualification: validLiveStatus(),
+      liveQualificationArtifactFingerprint: liveFingerprint,
+      findings: [],
+      findingsStatus: "passed",
+      workflows: blackBoxFixtureWorkflows(),
+      inventories: require("./testInventories"),
+    };
+    const forgedUi = {
+      schemaVersion: 0,
+      status: "passed",
+      source: SOURCE_IDENTITY,
+      sourceSha: SOURCE_SHA,
+      launchAttempted: false,
+      tests: [],
+    };
+    const forgedFingerprint = mutationArtifactFingerprint(forgedUi);
+    const forgedReceipts = plan.map(step => passedReceipt(step));
+    forgedReceipts.find(receipt => receipt.stepId === "black-box-ui-smoke")
+      .artifactFingerprint = forgedFingerprint;
+    const forged = generateReport({
+      ...common,
+      receipts: forgedReceipts,
+      ui: forgedUi,
+      uiArtifactFingerprint: forgedFingerprint,
+    });
+    assert.strictEqual(forged.blackBoxUi.status, "failed");
+    assert.strictEqual(forged.releaseReadiness.verdict, null);
+    assert.strictEqual(forged.status, "failed");
+
+    const tampered = generateReport({
+      ...common,
+      ui: validUiResult(),
+      uiArtifactFingerprint: "d".repeat(64),
+    });
+    assert.strictEqual(tampered.blackBoxUi.status, "failed");
+    assert.match(tampered.blackBoxUi.reason, /exact result artifact/u);
   });
 
   test("rejects traversal and symlinked quality outputs before any outside write", () => {
@@ -1481,6 +2872,7 @@ suite("Release checklist and deterministic quality report", () => {
         source: SOURCE_IDENTITY,
         workflows,
         document: staleFixture.document,
+        attestationFingerprint: staleFixture.attestationFingerprint,
       });
       const passed = evaluateLiveQualification({
         root: passedFixture.root,
@@ -1488,6 +2880,7 @@ suite("Release checklist and deterministic quality report", () => {
         source: SOURCE_IDENTITY,
         workflows,
         document: passedFixture.document,
+        attestationFingerprint: passedFixture.attestationFingerprint,
       });
 
       assert.strictEqual(staleResult.status, "failed");
@@ -1533,7 +2926,7 @@ suite("Release checklist and deterministic quality report", () => {
         profile: "full",
         plan,
         receipts,
-        impact: validImpact(),
+        ...validImpactEvidence(),
         ...validMutationEvidence(),
         liveQualification: evaluateLiveQualification({
           root: liveFixture.root,
@@ -1541,6 +2934,7 @@ suite("Release checklist and deterministic quality report", () => {
           source: SOURCE_IDENTITY,
           workflows,
           document: liveFixture.document,
+          attestationFingerprint: liveFixture.attestationFingerprint,
         }),
         findings: [],
         findingsStatus: "passed",
@@ -1556,13 +2950,71 @@ suite("Release checklist and deterministic quality report", () => {
     }
   });
 
+  test("rejects command receipts that self-exempt or contradict their execution", () => {
+    const plan = getGatePlan("full");
+    const common = {
+      source: SOURCE_IDENTITY,
+      profile: "full",
+      plan,
+      ...validImpactEvidence(),
+      ...validMutationEvidence(),
+      liveQualification: validLiveStatus(),
+      findings: [],
+      findingsStatus: "passed",
+      workflows: { workflows: [] },
+      inventories,
+    };
+    const selfExemptingReceipts = plan.map(step => ({
+      ...passedReceipt(step),
+      status: "not-applicable",
+      exitCode: null,
+      signal: null,
+      reason: "self-exempted",
+      testEvidence: null,
+      artifactFingerprint: null,
+    }));
+    const selfExempting = generateReport({ ...common, receipts: selfExemptingReceipts });
+    assert.strictEqual(selfExempting.status, "failed");
+    assert.strictEqual(hasDeterministicReportFailure(selfExempting), true);
+    assert.ok(selfExempting.deterministicGates.steps.every(step => (
+      step.status === "failed"
+        && /not-applicable-command-status/u.test(step.reason)
+    )));
+
+    const contradictoryReceipts = plan.map(step => passedReceipt(step));
+    const repositoryReceipt = contradictoryReceipts.find(receipt => (
+      receipt.stepId === "repository-check"
+    ));
+    repositoryReceipt.signal = "SIGTERM";
+    repositoryReceipt.reason = "terminated";
+    const contradictory = generateReport({ ...common, receipts: contradictoryReceipts });
+    const repositoryStep = contradictory.deterministicGates.steps.find(step => (
+      step.stepId === "repository-check"
+    ));
+    assert.strictEqual(repositoryStep.status, "failed");
+    assert.match(repositoryStep.reason, /signaled-command-claimed-pass/u);
+
+    const invalidBlockedReceipts = plan.map(step => passedReceipt(step));
+    const invalidBlocked = invalidBlockedReceipts.find(receipt => (
+      receipt.stepId === "repository-check"
+    ));
+    invalidBlocked.status = "blocked";
+    invalidBlocked.exitCode = 2;
+    const blockedReport = generateReport({ ...common, receipts: invalidBlockedReceipts });
+    const blockedStep = blockedReport.deterministicGates.steps.find(step => (
+      step.stepId === "repository-check"
+    ));
+    assert.strictEqual(blockedStep.status, "failed");
+    assert.match(blockedStep.reason, /invalid-blocked-exit-code/u);
+  });
+
   test("rejects wrong-suite and nonpassing structured Mocha receipts", () => {
     const plan = getGatePlan("fast");
     const baseOptions = {
       source: SOURCE_IDENTITY,
       profile: "fast",
       plan,
-      impact: validImpact(),
+      ...validImpactEvidence(),
       liveQualification: null,
       findings: [],
       findingsStatus: "passed",
@@ -1626,6 +3078,23 @@ suite("Release checklist and deterministic quality report", () => {
     ));
     assert.strictEqual(coreStep.status, "failed");
     assert.match(coreStep.reason, /test-evidence:suite-inventory-mismatch/u);
+
+    for (const suiteId of ["standalone-tests", "extension-host-core"]) {
+      const reorderedReceipts = fullPlan.map(step => passedReceipt(step));
+      reorderedReceipts.find(receipt => receipt.stepId === suiteId).testEvidence.tests.reverse();
+      const reordered = generateReport({
+        ...baseOptions,
+        profile: "full",
+        plan: fullPlan,
+        receipts: reorderedReceipts,
+        ...validMutationEvidence(),
+      });
+      const reorderedStep = reordered.deterministicGates.steps.find(step => (
+        step.stepId === suiteId
+      ));
+      assert.strictEqual(reorderedStep.status, "failed");
+      assert.match(reorderedStep.reason, /test-evidence:suite-inventory-mismatch/u);
+    }
   });
 
   test("binds the exact mutation artifact and independently rejects invalid summaries", () => {
@@ -1640,7 +3109,7 @@ suite("Release checklist and deterministic quality report", () => {
       profile: "full",
       plan,
       receipts,
-      impact: validImpact(),
+      ...validImpactEvidence(),
       mutation,
       mutationBaseline: validMutationBaseline(),
       liveQualification: null,
@@ -1687,6 +3156,20 @@ suite("Release checklist and deterministic quality report", () => {
     assert.strictEqual(invalid.mutation.status, "failed");
     assert.match(invalid.mutation.reason, /1 noCoverage mutants/u);
 
+    const wrongModeMutation = validMutationSummary({ mode: "core" });
+    const wrongModeFingerprint = mutationArtifactFingerprint(wrongModeMutation);
+    const wrongModeReceipts = plan.map(step => passedReceipt(step));
+    wrongModeReceipts.find(receipt => receipt.stepId === "changed-mutation")
+      .artifactFingerprint = wrongModeFingerprint;
+    const wrongMode = generateReport({
+      ...common,
+      receipts: wrongModeReceipts,
+      mutation: wrongModeMutation,
+      mutationArtifactFingerprint: wrongModeFingerprint,
+    });
+    assert.strictEqual(wrongMode.mutation.status, "failed");
+    assert.match(wrongMode.mutation.reason, /changed-mode evidence/u);
+
     const matching = generateReport({
       ...common,
       mutationArtifactFingerprint: fingerprint,
@@ -1702,7 +3185,7 @@ suite("Release checklist and deterministic quality report", () => {
       profile: "fast",
       plan,
       receipts: plan.map(step => passedReceipt(step)),
-      impact: validImpact(),
+      ...validImpactEvidence(),
       liveQualification: {
         status: "failed",
         source: SOURCE_IDENTITY,
@@ -1746,13 +3229,14 @@ suite("Release checklist and deterministic quality report", () => {
       profile: "release",
       plan,
       receipts,
-      impact: validImpact(),
+      ...validImpactEvidence(),
       ...validMutationEvidence(),
-      ui: { status: "passed", source: SOURCE_IDENTITY, tests: ["fixture"] },
+      ui: validUiResult(),
+      uiArtifactFingerprint: mutationArtifactFingerprint(validUiResult()),
       liveQualification: validLiveStatus(),
       findings: [],
       findingsStatus: "passed",
-      workflows: { workflows: [] },
+      workflows: blackBoxFixtureWorkflows(),
       inventories,
     });
 
@@ -1768,7 +3252,8 @@ suite("Release checklist and deterministic quality report", () => {
     assert.strictEqual(hasDeterministicReportFailure(report), true);
   });
 
-  test("rejects stale live status after a source-bound release checklist receipt passed", () => {
+  test("rejects stale live status after a source-bound release checklist receipt passed", function () {
+    this.timeout(30000);
     const plan = getGatePlan("release");
     const liveQualification = validLiveStatus();
     const common = {
@@ -1776,14 +3261,15 @@ suite("Release checklist and deterministic quality report", () => {
       profile: "release",
       plan,
       receipts: plan.map(step => passedReceipt(step)),
-      impact: validImpact(),
+      ...validImpactEvidence(),
       ...validMutationEvidence(),
-      ui: { status: "passed", source: SOURCE_IDENTITY, tests: ["fixture"] },
+      ui: validUiResult(),
+      uiArtifactFingerprint: mutationArtifactFingerprint(validUiResult()),
       findings: [],
       findingsStatus: "passed",
-      workflows: { workflows: [] },
+      workflows: blackBoxFixtureWorkflows(),
       inventories,
-      liveQualificationArtifactFingerprint: mutationArtifactFingerprint(validMutationSummary()),
+      liveQualificationArtifactFingerprint: mutationArtifactFingerprint(validLiveStatus()),
     };
     const matching = generateReport({ ...common, liveQualification });
     const mismatchedBytes = generateReport({
@@ -1802,9 +3288,25 @@ suite("Release checklist and deterministic quality report", () => {
         source: { sha: BASE_SHA, fingerprint: SOURCE_IDENTITY.fingerprint },
       },
     });
+    const changedFindings = generateReport({
+      ...common,
+      liveQualification,
+      findings: [{ id: "QH-LEDGER-DRIFT", status: "fixed", releaseBlocking: false }],
+      findingsFingerprint: "d".repeat(64),
+    });
+    const alternateInput = generateReport({
+      ...common,
+      liveQualification: {
+        ...liveQualification,
+        inputPath: "internal_docs/quality/alternate.json",
+      },
+    });
 
-    assert.strictEqual(matching.liveQualification.status, "passed");
-    assert.strictEqual(matching.status, "passed");
+    assert.strictEqual(matching.liveQualification.status, "failed");
+    assert.match(
+      matching.liveQualification.errors.join("\n"),
+      /fresh evaluation of its disk attestation/u
+    );
     assert.strictEqual(mismatchedBytes.liveQualification.status, "failed");
     assert.strictEqual(mismatchedBytes.releaseReadiness.verdict, null);
     assert.strictEqual(invalidSchema.liveQualification.status, "failed");
@@ -1813,7 +3315,144 @@ suite("Release checklist and deterministic quality report", () => {
     assert.strictEqual(stale.liveQualification.authenticatedAcceptance, "not-recorded");
     assert.strictEqual(stale.releaseReadiness.verdict, null);
     assert.strictEqual(stale.status, "failed");
+    assert.strictEqual(changedFindings.liveQualification.status, "failed");
+    assert.match(changedFindings.liveQualification.errors.join("\n"), /current findings ledger/u);
+    assert.strictEqual(changedFindings.releaseReadiness.verdict, null);
+    assert.strictEqual(alternateInput.liveQualification.status, "failed");
+    assert.match(alternateInput.liveQualification.errors.join("\n"), /exact default attestation/u);
     assert.strictEqual(hasDeterministicReportFailure(stale), true);
+  });
+
+  test("requires fresh disk revalidation before a release report can trust live acceptance", () => {
+    const fixtureNow = new Date();
+    const fixture = passedLiveAttestation(SOURCE_IDENTITY, fixtureNow);
+    const inputPath = "internal_docs/quality/live-qualification.json";
+    const workflows = require("../quality/critical-workflows.json");
+    const plan = getGatePlan("release");
+    try {
+      fs.writeFileSync(
+        path.join(fixture.root, inputPath),
+        `${JSON.stringify(fixture.document, null, 2)}\n`
+      );
+      const status = evaluateDiskLiveQualification({
+        root: fixture.root,
+        source: SOURCE_IDENTITY,
+        workflows,
+        inputPath,
+        now: fixtureNow,
+      });
+      const findingsBytes = fs.readFileSync(path.join(
+        fixture.root,
+        "internal_docs/quality/findings.jsonl"
+      ));
+      const findings = findingsBytes.toString("utf8").trim().split("\n").map(JSON.parse);
+      const uiTests = uniqueSorted(workflows.workflows.flatMap(workflow => (
+        (workflow.evidence || [])
+          .filter(evidence => evidence.layer === "black-box-ui")
+          .flatMap(evidence => evidence.testNames || [])
+      )));
+      const ui = validUiResult(uiTests);
+      const liveFingerprint = mutationArtifactFingerprint(status);
+      const receipts = plan.map(step => passedReceipt(step));
+      receipts.find(receipt => receipt.stepId === "release-checklist").artifactFingerprint
+        = liveFingerprint;
+      receipts.find(receipt => receipt.stepId === "black-box-ui-smoke").artifactFingerprint
+        = mutationArtifactFingerprint(ui);
+      const common = {
+        root: fixture.root,
+        source: SOURCE_IDENTITY,
+        profile: "release",
+        plan,
+        receipts,
+        ...validImpactEvidence(),
+        ...validMutationEvidence(),
+        ui,
+        uiArtifactFingerprint: mutationArtifactFingerprint(ui),
+        liveQualification: status,
+        liveQualificationArtifactFingerprint: liveFingerprint,
+        findings,
+        findingsFingerprint: status.findingsFingerprint,
+        findingsStatus: "passed",
+        workflows,
+        inventories,
+      };
+
+      const intact = generateReport(common);
+      assert.strictEqual(intact.liveQualification.status, "passed");
+      assert.strictEqual(intact.liveQualification.verdict, status.verdict);
+
+      fs.rmSync(path.join(fixture.root, "internal_docs/quality/e2e-evidence.md"));
+      fs.rmSync(path.join(fixture.root, "internal_docs/quality/release-readiness.md"));
+      const detached = evaluateDiskLiveQualification({
+        root: fixture.root,
+        source: SOURCE_IDENTITY,
+        workflows,
+        inputPath,
+        now: fixtureNow,
+      });
+      const report = generateReport(common);
+      assert.strictEqual(detached.status, "failed");
+      assert.strictEqual(report.liveQualification.status, "failed");
+      assert.match(
+        report.liveQualification.errors.join("\n"),
+        /fresh evaluation of its disk attestation/u
+      );
+      assert.strictEqual(report.releaseReadiness.verdict, null);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("rejects crossed live workflow sets even when exact artifact bytes are receipt-bound", () => {
+    const actualWorkflowId = "WF-ACTUAL-LIVE-FIXTURE";
+    const unrelatedWorkflowId = "WF-UNRELATED-LIVE-FIXTURE";
+    const plan = getGatePlan("release");
+    const liveQualification = validLiveStatus({
+      requiredWorkflowIds: [unrelatedWorkflowId],
+      passedWorkflowIds: [actualWorkflowId],
+      missingWorkflowIds: [unrelatedWorkflowId],
+    });
+    const receipts = plan.map(step => passedReceipt(step));
+    const liveFingerprint = mutationArtifactFingerprint(liveQualification);
+    receipts.find(receipt => receipt.stepId === "release-checklist").artifactFingerprint
+      = liveFingerprint;
+    const report = generateReport({
+      source: SOURCE_IDENTITY,
+      profile: "release",
+      plan,
+      receipts,
+      ...validImpactEvidence(),
+      ...validMutationEvidence(),
+      ui: validUiResult(),
+      uiArtifactFingerprint: mutationArtifactFingerprint(validUiResult()),
+      liveQualification,
+      liveQualificationArtifactFingerprint: liveFingerprint,
+      findings: [],
+      findingsStatus: "passed",
+      workflows: {
+        workflows: [{
+          id: actualWorkflowId,
+          criticality: "release-critical",
+          surface: "fixture",
+          authoritativeOutcome: "fixture",
+          requiredLayers: ["live-protocol", "black-box-ui"],
+          evidence: [{
+            layer: "black-box-ui",
+            interactionMode: "rendered-dom-activation",
+            testFile: "ui-test/smoke.test.js",
+            testNames: ["fixture"],
+          }],
+        }],
+      },
+      inventories,
+    });
+
+    assert.strictEqual(report.liveQualification.status, "failed");
+    assert.deepStrictEqual(report.liveQualification.passedWorkflowIds, []);
+    assert.match(report.liveQualification.errors.join("\n"), /workflow manifest|subset/u);
+    assert.strictEqual(report.workflowCoverage[0].layerStatuses["live-protocol"], "failed");
+    assert.strictEqual(report.releaseReadiness.verdict, null);
+    assert.strictEqual(report.status, "failed");
   });
 
   test("rejects truncated, explicit, and stale-fingerprint impact evidence", () => {
@@ -1830,6 +3469,31 @@ suite("Release checklist and deterministic quality report", () => {
     });
     assert.ok(validateImpactArtifact(explicit).some(error => /complete Git/.test(error)));
 
+    const originalImpact = validImpact({ workflows: ["WF-IMPACT-FIXTURE"] });
+    const tamperedImpact = clone(originalImpact);
+    tamperedImpact.workflows = [];
+    tamperedImpact.key.fingerprint = impactFingerprint(tamperedImpact);
+    tamperedImpact.analysisKey = `${SOURCE_SHA}:${tamperedImpact.key.fingerprint}`;
+    const tamperPlan = getGatePlan("fast");
+    const tamperReceipts = tamperPlan.map(step => passedReceipt(step));
+    tamperReceipts.find(receipt => receipt.stepId === "change-impact").artifactFingerprint
+      = mutationArtifactFingerprint(originalImpact);
+    const tamperedReport = generateReport({
+      source: SOURCE_IDENTITY,
+      profile: "fast",
+      plan: tamperPlan,
+      receipts: tamperReceipts,
+      impact: tamperedImpact,
+      impactArtifactFingerprint: mutationArtifactFingerprint(tamperedImpact),
+      liveQualification: null,
+      findings: [],
+      findingsStatus: "passed",
+      workflows: { workflows: [] },
+      inventories,
+    });
+    assert.strictEqual(tamperedReport.impact.status, "failed");
+    assert.match(tamperedReport.impact.errors.join("\n"), /exact artifact/u);
+
     const plan = getGatePlan("full");
     const stale = validImpact({
       source: {
@@ -1840,12 +3504,17 @@ suite("Release checklist and deterministic quality report", () => {
         baseSha: BASE_SHA,
       },
     });
+    const staleFingerprint = mutationArtifactFingerprint(stale);
+    const receipts = plan.map(step => passedReceipt(step));
+    receipts.find(receipt => receipt.stepId === "change-impact").artifactFingerprint
+      = staleFingerprint;
     const report = generateReport({
       source: SOURCE_IDENTITY,
       profile: "full",
       plan,
-      receipts: plan.map(step => passedReceipt(step)),
+      receipts,
       impact: stale,
+      impactArtifactFingerprint: staleFingerprint,
       ...validMutationEvidence(),
       liveQualification: null,
       findings: [],
@@ -1863,7 +3532,7 @@ suite("Release checklist and deterministic quality report", () => {
       profile: "full",
       plan,
       receipts: plan.map(step => passedReceipt(step)),
-      impact: validImpact(),
+      ...validImpactEvidence(),
       ...validMutationEvidence(),
       liveQualification: null,
       findings: [],
@@ -1891,7 +3560,7 @@ suite("Release checklist and deterministic quality report", () => {
       profile: "full",
       plan,
       receipts,
-      impact: validImpact(),
+      ...validImpactEvidence(),
       liveQualification: null,
       findings: [],
       findingsStatus: "not-run",
@@ -1960,6 +3629,34 @@ suite("Release checklist and deterministic quality report", () => {
     assert.ok(recordErrors.some(error => /invalid failure class/.test(error)));
     assert.ok(recordErrors.some(error => /invalid mutation proof/.test(error)));
     assert.ok(duplicateErrors.includes("Duplicate finding ID: QH-900."));
+
+    const unknownWorkflow = validateFindingRecord(validFinding({
+      workflowContract: "WF-NOT-REAL",
+    }), schema, taxonomy);
+    assert.ok(unknownWorkflow.some(error => /references unknown workflow contract/u.test(error)));
+
+    const hiddenCoreP2 = validateFindingRecord(validFinding({
+      severity: "P2",
+      releaseBlocking: false,
+    }), schema, taxonomy);
+    assert.ok(hiddenCoreP2.some(error => (
+      /unresolved P2 on a release-critical workflow must remain release blocking/u.test(error)
+    )));
+
+    const unrecordedCause = validateFindingRecord(validFinding({
+      rootCause: null,
+      rootCauseStatus: "proven",
+    }), schema, taxonomy);
+    assert.ok(unrecordedCause.some(error => /requires a nonempty rootCause/u.test(error)));
+
+    const unprovenNonIssue = validateFindingRecord(validFinding({
+      status: "closed-non-issue",
+      releaseBlocking: false,
+    }), schema, taxonomy);
+    assert.ok(unprovenNonIssue.some(error => /requires a proven disposition/u.test(error)));
+    assert.ok(unprovenNonIssue.some(error => /protecting regression test/u.test(error)));
+    assert.ok(unprovenNonIssue.some(error => /completed mutation disposition/u.test(error)));
+    assert.ok(unprovenNonIssue.some(error => /completed live disposition/u.test(error)));
   });
 
   test("resolves finding evidence through the repository path boundary", function () {
@@ -2025,6 +3722,162 @@ suite("Release checklist and deterministic quality report", () => {
 });
 
 suite("Quality contract verifier fixtures", () => {
+  test("requires the exact handoff verifier immediately before CI evidence upload", () => {
+    const workflowPath = ".github/workflows/main.yml";
+    const workflow = fs.readFileSync(path.join(root, workflowPath), "utf8");
+    const unconditional = verifyQualityContracts({
+      root,
+      sourceOverrides: {
+        [workflowPath]: workflow.replace(
+          "if: ${{ always() && steps.quality_evidence_handoff.outcome == 'success' }}",
+          "if: ${{ always() }}"
+        ),
+      },
+    });
+    assert.ok(unconditional.errors.includes(
+      "CI must verify the exact fast-gate evidence immediately before a verifier-gated upload."
+    ));
+
+    const rewriteAfterReceipt = verifyQualityContracts({
+      root,
+      sourceOverrides: {
+        [workflowPath]: workflow.replace(
+          "run: npm run quality:verify-evidence -- --gate-profile fast",
+          "run: npm run quality:report -- --gate-profile fast"
+        ),
+      },
+    });
+    assert.ok(rewriteAfterReceipt.errors.includes(
+      "CI must verify the exact fast-gate evidence immediately before a verifier-gated upload."
+    ));
+  });
+
+  test("rejects bypasses around changed and core mutation evidence handoffs", () => {
+    const workflowPath = ".github/workflows/main.yml";
+    const deepWorkflowPath = ".github/workflows/deep-quality.yml";
+    const workflow = fs.readFileSync(path.join(root, workflowPath), "utf8");
+    const deepWorkflow = fs.readFileSync(path.join(root, deepWorkflowPath), "utf8");
+    const changedError =
+      "CI must verify the exact changed-mutation evidence immediately before a verifier-gated upload.";
+    const changedMutations = [
+      workflow.replace(
+        "if: ${{ always() && steps.mutation_evidence_handoff.outcome == 'success' }}",
+        "if: ${{ always() }}"
+      ),
+      workflow.replace(
+        "      - name: Run changed high-risk mutation gate",
+        "      - name: Premature mutation upload\n"
+        + "        uses: actions/upload-artifact@invented\n\n"
+        + "      - name: Run changed high-risk mutation gate"
+      ),
+      workflow.replace("  pull_request:\n    branches: [main]\n", ""),
+      workflow.replace(
+        "  pull_request:\n    branches: [main]\n",
+        "  pull_request:\n    branches: [main]\n    paths: [\"docs/**\"]\n"
+      ),
+      workflow.replace(
+        "  pull_request:\n    branches: [main]\n",
+        "  pull_request:\n    branches: [main]\n    types: [closed]\n"
+      ),
+      workflow.replace("  mutation:\n", "  mutation:\n    if: ${{ github.event_name == 'push' }}\n"),
+      workflow.replace("  mutation:\n", "  mutation:\n    continue-on-error: true\n"),
+    ];
+    for (const changed of changedMutations) {
+      assert.ok(verifyQualityContracts({
+        root,
+        sourceOverrides: { [workflowPath]: changed },
+      }).errors.includes(changedError));
+    }
+
+    const deepError =
+      "Deep CI must verify exact core-mutation evidence before a verifier-gated upload.";
+    for (const changed of [
+      deepWorkflow.replace(
+        "if: ${{ always() && steps.mutation_evidence_handoff.outcome == 'success' }}",
+        "if: ${{ always() }}"
+      ),
+      deepWorkflow.replace(
+        "  core-mutation:\n",
+        "  core-mutation:\n    continue-on-error: true\n"
+      ),
+    ]) {
+      assert.ok(verifyQualityContracts({
+        root,
+        sourceOverrides: { [deepWorkflowPath]: changed },
+      }).errors.includes(deepError));
+    }
+  });
+
+  test("rejects required CI text hidden in inert YAML values", () => {
+    const workflowPath = ".github/workflows/main.yml";
+    const deepWorkflowPath = ".github/workflows/deep-quality.yml";
+    const workflow = fs.readFileSync(path.join(root, workflowPath), "utf8");
+    const deepWorkflow = fs.readFileSync(path.join(root, deepWorkflowPath), "utf8");
+    const mainDocument = yaml.load(workflow, { schema: yaml.CORE_SCHEMA });
+    const deepDocument = yaml.load(deepWorkflow, { schema: yaml.CORE_SCHEMA });
+    const originalMutation = clone(mainDocument.jobs.mutation);
+    const originalQuality = clone(mainDocument.jobs.quality);
+    const originalCore = clone(deepDocument.jobs["core-mutation"]);
+
+    mainDocument.jobs.mutation = {
+      name: yaml.dump(originalMutation),
+      "runs-on": "ubuntu-24.04",
+      steps: [{
+        name: "Unverified upload",
+        uses: "actions/upload-artifact@v4",
+        with: { name: "forged", path: "README.md", "if-no-files-found": "error" },
+      }],
+    };
+    const inertMutation = verifyQualityContracts({
+      root,
+      sourceOverrides: {
+        [workflowPath]: yaml.dump(mainDocument, { lineWidth: -1, noRefs: true }),
+      },
+    });
+    assert.ok(inertMutation.errors.includes(
+      "CI must verify the exact changed-mutation evidence immediately before a verifier-gated upload."
+    ));
+
+    mainDocument.jobs.mutation = originalMutation;
+    mainDocument.jobs.quality = {
+      name: yaml.dump(originalQuality),
+      "runs-on": "ubuntu-24.04",
+      steps: [{
+        name: "Unverified upload",
+        uses: "actions/upload-artifact@v4",
+        with: { name: "forged", path: "README.md", "if-no-files-found": "error" },
+      }],
+    };
+    const inertFast = verifyQualityContracts({
+      root,
+      sourceOverrides: {
+        [workflowPath]: yaml.dump(mainDocument, { lineWidth: -1, noRefs: true }),
+      },
+    });
+    assert.ok(inertFast.errors.includes(
+      "CI must verify the exact fast-gate evidence immediately before a verifier-gated upload."
+    ));
+
+    deepDocument.jobs["core-mutation"] = {
+      name: yaml.dump(originalCore),
+      "runs-on": "ubuntu-24.04",
+      steps: [{
+        name: "Unverified upload",
+        uses: "actions/upload-artifact@v4",
+        with: { name: "forged", path: "README.md", "if-no-files-found": "error" },
+      }],
+    };
+    const inertCore = verifyQualityContracts({
+      root,
+      sourceOverrides: {
+        [deepWorkflowPath]: yaml.dump(deepDocument, { lineWidth: -1, noRefs: true }),
+      },
+    });
+    assert.ok(inertCore.errors.includes(
+      "Deep CI must verify exact core-mutation evidence before a verifier-gated upload."
+    ));
+  });
+
   test("rejects an unmeasured mutation baseline", () => {
     const mutationBaseline = clone(require("../quality/mutation-baseline.json"));
     mutationBaseline.measuredAtSha = null;
@@ -2324,6 +4177,7 @@ suite("Quality contract verifier fixtures", () => {
       if (step.id === "black-box-ui-smoke") {
         receipt.status = "blocked";
         receipt.exitCode = 2;
+        receipt.artifactFingerprint = mutationArtifactFingerprint(blockedUiResult());
       }
       return receipt;
     });
@@ -2332,14 +4186,15 @@ suite("Quality contract verifier fixtures", () => {
       profile: "release",
       plan,
       receipts,
-      impact: validImpact(),
+      ...validImpactEvidence(),
       ...validMutationEvidence(),
       liveQualification: null,
       findings: [],
       findingsStatus: "passed",
       workflows,
       inventories: require("./testInventories"),
-      ui: { status: "blocked", source: SOURCE_IDENTITY, sourceSha: SOURCE_SHA },
+      ui: blockedUiResult(),
+      uiArtifactFingerprint: mutationArtifactFingerprint(blockedUiResult()),
     });
 
     assert.strictEqual(

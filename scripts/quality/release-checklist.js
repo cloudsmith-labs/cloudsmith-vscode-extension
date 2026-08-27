@@ -12,9 +12,17 @@ const {
   writeJson,
 } = require("./common");
 const { sourceIdentity } = require("./evidence");
+const {
+  decodeFindingsBytes,
+  decodeUtf8Bytes,
+  parseFindingsJsonl,
+  readBoundedFindingsBytes,
+  validateFindings,
+} = require("./findings");
 
 const DEFAULT_INPUT = "internal_docs/quality/live-qualification.json";
 const DEFAULT_OUTPUT = ".quality/gates/live-qualification-status.json";
+const DEFAULT_FINDINGS = "internal_docs/quality/findings.jsonl";
 const READY_VERDICTS = new Set([
   "TEAM-TEST READY",
   "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS",
@@ -36,12 +44,23 @@ function evaluateLiveQualification(options = {}) {
   const requiredIds = requiredLiveWorkflowIds(workflows);
   const document = options.document;
   const inputPath = options.inputPath || DEFAULT_INPUT;
+  const attestationFingerprint = document
+    ? options.attestationFingerprint || null
+    : null;
+  const evidenceManifest = document ? qualificationEvidenceManifest(document) : [];
+  const findingsState = options.findingsState || readFindingsState(
+    options.root || ROOT,
+    options.findingsPath || DEFAULT_FINDINGS
+  );
   if (!document) {
     return statusDocument({
       source,
       inputPath,
       status: "not-run",
       requiredIds,
+      findingsState,
+      attestationFingerprint,
+      evidenceManifest,
       reason: "No ignored authenticated live-qualification attestation was supplied.",
     });
   }
@@ -53,6 +72,9 @@ function evaluateLiveQualification(options = {}) {
       inputPath,
       status: "failed",
       requiredIds,
+      findingsState,
+      attestationFingerprint,
+      evidenceManifest,
       errors: ["Live qualification status must be passed, failed, blocked, or not-run."],
     });
   }
@@ -62,13 +84,16 @@ function evaluateLiveQualification(options = {}) {
       inputPath,
       status: declaredStatus,
       requiredIds,
+      findingsState,
+      attestationFingerprint,
+      evidenceManifest,
       reason: nonEmpty(document.summary)
         ? document.summary
         : `Authenticated live qualification is declared ${declaredStatus}.`,
     });
   }
 
-  const validationContext = createValidationContext(options);
+  const validationContext = createValidationContext({ ...options, findingsState });
   const errors = validatePassedAttestation(
     document,
     source,
@@ -91,6 +116,9 @@ function evaluateLiveQualification(options = {}) {
     errors,
     verdict: errors.length === 0 ? document.verdict : null,
     authenticatedAcceptance: errors.length === 0 ? "recorded" : "not-recorded",
+    findingsState,
+    attestationFingerprint,
+    evidenceManifest,
     visibleEnabledActions: {
       status: document.visibleEnabledActions?.status || "not-run",
       silentNoOpCount: Number.isInteger(document.visibleEnabledActions?.silentNoOpCount)
@@ -102,7 +130,7 @@ function evaluateLiveQualification(options = {}) {
 
 function validatePassedAttestation(document, source, workflows, requiredIds, context = createValidationContext()) {
   const errors = [];
-  if (document.schemaVersion !== 2) errors.push("Live qualification schemaVersion must be 2.");
+  if (document.schemaVersion !== 3) errors.push("Live qualification schemaVersion must be 3.");
   if (document.source?.sha !== source.sha) {
     errors.push("Live qualification source SHA does not match the current candidate.");
   }
@@ -134,6 +162,16 @@ function validatePassedAttestation(document, source, workflows, requiredIds, con
   if (!READY_VERDICTS.has(document.verdict)) {
     errors.push("Live qualification has no allowed team-test readiness verdict.");
   }
+  if (Number.isInteger(context.findingsState.openNonBlockingRiskCount)) {
+    const expectedVerdict = context.findingsState.openNonBlockingRiskCount > 0
+      ? "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS"
+      : "TEAM-TEST READY";
+    if (document.verdict !== expectedVerdict) {
+      errors.push(
+        "Live qualification verdict does not match the current open non-blocking findings."
+      );
+    }
+  }
   const evidencePaths = validateEvidenceReferences(
     document.evidence,
     "Live qualification",
@@ -141,6 +179,16 @@ function validatePassedAttestation(document, source, workflows, requiredIds, con
     context,
     { notAfter: completedAt, notBefore: evidenceNotBefore },
   );
+  if (!evidencePaths.has(DEFAULT_FINDINGS)) {
+    errors.push("Live qualification evidence must include the exact findings ledger.");
+  }
+  for (const error of context.findingsState.errors) errors.push(error);
+  if (document.findingsFingerprint !== context.findingsState.fingerprint) {
+    errors.push("Live qualification does not bind the exact findings ledger bytes.");
+  }
+  if (document.openReleaseBlockerCount !== context.findingsState.openReleaseBlockerCount) {
+    errors.push("Live qualification release-blocker count does not match the findings ledger.");
+  }
   if (document.openReleaseBlockerCount !== 0) {
     errors.push("Live qualification must explicitly record zero open release blockers.");
   }
@@ -291,6 +339,12 @@ function statusDocument(values) {
     requiredWorkflowIds: requiredIds,
     passedWorkflowIds: passedIds,
     missingWorkflowIds: requiredIds.filter(id => !passedIds.includes(id)),
+    attestationFingerprint: values.attestationFingerprint || null,
+    evidenceManifest: values.evidenceManifest || [],
+    findingsFingerprint: values.findingsState?.fingerprint || null,
+    openReleaseBlockerCount: Number.isInteger(values.findingsState?.openReleaseBlockerCount)
+      ? values.findingsState.openReleaseBlockerCount
+      : null,
     visibleEnabledActions: values.visibleEnabledActions || {
       status: "not-run",
       silentNoOpCount: null,
@@ -333,7 +387,84 @@ function createValidationContext(options = {}) {
     root: path.resolve(options.root || ROOT),
     nowMs,
     ignoredPathCache: new Map(),
+    findingsState: options.findingsState || readFindingsState(
+      options.root || ROOT,
+      options.findingsPath || DEFAULT_FINDINGS
+    ),
   };
+}
+
+function readFindingsState(root = ROOT, findingsPath = DEFAULT_FINDINGS) {
+  let target;
+  try {
+    target = resolveOptionalRepositoryFile(findingsPath, root, {
+      subtree: "internal_docs/quality",
+    });
+  } catch (error) {
+    return {
+      fingerprint: null,
+      openReleaseBlockerCount: null,
+      openNonBlockingRiskCount: null,
+      errors: [error.message],
+    };
+  }
+  if (!target) {
+    return {
+      fingerprint: null,
+      openReleaseBlockerCount: null,
+      openNonBlockingRiskCount: null,
+      errors: ["The ignored findings ledger is missing."],
+    };
+  }
+  let bytes;
+  try {
+    bytes = readBoundedFindingsBytes(target);
+  } catch (error) {
+    return {
+      fingerprint: null,
+      openReleaseBlockerCount: null,
+      openNonBlockingRiskCount: null,
+      errors: [error.message],
+    };
+  }
+  const fingerprint = crypto.createHash("sha256").update(bytes).digest("hex");
+  try {
+    const records = parseFindingsJsonl(decodeFindingsBytes(bytes));
+    if (records.length === 0) throw new Error("The ignored findings ledger is empty.");
+    const validationErrors = validateFindings(
+      records,
+      readJson("quality/finding.schema.json", root),
+      readJson("quality/defect-taxonomy.json", root),
+      root
+    );
+    if (validationErrors.length > 0) {
+      return {
+        fingerprint,
+        openReleaseBlockerCount: null,
+        openNonBlockingRiskCount: null,
+        errors: validationErrors.map(error => `The ignored findings ledger is invalid: ${error}`),
+      };
+    }
+    const terminal = new Set(["fixed", "closed-non-issue"]);
+    const openRecords = records.filter(record => !terminal.has(record?.status));
+    return {
+      fingerprint,
+      openReleaseBlockerCount: openRecords.filter(record => (
+        record?.releaseBlocking === true
+      )).length,
+      openNonBlockingRiskCount: openRecords.filter(record => (
+        record?.releaseBlocking === false
+      )).length,
+      errors: [],
+    };
+  } catch (error) {
+    return {
+      fingerprint,
+      openReleaseBlockerCount: null,
+      openNonBlockingRiskCount: null,
+      errors: [`The ignored findings ledger is invalid: ${error.message}`],
+    };
+  }
 }
 
 function validateTimestamp(value, label, errors, bounds = {}) {
@@ -469,6 +600,26 @@ function attestationReviewDigest(document) {
     .digest("hex");
 }
 
+function qualificationEvidenceManifest(document) {
+  const references = [
+    ...(document?.evidence || []),
+    ...(document?.workflowResults || []).flatMap(result => result?.evidence || []),
+    ...(document?.visibleEnabledActions?.evidence || []),
+    ...(document?.independentReview?.evidence || []),
+  ];
+  const byPath = new Map();
+  for (const reference of references) {
+    if (EVIDENCE_PATH_PATTERN.test(reference?.path || "")
+      && /^[a-f0-9]{64}$/u.test(reference?.sha256 || "")) {
+      byPath.set(reference.path, Object.freeze({
+        path: reference.path,
+        sha256: reference.sha256,
+      }));
+    }
+  }
+  return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
+}
+
 function loadLiveQualification(root, inputPath) {
   const target = resolveOptionalRepositoryFile(inputPath, root, {
     subtree: "internal_docs/quality",
@@ -487,7 +638,27 @@ function loadLiveQualification(root, inputPath) {
   if (validatedTarget !== target) {
     throw new Error("Live qualification input changed during path validation.");
   }
-  return JSON.parse(fs.readFileSync(target, "utf8"));
+  const bytes = fs.readFileSync(target);
+  return {
+    document: JSON.parse(decodeUtf8Bytes(bytes, "Live qualification input")),
+    fingerprint: crypto.createHash("sha256").update(bytes).digest("hex"),
+  };
+}
+
+function evaluateDiskLiveQualification(options = {}) {
+  const root = options.root || ROOT;
+  const inputPath = options.inputPath || DEFAULT_INPUT;
+  validateInputPath(inputPath);
+  const loaded = loadLiveQualification(root, inputPath);
+  return evaluateLiveQualification({
+    source: options.source || sourceIdentity(root),
+    workflows: options.workflows || readJson("quality/critical-workflows.json", root),
+    document: loaded?.document || null,
+    attestationFingerprint: loaded?.fingerprint || null,
+    inputPath,
+    now: options.now,
+    root,
+  });
 }
 
 function runChecklist(options = {}) {
@@ -495,14 +666,13 @@ function runChecklist(options = {}) {
   const inputPath = options.inputPath || DEFAULT_INPUT;
   validateInputPath(inputPath);
   const outputPath = options.outputPath || DEFAULT_OUTPUT;
-  const result = evaluateLiveQualification({
-    source: options.source || sourceIdentity(root),
-    workflows: options.workflows || readJson("quality/critical-workflows.json", root),
-    document: Object.prototype.hasOwnProperty.call(options, "document")
-      ? options.document
-      : loadLiveQualification(root, inputPath),
+  if (Object.prototype.hasOwnProperty.call(options, "document")) {
+    throw new Error("Release-checklist output requires an exact disk-backed attestation.");
+  }
+  const result = evaluateDiskLiveQualification({
     inputPath,
-    now: options.now,
+    source: options.source,
+    workflows: options.workflows,
     root,
   });
   writeJson(outputPath, result, root);
@@ -550,11 +720,15 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
+  DEFAULT_FINDINGS,
   DEFAULT_INPUT,
   DEFAULT_OUTPUT,
   attestationReviewDigest,
+  evaluateDiskLiveQualification,
   evaluateLiveQualification,
   parseArguments,
+  readFindingsState,
+  qualificationEvidenceManifest,
   requiredLiveWorkflowIds,
   runChecklist,
   validateInputPath,

@@ -5,9 +5,9 @@ const fs = require("fs");
 const { spawnSync } = require("child_process");
 const {
   ROOT,
+  discoverRepositoryOutputFiles,
   removeOutputFile,
   resolveExistingRepositoryFile,
-  uniqueSorted,
   writeJson,
 } = require("./common");
 const { aggregateStatuses, fingerprint, sourceIdentity } = require("./evidence");
@@ -54,12 +54,16 @@ const STEP_CATALOG = Object.freeze({
     "node",
     ["scripts/quality/verify.js"]
   ),
-  "change-impact": commandStep(
-    "change-impact",
-    "impact",
-    "node",
-    ["scripts/quality/impact.js"]
-  ),
+  "change-impact": Object.freeze({
+    ...commandStep(
+      "change-impact",
+      "impact",
+      "node",
+      ["scripts/quality/impact.js"]
+    ),
+    artifactPath: ".quality/impact.json",
+    artifactSubtree: ".quality",
+  }),
   "repository-check": commandStep(
     "repository-check",
     "architecture-polish-version",
@@ -136,6 +140,8 @@ const STEP_CATALOG = Object.freeze({
       "node",
       ["scripts/quality/run-ui-smoke.js"]
     ),
+    artifactPath: ".quality/ui/result.json",
+    artifactSubtree: ".quality/ui",
     blockedExitCodes: Object.freeze([2]),
   }),
   "release-checklist": Object.freeze({
@@ -177,6 +183,11 @@ function reportStep(profile) {
       "node",
       ["scripts/quality/report.js", "--gate-profile", profile]
     ),
+    artifactPaths: Object.freeze([
+      ".quality/report.json",
+      ".quality/report.md",
+    ]),
+    artifactSubtree: ".quality",
     runWhenBlocked: true,
   };
 }
@@ -191,7 +202,7 @@ function getGatePlan(profile) {
       ? ["fast", "full"]
       : ["fast", "full", "release"];
   const steps = phases.flatMap(phase => PHASE_STEPS[phase].map(id => STEP_CATALOG[id]));
-  if (profile !== "fast") steps.push(reportStep(profile));
+  steps.push(reportStep(profile));
   return steps.map((step, index) => ({
     ...step,
     args: [...step.args],
@@ -208,6 +219,8 @@ function runGate(options = {}) {
     || (options.source ? () => options.source : () => sourceIdentity(root));
   const source = options.source || readSource();
   const execute = options.execute || executeCommand;
+  clearGateReceipts(root, profile);
+  for (const step of plan) clearStepOutputs(step, root);
   const receipts = plan.map(step => plannedReceipt(profile, step, source));
   for (const receipt of receipts) writeReceipt(root, receipt);
 
@@ -262,32 +275,41 @@ function runGate(options = {}) {
     profile,
     source,
     status,
-    planFingerprint: fingerprint(plan.map(step => ({
-      id: step.id,
-      category: step.category,
-      command: step.command,
-      artifactPath: step.artifactPath || null,
-      evidencePath: step.evidencePath || null,
-      runWhenBlocked: step.runWhenBlocked === true,
-    }))),
+    planFingerprint: gatePlanFingerprint(plan),
     steps: receipts,
   };
   summary.key = {
     sha: source.sha,
-    fingerprint: fingerprint({
-      profile,
-      source,
-      steps: receipts.map(receipt => ({
-        id: receipt.stepId,
-        status: receipt.status,
-        exitCode: receipt.exitCode,
-        signal: receipt.signal,
-        reason: receipt.reason,
-      })),
-    }),
+    fingerprint: fingerprint(summary),
   };
   writeJson(`.quality/gates/${profile}.json`, summary, root);
   return summary;
+}
+
+function gatePlanFingerprint(plan) {
+  return fingerprint(plan.map(step => ({
+    id: step.id,
+    category: step.category,
+    command: step.command,
+    artifactPath: step.artifactPath || null,
+    artifactPaths: [...(step.artifactPaths || [])],
+    artifactSubtree: step.artifactSubtree || null,
+    blockedExitCodes: [...(step.blockedExitCodes || [])],
+    evidencePath: step.evidencePath || null,
+    runWhenBlocked: step.runWhenBlocked === true,
+  })));
+}
+
+function clearGateReceipts(root, profile) {
+  removeOutputFile(`.quality/gates/${profile}.json`, root, {
+    subtree: ".quality/gates",
+  });
+  const directory = `.quality/gates/${profile}`;
+  for (const relativePath of discoverRepositoryOutputFiles(directory, root, {
+    subtree: directory,
+  })) {
+    removeOutputFile(relativePath, root, { subtree: directory });
+  }
 }
 
 function sameSource(left, right) {
@@ -322,7 +344,7 @@ function completedReceipt(profile, step, source, execution = {}) {
   const evidenceError = status === "passed" && step.evidencePath
     ? validateTestEvidence(execution.testEvidence, step, source)
     : null;
-  const artifactError = ["passed", "blocked"].includes(status) && step.artifactPath
+  const artifactError = ["passed", "blocked"].includes(status) && stepArtifactPaths(step).length > 0
     && !/^[a-f0-9]{64}$/u.test(execution.artifactFingerprint || "")
     ? "missing-or-invalid-artifact-fingerprint"
     : null;
@@ -350,12 +372,7 @@ function completedReceipt(profile, step, source, execution = {}) {
 function executeCommand(step, context = {}) {
   const root = context.root || ROOT;
   const executable = resolveExecutable(step.executable);
-  if (step.evidencePath) removeOutputFile(step.evidencePath, root, {
-    subtree: ".quality/test-results",
-  });
-  if (step.artifactPath) removeOutputFile(step.artifactPath, root, {
-    subtree: step.artifactSubtree || ".quality/mutation",
-  });
+  clearStepOutputs(step, root);
   const result = spawnSync(executable, step.args, {
     cwd: root,
     encoding: "utf8",
@@ -372,14 +389,9 @@ function executeCommand(step, context = {}) {
   if (result.stderr) process.stderr.write(result.stderr);
   let artifactFingerprint = null;
   let artifactError = null;
-  if (step.artifactPath) {
+  if (stepArtifactPaths(step).length > 0) {
     try {
-      const artifact = fs.readFileSync(resolveExistingRepositoryFile(
-        step.artifactPath,
-        root,
-        { subtree: step.artifactSubtree || ".quality/mutation" }
-      ));
-      artifactFingerprint = crypto.createHash("sha256").update(artifact).digest("hex");
+      artifactFingerprint = artifactFingerprintForStep(step, root);
     } catch (error) {
       artifactError = `missing-or-invalid-artifact:${error.message}`;
     }
@@ -412,6 +424,63 @@ function executeCommand(step, context = {}) {
   return { ...result, testEvidence, artifactFingerprint };
 }
 
+function clearStepOutputs(step, root) {
+  if (step.evidencePath) removeOutputFile(step.evidencePath, root, {
+    subtree: ".quality/test-results",
+  });
+  for (const artifactPath of stepArtifactPaths(step)) {
+    removeOutputFile(artifactPath, root, {
+      subtree: step.artifactSubtree || ".quality/mutation",
+    });
+  }
+}
+
+function stepArtifactPaths(step) {
+  const declared = Array.isArray(step?.artifactPaths)
+    ? step.artifactPaths
+    : step?.artifactPath
+      ? [step.artifactPath]
+      : [];
+  if (declared.length !== new Set(declared).size) {
+    throw new Error(`Quality step ${String(step?.id)} declares duplicate artifact paths.`);
+  }
+  return declared;
+}
+
+function artifactFingerprintForStep(step, root = ROOT) {
+  const artifactPaths = stepArtifactPaths(step);
+  if (artifactPaths.length === 0) return null;
+  const subtree = step.artifactSubtree || ".quality/mutation";
+  const artifacts = artifactPaths.map(relativePath => ({
+    relativePath,
+    bytes: fs.readFileSync(resolveExistingRepositoryFile(relativePath, root, { subtree })),
+  }));
+  if (artifacts.length === 1) {
+    return crypto.createHash("sha256").update(artifacts[0].bytes).digest("hex");
+  }
+  const hash = crypto.createHash("sha256");
+  hash.update("cloudsmith-quality-artifact-bundle-v1\0");
+  for (const artifact of artifacts) {
+    hash.update(`${artifact.relativePath}\0${artifact.bytes.length}\0`);
+    hash.update(artifact.bytes);
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+function validateArtifactBinding(receipt, step, root = ROOT) {
+  if (!/^[a-f0-9]{64}$/u.test(receipt?.artifactFingerprint || "")) {
+    return "missing-or-invalid-artifact-fingerprint";
+  }
+  try {
+    return artifactFingerprintForStep(step, root) === receipt.artifactFingerprint
+      ? null
+      : "artifact-fingerprint-mismatch";
+  } catch (error) {
+    return `missing-or-invalid-artifact:${error.message}`;
+  }
+}
+
 function validateTestEvidence(value, step, source) {
   if (value?.schemaVersion !== 1) return "invalid-schema";
   if (value?.source?.sha !== source?.sha
@@ -441,8 +510,8 @@ function validateTestEvidence(value, step, source) {
     if (value.counts?.[name] !== counted[name]) return "count-mismatch";
   }
   const expectedFiles = TEST_INVENTORIES_BY_SUITE[step.id];
-  if (expectedFiles && JSON.stringify(uniqueSorted([...seenFiles]))
-    !== JSON.stringify(uniqueSorted(expectedFiles))) return "suite-inventory-mismatch";
+  if (expectedFiles && JSON.stringify([...seenFiles])
+    !== JSON.stringify(expectedFiles)) return "suite-inventory-mismatch";
   if (counted.failed > 0 || counted.pending > 0) return "nonpassing-test-record";
   return null;
 }
@@ -498,13 +567,17 @@ if (require.main === module) main();
 module.exports = {
   PHASE_STEPS,
   STEP_CATALOG,
+  artifactFingerprintForStep,
   completedReceipt,
   executeCommand,
+  gatePlanFingerprint,
   getGatePlan,
   parseArguments,
   parseTestCounts,
   receiptPath,
   runGate,
   sameSource,
+  stepArtifactPaths,
+  validateArtifactBinding,
   validateTestEvidence,
 };

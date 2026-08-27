@@ -15,7 +15,13 @@ function receipt(status, values = {}) {
     sourceSha: source.sha,
     tool: null,
     toolVersion: null,
+    vscodeVersion: null,
+    platform: null,
+    architecture: null,
     launchAttempted: false,
+    tests: [],
+    results: [],
+    reason: null,
     ...values,
   };
 }

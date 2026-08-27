@@ -15,6 +15,46 @@ const PRODUCT_MANIFEST = JSON.parse(fs.readFileSync(
 ));
 const TEST_HARNESS_ID = "cloudsmith-test.cloudsmith-vsc-test-harness";
 const TEST_HARNESS_ROOT = path.join(PRODUCT_ROOT, "test", "harness-extension");
+const SENSITIVE_EXTENSION_IDS = new Set([
+  "github.copilot",
+  "github.copilot-chat",
+  "typescriptteam.jsts-chat-features",
+  "vscode.git",
+  "vscode.github",
+  "vscode.github-authentication",
+  "vscode.mermaid-markdown-features",
+  "vscode.microsoft-authentication",
+]);
+
+function declaresCredentialOrAiCapability(extension) {
+  if (SENSITIVE_EXTENSION_IDS.has(String(extension?.id || "").toLowerCase())) return true;
+  const contributions = extension?.packageJSON?.contributes;
+  if (!contributions || typeof contributions !== "object" || Array.isArray(contributions)) {
+    return false;
+  }
+  return Object.keys(contributions).some(key => (
+    key === "authentication" || /^(?:chat|languageModel)/u.test(key)
+  ));
+}
+
+function assertCredentialAndAiInactivity(options = {}) {
+  const extensions = options.extensions || vscode.extensions.all;
+  const getChatConfiguration = options.getChatConfiguration
+    || (() => vscode.workspace.getConfiguration("chat"));
+  const activeCredentialExtensions = extensions
+    .filter(declaresCredentialOrAiCapability)
+    .filter(extension => extension.isActive)
+    .map(extension => extension.id)
+    .sort();
+  assert.deepStrictEqual(
+    activeCredentialExtensions,
+    [],
+    "Credential-capable built-in and AI extensions must remain inactive"
+  );
+  const chatConfiguration = getChatConfiguration();
+  assert.strictEqual(chatConfiguration.get("disableAIFeatures"), true);
+  assert.strictEqual(chatConfiguration.get("enabled"), false);
+}
 
 function isWithin(candidatePath, rootPath) {
   const relative = path.relative(
@@ -130,27 +170,7 @@ suite("Extension activation smoke", () => {
     assert.match(expectedVersion || "", /^\d+\.\d+\.\d+$/);
     assert.strictEqual(vscode.version, expectedVersion);
 
-    const credentialCapableExtensionIds = new Set([
-      "github.copilot",
-      "github.copilot-chat",
-      "vscode.git",
-      "vscode.github",
-      "vscode.github-authentication",
-      "vscode.microsoft-authentication",
-    ]);
-    const activeCredentialExtensions = vscode.extensions.all
-      .filter(extension => credentialCapableExtensionIds.has(extension.id.toLowerCase()))
-      .filter(extension => extension.isActive)
-      .map(extension => extension.id)
-      .sort();
-    assert.deepStrictEqual(
-      activeCredentialExtensions,
-      [],
-      "Credential-capable built-in and AI extensions must remain inactive"
-    );
-    const chatConfiguration = vscode.workspace.getConfiguration("chat");
-    assert.strictEqual(chatConfiguration.get("disableAIFeatures"), true);
-    assert.strictEqual(chatConfiguration.get("enabled"), false);
+    assertCredentialAndAiInactivity();
 
     const harnessExtension = vscode.extensions.getExtension(TEST_HARNESS_ID);
     assert.ok(harnessExtension, "The credential-free test harness extension was not loaded");
@@ -231,6 +251,7 @@ suite("Extension activation smoke", () => {
     ]);
     assert.ok(performance.now() - activationStartedAt < 3000);
     await new Promise(resolve => setImmediate(resolve));
+    assertCredentialAndAiInactivity();
     assert.ok(
       inMemoryCredentialReads > 0,
       "production activation must use the explicit in-memory credential boundary"
@@ -271,6 +292,7 @@ suite("Extension activation smoke", () => {
       command: "workbench.action.openSettings",
       args: ["@ext:Cloudsmith.cloudsmith-vsc"],
     }]);
+    assertCredentialAndAiInactivity();
 
     const viewIds = (PRODUCT_MANIFEST.contributes?.views?.cloudsmithSideBar || [])
       .map((entry) => entry.id);
@@ -283,6 +305,7 @@ suite("Extension activation smoke", () => {
       undefined,
       "Manual composition must not register the production manifest with the host"
     );
+    assertCredentialAndAiInactivity();
   });
 
   test("deactivation disposes registered commands and is idempotent", async () => {
@@ -291,6 +314,7 @@ suite("Extension activation smoke", () => {
     const { deactivate } = require("../extension");
     await deactivate();
     await deactivate();
+    assertCredentialAndAiInactivity();
 
     assert.ok(
       !(await vscode.commands.getCommands(true)).includes("cloudsmith-vsc.refreshView"),
@@ -352,6 +376,7 @@ suite("Extension activation smoke", () => {
       ]);
       assert.ok(performance.now() - startedAt < 750);
       await new Promise(resolve => setImmediate(resolve));
+      assertCredentialAndAiInactivity();
       assert.strictEqual(upstreamStarted, true);
       assert.strictEqual(secretReadStarted, true);
       assert.strictEqual(contextProjectionStarted, true);
@@ -385,10 +410,12 @@ suite("Extension activation smoke", () => {
         )),
       ]);
       assert.deepStrictEqual(guardedResults, [undefined, undefined]);
+      assertCredentialAndAiInactivity();
 
       const deactivationStartedAt = performance.now();
       await extensionModule.deactivate();
       assert.ok(performance.now() - deactivationStartedAt < 250);
+      assertCredentialAndAiInactivity();
     } finally {
       upstreamReadiness.resolve(false);
       secretRead.resolve(undefined);
@@ -397,6 +424,7 @@ suite("Extension activation smoke", () => {
       vscode.commands.registerCommand = originalRegisterCommand;
       vscode.commands.executeCommand = originalExecuteCommand;
       await extensionModule.deactivate();
+      assertCredentialAndAiInactivity();
     }
   });
 
@@ -456,6 +484,7 @@ suite("Extension activation smoke", () => {
 
       generation = 1;
       await extensionModule.activate(context);
+      assertCredentialAndAiInactivity();
       const first = registrations.filter(entry => entry.generation === 1);
       assert.strictEqual(first.length, 64);
       assert.strictEqual(active.size, 64);
@@ -464,6 +493,7 @@ suite("Extension activation smoke", () => {
 
       generation = 2;
       await extensionModule.activate(context);
+      assertCredentialAndAiInactivity();
       const second = registrations.filter(entry => entry.generation === 2);
       assert.strictEqual(second.length, 64);
       assert.strictEqual(active.size, 64);
@@ -473,23 +503,60 @@ suite("Extension activation smoke", () => {
       }
 
       await extensionModule.deactivate();
+      assertCredentialAndAiInactivity();
       assert.strictEqual(active.size, 0);
       assert.ok(second.every(entry => entry.disposed));
 
       generation = 3;
       failId = "cloudsmith-vsc.previewUpstreamResolution";
       await assert.rejects(extensionModule.activate(context), /late registrar failure/);
+      assertCredentialAndAiInactivity();
       const failed = registrations.filter(entry => entry.generation === 3);
       assert.strictEqual(failed.length, 63);
       assert.ok(failed.every(entry => entry.disposed));
       assert.strictEqual(active.size, 0);
     } finally {
       failId = null;
-      await extensionModule.deactivate();
-      vscode.commands.registerCommand = originalRegisterCommand;
-      restoreHostResources();
-      filterState.clear();
-      recentPackages.clear();
+      try {
+        await extensionModule.deactivate();
+      } finally {
+        vscode.commands.registerCommand = originalRegisterCommand;
+        restoreHostResources();
+        filterState.clear();
+        recentPackages.clear();
+      }
+      assertCredentialAndAiInactivity();
     }
+  });
+
+  test("credential and AI inactivity assertions fail closed on hostile host state", () => {
+    const safeConfiguration = {
+      get(key) { return key === "disableAIFeatures"; },
+    };
+    assert.throws(
+      () => assertCredentialAndAiInactivity({
+        extensions: [{ id: "vscode.github-authentication", isActive: true }],
+        getChatConfiguration: () => safeConfiguration,
+      }),
+      /must remain inactive/u
+    );
+    assert.throws(
+      () => assertCredentialAndAiInactivity({
+        extensions: [{
+          id: "vendor.renamed-ai-provider",
+          isActive: true,
+          packageJSON: { contributes: { languageModelTools: [{ name: "fixture" }] } },
+        }],
+        getChatConfiguration: () => safeConfiguration,
+      }),
+      /must remain inactive/u
+    );
+    assert.throws(
+      () => assertCredentialAndAiInactivity({
+        extensions: [],
+        getChatConfiguration: () => ({ get: () => true }),
+      }),
+      /false/u
+    );
   });
 });

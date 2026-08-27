@@ -11,6 +11,7 @@ const {
   VSCODE_SMOKE_TESTS,
   assertCredentialFreeRequiredEnvironment,
   createIsolatedQualificationRoot,
+  exportIsolatedQualificationRoot,
   removeIsolatedQualificationRoot,
   sanitizeQualificationEnvironment,
 } = require("./testInventories");
@@ -73,6 +74,8 @@ suite("test runner inventories", () => {
     assert.match(combinedRunner, /CREDENTIAL_BOUNDARY_SKIP_REASON/);
     const vscodeRunner = fs.readFileSync(path.join(root, "scripts", "run-vscode-tests.js"), "utf8");
     assert.match(vscodeRunner, /process\.execve/);
+    assert.match(vscodeRunner, /exportIsolatedQualificationRoot/);
+    assert.match(vscodeRunner, /cleanupLauncherHome/);
     assert.match(vscodeRunner, /stdio: "pipe"/);
     assert.doesNotMatch(vscodeRunner, /CLOUDSMITH_TEST_API_KEY|CLOUDSMITH_SSO_LIVE_TESTS/);
     assert.ok(CREDENTIAL_BOUNDARY_SKIP_REASON.length > 80);
@@ -170,6 +173,38 @@ suite("test runner inventories", () => {
     );
   });
 
+  test("qualification metadata cannot be shadowed by mixed-case environment collisions", () => {
+    const isolatedHome = path.join(root, ".quality", "synthetic-collision-home");
+    const canonical = {
+      VSCODE_TEST_VERSION: "1.134.0",
+      CLOUDSMITH_QUALITY_TEST_EVIDENCE: ".quality/test-results/core.json",
+      CLOUDSMITH_QUALITY_SOURCE_SHA: "a".repeat(40),
+      CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT: "b".repeat(64),
+      CLOUDSMITH_QUALITY_TEST_SUITE: "extension-host-core",
+    };
+    const collision = {
+      vscode_test_version: "1.99.0",
+      cloudsmith_quality_test_evidence: "/private/forged.json",
+      cloudsmith_quality_source_sha: "0".repeat(40),
+      cloudsmith_quality_source_fingerprint: "0".repeat(64),
+      cloudsmith_quality_test_suite: "forged-suite",
+      ...canonical,
+    };
+
+    const posix = sanitizeQualificationEnvironment(collision, isolatedHome, {
+      platform: "darwin",
+    });
+    for (const [name, value] of Object.entries(canonical)) {
+      assert.strictEqual(posix[name], value);
+    }
+    assert.throws(
+      () => sanitizeQualificationEnvironment(collision, isolatedHome, {
+        platform: "win32",
+      }),
+      /case-colliding key/u
+    );
+  });
+
   test("qualification host roots are atomic, private, unique, and exactly cleaned", () => {
     const temporaryParent = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-host-root-test-"));
     try {
@@ -179,6 +214,8 @@ suite("test runner inventories", () => {
       fs.writeFileSync(rogueExtension, "{}\n");
 
       const runRoot = createIsolatedQualificationRoot("core", temporaryParent);
+      const secondRunRoot = createIsolatedQualificationRoot("core", temporaryParent);
+      assert.notStrictEqual(runRoot, secondRunRoot);
       assert.notStrictEqual(runRoot, predictableRoot);
       assert.strictEqual(path.dirname(runRoot), fs.realpathSync(temporaryParent));
       assert.match(path.basename(runRoot), /^csv-c-[A-Za-z0-9]{6}$/);
@@ -193,9 +230,65 @@ suite("test runner inventories", () => {
         () => removeIsolatedQualificationRoot(predictableRoot),
         /refuses a directory it did not create/
       );
+      const heldRoot = `${runRoot}-held`;
+      fs.renameSync(runRoot, heldRoot);
+      fs.mkdirSync(runRoot, { mode: 0o700 });
+      assert.throws(
+        () => removeIsolatedQualificationRoot(runRoot),
+        /refuses a replaced host root/
+      );
+      fs.rmSync(runRoot, { force: true, recursive: true });
+      fs.renameSync(heldRoot, runRoot);
       removeIsolatedQualificationRoot(runRoot);
+      removeIsolatedQualificationRoot(secondRunRoot);
       assert.strictEqual(fs.existsSync(runRoot), false);
       assert.strictEqual(fs.existsSync(rogueExtension), true);
+    } finally {
+      fs.rmSync(temporaryParent, { force: true, recursive: true });
+    }
+  });
+
+  test("qualification launcher roots require an exact one-use ownership handoff", () => {
+    const temporaryParent = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-host-transfer-test-"));
+    const runRoot = createIsolatedQualificationRoot("smoke", temporaryParent);
+    try {
+      const proof = exportIsolatedQualificationRoot(runRoot);
+      const inventoryModule = require.resolve("./testInventories");
+      delete require.cache[inventoryModule];
+      const transferredInventory = require("./testInventories");
+      assert.throws(
+        () => transferredInventory.adoptIsolatedQualificationRoot(
+          runRoot,
+          "0".repeat(64),
+          "smoke",
+          temporaryParent
+        ),
+        /ownership proof does not match/u
+      );
+      assert.throws(
+        () => transferredInventory.adoptIsolatedQualificationRoot(
+          runRoot,
+          proof,
+          "core",
+          temporaryParent
+        ),
+        /exact temporary namespace/u
+      );
+      assert.throws(
+        () => exportIsolatedQualificationRoot(runRoot),
+        /EEXIST/u
+      );
+      assert.strictEqual(
+        transferredInventory.adoptIsolatedQualificationRoot(
+          runRoot,
+          proof,
+          "smoke",
+          temporaryParent
+        ),
+        runRoot
+      );
+      transferredInventory.removeIsolatedQualificationRoot(runRoot);
+      assert.strictEqual(fs.existsSync(runRoot), false);
     } finally {
       fs.rmSync(temporaryParent, { force: true, recursive: true });
     }
@@ -259,6 +352,8 @@ suite("test runner inventories", () => {
       "vscode.microsoft-authentication",
       "GitHub.copilot",
       "GitHub.copilot-chat",
+      "TypeScriptTeam.jsts-chat-features",
+      "vscode.mermaid-markdown-features",
     ]) {
       assert.match(
         config,

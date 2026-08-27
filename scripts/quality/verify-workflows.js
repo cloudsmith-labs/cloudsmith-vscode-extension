@@ -2,6 +2,8 @@
 
 const fs = require("fs");
 const path = require("path");
+const { isDeepStrictEqual } = require("util");
+const yaml = require("js-yaml");
 const {
   AUTOMATED_LAYERS,
   ROOT,
@@ -46,6 +48,7 @@ function verifyQualityContracts(options = {}) {
   const sourceOverrides = options.sourceOverrides || {};
   const repositoryFiles = options.repositoryFiles || gitVisibleFiles(root);
   const manifest = options.manifest || readJson("package.json", root);
+  const lockfile = options.lockfile || readJson("package-lock.json", root);
   const mutationBaseline = options.mutationBaseline
     || readJson("quality/mutation-baseline.json", root);
   const inventories = options.inventories
@@ -55,10 +58,19 @@ function verifyQualityContracts(options = {}) {
   errors.push(...validateMutationBaseline(mutationBaseline, {
     root,
     commitIsAncestor: options.mutationBaselineCommitIsAncestor,
+    lockfile,
+    manifest,
     repositoryFiles,
   }).errors);
   verifyTaxonomy(taxonomy, findingSchema, errors);
   verifyExtensionHostHarness(root, repositoryFiles, sourceOverrides, errors);
+  verifyEvidenceHandoffContract(
+    root,
+    repositoryFiles,
+    sourceOverrides,
+    errors,
+    manifest
+  );
   const workflowIds = verifyWorkflows(
     workflowsDocument,
     actionDocument,
@@ -82,6 +94,280 @@ function verifyQualityContracts(options = {}) {
   verifyScriptedWebviews(actionDocument, root, repositoryFiles, sourceOverrides, errors);
 
   return { errors: uniqueSorted(errors), workflowCount: workflowIds.size };
+}
+
+function verifyEvidenceHandoffContract(
+  root,
+  repositoryFiles,
+  sourceOverrides,
+  errors,
+  manifest
+) {
+  const verifierPath = "scripts/quality/verify-handoff.js";
+  const mutationVerifierPath = "scripts/quality/verify-mutation-handoff.js";
+  const deepWorkflowPath = ".github/workflows/deep-quality.yml";
+  const workflowPath = ".github/workflows/main.yml";
+  if (manifest?.scripts?.["quality:verify-evidence"]
+    !== "node scripts/quality/verify-handoff.js") {
+    errors.push("Package scripts must expose the exact quality evidence handoff verifier.");
+  }
+  if (manifest?.scripts?.["quality:verify-mutation-evidence"]
+    !== "node scripts/quality/verify-mutation-handoff.js") {
+    errors.push("Package scripts must expose the exact mutation evidence handoff verifier.");
+  }
+  let deepWorkflowTarget;
+  let workflowTarget;
+  try {
+    resolveGitVisibleRegularFile(verifierPath, repositoryFiles, root);
+    resolveGitVisibleRegularFile(mutationVerifierPath, repositoryFiles, root);
+    deepWorkflowTarget = resolveGitVisibleRegularFile(deepWorkflowPath, repositoryFiles, root);
+    workflowTarget = resolveGitVisibleRegularFile(workflowPath, repositoryFiles, root);
+  } catch {
+    errors.push("Quality evidence handoff source and CI workflow must be Git-visible regular files.");
+    return;
+  }
+  const deepWorkflow = verifiedSource(deepWorkflowPath, deepWorkflowTarget, sourceOverrides);
+  const workflow = verifiedSource(workflowPath, workflowTarget, sourceOverrides);
+  const workflowDocument = parseCiWorkflow(workflow);
+  const deepWorkflowDocument = parseCiWorkflow(deepWorkflow);
+  if (!validMainWorkflowEnvelope(workflowDocument)
+    || !isDeepStrictEqual(workflowDocument?.jobs?.quality, expectedQualityJob())) {
+    errors.push(
+      "CI must verify the exact fast-gate evidence immediately before a verifier-gated upload."
+    );
+  }
+  if (!validMainWorkflowEnvelope(workflowDocument)
+    || !isDeepStrictEqual(workflowDocument?.jobs?.mutation, expectedChangedMutationJob())
+    || !validArtifactUploadInventory(workflowDocument, {
+      quality: 1,
+      mutation: 1,
+      "extension-tests": 0,
+      package: 1,
+      "build-candidate": 0,
+    })) {
+    errors.push(
+      "CI must verify the exact changed-mutation evidence immediately before a verifier-gated upload."
+    );
+  }
+  if (!validDeepWorkflowEnvelope(deepWorkflowDocument)
+    || !isDeepStrictEqual(
+      deepWorkflowDocument?.jobs?.["core-mutation"],
+      expectedCoreMutationJob()
+    )
+    || !validArtifactUploadInventory(deepWorkflowDocument, {
+      "core-mutation": 1,
+      "black-box-ui-boundary": 1,
+    })) {
+    errors.push(
+      "Deep CI must verify exact core-mutation evidence before a verifier-gated upload."
+    );
+  }
+}
+
+const CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
+const SETUP_NODE_ACTION = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020";
+const UPLOAD_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+const QUALITY_BASE = "${{ github.event_name == 'push' && github.event.before || 'origin/main' }}";
+
+function parseCiWorkflow(source) {
+  try {
+    const document = yaml.load(source, { schema: yaml.CORE_SCHEMA });
+    return isPlainObject(document) ? document : null;
+  } catch {
+    return null;
+  }
+}
+
+function validMainWorkflowEnvelope(document) {
+  return isPlainObject(document)
+    && isDeepStrictEqual(Object.keys(document).sort(), ["env", "jobs", "name", "on", "permissions"])
+    && isDeepStrictEqual(document.on, {
+      push: { branches: ["main"] },
+      pull_request: { branches: ["main"] },
+    })
+    && isDeepStrictEqual(document.permissions, { contents: "read" })
+    && isDeepStrictEqual(document.env, { NODE_VERSION: "22.23.2" })
+    && isDeepStrictEqual(Object.keys(document.jobs || {}).sort(), [
+      "build-candidate",
+      "extension-tests",
+      "mutation",
+      "package",
+      "quality",
+    ]);
+}
+
+function validDeepWorkflowEnvelope(document) {
+  return isPlainObject(document)
+    && isDeepStrictEqual(Object.keys(document).sort(), ["env", "jobs", "name", "on", "permissions"])
+    && isDeepStrictEqual(document.on, { workflow_dispatch: null })
+    && isDeepStrictEqual(document.permissions, { contents: "read" })
+    && isDeepStrictEqual(document.env, { NODE_VERSION: "22.23.2" })
+    && isDeepStrictEqual(Object.keys(document.jobs || {}).sort(), [
+      "black-box-ui-boundary",
+      "core-mutation",
+    ]);
+}
+
+function expectedQualityJob() {
+  return {
+    name: "Quality",
+    "runs-on": "ubuntu-24.04",
+    "timeout-minutes": 15,
+    steps: [
+      checkoutStep("Checkout exact source", true),
+      setupNodeStep(),
+      installStep(),
+      {
+        name: "Log toolchain",
+        run: "node -e \"console.log({node:process.version,npm:process.env.npm_config_user_agent,platform:process.platform,arch:process.arch})\"",
+      },
+      { name: "Verify architecture boundaries", run: "npm run verify:architecture" },
+      { name: "Audit runtime dependency graph", run: "npm run audit:runtime" },
+      { name: "Audit development dependency graph", run: "npm run audit:dev" },
+      {
+        name: "Run the deterministic fast quality gate",
+        env: { QUALITY_BASE },
+        run: "npm run quality:fast",
+      },
+      {
+        name: "Verify exact quality evidence handoff",
+        id: "quality_evidence_handoff",
+        if: "${{ always() }}",
+        run: "npm run quality:verify-evidence -- --gate-profile fast",
+      },
+      {
+        name: "Upload quality impact and report evidence",
+        if: "${{ always() && steps.quality_evidence_handoff.outcome == 'success' }}",
+        uses: UPLOAD_ACTION,
+        with: {
+          name: "quality-evidence-${{ github.sha }}-${{ github.run_attempt }}",
+          path: ".quality/impact.json\n.quality/gates/fast.json\n.quality/gates/fast/*.json\n.quality/report.json\n.quality/report.md\n",
+          "if-no-files-found": "error",
+          "include-hidden-files": true,
+          "retention-days": 30,
+        },
+      },
+    ],
+  };
+}
+
+function expectedChangedMutationJob() {
+  return {
+    name: "Changed high-risk mutation gate",
+    "runs-on": "ubuntu-24.04",
+    "timeout-minutes": 30,
+    steps: [
+      checkoutStep("Checkout exact source with comparison history", true),
+      setupNodeStep(),
+      installStep(),
+      {
+        name: "Run changed high-risk mutation gate",
+        id: "mutation_run",
+        env: { QUALITY_BASE },
+        run: "set +e\nnpm run test:mutation:changed -- --base \"$QUALITY_BASE\"\nstatus=$?\necho \"exit_code=$status\" >> \"$GITHUB_OUTPUT\"\nexit \"$status\"\n",
+      },
+      {
+        name: "Verify exact mutation evidence handoff",
+        id: "mutation_evidence_handoff",
+        if: "${{ always() }}",
+        env: {
+          QUALITY_BASE,
+          EXPECTED_MUTATION_EXIT_CODE: "${{ steps.mutation_run.outputs.exit_code }}",
+          EXPECTED_MUTATION_OUTCOME: "${{ steps.mutation_run.outcome }}",
+          EXPECTED_SOURCE_SHA: "${{ github.sha }}",
+        },
+        run: "npm run quality:verify-mutation-evidence -- --base \"$QUALITY_BASE\" --expected-exit-code \"$EXPECTED_MUTATION_EXIT_CODE\" --expected-run-outcome \"$EXPECTED_MUTATION_OUTCOME\" --expected-source-sha \"$EXPECTED_SOURCE_SHA\"",
+      },
+      {
+        name: "Upload mutation evidence",
+        if: "${{ always() && steps.mutation_evidence_handoff.outcome == 'success' }}",
+        uses: UPLOAD_ACTION,
+        with: {
+          name: "mutation-evidence-${{ github.sha }}-${{ github.run_attempt }}",
+          path: ".quality/mutation/summary-changed.json\n.quality/mutation/mutation.json\n",
+          "if-no-files-found": "error",
+          "include-hidden-files": true,
+          "retention-days": 30,
+        },
+      },
+    ],
+  };
+}
+
+function expectedCoreMutationJob() {
+  return {
+    name: "Core mutation",
+    "runs-on": "ubuntu-24.04",
+    "timeout-minutes": 45,
+    steps: [
+      checkoutStep("Checkout exact source", true),
+      setupNodeStep(),
+      installStep(),
+      { name: "Verify release-quality contracts", run: "npm run verify:quality" },
+      {
+        name: "Run core mutation",
+        id: "mutation_run",
+        run: "set +e\nnpm run test:mutation:core\nstatus=$?\necho \"exit_code=$status\" >> \"$GITHUB_OUTPUT\"\nexit \"$status\"\n",
+      },
+      {
+        name: "Verify exact core mutation evidence handoff",
+        id: "mutation_evidence_handoff",
+        if: "${{ always() }}",
+        env: {
+          EXPECTED_MUTATION_EXIT_CODE: "${{ steps.mutation_run.outputs.exit_code }}",
+          EXPECTED_MUTATION_OUTCOME: "${{ steps.mutation_run.outcome }}",
+          EXPECTED_SOURCE_SHA: "${{ github.sha }}",
+        },
+        run: "npm run quality:verify-mutation-evidence -- --mode core --expected-exit-code \"$EXPECTED_MUTATION_EXIT_CODE\" --expected-run-outcome \"$EXPECTED_MUTATION_OUTCOME\" --expected-source-sha \"$EXPECTED_SOURCE_SHA\"",
+      },
+      {
+        name: "Upload core mutation evidence",
+        if: "${{ always() && steps.mutation_evidence_handoff.outcome == 'success' }}",
+        uses: UPLOAD_ACTION,
+        with: {
+          name: "core-mutation-evidence-${{ github.sha }}-${{ github.run_attempt }}",
+          path: ".quality/mutation/summary-core.json\n.quality/mutation/mutation.json\n",
+          "if-no-files-found": "error",
+          "include-hidden-files": true,
+          "retention-days": 30,
+        },
+      },
+    ],
+  };
+}
+
+function checkoutStep(name, history) {
+  const withOptions = { "persist-credentials": false };
+  if (history) withOptions["fetch-depth"] = 0;
+  return { name, uses: CHECKOUT_ACTION, with: withOptions };
+}
+
+function setupNodeStep() {
+  return {
+    name: "Set up exact Node.js",
+    uses: SETUP_NODE_ACTION,
+    with: {
+      "node-version": "${{ env.NODE_VERSION }}",
+      "package-manager-cache": false,
+    },
+  };
+}
+
+function installStep() {
+  return {
+    name: "Install locked dependencies without lifecycle scripts",
+    run: "npm ci --ignore-scripts --no-audit --no-fund",
+  };
+}
+
+function validArtifactUploadInventory(document, expectedByJob) {
+  if (!isPlainObject(document?.jobs)) return false;
+  return Object.entries(expectedByJob).every(([jobId, expected]) => {
+    const steps = document.jobs[jobId]?.steps;
+    return Array.isArray(steps) && steps.filter(step => (
+      typeof step?.uses === "string" && step.uses.startsWith("actions/upload-artifact@")
+    )).length === expected;
+  });
 }
 
 function verifyTaxonomy(taxonomy, findingSchema, errors) {

@@ -1,8 +1,10 @@
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
 const isolatedQualificationRoots = new Map();
+const QUALIFICATION_ROOT_TRANSFER_MARKER = ".cloudsmith-quality-root-owner";
 
 const STANDALONE_NODE_TESTS = Object.freeze([
   "test/accountOperation.test.js",
@@ -188,21 +190,30 @@ function assertCredentialFreeRequiredEnvironment(names) {
   return names;
 }
 
-function sanitizeQualificationEnvironment(environment, isolatedHome) {
+function sanitizeQualificationEnvironment(environment, isolatedHome, options = {}) {
   if (!environment || typeof environment !== "object" || Array.isArray(environment)) {
     throw new TypeError("Qualification environment must be an object.");
   }
   if (typeof isolatedHome !== "string" || !isolatedHome || !path.isAbsolute(isolatedHome)) {
     throw new Error("Qualification isolated home must be an absolute path.");
   }
+  const platform = options.platform || process.platform;
   const sourceEntries = Object.entries(environment);
-  const readCaseInsensitive = expectedName => {
-    const entry = sourceEntries.find(([name]) => name.toUpperCase() === expectedName);
-    return entry?.[1];
+  const readAllowedValue = expectedName => {
+    if (platform !== "win32") {
+      return Object.prototype.hasOwnProperty.call(environment, expectedName)
+        ? environment[expectedName]
+        : undefined;
+    }
+    const matching = sourceEntries.filter(([name]) => name.toUpperCase() === expectedName);
+    if (matching.length > 1) {
+      throw new Error(`Qualification environment has a case-colliding key: ${expectedName}`);
+    }
+    return matching[0]?.[1];
   };
   const sanitized = {};
   for (const name of QUALIFICATION_ENVIRONMENT_ALLOWLIST) {
-    const value = readCaseInsensitive(name);
+    const value = readAllowedValue(name);
     if (typeof value === "string" && value.length <= 32768 && !value.includes("\u0000")) {
       sanitized[name] = value;
     }
@@ -256,6 +267,67 @@ function createIsolatedQualificationRoot(label, temporaryParent = os.tmpdir()) {
   }
 }
 
+function exportIsolatedQualificationRoot(runRoot) {
+  const resolved = typeof runRoot === "string" ? path.resolve(runRoot) : "";
+  const identity = isolatedQualificationRoots.get(resolved);
+  if (!identity || path.dirname(resolved) !== identity.parent) {
+    throw new Error("Qualification transfer refuses a directory it did not create.");
+  }
+  const stat = fs.lstatSync(resolved);
+  if (!stat.isDirectory() || stat.isSymbolicLink()
+    || stat.dev !== identity.device || stat.ino !== identity.inode) {
+    throw new Error("Qualification transfer refuses a replaced host root.");
+  }
+  const proof = crypto.randomBytes(32).toString("hex");
+  fs.writeFileSync(
+    path.join(resolved, QUALIFICATION_ROOT_TRANSFER_MARKER),
+    `${proof}\n`,
+    { encoding: "utf8", flag: "wx", mode: 0o600 }
+  );
+  return proof;
+}
+
+function adoptIsolatedQualificationRoot(runRoot, proof, label, temporaryParent = os.tmpdir()) {
+  if (!new Set(["core", "smoke"]).has(label)) {
+    throw new Error("Qualification transfer label must be core or smoke.");
+  }
+  if (typeof runRoot !== "string" || !path.isAbsolute(runRoot)
+    || !/^[a-f0-9]{64}$/u.test(proof || "")) {
+    throw new Error("Qualification transfer requires an absolute root and exact ownership proof.");
+  }
+  const parent = fs.realpathSync(temporaryParent);
+  const resolved = path.resolve(runRoot);
+  const expectedName = new RegExp(
+    `^csv-${label === "core" ? "c" : "s"}-[A-Za-z0-9]{6}$`,
+    "u"
+  );
+  if (path.dirname(resolved) !== parent
+    || !expectedName.test(path.basename(resolved))
+    || isolatedQualificationRoots.has(resolved)) {
+    throw new Error("Qualification transfer root is outside its exact temporary namespace.");
+  }
+  const stat = fs.lstatSync(resolved);
+  if (!stat.isDirectory() || stat.isSymbolicLink()
+    || (process.platform !== "win32" && (stat.mode & 0o077) !== 0)) {
+    throw new Error("Qualification transfer root must be a private real directory.");
+  }
+  const marker = path.join(resolved, QUALIFICATION_ROOT_TRANSFER_MARKER);
+  const markerStat = fs.lstatSync(marker);
+  if (!markerStat.isFile() || markerStat.isSymbolicLink()
+    || markerStat.size !== 65
+    || (process.platform !== "win32" && (markerStat.mode & 0o077) !== 0)
+    || fs.readFileSync(marker, "utf8") !== `${proof}\n`) {
+    throw new Error("Qualification transfer ownership proof does not match.");
+  }
+  fs.unlinkSync(marker);
+  isolatedQualificationRoots.set(resolved, Object.freeze({
+    device: stat.dev,
+    inode: stat.ino,
+    parent,
+  }));
+  return resolved;
+}
+
 function removeIsolatedQualificationRoot(runRoot) {
   const resolved = typeof runRoot === "string" ? path.resolve(runRoot) : "";
   const identity = isolatedQualificationRoots.get(resolved);
@@ -287,7 +359,9 @@ module.exports = {
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,
   assertCredentialFreeRequiredEnvironment,
+  adoptIsolatedQualificationRoot,
   createIsolatedQualificationRoot,
+  exportIsolatedQualificationRoot,
   removeIsolatedQualificationRoot,
   sanitizeQualificationEnvironment,
 };

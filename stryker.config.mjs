@@ -1,42 +1,20 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const mutationBaseline = require("./quality/mutation-baseline.json");
+const mutationTestFiles = Object.freeze([...new Set(
+  mutationBaseline.scope.flatMap(target => mutationBaseline.files[target].testFiles)
+)].sort());
+
 export default {
-  mutate: [
-    "domain/authCapabilities.js",
-    "domain/installGuidanceSupport.js",
-    "domain/packageActionCapabilities.js",
-    "util/searchQueryBuilder.js",
-    "util/vulnerabilityReportProjection.js",
-    "util/externalNavigation.js",
-    "util/upstreamOperationScheduler.js:141-219",
-    "util/vulnerabilityStateService.js:616-718",
-    "util/installCommandBuilder.js:650-830",
-  ],
+  mutate: [...mutationBaseline.scope],
   testRunner: "mocha",
-  testFiles: [
-    "test/authCapabilities.test.js",
-    "test/installCommandBuilder.test.js",
-    "test/installGuidanceSupport.test.js",
-    "test/packageActionCapabilities.test.js",
-    "test/searchQueryBuilder.test.js",
-    "test/vulnerabilityReportProjection.test.js",
-    "test/externalNavigation.test.js",
-    "test/upstreamOperationScheduler.test.js",
-    "test/vulnerabilityStateService.test.js",
-  ],
+  testFiles: mutationTestFiles,
   mochaOptions: {
     ui: "tdd",
-    spec: [
-      "test/authCapabilities.test.js",
-      "test/installCommandBuilder.test.js",
-      "test/installGuidanceSupport.test.js",
-      "test/packageActionCapabilities.test.js",
-      "test/searchQueryBuilder.test.js",
-      "test/vulnerabilityReportProjection.test.js",
-      "test/externalNavigation.test.js",
-      "test/upstreamOperationScheduler.test.js",
-      "test/vulnerabilityStateService.test.js",
-    ],
+    spec: mutationTestFiles,
     "no-config": true,
     "no-package": true,
     "no-opts": true,
@@ -61,6 +39,10 @@ export default {
   timeoutMS: 10_000,
   // The wrapper applies the measured core and per-file changed-mode floors.
   // A single Stryker break value cannot represent both aggregate and scoped runs.
-  thresholds: { high: 95, low: 90, break: 0 },
+  thresholds: {
+    high: mutationBaseline.thresholds.high,
+    low: mutationBaseline.thresholds.low,
+    break: 0,
+  },
   allowEmpty: false,
 };

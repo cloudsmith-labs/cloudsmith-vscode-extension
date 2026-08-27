@@ -51,21 +51,23 @@ jobs:
           QUALITY_BASE: ${{ github.event_name == 'push' && github.event.before || 'origin/main' }}
         run: npm run quality:fast
 
-      - name: Summarize deterministic quality evidence
+      - name: Verify exact quality evidence handoff
+        id: quality_evidence_handoff
         if: ${{ always() }}
-        run: npm run quality:report -- --gate-profile fast
+        run: npm run quality:verify-evidence -- --gate-profile fast
 
       - name: Upload quality impact and report evidence
-        if: ${{ always() }}
+        if: ${{ always() && steps.quality_evidence_handoff.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: quality-evidence-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             .quality/impact.json
-            .quality/gates/**
+            .quality/gates/fast.json
+            .quality/gates/fast/*.json
             .quality/report.json
             .quality/report.md
-          if-no-files-found: warn
+          if-no-files-found: error
           include-hidden-files: true
           retention-days: 30
 
@@ -90,18 +92,35 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Run changed high-risk mutation gate
+        id: mutation_run
         env:
           QUALITY_BASE: ${{ github.event_name == 'push' && github.event.before || 'origin/main' }}
-        run: npm run test:mutation:changed -- --base "$QUALITY_BASE"
+        run: |
+          set +e
+          npm run test:mutation:changed -- --base "$QUALITY_BASE"
+          status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Verify exact mutation evidence handoff
+        id: mutation_evidence_handoff
+        if: ${{ always() }}
+        env:
+          QUALITY_BASE: ${{ github.event_name == 'push' && github.event.before || 'origin/main' }}
+          EXPECTED_MUTATION_EXIT_CODE: ${{ steps.mutation_run.outputs.exit_code }}
+          EXPECTED_MUTATION_OUTCOME: ${{ steps.mutation_run.outcome }}
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+        run: npm run quality:verify-mutation-evidence -- --base "$QUALITY_BASE" --expected-exit-code "$EXPECTED_MUTATION_EXIT_CODE" --expected-run-outcome "$EXPECTED_MUTATION_OUTCOME" --expected-source-sha "$EXPECTED_SOURCE_SHA"
 
       - name: Upload mutation evidence
-        if: ${{ always() }}
+        if: ${{ always() && steps.mutation_evidence_handoff.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mutation-evidence-${{ github.sha }}-${{ github.run_attempt }}
           path: |
-            .quality/mutation/**
-          if-no-files-found: warn
+            .quality/mutation/summary-changed.json
+            .quality/mutation/mutation.json
+          if-no-files-found: error
           include-hidden-files: true
           retention-days: 30
 
