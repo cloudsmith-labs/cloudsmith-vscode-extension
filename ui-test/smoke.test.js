@@ -51,7 +51,7 @@ suite("packaged black-box UI smoke", function () {
 
   test("publishes the exact signed-out command set in the real Command Palette", async () => {
     const input = await new Workbench().openCommandPrompt();
-    await input.setText("Cloudsmith:");
+    await input.setText(">Cloudsmith:");
     const choices = await Promise.all((await input.getQuickPicks()).map(async item => ({
       label: await item.getLabel(),
       enabled: await item.isEnabled(),

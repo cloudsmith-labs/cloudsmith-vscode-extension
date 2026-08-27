@@ -731,10 +731,12 @@ suite("Command registrars", () => {
       id: child.command.arguments[0],
       command: child.command.command,
       url: child.tooltip,
+      accessibleName: child.getTreeItem().accessibilityInformation?.label,
     })), HELP_LINKS.map(link => ({
       id: link.id,
       command: "cloudsmith-vscode-extension.cloudsmithDocs",
       url: link.url,
+      accessibleName: link.label,
     })));
   });
 

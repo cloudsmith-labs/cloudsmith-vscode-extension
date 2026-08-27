@@ -20,6 +20,7 @@ class helpNode extends vscode.TreeItem {
     getTreeItem() {
         return {
             label: this.label,
+            accessibilityInformation: { label: this.label },
             iconPath: this.icon,
             command: this.command,
             tooltip: this.tooltip,
