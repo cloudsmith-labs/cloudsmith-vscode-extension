@@ -21,6 +21,7 @@
     "canonical-dependency-package",
     "canonical-repository",
     "validated-external-url",
+    "validated-nvd-https-reference",
     "current-webview-operation"
   ],
   "actions": [
@@ -108,11 +109,11 @@
       "id": "ACT-VULNERABILITY-OPEN-REFERENCE",
       "workflow": "WF-VULNERABILITY-TRUTH",
       "producer": { "surface": "Vulnerability WebView", "actionId": "openExternal", "provenance": "current-webview-operation" },
-      "consumer": { "kind": "provider-internal", "target": "VulnerabilityProvider._openExternal", "acceptedProvenance": ["current-webview-operation"] },
-      "canonicalArgumentType": "validated-external-url",
+      "consumer": { "kind": "provider-internal", "target": "NVD-only VulnerabilityProvider._openExternal navigation", "acceptedProvenance": ["current-webview-operation"] },
+      "canonicalArgumentType": "validated-nvd-https-reference",
       "freshnessOwner": "VulnerabilityProvider current operation",
-      "authoritativeOutcome": "The exact validated CVE/GHSA reference opens only on an approved HTTPS origin, or refusal/rejection produces a truthful warning.",
-      "requiredTest": { "file": "test/vulnerabilityProvider.test.js", "name": "vulnerability WebView navigation reports refused and rejected external opens" }
+      "authoritativeOutcome": "A current-operation HTTPS NVD reference opens only on nvd.nist.gov or a .nist.gov subdomain without credentials or an explicit port; invalid or unapproved references are ignored, and platform refusal/rejection produces a truthful warning.",
+      "requiredTest": { "file": "test/vulnerabilityProvider.test.js", "name": "opens only approved HTTPS NVD references from the current vulnerability WebView operation" }
     },
     {
       "id": "ACT-VULNERABILITY-RETRY",

@@ -5,6 +5,7 @@ const path = require("path");
 const zlib = require("zlib");
 const { spawnSync } = require("child_process");
 const yauzl = require("yauzl");
+const { buildNonAuthQualityEnvironment } = require("../quality/non-auth-environment");
 const { FORMAT_ICON_FILES } = require("../../util/formatIconInventory");
 
 const root = path.resolve(__dirname, "../..");
@@ -55,10 +56,12 @@ const sensitivePatterns = Object.freeze([
   { id: "aws-access-key", expression: /AKIA[0-9A-Z]{16}/ },
 ]);
 
-function runGit(arguments_, encoding = "utf8") {
-  const result = spawnSync("git", arguments_, {
+function runGit(arguments_, encoding = "utf8", options = {}) {
+  const spawn = options.spawnSync || spawnSync;
+  const result = spawn("git", arguments_, {
     cwd: root,
     encoding,
+    env: buildNonAuthQualityEnvironment(options.environment || process.env),
     maxBuffer: 64 * 1024 * 1024,
   });
   if (result.status !== 0) {
@@ -727,6 +730,7 @@ module.exports = {
   limits,
   parseCentralDirectory,
   parseCliArguments,
+  runPackageGitCommand: runGit,
   resolveExpectedSourceSha,
   scanSensitiveBytes,
   selectArtifactPath,

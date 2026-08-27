@@ -11,6 +11,7 @@ const {
   writeJson,
 } = require("./common");
 const { aggregateStatuses, fingerprint, sourceIdentity } = require("./evidence");
+const { buildNonAuthQualityEnvironment } = require("./non-auth-environment");
 const {
   STANDALONE_NODE_TESTS,
   VSCODE_CORE_TESTS,
@@ -45,6 +46,7 @@ const PHASE_STEPS = Object.freeze({
   ]),
   release: Object.freeze([
     "black-box-ui-smoke",
+    "secret-release",
     "release-checklist",
     "secret-history",
   ]),
@@ -166,6 +168,16 @@ const STEP_CATALOG = Object.freeze({
     artifactPath: ".quality/ui/result.json",
     artifactSubtree: ".quality/ui",
     blockedExitCodes: Object.freeze([2]),
+  }),
+  "secret-release": Object.freeze({
+    ...commandStep(
+      "secret-release",
+      "security",
+      "node",
+      ["scripts/quality/release-exposure-scan.js"]
+    ),
+    artifactPath: ".quality/secrets/release.json",
+    artifactSubtree: ".quality/secrets",
   }),
   "release-checklist": Object.freeze({
     ...commandStep(
@@ -406,17 +418,23 @@ function completedReceipt(profile, step, source, execution = {}) {
 function executeCommand(step, context = {}) {
   const root = context.root || ROOT;
   const executable = resolveExecutable(step.executable);
+  const spawn = context.spawnSync || spawnSync;
   clearStepOutputs(step, root);
-  const result = spawnSync(executable, step.args, {
+  const evidenceEnvironment = step.evidencePath ? {
+    CLOUDSMITH_QUALITY_SOURCE_SHA: context.source?.sha || "",
+    CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT: context.source?.fingerprint || "",
+    CLOUDSMITH_QUALITY_TEST_EVIDENCE: step.evidencePath,
+    CLOUDSMITH_QUALITY_TEST_SUITE: step.id,
+  } : {};
+  const environment = buildNonAuthQualityEnvironment(
+    context.environment || process.env,
+    evidenceEnvironment,
+    { platform: context.platform }
+  );
+  const result = spawn(executable, step.args, {
     cwd: root,
     encoding: "utf8",
-    env: step.evidencePath ? {
-      ...process.env,
-      CLOUDSMITH_QUALITY_SOURCE_SHA: context.source?.sha || "",
-      CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT: context.source?.fingerprint || "",
-      CLOUDSMITH_QUALITY_TEST_EVIDENCE: step.evidencePath,
-      CLOUDSMITH_QUALITY_TEST_SUITE: step.id,
-    } : process.env,
+    env: environment,
     maxBuffer: 64 * 1024 * 1024,
   });
   if (result.stdout) process.stdout.write(result.stdout);

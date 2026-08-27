@@ -3,17 +3,25 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const { buildNonAuthQualityEnvironment } = require("../quality/non-auth-environment");
 const { assertVersionState } = require("./verify-version");
 const { validateSidecars, verifyVsix } = require("./verify-vsix");
 
 const root = path.resolve(__dirname, "../..");
 
 function run(command, arguments_, options = {}) {
-  const result = spawnSync(command, arguments_, {
-    cwd: root,
+  const spawn = options.spawnSync || spawnSync;
+  const environment = buildNonAuthQualityEnvironment(
+    options.environment || process.env,
+    options.environmentOverrides || {},
+    { platform: options.platform }
+  );
+  const result = spawn(command, arguments_, {
+    cwd: options.cwd || root,
     encoding: "utf8",
     maxBuffer: 32 * 1024 * 1024,
-    ...options,
+    windowsHide: true,
+    env: environment,
   });
   if (result.error || result.signal || result.status !== 0) {
     process.stderr.write(result.stdout || "");
@@ -81,15 +89,16 @@ async function main() {
   const firstPath = resolveOutputPath(tempDirectory, `first-${filename}`);
   const secondPath = resolveOutputPath(tempDirectory, `second-${filename}`);
   const vsce = path.join(root, "node_modules", ".bin", process.platform === "win32" ? "vsce.cmd" : "vsce");
-  const environment = {
-    ...process.env,
+  const environmentOverrides = {
     SOURCE_DATE_EPOCH: String(sourceCommitEpoch),
     TZ: "UTC",
   };
 
   try {
     for (const outputPath of [firstPath, secondPath]) {
-      run(vsce, ["package", "--no-dependencies", "--out", outputPath], { env: environment });
+      run(vsce, ["package", "--no-dependencies", "--out", outputPath], {
+        environmentOverrides,
+      });
       if (requireClean && gitStatus() !== "") {
         throw new Error("VSCE prepublish changed the clean source checkout");
       }
@@ -174,5 +183,6 @@ if (require.main === module) {
 }
 
 module.exports = {
+  runPackageCommand: run,
   resolveOutputPath,
 };

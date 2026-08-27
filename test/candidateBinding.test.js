@@ -8,6 +8,7 @@ const path = require("path");
 const {
   AUTHENTICATED_CANDIDATE_ARTIFACT,
   AUTHENTICATED_CANDIDATE_RECEIPT,
+  IMMUTABLE_EXTENSION_ARTIFACT_KEYS,
   IMMUTABLE_CANDIDATE_KEYS,
   LIVE_CANDIDATE_ARTIFACT,
   LIVE_CANDIDATE_RECEIPT,
@@ -16,6 +17,7 @@ const {
   validateAuthenticatedExecutionReceipt,
   validateCandidateBinding,
   validateEquivalentCandidateProduct,
+  validateEquivalentExtensionArtifact,
 } = require("../scripts/quality/candidate-binding");
 const { fingerprint } = require("../scripts/quality/evidence");
 const {
@@ -256,6 +258,35 @@ suite("live qualification candidate binding", () => {
         vsixSha256: "f".repeat(64),
       }),
       /same immutable product artifact/u,
+    );
+  });
+
+  test("matches one immutable extension artifact across different VS Code runtimes", () => {
+    const fixture = candidateFixture(roots);
+    const liveCandidate = candidateBindingFromReceipt(fixture.receipt, { source: SOURCE });
+    const signedOutCandidate = {
+      ...liveCandidate,
+      vscodeVersion: "1.131.0",
+    };
+
+    assert.strictEqual(
+      validateEquivalentExtensionArtifact(liveCandidate, signedOutCandidate),
+      true,
+    );
+    assert.deepStrictEqual(
+      IMMUTABLE_EXTENSION_ARTIFACT_KEYS,
+      IMMUTABLE_CANDIDATE_KEYS.filter(key => key !== "vscodeVersion"),
+    );
+    assert.throws(
+      () => validateEquivalentCandidateProduct(liveCandidate, signedOutCandidate),
+      /same immutable product artifact/u,
+    );
+    assert.throws(
+      () => validateEquivalentExtensionArtifact(liveCandidate, {
+        ...signedOutCandidate,
+        vsixSha256: "f".repeat(64),
+      }),
+      /same immutable extension artifact/u,
     );
   });
 

@@ -15,6 +15,8 @@ const LIVE_CANDIDATE_RECEIPT = ".quality/qualification/live-candidate.json";
 const LIVE_CANDIDATE_ARTIFACT = ".quality/qualification/live-candidate.vsix";
 const AUTHENTICATED_CANDIDATE_RECEIPT = ".quality/qualification/authenticated-candidate.json";
 const AUTHENTICATED_CANDIDATE_ARTIFACT = ".quality/qualification/authenticated-candidate.vsix";
+const UI_CANDIDATE_RECEIPT = ".quality/qualification/ui-candidate.json";
+const UI_CANDIDATE_ARTIFACT = ".quality/qualification/ui-candidate.vsix";
 const MAX_VSIX_BYTES = 12 * 1024 * 1024;
 const MAX_VSIX_ENTRIES = 1250;
 const CANDIDATE_BINDING_KEYS = Object.freeze([
@@ -42,6 +44,9 @@ const IMMUTABLE_CANDIDATE_KEYS = Object.freeze([
   "vscodeVersion",
   "vsixSha256",
 ]);
+const IMMUTABLE_EXTENSION_ARTIFACT_KEYS = Object.freeze(
+  IMMUTABLE_CANDIDATE_KEYS.filter(key => key !== "vscodeVersion")
+);
 
 function hasExactKeys(value, keys) {
   return isPlainObject(value)
@@ -284,6 +289,19 @@ function validateEquivalentCandidateProduct(localCandidate, ciCandidate) {
   return true;
 }
 
+function validateEquivalentExtensionArtifact(leftCandidate, rightCandidate) {
+  validateCandidateBinding(leftCandidate);
+  validateCandidateBinding(rightCandidate);
+  if (IMMUTABLE_EXTENSION_ARTIFACT_KEYS.some(
+    key => leftCandidate[key] !== rightCandidate[key]
+  )) {
+    throw new Error(
+      "Qualification candidates do not identify the same immutable extension artifact."
+    );
+  }
+  return true;
+}
+
 function validateAuthenticatedExecutionReceipt(receipt, candidate, source) {
   const unsigned = { ...receipt };
   delete unsigned.fingerprint;
@@ -358,13 +376,17 @@ module.exports = {
   AUTHENTICATED_CANDIDATE_ARTIFACT,
   AUTHENTICATED_CANDIDATE_RECEIPT,
   CANDIDATE_BINDING_KEYS,
+  IMMUTABLE_EXTENSION_ARTIFACT_KEYS,
   IMMUTABLE_CANDIDATE_KEYS,
   LIVE_CANDIDATE_ARTIFACT,
   LIVE_CANDIDATE_RECEIPT,
+  UI_CANDIDATE_ARTIFACT,
+  UI_CANDIDATE_RECEIPT,
   candidateBindingFromReceipt,
   profileRootIdentity,
   sameSource,
   validateAuthenticatedExecutionReceipt,
   validateCandidateBinding,
   validateEquivalentCandidateProduct,
+  validateEquivalentExtensionArtifact,
 };

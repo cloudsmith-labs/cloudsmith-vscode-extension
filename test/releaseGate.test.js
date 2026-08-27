@@ -5,13 +5,17 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { applyAuditPolicy } = require("../scripts/release/verify-dependency-audit");
-const { resolveOutputPath } = require("../scripts/release/package-vsix");
+const {
+  resolveOutputPath,
+  runPackageCommand,
+} = require("../scripts/release/package-vsix");
 const { assertVersionState } = require("../scripts/release/verify-version");
 const {
   assertRelativeModuleClosure,
   isApprovedSourcePath,
   parseCliArguments,
   resolveExpectedSourceSha,
+  runPackageGitCommand,
   scanSensitiveBytes,
   selectArtifactPath,
   validateArchivePath,
@@ -268,6 +272,83 @@ suite("M9 release gate helpers", () => {
     assert.throws(
       () => resolveOutputPath(outputRoot, "../escaped.vsix"),
       /escaped/,
+    );
+  });
+
+  test("package and VSCE subprocesses receive only the non-auth environment allowlist", () => {
+    const syntheticEnvironment = {
+      PATH: "/fixture/bin",
+      LANG: "en_US.UTF-8",
+      CLOUDSMITH_API_KEY: "synthetic-qh141-package-sentinel",
+      ARBITRARY_REFRESH_TOKEN: "synthetic-qh141-refresh-sentinel",
+      NODE_OPTIONS: "--require=synthetic-untrusted-hook",
+    };
+    let childEnvironment;
+    const output = runPackageCommand("fixture-vsce", ["package"], {
+      environment: syntheticEnvironment,
+      environmentOverrides: { SOURCE_DATE_EPOCH: "1234567890", TZ: "UTC" },
+      spawnSync(_command, _arguments, options) {
+        childEnvironment = options.env;
+        const unsafe = [
+          "CLOUDSMITH_API_KEY",
+          "ARBITRARY_REFRESH_TOKEN",
+          "NODE_OPTIONS",
+        ].some(name => Object.prototype.hasOwnProperty.call(options.env, name));
+        return {
+          status: 0,
+          signal: null,
+          error: null,
+          stdout: unsafe ? "unsafe-package-output" : "safe-package-output",
+          stderr: "",
+        };
+      },
+    });
+
+    assert.strictEqual(output, "safe-package-output");
+    assert.deepStrictEqual(childEnvironment, {
+      PATH: "/fixture/bin",
+      LANG: "en_US.UTF-8",
+      TZ: "UTC",
+      SOURCE_DATE_EPOCH: "1234567890",
+    });
+    assert.strictEqual(
+      crypto.createHash("sha256").update(output).digest("hex"),
+      crypto.createHash("sha256").update("safe-package-output").digest("hex")
+    );
+    for (const value of [
+      syntheticEnvironment.CLOUDSMITH_API_KEY,
+      syntheticEnvironment.ARBITRARY_REFRESH_TOKEN,
+    ]) {
+      assert.strictEqual(JSON.stringify(childEnvironment).includes(value), false);
+      assert.strictEqual(output.includes(value), false);
+    }
+
+    let verifierEnvironment;
+    const verifierOutput = runPackageGitCommand(["status"], "utf8", {
+      environment: syntheticEnvironment,
+      spawnSync(_command, _arguments, options) {
+        verifierEnvironment = options.env;
+        const unsafe = Object.prototype.hasOwnProperty.call(
+          options.env,
+          "CLOUDSMITH_API_KEY"
+        );
+        return {
+          status: 0,
+          signal: null,
+          error: null,
+          stdout: unsafe ? "unsafe-verifier-output" : "safe-verifier-output",
+          stderr: "",
+        };
+      },
+    });
+    assert.strictEqual(verifierOutput, "safe-verifier-output");
+    assert.deepStrictEqual(verifierEnvironment, {
+      PATH: "/fixture/bin",
+      LANG: "en_US.UTF-8",
+    });
+    assert.strictEqual(
+      crypto.createHash("sha256").update(verifierOutput).digest("hex"),
+      crypto.createHash("sha256").update("safe-verifier-output").digest("hex")
     );
   });
 

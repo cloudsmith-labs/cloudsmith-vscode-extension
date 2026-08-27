@@ -1,20 +1,23 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const fs = require("fs");
-const path = require("path");
 const {
   ROOT,
   readJson,
   resolveExistingRepositoryFile,
 } = require("./common");
 const { sourceIdentity } = require("./evidence");
-const { candidateBindingFromReceipt } = require("./candidate-binding");
+const {
+  UI_CANDIDATE_ARTIFACT,
+  UI_CANDIDATE_RECEIPT,
+  candidateBindingFromReceipt,
+} = require("./candidate-binding");
 const {
   expectedBlackBoxUiTests,
   validateUiResult,
 } = require("./report");
 
-const CANDIDATE_RECEIPT = ".quality/qualification/candidate.json";
+const CANDIDATE_RECEIPT = UI_CANDIDATE_RECEIPT;
 const UI_RESULT = ".quality/ui/result.json";
 const MAX_EVIDENCE_BYTES = 2 * 1024 * 1024;
 
@@ -39,7 +42,11 @@ function verifySignedOutUiEvidence(options = {}) {
   );
   const ui = options.ui || readBoundedJson(UI_RESULT, root, ".quality/ui");
   try {
-    const artifactPath = path.resolve(root, String(candidateReceipt?.artifact?.vsixPath || ""));
+    const artifactPath = options.candidateArtifactPath || resolveExistingRepositoryFile(
+      UI_CANDIDATE_ARTIFACT,
+      root,
+      { subtree: ".quality/qualification" }
+    );
     candidateBindingFromReceipt(candidateReceipt, {
       root,
       source,

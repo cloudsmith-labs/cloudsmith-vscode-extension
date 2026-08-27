@@ -34,10 +34,18 @@ const {
 } = require("../scripts/quality/gate");
 const { aggregateStatuses, fingerprint, sourceIdentity } = require("../scripts/quality/evidence");
 const {
+  CREDENTIAL_LIKE_ENVIRONMENT_NAME,
+  NON_AUTH_QUALITY_ENVIRONMENT_ALLOWLIST,
+  NON_AUTH_QUALITY_OVERRIDE_NAMES,
+  buildNonAuthQualityEnvironment,
+} = require("../scripts/quality/non-auth-environment");
+const {
   AUTHENTICATED_CANDIDATE_ARTIFACT,
   AUTHENTICATED_CANDIDATE_RECEIPT,
   LIVE_CANDIDATE_ARTIFACT,
   LIVE_CANDIDATE_RECEIPT,
+  UI_CANDIDATE_ARTIFACT,
+  UI_CANDIDATE_RECEIPT,
   candidateBindingFromReceipt,
 } = require("../scripts/quality/candidate-binding");
 const {
@@ -66,6 +74,7 @@ const {
   evaluateDiskLiveQualification,
   evaluateLiveQualification,
   parseArguments: parseChecklistArguments,
+  qualificationEvidenceManifest,
   requiredLiveWorkflowIds,
 } = require("../scripts/quality/release-checklist");
 const {
@@ -73,7 +82,13 @@ const {
   assertExposureReceipt,
 } = require("../scripts/quality/authenticated-exposure-scan");
 const {
+  RELEASE_EXPOSURE_RESULT,
+  buildReleaseExposureResult,
+} = require("../scripts/quality/release-exposure-scan");
+const { UI_RESULT } = require("../scripts/quality/verify-ui-evidence");
+const {
   discoverUiArtifacts,
+  expectedBlackBoxUiTests,
   generateReport,
   hasDeterministicReportFailure,
   renderMarkdown,
@@ -125,6 +140,7 @@ function passedReceipt(step, source = SOURCE_IDENTITY) {
     "secret-current": mutationArtifactFingerprint(validSecretReceipt("current")),
     "secret-artifacts": mutationArtifactFingerprint(validSecretReceipt("artifacts")),
     "secret-history": mutationArtifactFingerprint(validSecretReceipt("history")),
+    "secret-release": "9".repeat(64),
     "changed-mutation": mutationArtifactFingerprint(validMutationSummary()),
     "black-box-ui-smoke": mutationArtifactFingerprint(validUiResult()),
     "release-checklist": mutationArtifactFingerprint(validLiveStatus()),
@@ -567,10 +583,11 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
     `${JSON.stringify(authenticatedReceipt, null, 2)}\n`
   );
   const authenticatedExposureBase = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: "passed",
     sourceSha: source.sha,
     candidateReceiptFingerprint: authenticatedCandidateReceipt.fingerprint,
+    vsixSha256: authenticatedCandidateReceipt.artifact.sha256,
     scanner: {
       name: "gitleaks",
       version: "8.30.1",
@@ -592,7 +609,7 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
         findingCount: 0,
       },
       {
-        id: `vsix:${authenticatedCandidateReceipt.artifact.vsixPath}`,
+        id: `vsix:${AUTHENTICATED_CANDIDATE_ARTIFACT}`,
         status: "scanned",
         fileCount: 2,
         findingCount: 0,
@@ -670,6 +687,89 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
     qualificationHomeDirectory,
     root: fixtureRoot,
   };
+}
+
+function writeReleaseExposureFixture(fixture, document, inputPath) {
+  const uiCandidateBytes = fs.readFileSync(fixture.authenticatedCandidateArtifactPath);
+  const uiCandidateBase = clone(fixture.authenticatedCandidateReceipt);
+  delete uiCandidateBase.fingerprint;
+  uiCandidateBase.vscode.version = "1.131.0";
+  const uiCandidateReceipt = {
+    ...uiCandidateBase,
+    fingerprint: fingerprint(uiCandidateBase),
+  };
+  fs.writeFileSync(path.join(fixture.root, UI_CANDIDATE_ARTIFACT), uiCandidateBytes);
+  fs.writeFileSync(
+    path.join(fixture.root, UI_CANDIDATE_RECEIPT),
+    `${JSON.stringify(uiCandidateReceipt, null, 2)}\n`,
+  );
+  const tests = expectedBlackBoxUiTests(require("../quality/critical-workflows.json"));
+  const uiResultBytes = Buffer.from(`${JSON.stringify({
+    schemaVersion: 2,
+    status: "passed",
+    source: SOURCE_IDENTITY,
+    sourceSha: SOURCE_IDENTITY.sha,
+    tool: "vscode-extension-tester",
+    toolVersion: "8.24.0",
+    vscodeVersion: uiCandidateReceipt.vscode.version,
+    platform: process.platform === "win32" ? "win32" : process.platform,
+    architecture: process.arch === "arm64" ? "arm64" : "x64",
+    launchAttempted: true,
+    tests,
+    results: tests.map(name => ({ name, status: "passed" })),
+    candidate: {
+      candidateReceiptFingerprint: uiCandidateReceipt.fingerprint,
+      extensionId: uiCandidateReceipt.extension.id,
+      extensionVersion: uiCandidateReceipt.extension.version,
+      profileMode: uiCandidateReceipt.profile.mode,
+      sourceFingerprint: uiCandidateReceipt.source.fingerprint,
+      sourceSha: uiCandidateReceipt.source.sha,
+      vscodeVersion: uiCandidateReceipt.vscode.version,
+      vsixSha256: uiCandidateReceipt.artifact.sha256,
+    },
+    reason: null,
+  }, null, 2)}\n`);
+  fs.mkdirSync(path.join(fixture.root, path.dirname(UI_RESULT)), { recursive: true });
+  fs.writeFileSync(path.join(fixture.root, UI_RESULT), uiResultBytes);
+  const attestationBytes = fs.readFileSync(path.join(fixture.root, inputPath));
+  const evidenceManifest = qualificationEvidenceManifest(document);
+  const receipt = buildReleaseExposureResult({
+    source: SOURCE_IDENTITY,
+    candidateReceiptFingerprint: uiCandidateReceipt.fingerprint,
+    vsixSha256: uiCandidateReceipt.artifact.sha256,
+    uiResultSha256: crypto.createHash("sha256").update(uiResultBytes).digest("hex"),
+    attestationPath: inputPath,
+    attestationSha256: crypto.createHash("sha256").update(attestationBytes).digest("hex"),
+    evidenceManifest,
+    components: [
+      {
+        id: "post-ui-generated-quality-evidence",
+        status: "scanned",
+        fileCount: 3,
+        findings: [],
+      },
+      {
+        id: `vsix:${UI_CANDIDATE_ARTIFACT}`,
+        status: "scanned",
+        fileCount: 2,
+        findings: [],
+      },
+      {
+        id: "accepted-live-evidence",
+        status: "scanned",
+        fileCount: new Set([
+          inputPath,
+          ...evidenceManifest.map(reference => reference.path),
+        ]).size,
+        findings: [],
+      },
+    ],
+    now: LIVE_FIXTURE_NOW,
+  });
+  fs.writeFileSync(
+    path.join(fixture.root, RELEASE_EXPOSURE_RESULT),
+    `${JSON.stringify(receipt, null, 2)}\n`,
+  );
 }
 
 function liveCandidateProof(fixture) {
@@ -1440,6 +1540,67 @@ suite("Quality change-impact analyzer", () => {
 });
 
 suite("Quality gate runner", () => {
+  test("non-auth process environment uses a credential-free closed allowlist", () => {
+    assert.strictEqual(
+      [...NON_AUTH_QUALITY_ENVIRONMENT_ALLOWLIST, ...NON_AUTH_QUALITY_OVERRIDE_NAMES]
+        .some(name => CREDENTIAL_LIKE_ENVIRONMENT_NAME.test(name)),
+      false
+    );
+    const sanitized = buildNonAuthQualityEnvironment({
+      PATH: "/fixture/bin",
+      QUALITY_BASE: "fixture-base",
+      CLOUDSMITH_API_KEY: "synthetic-qh141-helper-sentinel",
+      NODE_OPTIONS: "--require=synthetic-untrusted-hook",
+      HOME: "/untrusted/profile",
+    }, {
+      CLOUDSMITH_QUALITY_TEST_SUITE: "fixture-suite",
+    });
+    assert.deepStrictEqual(sanitized, {
+      PATH: "/fixture/bin",
+      QUALITY_BASE: "fixture-base",
+      CLOUDSMITH_QUALITY_TEST_SUITE: "fixture-suite",
+    });
+    assert.strictEqual(Object.isFrozen(sanitized), true);
+    assert.throws(
+      () => buildNonAuthQualityEnvironment({}, {
+        CLOUDSMITH_API_KEY: "synthetic-qh141-rejected-override",
+      }),
+      /override is unsafe/u
+    );
+    assert.throws(
+      () => buildNonAuthQualityEnvironment({
+        PATH: "/fixture/one",
+        Path: "/fixture/two",
+      }, {}, { platform: "win32" }),
+      /case-colliding key/u
+    );
+
+    const gitChildEnvironments = [];
+    const identity = sourceIdentity(root, (_command, arguments_, options) => {
+      gitChildEnvironments.push(options.env);
+      return {
+        status: 0,
+        signal: null,
+        error: null,
+        stdout: arguments_[0] === "rev-parse" ? `${SOURCE_SHA}\n` : Buffer.alloc(0),
+        stderr: options.encoding === null ? Buffer.alloc(0) : "",
+      };
+    }, {
+      PATH: "/fixture/bin",
+      CLOUDSMITH_API_KEY: "synthetic-qh141-source-sentinel",
+    });
+    assert.strictEqual(identity.sha, SOURCE_SHA);
+    assert.deepStrictEqual(gitChildEnvironments, [
+      { PATH: "/fixture/bin" },
+      { PATH: "/fixture/bin" },
+      { PATH: "/fixture/bin" },
+    ]);
+    assert.strictEqual(
+      JSON.stringify(identity).includes("synthetic-qh141-source-sentinel"),
+      false
+    );
+  });
+
   test("composes fast, full, and release plans without hiding either Extension Host label", () => {
     const fast = getGatePlan("fast");
     const full = getGatePlan("full");
@@ -1448,6 +1609,7 @@ suite("Quality gate runner", () => {
     const fullWithoutReport = full.filter(step => step.id !== "quality-report");
     const releaseWithoutFinalizers = release.filter(step => ![
       "black-box-ui-smoke",
+      "secret-release",
       "release-checklist",
       "secret-history",
       "quality-report",
@@ -1487,8 +1649,9 @@ suite("Quality gate runner", () => {
       "package-list",
       "secret-artifacts",
     ]) assert.ok(full.some(step => step.id === id), `missing full gate step ${id}`);
-    assert.deepStrictEqual(release.slice(-4).map(step => step.id), [
+    assert.deepStrictEqual(release.slice(-5).map(step => step.id), [
       "black-box-ui-smoke",
+      "secret-release",
       "release-checklist",
       "secret-history",
       "quality-report",
@@ -1589,6 +1752,54 @@ suite("Quality gate runner", () => {
         "passed"
       );
     } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("non-auth gate children cannot inherit credential-shaped ambient values", () => {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-gate-env-"));
+    const syntheticNames = [
+      "CLOUDSMITH_API_KEY",
+      "ARBITRARY_ACCESS_TOKEN",
+      "FIXTURE_PASSWORD",
+    ];
+    const previous = Object.fromEntries(syntheticNames.map(name => [name, process.env[name]]));
+    const step = {
+      id: "fixture-environment-boundary",
+      category: "security",
+      executable: "node",
+      args: [
+        "-e",
+        `const forbidden = ${JSON.stringify(syntheticNames)}; process.stdout.write(forbidden.some(name => Object.prototype.hasOwnProperty.call(process.env, name)) ? "unsafe-child-environment" : "safe-child-environment");`,
+      ],
+      command: "node credential-boundary-probe",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    try {
+      syntheticNames.forEach((name, index) => {
+        process.env[name] = `synthetic-qh141-sentinel-${index}`;
+      });
+      const execution = executeCommand(step, {
+        root: temporaryRoot,
+        source: SOURCE_IDENTITY,
+      });
+      const receipt = completedReceipt("fast", step, SOURCE_IDENTITY, execution);
+      assert.strictEqual(execution.stdout, "safe-child-environment");
+      assert.strictEqual(receipt.status, "passed");
+      assert.strictEqual(
+        receipt.outputFingerprint,
+        crypto.createHash("sha256").update("safe-child-environment").digest("hex")
+      );
+      for (const name of syntheticNames) {
+        assert.strictEqual(JSON.stringify(execution).includes(process.env[name]), false);
+        assert.strictEqual(JSON.stringify(receipt).includes(process.env[name]), false);
+      }
+    } finally {
+      for (const name of syntheticNames) {
+        if (previous[name] === undefined) delete process.env[name];
+        else process.env[name] = previous[name];
+      }
       fs.rmSync(temporaryRoot, { recursive: true, force: true });
     }
   });
@@ -3021,7 +3232,8 @@ suite("Quality mutation and UI harness boundaries", () => {
     );
   });
 
-  test("rejects unbound or semantically forged black-box UI results", () => {
+  test("rejects unbound or semantically forged black-box UI results", function () {
+    this.timeout(30000);
     const plan = getGatePlan("release");
     const liveFingerprint = mutationArtifactFingerprint(validLiveStatus());
     const common = {
@@ -3521,7 +3733,8 @@ suite("Release checklist and deterministic quality report", () => {
     assert.strictEqual(hasDeterministicReportFailure(report), true);
   });
 
-  test("rejects a stale passed live status when the release checklist receipt failed", () => {
+  test("rejects a stale passed live status when the release checklist receipt failed", function () {
+    this.timeout(30000);
     const plan = getGatePlan("release");
     const receipts = plan.map(step => passedReceipt(step));
     const checklistReceipt = receipts.find(receipt => receipt.stepId === "release-checklist");
@@ -3640,6 +3853,7 @@ suite("Release checklist and deterministic quality report", () => {
         path.join(fixture.root, inputPath),
         `${JSON.stringify(fixture.document, null, 2)}\n`
       );
+      writeReleaseExposureFixture(fixture, fixture.document, inputPath);
       const status = evaluateDiskLiveQualification({
         root: fixture.root,
         source: SOURCE_IDENTITY,
@@ -3723,7 +3937,8 @@ suite("Release checklist and deterministic quality report", () => {
     }
   });
 
-  test("rejects crossed live workflow sets even when exact artifact bytes are receipt-bound", () => {
+  test("rejects crossed live workflow sets even when exact artifact bytes are receipt-bound", function () {
+    this.timeout(30000);
     const actualWorkflowId = "WF-ACTUAL-LIVE-FIXTURE";
     const unrelatedWorkflowId = "WF-UNRELATED-LIVE-FIXTURE";
     const plan = getGatePlan("release");

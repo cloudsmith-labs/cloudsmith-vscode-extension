@@ -5,7 +5,10 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { fingerprint } = require("../scripts/quality/evidence");
-const { candidateBindingFromReceipt } = require("../scripts/quality/candidate-binding");
+const {
+  UI_CANDIDATE_ARTIFACT,
+  candidateBindingFromReceipt,
+} = require("../scripts/quality/candidate-binding");
 const {
   generateReport,
   summarizeFindings,
@@ -300,6 +303,9 @@ suite("two-lane release-readiness model", () => {
       const artifactBytes = Buffer.from("signed-out candidate A");
       const artifactPath = path.join(developmentDir, "cloudsmith-vsc-2.3.0.vsix");
       fs.writeFileSync(artifactPath, artifactBytes);
+      const candidateArtifactPath = path.join(fixtureRoot, UI_CANDIDATE_ARTIFACT);
+      fs.mkdirSync(path.dirname(candidateArtifactPath), { recursive: true });
+      fs.writeFileSync(candidateArtifactPath, artifactBytes);
       const baseReceipt = candidateReceipt();
       const receipt = candidateReceipt({
         artifact: {
@@ -328,6 +334,7 @@ suite("two-lane release-readiness model", () => {
           }],
         },
         candidateReceipt: receipt,
+        candidateArtifactPath,
         ui,
       };
 
@@ -347,17 +354,25 @@ suite("two-lane release-readiness model", () => {
         /does not bind the exact verified candidate/u
       );
 
-      fs.rmSync(artifactPath);
+      fs.rmSync(candidateArtifactPath);
       assert.throws(
         () => verifySignedOutUiEvidence(options),
         /does not bind the exact verified candidate/u
       );
 
-      fs.writeFileSync(artifactPath, Buffer.from("signed-out candidate B"));
+      fs.writeFileSync(candidateArtifactPath, Buffer.from("signed-out candidate B"));
       assert.throws(
         () => verifySignedOutUiEvidence(options),
         /does not bind the exact verified candidate/u
       );
+
+      fs.writeFileSync(candidateArtifactPath, artifactBytes);
+      fs.writeFileSync(artifactPath, Buffer.from("mutable output changed after proof capture"));
+      assert.deepStrictEqual(verifySignedOutUiEvidence(options), {
+        status: "passed",
+        sourceSha: SOURCE.sha,
+        testCount: 1,
+      });
 
       const crossedBytes = Buffer.from("crossed release candidate");
       const crossedPath = path.join(releaseDir, "cloudsmith-vsc-2.3.0.vsix");

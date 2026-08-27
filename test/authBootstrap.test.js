@@ -1,6 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const assert = require("assert");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -26,6 +27,8 @@ const {
 const {
   assertExposureReceipt,
   assertProfileMetadataBoundary,
+  assertStableAuthenticatedProof,
+  captureAuthenticatedCandidateProof,
   createRuntimeLogRoot,
   destroyRuntimeLogRoot,
   runAuthenticatedExposureScan,
@@ -34,6 +37,7 @@ const {
   verifyAuthenticatedEvidence,
 } = require("../scripts/quality/verify-authenticated-evidence");
 const {
+  AUTHENTICATED_CANDIDATE_ARTIFACT,
   candidateBindingFromReceipt,
 } = require("../scripts/quality/candidate-binding");
 const {
@@ -842,7 +846,7 @@ suite("authenticated CI SecretStorage bootstrap", () => {
     assert.strictEqual(fs.existsSync(retryDescriptor), true);
   });
 
-  test("authenticated exposure scan reads no profile content and persists counts only", async () => {
+  test("authenticated exposure scan ignores mutable output and reads no profile content", async () => {
     const candidate = candidateFixture();
     const logRoot = createRuntimeLogRoot({ temporaryParent: temporaryRoot() });
     let persisted;
@@ -855,6 +859,21 @@ suite("authenticated CI SecretStorage bootstrap", () => {
       }
       return originalRead.call(this, target, ...arguments_);
     };
+    const proofSnapshot = {
+      artifactPath: AUTHENTICATED_CANDIDATE_ARTIFACT,
+      candidateReceiptFingerprint: candidate.receipt.fingerprint,
+      sourceFingerprint: SOURCE.fingerprint,
+      sourceSha: SOURCE.sha,
+      vsixSha256: candidate.receipt.artifact.sha256,
+      identity: {
+        device: "1",
+        inode: "2",
+        size: String(candidate.receipt.artifact.archiveBytes),
+        modifiedNanoseconds: "3",
+        changedNanoseconds: "4",
+      },
+    };
+    let scannedArtifactPath;
     let result;
     try {
       result = await runAuthenticatedExposureScan({
@@ -872,18 +891,29 @@ suite("authenticated CI SecretStorage bootstrap", () => {
           fileCount: 2,
           findings: [],
         }),
-        scanVsix: async () => ({
-          id: `vsix:${candidate.receipt.artifact.vsixPath}`,
-          status: "scanned",
-          fileCount: 3,
-          findings: [],
-        }),
+        captureAuthenticatedCandidateProof: () => proofSnapshot,
+        scanVsix: async (_root, relativePath) => {
+          scannedArtifactPath = relativePath;
+          return {
+            id: `vsix:${relativePath}`,
+            status: "scanned",
+            fileCount: 3,
+            findings: [],
+          };
+        },
         writeReceipt(value) { persisted = value; },
       });
     } finally {
       fs.readFileSync = originalRead;
     }
     assert.strictEqual(result.status, "passed");
+    assert.strictEqual(result.schemaVersion, 2);
+    assert.strictEqual(result.vsixSha256, candidate.receipt.artifact.sha256);
+    assert.strictEqual(scannedArtifactPath, AUTHENTICATED_CANDIDATE_ARTIFACT);
+    assert.strictEqual(
+      result.components[1].id,
+      `vsix:${AUTHENTICATED_CANDIDATE_ARTIFACT}`,
+    );
     assert.strictEqual(result.components.length, 4);
     assert.strictEqual(result.credentialBoundary.profileContentRead, false);
     assert.strictEqual(result.credentialBoundary.secretStorageRead, false);
@@ -892,6 +922,151 @@ suite("authenticated CI SecretStorage bootstrap", () => {
     assert.strictEqual(result.credentialBoundary.credentialDigestRecorded, false);
     assert.strictEqual(persisted.fingerprint, result.fingerprint);
     assert.strictEqual(destroyRuntimeLogRoot(logRoot), true);
+    fs.rmSync(candidate.profile.root, { recursive: true, force: true });
+  });
+
+  test("authenticated exposure scan fails closed when proof identity changes during scanning", async () => {
+    const candidate = candidateFixture();
+    const logRoot = createRuntimeLogRoot({ temporaryParent: temporaryRoot() });
+    let captures = 0;
+    const captureAuthenticatedCandidateProof = () => ({
+      artifactPath: AUTHENTICATED_CANDIDATE_ARTIFACT,
+      candidateReceiptFingerprint: candidate.receipt.fingerprint,
+      sourceFingerprint: SOURCE.fingerprint,
+      sourceSha: SOURCE.sha,
+      vsixSha256: candidate.receipt.artifact.sha256,
+      identity: {
+        device: "1",
+        inode: String(++captures),
+        size: String(candidate.receipt.artifact.archiveBytes),
+        modifiedNanoseconds: "3",
+        changedNanoseconds: "4",
+      },
+    });
+    await assert.rejects(runAuthenticatedExposureScan({
+      root: ROOT,
+      source: SOURCE,
+      candidate,
+      candidateReceiptFingerprint: candidate.receipt.fingerprint,
+      runtimeLogRoot: logRoot.root,
+      environment: { PATH: process.env.PATH || "" },
+    }, {
+      assertScannerVersion() {},
+      scanGeneratedEvidence: () => ({
+        id: "authenticated-generated-evidence",
+        status: "scanned",
+        fileCount: 2,
+        findings: [],
+      }),
+      captureAuthenticatedCandidateProof,
+      scanVsix: async (_root, relativePath) => ({
+        id: `vsix:${relativePath}`,
+        status: "scanned",
+        fileCount: 3,
+        findings: [],
+      }),
+      writeReceipt() {},
+    }), /proof identity or bytes changed during scanning/u);
+    assert.strictEqual(destroyRuntimeLogRoot(logRoot), true);
+    fs.rmSync(candidate.profile.root, { recursive: true, force: true });
+  });
+
+  test("authenticated exposure scan fails closed when proof bytes change during scanning", async () => {
+    const candidate = candidateFixture();
+    const logRoot = createRuntimeLogRoot({ temporaryParent: temporaryRoot() });
+    let captures = 0;
+    const captureAuthenticatedCandidateProof = () => ({
+      artifactPath: AUTHENTICATED_CANDIDATE_ARTIFACT,
+      candidateReceiptFingerprint: candidate.receipt.fingerprint,
+      sourceFingerprint: SOURCE.fingerprint,
+      sourceSha: SOURCE.sha,
+      vsixSha256: captures++ === 0
+        ? candidate.receipt.artifact.sha256
+        : "e".repeat(64),
+      identity: {
+        device: "1",
+        inode: "2",
+        size: String(candidate.receipt.artifact.archiveBytes),
+        modifiedNanoseconds: "3",
+        changedNanoseconds: "4",
+      },
+    });
+    await assert.rejects(runAuthenticatedExposureScan({
+      root: ROOT,
+      source: SOURCE,
+      candidate,
+      candidateReceiptFingerprint: candidate.receipt.fingerprint,
+      runtimeLogRoot: logRoot.root,
+      environment: { PATH: process.env.PATH || "" },
+    }, {
+      assertScannerVersion() {},
+      scanGeneratedEvidence: () => ({
+        id: "authenticated-generated-evidence",
+        status: "scanned",
+        fileCount: 2,
+        findings: [],
+      }),
+      captureAuthenticatedCandidateProof,
+      scanVsix: async (_root, relativePath) => ({
+        id: `vsix:${relativePath}`,
+        status: "scanned",
+        fileCount: 3,
+        findings: [],
+      }),
+      writeReceipt() {},
+    }), /proof identity or bytes changed during scanning/u);
+    assert.strictEqual(destroyRuntimeLogRoot(logRoot), true);
+    fs.rmSync(candidate.profile.root, { recursive: true, force: true });
+  });
+
+  test("authenticated proof capture validates immutable bytes and detects same-byte replacement", () => {
+    const fixtureRoot = temporaryRoot("cloudsmith-authenticated-proof-test-");
+    const candidate = candidateFixture();
+    const proofBytes = Buffer.from("synthetic-vsix-proof");
+    const proofDirectory = path.join(fixtureRoot, ".quality", "qualification");
+    const proofPath = path.join(proofDirectory, "authenticated-candidate.vsix");
+    fs.mkdirSync(proofDirectory, { recursive: true });
+    fs.writeFileSync(proofPath, proofBytes);
+    fs.writeFileSync(path.join(fixtureRoot, "package.json"), JSON.stringify({
+      publisher: "Cloudsmith",
+      name: "cloudsmith-vsc",
+      version: "2.3.0",
+    }));
+    const receiptBase = { ...candidate.receipt };
+    delete receiptBase.fingerprint;
+    receiptBase.artifact = {
+      ...receiptBase.artifact,
+      absoluteVsixPath: path.join(
+        fixtureRoot,
+        ...receiptBase.artifact.vsixPath.split("/"),
+      ),
+      archiveBytes: proofBytes.length,
+      sha256: crypto.createHash("sha256").update(proofBytes).digest("hex"),
+    };
+    const receipt = { ...receiptBase, fingerprint: fingerprint(receiptBase) };
+    const before = captureAuthenticatedCandidateProof(fixtureRoot, receipt, SOURCE);
+    assert.strictEqual(before.artifactPath, AUTHENTICATED_CANDIDATE_ARTIFACT);
+    assert.strictEqual(before.candidateReceiptFingerprint, receipt.fingerprint);
+    assert.strictEqual(before.vsixSha256, receipt.artifact.sha256);
+
+    const replacement = path.join(proofDirectory, "replacement.vsix");
+    fs.writeFileSync(replacement, proofBytes);
+    fs.renameSync(replacement, proofPath);
+    const afterReplacement = captureAuthenticatedCandidateProof(
+      fixtureRoot,
+      receipt,
+      SOURCE,
+    );
+    assert.throws(
+      () => assertStableAuthenticatedProof(before, afterReplacement),
+      /proof identity or bytes changed during scanning/u,
+    );
+
+    fs.writeFileSync(proofPath, Buffer.from("changed-vsix-proof"));
+    assert.throws(
+      () => captureAuthenticatedCandidateProof(fixtureRoot, receipt, SOURCE),
+      /VSIX proof is stale or mismatched/u,
+    );
     fs.rmSync(candidate.profile.root, { recursive: true, force: true });
   });
 
@@ -917,8 +1092,22 @@ suite("authenticated CI SecretStorage bootstrap", () => {
         fileCount: 2,
         findings: [],
       }),
-      scanVsix: async () => ({
-        id: `vsix:${candidate.receipt.artifact.vsixPath}`,
+      captureAuthenticatedCandidateProof: () => ({
+        artifactPath: AUTHENTICATED_CANDIDATE_ARTIFACT,
+        candidateReceiptFingerprint: candidate.receipt.fingerprint,
+        sourceFingerprint: SOURCE.fingerprint,
+        sourceSha: SOURCE.sha,
+        vsixSha256: candidate.receipt.artifact.sha256,
+        identity: {
+          device: "1",
+          inode: "2",
+          size: String(candidate.receipt.artifact.archiveBytes),
+          modifiedNanoseconds: "3",
+          changedNanoseconds: "4",
+        },
+      }),
+      scanVsix: async (_root, relativePath) => ({
+        id: `vsix:${relativePath}`,
         status: "scanned",
         fileCount: 3,
         findings: [],
@@ -939,10 +1128,11 @@ suite("authenticated CI SecretStorage bootstrap", () => {
     const authenticated = await runAuthenticatedCi(harness.options);
     const candidate = harness.candidate.receipt;
     const exposureBase = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: "passed",
       sourceSha: SOURCE.sha,
       candidateReceiptFingerprint: candidate.fingerprint,
+      vsixSha256: candidate.artifact.sha256,
       scanner: {
         name: "gitleaks",
         version: "8.30.1",
@@ -964,7 +1154,7 @@ suite("authenticated CI SecretStorage bootstrap", () => {
           findingCount: 0,
         },
         {
-          id: "vsix:out/development/cloudsmith-vsc-2.3.0.vsix",
+          id: `vsix:${AUTHENTICATED_CANDIDATE_ARTIFACT}`,
           status: "scanned",
           fileCount: 3,
           findingCount: 0,
@@ -1014,7 +1204,7 @@ suite("authenticated CI SecretStorage bootstrap", () => {
     });
     const crossedBase = JSON.parse(JSON.stringify(exposure));
     delete crossedBase.fingerprint;
-    crossedBase.components[1].id = "vsix:out/development/unbound-candidate.vsix";
+    crossedBase.components[1].id = "vsix:.quality/qualification/unbound-candidate.vsix";
     documents[".quality/secrets/authenticated-ci.json"] = assertExposureReceipt({
       ...crossedBase,
       fingerprint: fingerprint(crossedBase),
@@ -1025,6 +1215,24 @@ suite("authenticated CI SecretStorage bootstrap", () => {
       expectedSourceSha: SOURCE.sha,
       readJson: relativePath => documents[relativePath],
       candidateBindingFromReceipt: (receipt) => candidateBindingFromReceipt(
+        receipt,
+        { root: ROOT, source: SOURCE },
+      ),
+    }), /exact value-blind components/u);
+
+    const crossedDigestBase = JSON.parse(JSON.stringify(exposure));
+    delete crossedDigestBase.fingerprint;
+    crossedDigestBase.vsixSha256 = "e".repeat(64);
+    documents[".quality/secrets/authenticated-ci.json"] = assertExposureReceipt({
+      ...crossedDigestBase,
+      fingerprint: fingerprint(crossedDigestBase),
+    });
+    assert.throws(() => verifyAuthenticatedEvidence({
+      root: ROOT,
+      sourceIdentity: () => SOURCE,
+      expectedSourceSha: SOURCE.sha,
+      readJson: relativePath => documents[relativePath],
+      candidateBindingFromReceipt: receipt => candidateBindingFromReceipt(
         receipt,
         { root: ROOT, source: SOURCE },
       ),

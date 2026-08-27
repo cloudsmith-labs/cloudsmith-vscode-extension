@@ -20,6 +20,8 @@ const {
   AUTHENTICATED_CANDIDATE_RECEIPT,
   LIVE_CANDIDATE_ARTIFACT,
   LIVE_CANDIDATE_RECEIPT,
+  UI_CANDIDATE_ARTIFACT,
+  UI_CANDIDATE_RECEIPT,
 } = require("./candidate-binding");
 const {
   cleanupCiQualificationProfile,
@@ -522,6 +524,13 @@ function writeAuthenticatedCandidateProof(root, receipt, verifiedBuffer) {
   });
 }
 
+function writeUiCandidateProof(root, receipt, verifiedBuffer) {
+  return writeCandidateProof(root, receipt, verifiedBuffer, {
+    artifactPath: UI_CANDIDATE_ARTIFACT,
+    receiptPath: UI_CANDIDATE_RECEIPT,
+  });
+}
+
 function profileFromCandidate(candidateOrProfile) {
   const profile = candidateOrProfile?.profile || candidateOrProfile;
   if (!profile || typeof profile !== "object") {
@@ -633,13 +642,13 @@ async function prepareQualificationCandidate(options = {}) {
   }
   const qualificationLane = options.qualificationLane
     || (mode === "local" ? "current" : "black-box");
-  if (qualificationLane === "current") {
-    const proofPaths = mode === "local"
+  const proofPaths = qualificationLane === "current"
+    ? mode === "local"
       ? [LIVE_CANDIDATE_RECEIPT, LIVE_CANDIDATE_ARTIFACT]
-      : [AUTHENTICATED_CANDIDATE_RECEIPT, AUTHENTICATED_CANDIDATE_ARTIFACT];
-    for (const proofPath of proofPaths) {
-      removeOutputFile(proofPath, root, { subtree: ".quality/qualification" });
-    }
+      : [AUTHENTICATED_CANDIDATE_RECEIPT, AUTHENTICATED_CANDIDATE_ARTIFACT]
+    : [UI_CANDIDATE_RECEIPT, UI_CANDIDATE_ARTIFACT];
+  for (const proofPath of proofPaths) {
+    removeOutputFile(proofPath, root, { subtree: ".quality/qualification" });
   }
   let profile;
   let succeeded = false;
@@ -811,7 +820,7 @@ async function prepareQualificationCandidate(options = {}) {
     if (qualificationLane === "current") {
       if (mode === "local") writeLiveCandidateProof(root, receipt, verification.buffer);
       else writeAuthenticatedCandidateProof(root, receipt, verification.buffer);
-    }
+    } else writeUiCandidateProof(root, receipt, verification.buffer);
     succeeded = true;
     const cleanup = profile.mode === "ci"
       ? () => cleanupCiQualificationProfile(profile)
@@ -889,5 +898,6 @@ module.exports = {
   removeFreshPackageOutputs,
   resolveCodeInstallation,
   writeLiveCandidateProof,
+  writeUiCandidateProof,
   writeAuthenticatedCandidateProof,
 };

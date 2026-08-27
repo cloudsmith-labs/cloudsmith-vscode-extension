@@ -12,14 +12,22 @@ const {
   AUTHENTICATED_CANDIDATE_RECEIPT,
   LIVE_CANDIDATE_ARTIFACT,
   LIVE_CANDIDATE_RECEIPT,
+  UI_CANDIDATE_ARTIFACT,
+  UI_CANDIDATE_RECEIPT,
   candidateBindingFromReceipt,
 } = require("../scripts/quality/candidate-binding");
 const {
   attestationReviewDigest,
   evaluateLiveQualification,
+  qualificationEvidenceManifest,
   requiredLiveWorkflowIds,
   runChecklist,
 } = require("../scripts/quality/release-checklist");
+const {
+  RELEASE_EXPOSURE_RESULT,
+  buildReleaseExposureResult,
+} = require("../scripts/quality/release-exposure-scan");
+const { UI_RESULT } = require("../scripts/quality/verify-ui-evidence");
 
 const SOURCE = Object.freeze({
   sha: "1".repeat(40),
@@ -33,7 +41,11 @@ const REVIEWED_AT = timestampBeforeNow(60 * 1000);
 const WORKFLOWS = Object.freeze({
   workflows: Object.freeze([Object.freeze({
     id: "WF-AUTH-STATE",
-    requiredLayers: Object.freeze(["live-protocol"]),
+    requiredLayers: Object.freeze(["live-protocol", "black-box-ui"]),
+    evidence: Object.freeze([Object.freeze({
+      layer: "black-box-ui",
+      testNames: Object.freeze(["fixture signed-out UI"]),
+    })]),
     liveFixture: Object.freeze({ required: true }),
   })]),
 });
@@ -254,10 +266,11 @@ function createFixture() {
     `${JSON.stringify(authenticatedReceipt, null, 2)}\n`
   );
   const authenticatedExposureBase = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: "passed",
     sourceSha: SOURCE.sha,
     candidateReceiptFingerprint: authenticatedCandidateReceipt.fingerprint,
+    vsixSha256: authenticatedCandidateReceipt.artifact.sha256,
     scanner: {
       name: "gitleaks",
       version: "8.30.1",
@@ -279,7 +292,7 @@ function createFixture() {
         findingCount: 0,
       },
       {
-        id: `vsix:${authenticatedCandidateReceipt.artifact.vsixPath}`,
+        id: `vsix:${AUTHENTICATED_CANDIDATE_ARTIFACT}`,
         status: "scanned",
         fileCount: 2,
         findingCount: 0,
@@ -380,6 +393,94 @@ function evaluate(fixture, document = fixture.document, overrides = {}) {
     qualificationHomeDirectory: fixture.qualificationHomeDirectory,
     ...overrides,
   });
+}
+
+function writeReleaseExposureFixture(fixture, document, inputPath, overrides = {}) {
+  const uiCandidateBytes = fs.readFileSync(fixture.authenticatedCandidateArtifactPath);
+  const uiCandidateBase = clone(fixture.authenticatedCandidateReceipt);
+  delete uiCandidateBase.fingerprint;
+  uiCandidateBase.vscode.version = "1.131.0";
+  const uiCandidateReceipt = {
+    ...uiCandidateBase,
+    fingerprint: fingerprint(uiCandidateBase),
+  };
+  const uiCandidateArtifactPath = path.join(fixture.root, UI_CANDIDATE_ARTIFACT);
+  fs.writeFileSync(uiCandidateArtifactPath, uiCandidateBytes);
+  fs.writeFileSync(
+    path.join(fixture.root, UI_CANDIDATE_RECEIPT),
+    `${JSON.stringify(uiCandidateReceipt, null, 2)}\n`,
+  );
+  const uiResultBytes = Buffer.from(`${JSON.stringify({
+    schemaVersion: 2,
+    status: "passed",
+    source: SOURCE,
+    sourceSha: SOURCE.sha,
+    tool: "vscode-extension-tester",
+    toolVersion: "8.24.0",
+    vscodeVersion: uiCandidateReceipt.vscode.version,
+    platform: process.platform === "win32" ? "win32" : process.platform,
+    architecture: process.arch === "arm64" ? "arm64" : "x64",
+    launchAttempted: true,
+    tests: ["fixture signed-out UI"],
+    results: [{ name: "fixture signed-out UI", status: "passed" }],
+    candidate: {
+      candidateReceiptFingerprint: uiCandidateReceipt.fingerprint,
+      extensionId: uiCandidateReceipt.extension.id,
+      extensionVersion: uiCandidateReceipt.extension.version,
+      profileMode: uiCandidateReceipt.profile.mode,
+      sourceFingerprint: uiCandidateReceipt.source.fingerprint,
+      sourceSha: uiCandidateReceipt.source.sha,
+      vscodeVersion: uiCandidateReceipt.vscode.version,
+      vsixSha256: uiCandidateReceipt.artifact.sha256,
+    },
+    reason: null,
+  }, null, 2)}\n`);
+  fs.mkdirSync(path.join(fixture.root, path.dirname(UI_RESULT)), { recursive: true });
+  fs.writeFileSync(path.join(fixture.root, UI_RESULT), uiResultBytes);
+  const attestationBytes = fs.readFileSync(path.join(fixture.root, inputPath));
+  const evidenceManifest = Object.prototype.hasOwnProperty.call(
+    overrides,
+    "evidenceManifest",
+  ) ? overrides.evidenceManifest : qualificationEvidenceManifest(document);
+  const receipt = buildReleaseExposureResult({
+    source: SOURCE,
+    candidateReceiptFingerprint: overrides.candidateReceiptFingerprint
+      || uiCandidateReceipt.fingerprint,
+    vsixSha256: uiCandidateReceipt.artifact.sha256,
+    uiResultSha256: crypto.createHash("sha256").update(uiResultBytes).digest("hex"),
+    attestationPath: inputPath,
+    attestationSha256: crypto.createHash("sha256").update(attestationBytes).digest("hex"),
+    evidenceManifest,
+    components: [
+      {
+        id: "post-ui-generated-quality-evidence",
+        status: "scanned",
+        fileCount: 3,
+        findings: [],
+      },
+      {
+        id: `vsix:${UI_CANDIDATE_ARTIFACT}`,
+        status: "scanned",
+        fileCount: 2,
+        findings: [],
+      },
+      {
+        id: "accepted-live-evidence",
+        status: "scanned",
+        fileCount: new Set([
+          inputPath,
+          ...evidenceManifest.map(reference => reference.path),
+        ]).size,
+        findings: [],
+      },
+    ],
+    now: NOW,
+  });
+  fs.writeFileSync(
+    path.join(fixture.root, RELEASE_EXPOSURE_RESULT),
+    `${JSON.stringify(receipt, null, 2)}\n`,
+  );
+  return receipt;
 }
 
 suite("Release checklist trust receipts", () => {
@@ -497,7 +598,7 @@ suite("Release checklist trust receipts", () => {
     assert.ok(missing.errors.some(error => /exposure receipt is missing/u.test(error)));
 
     const crossed = clone(fixture.authenticatedExposureReceipt);
-    crossed.components[1].id = "vsix:out/development/unbound-candidate.vsix";
+    crossed.components[1].id = "vsix:.quality/qualification/unbound-candidate.vsix";
     delete crossed.fingerprint;
     crossed.fingerprint = fingerprint(crossed);
     const mismatched = evaluate(fixture, fixture.document, {
@@ -736,6 +837,7 @@ suite("Release checklist trust receipts", () => {
     const inputPath = "internal_docs/quality/live-qualification.json";
     const bytes = Buffer.from(`${JSON.stringify(fixture.document, null, 2)}\n`);
     fs.writeFileSync(path.join(fixture.root, inputPath), bytes);
+    writeReleaseExposureFixture(fixture, fixture.document, inputPath);
 
     const result = runChecklist({
       inputPath,
@@ -761,6 +863,58 @@ suite("Release checklist trust receipts", () => {
     );
   });
 
+  test("rejects missing, crossed, and omitted disk release-exposure proof", () => {
+    const inputPath = "internal_docs/quality/live-qualification.json";
+    fs.writeFileSync(
+      path.join(fixture.root, inputPath),
+      `${JSON.stringify(fixture.document, null, 2)}\n`,
+    );
+    writeReleaseExposureFixture(fixture, fixture.document, inputPath);
+    fs.rmSync(path.join(fixture.root, RELEASE_EXPOSURE_RESULT));
+
+    const missing = runChecklist({
+      inputPath,
+      now: NOW,
+      outputPath: ".quality/live-status.json",
+      root: fixture.root,
+      source: SOURCE,
+      workflows: WORKFLOWS,
+      qualificationHomeDirectory: fixture.qualificationHomeDirectory,
+    });
+    assert.strictEqual(missing.status, "failed");
+    assert.ok(missing.errors.some(error => /Release exposure proof is missing/u.test(error)));
+
+    writeReleaseExposureFixture(fixture, fixture.document, inputPath, {
+      candidateReceiptFingerprint: "9".repeat(64),
+    });
+    const crossed = runChecklist({
+      inputPath,
+      now: NOW,
+      outputPath: ".quality/live-status.json",
+      root: fixture.root,
+      source: SOURCE,
+      workflows: WORKFLOWS,
+      qualificationHomeDirectory: fixture.qualificationHomeDirectory,
+    });
+    assert.strictEqual(crossed.status, "failed");
+    assert.ok(crossed.errors.some(error => /Release exposure proof is invalid/u.test(error)));
+
+    writeReleaseExposureFixture(fixture, fixture.document, inputPath, {
+      evidenceManifest: [],
+    });
+    const omitted = runChecklist({
+      inputPath,
+      now: NOW,
+      outputPath: ".quality/live-status.json",
+      root: fixture.root,
+      source: SOURCE,
+      workflows: WORKFLOWS,
+      qualificationHomeDirectory: fixture.qualificationHomeDirectory,
+    });
+    assert.strictEqual(omitted.status, "failed");
+    assert.ok(omitted.errors.some(error => /Release exposure proof is invalid/u.test(error)));
+  });
+
   test("does not load stale authenticated proof for a non-authenticated partial disk result", () => {
     const inputPath = "internal_docs/quality/live-qualification.json";
     const partial = clone(fixture.document);
@@ -772,6 +926,7 @@ suite("Release checklist trust receipts", () => {
     partial.workflowResults[0].status = "PARTIAL";
     partial.workflowResults[0].authoritativeOutcomeObserved = false;
     fs.writeFileSync(path.join(fixture.root, inputPath), `${JSON.stringify(partial, null, 2)}\n`);
+    writeReleaseExposureFixture(fixture, partial, inputPath);
     fs.writeFileSync(
       path.join(fixture.root, AUTHENTICATED_CANDIDATE_RECEIPT),
       "{stale-auth-proof}\n",

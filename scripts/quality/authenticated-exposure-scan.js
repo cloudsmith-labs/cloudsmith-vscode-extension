@@ -5,11 +5,14 @@ const os = require("os");
 const path = require("path");
 const {
   ROOT,
-  assertRepositoryRelativePath,
   removeOutputFile,
   writeJson,
 } = require("./common");
 const { fingerprint } = require("./evidence");
+const {
+  AUTHENTICATED_CANDIDATE_ARTIFACT,
+  candidateBindingFromReceipt,
+} = require("./candidate-binding");
 const {
   GITLEAKS_VERSION,
   assertScannerVersion,
@@ -21,6 +24,21 @@ const {
 const AUTHENTICATED_EXPOSURE_RESULT = ".quality/secrets/authenticated-ci.json";
 const MAX_RUNTIME_LOG_FILES = 10_000;
 const profileBoundaryProofs = new WeakSet();
+const PROOF_IDENTITY_KEYS = Object.freeze([
+  "changedNanoseconds",
+  "device",
+  "inode",
+  "modifiedNanoseconds",
+  "size",
+]);
+const PROOF_SNAPSHOT_KEYS = Object.freeze([
+  "artifactPath",
+  "candidateReceiptFingerprint",
+  "identity",
+  "sourceFingerprint",
+  "sourceSha",
+  "vsixSha256",
+]);
 
 function exactPrivateDirectory(value, label) {
   if (typeof value !== "string" || !path.isAbsolute(value)
@@ -153,19 +171,108 @@ function safeComponent(component) {
   });
 }
 
+function exactKeys(value, keys) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).sort().join(",") === [...keys].sort().join(","));
+}
+
+function authenticatedProofIdentity(root) {
+  const artifactPath = path.join(
+    root,
+    ...AUTHENTICATED_CANDIDATE_ARTIFACT.split("/"),
+  );
+  let stat;
+  let realPath;
+  try {
+    stat = fs.lstatSync(artifactPath, { bigint: true });
+    realPath = fs.realpathSync(artifactPath);
+  } catch {
+    throw new Error("Authenticated candidate VSIX proof is missing or unreadable.");
+  }
+  if (stat.isSymbolicLink() || !stat.isFile() || realPath !== artifactPath) {
+    throw new Error("Authenticated candidate VSIX proof must be an exact real file.");
+  }
+  return Object.freeze({
+    device: String(stat.dev),
+    inode: String(stat.ino),
+    size: String(stat.size),
+    modifiedNanoseconds: String(stat.mtimeNs),
+    changedNanoseconds: String(stat.ctimeNs),
+  });
+}
+
+function assertAuthenticatedProofSnapshot(snapshot, candidateReceipt, source) {
+  if (!exactKeys(snapshot, PROOF_SNAPSHOT_KEYS)
+    || snapshot.artifactPath !== AUTHENTICATED_CANDIDATE_ARTIFACT
+    || snapshot.candidateReceiptFingerprint !== candidateReceipt?.fingerprint
+    || snapshot.sourceSha !== source?.sha
+    || snapshot.sourceFingerprint !== source?.fingerprint
+    || snapshot.vsixSha256 !== candidateReceipt?.artifact?.sha256
+    || !/^[a-f0-9]{64}$/u.test(snapshot.candidateReceiptFingerprint || "")
+    || !/^[a-f0-9]{40,64}$/u.test(snapshot.sourceSha || "")
+    || !/^[a-f0-9]{64}$/u.test(snapshot.sourceFingerprint || "")
+    || !/^[a-f0-9]{64}$/u.test(snapshot.vsixSha256 || "")
+    || !exactKeys(snapshot.identity, PROOF_IDENTITY_KEYS)
+    || Object.values(snapshot.identity).some(value => !/^\d+$/u.test(value || ""))
+    || snapshot.identity.size !== String(candidateReceipt?.artifact?.archiveBytes)) {
+    throw new Error("Authenticated candidate VSIX proof snapshot is invalid or stale.");
+  }
+  return snapshot;
+}
+
+function assertStableAuthenticatedProof(before, after) {
+  if (!exactKeys(before, PROOF_SNAPSHOT_KEYS)
+    || !exactKeys(after, PROOF_SNAPSHOT_KEYS)
+    || PROOF_SNAPSHOT_KEYS.some(key => (
+      key === "identity"
+        ? JSON.stringify(before.identity) !== JSON.stringify(after.identity)
+        : before[key] !== after[key]
+    ))) {
+    throw new Error(
+      "Authenticated candidate VSIX proof identity or bytes changed during scanning.",
+    );
+  }
+  return after;
+}
+
+function captureAuthenticatedCandidateProof(root, candidateReceipt, source, options = {}) {
+  const before = authenticatedProofIdentity(root);
+  const bindCandidate = options.candidateBindingFromReceipt || candidateBindingFromReceipt;
+  const binding = bindCandidate(candidateReceipt, {
+    root,
+    source,
+    artifactPath: path.join(root, ...AUTHENTICATED_CANDIDATE_ARTIFACT.split("/")),
+  });
+  const after = authenticatedProofIdentity(root);
+  if (JSON.stringify(before) !== JSON.stringify(after)) {
+    throw new Error(
+      "Authenticated candidate VSIX proof identity or bytes changed during validation.",
+    );
+  }
+  return assertAuthenticatedProofSnapshot(Object.freeze({
+    artifactPath: AUTHENTICATED_CANDIDATE_ARTIFACT,
+    candidateReceiptFingerprint: binding.receiptFingerprint,
+    sourceFingerprint: binding.sourceFingerprint,
+    sourceSha: binding.sourceSha,
+    vsixSha256: binding.vsixSha256,
+    identity: after,
+  }), candidateReceipt, source);
+}
+
 function assertExposureReceipt(value) {
   const unsigned = { ...value };
   delete unsigned.fingerprint;
   const exactKeys = [
     "candidateReceiptFingerprint", "components", "credentialBoundary", "findingCount",
-    "fingerprint", "scanner", "schemaVersion", "sourceSha", "status",
+    "fingerprint", "scanner", "schemaVersion", "sourceSha", "status", "vsixSha256",
   ];
   if (!value || typeof value !== "object" || Array.isArray(value)
     || Object.keys(value).sort().join(",") !== exactKeys.sort().join(",")
-    || value.schemaVersion !== 1
+    || value.schemaVersion !== 2
     || !new Set(["passed", "failed"]).has(value.status)
     || !/^[0-9a-f]{40,64}$/u.test(value.sourceSha || "")
     || !/^[a-f0-9]{64}$/u.test(value.candidateReceiptFingerprint || "")
+    || !/^[a-f0-9]{64}$/u.test(value.vsixSha256 || "")
     || !value.scanner || Object.keys(value.scanner).sort().join(",")
       !== "name,secretBearingFieldsPersisted,version"
     || value.scanner.name !== "gitleaks"
@@ -200,7 +307,7 @@ function validateAuthenticatedExposureProof(receipt, candidateReceipt, source) {
   assertExposureReceipt(receipt);
   const expectedIds = [
     "authenticated-generated-evidence",
-    `vsix:${candidateReceipt?.artifact?.vsixPath || ""}`,
+    `vsix:${AUTHENTICATED_CANDIDATE_ARTIFACT}`,
     "authenticated-runtime-logs",
     "profile-boundary-metadata-only",
   ];
@@ -208,6 +315,7 @@ function validateAuthenticatedExposureProof(receipt, candidateReceipt, source) {
   if (receipt.status !== "passed"
     || receipt.sourceSha !== source?.sha
     || receipt.candidateReceiptFingerprint !== candidateReceipt?.fingerprint
+    || receipt.vsixSha256 !== candidateReceipt?.artifact?.sha256
     || JSON.stringify(receipt.components.map(component => component.id))
       !== JSON.stringify(expectedIds)
     || generated.status !== "scanned"
@@ -236,6 +344,8 @@ async function runAuthenticatedExposureScan(context, options = {}) {
   const scanGenerated = options.scanGeneratedEvidence || scanGeneratedEvidence;
   const scanArtifact = options.scanVsix || scanVsix;
   const scanLogs = options.scanWithGitleaks || scanWithGitleaks;
+  const captureProof = options.captureAuthenticatedCandidateProof
+    || captureAuthenticatedCandidateProof;
   assertScanner({
     root,
     execute: options.execute,
@@ -252,14 +362,28 @@ async function runAuthenticatedExposureScan(context, options = {}) {
     execute: options.execute,
     environment: context.environment,
   });
-  const artifactPath = assertRepositoryRelativePath(
-    context.candidate.receipt.artifact.vsixPath,
-    { subtree: "out" },
+  const proofBefore = assertAuthenticatedProofSnapshot(
+    await captureProof(root, context.candidate.receipt, context.source, {
+      candidateBindingFromReceipt: options.candidateBindingFromReceipt,
+    }),
+    context.candidate.receipt,
+    context.source,
   );
-  const artifact = await scanArtifact(root, artifactPath, {
+  const artifact = await scanArtifact(root, AUTHENTICATED_CANDIDATE_ARTIFACT, {
     execute: options.execute,
     environment: context.environment,
   });
+  const proofAfter = await captureProof(
+    root,
+    context.candidate.receipt,
+    context.source,
+    { candidateBindingFromReceipt: options.candidateBindingFromReceipt },
+  );
+  assertAuthenticatedProofSnapshot(
+    assertStableAuthenticatedProof(proofBefore, proofAfter),
+    context.candidate.receipt,
+    context.source,
+  );
   const logFindings = runtimeLogs.fileCount === 0 ? [] : scanLogs(
     "dir",
     context.runtimeLogRoot,
@@ -291,10 +415,11 @@ async function runAuthenticatedExposureScan(context, options = {}) {
     total + component.findingCount
   ), 0);
   const base = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: findingCount === 0 ? "passed" : "failed",
     sourceSha: context.source.sha,
     candidateReceiptFingerprint: context.candidateReceiptFingerprint,
+    vsixSha256: proofBefore.vsixSha256,
     scanner: {
       name: "gitleaks",
       version: GITLEAKS_VERSION,
@@ -327,8 +452,11 @@ async function runAuthenticatedExposureScan(context, options = {}) {
 
 module.exports = {
   AUTHENTICATED_EXPOSURE_RESULT,
+  assertAuthenticatedProofSnapshot,
   assertExposureReceipt,
   assertProfileMetadataBoundary,
+  assertStableAuthenticatedProof,
+  captureAuthenticatedCandidateProof,
   createRuntimeLogRoot,
   destroyRuntimeLogRoot,
   runAuthenticatedExposureScan,

@@ -1,9 +1,14 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const assert = require("assert");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { fingerprint } = require("../scripts/quality/evidence");
+const {
+  UI_CANDIDATE_ARTIFACT,
+} = require("../scripts/quality/candidate-binding");
 const {
   FORBIDDEN_REPORT_FIELDS,
   GITLEAKS_VERSION,
@@ -16,12 +21,161 @@ const {
   scannerEnvironment,
   validateArchiveEntryPath,
 } = require("../scripts/quality/secret-scan");
+const {
+  RELEASE_COMPONENT_IDS,
+  buildReleaseExposureResult,
+  executeReleaseExposureScan,
+  validateReleaseExposureProof,
+} = require("../scripts/quality/release-exposure-scan");
+
+function createReleaseExposureFixture(root) {
+  const source = Object.freeze({
+    sha: "a".repeat(40),
+    fingerprint: "b".repeat(64),
+  });
+  const candidateBytes = Buffer.from("synthetic-ui-candidate");
+  fs.mkdirSync(path.join(root, ".quality", "qualification"), { recursive: true });
+  fs.mkdirSync(path.join(root, ".quality", "ui"), { recursive: true });
+  fs.mkdirSync(path.join(root, "quality"), { recursive: true });
+  fs.mkdirSync(path.join(root, "internal_docs", "quality"), { recursive: true });
+  fs.writeFileSync(path.join(root, "package.json"), `${JSON.stringify({
+    publisher: "Cloudsmith",
+    name: "cloudsmith-vsc",
+    version: "2.3.0",
+  })}\n`);
+  fs.writeFileSync(path.join(root, "quality", "critical-workflows.json"), `${JSON.stringify({
+    workflows: [{
+      id: "WF-FIXTURE",
+      evidence: [{ layer: "black-box-ui", testNames: ["fixture UI test"] }],
+    }],
+  })}\n`);
+  const candidateArtifactPath = path.join(root, UI_CANDIDATE_ARTIFACT);
+  fs.writeFileSync(candidateArtifactPath, candidateBytes);
+  const outputPath = path.join(root, "out", "development", "cloudsmith-vsc-2.3.0.vsix");
+  const receiptBase = {
+    schemaVersion: 2,
+    status: "passed",
+    capturedAt: "2026-08-27T12:00:00.000Z",
+    source,
+    repository: { branch: "test/release-quality-harness", dirty: true, status: "dirty" },
+    extension: {
+      id: "Cloudsmith.cloudsmith-vsc",
+      publisher: "Cloudsmith",
+      name: "cloudsmith-vsc",
+      version: "2.3.0",
+    },
+    vscode: {
+      version: "1.131.0",
+      executable: "/bounded/code",
+      cli: "/bounded/cli",
+    },
+    profile: {
+      mode: "ci",
+      persistent: false,
+      root: "/bounded/ui-profile",
+      testResourcesDir: "/bounded/ui-profile",
+      userDataDir: "/bounded/ui-profile/settings",
+      extensionsDir: "/bounded/ui-profile/extensions",
+    },
+    artifact: {
+      vsixPath: "out/development/cloudsmith-vsc-2.3.0.vsix",
+      absoluteVsixPath: outputPath,
+      sha256: crypto.createHash("sha256").update(candidateBytes).digest("hex"),
+      archiveBytes: candidateBytes.length,
+      entryCount: 1,
+      sourceSha: source.sha,
+      sourceFingerprint: source.fingerprint,
+    },
+    installation: {
+      status: "passed",
+      id: "Cloudsmith.cloudsmith-vsc",
+      version: "2.3.0",
+    },
+    launch: { status: "not-requested", developmentPath: false },
+  };
+  const candidateReceipt = {
+    ...receiptBase,
+    fingerprint: fingerprint(receiptBase),
+  };
+  const ui = {
+    schemaVersion: 2,
+    status: "passed",
+    source,
+    sourceSha: source.sha,
+    tool: "vscode-extension-tester",
+    toolVersion: "8.24.0",
+    vscodeVersion: "1.131.0",
+    platform: "darwin",
+    architecture: "arm64",
+    launchAttempted: true,
+    tests: ["fixture UI test"],
+    results: [{ name: "fixture UI test", status: "passed" }],
+    candidate: {
+      candidateReceiptFingerprint: candidateReceipt.fingerprint,
+      extensionId: "Cloudsmith.cloudsmith-vsc",
+      extensionVersion: "2.3.0",
+      profileMode: "ci",
+      sourceFingerprint: source.fingerprint,
+      sourceSha: source.sha,
+      vscodeVersion: "1.131.0",
+      vsixSha256: receiptBase.artifact.sha256,
+    },
+    reason: null,
+  };
+  const uiBytes = Buffer.from(JSON.stringify(ui));
+  fs.writeFileSync(path.join(root, ".quality", "ui", "result.json"), uiBytes);
+  const evidencePath = "internal_docs/quality/findings.jsonl";
+  const evidenceBytes = Buffer.from("synthetic value-blind finding evidence\n");
+  fs.writeFileSync(path.join(root, evidencePath), evidenceBytes);
+  const attestationPath = "internal_docs/quality/live-qualification.json";
+  const attestation = {
+    evidence: [{
+      path: evidencePath,
+      sha256: crypto.createHash("sha256").update(evidenceBytes).digest("hex"),
+    }],
+    workflowResults: [],
+  };
+  const attestationBytes = Buffer.from(JSON.stringify(attestation));
+  fs.writeFileSync(path.join(root, attestationPath), attestationBytes);
+  const scanGeneratedEvidence = () => ({
+    id: RELEASE_COMPONENT_IDS[0],
+    status: "scanned",
+    fileCount: 4,
+    findings: [],
+  });
+  const scanAcceptedEvidence = (_root, paths) => ({
+    id: RELEASE_COMPONENT_IDS[2],
+    status: "scanned",
+    fileCount: paths.length,
+    findings: [],
+    snapshot: Object.fromEntries(paths.map(relativePath => [
+      relativePath,
+      fs.readFileSync(path.join(root, relativePath)),
+    ])),
+  });
+  return {
+    attestation,
+    attestationBytes,
+    candidateArtifactPath,
+    candidateBytes,
+    candidateReceipt,
+    evidencePath,
+    scanAcceptedEvidence,
+    scanGeneratedEvidence,
+    source,
+    ui,
+    uiBytes,
+  };
+}
 
 suite("secret exposure gate", () => {
   let scratch;
 
   setup(() => {
-    scratch = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-secret-gate-test-"));
+    scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-secret-gate-test-",
+    )));
   });
 
   teardown(() => {
@@ -218,5 +372,194 @@ suite("secret exposure gate", () => {
     assert.strictEqual(document.findingCount, 1);
     assert.strictEqual(document.scanner.version, GITLEAKS_VERSION);
     assert.doesNotMatch(JSON.stringify(document), /(?:secretHash|fingerprint|match|entropy|author|email|message)/iu);
+  });
+
+  test("release exposure proof binds the exact post-UI candidate and accepted evidence", () => {
+    const source = {
+      sha: "a".repeat(40),
+      fingerprint: "b".repeat(64),
+    };
+    const expected = {
+      source,
+      candidateReceiptFingerprint: "c".repeat(64),
+      vsixSha256: "d".repeat(64),
+      uiResultSha256: "e".repeat(64),
+      attestationPath: "internal_docs/quality/live-qualification.json",
+      attestationSha256: "f".repeat(64),
+      evidenceManifest: [{
+        path: "internal_docs/quality/findings.jsonl",
+        sha256: "1".repeat(64),
+      }],
+    };
+    const result = buildReleaseExposureResult({
+      ...expected,
+      components: [
+        {
+          id: RELEASE_COMPONENT_IDS[0],
+          status: "scanned",
+          fileCount: 8,
+          findings: [],
+        },
+        {
+          id: RELEASE_COMPONENT_IDS[1],
+          status: "scanned",
+          fileCount: 171,
+          findings: [],
+        },
+        { id: "accepted-live-evidence", status: "scanned", fileCount: 2, findings: [] },
+      ],
+      now: new Date("2026-08-27T12:00:00.000Z"),
+    });
+    assert.strictEqual(validateReleaseExposureProof(result, expected), true);
+    assert.strictEqual(result.status, "passed");
+    assert.strictEqual(result.findingCount, 0);
+    assert.strictEqual(result.scanner.secretBearingFieldsPersisted, false);
+
+    for (const mutation of [
+      { candidateReceiptFingerprint: "2".repeat(64) },
+      { vsixSha256: "3".repeat(64) },
+      { uiResultSha256: "4".repeat(64) },
+      { attestationSha256: "5".repeat(64) },
+      { evidenceManifest: [] },
+    ]) {
+      assert.throws(
+        () => validateReleaseExposureProof(result, { ...expected, ...mutation }),
+        /release exposure proof/iu,
+      );
+    }
+  });
+
+  test("release exposure proof rejects omitted evidence and self-consistent crossed receipts", () => {
+    const source = {
+      sha: "a".repeat(40),
+      fingerprint: "b".repeat(64),
+    };
+    const expected = {
+      source,
+      candidateReceiptFingerprint: "c".repeat(64),
+      vsixSha256: "d".repeat(64),
+      uiResultSha256: "e".repeat(64),
+      attestationPath: "internal_docs/quality/live-qualification.json",
+      attestationSha256: "f".repeat(64),
+      evidenceManifest: [
+        { path: "internal_docs/quality/findings.jsonl", sha256: "1".repeat(64) },
+        { path: "internal_docs/quality/workflow.md", sha256: "2".repeat(64) },
+      ],
+    };
+    const crossed = buildReleaseExposureResult({
+      ...expected,
+      candidateReceiptFingerprint: "9".repeat(64),
+      evidenceManifest: expected.evidenceManifest.slice(0, 1),
+      components: [
+        {
+          id: RELEASE_COMPONENT_IDS[0],
+          status: "scanned",
+          fileCount: 8,
+          findings: [],
+        },
+        {
+          id: RELEASE_COMPONENT_IDS[1],
+          status: "scanned",
+          fileCount: 171,
+          findings: [],
+        },
+        { id: "accepted-live-evidence", status: "scanned", fileCount: 2, findings: [] },
+      ],
+      now: new Date("2026-08-27T12:00:00.000Z"),
+    });
+    assert.throws(
+      () => validateReleaseExposureProof(crossed, expected),
+      /release exposure proof/iu,
+    );
+  });
+
+  test("release exposure scan binds the scanned post-UI bytes and exact evidence snapshot", async () => {
+    const fixture = createReleaseExposureFixture(scratch);
+    const result = await executeReleaseExposureScan({
+      root: scratch,
+      source: fixture.source,
+      candidateReceipt: fixture.candidateReceipt,
+      candidateArtifactPath: fixture.candidateArtifactPath,
+      ui: fixture.ui,
+      attestation: fixture.attestation,
+      attestationBytes: fixture.attestationBytes,
+      assertScannerVersion() {},
+      scanGeneratedEvidence: fixture.scanGeneratedEvidence,
+      scanVsix: async (_root, relativePath) => ({
+        id: `vsix:${relativePath}`,
+        status: "scanned",
+        fileCount: 2,
+        findings: [],
+      }),
+      scanAcceptedEvidence: fixture.scanAcceptedEvidence,
+      now: new Date("2026-08-27T12:05:00.000Z"),
+    });
+    assert.strictEqual(validateReleaseExposureProof(result, {
+      source: fixture.source,
+      candidateReceiptFingerprint: fixture.candidateReceipt.fingerprint,
+      vsixSha256: fixture.candidateReceipt.artifact.sha256,
+      uiResultSha256: crypto.createHash("sha256").update(fixture.uiBytes).digest("hex"),
+      attestationPath: "internal_docs/quality/live-qualification.json",
+      attestationSha256: crypto.createHash("sha256")
+        .update(fixture.attestationBytes)
+        .digest("hex"),
+      evidenceManifest: fixture.attestation.evidence,
+    }), true);
+  });
+
+  test("release exposure scan rejects same-byte candidate replacement during inspection", async () => {
+    const fixture = createReleaseExposureFixture(scratch);
+    await assert.rejects(() => executeReleaseExposureScan({
+      root: scratch,
+      source: fixture.source,
+      candidateReceipt: fixture.candidateReceipt,
+      candidateArtifactPath: fixture.candidateArtifactPath,
+      ui: fixture.ui,
+      attestation: fixture.attestation,
+      attestationBytes: fixture.attestationBytes,
+      assertScannerVersion() {},
+      scanGeneratedEvidence: fixture.scanGeneratedEvidence,
+      scanVsix: async (_root, relativePath) => {
+        const replacement = path.join(scratch, ".quality", "qualification", "replacement.vsix");
+        fs.writeFileSync(replacement, fixture.candidateBytes);
+        fs.renameSync(replacement, fixture.candidateArtifactPath);
+        return {
+          id: `vsix:${relativePath}`,
+          status: "scanned",
+          fileCount: 2,
+          findings: [],
+        };
+      },
+      scanAcceptedEvidence: fixture.scanAcceptedEvidence,
+    }), /candidate changed during release exposure scanning/u);
+  });
+
+  test("release exposure scan rejects accepted evidence changed after snapshot", async () => {
+    const fixture = createReleaseExposureFixture(scratch);
+    await assert.rejects(() => executeReleaseExposureScan({
+      root: scratch,
+      source: fixture.source,
+      candidateReceipt: fixture.candidateReceipt,
+      candidateArtifactPath: fixture.candidateArtifactPath,
+      ui: fixture.ui,
+      attestation: fixture.attestation,
+      attestationBytes: fixture.attestationBytes,
+      assertScannerVersion() {},
+      scanGeneratedEvidence: fixture.scanGeneratedEvidence,
+      scanVsix: async (_root, relativePath) => ({
+        id: `vsix:${relativePath}`,
+        status: "scanned",
+        fileCount: 2,
+        findings: [],
+      }),
+      scanAcceptedEvidence(root, paths) {
+        const component = fixture.scanAcceptedEvidence(root, paths);
+        fs.writeFileSync(
+          path.join(scratch, fixture.evidencePath),
+          "changed after evidence snapshot\n",
+        );
+        return component;
+      },
+    }), /evidence changed or does not match/u);
   });
 });

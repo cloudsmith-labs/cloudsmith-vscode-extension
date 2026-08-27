@@ -26,10 +26,13 @@ const {
   AUTHENTICATED_CANDIDATE_RECEIPT,
   LIVE_CANDIDATE_ARTIFACT,
   LIVE_CANDIDATE_RECEIPT,
+  UI_CANDIDATE_ARTIFACT,
+  UI_CANDIDATE_RECEIPT,
   candidateBindingFromReceipt,
   validateAuthenticatedExecutionReceipt,
   validateCandidateBinding,
   validateEquivalentCandidateProduct,
+  validateEquivalentExtensionArtifact,
 } = require("./candidate-binding");
 const { captureRepositoryState } = require("./prepare-qualification");
 const {
@@ -41,6 +44,8 @@ const DEFAULT_INPUT = "internal_docs/quality/live-qualification.json";
 const DEFAULT_OUTPUT = ".quality/gates/live-qualification-status.json";
 const DEFAULT_FINDINGS = "internal_docs/quality/findings.jsonl";
 const DEFAULT_AUTHENTICATED_RECEIPT = ".quality/qualification/authenticated-ci.json";
+const RELEASE_EXPOSURE_RESULT = ".quality/secrets/release.json";
+const UI_RESULT = ".quality/ui/result.json";
 const READY_VERDICTS = new Set([
   "TEAM-TEST READY",
   "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS",
@@ -431,6 +436,67 @@ function validateAttestationEnvelope(document, source, errors, context) {
     errors.push("Live qualification must identify the qualification operator.");
   }
   if (!Number.isFinite(context.nowMs)) errors.push("Live qualification validation time is invalid.");
+  if (context.requireReleaseExposureProof) {
+    validateReleaseExposureBinding(document, source, errors, context);
+  }
+}
+
+function validateReleaseExposureBinding(document, source, errors, context) {
+  try {
+    if (!context.releaseExposureReceipt) {
+      throw new Error("Release exposure proof is missing.");
+    }
+    if (!context.uiCandidateReceipt) {
+      throw new Error("Signed-out UI candidate receipt is missing.");
+    }
+    if (!context.uiCandidateArtifactPath) {
+      throw new Error("Signed-out UI candidate VSIX proof is missing.");
+    }
+    if (!/^[a-f0-9]{64}$/u.test(context.uiResultSha256 || "")) {
+      throw new Error("Signed-out UI result proof is missing.");
+    }
+    if (!/^[a-f0-9]{64}$/u.test(context.attestationFingerprint || "")) {
+      throw new Error("Live qualification attestation proof is missing.");
+    }
+    const uiCandidate = candidateBindingFromReceipt(context.uiCandidateReceipt, {
+      root: context.root,
+      source,
+      artifactPath: context.uiCandidateArtifactPath,
+    });
+    if (uiCandidate.profileMode !== "ci") {
+      throw new Error("Signed-out UI candidate must use an ephemeral CI profile.");
+    }
+    if (document.candidate) {
+      validateCandidateBinding(document.candidate);
+      validateEquivalentExtensionArtifact(document.candidate, uiCandidate);
+    }
+    if (!context.uiResult) {
+      throw new Error("Signed-out UI result proof is missing.");
+    }
+    const {
+      validateReleaseExposureProof,
+    } = require("./release-exposure-scan");
+    const { verifySignedOutUiEvidence } = require("./verify-ui-evidence");
+    verifySignedOutUiEvidence({
+      root: context.root,
+      source,
+      workflows: context.workflows,
+      candidateReceipt: context.uiCandidateReceipt,
+      candidateArtifactPath: context.uiCandidateArtifactPath,
+      ui: context.uiResult,
+    });
+    validateReleaseExposureProof(context.releaseExposureReceipt, {
+      source,
+      candidateReceiptFingerprint: uiCandidate.receiptFingerprint,
+      vsixSha256: uiCandidate.vsixSha256,
+      uiResultSha256: context.uiResultSha256,
+      attestationPath: context.inputPath,
+      attestationSha256: context.attestationFingerprint,
+      evidenceManifest: qualificationEvidenceManifest(document),
+    });
+  } catch (error) {
+    errors.push(`Release exposure proof is invalid: ${error.message}`);
+  }
 }
 
 function validatePassedAttestation(
@@ -766,6 +832,15 @@ function createValidationContext(options = {}) {
     authenticatedExposureReceipt: options.authenticatedExposureReceipt || null,
     authenticatedCandidateReceipt: options.authenticatedCandidateReceipt || null,
     authenticatedCandidateArtifactPath: options.authenticatedCandidateArtifactPath || null,
+    requireReleaseExposureProof: options.requireReleaseExposureProof === true,
+    releaseExposureReceipt: options.releaseExposureReceipt || null,
+    uiCandidateReceipt: options.uiCandidateReceipt || null,
+    uiCandidateArtifactPath: options.uiCandidateArtifactPath || null,
+    uiResult: options.uiResult || null,
+    uiResultSha256: options.uiResultSha256 || null,
+    attestationFingerprint: options.attestationFingerprint || null,
+    inputPath: options.inputPath || DEFAULT_INPUT,
+    workflows: options.workflows || null,
     qualificationHomeDirectory: options.qualificationHomeDirectory,
     repositoryState: options.repositoryState || null,
     findingsState: options.findingsState || readFindingsState(
@@ -1031,15 +1106,23 @@ function loadLiveQualification(root, inputPath) {
 }
 
 function loadQualificationJson(root, relativePath, subtree = ".quality/qualification") {
+  return loadQualificationProof(root, relativePath, subtree)?.document || null;
+}
+
+function loadQualificationProof(root, relativePath, subtree = ".quality/qualification") {
   const target = resolveOptionalRepositoryFile(relativePath, root, {
     subtree,
   });
   if (!target) return null;
   const stat = fs.lstatSync(target);
-  if (stat.size <= 0 || stat.size > 1024 * 1024) {
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > 1024 * 1024) {
     throw new Error(`Qualification proof is not a bounded regular file: ${relativePath}`);
   }
-  return JSON.parse(decodeUtf8Bytes(fs.readFileSync(target), "Qualification proof"));
+  const bytes = fs.readFileSync(target);
+  return {
+    document: JSON.parse(decodeUtf8Bytes(bytes, "Qualification proof")),
+    sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+  };
 }
 
 function evaluateDiskLiveQualification(options = {}) {
@@ -1053,6 +1136,15 @@ function evaluateDiskLiveQualification(options = {}) {
   const liveCandidateReceipt = loaded
     ? loadQualificationJson(root, LIVE_CANDIDATE_RECEIPT)
     : null;
+  const releaseExposureReceipt = loaded
+    ? loadQualificationJson(root, RELEASE_EXPOSURE_RESULT, ".quality/secrets")
+    : null;
+  const uiCandidateReceipt = loaded
+    ? loadQualificationJson(root, UI_CANDIDATE_RECEIPT)
+    : null;
+  const uiResultProof = loaded
+    ? loadQualificationProof(root, UI_RESULT, ".quality/ui")
+    : null;
   const authenticatedReceipt = authenticatedProofRequired
     ? loadQualificationJson(root, DEFAULT_AUTHENTICATED_RECEIPT)
     : null;
@@ -1064,6 +1156,11 @@ function evaluateDiskLiveQualification(options = {}) {
     : null;
   const liveCandidateArtifactPath = loaded
     ? resolveOptionalRepositoryFile(LIVE_CANDIDATE_ARTIFACT, root, {
+      subtree: ".quality/qualification",
+    })
+    : null;
+  const uiCandidateArtifactPath = loaded
+    ? resolveOptionalRepositoryFile(UI_CANDIDATE_ARTIFACT, root, {
       subtree: ".quality/qualification",
     })
     : null;
@@ -1085,6 +1182,12 @@ function evaluateDiskLiveQualification(options = {}) {
     root,
     liveCandidateReceipt,
     liveCandidateArtifactPath,
+    requireReleaseExposureProof: Boolean(loaded),
+    releaseExposureReceipt,
+    uiCandidateReceipt,
+    uiCandidateArtifactPath,
+    uiResult: uiResultProof?.document || null,
+    uiResultSha256: uiResultProof?.sha256 || null,
     authenticatedReceipt,
     authenticatedExposureReceipt,
     authenticatedCandidateReceipt,
