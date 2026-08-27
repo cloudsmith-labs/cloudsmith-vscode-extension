@@ -16,6 +16,13 @@ const HELP_ROWS = Object.freeze([
   "View issues",
   "Report an issue",
 ]);
+const SIGNED_OUT_COMMANDS = Object.freeze([
+  Object.freeze({ label: "Cloudsmith: Import API key from Cloudsmith CLI", enabled: true }),
+  Object.freeze({ label: "Cloudsmith: Open Cloudsmith settings", enabled: true }),
+  Object.freeze({ label: "Cloudsmith: Set up Cloudsmith authentication", enabled: true }),
+  Object.freeze({ label: "Cloudsmith: Sign in with SSO", enabled: true }),
+  Object.freeze({ label: "Cloudsmith: View Cloudsmith documentation", enabled: true }),
+]);
 const SIGNED_OUT_ROWS = Object.freeze({
   Workspaces: Object.freeze(["Connect to Cloudsmith"]),
   "Package search": Object.freeze(["Connect to Cloudsmith"]),
@@ -56,25 +63,8 @@ suite("packaged black-box UI smoke", function () {
       label: await item.getLabel(),
       enabled: await item.isEnabled(),
     })));
-    const labels = choices.map(choice => choice.label);
-    assert.ok(labels.includes("Cloudsmith: Open Cloudsmith settings"));
-    assert.ok(labels.includes("Cloudsmith: View Cloudsmith documentation"));
-    assert.ok(
-      choices.some(choice => (
-        choice.label === "Cloudsmith: Set up Cloudsmith authentication" && choice.enabled
-      )),
-      "signed-out users must be able to choose the authentication setup command"
-    );
-    for (const unavailable of [
-      "Cloudsmith: Connect to Cloudsmith",
-      "Cloudsmith: Clear stored credentials",
-    ]) {
-      assert.strictEqual(
-        labels.includes(unavailable),
-        false,
-        `${unavailable} must be absent without stored credentials`
-      );
-    }
+    choices.sort((left, right) => left.label.localeCompare(right.label));
+    assert.deepStrictEqual(choices, SIGNED_OUT_COMMANDS);
     await input.cancel();
   });
 
