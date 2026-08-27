@@ -59,11 +59,14 @@ suite("packaged black-box UI smoke", function () {
   test("publishes the exact signed-out command set in the real Command Palette", async () => {
     const input = await new Workbench().openCommandPrompt();
     await input.setText(">Cloudsmith:");
-    const choices = await Promise.all((await input.getQuickPicks()).map(async item => ({
-      label: await item.getLabel(),
-      enabled: await item.isEnabled(),
-    })));
-    choices.sort((left, right) => left.label.localeCompare(right.label));
+    const choices = await VSBrowser.instance.driver.wait(async () => {
+      try {
+        const current = await commandChoices(input);
+        return JSON.stringify(current) === JSON.stringify(SIGNED_OUT_COMMANDS) ? current : false;
+      } catch (error) {
+        return error?.name === "StaleElementReferenceError" ? false : Promise.reject(error);
+      }
+    }, 10_000, "the Command Palette never published its exact signed-out command set");
     assert.deepStrictEqual(choices, SIGNED_OUT_COMMANDS);
     await input.cancel();
   });
@@ -102,4 +105,12 @@ suite("packaged black-box UI smoke", function () {
 async function labelsFor(section) {
   const items = await section.getVisibleItems();
   return Promise.all(items.map(item => item.getLabel()));
+}
+
+async function commandChoices(input) {
+  const choices = await Promise.all((await input.getQuickPicks()).map(async item => ({
+    label: await item.getLabel(),
+    enabled: await item.isEnabled(),
+  })));
+  return choices.sort((left, right) => left.label.localeCompare(right.label));
 }
