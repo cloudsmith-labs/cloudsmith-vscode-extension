@@ -29,4 +29,6 @@ function run(script, args = []) {
 
 run("run-node-tests.js", zeroProbe ? ["--zero-probe"] : []);
 run("run-vscode-tests.js", ["--label", label, ...(zeroProbe ? ["--zero-probe"] : [])]);
-if (!zeroProbe) console.log(`Live automation excluded: ${CREDENTIAL_BOUNDARY_SKIP_REASON}`);
+if (!zeroProbe) {
+  console.log(`Deterministic live-suite boundary: ${CREDENTIAL_BOUNDARY_SKIP_REASON}`);
+}

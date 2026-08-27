@@ -2,12 +2,22 @@
 
 const assert = require("assert");
 const crypto = require("crypto");
+const { spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { fingerprint } = require("../scripts/quality/evidence");
+const {
+  AUTHENTICATED_CANDIDATE_ARTIFACT,
+  AUTHENTICATED_CANDIDATE_RECEIPT,
+  LIVE_CANDIDATE_ARTIFACT,
+  LIVE_CANDIDATE_RECEIPT,
+  candidateBindingFromReceipt,
+} = require("../scripts/quality/candidate-binding");
 const {
   attestationReviewDigest,
   evaluateLiveQualification,
+  requiredLiveWorkflowIds,
   runChecklist,
 } = require("../scripts/quality/release-checklist");
 
@@ -22,8 +32,9 @@ const COMPLETED_AT = timestampBeforeNow(2 * 60 * 1000);
 const REVIEWED_AT = timestampBeforeNow(60 * 1000);
 const WORKFLOWS = Object.freeze({
   workflows: Object.freeze([Object.freeze({
-    id: "critical-live-workflow",
+    id: "WF-AUTH-STATE",
     requiredLayers: Object.freeze(["live-protocol"]),
+    liveFixture: Object.freeze({ required: true }),
   })]),
 });
 
@@ -44,8 +55,21 @@ function writeEvidence(root, filename, content, capturedAt) {
 }
 
 function createFixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "release-checklist-trust-"));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(
+    os.tmpdir(),
+    "release-checklist-trust-",
+  )));
+  assert.strictEqual(spawnSync("git", ["init", "-b", "test/release-quality-harness"], {
+    cwd: root,
+    stdio: "ignore",
+  }).status, 0);
+  fs.writeFileSync(path.join(root, ".gitignore"), ".quality/\ninternal_docs/\n");
   fs.mkdirSync(path.join(root, "quality"), { recursive: true });
+  fs.writeFileSync(path.join(root, "package.json"), `${JSON.stringify({
+    publisher: "Cloudsmith",
+    name: "cloudsmith-vsc",
+    version: "2.3.0",
+  })}\n`);
   for (const filename of [
     "critical-workflows.json",
     "defect-taxonomy.json",
@@ -74,7 +98,10 @@ function createFixture() {
     `${JSON.stringify({
       id: "QH-900",
       severity: "P3",
+      domain: "product",
       status: "deferred",
+      deterministicStatus: "failing",
+      liveStatus: "blocked",
       surface: "fixture",
       workflowContract: "WF-AUTH-STATE",
       failureClasses: ["false-green-test"],
@@ -90,15 +117,203 @@ function createFixture() {
       regressionTest: null,
       mutationProof: { status: "not-started", summary: "Not applicable to the fixture." },
       fixedSha: null,
-      liveVerification: { status: "blocked", summary: "Fixture only." },
+      liveVerification: { summary: "Fixture only." },
       releaseBlocking: false,
     })}\n`,
     CAPTURED_AT,
   );
-  const document = {
-    schemaVersion: 3,
-    source: SOURCE,
+  const candidateBytes = Buffer.from("x");
+  const qualificationHomeDirectory = path.join(root, "qualification-home");
+  fs.mkdirSync(qualificationHomeDirectory);
+  const localProfileRoot = path.join(
+    qualificationHomeDirectory,
+    ".cloudsmith-vscode-qualification",
+  );
+  const repositoryArtifactPath = path.join(
+    root,
+    "out",
+    "development",
+    "cloudsmith-vsc-2.3.0.vsix",
+  );
+  fs.mkdirSync(path.dirname(repositoryArtifactPath), { recursive: true });
+  fs.writeFileSync(repositoryArtifactPath, candidateBytes);
+  const candidateBase = {
+    schemaVersion: 2,
     status: "passed",
+    capturedAt: CAPTURED_AT,
+    source: SOURCE,
+    repository: {
+      branch: "test/release-quality-harness",
+      dirty: true,
+      status: "dirty",
+    },
+    extension: {
+      id: "Cloudsmith.cloudsmith-vsc",
+      publisher: "Cloudsmith",
+      name: "cloudsmith-vsc",
+      version: "2.3.0",
+    },
+    vscode: { version: "1.134.0", executable: "/bounded/code", cli: "/bounded/cli" },
+    profile: {
+      mode: "local",
+      persistent: true,
+      root: localProfileRoot,
+      testResourcesDir: localProfileRoot,
+      userDataDir: path.join(localProfileRoot, "user-data"),
+      extensionsDir: path.join(localProfileRoot, "extensions"),
+    },
+    artifact: {
+      vsixPath: "out/development/cloudsmith-vsc-2.3.0.vsix",
+      absoluteVsixPath: repositoryArtifactPath,
+      sha256: crypto.createHash("sha256").update(candidateBytes).digest("hex"),
+      archiveBytes: candidateBytes.length,
+      entryCount: 1,
+      sourceSha: SOURCE.sha,
+      sourceFingerprint: SOURCE.fingerprint,
+    },
+    installation: { status: "passed", id: "Cloudsmith.cloudsmith-vsc", version: "2.3.0" },
+    launch: { status: "not-requested", developmentPath: false },
+  };
+  const candidateReceipt = { ...candidateBase, fingerprint: fingerprint(candidateBase) };
+  const authenticatedCandidateBase = {
+    ...candidateBase,
+    profile: {
+      mode: "ci",
+      persistent: false,
+      root: "/bounded/authenticated-ci-profile",
+      testResourcesDir: "/bounded/authenticated-ci-profile",
+      userDataDir: "/bounded/authenticated-ci-profile/settings",
+      extensionsDir: "/bounded/authenticated-ci-profile/extensions",
+    },
+  };
+  const authenticatedCandidateReceipt = {
+    ...authenticatedCandidateBase,
+    fingerprint: fingerprint(authenticatedCandidateBase),
+  };
+  const proofDirectory = path.join(root, ".quality", "qualification");
+  fs.mkdirSync(proofDirectory, { recursive: true });
+  const candidateArtifactPath = path.join(root, LIVE_CANDIDATE_ARTIFACT);
+  fs.writeFileSync(candidateArtifactPath, candidateBytes);
+  fs.writeFileSync(
+    path.join(root, LIVE_CANDIDATE_RECEIPT),
+    `${JSON.stringify(candidateReceipt, null, 2)}\n`
+  );
+  const authenticatedCandidateArtifactPath = path.join(
+    root,
+    AUTHENTICATED_CANDIDATE_ARTIFACT,
+  );
+  fs.writeFileSync(authenticatedCandidateArtifactPath, candidateBytes);
+  fs.writeFileSync(
+    path.join(root, AUTHENTICATED_CANDIDATE_RECEIPT),
+    `${JSON.stringify(authenticatedCandidateReceipt, null, 2)}\n`,
+  );
+  const candidate = candidateBindingFromReceipt(candidateReceipt, {
+    root,
+    source: SOURCE,
+    artifactPath: candidateArtifactPath,
+    homeDirectory: qualificationHomeDirectory,
+  });
+  const authenticatedCandidate = candidateBindingFromReceipt(authenticatedCandidateReceipt, {
+    root,
+    source: SOURCE,
+    artifactPath: authenticatedCandidateArtifactPath,
+  });
+  const authenticatedBase = {
+    schemaVersion: 2,
+    status: "passed",
+    reasonCode: null,
+    source: SOURCE,
+    workspace: {
+      expected: "dl-technology-consulting",
+      observed: "dl-technology-consulting",
+      surface: "production-connected-workspace",
+    },
+    candidate: authenticatedCandidate,
+    credentialBoundary: {
+      storageKey: "cloudsmith-vsc.authToken",
+      transport: "creator-bound-0700-0600-handoff",
+      valueRecorded: false,
+      digestRecorded: false,
+    },
+    phases: {
+      candidate: "prepared",
+      handoff: "consumed-before-store-completion",
+      seed: "passed",
+      productionWorkspaceCheck: "passed",
+      secretStorageCleanup: "passed",
+      profileCleanup: "passed",
+      outputBoundary: "passed",
+    },
+  };
+  const authenticatedReceipt = {
+    ...authenticatedBase,
+    fingerprint: fingerprint(authenticatedBase),
+  };
+  fs.writeFileSync(
+    path.join(proofDirectory, "authenticated-ci.json"),
+    `${JSON.stringify(authenticatedReceipt, null, 2)}\n`
+  );
+  const authenticatedExposureBase = {
+    schemaVersion: 1,
+    status: "passed",
+    sourceSha: SOURCE.sha,
+    candidateReceiptFingerprint: authenticatedCandidateReceipt.fingerprint,
+    scanner: {
+      name: "gitleaks",
+      version: "8.30.1",
+      secretBearingFieldsPersisted: false,
+    },
+    credentialBoundary: {
+      profileContentRead: false,
+      secretStorageRead: false,
+      keychainRead: false,
+      credentialValueRecorded: false,
+      credentialDigestRecorded: false,
+    },
+    findingCount: 0,
+    components: [
+      {
+        id: "authenticated-generated-evidence",
+        status: "scanned",
+        fileCount: 2,
+        findingCount: 0,
+      },
+      {
+        id: `vsix:${authenticatedCandidateReceipt.artifact.vsixPath}`,
+        status: "scanned",
+        fileCount: 2,
+        findingCount: 0,
+      },
+      {
+        id: "authenticated-runtime-logs",
+        status: "not-present",
+        fileCount: 0,
+        findingCount: 0,
+      },
+      {
+        id: "profile-boundary-metadata-only",
+        status: "scanned",
+        fileCount: 4,
+        findingCount: 0,
+      },
+    ],
+  };
+  const authenticatedExposureReceipt = {
+    ...authenticatedExposureBase,
+    fingerprint: fingerprint(authenticatedExposureBase),
+  };
+  const secretsDirectory = path.join(root, ".quality", "secrets");
+  fs.mkdirSync(secretsDirectory, { recursive: true });
+  fs.writeFileSync(
+    path.join(secretsDirectory, "authenticated-ci.json"),
+    `${JSON.stringify(authenticatedExposureReceipt, null, 2)}\n`,
+  );
+  const document = {
+    schemaVersion: 5,
+    source: SOURCE,
+    candidate,
+    status: "passed",
+    summary: null,
     authenticatedAcceptance: true,
     checklistConfirmed: true,
     operatorId: "qualification-operator",
@@ -108,29 +323,45 @@ function createFixture() {
     findingsFingerprint: findingsEvidence.sha256,
     openReleaseBlockerCount: 0,
     workflowResults: [{
-      id: "critical-live-workflow",
-      status: "passed",
+      id: "WF-AUTH-STATE",
+      status: "PASS",
       authoritativeOutcomeObserved: true,
+      candidateReceiptFingerprint: candidate.receiptFingerprint,
       evidence: [qualificationEvidence],
     }],
     visibleEnabledActions: {
       status: "passed",
+      candidateReceiptFingerprint: candidate.receiptFingerprint,
       silentNoOpCount: 0,
       evidence: [qualificationEvidence],
     },
   };
   document.independentReview = {
     status: "passed",
+    candidateReceiptFingerprint: candidate.receiptFingerprint,
     reviewerId: "independent-reviewer",
     source: SOURCE,
     reviewedAt: REVIEWED_AT,
     attestationSha256: attestationReviewDigest(document),
     evidence: [reviewEvidence],
   };
-  return { document, qualificationEvidence, reviewEvidence, root };
+  return {
+    authenticatedReceipt,
+    authenticatedExposureReceipt,
+    authenticatedCandidate,
+    authenticatedCandidateArtifactPath,
+    authenticatedCandidateReceipt,
+    candidateArtifactPath,
+    candidateReceipt,
+    document,
+    qualificationEvidence,
+    qualificationHomeDirectory,
+    reviewEvidence,
+    root,
+  };
 }
 
-function evaluate(fixture, document = fixture.document) {
+function evaluate(fixture, document = fixture.document, overrides = {}) {
   return evaluateLiveQualification({
     attestationFingerprint: crypto.createHash("sha256")
       .update(JSON.stringify(document))
@@ -140,6 +371,14 @@ function evaluate(fixture, document = fixture.document) {
     root: fixture.root,
     source: SOURCE,
     workflows: WORKFLOWS,
+    liveCandidateReceipt: fixture.candidateReceipt,
+    liveCandidateArtifactPath: fixture.candidateArtifactPath,
+    authenticatedReceipt: fixture.authenticatedReceipt,
+    authenticatedExposureReceipt: fixture.authenticatedExposureReceipt,
+    authenticatedCandidateReceipt: fixture.authenticatedCandidateReceipt,
+    authenticatedCandidateArtifactPath: fixture.authenticatedCandidateArtifactPath,
+    qualificationHomeDirectory: fixture.qualificationHomeDirectory,
+    ...overrides,
   });
 }
 
@@ -159,6 +398,17 @@ suite("Release checklist trust receipts", () => {
 
     assert.strictEqual(result.status, "passed");
     assert.strictEqual(result.authenticatedAcceptance, "recorded");
+    assert.deepStrictEqual(result.candidate, fixture.document.candidate);
+    assert.strictEqual(fixture.document.candidate.profileMode, "local");
+    assert.strictEqual(fixture.authenticatedCandidate.profileMode, "ci");
+    assert.notStrictEqual(
+      fixture.document.candidate.receiptFingerprint,
+      fixture.authenticatedCandidate.receiptFingerprint,
+    );
+    assert.notStrictEqual(
+      fixture.document.candidate.profileRootIdentity,
+      fixture.authenticatedCandidate.profileRootIdentity,
+    );
     assert.deepStrictEqual(result.missingWorkflowIds, []);
     assert.match(result.attestationFingerprint, /^[a-f0-9]{64}$/u);
     assert.deepStrictEqual(
@@ -169,6 +419,317 @@ suite("Release checklist trust receipts", () => {
         "internal_docs/quality/qualification.md",
       ]
     );
+  });
+
+  test("rejects a local receipt outside the producer's canonical profile root", () => {
+    const redirectedRoot = path.join(
+      fixture.qualificationHomeDirectory,
+      "other-qualification-profile",
+    );
+    const redirectedBase = {
+      ...fixture.candidateReceipt,
+      profile: {
+        ...fixture.candidateReceipt.profile,
+        root: redirectedRoot,
+        testResourcesDir: redirectedRoot,
+        userDataDir: path.join(redirectedRoot, "user-data"),
+        extensionsDir: path.join(redirectedRoot, "extensions"),
+      },
+    };
+    delete redirectedBase.fingerprint;
+    const result = evaluate(fixture, fixture.document, {
+      liveCandidateReceipt: {
+        ...redirectedBase,
+        fingerprint: fingerprint(redirectedBase),
+      },
+    });
+
+    assert.strictEqual(result.status, "failed");
+    assert.ok(result.errors.some(error => /local profile root is not canonical/u.test(error)));
+  });
+
+  test("rejects missing, crossed, and stale candidate proof for every live PASS", () => {
+    const missing = clone(fixture.document);
+    missing.candidate = null;
+    missing.workflowResults[0].candidateReceiptFingerprint = null;
+    missing.visibleEnabledActions.candidateReceiptFingerprint = null;
+    missing.independentReview.candidateReceiptFingerprint = null;
+    missing.independentReview.attestationSha256 = attestationReviewDigest(missing);
+    const missingResult = evaluate(fixture, missing);
+    assert.strictEqual(missingResult.status, "failed");
+    assert.ok(missingResult.errors.some(error => /Every live PASS must bind/u.test(error)));
+
+    const crossed = clone(fixture.document);
+    crossed.workflowResults[0].candidateReceiptFingerprint = "f".repeat(64);
+    crossed.independentReview.attestationSha256 = attestationReviewDigest(crossed);
+    const crossedResult = evaluate(fixture, crossed);
+    assert.strictEqual(crossedResult.status, "failed");
+    assert.ok(crossedResult.errors.some(error => /does not bind the exact candidate receipt/u.test(error)));
+
+    fs.writeFileSync(fixture.candidateArtifactPath, "stale bytes");
+    const staleResult = evaluate(fixture);
+    assert.strictEqual(staleResult.status, "failed");
+    assert.ok(staleResult.errors.some(error => /VSIX proof is stale or mismatched/u.test(error)));
+  });
+
+  test("requires a passed authenticated verifier receipt for candidate-bound PASS rows", () => {
+    const authenticationFailed = clone(fixture.authenticatedReceipt);
+    authenticationFailed.status = "failed";
+    authenticationFailed.reasonCode = "connected-workspace-mismatch";
+    delete authenticationFailed.fingerprint;
+    authenticationFailed.fingerprint = fingerprint(authenticationFailed);
+
+    const result = evaluate(fixture, fixture.document, {
+      authenticatedReceipt: authenticationFailed,
+    });
+
+    assert.strictEqual(result.status, "failed");
+    assert.ok(result.errors.some(error => /not passed/u.test(error)));
+    assert.strictEqual(result.authenticatedAcceptance, "not-recorded");
+  });
+
+  test("requires the exact passed authenticated exposure receipt for final PASS", () => {
+    const missing = evaluate(fixture, fixture.document, {
+      authenticatedExposureReceipt: null,
+    });
+    assert.strictEqual(missing.status, "failed");
+    assert.strictEqual(missing.authenticatedAcceptance, "not-recorded");
+    assert.ok(missing.errors.some(error => /exposure receipt is missing/u.test(error)));
+
+    const crossed = clone(fixture.authenticatedExposureReceipt);
+    crossed.components[1].id = "vsix:out/development/unbound-candidate.vsix";
+    delete crossed.fingerprint;
+    crossed.fingerprint = fingerprint(crossed);
+    const mismatched = evaluate(fixture, fixture.document, {
+      authenticatedExposureReceipt: crossed,
+    });
+    assert.strictEqual(mismatched.status, "failed");
+    assert.ok(mismatched.errors.some(error => /exact value-blind components/u.test(error)));
+  });
+
+  test("rejects a valid authenticated-CI proof for a different VSIX artifact", () => {
+    const crossedBytes = Buffer.from("y");
+    const crossedReceipt = clone(fixture.authenticatedCandidateReceipt);
+    crossedReceipt.artifact.vsixPath = "out/release/cloudsmith-vsc-2.3.0.vsix";
+    crossedReceipt.artifact.absoluteVsixPath = path.join(
+      fixture.root,
+      crossedReceipt.artifact.vsixPath,
+    );
+    crossedReceipt.artifact.sha256 = crypto.createHash("sha256")
+      .update(crossedBytes)
+      .digest("hex");
+    crossedReceipt.artifact.archiveBytes = crossedBytes.length;
+    delete crossedReceipt.fingerprint;
+    crossedReceipt.fingerprint = fingerprint(crossedReceipt);
+    fs.mkdirSync(path.dirname(crossedReceipt.artifact.absoluteVsixPath), { recursive: true });
+    fs.writeFileSync(crossedReceipt.artifact.absoluteVsixPath, crossedBytes);
+    fs.writeFileSync(fixture.authenticatedCandidateArtifactPath, crossedBytes);
+    const crossedCandidate = candidateBindingFromReceipt(crossedReceipt, {
+      root: fixture.root,
+      source: SOURCE,
+      artifactPath: fixture.authenticatedCandidateArtifactPath,
+    });
+    const crossedAuthentication = clone(fixture.authenticatedReceipt);
+    crossedAuthentication.candidate = crossedCandidate;
+    delete crossedAuthentication.fingerprint;
+    crossedAuthentication.fingerprint = fingerprint(crossedAuthentication);
+
+    const result = evaluate(fixture, fixture.document, {
+      authenticatedCandidateReceipt: crossedReceipt,
+      authenticatedReceipt: crossedAuthentication,
+    });
+
+    assert.strictEqual(result.status, "failed");
+    assert.ok(result.errors.some(error => /same immutable product artifact/u.test(error)));
+  });
+
+  test("rejects authenticated-CI candidate proof crossed from another source", () => {
+    const crossedReceipt = clone(fixture.authenticatedCandidateReceipt);
+    crossedReceipt.source = {
+      sha: "a".repeat(40),
+      fingerprint: "b".repeat(64),
+    };
+    crossedReceipt.artifact.sourceSha = crossedReceipt.source.sha;
+    crossedReceipt.artifact.sourceFingerprint = crossedReceipt.source.fingerprint;
+    delete crossedReceipt.fingerprint;
+    crossedReceipt.fingerprint = fingerprint(crossedReceipt);
+
+    const result = evaluate(fixture, fixture.document, {
+      authenticatedCandidateReceipt: crossedReceipt,
+    });
+
+    assert.strictEqual(result.status, "failed");
+    assert.ok(result.errors.some(error => /source is stale or mismatched/u.test(error)));
+  });
+
+  test("rejects a candidate captured after or more than 24 hours before completion", () => {
+    for (const capturedAt of [
+      timestampBeforeNow(60 * 1000),
+      new Date(Date.parse(COMPLETED_AT) - (24 * 60 * 60 * 1000) - 1).toISOString(),
+    ]) {
+      const changed = clone(fixture.candidateReceipt);
+      changed.capturedAt = capturedAt;
+      delete changed.fingerprint;
+      changed.fingerprint = fingerprint(changed);
+      const result = evaluate(fixture, fixture.document, {
+        liveCandidateReceipt: changed,
+      });
+      assert.strictEqual(result.status, "failed");
+      assert.ok(result.errors.some(error => /capture does not precede completion/u.test(error)));
+    }
+  });
+
+  test("requires every declared live fixture and retains a partial workflow row", () => {
+    assert.deepStrictEqual(requiredLiveWorkflowIds({
+      workflows: [
+        { id: "WF-NO-LIVE-LAYER", requiredLayers: ["black-box-ui"], liveFixture: { required: true } },
+        { id: "WF-LIVE-LAYER", requiredLayers: ["live-protocol"], liveFixture: { required: true } },
+        { id: "WF-OPTIONAL", requiredLayers: ["live-protocol"], liveFixture: { required: false } },
+      ],
+    }), ["WF-LIVE-LAYER", "WF-NO-LIVE-LAYER"]);
+
+    const partial = clone(fixture.document);
+    partial.status = "partial";
+    partial.summary = "The authoritative outcome was only partially observed.";
+    partial.authenticatedAcceptance = false;
+    partial.checklistConfirmed = false;
+    partial.verdict = null;
+    partial.workflowResults[0].status = "PARTIAL";
+    partial.workflowResults[0].authoritativeOutcomeObserved = false;
+
+    const result = evaluate(fixture, partial);
+
+    assert.strictEqual(result.status, "partial");
+    assert.strictEqual(result.authenticatedAcceptance, "not-recorded");
+    assert.strictEqual(result.verdict, null);
+    assert.deepStrictEqual(result.workflowMatrix, [{
+      id: "WF-AUTH-STATE",
+      status: "PARTIAL",
+    }]);
+    assert.deepStrictEqual(result.missingWorkflowIds, ["WF-AUTH-STATE"]);
+  });
+
+  test("retains exact local PASS evidence in non-passing attestations without CI proof", () => {
+    const workflows = {
+      workflows: [
+        ...WORKFLOWS.workflows,
+        {
+          id: "WF-SECOND-LIVE",
+          requiredLayers: ["live-protocol"],
+          liveFixture: { required: true },
+        },
+      ],
+    };
+
+    for (const [declaredStatus, rowStatus] of [
+      ["partial", "PARTIAL"],
+      ["blocked", "BLOCKED"],
+    ]) {
+      const document = clone(fixture.document);
+      document.status = declaredStatus;
+      document.summary = `The second live workflow is ${rowStatus.toLowerCase()}.`;
+      document.authenticatedAcceptance = false;
+      document.checklistConfirmed = false;
+      document.verdict = null;
+      document.workflowResults.push({
+        id: "WF-SECOND-LIVE",
+        status: rowStatus,
+        authoritativeOutcomeObserved: false,
+        candidateReceiptFingerprint: null,
+        evidence: [fixture.qualificationEvidence],
+      });
+
+      const result = evaluate(fixture, document, {
+        authenticatedReceipt: null,
+        authenticatedCandidateReceipt: null,
+        authenticatedCandidateArtifactPath: null,
+        workflows,
+      });
+
+      assert.strictEqual(result.status, declaredStatus);
+      assert.deepStrictEqual(result.candidate, fixture.document.candidate);
+      assert.deepStrictEqual(result.passedWorkflowIds, ["WF-AUTH-STATE"]);
+      assert.deepStrictEqual(result.missingWorkflowIds, ["WF-SECOND-LIVE"]);
+      assert.deepStrictEqual(result.errors, []);
+    }
+  });
+
+  test("keeps local PASS binding fail-closed without weakening passed CI acceptance", () => {
+    const workflows = {
+      workflows: [
+        ...WORKFLOWS.workflows,
+        {
+          id: "WF-SECOND-LIVE",
+          requiredLayers: ["live-protocol"],
+          liveFixture: { required: true },
+        },
+      ],
+    };
+    const partial = clone(fixture.document);
+    partial.status = "partial";
+    partial.summary = "The live result is incomplete.";
+    partial.authenticatedAcceptance = false;
+    partial.checklistConfirmed = false;
+    partial.verdict = null;
+    partial.workflowResults[0].candidateReceiptFingerprint = "f".repeat(64);
+    partial.workflowResults.push({
+      id: "WF-SECOND-LIVE",
+      status: "PARTIAL",
+      authoritativeOutcomeObserved: false,
+      candidateReceiptFingerprint: null,
+      evidence: [fixture.qualificationEvidence],
+    });
+    const crossed = evaluate(fixture, partial, {
+      authenticatedReceipt: null,
+      authenticatedCandidateReceipt: null,
+      authenticatedCandidateArtifactPath: null,
+      workflows,
+    });
+    assert.strictEqual(crossed.status, "failed");
+    assert.ok(crossed.errors.some(error => /does not bind the exact candidate receipt/u.test(error)));
+
+    const passed = evaluate(fixture, fixture.document, {
+      authenticatedReceipt: null,
+      authenticatedCandidateReceipt: null,
+      authenticatedCandidateArtifactPath: null,
+    });
+    assert.strictEqual(passed.status, "failed");
+    assert.strictEqual(passed.authenticatedAcceptance, "not-recorded");
+    assert.ok(passed.errors.some(error => /Authenticated-CI candidate receipt is missing/u.test(error)));
+  });
+
+  test("keeps passed workflow rows blocked, not failed, when only a derived finding remains open", () => {
+    const document = clone(fixture.document);
+    document.openReleaseBlockerCount = 1;
+    document.independentReview.attestationSha256 = attestationReviewDigest(document);
+
+    const result = evaluateLiveQualification({
+      attestationFingerprint: "a".repeat(64),
+      document,
+      findingsState: {
+        fingerprint: document.findingsFingerprint,
+        openReleaseBlockerCount: 1,
+        openNonBlockingRiskCount: 1,
+        errors: [],
+      },
+      now: NOW,
+      root: fixture.root,
+      source: SOURCE,
+      workflows: WORKFLOWS,
+      liveCandidateReceipt: fixture.candidateReceipt,
+      liveCandidateArtifactPath: fixture.candidateArtifactPath,
+      authenticatedReceipt: fixture.authenticatedReceipt,
+      authenticatedExposureReceipt: fixture.authenticatedExposureReceipt,
+      authenticatedCandidateReceipt: fixture.authenticatedCandidateReceipt,
+      authenticatedCandidateArtifactPath: fixture.authenticatedCandidateArtifactPath,
+      qualificationHomeDirectory: fixture.qualificationHomeDirectory,
+    });
+
+    assert.strictEqual(result.status, "blocked");
+    assert.strictEqual(result.authenticatedAcceptance, "not-recorded");
+    assert.strictEqual(result.verdict, null);
+    assert.deepStrictEqual(result.workflowMatrix, [{ id: "WF-AUTH-STATE", status: "PASS" }]);
+    assert.deepStrictEqual(result.passedWorkflowIds, ["WF-AUTH-STATE"]);
   });
 
   test("carries the exact attestation bytes and evidence hashes into the derived status", () => {
@@ -183,6 +744,7 @@ suite("Release checklist trust receipts", () => {
       root: fixture.root,
       source: SOURCE,
       workflows: WORKFLOWS,
+      qualificationHomeDirectory: fixture.qualificationHomeDirectory,
     });
 
     assert.strictEqual(result.status, "passed");
@@ -199,9 +761,39 @@ suite("Release checklist trust receipts", () => {
     );
   });
 
+  test("does not load stale authenticated proof for a non-authenticated partial disk result", () => {
+    const inputPath = "internal_docs/quality/live-qualification.json";
+    const partial = clone(fixture.document);
+    partial.status = "partial";
+    partial.summary = "The authoritative outcome was only partially observed.";
+    partial.authenticatedAcceptance = false;
+    partial.checklistConfirmed = false;
+    partial.verdict = null;
+    partial.workflowResults[0].status = "PARTIAL";
+    partial.workflowResults[0].authoritativeOutcomeObserved = false;
+    fs.writeFileSync(path.join(fixture.root, inputPath), `${JSON.stringify(partial, null, 2)}\n`);
+    fs.writeFileSync(
+      path.join(fixture.root, AUTHENTICATED_CANDIDATE_RECEIPT),
+      "{stale-auth-proof}\n",
+    );
+
+    const result = runChecklist({
+      inputPath,
+      now: NOW,
+      outputPath: ".quality/live-status.json",
+      root: fixture.root,
+      source: SOURCE,
+      workflows: WORKFLOWS,
+      qualificationHomeDirectory: fixture.qualificationHomeDirectory,
+    });
+
+    assert.strictEqual(result.status, "partial");
+    assert.deepStrictEqual(result.candidate, fixture.document.candidate);
+  });
+
   test("rejects a disk attestation containing malformed UTF-8", () => {
     const inputPath = "internal_docs/quality/live-qualification.json";
-    const prefix = Buffer.from('{"schemaVersion":3,"operatorId":"');
+    const prefix = Buffer.from('{"schemaVersion":5,"operatorId":"');
     const suffix = Buffer.from('"}\n');
     fs.writeFileSync(
       path.join(fixture.root, inputPath),
@@ -279,11 +871,12 @@ suite("Release checklist trust receipts", () => {
     const wrongHashResult = evaluate(fixture, wrongHash);
     assert.ok(wrongHashResult.errors.some(error => /SHA-256 does not match/.test(error)));
     assert.strictEqual(wrongHashResult.status, "failed");
-    assert.deepStrictEqual(wrongHashResult.passedWorkflowIds, []);
-    assert.deepStrictEqual(
-      wrongHashResult.missingWorkflowIds,
-      wrongHashResult.requiredWorkflowIds
-    );
+    assert.deepStrictEqual(wrongHashResult.passedWorkflowIds, ["WF-AUTH-STATE"]);
+    assert.deepStrictEqual(wrongHashResult.missingWorkflowIds, []);
+    assert.deepStrictEqual(wrongHashResult.workflowMatrix, [{
+      id: "WF-AUTH-STATE",
+      status: "PASS",
+    }]);
 
     const traversal = clone(fixture.document);
     traversal.evidence[0] = {

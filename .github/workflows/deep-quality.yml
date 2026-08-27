@@ -14,7 +14,7 @@ jobs:
   core-mutation:
     name: Core mutation
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,14 +64,34 @@ jobs:
           include-hidden-files: true
           retention-days: 30
 
-  black-box-ui-boundary:
-    name: Black-box UI - BLOCKED (no SecretStorage authorization)
+      - name: Set up the pinned secret scanner after mutation evidence
+        if: ${{ always() }}
+        uses: ./.github/actions/setup-gitleaks
+
+      - name: Scan complete Git history without suppressing mutation work
+        id: history_secret_scan
+        if: ${{ always() }}
+        run: npm run quality:secrets:history
+
+      - name: Upload only the value-blind history receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: history-secret-receipt-${{ github.sha }}-${{ github.run_attempt }}
+          path: .quality/secrets/history.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
+
+  signed-out-black-box-ui:
+    name: Signed-out packaged black-box UI
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 30
     steps:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up exact Node.js
@@ -80,25 +100,101 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
 
-      - name: Record blocked black-box evidence
-        run: |
-          set +e
-          node scripts/quality/run-ui-smoke.js
-          status=$?
-          set -e
-          if [[ "$status" -ne 2 ]]; then
-            echo "The fail-closed UI boundary did not return its blocked status."
-            exit 1
-          fi
-          echo "### Black-box UI BLOCKED" >> "$GITHUB_STEP_SUMMARY"
-          echo "No UI automation ran and no live acceptance is claimed. Automated VS Code SecretStorage access is outside this task authorization." >> "$GITHUB_STEP_SUMMARY"
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
-      - name: Upload blocked UI receipt
+      - name: Set up the pinned secret scanner
+        uses: ./.github/actions/setup-gitleaks
+
+      - name: Run signed-out packaged black-box UI
+        id: ui_smoke
+        run: xvfb-run -a npm run test:ui:smoke
+
+      - name: Verify exact candidate and UI result binding
+        id: ui_evidence_handoff
         if: ${{ always() }}
+        run: node scripts/quality/verify-ui-evidence.js
+
+      - name: Scan upload-eligible signed-out UI evidence
+        id: ui_evidence_secret_scan
+        if: ${{ always() }}
+        run: npm run quality:secrets:evidence
+
+      - name: Upload safe signed-out UI receipts
+        if: ${{ always() && steps.ui_evidence_handoff.outcome == 'success' && steps.ui_evidence_secret_scan.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: black-box-ui-blocked-${{ github.sha }}-${{ github.run_attempt }}
-          path: .quality/ui/result.json
+          name: signed-out-ui-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            .quality/qualification/candidate.json
+            .quality/ui/result.json
+            .quality/secrets/evidence.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
+
+  authenticated-production-ui:
+    name: Authenticated packaged production UI
+    runs-on: ubuntu-24.04
+    environment: cloudsmith-release-qualification
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Set up the pinned secret scanner
+        uses: ./.github/actions/setup-gitleaks
+
+      - name: Prepare and validate exact authenticated candidate without credentials
+        run: npm run quality:qualification:prepare-authenticated-ci
+
+      - name: Run authenticated packaged production UI
+        id: authenticated_qualification
+        timeout-minutes: 15
+        env:
+          CLOUDSMITH_QUALIFICATION_API_KEY: ${{ secrets.CLOUDSMITH_QUALIFICATION_API_KEY }}
+        run: xvfb-run -a node scripts/quality/run-authenticated-ci.js
+
+      - name: Always clean the authenticated profile session
+        id: authenticated_profile_cleanup
+        if: ${{ always() }}
+        run: node scripts/quality/authenticated-candidate-session.js cleanup
+
+      - name: Verify exact authenticated evidence binding
+        id: authenticated_evidence_handoff
+        if: ${{ always() }}
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+        run: npm run quality:verify-authenticated-evidence
+
+      - name: Scan upload-eligible authenticated evidence
+        id: authenticated_evidence_secret_scan
+        if: ${{ always() }}
+        run: npm run quality:secrets:evidence
+
+      - name: Upload safe authenticated UI receipts
+        if: ${{ always() && steps.authenticated_evidence_handoff.outcome == 'success' && steps.authenticated_evidence_secret_scan.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: authenticated-ui-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            .quality/qualification/authenticated-candidate.json
+            .quality/qualification/authenticated-candidate.vsix
+            .quality/qualification/authenticated-ci.json
+            .quality/secrets/authenticated-ci.json
+            .quality/secrets/evidence.json
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 30

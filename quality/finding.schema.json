@@ -7,7 +7,10 @@
   "required": [
     "id",
     "severity",
+    "domain",
     "status",
+    "deterministicStatus",
+    "liveStatus",
     "surface",
     "workflowContract",
     "failureClasses",
@@ -29,16 +32,27 @@
   "properties": {
     "id": { "type": "string", "pattern": "^QH-[0-9]{3,}$" },
     "severity": { "enum": ["P0", "P1", "P2", "P3"] },
+    "domain": {
+      "enum": [
+        "product",
+        "test-harness",
+        "ci",
+        "release-evidence",
+        "security-environment",
+        "documentation",
+        "external-platform"
+      ]
+    },
     "status": {
       "enum": [
         "open",
-        "fixed-pending-verification",
-        "fixed",
-        "blocked",
+        "closed",
         "deferred",
         "closed-non-issue"
       ]
     },
+    "deterministicStatus": { "enum": ["failing", "fixed", "not-applicable"] },
+    "liveStatus": { "enum": ["not-required", "pending", "blocked", "verified", "failed"] },
     "surface": { "type": "string", "minLength": 1, "maxLength": 200 },
     "workflowContract": { "type": "string", "pattern": "^WF-[A-Z0-9-]+$" },
     "failureClasses": {
@@ -118,10 +132,9 @@
     "liveVerification": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "summary"],
+      "required": ["summary"],
       "properties": {
-        "status": { "enum": ["not-started", "live-pass", "live-fail", "partial", "blocked", "not-applicable"] },
-        "summary": { "type": "string" }
+        "summary": { "type": "string", "minLength": 1 }
       }
     },
     "releaseBlocking": { "type": "boolean" }

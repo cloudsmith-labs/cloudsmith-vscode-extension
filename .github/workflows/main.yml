@@ -34,6 +34,9 @@ jobs:
       - name: Install locked dependencies without lifecycle scripts
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      - name: Set up the pinned secret scanner
+        uses: ./.github/actions/setup-gitleaks
+
       - name: Log toolchain
         run: node -e "console.log({node:process.version,npm:process.env.npm_config_user_agent,platform:process.platform,arch:process.arch})"
 
@@ -51,13 +54,18 @@ jobs:
           QUALITY_BASE: ${{ github.event_name == 'push' && github.event.before || 'origin/main' }}
         run: npm run quality:fast
 
+      - name: Scan upload-eligible quality evidence
+        id: quality_evidence_secret_scan
+        if: ${{ always() }}
+        run: npm run quality:secrets:evidence
+
       - name: Verify exact quality evidence handoff
         id: quality_evidence_handoff
         if: ${{ always() }}
         run: npm run quality:verify-evidence -- --gate-profile fast
 
       - name: Upload quality impact and report evidence
-        if: ${{ always() && steps.quality_evidence_handoff.outcome == 'success' }}
+        if: ${{ always() && steps.quality_evidence_handoff.outcome == 'success' && steps.quality_evidence_secret_scan.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: quality-evidence-${{ github.sha }}-${{ github.run_attempt }}
@@ -67,6 +75,8 @@ jobs:
             .quality/gates/fast/*.json
             .quality/report.json
             .quality/report.md
+            .quality/secrets/current.json
+            .quality/secrets/evidence.json
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 30
@@ -194,6 +204,9 @@ jobs:
       - name: Install locked dependencies without lifecycle scripts
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      - name: Set up the pinned secret scanner
+        uses: ./.github/actions/setup-gitleaks
+
       - name: Build and verify byte-reproducible VSIX twice
         id: package
         env:
@@ -207,6 +220,9 @@ jobs:
           VSIX_PATH: ${{ steps.package.outputs.vsix_path }}
         run: npm run package:verify -- --expected-source-sha "$EXPECTED_SOURCE_SHA" --require-publishable "$VSIX_PATH"
 
+      - name: Scan archive bytes and expanded VSIX contents
+        run: npm run quality:secrets:artifacts
+
       - name: Upload exact verified release inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -215,6 +231,7 @@ jobs:
             ${{ steps.package.outputs.vsix_path }}
             ${{ steps.package.outputs.checksum_path }}
             ${{ steps.package.outputs.provenance_path }}
+            .quality/secrets/artifacts.json
           if-no-files-found: error
           retention-days: 90
           compression-level: 0

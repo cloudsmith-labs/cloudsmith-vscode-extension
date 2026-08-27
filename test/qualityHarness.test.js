@@ -34,6 +34,13 @@ const {
 } = require("../scripts/quality/gate");
 const { aggregateStatuses, fingerprint, sourceIdentity } = require("../scripts/quality/evidence");
 const {
+  AUTHENTICATED_CANDIDATE_ARTIFACT,
+  AUTHENTICATED_CANDIDATE_RECEIPT,
+  LIVE_CANDIDATE_ARTIFACT,
+  LIVE_CANDIDATE_RECEIPT,
+  candidateBindingFromReceipt,
+} = require("../scripts/quality/candidate-binding");
+const {
   assertValidMutationBaseline,
   assertMutationTestOwners,
   assertCanonicalMutationRuntime,
@@ -62,6 +69,10 @@ const {
   requiredLiveWorkflowIds,
 } = require("../scripts/quality/release-checklist");
 const {
+  AUTHENTICATED_EXPOSURE_RESULT,
+  assertExposureReceipt,
+} = require("../scripts/quality/authenticated-exposure-scan");
+const {
   discoverUiArtifacts,
   generateReport,
   hasDeterministicReportFailure,
@@ -86,6 +97,7 @@ const SOURCE_IDENTITY = Object.freeze({
   fingerprint: "a".repeat(64),
 });
 const LIVE_FIXTURE_NOW = new Date("2026-08-26T00:03:00.000Z");
+const QUALITY_FIXTURE_HOME = fs.realpathSync(os.tmpdir());
 
 function analyzeFiles(files) {
   const changeSet = explicitChanges(files, {
@@ -110,6 +122,9 @@ function clone(value) {
 function passedReceipt(step, source = SOURCE_IDENTITY) {
   const artifactFingerprints = {
     "change-impact": mutationArtifactFingerprint(validImpact()),
+    "secret-current": mutationArtifactFingerprint(validSecretReceipt("current")),
+    "secret-artifacts": mutationArtifactFingerprint(validSecretReceipt("artifacts")),
+    "secret-history": mutationArtifactFingerprint(validSecretReceipt("history")),
     "changed-mutation": mutationArtifactFingerprint(validMutationSummary()),
     "black-box-ui-smoke": mutationArtifactFingerprint(validUiResult()),
     "release-checklist": mutationArtifactFingerprint(validLiveStatus()),
@@ -162,9 +177,28 @@ function testEvidence(step, source = SOURCE_IDENTITY) {
 }
 
 function validLiveStatus(overrides = {}) {
-  return {
-    schemaVersion: 1,
+  const qualificationProfileRoot = path.join(
+    QUALITY_FIXTURE_HOME,
+    ".cloudsmith-vscode-qualification",
+  );
+  const localCandidateReceipt = validCandidateReceipt({
+    vscode: { version: "1.134.0", executable: "/bounded/code", cli: "/bounded/cli" },
+    profile: {
+      mode: "local",
+      persistent: true,
+      root: qualificationProfileRoot,
+      testResourcesDir: qualificationProfileRoot,
+      userDataDir: path.join(qualificationProfileRoot, "user-data"),
+      extensionsDir: path.join(qualificationProfileRoot, "extensions"),
+    },
+  });
+  const value = {
+    schemaVersion: 3,
     source: SOURCE_IDENTITY,
+    candidate: candidateBindingFromReceipt(localCandidateReceipt, {
+      source: SOURCE_IDENTITY,
+      homeDirectory: QUALITY_FIXTURE_HOME,
+    }),
     inputPath: "internal_docs/quality/live-qualification.json",
     status: "passed",
     authenticatedAcceptance: "recorded",
@@ -184,23 +218,92 @@ function validLiveStatus(overrides = {}) {
     errors: [],
     ...overrides,
   };
+  if (!Object.prototype.hasOwnProperty.call(overrides, "workflowMatrix")) {
+    const passed = new Set(value.passedWorkflowIds);
+    value.workflowMatrix = value.requiredWorkflowIds.map(id => ({
+      id,
+      status: passed.has(id) ? "PASS" : "BLOCKED",
+    }));
+  }
+  return value;
+}
+
+function validCandidateReceipt(overrides = {}) {
+  const base = {
+    schemaVersion: 2,
+    status: "passed",
+    capturedAt: "2026-08-27T00:00:00.000Z",
+    source: SOURCE_IDENTITY,
+    repository: {
+      branch: "test/release-quality-harness",
+      dirty: true,
+      status: "dirty",
+    },
+    extension: {
+      id: "Cloudsmith.cloudsmith-vsc",
+      publisher: "Cloudsmith",
+      name: "cloudsmith-vsc",
+      version: "2.3.0",
+    },
+    vscode: {
+      version: "1.131.0",
+      executable: "/bounded/code",
+      cli: "/bounded/cli",
+    },
+    profile: {
+      mode: "ci",
+      persistent: false,
+      root: "/bounded/profile",
+      testResourcesDir: "/bounded/profile",
+      userDataDir: "/bounded/profile/settings",
+      extensionsDir: "/bounded/profile/extensions",
+    },
+    artifact: {
+      vsixPath: "out/development/cloudsmith-vsc-2.3.0.vsix",
+      absoluteVsixPath: "/bounded/out/development/cloudsmith-vsc-2.3.0.vsix",
+      sha256: "3".repeat(64),
+      archiveBytes: 1,
+      entryCount: 1,
+      sourceSha: SOURCE_SHA,
+      sourceFingerprint: SOURCE_IDENTITY.fingerprint,
+    },
+    installation: {
+      status: "passed",
+      id: "Cloudsmith.cloudsmith-vsc",
+      version: "2.3.0",
+    },
+    launch: { status: "not-requested", developmentPath: false },
+    ...overrides,
+  };
+  return { ...base, fingerprint: fingerprint(base) };
 }
 
 function validUiResult(tests = ["fixture"], overrides = {}) {
   const sortedTests = uniqueSorted(tests);
+  const candidateReceipt = validCandidateReceipt();
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: "passed",
     source: SOURCE_IDENTITY,
     sourceSha: SOURCE_SHA,
     tool: "vscode-extension-tester",
     toolVersion: "8.24.0",
-    vscodeVersion: "1.134.0",
+    vscodeVersion: "1.131.0",
     platform: "darwin",
     architecture: "arm64",
     launchAttempted: true,
     tests: sortedTests,
     results: sortedTests.map(name => ({ name, status: "passed" })),
+    candidate: {
+      candidateReceiptFingerprint: candidateReceipt.fingerprint,
+      extensionId: candidateReceipt.extension.id,
+      extensionVersion: candidateReceipt.extension.version,
+      profileMode: candidateReceipt.profile.mode,
+      sourceFingerprint: candidateReceipt.source.fingerprint,
+      sourceSha: candidateReceipt.source.sha,
+      vscodeVersion: candidateReceipt.vscode.version,
+      vsixSha256: candidateReceipt.artifact.sha256,
+    },
     reason: null,
     ...overrides,
   };
@@ -208,7 +311,7 @@ function validUiResult(tests = ["fixture"], overrides = {}) {
 
 function blockedUiResult(overrides = {}) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: "blocked",
     source: SOURCE_IDENTITY,
     sourceSha: SOURCE_SHA,
@@ -220,8 +323,28 @@ function blockedUiResult(overrides = {}) {
     launchAttempted: false,
     tests: [],
     results: [],
-    reason: "Production activation reads VS Code SecretStorage; automated UI qualification is not authorized.",
+    candidate: null,
+    reason: "Black-box UI qualification is blocked by the current host environment.",
     ...overrides,
+  };
+}
+
+function validSecretReceipt(mode) {
+  return {
+    schemaVersion: 1,
+    scanner: {
+      name: "gitleaks",
+      version: "8.30.1",
+      redactionPercent: 100,
+      secretBearingFieldsPersisted: false,
+    },
+    mode,
+    status: "passed",
+    sourceSha: SOURCE_SHA,
+    capturedAt: "2026-08-26T00:00:00.000Z",
+    findingCount: 0,
+    components: [],
+    findings: [],
   };
 }
 
@@ -245,8 +368,23 @@ function blackBoxFixtureWorkflows() {
 
 function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW) {
   const workflows = require("../quality/critical-workflows.json");
-  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-live-receipt-"));
+  const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+    os.tmpdir(),
+    "cloudsmith-live-receipt-",
+  )));
+  const qualificationHomeDirectory = fixtureRoot;
+  const qualificationProfileRoot = path.join(
+    qualificationHomeDirectory,
+    ".cloudsmith-vscode-qualification",
+  );
+  assert.strictEqual(require("child_process").spawnSync(
+    "git",
+    ["init", "-b", "test/release-quality-harness"],
+    { cwd: fixtureRoot, stdio: "ignore" },
+  ).status, 0);
+  fs.writeFileSync(path.join(fixtureRoot, ".gitignore"), ".quality/\ninternal_docs/\n");
   fs.mkdirSync(path.join(fixtureRoot, "quality"), { recursive: true });
+  fs.copyFileSync(path.join(root, "package.json"), path.join(fixtureRoot, "package.json"));
   for (const filename of [
     "critical-workflows.json",
     "defect-taxonomy.json",
@@ -285,7 +423,10 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
     `${JSON.stringify({
       id: "QH-900",
       severity: "P3",
+      domain: "documentation",
       status: "deferred",
+      deterministicStatus: "not-applicable",
+      liveStatus: "not-required",
       surface: "fixture",
       workflowContract: "WF-AUTH-STATE",
       failureClasses: ["false-green-test"],
@@ -299,39 +440,217 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
       testLayerThatShouldHaveCaughtIt: "live-protocol",
       whyItEscaped: "This is a schema-valid trust fixture.",
       regressionTest: null,
-      mutationProof: { status: "not-started", summary: "Not applicable to the fixture." },
+      mutationProof: { status: "not-applicable", summary: "Not applicable to the fixture." },
       fixedSha: null,
-      liveVerification: { status: "blocked", summary: "Fixture only." },
+      liveVerification: { summary: "No live verification is required for this fixture." },
       releaseBlocking: false,
     })}\n`,
     capturedAt
   );
-  const document = {
-    schemaVersion: 3,
+  const candidateBytes = Buffer.from("live candidate fixture");
+  const candidateBase = {
+    schemaVersion: 2,
+    status: "passed",
+    capturedAt,
     source,
+    repository: {
+      branch: "test/release-quality-harness",
+      dirty: true,
+      status: "dirty",
+    },
+    extension: {
+      id: "Cloudsmith.cloudsmith-vsc",
+      publisher: "Cloudsmith",
+      name: "cloudsmith-vsc",
+      version: "2.3.0",
+    },
+    vscode: { version: "1.134.0", executable: "/bounded/code", cli: "/bounded/cli" },
+    profile: {
+      mode: "local",
+      persistent: true,
+      root: qualificationProfileRoot,
+      testResourcesDir: qualificationProfileRoot,
+      userDataDir: path.join(qualificationProfileRoot, "user-data"),
+      extensionsDir: path.join(qualificationProfileRoot, "extensions"),
+    },
+    artifact: {
+      vsixPath: "out/development/cloudsmith-vsc-2.3.0.vsix",
+      absoluteVsixPath: path.join(
+        fixtureRoot,
+        "out/development/cloudsmith-vsc-2.3.0.vsix",
+      ),
+      sha256: crypto.createHash("sha256").update(candidateBytes).digest("hex"),
+      archiveBytes: candidateBytes.length,
+      entryCount: 1,
+      sourceSha: source.sha,
+      sourceFingerprint: source.fingerprint,
+    },
+    installation: { status: "passed", id: "Cloudsmith.cloudsmith-vsc", version: "2.3.0" },
+    launch: { status: "not-requested", developmentPath: false },
+  };
+  const candidateReceipt = { ...candidateBase, fingerprint: fingerprint(candidateBase) };
+  const authenticatedCandidateBase = {
+    ...candidateBase,
+    profile: {
+      mode: "ci",
+      persistent: false,
+      root: "/bounded/authenticated-ci-profile",
+      testResourcesDir: "/bounded/authenticated-ci-profile",
+      userDataDir: "/bounded/authenticated-ci-profile/settings",
+      extensionsDir: "/bounded/authenticated-ci-profile/extensions",
+    },
+  };
+  const authenticatedCandidateReceipt = {
+    ...authenticatedCandidateBase,
+    fingerprint: fingerprint(authenticatedCandidateBase),
+  };
+  const candidateArtifactPath = path.join(fixtureRoot, LIVE_CANDIDATE_ARTIFACT);
+  fs.mkdirSync(path.dirname(candidateArtifactPath), { recursive: true });
+  fs.writeFileSync(candidateArtifactPath, candidateBytes);
+  fs.writeFileSync(
+    path.join(fixtureRoot, LIVE_CANDIDATE_RECEIPT),
+    `${JSON.stringify(candidateReceipt, null, 2)}\n`
+  );
+  const authenticatedCandidateArtifactPath = path.join(
+    fixtureRoot,
+    AUTHENTICATED_CANDIDATE_ARTIFACT,
+  );
+  fs.writeFileSync(authenticatedCandidateArtifactPath, candidateBytes);
+  fs.writeFileSync(
+    path.join(fixtureRoot, AUTHENTICATED_CANDIDATE_RECEIPT),
+    `${JSON.stringify(authenticatedCandidateReceipt, null, 2)}\n`,
+  );
+  const candidate = candidateBindingFromReceipt(candidateReceipt, {
+    root: fixtureRoot,
+    source,
+    artifactPath: candidateArtifactPath,
+    homeDirectory: qualificationHomeDirectory,
+  });
+  const authenticatedCandidate = candidateBindingFromReceipt(authenticatedCandidateReceipt, {
+    root: fixtureRoot,
+    source,
+    artifactPath: authenticatedCandidateArtifactPath,
+  });
+  const authenticatedBase = {
+    schemaVersion: 2,
+    status: "passed",
+    reasonCode: null,
+    source,
+    workspace: {
+      expected: "dl-technology-consulting",
+      observed: "dl-technology-consulting",
+      surface: "production-connected-workspace",
+    },
+    candidate: authenticatedCandidate,
+    credentialBoundary: {
+      storageKey: "cloudsmith-vsc.authToken",
+      transport: "creator-bound-0700-0600-handoff",
+      valueRecorded: false,
+      digestRecorded: false,
+    },
+    phases: {
+      candidate: "prepared",
+      handoff: "consumed-before-store-completion",
+      seed: "passed",
+      productionWorkspaceCheck: "passed",
+      secretStorageCleanup: "passed",
+      profileCleanup: "passed",
+      outputBoundary: "passed",
+    },
+  };
+  const authenticatedReceipt = {
+    ...authenticatedBase,
+    fingerprint: fingerprint(authenticatedBase),
+  };
+  fs.writeFileSync(
+    path.join(fixtureRoot, ".quality/qualification/authenticated-ci.json"),
+    `${JSON.stringify(authenticatedReceipt, null, 2)}\n`
+  );
+  const authenticatedExposureBase = {
+    schemaVersion: 1,
+    status: "passed",
+    sourceSha: source.sha,
+    candidateReceiptFingerprint: authenticatedCandidateReceipt.fingerprint,
+    scanner: {
+      name: "gitleaks",
+      version: "8.30.1",
+      secretBearingFieldsPersisted: false,
+    },
+    credentialBoundary: {
+      profileContentRead: false,
+      secretStorageRead: false,
+      keychainRead: false,
+      credentialValueRecorded: false,
+      credentialDigestRecorded: false,
+    },
+    findingCount: 0,
+    components: [
+      {
+        id: "authenticated-generated-evidence",
+        status: "scanned",
+        fileCount: 2,
+        findingCount: 0,
+      },
+      {
+        id: `vsix:${authenticatedCandidateReceipt.artifact.vsixPath}`,
+        status: "scanned",
+        fileCount: 2,
+        findingCount: 0,
+      },
+      {
+        id: "authenticated-runtime-logs",
+        status: "not-present",
+        fileCount: 0,
+        findingCount: 0,
+      },
+      {
+        id: "profile-boundary-metadata-only",
+        status: "scanned",
+        fileCount: 4,
+        findingCount: 0,
+      },
+    ],
+  };
+  const authenticatedExposureReceipt = assertExposureReceipt({
+    ...authenticatedExposureBase,
+    fingerprint: fingerprint(authenticatedExposureBase),
+  });
+  fs.mkdirSync(path.join(fixtureRoot, ".quality/secrets"), { recursive: true });
+  fs.writeFileSync(
+    path.join(fixtureRoot, AUTHENTICATED_EXPOSURE_RESULT),
+    `${JSON.stringify(authenticatedExposureReceipt, null, 2)}\n`,
+  );
+  const document = {
+    schemaVersion: 5,
+    source,
+    candidate,
     status: "passed",
     authenticatedAcceptance: true,
     checklistConfirmed: true,
     operatorId: "fixture-qualification-operator",
     completedAt,
+    summary: null,
     verdict: "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS",
     evidence: [qualificationEvidence, findingsEvidence],
     findingsFingerprint: findingsEvidence.sha256,
     openReleaseBlockerCount: 0,
     workflowResults: requiredLiveWorkflowIds(workflows).map(id => ({
       id,
-      status: "passed",
+      status: "PASS",
       authoritativeOutcomeObserved: true,
+      candidateReceiptFingerprint: candidate.receiptFingerprint,
       evidence: [qualificationEvidence],
     })),
     visibleEnabledActions: {
       status: "passed",
+      candidateReceiptFingerprint: candidate.receiptFingerprint,
       silentNoOpCount: 0,
       evidence: [qualificationEvidence],
     },
   };
   document.independentReview = {
     status: "passed",
+    candidateReceiptFingerprint: candidate.receiptFingerprint,
     reviewerId: "fixture-independent-reviewer",
     source,
     reviewedAt,
@@ -340,9 +659,28 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
   };
   return {
     cleanup: () => fs.rmSync(fixtureRoot, { force: true, recursive: true }),
+    authenticatedExposureReceipt,
+    authenticatedReceipt,
+    authenticatedCandidateArtifactPath,
+    authenticatedCandidateReceipt,
+    candidateArtifactPath,
+    candidateReceipt,
     document,
     attestationFingerprint: mutationArtifactFingerprint(document),
+    qualificationHomeDirectory,
     root: fixtureRoot,
+  };
+}
+
+function liveCandidateProof(fixture) {
+  return {
+    liveCandidateReceipt: fixture.candidateReceipt,
+    liveCandidateArtifactPath: fixture.candidateArtifactPath,
+    authenticatedReceipt: fixture.authenticatedReceipt,
+    authenticatedExposureReceipt: fixture.authenticatedExposureReceipt,
+    authenticatedCandidateReceipt: fixture.authenticatedCandidateReceipt,
+    authenticatedCandidateArtifactPath: fixture.authenticatedCandidateArtifactPath,
+    qualificationHomeDirectory: fixture.qualificationHomeDirectory,
   };
 }
 
@@ -755,7 +1093,10 @@ function validFinding(overrides = {}) {
   return {
     id: "QH-900",
     severity: "P1",
+    domain: "product",
     status: "open",
+    deterministicStatus: "failing",
+    liveStatus: "pending",
     surface: "Package Search",
     workflowContract: "WF-SEARCH-FIRST-PAGE",
     failureClasses: ["terminal-state"],
@@ -775,7 +1116,7 @@ function validFinding(overrides = {}) {
     regressionTest: null,
     mutationProof: { status: "not-started", summary: "Not run." },
     fixedSha: null,
-    liveVerification: { status: "not-started", summary: "Not run." },
+    liveVerification: { summary: "Live verification is pending." },
     releaseBlocking: true,
     ...overrides,
   };
@@ -788,6 +1129,7 @@ function createEvidenceHandoffFixture(options = {}) {
   const plan = getGatePlan(profile);
   fs.mkdirSync(path.join(fixtureRoot, "quality"), { recursive: true });
   fs.mkdirSync(path.join(fixtureRoot, "test"), { recursive: true });
+  fs.copyFileSync(path.join(root, "package.json"), path.join(fixtureRoot, "package.json"));
   for (const filename of ["critical-workflows.json", "mutation-baseline.json"]) {
     fs.copyFileSync(
       path.join(root, "quality", filename),
@@ -801,6 +1143,9 @@ function createEvidenceHandoffFixture(options = {}) {
   const impact = validImpact();
   writeJson(".quality/impact.json", impact, fixtureRoot);
   const impactArtifactFingerprint = mutationArtifactFingerprint(impact);
+  const secretCurrent = validSecretReceipt("current");
+  writeJson(".quality/secrets/current.json", secretCurrent, fixtureRoot);
+  const secretCurrentArtifactFingerprint = mutationArtifactFingerprint(secretCurrent);
   let blocker = null;
   const receipts = plan.map(step => {
     if (blocker && !step.runWhenBlocked) {
@@ -839,7 +1184,9 @@ function createEvidenceHandoffFixture(options = {}) {
       testEvidence: step.evidencePath ? testEvidence(step) : null,
       artifactFingerprint: step.id === "change-impact"
         ? impactArtifactFingerprint
-        : null,
+        : step.id === "secret-current"
+          ? secretCurrentArtifactFingerprint
+          : null,
     };
   });
   const workflows = require("../quality/critical-workflows.json");
@@ -1102,11 +1449,13 @@ suite("Quality gate runner", () => {
     const releaseWithoutFinalizers = release.filter(step => ![
       "black-box-ui-smoke",
       "release-checklist",
+      "secret-history",
       "quality-report",
     ].includes(step.id));
 
     assert.deepStrictEqual(fastIds, [
       "quality-contract-verifier",
+      "secret-current",
       "change-impact",
       "repository-check",
       "standalone-tests",
@@ -1136,10 +1485,12 @@ suite("Quality gate runner", () => {
       "package-build",
       "package-verify",
       "package-list",
+      "secret-artifacts",
     ]) assert.ok(full.some(step => step.id === id), `missing full gate step ${id}`);
-    assert.deepStrictEqual(release.slice(-3).map(step => step.id), [
+    assert.deepStrictEqual(release.slice(-4).map(step => step.id), [
       "black-box-ui-smoke",
       "release-checklist",
+      "secret-history",
       "quality-report",
     ]);
     assert.strictEqual(
@@ -2670,67 +3021,6 @@ suite("Quality mutation and UI harness boundaries", () => {
     );
   });
 
-  test("blocks UI smoke before packaging even with the former acknowledgement", async () => {
-    require("../scripts/quality/evidence");
-    const childProcess = require("child_process");
-    const originalSpawnSync = childProcess.spawnSync;
-    const previousAck = process.env.CLOUDSMITH_UI_SECRET_BOUNDARY_ACK;
-    const modulePath = require.resolve("../scripts/quality/run-ui-smoke");
-    const resultPath = path.join(root, ".quality", "ui", "result.json");
-    const originalResult = fs.existsSync(resultPath) ? fs.readFileSync(resultPath) : null;
-    const runsPath = path.join(root, ".quality", "ui", "runs");
-    const originalRuns = fs.existsSync(runsPath) ? new Set(fs.readdirSync(runsPath)) : new Set();
-    let packageCalls = 0;
-    childProcess.spawnSync = (command, args, options) => {
-      if ((args || []).includes("scripts/release/package-vsix.js")) {
-        packageCalls += 1;
-        return { status: 70, signal: null, stdout: "", stderr: "packaging was reached" };
-      }
-      return originalSpawnSync(command, args, options);
-    };
-    process.env.CLOUDSMITH_UI_SECRET_BOUNDARY_ACK = "isolated-empty-profile";
-    delete require.cache[modulePath];
-    try {
-      const { runUiSmoke } = require(modulePath);
-      await assert.rejects(
-        () => runUiSmoke(),
-        error => error.code === "UI_SECRET_BOUNDARY_BLOCKED"
-      );
-      assert.strictEqual(packageCalls, 0, "UI boundary must settle before package creation");
-      const receipt = JSON.parse(fs.readFileSync(resultPath, "utf8"));
-      assert.strictEqual(receipt.status, "blocked");
-      assert.strictEqual(receipt.launchAttempted, false);
-      assert.strictEqual(receipt.tool, null);
-      assert.match(receipt.reason, /SecretStorage.*not authorized/i);
-      assert.doesNotMatch(
-        fs.readFileSync(path.join(root, "scripts", "quality", "run-ui-smoke.js"), "utf8"),
-        /CLOUDSMITH_UI_SECRET_BOUNDARY_ACK|isolated-empty-profile/
-      );
-      assert.doesNotMatch(
-        fs.readFileSync(path.join(root, "ui-test", "smoke.test.js"), "utf8"),
-        /CLOUDSMITH_UI_SECRET_BOUNDARY_ACK|isolated-empty-profile/
-      );
-    } finally {
-      childProcess.spawnSync = originalSpawnSync;
-      if (previousAck === undefined) delete process.env.CLOUDSMITH_UI_SECRET_BOUNDARY_ACK;
-      else process.env.CLOUDSMITH_UI_SECRET_BOUNDARY_ACK = previousAck;
-      delete require.cache[modulePath];
-      if (originalResult) {
-        fs.mkdirSync(path.dirname(resultPath), { recursive: true });
-        fs.writeFileSync(resultPath, originalResult);
-      } else {
-        fs.rmSync(resultPath, { force: true });
-      }
-      if (fs.existsSync(runsPath)) {
-        for (const entry of fs.readdirSync(runsPath)) {
-          if (!originalRuns.has(entry)) {
-            fs.rmSync(path.join(runsPath, entry), { force: true, recursive: true });
-          }
-        }
-      }
-    }
-  });
-
   test("rejects unbound or semantically forged black-box UI results", () => {
     const plan = getGatePlan("release");
     const liveFingerprint = mutationArtifactFingerprint(validLiveStatus());
@@ -2741,6 +3031,7 @@ suite("Quality mutation and UI harness boundaries", () => {
       receipts: plan.map(step => passedReceipt(step)),
       ...validImpactEvidence(),
       ...validMutationEvidence(),
+      candidateReceipt: validCandidateReceipt(),
       liveQualification: validLiveStatus(),
       liveQualificationArtifactFingerprint: liveFingerprint,
       findings: [],
@@ -2852,6 +3143,12 @@ suite("Release checklist and deterministic quality report", () => {
       source: SOURCE_IDENTITY,
       workflows,
       document: null,
+      findingsState: {
+        fingerprint: "f".repeat(64),
+        openReleaseBlockerCount: 0,
+        openNonBlockingRiskCount: 0,
+        errors: [],
+      },
     });
 
     assert.strictEqual(result.status, "not-run");
@@ -2873,6 +3170,7 @@ suite("Release checklist and deterministic quality report", () => {
         workflows,
         document: staleFixture.document,
         attestationFingerprint: staleFixture.attestationFingerprint,
+        ...liveCandidateProof(staleFixture),
       });
       const passed = evaluateLiveQualification({
         root: passedFixture.root,
@@ -2881,11 +3179,15 @@ suite("Release checklist and deterministic quality report", () => {
         workflows,
         document: passedFixture.document,
         attestationFingerprint: passedFixture.attestationFingerprint,
+        ...liveCandidateProof(passedFixture),
       });
 
       assert.strictEqual(staleResult.status, "failed");
       assert.ok(staleResult.errors.some(error => /source SHA/.test(error)));
-      assert.deepStrictEqual(staleResult.passedWorkflowIds, []);
+      assert.deepStrictEqual(
+        staleResult.passedWorkflowIds,
+        requiredLiveWorkflowIds(workflows)
+      );
       assert.strictEqual(passed.status, "passed");
       assert.strictEqual(passed.authenticatedAcceptance, "recorded");
       assert.deepStrictEqual(passed.missingWorkflowIds, []);
@@ -2935,6 +3237,7 @@ suite("Release checklist and deterministic quality report", () => {
           workflows,
           document: liveFixture.document,
           attestationFingerprint: liveFixture.attestationFingerprint,
+          ...liveCandidateProof(liveFixture),
         }),
         findings: [],
         findingsStatus: "passed",
@@ -3205,14 +3508,15 @@ suite("Release checklist and deterministic quality report", () => {
           authoritativeOutcome: "fixture",
           requiredLayers: ["live-protocol"],
           evidence: [],
+          liveFixture: { required: true },
         }],
       },
       inventories,
     });
 
-    assert.deepStrictEqual(report.liveQualification.passedWorkflowIds, []);
-    assert.deepStrictEqual(report.liveQualification.missingWorkflowIds, [workflowId]);
-    assert.strictEqual(report.workflowCoverage[0].layerStatuses["live-protocol"], "failed");
+    assert.deepStrictEqual(report.liveQualification.passedWorkflowIds, [workflowId]);
+    assert.deepStrictEqual(report.liveQualification.missingWorkflowIds, []);
+    assert.strictEqual(report.workflowCoverage[0].layerStatuses["live-protocol"], "not-run");
     assert.strictEqual(report.status, "failed");
     assert.strictEqual(hasDeterministicReportFailure(report), true);
   });
@@ -3231,6 +3535,7 @@ suite("Release checklist and deterministic quality report", () => {
       receipts,
       ...validImpactEvidence(),
       ...validMutationEvidence(),
+      candidateReceipt: validCandidateReceipt(),
       ui: validUiResult(),
       uiArtifactFingerprint: mutationArtifactFingerprint(validUiResult()),
       liveQualification: validLiveStatus(),
@@ -3243,7 +3548,7 @@ suite("Release checklist and deterministic quality report", () => {
     const checklistStep = report.deterministicGates.steps.find(step => (
       step.stepId === "release-checklist"
     ));
-    assert.strictEqual(checklistStep.status, "failed");
+    assert.strictEqual(checklistStep, undefined);
     assert.strictEqual(report.deterministicGates.status, "passed");
     assert.strictEqual(report.liveQualification.status, "failed");
     assert.strictEqual(report.liveQualification.authenticatedAcceptance, "not-recorded");
@@ -3263,6 +3568,7 @@ suite("Release checklist and deterministic quality report", () => {
       receipts: plan.map(step => passedReceipt(step)),
       ...validImpactEvidence(),
       ...validMutationEvidence(),
+      candidateReceipt: validCandidateReceipt(),
       ui: validUiResult(),
       uiArtifactFingerprint: mutationArtifactFingerprint(validUiResult()),
       findings: [],
@@ -3340,6 +3646,7 @@ suite("Release checklist and deterministic quality report", () => {
         workflows,
         inputPath,
         now: fixtureNow,
+        qualificationHomeDirectory: fixture.qualificationHomeDirectory,
       });
       const findingsBytes = fs.readFileSync(path.join(
         fixture.root,
@@ -3366,6 +3673,7 @@ suite("Release checklist and deterministic quality report", () => {
         receipts,
         ...validImpactEvidence(),
         ...validMutationEvidence(),
+        candidateReceipt: validCandidateReceipt(),
         ui,
         uiArtifactFingerprint: mutationArtifactFingerprint(ui),
         liveQualification: status,
@@ -3375,11 +3683,22 @@ suite("Release checklist and deterministic quality report", () => {
         findingsStatus: "passed",
         workflows,
         inventories,
+        qualificationHomeDirectory: fixture.qualificationHomeDirectory,
       };
 
       const intact = generateReport(common);
       assert.strictEqual(intact.liveQualification.status, "passed");
       assert.strictEqual(intact.liveQualification.verdict, status.verdict);
+      const rendered = renderMarkdown(intact);
+      assert.match(rendered, new RegExp(status.candidate.receiptFingerprint, "u"));
+      assert.match(rendered, new RegExp(status.candidate.profileRootIdentity, "u"));
+      assert.strictEqual(
+        rendered.includes(path.join(
+          fixture.qualificationHomeDirectory,
+          ".cloudsmith-vscode-qualification",
+        )),
+        false,
+      );
 
       fs.rmSync(path.join(fixture.root, "internal_docs/quality/e2e-evidence.md"));
       fs.rmSync(path.join(fixture.root, "internal_docs/quality/release-readiness.md"));
@@ -3389,6 +3708,7 @@ suite("Release checklist and deterministic quality report", () => {
         workflows,
         inputPath,
         now: fixtureNow,
+        qualificationHomeDirectory: fixture.qualificationHomeDirectory,
       });
       const report = generateReport(common);
       assert.strictEqual(detached.status, "failed");
@@ -3423,6 +3743,7 @@ suite("Release checklist and deterministic quality report", () => {
       receipts,
       ...validImpactEvidence(),
       ...validMutationEvidence(),
+      candidateReceipt: validCandidateReceipt(),
       ui: validUiResult(),
       uiArtifactFingerprint: mutationArtifactFingerprint(validUiResult()),
       liveQualification,
@@ -3436,6 +3757,7 @@ suite("Release checklist and deterministic quality report", () => {
           surface: "fixture",
           authoritativeOutcome: "fixture",
           requiredLayers: ["live-protocol", "black-box-ui"],
+          liveFixture: { required: true },
           evidence: [{
             layer: "black-box-ui",
             interactionMode: "rendered-dom-activation",
@@ -3448,9 +3770,9 @@ suite("Release checklist and deterministic quality report", () => {
     });
 
     assert.strictEqual(report.liveQualification.status, "failed");
-    assert.deepStrictEqual(report.liveQualification.passedWorkflowIds, []);
+    assert.deepStrictEqual(report.liveQualification.passedWorkflowIds, [actualWorkflowId]);
     assert.match(report.liveQualification.errors.join("\n"), /workflow manifest|subset/u);
-    assert.strictEqual(report.workflowCoverage[0].layerStatuses["live-protocol"], "failed");
+    assert.strictEqual(report.workflowCoverage[0].layerStatuses["live-protocol"], "not-run");
     assert.strictEqual(report.releaseReadiness.verdict, null);
     assert.strictEqual(report.status, "failed");
   });
@@ -3640,7 +3962,7 @@ suite("Release checklist and deterministic quality report", () => {
       releaseBlocking: false,
     }), schema, taxonomy);
     assert.ok(hiddenCoreP2.some(error => (
-      /unresolved P2 on a release-critical workflow must remain release blocking/u.test(error)
+      /releaseBlocking must match policy-derived value true/u.test(error)
     )));
 
     const unrecordedCause = validateFindingRecord(validFinding({
@@ -3701,14 +4023,16 @@ suite("Release checklist and deterministic quality report", () => {
     const taxonomy = require("../quality/defect-taxonomy.json");
     const errors = validateFindingRecord(validFinding({
       severity: "P0",
-      status: "fixed",
+      status: "open",
+      deterministicStatus: "fixed",
+      liveStatus: "blocked",
       customerImpact: 7,
       evidence: "not-an-evidence-array",
       rootCauseStatus: "suspected",
       regressionTest: null,
       mutationProof: { status: "not-started", summary: "Not proven." },
       fixedSha: SOURCE_SHA,
-      liveVerification: { status: "blocked", summary: "Not verified." },
+      liveVerification: { summary: "Not verified." },
       releaseBlocking: false,
     }), schema, taxonomy);
 
@@ -3716,12 +4040,188 @@ suite("Release checklist and deterministic quality report", () => {
     assert.ok(errors.some(error => /evidence has invalid type/.test(error)));
     assert.ok(errors.some(error => /requires a regression test/.test(error)));
     assert.ok(errors.some(error => /completed mutation proof/.test(error)));
-    assert.ok(errors.some(error => /completed live verification/.test(error)));
+    assert.ok(errors.some(error => /releaseBlocking must match policy-derived value true/.test(error)));
     assert.ok(errors.some(error => /not an ancestor/.test(error)));
+  });
+
+  test("cannot close a core product blocker through a not-applicable disposition", () => {
+    const schema = require("../quality/finding.schema.json");
+    const taxonomy = require("../quality/defect-taxonomy.json");
+    for (const severity of ["P0", "P1", "P2"]) {
+      const errors = validateFindingRecord(validFinding({
+        severity,
+        status: "closed",
+        deterministicStatus: "not-applicable",
+        liveStatus: "verified",
+        rootCauseStatus: "unknown",
+        regressionTest: null,
+        mutationProof: { status: "not-applicable", summary: "No fix was claimed." },
+        fixedSha: null,
+        liveVerification: { summary: "The fixture claims a completed live disposition." },
+        releaseBlocking: false,
+      }), schema, taxonomy);
+
+      assert.ok(errors.some(error => (
+        /cannot close a release-critical product defect without a deterministic fix/u.test(error)
+      )), `${severity} closure bypass must fail`);
+      assert.ok(errors.some(error => (
+        /deterministic non-applicability requires a proven disposition/u.test(error)
+      )), `${severity} non-applicability must require proof`);
+    }
+  });
+
+  test("permits a proof-bearing non-code closure without inventing a product fix", () => {
+    const schema = require("../quality/finding.schema.json");
+    const taxonomy = require("../quality/defect-taxonomy.json");
+    const errors = validateFindingRecord(validFinding({
+      severity: "P0",
+      domain: "security-environment",
+      status: "closed",
+      deterministicStatus: "not-applicable",
+      liveStatus: "verified",
+      rootCauseStatus: "proven",
+      rootCause: "The external security disposition is independently evidenced.",
+      regressionTest: null,
+      mutationProof: { status: "not-applicable", summary: "No repository code fix applies." },
+      fixedSha: null,
+      liveVerification: { summary: "The external closure evidence was verified." },
+      releaseBlocking: false,
+    }), schema, taxonomy);
+
+    assert.deepStrictEqual(errors, []);
+  });
+
+  test("keeps every open P1 release-blocking after deterministic and live proof", () => {
+    const schema = require("../quality/finding.schema.json");
+    const taxonomy = require("../quality/defect-taxonomy.json");
+    const errors = validateFindingRecord(validFinding({
+      deterministicStatus: "fixed",
+      liveStatus: "verified",
+      rootCauseStatus: "proven",
+      regressionTest: "test/searchProvider.test.js",
+      mutationProof: { status: "mutation-killed", summary: "The regression killed the mutant." },
+      fixedSha: SOURCE_SHA,
+      liveVerification: { summary: "The exact candidate passed live verification." },
+      releaseBlocking: false,
+    }), schema, taxonomy);
+
+    assert.ok(errors.some(error => /releaseBlocking must match policy-derived value true/.test(error)));
   });
 });
 
-suite("Quality contract verifier fixtures", () => {
+suite("Quality contract verifier fixtures", function () {
+  this.timeout(10_000);
+  test("rejects whole-object replacements of deterministic release jobs", () => {
+    const workflowPath = ".github/workflows/main.yml";
+    const workflow = yaml.load(
+      fs.readFileSync(path.join(root, workflowPath), "utf8"),
+      { schema: yaml.CORE_SCHEMA }
+    );
+    const replacements = [
+      {
+        jobId: "extension-tests",
+        error: "CI must execute the exact extension-test matrix and zero-test guard.",
+        job: {
+          name: "Extension tests",
+          "runs-on": "ubuntu-24.04",
+          steps: [{ name: "Skip extension tests", run: "echo skipped" }],
+        },
+      },
+      {
+        jobId: "package",
+        error: "CI must build, verify, scan, and upload the exact reproducible VSIX inputs.",
+        job: {
+          name: "Package",
+          "runs-on": "ubuntu-24.04",
+          steps: [{
+            name: "Upload README instead of a candidate",
+            uses: "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            with: { name: "not-a-candidate", path: "README.md" },
+          }],
+        },
+      },
+      {
+        jobId: "build-candidate",
+        error: "CI build-candidate must require every deterministic input to succeed.",
+        job: {
+          name: "Deterministic build candidate",
+          "runs-on": "ubuntu-24.04",
+          steps: [{ name: "Claim success", run: "echo success" }],
+        },
+      },
+    ];
+
+    for (const replacement of replacements) {
+      const changed = clone(workflow);
+      changed.jobs[replacement.jobId] = replacement.job;
+      const result = verifyQualityContracts({
+        root,
+        sourceOverrides: {
+          [workflowPath]: yaml.dump(changed, { lineWidth: -1, noRefs: true }),
+        },
+      });
+      assert.ok(
+        result.errors.includes(replacement.error),
+        `${replacement.jobId} whole-object replacement was accepted: ${result.errors.join("\n")}`
+      );
+    }
+  });
+
+  test("rejects aliases redirected away from exact CI entrypoints", function () {
+    this.timeout(30_000);
+    const redirects = [
+      ["build", "npm run syntax"],
+      ["check", "npm run build"],
+      ["lint", "npm run build"],
+      ["test", "npm run test:node"],
+      ["package", "npm run package:verify"],
+      ["package:list", "npm run package:verify"],
+      ["package:verify", "npm run package"],
+      ["pretest", "npm run build"],
+      ["quality:fast", "npm run quality:full"],
+      ["quality:full", "npm run quality:fast"],
+      ["quality:release", "npm run quality:full"],
+      ["syntax", "npm run build"],
+      ["test:node", "npm run test:zero-guard"],
+      ["test:ui:smoke", "npm test"],
+      ["verify:polish", "npm run verify:version"],
+      ["verify:version", "npm run verify:polish"],
+      ["vscode:prepublish", "npm run build"],
+    ];
+
+    for (const [name, redirected] of redirects) {
+      const manifest = clone(require("../package.json"));
+      manifest.scripts[name] = redirected;
+      const result = verifyQualityContracts({ root, manifest });
+      assert.ok(
+        result.errors.includes(
+          `Package script ${name} must expose its exact reviewed quality entrypoint.`
+        ),
+        `${name} alias redirection was accepted: ${result.errors.join("\n")}`
+      );
+    }
+  });
+
+  test("rejects local qualification aliases redirected from exact entrypoints", () => {
+    const redirects = [
+      ["quality:qualification:prepare", "npm run build"],
+      ["quality:qualification:launch", "npm run quality:qualification:prepare"],
+      ["quality:qualification:reset", "npm run quality:qualification:launch"],
+    ];
+
+    for (const [name, redirected] of redirects) {
+      const manifest = clone(require("../package.json"));
+      manifest.scripts[name] = redirected;
+      const result = verifyQualityContracts({ root, manifest });
+      assert.ok(
+        result.errors.includes(
+          `Package script ${name} must expose its exact reviewed quality entrypoint.`
+        ),
+        `${name} local qualification redirect was accepted: ${result.errors.join("\n")}`
+      );
+    }
+  });
+
   test("requires the exact handoff verifier immediately before CI evidence upload", () => {
     const workflowPath = ".github/workflows/main.yml";
     const workflow = fs.readFileSync(path.join(root, workflowPath), "utf8");
@@ -3729,7 +4229,7 @@ suite("Quality contract verifier fixtures", () => {
       root,
       sourceOverrides: {
         [workflowPath]: workflow.replace(
-          "if: ${{ always() && steps.quality_evidence_handoff.outcome == 'success' }}",
+          "if: ${{ always() && steps.quality_evidence_handoff.outcome == 'success' && steps.quality_evidence_secret_scan.outcome == 'success' }}",
           "if: ${{ always() }}"
         ),
       },
@@ -3800,12 +4300,132 @@ suite("Quality contract verifier fixtures", () => {
         "  core-mutation:\n",
         "  core-mutation:\n    continue-on-error: true\n"
       ),
+      deepWorkflow.replace(
+        "      - name: Set up the pinned secret scanner after mutation evidence\n        if: ${{ always() }}",
+        "      - name: Set up the pinned secret scanner after mutation evidence"
+      ),
+      deepWorkflow.replace(
+        "run: npm run quality:secrets:history",
+        "run: npm run quality:secrets:current"
+      ),
+      deepWorkflow.replace(
+        "      - name: Upload only the value-blind history receipt\n        if: ${{ always() }}",
+        "      - name: Upload only the value-blind history receipt\n        if: ${{ steps.history_secret_scan.outcome == 'success' }}"
+      ),
+      deepWorkflow.replace(
+        "          path: .quality/secrets/history.json",
+        "          path: .quality/secrets"
+      ),
     ]) {
       assert.ok(verifyQualityContracts({
         root,
         sourceOverrides: { [deepWorkflowPath]: changed },
       }).errors.includes(deepError));
     }
+  });
+
+  test("rejects signed-out UI workflow bypasses and profile uploads", () => {
+    const deepWorkflowPath = ".github/workflows/deep-quality.yml";
+    const deepWorkflow = fs.readFileSync(path.join(root, deepWorkflowPath), "utf8");
+    const uiError =
+      "Deep CI must bind and secret-scan signed-out packaged UI evidence before upload.";
+    const mutations = [
+      deepWorkflow.replace(
+        "run: xvfb-run -a npm run test:ui:smoke",
+        "run: npm run test:ui:smoke"
+      ),
+      deepWorkflow.replace(
+        "run: node scripts/quality/verify-ui-evidence.js",
+        "run: npm run quality:report"
+      ),
+      deepWorkflow.replace(
+        "run: npm run quality:secrets:evidence",
+        "run: npm run quality:secrets:current"
+      ),
+      deepWorkflow.replace(
+        "if: ${{ always() && steps.ui_evidence_handoff.outcome == 'success' && steps.ui_evidence_secret_scan.outcome == 'success' }}",
+        "if: ${{ always() }}"
+      ),
+      deepWorkflow.replace(
+        "            .quality/secrets/evidence.json\n",
+        "            .quality/secrets/evidence.json\n            .quality/qualification-profile\n"
+      ),
+      deepWorkflow.replace(
+        "  signed-out-black-box-ui:\n    name: Signed-out packaged black-box UI\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    steps:\n      - name: Checkout exact source\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          fetch-depth: 0\n          persist-credentials: false",
+        "  signed-out-black-box-ui:\n    name: Signed-out packaged black-box UI\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    steps:\n      - name: Checkout exact source\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          persist-credentials: false"
+      ),
+    ];
+    for (const changed of mutations) {
+      assert.ok(verifyQualityContracts({
+        root,
+        sourceOverrides: { [deepWorkflowPath]: changed },
+      }).errors.includes(uiError));
+    }
+  });
+
+  test("rejects authenticated production UI bypasses and credential/profile uploads", () => {
+    const deepWorkflowPath = ".github/workflows/deep-quality.yml";
+    const deepWorkflow = fs.readFileSync(path.join(root, deepWorkflowPath), "utf8");
+    const authenticatedError =
+      "Deep CI must verify production authenticated UI through the value-blind bootstrap boundary.";
+    const mutations = [
+      deepWorkflow.replace(
+        "    environment: cloudsmith-release-qualification\n",
+        ""
+      ),
+      deepWorkflow.replace(
+        "CLOUDSMITH_QUALIFICATION_API_KEY: ${{ secrets.CLOUDSMITH_QUALIFICATION_API_KEY }}",
+        "CLOUDSMITH_QUALIFICATION_API_KEY: unsafe-literal"
+      ),
+      deepWorkflow.replace(
+        "run: xvfb-run -a node scripts/quality/run-authenticated-ci.js",
+        "run: xvfb-run -a npm run quality:qualification:authenticated-ci"
+      ),
+      deepWorkflow.replace(
+        "        id: authenticated_qualification\n        timeout-minutes: 15",
+        "        id: authenticated_qualification"
+      ),
+      deepWorkflow.replace(
+        "      - name: Prepare and validate exact authenticated candidate without credentials\n        run: npm run quality:qualification:prepare-authenticated-ci",
+        "      - name: Prepare and validate exact authenticated candidate without credentials\n        env:\n          CLOUDSMITH_QUALIFICATION_API_KEY: unsafe-literal\n        run: npm run quality:qualification:prepare-authenticated-ci"
+      ),
+      deepWorkflow.replace(
+        "        id: authenticated_profile_cleanup\n        if: ${{ always() }}",
+        "        id: authenticated_profile_cleanup"
+      ),
+      deepWorkflow.replace(
+        "run: npm run quality:verify-authenticated-evidence",
+        "run: npm run quality:report"
+      ),
+      deepWorkflow.replace(
+        "if: ${{ always() && steps.authenticated_evidence_handoff.outcome == 'success' && steps.authenticated_evidence_secret_scan.outcome == 'success' }}",
+        "if: ${{ always() }}"
+      ),
+      deepWorkflow.replace(
+        "            .quality/secrets/authenticated-ci.json\n            .quality/secrets/evidence.json\n",
+        "            .quality/secrets/authenticated-ci.json\n            .quality/secrets/evidence.json\n            /tmp/authenticated-profile\n"
+      ),
+    ];
+    for (const changed of mutations) {
+      assert.ok(verifyQualityContracts({
+        root,
+        sourceOverrides: { [deepWorkflowPath]: changed },
+      }).errors.includes(authenticatedError));
+    }
+  });
+
+  test("rejects drift in the reviewed pinned secret scanner setup", () => {
+    const actionPath = ".github/actions/setup-gitleaks/action.yml";
+    const action = fs.readFileSync(path.join(root, actionPath), "utf8");
+    const result = verifyQualityContracts({
+      root,
+      sourceOverrides: {
+        [actionPath]: action.replace("8.30.1", "8.30.2"),
+      },
+    });
+    assert.ok(result.errors.includes(
+      "CI secret scanning must use the exact reviewed Gitleaks release and archive digest."
+    ));
   });
 
   test("rejects required CI text hidden in inert YAML values", () => {
@@ -3818,6 +4438,8 @@ suite("Quality contract verifier fixtures", () => {
     const originalMutation = clone(mainDocument.jobs.mutation);
     const originalQuality = clone(mainDocument.jobs.quality);
     const originalCore = clone(deepDocument.jobs["core-mutation"]);
+    const originalSignedOutUi = clone(deepDocument.jobs["signed-out-black-box-ui"]);
+    const originalAuthenticatedUi = clone(deepDocument.jobs["authenticated-production-ui"]);
 
     mainDocument.jobs.mutation = {
       name: yaml.dump(originalMutation),
@@ -3875,6 +4497,46 @@ suite("Quality contract verifier fixtures", () => {
     });
     assert.ok(inertCore.errors.includes(
       "Deep CI must verify exact core-mutation evidence before a verifier-gated upload."
+    ));
+
+    deepDocument.jobs["core-mutation"] = originalCore;
+    deepDocument.jobs["signed-out-black-box-ui"] = {
+      name: yaml.dump(originalSignedOutUi),
+      "runs-on": "ubuntu-24.04",
+      steps: [{
+        name: "Unverified upload",
+        uses: "actions/upload-artifact@v4",
+        with: { name: "forged", path: ".quality", "if-no-files-found": "error" },
+      }],
+    };
+    const inertSignedOutUi = verifyQualityContracts({
+      root,
+      sourceOverrides: {
+        [deepWorkflowPath]: yaml.dump(deepDocument, { lineWidth: -1, noRefs: true }),
+      },
+    });
+    assert.ok(inertSignedOutUi.errors.includes(
+      "Deep CI must bind and secret-scan signed-out packaged UI evidence before upload."
+    ));
+
+    deepDocument.jobs["signed-out-black-box-ui"] = originalSignedOutUi;
+    deepDocument.jobs["authenticated-production-ui"] = {
+      name: yaml.dump(originalAuthenticatedUi),
+      "runs-on": "ubuntu-24.04",
+      steps: [{
+        name: "Unverified upload",
+        uses: "actions/upload-artifact@v4",
+        with: { name: "forged", path: ".quality", "if-no-files-found": "error" },
+      }],
+    };
+    const inertAuthenticatedUi = verifyQualityContracts({
+      root,
+      sourceOverrides: {
+        [deepWorkflowPath]: yaml.dump(deepDocument, { lineWidth: -1, noRefs: true }),
+      },
+    });
+    assert.ok(inertAuthenticatedUi.errors.includes(
+      "Deep CI must verify production authenticated UI through the value-blind bootstrap boundary."
     ));
   });
 
@@ -4220,7 +4882,7 @@ suite("Quality contract verifier fixtures", () => {
     assert.match(renderMarkdown(report), /Rendered DOM activation: BLOCKED/);
     assert.match(
       renderMarkdown(report),
-      /manual-production-composition in a real VS Code host; the production manifest is not host-managed/
+      /manual-production-composition in a real VS Code host\. Packaged-candidate activation is independently covered by the signed-out black-box UI lane\./
     );
   });
 });

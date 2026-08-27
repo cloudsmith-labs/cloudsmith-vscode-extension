@@ -363,6 +363,7 @@ function summarizeMutationReport(report) {
 module.exports = {
   AUTOMATED_LAYERS,
   ROOT,
+  assertRealRepositoryRoot,
   assertRepositoryRelativePath,
   discoverRepositoryOutputFiles,
   prepareOutputDirectory,

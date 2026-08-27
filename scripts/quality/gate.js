@@ -26,6 +26,7 @@ const TEST_INVENTORIES_BY_SUITE = Object.freeze({
 const PHASE_STEPS = Object.freeze({
   fast: Object.freeze([
     "quality-contract-verifier",
+    "secret-current",
     "change-impact",
     "repository-check",
     "standalone-tests",
@@ -40,10 +41,12 @@ const PHASE_STEPS = Object.freeze({
     "package-build",
     "package-verify",
     "package-list",
+    "secret-artifacts",
   ]),
   release: Object.freeze([
     "black-box-ui-smoke",
     "release-checklist",
+    "secret-history",
   ]),
 });
 
@@ -54,6 +57,16 @@ const STEP_CATALOG = Object.freeze({
     "node",
     ["scripts/quality/verify.js"]
   ),
+  "secret-current": Object.freeze({
+    ...commandStep(
+      "secret-current",
+      "security",
+      "node",
+      ["scripts/quality/secret-scan.js", "current"]
+    ),
+    artifactPath: ".quality/secrets/current.json",
+    artifactSubtree: ".quality/secrets",
+  }),
   "change-impact": Object.freeze({
     ...commandStep(
       "change-impact",
@@ -133,6 +146,16 @@ const STEP_CATALOG = Object.freeze({
     "npm",
     ["run", "package:list"]
   ),
+  "secret-artifacts": Object.freeze({
+    ...commandStep(
+      "secret-artifacts",
+      "security",
+      "node",
+      ["scripts/quality/secret-scan.js", "artifacts"]
+    ),
+    artifactPath: ".quality/secrets/artifacts.json",
+    artifactSubtree: ".quality/secrets",
+  }),
   "black-box-ui-smoke": Object.freeze({
     ...commandStep(
       "black-box-ui-smoke",
@@ -154,6 +177,17 @@ const STEP_CATALOG = Object.freeze({
     artifactPath: ".quality/gates/live-qualification-status.json",
     artifactSubtree: ".quality/gates",
     blockedExitCodes: Object.freeze([2]),
+    runWhenBlocked: true,
+  }),
+  "secret-history": Object.freeze({
+    ...commandStep(
+      "secret-history",
+      "security",
+      "node",
+      ["scripts/quality/secret-scan.js", "history"]
+    ),
+    artifactPath: ".quality/secrets/history.json",
+    artifactSubtree: ".quality/secrets",
     runWhenBlocked: true,
   }),
 });

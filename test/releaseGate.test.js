@@ -99,22 +99,26 @@ suite("M9 release gate helpers", () => {
     assert.doesNotMatch(workflow, /Every required release input succeeded\./);
   });
 
-  test("manual deep quality records UI blocking through the fail-closed writer", () => {
+  test("manual deep quality executes and binds the signed-out packaged UI lane", () => {
     const workflow = fs.readFileSync(
       path.join(__dirname, "../.github/workflows/deep-quality.yml"),
       "utf8"
     );
     const coreMutationJob = workflow.slice(
       workflow.indexOf("  core-mutation:"),
-      workflow.indexOf("  black-box-ui-boundary:")
+      workflow.indexOf("  signed-out-black-box-ui:")
     );
-    const blockedUiJob = workflow.slice(workflow.indexOf("  black-box-ui-boundary:"));
+    const signedOutUiJob = workflow.slice(
+      workflow.indexOf("  signed-out-black-box-ui:"),
+      workflow.indexOf("  authenticated-production-ui:")
+    );
     assert.match(coreMutationJob, /fetch-depth:\s+0/);
-    assert.match(blockedUiJob, /- name: Checkout exact source[\s\S]*persist-credentials:\s+false/);
-    assert.match(blockedUiJob, /- name: Set up exact Node\.js[\s\S]*node-version:\s+\$\{\{ env\.NODE_VERSION \}\}/);
-    assert.match(workflow, /node scripts\/quality\/run-ui-smoke\.js/);
-    assert.match(workflow, /\[\[ "\$status" -ne 2 \]\]/);
-    assert.doesNotMatch(workflow, /fs\.writeFileSync|CLOUDSMITH_UI_SECRET_BOUNDARY_ACK/);
+    assert.match(signedOutUiJob, /- name: Checkout exact source[\s\S]*persist-credentials:\s+false/);
+    assert.match(signedOutUiJob, /- name: Set up exact Node\.js[\s\S]*node-version:\s+\$\{\{ env\.NODE_VERSION \}\}/);
+    assert.match(signedOutUiJob, /run: xvfb-run -a npm run test:ui:smoke/);
+    assert.match(signedOutUiJob, /id: ui_evidence_handoff[\s\S]*if: \$\{\{ always\(\) \}\}[\s\S]*node scripts\/quality\/verify-ui-evidence\.js/);
+    assert.match(signedOutUiJob, /steps\.ui_evidence_handoff\.outcome == 'success'[\s\S]*steps\.ui_evidence_secret_scan\.outcome == 'success'/);
+    assert.doesNotMatch(signedOutUiJob, /secrets\.|CLOUDSMITH_QUALIFICATION_API_KEY/);
   });
 
   test("CI retains the minimum VS Code contract and current stable 1.134.0 matrix", () => {

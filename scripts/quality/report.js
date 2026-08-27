@@ -25,6 +25,8 @@ const { getGatePlan, receiptPath, validateTestEvidence } = require("./gate");
 const { impactFingerprint } = require("./impact");
 const {
   decodeFindingsBytes,
+  deriveReleaseBlocking,
+  isClosedFinding,
   parseFindingsJsonl,
   readBoundedFindingsBytes,
   validateFindingRecord,
@@ -36,13 +38,25 @@ const {
   requiredLiveWorkflowIds,
 } = require("./release-checklist");
 const { validateMutationSummary } = require("./run-mutation");
+const { validateCandidateBinding } = require("./candidate-binding");
 
 const DEFAULT_JSON_OUTPUT = ".quality/report.json";
 const DEFAULT_MARKDOWN_OUTPUT = ".quality/report.md";
 const DEFAULT_FINDINGS = "internal_docs/quality/findings.jsonl";
 const DEFAULT_LIVE_STATUS = ".quality/gates/live-qualification-status.json";
 const DEFAULT_UI_RESULT = ".quality/ui/result.json";
-const TERMINAL_FINDING_STATUSES = new Set(["fixed", "closed-non-issue"]);
+const DEFAULT_CANDIDATE_RECEIPT = ".quality/qualification/candidate.json";
+const DEFAULT_EXTENSION_VERSION = require("../../package.json").version;
+const UI_BLOCKED_REASON = "Black-box UI qualification is blocked by the current host environment.";
+const FINDING_DOMAINS = Object.freeze([
+  "product", "test-harness", "ci", "release-evidence", "security-environment",
+  "documentation", "external-platform",
+]);
+const FINDING_SEVERITIES = Object.freeze(["P0", "P1", "P2", "P3"]);
+const DETERMINISTIC_FINDING_STATUSES = Object.freeze(["failing", "fixed", "not-applicable"]);
+const LIVE_FINDING_STATUSES = Object.freeze([
+  "not-required", "pending", "blocked", "verified", "failed",
+]);
 
 function generateReport(options = {}) {
   const source = options.source;
@@ -50,14 +64,6 @@ function generateReport(options = {}) {
   const plan = options.plan || getGatePlan(profile);
   const receipts = normalizeGateReceipts(options.receipts || [], plan, source);
   const receiptById = new Map(receipts.map(receipt => [receipt.stepId, receipt]));
-  const deterministicReceipts = receipts.filter(receipt => ![
-    "black-box-ui-smoke",
-    "quality-report",
-    "release-checklist",
-  ].includes(receipt.stepId));
-  const deterministicStatus = aggregateStatuses(
-    deterministicReceipts.map(receipt => receipt.status)
-  );
   const impact = summarizeImpact(
     receiptById.get("change-impact"),
     options.impact,
@@ -78,13 +84,26 @@ function generateReport(options = {}) {
     options.uiArtifacts || [],
     {
       artifactFingerprint: options.uiArtifactFingerprint,
+      candidateReceipt: options.candidateReceipt,
       expectedTests: expectedBlackBoxUiTests(options.workflows),
+      extensionId: options.extensionId || "Cloudsmith.cloudsmith-vsc",
+      extensionVersion: options.extensionVersion || DEFAULT_EXTENSION_VERSION,
     }
   );
+  const deterministicReceipts = receipts.filter(receipt => ![
+    "quality-report",
+    "release-checklist",
+  ].includes(receipt.stepId));
+  const deterministicStatuses = deterministicReceipts.map(receipt => receipt.status);
+  if (deterministicReceipts.some(receipt => receipt.stepId === "black-box-ui-smoke")) {
+    deterministicStatuses.push(blackBoxUi.status);
+  }
+  const deterministicStatus = aggregateStatuses(deterministicStatuses);
   const findings = summarizeFindings(
     options.findings || [],
     options.findingsStatus || "passed",
-    options.findingsErrors || []
+    options.findingsErrors || [],
+    options.workflows
   );
   const findingsState = {
     fingerprint: options.findingsFingerprint || fingerprint(options.findings || []),
@@ -131,7 +150,7 @@ function generateReport(options = {}) {
     profile,
   });
   const report = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     source,
     gateProfile: profile,
     status: releaseReadiness.status,
@@ -139,7 +158,7 @@ function generateReport(options = {}) {
     impact,
     deterministicGates: {
       status: deterministicStatus,
-      steps: receipts.filter(receipt => receipt.stepId !== "quality-report"),
+      steps: deterministicReceipts,
     },
     testResults,
     mutation,
@@ -166,6 +185,7 @@ function revalidateLiveQualificationForReport(options, source) {
         source,
         workflows: options.workflows,
         inputPath: options.liveQualification?.inputPath,
+        qualificationHomeDirectory: options.qualificationHomeDirectory,
       }),
       error: null,
     };
@@ -452,7 +472,7 @@ function summarizeUi(gateReceipt, ui, source, artifacts, options = {}) {
     };
   }
   if (!ui) return emptyUi("failed", artifacts, "UI command completed without a result artifact.");
-  const errors = validateUiResult(ui, source, options.expectedTests || []);
+  const errors = validateUiResult(ui, source, options.expectedTests || [], options);
   if (!/^[a-f0-9]{64}$/u.test(options.artifactFingerprint || "")
     || gateReceipt.artifactFingerprint !== options.artifactFingerprint) {
     errors.push("UI gate receipt does not bind the exact result artifact.");
@@ -471,6 +491,7 @@ function summarizeUi(gateReceipt, ui, source, artifacts, options = {}) {
     vscodeVersion: ui.vscodeVersion,
     platform: ui.platform,
     architecture: ui.architecture,
+    candidate: ui.candidate,
     declaredTests: [...ui.tests],
     failureArtifacts: [],
     reason: null,
@@ -485,18 +506,18 @@ function expectedBlackBoxUiTests(workflows) {
   )));
 }
 
-function validateUiResult(value, source, expectedTests) {
+function validateUiResult(value, source, expectedTests, options = {}) {
   const errors = [];
   const exactKeys = [
-    "architecture", "launchAttempted", "platform", "reason", "results",
-    "schemaVersion", "source", "sourceSha", "status", "tests", "tool",
-    "toolVersion", "vscodeVersion",
+    "architecture", "candidate", "launchAttempted", "platform", "reason",
+    "results", "schemaVersion", "source", "sourceSha", "status", "tests",
+    "tool", "toolVersion", "vscodeVersion",
   ];
   if (!isPlainObject(value)) return ["UI result artifact must be an object."];
   if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(exactKeys)) {
-    errors.push("UI result artifact fields do not match schemaVersion 1.");
+    errors.push("UI result artifact fields do not match schemaVersion 2.");
   }
-  if (value.schemaVersion !== 1) errors.push("UI result artifact schemaVersion must be 1.");
+  if (value.schemaVersion !== 2) errors.push("UI result artifact schemaVersion must be 2.");
   if (!isPlainObject(value.source)
     || JSON.stringify(Object.keys(value.source).sort()) !== JSON.stringify(["fingerprint", "sha"])
     || value.source.sha !== source.sha
@@ -504,7 +525,7 @@ function validateUiResult(value, source, expectedTests) {
     || value.sourceSha !== source.sha) {
     errors.push("UI result artifact does not bind the current source.");
   }
-  if (!new Set(["passed", "blocked"]).has(value.status)) {
+  if (!["passed", "blocked"].includes(value.status)) {
     errors.push("UI result artifact has an invalid status.");
   }
   if (!Array.isArray(value.tests)
@@ -525,6 +546,7 @@ function validateUiResult(value, source, expectedTests) {
       || value.reason !== null) {
       errors.push("Passed UI result artifact has invalid execution metadata or test inventory.");
     }
+    errors.push(...validateUiCandidate(value.candidate, value, source, options));
     const resultNames = [];
     for (const result of value.results || []) {
       if (!isPlainObject(result)
@@ -539,14 +561,71 @@ function validateUiResult(value, source, expectedTests) {
     if (JSON.stringify(resultNames) !== JSON.stringify(expectedTests)) {
       errors.push("Passed UI result artifact does not prove every declared UI test.");
     }
-  } else if (value.launchAttempted !== false
-    || value.tool !== null || value.toolVersion !== null || value.vscodeVersion !== null
-    || value.platform !== null || value.architecture !== null
-    || JSON.stringify(value.tests) !== "[]" || JSON.stringify(value.results) !== "[]"
-    || !requireNonEmptyString(value.reason)) {
-    errors.push("Blocked UI result artifact is internally inconsistent.");
+  } else if (value.candidate !== null
+    || value.launchAttempted !== false
+    || value.tool !== null
+    || value.toolVersion !== null
+    || value.vscodeVersion !== null
+    || value.platform !== null
+    || value.architecture !== null
+    || JSON.stringify(value.tests) !== "[]"
+    || JSON.stringify(value.results) !== "[]"
+    || value.reason !== UI_BLOCKED_REASON) {
+    errors.push("Blocked UI result artifact is not the strict value-blind blocked shape.");
   }
   return uniqueSorted(errors);
+}
+
+function validateUiCandidate(candidate, ui, source, options = {}) {
+  const errors = [];
+  const exactKeys = [
+    "candidateReceiptFingerprint", "extensionId", "extensionVersion", "profileMode",
+    "sourceFingerprint", "sourceSha", "vscodeVersion", "vsixSha256",
+  ];
+  if (!isPlainObject(candidate)
+    || JSON.stringify(Object.keys(candidate).sort()) !== JSON.stringify(exactKeys)) {
+    return ["UI result candidate binding does not match the public schema."];
+  }
+  if (!/^[a-f0-9]{64}$/u.test(candidate.candidateReceiptFingerprint || "")
+    || !/^[a-f0-9]{64}$/u.test(candidate.sourceFingerprint || "")
+    || !/^[a-f0-9]{64}$/u.test(candidate.vsixSha256 || "")
+    || !/^[a-f0-9]{40,64}$/u.test(candidate.sourceSha || "")
+    || candidate.extensionId !== (options.extensionId || "Cloudsmith.cloudsmith-vsc")
+    || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(candidate.extensionVersion || "")
+    || (options.extensionVersion && candidate.extensionVersion !== options.extensionVersion)
+    || candidate.profileMode !== "ci"
+    || candidate.sourceSha !== source.sha
+    || candidate.sourceFingerprint !== source.fingerprint
+    || candidate.vscodeVersion !== ui.vscodeVersion) {
+    errors.push("UI result candidate binding is invalid or stale.");
+  }
+  const receipt = options.candidateReceipt;
+  if (!isPlainObject(receipt)
+    || receipt.schemaVersion !== 2
+    || receipt.status !== "passed"
+    || receipt.fingerprint !== candidate.candidateReceiptFingerprint
+    || receipt.source?.sha !== candidate.sourceSha
+    || receipt.source?.fingerprint !== candidate.sourceFingerprint
+    || receipt.artifact?.sourceSha !== candidate.sourceSha
+    || receipt.artifact?.sourceFingerprint !== candidate.sourceFingerprint
+    || receipt.artifact?.sha256 !== candidate.vsixSha256
+    || receipt.extension?.id !== candidate.extensionId
+    || receipt.extension?.version !== candidate.extensionVersion
+    || receipt.vscode?.version !== candidate.vscodeVersion
+    || receipt.profile?.mode !== candidate.profileMode
+    || receipt.profile?.persistent !== false
+    || receipt.installation?.status !== "passed"
+    || receipt.installation?.id !== candidate.extensionId
+    || receipt.installation?.version !== candidate.extensionVersion
+    || receipt.launch?.developmentPath !== false) {
+    errors.push("UI result does not bind the exact verified candidate receipt.");
+  } else {
+    const { fingerprint: declaredFingerprint, ...receiptBase } = receipt;
+    if (declaredFingerprint !== fingerprint(receiptBase)) {
+      errors.push("UI candidate receipt fingerprint does not match its exact contents.");
+    }
+  }
+  return errors;
 }
 
 function emptyUi(status, artifacts = [], reason = null) {
@@ -557,6 +636,7 @@ function emptyUi(status, artifacts = [], reason = null) {
     vscodeVersion: null,
     platform: null,
     architecture: null,
+    candidate: null,
     declaredTests: [],
     failureArtifacts: status === "passed" ? [] : uniqueSorted(artifacts),
     reason,
@@ -566,23 +646,28 @@ function emptyUi(status, artifacts = [], reason = null) {
 function summarizeLiveQualification(value, source, options = {}) {
   let summary;
   if (!value) {
-    summary = emptyLiveQualification("not-run", options.findingsState);
+    summary = emptyLiveQualification(
+      "not-run",
+      options.findingsState,
+      options.requiredWorkflowIds || []
+    );
   } else {
     const artifactErrors = validateDerivedLiveStatus(
       value,
       options.requiredWorkflowIds || [],
       options.findingsState
     );
-    let status = EVIDENCE_STATUSES.includes(value.status) ? value.status : "failed";
+    let status = [...EVIDENCE_STATUSES, "partial"].includes(value.status)
+      ? value.status
+      : "failed";
     if (artifactErrors.length > 0) status = "failed";
     else if (value.source?.sha !== source.sha
       || value.source?.fingerprint !== source.fingerprint) status = "blocked";
-    const passedWorkflowIds = status === "passed"
-      ? uniqueSorted(value.passedWorkflowIds || [])
-      : [];
+    const passedWorkflowIds = uniqueSorted(value.passedWorkflowIds || []);
     const requiredWorkflowIds = uniqueSorted(value.requiredWorkflowIds || []);
     summary = {
       status,
+      candidate: safeLiveCandidate(value.candidate),
       authenticatedAcceptance: status === "passed"
         ? value.authenticatedAcceptance
         : "not-recorded",
@@ -590,6 +675,7 @@ function summarizeLiveQualification(value, source, options = {}) {
       requiredWorkflowIds,
       passedWorkflowIds,
       missingWorkflowIds: requiredWorkflowIds.filter(id => !passedWorkflowIds.includes(id)),
+      workflowMatrix: Array.isArray(value.workflowMatrix) ? value.workflowMatrix : [],
       attestationFingerprint: value.attestationFingerprint || null,
       evidenceManifest: Array.isArray(value.evidenceManifest) ? value.evidenceManifest : [],
       findingsFingerprint: value.findingsFingerprint || null,
@@ -645,19 +731,19 @@ function summarizeLiveQualification(value, source, options = {}) {
 function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsState = {}) {
   const errors = [];
   const exactKeys = [
-    "attestationFingerprint", "authenticatedAcceptance", "errors", "evidenceManifest",
+    "attestationFingerprint", "authenticatedAcceptance", "candidate", "errors", "evidenceManifest",
     "findingsFingerprint", "inputPath", "missingWorkflowIds", "openReleaseBlockerCount",
     "passedWorkflowIds", "reason", "requiredWorkflowIds", "schemaVersion", "source",
-    "status", "verdict", "visibleEnabledActions",
+    "status", "verdict", "visibleEnabledActions", "workflowMatrix",
   ];
   if (!isPlainObject(value)) return ["Live status artifact must be an object."];
   if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(exactKeys)) {
-    errors.push("Live status artifact fields do not match schemaVersion 1.");
+    errors.push("Live status artifact fields do not match schemaVersion 3.");
   }
-  if (value.schemaVersion !== 1) errors.push("Live status artifact schemaVersion must be 1.");
+  if (value.schemaVersion !== 3) errors.push("Live status artifact schemaVersion must be 3.");
   if (!isPlainObject(value.source)
     || JSON.stringify(Object.keys(value.source).sort()) !== JSON.stringify(["fingerprint", "sha"])
-    || !/^[a-f0-9]{40}$/u.test(value.source?.sha || "")
+    || !/^[a-f0-9]{40,64}$/u.test(value.source?.sha || "")
     || !/^[a-f0-9]{64}$/u.test(value.source?.fingerprint || "")) {
     errors.push("Live status artifact has invalid source identity.");
   }
@@ -668,6 +754,20 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
   if (!(value.attestationFingerprint === null
     || /^[a-f0-9]{64}$/u.test(value.attestationFingerprint || ""))) {
     errors.push("Live status artifact has an invalid attestation fingerprint.");
+  }
+  if (value.candidate !== null) {
+    try {
+      validateCandidateBinding(value.candidate);
+      if (value.candidate.sourceSha !== value.source?.sha
+        || value.candidate.sourceFingerprint !== value.source?.fingerprint) {
+        errors.push("Live status artifact candidate does not bind its source identity.");
+      }
+      if (value.candidate.profileMode !== "local") {
+        errors.push("Live status artifact candidate does not bind the dedicated local profile.");
+      }
+    } catch {
+      errors.push("Live status artifact has an invalid candidate binding.");
+    }
   }
   if (!validLiveEvidenceManifest(value.evidenceManifest)) {
     errors.push("Live status artifact has an invalid evidence manifest.");
@@ -684,7 +784,7 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
     || value.openReleaseBlockerCount !== findingsState?.openReleaseBlockerCount) {
     errors.push("Live status artifact does not bind the current findings ledger.");
   }
-  if (!["passed", "failed", "blocked", "not-run"].includes(value.status)) {
+  if (!["passed", "failed", "partial", "blocked", "not-run"].includes(value.status)) {
     errors.push("Live status artifact has an invalid status.");
   }
   for (const field of ["requiredWorkflowIds", "passedWorkflowIds", "missingWorkflowIds"]) {
@@ -705,6 +805,31 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
     .filter(id => !(value.passedWorkflowIds || []).includes(id));
   if (JSON.stringify(value.missingWorkflowIds) !== JSON.stringify(expectedMissing)) {
     errors.push("Live status artifact missingWorkflowIds do not reconcile.");
+  }
+  if ((value.passedWorkflowIds || []).length > 0 && value.candidate === null) {
+    errors.push("Live status PASS rows do not bind a qualification candidate.");
+  }
+  if (!Array.isArray(value.workflowMatrix)
+    || value.workflowMatrix.length !== requiredWorkflowIds.length) {
+    errors.push("Live status artifact must contain one workflow-matrix row per requirement.");
+  } else {
+    const matrixIds = [];
+    const matrixPassed = [];
+    for (const row of value.workflowMatrix) {
+      if (!isPlainObject(row)
+        || JSON.stringify(Object.keys(row).sort()) !== JSON.stringify(["id", "status"])
+        || !/^WF-[A-Z0-9-]+$/u.test(row.id || "")
+        || !["PASS", "FAIL", "PARTIAL", "BLOCKED"].includes(row.status)) {
+        errors.push("Live status artifact has an invalid workflow-matrix row.");
+        continue;
+      }
+      matrixIds.push(row.id);
+      if (row.status === "PASS") matrixPassed.push(row.id);
+    }
+    if (JSON.stringify(matrixIds) !== JSON.stringify(requiredWorkflowIds)
+      || JSON.stringify(matrixPassed) !== JSON.stringify(value.passedWorkflowIds)) {
+      errors.push("Live status artifact workflow matrix does not reconcile with its inventories.");
+    }
   }
   if (!isPlainObject(value.visibleEnabledActions)
     || JSON.stringify(Object.keys(value.visibleEnabledActions).sort())
@@ -729,6 +854,7 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
         "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS",
       ]).has(value.verdict)
       || JSON.stringify(value.passedWorkflowIds) !== JSON.stringify(value.requiredWorkflowIds)
+      || (value.workflowMatrix || []).some(row => row.status !== "PASS")
       || (value.missingWorkflowIds || []).length !== 0
       || !/^[a-f0-9]{64}$/u.test(value.attestationFingerprint || "")
       || (value.evidenceManifest || []).length === 0
@@ -739,8 +865,11 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
       || (value.errors || []).length !== 0) {
       errors.push("Passed live status artifact is internally inconsistent.");
     }
+    if (value.candidate === null) {
+      errors.push("Passed live status artifact does not bind a qualification candidate.");
+    }
   } else if (value.authenticatedAcceptance !== "not-recorded"
-    || value.verdict !== null || (value.passedWorkflowIds || []).length !== 0) {
+    || value.verdict !== null) {
     errors.push("Non-passing live status artifact claims authenticated acceptance.");
   }
   return uniqueSorted(errors);
@@ -763,14 +892,26 @@ function validLiveEvidenceManifest(value) {
     && JSON.stringify(paths) === JSON.stringify(uniqueSorted(paths));
 }
 
-function emptyLiveQualification(status, findingsState = {}) {
+function safeLiveCandidate(value) {
+  try {
+    validateCandidateBinding(value);
+    return { ...value };
+  } catch {
+    return null;
+  }
+}
+
+function emptyLiveQualification(status, findingsState = {}, requiredWorkflowIds = []) {
+  const required = uniqueSorted(requiredWorkflowIds);
   return {
     status,
+    candidate: null,
     authenticatedAcceptance: "not-recorded",
     verdict: null,
-    requiredWorkflowIds: [],
+    requiredWorkflowIds: required,
     passedWorkflowIds: [],
-    missingWorkflowIds: [],
+    missingWorkflowIds: required,
+    workflowMatrix: required.map(id => ({ id, status: "BLOCKED" })),
     attestationFingerprint: null,
     evidenceManifest: [],
     findingsFingerprint: findingsState?.fingerprint || null,
@@ -817,32 +958,77 @@ function rejectUnboundLiveQualification(summary, status, error) {
     status,
     authenticatedAcceptance: "not-recorded",
     verdict: null,
-    passedWorkflowIds: [],
-    missingWorkflowIds: [...summary.requiredWorkflowIds],
     visibleEnabledActions: { status: "not-run", silentNoOpCount: null },
     errors: uniqueSorted([...summary.errors, error]),
   };
 }
 
-function summarizeFindings(findings, inputStatus, errors = []) {
-  const normalized = findings.map(finding => ({
-    id: finding.id,
-    severity: finding.severity,
-    status: finding.status,
-    workflowContract: finding.workflowContract,
-    surface: finding.surface,
-    releaseBlocking: finding.releaseBlocking === true,
-  })).sort((left, right) => String(left.id).localeCompare(String(right.id)));
-  const open = normalized.filter(finding => !TERMINAL_FINDING_STATUSES.has(finding.status));
+function summarizeFindings(findings, inputStatus, errors = [], workflows = {}) {
+  const workflowById = new Map((workflows?.workflows || []).map(workflow => [
+    workflow.id,
+    workflow,
+  ]));
+  const policyErrors = [];
+  const normalized = findings.map(finding => {
+    const releaseBlocking = deriveReleaseBlocking(
+      finding,
+      workflowById.get(finding.workflowContract)
+    );
+    if (typeof finding.releaseBlocking !== "boolean"
+      || finding.releaseBlocking !== releaseBlocking) {
+      policyErrors.push(
+        `Finding ${String(finding.id)} releaseBlocking does not match derived policy.`
+      );
+    }
+    return {
+      id: finding.id,
+      severity: finding.severity,
+      domain: finding.domain,
+      status: finding.status,
+      deterministicStatus: finding.deterministicStatus,
+      liveStatus: finding.liveStatus,
+      workflowContract: finding.workflowContract,
+      surface: finding.surface,
+      releaseBlocking,
+    };
+  }).sort((left, right) => String(left.id).localeCompare(String(right.id)));
+  const open = normalized.filter(finding => !isClosedFinding(finding));
   const blockers = open.filter(finding => finding.releaseBlocking);
+  const deterministicBlockers = blockers.filter(finding => (
+    finding.deterministicStatus === "failing"
+  ));
+  const liveBlockers = blockers.filter(finding => (
+    ["pending", "blocked", "failed"].includes(finding.liveStatus)
+  ));
+  const findingErrors = uniqueSorted([...errors, ...policyErrors]);
   return {
-    status: inputStatus,
+    status: findingErrors.length > 0 ? "failed" : inputStatus,
     total: normalized.length,
     open: open.length,
+    closed: normalized.length - open.length,
+    counts: {
+      byDomain: countFindingsBy(normalized, "domain", FINDING_DOMAINS),
+      bySeverity: countFindingsBy(normalized, "severity", FINDING_SEVERITIES),
+      byDeterministicStatus: countFindingsBy(
+        normalized,
+        "deterministicStatus",
+        DETERMINISTIC_FINDING_STATUSES
+      ),
+      byLiveStatus: countFindingsBy(normalized, "liveStatus", LIVE_FINDING_STATUSES),
+    },
     releaseBlocking: blockers.length,
+    deterministicReleaseBlocking: deterministicBlockers.length,
+    liveReleaseBlocking: liveBlockers.length,
     releaseBlockers: blockers,
-    errors: uniqueSorted(errors),
+    errors: findingErrors,
   };
+}
+
+function countFindingsBy(findings, field, values) {
+  return Object.fromEntries(values.map(value => [
+    value,
+    findings.filter(finding => finding[field] === value).length,
+  ]));
 }
 
 function summarizeTestResults(receiptById) {
@@ -876,15 +1062,28 @@ function testResult(receipt) {
 
 function summarizeWorkflowCoverage(options) {
   const impacted = new Set(options.impact.workflows);
-  const livePassed = new Set(options.liveQualification.status === "passed"
-    ? options.liveQualification.passedWorkflowIds
-    : []);
+  const liveMatrix = new Map((options.liveQualification.workflowMatrix || []).map(row => [
+    row.id,
+    row.status,
+  ]));
   const inventories = options.inventories || {};
   return (options.workflows?.workflows || []).map(workflow => {
     const layers = Object.fromEntries((workflow.requiredLayers || []).map(layer => [
       layer,
-      workflowLayerStatus(workflow, layer, options, inventories, livePassed),
+      workflowLayerStatus(workflow, layer, options, inventories, liveMatrix),
     ]));
+    const authenticatedRequired = workflow.liveFixture?.required === true;
+    const authenticatedStatus = authenticatedRequired
+      ? liveMatrix.get(workflow.id) || "BLOCKED"
+      : "NOT-REQUIRED";
+    const deterministicStatus = aggregateStatuses(Object.entries(layers)
+      .filter(([layer]) => layer !== "live-protocol")
+      .map(([, status]) => status));
+    const authenticatedEvidenceStatus = authenticatedStatus === "PASS"
+      ? "passed"
+      : authenticatedStatus === "FAIL"
+        ? "failed"
+        : authenticatedRequired ? "blocked" : "not-applicable";
     return {
       id: workflow.id,
       criticality: workflow.criticality,
@@ -893,17 +1092,21 @@ function summarizeWorkflowCoverage(options) {
       authoritativeOutcome: workflow.authoritativeOutcome,
       requiredLayers: [...(workflow.requiredLayers || [])],
       layerStatuses: layers,
-      status: aggregateStatuses(Object.values(layers)),
+      deterministicStatus,
+      authenticatedRequired,
+      authenticatedStatus,
+      status: aggregateStatuses([deterministicStatus, authenticatedEvidenceStatus]),
     };
   }).sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function workflowLayerStatus(workflow, layer, options, inventories, livePassed) {
+function workflowLayerStatus(workflow, layer, options, inventories, liveMatrix) {
   if (layer === "live-protocol") {
-    if (livePassed.has(workflow.id)) return "passed";
-    return options.liveQualification.status === "passed"
-      ? "failed"
-      : options.liveQualification.status;
+    const status = liveMatrix.get(workflow.id);
+    if (status === "PASS") return "passed";
+    if (status === "FAIL") return "failed";
+    if (["PARTIAL", "BLOCKED"].includes(status)) return "blocked";
+    return "not-run";
   }
   if (layer === "black-box-ui") return options.blackBoxUi.status;
   const evidence = (workflow.evidence || []).filter(item => item.layer === layer);
@@ -1011,7 +1214,12 @@ function releaseReadinessStatus(values) {
   const reasons = [];
   const workflowStatus = aggregateStatuses(values.workflowCoverage
     .filter(workflow => workflow.criticality === "release-critical")
-    .map(workflow => workflow.status));
+    .map(workflow => workflow.deterministicStatus));
+  const requiredAuthenticated = values.workflowCoverage.filter(workflow => (
+    workflow.authenticatedRequired
+  ));
+  const allAuthenticatedPassed = requiredAuthenticated.length > 0
+    && requiredAuthenticated.every(workflow => workflow.authenticatedStatus === "PASS");
   for (const [label, status] of [
     ["deterministic gates", values.deterministicStatus],
     ["impact analysis", values.impact.status],
@@ -1023,7 +1231,7 @@ function releaseReadinessStatus(values) {
   if (values.profile === "release" && values.blackBoxUi.status !== "passed") {
     reasons.push(`black-box UI: ${values.blackBoxUi.status}`);
   }
-  if (values.liveQualification.status !== "passed") {
+  if (values.liveQualification.status !== "passed" || !allAuthenticatedPassed) {
     reasons.push(`authenticated live qualification: ${values.liveQualification.status}`);
   }
   if (values.findings.status === "failed") reasons.push("finding input: failed");
@@ -1033,6 +1241,19 @@ function releaseReadinessStatus(values) {
   if (values.findings.releaseBlocking > 0) {
     reasons.push(`open release-blocking findings: ${values.findings.releaseBlocking}`);
   }
+  if (values.findings.deterministicReleaseBlocking > 0) {
+    reasons.push(
+      `deterministic release-blocking findings: ${values.findings.deterministicReleaseBlocking}`
+    );
+  }
+
+  const authenticatedLaneStatus = values.findings.liveReleaseBlocking > 0
+    && values.workflowCoverage.some(workflow => workflow.authenticatedStatus === "FAIL")
+    ? "failed"
+    : values.findings.liveReleaseBlocking > 0
+      && values.liveQualification.status === "passed"
+      ? "blocked"
+      : values.liveQualification.status;
 
   const hardStatuses = [
     values.deterministicStatus,
@@ -1042,15 +1263,42 @@ function releaseReadinessStatus(values) {
     values.profile === "release" ? values.blackBoxUi.status : "not-applicable",
     values.liveQualification.status === "failed" ? "failed" : "not-applicable",
     values.findings.status,
+    values.findings.deterministicReleaseBlocking > 0 ? "failed" : "not-applicable",
+    authenticatedLaneStatus === "failed" ? "failed" : "not-applicable",
   ];
   let status = hardStatuses.includes("failed") ? "failed" : "passed";
-  if (status === "passed" && (reasons.length > 0 || values.liveQualification.status !== "passed")) {
+  if (status === "passed" && (
+    reasons.length > 0
+    || values.liveQualification.status !== "passed"
+    || !allAuthenticatedPassed
+  )) {
     status = "blocked";
   }
   return {
     status,
     deterministicStatus: values.deterministicStatus,
     criticalWorkflowStatus: workflowStatus,
+    deterministicLane: {
+      status: aggregateStatuses([
+        values.deterministicStatus,
+        values.impact.status,
+        values.mutation.status,
+        values.profile === "fast" ? "not-applicable" : workflowStatus,
+        values.findings.status,
+        values.findings.deterministicReleaseBlocking > 0 ? "failed" : "not-applicable",
+      ]),
+      signedOutBlackBoxUi: values.profile === "release"
+        ? values.blackBoxUi.status
+        : "not-applicable",
+    },
+    authenticatedLiveLane: {
+      status: authenticatedLaneStatus,
+      requiredWorkflowCount: requiredAuthenticated.length,
+      passedWorkflowCount: requiredAuthenticated.filter(workflow => (
+        workflow.authenticatedStatus === "PASS"
+      )).length,
+      allRequiredPassed: allAuthenticatedPassed,
+    },
     authenticatedAcceptance: values.liveQualification.authenticatedAcceptance,
     verdict: status === "passed" ? values.liveQualification.verdict : null,
     reasons: uniqueSorted(reasons),
@@ -1061,6 +1309,7 @@ function loadReportInputs(options = {}) {
   const root = options.root || ROOT;
   const profile = options.profile || "full";
   const source = options.source || sourceIdentity(root);
+  const manifest = readJson("package.json", root);
   const plan = getGatePlan(profile);
   const workflows = readJson("quality/critical-workflows.json", root);
   const receipts = plan.map(step => readOptionalRepositoryJson(receiptPath({
@@ -1123,6 +1372,13 @@ function loadReportInputs(options = {}) {
       ".quality/ui"
     )
     : null;
+  const candidateArtifact = profile === "release"
+    ? readOptionalRepositoryJsonArtifact(
+      DEFAULT_CANDIDATE_RECEIPT,
+      root,
+      ".quality/qualification"
+    )
+    : null;
   const impactArtifact = readOptionalRepositoryJsonArtifact(
     ".quality/impact.json",
     root,
@@ -1142,6 +1398,9 @@ function loadReportInputs(options = {}) {
     ui: uiArtifact?.value || null,
     uiArtifactFingerprint: uiArtifact?.fingerprint || null,
     uiArtifacts: profile === "release" ? discoverUiArtifacts(root) : [],
+    candidateReceipt: candidateArtifact?.value || null,
+    extensionId: `${manifest.publisher}.${manifest.name}`,
+    extensionVersion: manifest.version,
     liveQualification: liveArtifact?.value || null,
     liveQualificationArtifactFingerprint: liveArtifact?.fingerprint || null,
     findings,
@@ -1183,6 +1442,7 @@ function writeReport(report, options = {}) {
 }
 
 function renderMarkdown(report) {
+  const liveCandidate = report.liveQualification.candidate;
   const lines = [
     "# Quality report",
     "",
@@ -1193,6 +1453,8 @@ function renderMarkdown(report) {
     "## Release readiness",
     "",
     `Status: **${report.releaseReadiness.status.toUpperCase()}**  `,
+    `Deterministic lane: **${report.releaseReadiness.deterministicLane.status.toUpperCase()}**  `,
+    `Authenticated live lane: **${report.releaseReadiness.authenticatedLiveLane.status.toUpperCase()}**  `,
     `Authenticated acceptance: **${report.releaseReadiness.authenticatedAcceptance}**  `,
     `Verdict: ${report.releaseReadiness.verdict || "none"}`,
     "",
@@ -1210,10 +1472,10 @@ function renderMarkdown(report) {
     "",
     "## Critical workflow evidence",
     "",
-    "| Workflow | Impacted | Status | Required layers |",
-    "| --- | --- | --- | --- |",
+    "| Workflow | Impacted | Deterministic | Authenticated | Required layers |",
+    "| --- | --- | --- | --- | --- |",
     ...report.workflowCoverage.map(workflow => (
-      `| ${workflow.id} | ${workflow.impacted ? "yes" : "no"} | ${workflow.status} | ${workflow.requiredLayers.join(", ")} |`
+      `| ${workflow.id} | ${workflow.impacted ? "yes" : "no"} | ${workflow.deterministicStatus} | ${workflow.authenticatedStatus} | ${workflow.requiredLayers.join(", ")} |`
     )),
     "",
     "## WebView interaction evidence",
@@ -1223,7 +1485,7 @@ function renderMarkdown(report) {
     "",
     "## Extension Host execution evidence",
     "",
-    `Production activation: ${report.extensionHostExecutionEvidence.classification} in a real VS Code host; the production manifest is not host-managed or installed by qualification.  `,
+    `Deterministic host composition: ${report.extensionHostExecutionEvidence.classification} in a real VS Code host. Packaged-candidate activation is independently covered by the signed-out black-box UI lane.  `,
     `Credential boundary: ${report.extensionHostExecutionEvidence.credentialBoundary}.`,
     "",
     "## Gate receipts",
@@ -1247,11 +1509,42 @@ function renderMarkdown(report) {
     `VS Code: ${report.blackBoxUi.vscodeVersion || "not recorded"}  `,
     `Failure artifacts: ${report.blackBoxUi.failureArtifacts.join(", ") || "none"}`,
     "",
+    "## Authenticated candidate binding",
+    "",
+    `Receipt fingerprint: ${liveCandidate?.receiptFingerprint || "not recorded"}  `,
+    `VSIX SHA-256: ${liveCandidate?.vsixSha256 || "not recorded"}  `,
+    `Extension: ${liveCandidate
+      ? `${liveCandidate.extensionId}@${liveCandidate.extensionVersion}`
+      : "not recorded"}  `,
+    `Installed identity: ${liveCandidate
+      ? `${liveCandidate.installedExtensionId}@${liveCandidate.installedExtensionVersion}`
+      : "not recorded"}  `,
+    `Source: ${liveCandidate
+      ? `${liveCandidate.sourceSha}/${liveCandidate.sourceFingerprint}`
+      : "not recorded"}  `,
+    `Profile identity: ${liveCandidate
+      ? `${liveCandidate.profileMode}/${liveCandidate.profileRootIdentity}`
+      : "not recorded"}`,
+    "",
+    "## Authenticated live workflow matrix",
+    "",
+    "| Workflow | Status |",
+    "| --- | --- |",
+    ...report.liveQualification.workflowMatrix.map(row => `| ${row.id} | ${row.status} |`),
+    "",
     "## Findings",
     "",
     `Input status: **${report.findings.status.toUpperCase()}**  `,
     `Open: ${report.findings.open}  `,
-    `Release-blocking: ${report.findings.releaseBlocking}`,
+    `Closed: ${report.findings.closed}  `,
+    `Release-blocking: ${report.findings.releaseBlocking}  `,
+    `Deterministic blockers: ${report.findings.deterministicReleaseBlocking}  `,
+    `Authenticated-live blockers: ${report.findings.liveReleaseBlocking}`,
+    "",
+    `By domain: ${formatCounts(report.findings.counts.byDomain)}  `,
+    `By severity: ${formatCounts(report.findings.counts.bySeverity)}  `,
+    `By deterministic status: ${formatCounts(report.findings.counts.byDeterministicStatus)}  `,
+    `By live status: ${formatCounts(report.findings.counts.byLiveStatus)}`,
     "",
   );
   for (const error of report.findings.errors) lines.push(`- Finding input error: ${error}`);
@@ -1265,6 +1558,10 @@ function renderMarkdown(report) {
 
 function formatCount(value) {
   return value === null ? "not recorded" : String(value);
+}
+
+function formatCounts(value) {
+  return Object.entries(value || {}).map(([key, count]) => `${key}=${count}`).join(", ");
 }
 
 function integerOrNull(value) {
@@ -1308,6 +1605,7 @@ function hasDeterministicReportFailure(report) {
     && !["passed", "not-applicable"].includes(report.mutation?.status)) return true;
   if (["failed", "blocked", "not-run"].includes(report.deterministicGates?.status)) return true;
   if (report.findings?.status === "failed") return true;
+  if ((report.findings?.deterministicReleaseBlocking || 0) > 0) return true;
   return false;
 }
 
@@ -1317,7 +1615,9 @@ module.exports = {
   DEFAULT_FINDINGS,
   DEFAULT_JSON_OUTPUT,
   DEFAULT_MARKDOWN_OUTPUT,
+  UI_BLOCKED_REASON,
   discoverUiArtifacts,
+  expectedBlackBoxUiTests,
   generateReport,
   hasDeterministicReportFailure,
   loadReportInputs,
@@ -1326,6 +1626,7 @@ module.exports = {
   parseFindingsJsonl,
   renderMarkdown,
   summarizeFindings,
+  validateUiResult,
   validateImpactArtifact,
   validateFindingRecord,
   validateFindings,

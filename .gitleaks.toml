@@ -1,0 +1,8 @@
+title = "Cloudsmith VS Code extension secret exposure policy"
+
+# Keep the mature upstream ruleset authoritative. Any future exception must be
+# constrained to an exact rule and path, carry a reviewed non-secret rationale,
+# and include a regression test. Broad allowlists and secret-derived baselines
+# are intentionally unsupported by the quality harness.
+[extend]
+useDefault = true

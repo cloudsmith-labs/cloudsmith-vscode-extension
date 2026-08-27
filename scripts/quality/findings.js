@@ -13,6 +13,7 @@ const {
 } = require("./common");
 
 const FINDINGS_MAX_BYTES = 16 * 1024 * 1024;
+const CLOSED_FINDING_STATUSES = new Set(["closed", "closed-non-issue"]);
 
 function readBoundedFindingsBytes(target) {
   const stat = fs.lstatSync(target);
@@ -46,6 +47,37 @@ function parseFindingsJsonl(source) {
     }
   }
   return findings;
+}
+
+function isClosedFinding(finding) {
+  return CLOSED_FINDING_STATUSES.has(finding?.status);
+}
+
+function findingRequiresLiveVerification(finding) {
+  if (!isPlainObject(finding)) return false;
+  if (finding.liveStatus !== "not-required") return true;
+  if (finding.domain === "security-environment" && finding.severity === "P0") return true;
+  return finding.domain === "product"
+    && ["live-protocol", "black-box-ui"].includes(finding.testLayerThatShouldHaveCaughtIt);
+}
+
+function deriveReleaseBlocking(finding, workflow = null) {
+  if (!isPlainObject(finding)) return true;
+  if (isClosedFinding(finding)) return false;
+  if (finding.severity === "P3") return false;
+  if (finding.severity === "P0") return true;
+  if (finding.severity === "P1") return true;
+
+  const deterministicUnresolved = finding.deterministicStatus !== "fixed";
+  const liveUnresolved = findingRequiresLiveVerification(finding)
+    && finding.liveStatus !== "verified";
+  if (finding.domain === "product") {
+    const releaseCritical = workflow == null || workflow.criticality === "release-critical";
+    return finding.severity === "P2"
+      && releaseCritical
+      && (deterministicUnresolved || liveUnresolved);
+  }
+  return false;
 }
 
 function validateFindings(findings, schema, taxonomy, root = ROOT) {
@@ -100,8 +132,19 @@ function validateFindingRecord(
   if (!Object.prototype.hasOwnProperty.call(taxonomy?.severities || {}, finding.severity)) {
     errors.push(`Finding ${label} has invalid severity ${String(finding.severity)}.`);
   }
+  if (!Object.prototype.hasOwnProperty.call(taxonomy?.domains || {}, finding.domain)) {
+    errors.push(`Finding ${label} has invalid domain ${String(finding.domain)}.`);
+  }
   if (!(taxonomy?.statuses || []).includes(finding.status)) {
     errors.push(`Finding ${label} has invalid status ${String(finding.status)}.`);
+  }
+  if (!(taxonomy?.deterministicStatuses || []).includes(finding.deterministicStatus)) {
+    errors.push(
+      `Finding ${label} has invalid deterministic status ${String(finding.deterministicStatus)}.`
+    );
+  }
+  if (!(taxonomy?.liveStatuses || []).includes(finding.liveStatus)) {
+    errors.push(`Finding ${label} has invalid live status ${String(finding.liveStatus)}.`);
   }
   let workflow = null;
   try {
@@ -135,52 +178,79 @@ function validateFindingRecord(
     label,
     errors
   );
-  validateNestedEvidenceStatus(
-    finding.liveVerification,
-    schema?.properties?.liveVerification?.properties?.status?.enum,
-    "live verification",
-    label,
-    errors
-  );
+  if (!isPlainObject(finding.liveVerification)
+    || !requireNonEmptyString(finding.liveVerification.summary)) {
+    errors.push(`Finding ${label} has invalid live verification summary.`);
+  }
   if (typeof finding.releaseBlocking !== "boolean") {
     errors.push(`Finding ${label} must declare boolean releaseBlocking.`);
   }
-  const terminalFix = finding.status === "fixed";
-  const pendingFix = finding.status === "fixed-pending-verification";
-  const closedNonIssue = finding.status === "closed-non-issue";
-  if (["P0", "P1"].includes(finding.severity)
-    && !terminalFix
-    && finding.status !== "closed-non-issue"
-    && finding.releaseBlocking !== true) {
-    errors.push(`Finding ${label} ${finding.severity} must remain release blocking until fixed.`);
-  }
-  if (finding.severity === "P2"
-    && workflow?.criticality === "release-critical"
-    && !terminalFix
-    && finding.status !== "closed-non-issue"
-    && finding.releaseBlocking !== true) {
+  const derivedReleaseBlocking = deriveReleaseBlocking(finding, workflow);
+  if (typeof finding.releaseBlocking === "boolean"
+    && finding.releaseBlocking !== derivedReleaseBlocking) {
     errors.push(
-      `Finding ${label} unresolved P2 on a release-critical workflow must remain release blocking.`
+      `Finding ${label} releaseBlocking must match policy-derived value `
+      + `${String(derivedReleaseBlocking)}.`
     );
   }
-  if (finding.severity === "P3" && finding.releaseBlocking !== false) {
-    errors.push(`Finding ${label} P3 must not be release blocking.`);
-  }
-  if (terminalFix || pendingFix) {
+  const deterministicFix = finding.deterministicStatus === "fixed";
+  const closedNonIssue = finding.status === "closed-non-issue";
+  const closedResolved = finding.status === "closed";
+  const releaseCriticalProduct = finding.domain === "product"
+    && (finding.severity === "P0"
+      || finding.severity === "P1"
+      || (finding.severity === "P2" && workflow?.criticality === "release-critical"));
+  if (deterministicFix) {
     if (!requireNonEmptyString(finding.regressionTest)) {
-      errors.push(`Finding ${label} fixed lifecycle requires a regression test.`);
+      errors.push(`Finding ${label} deterministic fix requires a regression test.`);
     }
     if (finding.rootCauseStatus !== "proven") {
-      errors.push(`Finding ${label} fixed lifecycle requires proven root cause.`);
+      errors.push(`Finding ${label} deterministic fix requires proven root cause.`);
     }
     if (!/^[a-f0-9]{7,40}$/u.test(finding.fixedSha || "")) {
-      errors.push(`Finding ${label} fixed lifecycle requires a fixed SHA.`);
+      errors.push(`Finding ${label} deterministic fix requires a fixed SHA.`);
     } else if (!isAncestorCommit(root, finding.fixedSha)) {
       errors.push(`Finding ${label} fixed SHA is not an ancestor of the current candidate.`);
     }
     if (!["mutation-killed", "not-applicable"].includes(finding.mutationProof?.status)) {
-      errors.push(`Finding ${label} fixed lifecycle requires completed mutation proof.`);
+      errors.push(`Finding ${label} deterministic fix requires completed mutation proof.`);
     }
+  }
+  if (finding.deterministicStatus === "failing" && isClosedFinding(finding)) {
+    errors.push(`Finding ${label} cannot close while deterministic evidence is failing.`);
+  }
+  if (finding.deterministicStatus === "not-applicable"
+    && finding.mutationProof?.status !== "not-applicable") {
+    errors.push(`Finding ${label} deterministic non-applicability requires matching mutation proof.`);
+  }
+  if (isClosedFinding(finding)
+    && !["fixed", "not-applicable"].includes(finding.deterministicStatus)) {
+    errors.push(`Finding ${label} closed lifecycle requires completed deterministic disposition.`);
+  }
+  if (isClosedFinding(finding)
+    && !["verified", "not-required"].includes(finding.liveStatus)) {
+    errors.push(`Finding ${label} closed lifecycle requires completed live disposition.`);
+  }
+  if (closedResolved && releaseCriticalProduct && !deterministicFix) {
+    errors.push(
+      `Finding ${label} cannot close a release-critical product defect without a deterministic fix.`
+    );
+  }
+  if (closedResolved && finding.deterministicStatus === "not-applicable") {
+    if (finding.rootCauseStatus !== "proven" || !requireNonEmptyString(finding.rootCause)) {
+      errors.push(`Finding ${label} deterministic non-applicability requires a proven disposition.`);
+    }
+    if (!Array.isArray(finding.evidence) || !finding.evidence.some(evidence => (
+      ["test", "source", "log", "screenshot"].includes(evidence?.kind)
+    ))) {
+      errors.push(
+        `Finding ${label} deterministic non-applicability requires repository-verifiable evidence.`
+      );
+    }
+  }
+  if (findingRequiresLiveVerification(finding)
+    && finding.liveStatus === "not-required") {
+    errors.push(`Finding ${label} cannot mark required live verification as not-required.`);
   }
   if (finding.rootCauseStatus === "proven" && !requireNonEmptyString(finding.rootCause)) {
     errors.push(`Finding ${label} proven root cause requires a nonempty rootCause.`);
@@ -200,19 +270,11 @@ function validateFindingRecord(
     if (!["mutation-killed", "not-applicable"].includes(finding.mutationProof?.status)) {
       errors.push(`Finding ${label} closed-non-issue requires completed mutation disposition.`);
     }
-    if (!["live-pass", "not-applicable"].includes(finding.liveVerification?.status)) {
+    if (!["verified", "not-required"].includes(finding.liveStatus)) {
       errors.push(`Finding ${label} closed-non-issue requires completed live disposition.`);
     }
     if (finding.releaseBlocking !== false) {
       errors.push(`Finding ${label} closed-non-issue must clear releaseBlocking.`);
-    }
-  }
-  if (terminalFix) {
-    if (!["live-pass", "not-applicable"].includes(finding.liveVerification?.status)) {
-      errors.push(`Finding ${label} cannot be fixed without completed live verification.`);
-    }
-    if (finding.releaseBlocking !== false) {
-      errors.push(`Finding ${label} fixed lifecycle must clear releaseBlocking.`);
     }
   }
   for (const evidence of finding.evidence || []) {
@@ -328,6 +390,9 @@ function validateNestedEvidenceStatus(value, allowedStatuses, field, label, erro
 module.exports = {
   decodeFindingsBytes,
   decodeUtf8Bytes,
+  deriveReleaseBlocking,
+  findingRequiresLiveVerification,
+  isClosedFinding,
   parseFindingsJsonl,
   readBoundedFindingsBytes,
   validateFindingRecord,

@@ -1,0 +1,370 @@
+// Copyright 2026 Cloudsmith Ltd. All rights reserved.
+
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const {
+  isPlainObject,
+  readJson,
+  resolveExistingRepositoryFile,
+} = require("./common");
+const { fingerprint } = require("./evidence");
+const { canonicalLocalProfileRoot } = require("./qualification-profile");
+
+const LIVE_CANDIDATE_RECEIPT = ".quality/qualification/live-candidate.json";
+const LIVE_CANDIDATE_ARTIFACT = ".quality/qualification/live-candidate.vsix";
+const AUTHENTICATED_CANDIDATE_RECEIPT = ".quality/qualification/authenticated-candidate.json";
+const AUTHENTICATED_CANDIDATE_ARTIFACT = ".quality/qualification/authenticated-candidate.vsix";
+const MAX_VSIX_BYTES = 12 * 1024 * 1024;
+const MAX_VSIX_ENTRIES = 1250;
+const CANDIDATE_BINDING_KEYS = Object.freeze([
+  "developmentPath",
+  "extensionId",
+  "extensionVersion",
+  "installedExtensionId",
+  "installedExtensionVersion",
+  "profileMode",
+  "profileRootIdentity",
+  "receiptFingerprint",
+  "sourceFingerprint",
+  "sourceSha",
+  "vscodeVersion",
+  "vsixSha256",
+]);
+const IMMUTABLE_CANDIDATE_KEYS = Object.freeze([
+  "developmentPath",
+  "extensionId",
+  "extensionVersion",
+  "installedExtensionId",
+  "installedExtensionVersion",
+  "sourceFingerprint",
+  "sourceSha",
+  "vscodeVersion",
+  "vsixSha256",
+]);
+
+function hasExactKeys(value, keys) {
+  return isPlainObject(value)
+    && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
+}
+
+function exactSource(value) {
+  return hasExactKeys(value, ["fingerprint", "sha"])
+    && /^[a-f0-9]{40,64}$/u.test(value.sha || "")
+    && /^[a-f0-9]{64}$/u.test(value.fingerprint || "");
+}
+
+function sameSource(left, right) {
+  return exactSource(left) && exactSource(right)
+    && left.sha === right.sha && left.fingerprint === right.fingerprint;
+}
+
+function profileRootIdentity(mode, root) {
+  if (!new Set(["ci", "local"]).has(mode)
+    || typeof root !== "string"
+    || !path.isAbsolute(root)
+    || path.resolve(root) !== root
+    || path.normalize(root) !== root
+    || /[\u0000-\u001f\u007f]/u.test(root)) {
+    throw new Error("Qualification candidate profile identity is invalid.");
+  }
+  return fingerprint({ mode, root });
+}
+
+function candidateBindingFromReceipt(receipt, options = {}) {
+  if (!hasExactKeys(receipt, [
+    "artifact", "capturedAt", "extension", "fingerprint", "installation", "launch",
+    "profile", "repository", "schemaVersion", "source", "status", "vscode",
+  ])
+    || receipt.schemaVersion !== 2
+    || receipt.status !== "passed"
+    || !canonicalTimestamp(receipt.capturedAt)
+    || !/^[a-f0-9]{64}$/u.test(receipt.fingerprint || "")) {
+    throw new Error("Qualification candidate receipt fields are invalid.");
+  }
+  const unsigned = { ...receipt };
+  delete unsigned.fingerprint;
+  if (fingerprint(unsigned) !== receipt.fingerprint) {
+    throw new Error("Qualification candidate receipt fingerprint is invalid.");
+  }
+  if (!exactSource(receipt.source)
+    || (options.source && !sameSource(receipt.source, options.source))) {
+    throw new Error("Qualification candidate receipt source is stale or mismatched.");
+  }
+  if (!validRepositoryState(receipt.repository)) {
+    throw new Error("Qualification candidate repository state is invalid.");
+  }
+  if (options.repositoryState) {
+    if (!validRepositoryState(options.repositoryState)
+      || JSON.stringify(receipt.repository) !== JSON.stringify(options.repositoryState)) {
+      throw new Error("Qualification candidate repository state is stale or mismatched.");
+    }
+  }
+
+  const extension = receipt.extension;
+  const installation = receipt.installation;
+  if (!hasExactKeys(extension, ["id", "name", "publisher", "version"])
+    || !/^[A-Za-z0-9][A-Za-z0-9.-]*$/u.test(extension.id || "")
+    || extension.id !== `${extension.publisher}.${extension.name}`
+    || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(extension.version || "")
+    || !hasExactKeys(installation, ["id", "status", "version"])
+    || installation.status !== "passed"
+    || installation.id !== extension.id
+    || installation.version !== extension.version) {
+    throw new Error("Qualification candidate installed identity is invalid.");
+  }
+  if (options.root) {
+    const manifest = readJson("package.json", options.root);
+    if (extension.id !== `${manifest.publisher}.${manifest.name}`
+      || extension.publisher !== manifest.publisher
+      || extension.name !== manifest.name
+      || extension.version !== manifest.version) {
+      throw new Error("Qualification candidate extension identity is stale or mismatched.");
+    }
+  }
+
+  const artifact = receipt.artifact;
+  const artifactFilename = `${extension.name}-${extension.version}.vsix`;
+  const allowedArtifactPaths = new Set([
+    `out/development/${artifactFilename}`,
+    `out/release/${artifactFilename}`,
+  ]);
+  if (!hasExactKeys(artifact, [
+    "absoluteVsixPath", "archiveBytes", "entryCount", "sha256", "sourceFingerprint",
+    "sourceSha", "vsixPath",
+  ])
+    || !/^[a-f0-9]{64}$/u.test(artifact.sha256 || "")
+    || artifact.sourceSha !== receipt.source.sha
+    || artifact.sourceFingerprint !== receipt.source.fingerprint
+    || !Number.isSafeInteger(artifact.archiveBytes) || artifact.archiveBytes <= 0
+    || artifact.archiveBytes > MAX_VSIX_BYTES
+    || !Number.isSafeInteger(artifact.entryCount) || artifact.entryCount <= 0
+    || artifact.entryCount > MAX_VSIX_ENTRIES
+    || typeof artifact.vsixPath !== "string"
+    || !allowedArtifactPaths.has(artifact.vsixPath)
+    || !absoluteNormalizedPath(artifact.absoluteVsixPath)) {
+    throw new Error("Qualification candidate VSIX provenance is invalid.");
+  }
+  if (options.root
+    && artifact.absoluteVsixPath !== path.resolve(options.root, artifact.vsixPath)) {
+    throw new Error("Qualification candidate VSIX absolute path is stale or mismatched.");
+  }
+  if (options.artifactPath) {
+    const proofPath = containedRealProofPath(options.artifactPath, options.root);
+    assertVsixProof(
+      proofPath,
+      artifact,
+      "Qualification candidate VSIX proof is stale or mismatched.",
+    );
+  }
+
+  const profile = receipt.profile;
+  const expectedUserDataName = profile?.mode === "local" ? "user-data" : "settings";
+  if (!hasExactKeys(profile, [
+    "extensionsDir", "mode", "persistent", "root", "testResourcesDir", "userDataDir",
+  ])
+    || !new Set(["ci", "local"]).has(profile.mode)
+    || profile.persistent !== (profile.mode === "local")
+    || profile.testResourcesDir !== profile.root
+    || profile.userDataDir !== path.join(profile.root, expectedUserDataName)
+    || profile.extensionsDir !== path.join(profile.root, "extensions")) {
+    throw new Error("Qualification candidate profile binding is invalid.");
+  }
+  if (profile.mode === "local") {
+    let expectedLocalRoot;
+    try {
+      expectedLocalRoot = canonicalLocalProfileRoot(options.homeDirectory);
+    } catch {
+      throw new Error("Qualification candidate local profile root is not canonical.");
+    }
+    if (profile.root !== expectedLocalRoot) {
+      throw new Error("Qualification candidate local profile root is not canonical.");
+    }
+  }
+  const rootIdentity = profileRootIdentity(profile.mode, profile.root);
+
+  const vscode = receipt.vscode;
+  if (!hasExactKeys(vscode, ["cli", "executable", "version"])
+    || !/^\d+\.\d+\.\d+$/u.test(vscode.version || "")
+    || !absoluteNormalizedPath(vscode.executable)
+    || !absoluteNormalizedPath(vscode.cli)
+    || !hasExactKeys(receipt.launch, ["developmentPath", "status"])
+    || receipt.launch.developmentPath !== false
+    || !new Set(["not-requested", "command-accepted"]).has(receipt.launch.status)) {
+    throw new Error("Qualification candidate launch identity is invalid.");
+  }
+
+  return Object.freeze({
+    developmentPath: false,
+    extensionId: extension.id,
+    extensionVersion: extension.version,
+    installedExtensionId: installation.id,
+    installedExtensionVersion: installation.version,
+    profileMode: profile.mode,
+    profileRootIdentity: rootIdentity,
+    receiptFingerprint: receipt.fingerprint,
+    sourceFingerprint: receipt.source.fingerprint,
+    sourceSha: receipt.source.sha,
+    vscodeVersion: vscode.version,
+    vsixSha256: artifact.sha256,
+  });
+}
+
+function containedRealProofPath(file, root) {
+  if (!absoluteNormalizedPath(file)) {
+    throw new Error("Qualification candidate VSIX proof is stale or mismatched.");
+  }
+  try {
+    if (!root) {
+      if (fs.realpathSync(file) !== file) throw new Error("noncanonical proof");
+      return file;
+    }
+    const realRoot = fs.realpathSync(path.resolve(root));
+    const relative = path.relative(realRoot, file).split(path.sep).join("/");
+    if (!relative || relative.startsWith("../") || path.posix.isAbsolute(relative)) {
+      throw new Error("escaped proof");
+    }
+    const resolved = resolveExistingRepositoryFile(relative, root);
+    if (resolved !== file) throw new Error("noncanonical proof");
+    return resolved;
+  } catch {
+    throw new Error("Qualification candidate VSIX proof is stale or mismatched.");
+  }
+}
+
+function assertVsixProof(file, artifact, errorMessage) {
+  let stat;
+  let digest;
+  try {
+    stat = fs.lstatSync(file);
+  } catch {
+    throw new Error(errorMessage);
+  }
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== artifact.archiveBytes) {
+    throw new Error(errorMessage);
+  }
+  try {
+    digest = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+  } catch {
+    throw new Error(errorMessage);
+  }
+  if (digest !== artifact.sha256) throw new Error(errorMessage);
+}
+
+function validateCandidateBinding(value, expected = null) {
+  if (!hasExactKeys(value, CANDIDATE_BINDING_KEYS)
+    || value.developmentPath !== false
+    || !/^[A-Za-z0-9][A-Za-z0-9.-]*$/u.test(value.extensionId || "")
+    || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(value.extensionVersion || "")
+    || value.installedExtensionId !== value.extensionId
+    || value.installedExtensionVersion !== value.extensionVersion
+    || !new Set(["ci", "local"]).has(value.profileMode)
+    || !/^[a-f0-9]{64}$/u.test(value.profileRootIdentity || "")
+    || !/^[a-f0-9]{64}$/u.test(value.receiptFingerprint || "")
+    || !/^[a-f0-9]{64}$/u.test(value.sourceFingerprint || "")
+    || !/^[a-f0-9]{40,64}$/u.test(value.sourceSha || "")
+    || !/^\d+\.\d+\.\d+$/u.test(value.vscodeVersion || "")
+    || !/^[a-f0-9]{64}$/u.test(value.vsixSha256 || "")) {
+    throw new Error("Qualification candidate binding fields are invalid.");
+  }
+  if (expected && CANDIDATE_BINDING_KEYS.some(key => value[key] !== expected[key])) {
+    throw new Error("Qualification candidate binding is stale or mismatched.");
+  }
+  return value;
+}
+
+function validateEquivalentCandidateProduct(localCandidate, ciCandidate) {
+  validateCandidateBinding(localCandidate);
+  validateCandidateBinding(ciCandidate);
+  if (IMMUTABLE_CANDIDATE_KEYS.some(key => localCandidate[key] !== ciCandidate[key])) {
+    throw new Error(
+      "Local and authenticated-CI candidates do not identify the same immutable product artifact."
+    );
+  }
+  return true;
+}
+
+function validateAuthenticatedExecutionReceipt(receipt, candidate, source) {
+  const unsigned = { ...receipt };
+  delete unsigned.fingerprint;
+  if (!hasExactKeys(receipt, [
+    "candidate", "credentialBoundary", "fingerprint", "phases", "reasonCode",
+    "schemaVersion", "source", "status", "workspace",
+  ])
+    || receipt.schemaVersion !== 2
+    || receipt.status !== "passed"
+    || receipt.reasonCode !== null
+    || !sameSource(receipt.source, source)
+    || fingerprint(unsigned) !== receipt.fingerprint
+    || !/^[a-f0-9]{64}$/u.test(receipt.fingerprint || "")) {
+    throw new Error("Authenticated qualification receipt is missing, stale, or not passed.");
+  }
+  validateCandidateBinding(receipt.candidate, candidate);
+  if (candidate.profileMode !== "ci"
+    || !hasExactKeys(receipt.workspace, ["expected", "observed", "surface"])
+    || receipt.workspace.expected !== "dl-technology-consulting"
+    || receipt.workspace.observed !== receipt.workspace.expected
+    || receipt.workspace.surface !== "production-connected-workspace"
+    || !hasExactKeys(receipt.credentialBoundary, [
+      "digestRecorded", "storageKey", "transport", "valueRecorded",
+    ])
+    || receipt.credentialBoundary.storageKey !== "cloudsmith-vsc.authToken"
+    || receipt.credentialBoundary.transport !== "creator-bound-0700-0600-handoff"
+    || receipt.credentialBoundary.valueRecorded !== false
+    || receipt.credentialBoundary.digestRecorded !== false
+    || !hasExactKeys(receipt.phases, [
+      "candidate", "handoff", "outputBoundary", "productionWorkspaceCheck",
+      "profileCleanup", "secretStorageCleanup", "seed",
+    ])
+    || receipt.phases.candidate !== "prepared"
+    || receipt.phases.handoff !== "consumed-before-store-completion"
+    || receipt.phases.seed !== "passed"
+    || receipt.phases.productionWorkspaceCheck !== "passed"
+    || receipt.phases.secretStorageCleanup !== "passed"
+    || receipt.phases.profileCleanup !== "passed"
+    || receipt.phases.outputBoundary !== "passed") {
+    throw new Error("Authenticated qualification receipt lacks exact successful lifecycle proof.");
+  }
+  return receipt;
+}
+
+function absoluteNormalizedPath(value) {
+  return typeof value === "string"
+    && path.isAbsolute(value)
+    && path.resolve(value) === value
+    && path.normalize(value) === value
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function canonicalTimestamp(value) {
+  if (typeof value !== "string") return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+function validRepositoryState(value) {
+  return hasExactKeys(value, ["branch", "dirty", "status"])
+    && (value.branch === null || (
+      typeof value.branch === "string"
+      && value.branch.length > 0
+      && value.branch.length <= 255
+      && !/[\u0000-\u001f\u007f]/u.test(value.branch)
+    ))
+    && typeof value.dirty === "boolean"
+    && value.status === (value.dirty ? "dirty" : "clean");
+}
+
+module.exports = {
+  AUTHENTICATED_CANDIDATE_ARTIFACT,
+  AUTHENTICATED_CANDIDATE_RECEIPT,
+  CANDIDATE_BINDING_KEYS,
+  IMMUTABLE_CANDIDATE_KEYS,
+  LIVE_CANDIDATE_ARTIFACT,
+  LIVE_CANDIDATE_RECEIPT,
+  candidateBindingFromReceipt,
+  profileRootIdentity,
+  sameSource,
+  validateAuthenticatedExecutionReceipt,
+  validateCandidateBinding,
+  validateEquivalentCandidateProduct,
+};

@@ -4,5 +4,5 @@
   "failZero": true,
   "forbidOnly": true,
   "forbidPending": true,
-  "reporter": "spec"
+  "reporter": "./ui-test/evidence-reporter.js"
 }

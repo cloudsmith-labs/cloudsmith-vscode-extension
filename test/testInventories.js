@@ -10,7 +10,9 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/accountOperation.test.js",
   "test/apiEndpoint.test.js",
   "test/architectureGate.test.js",
+  "test/authBootstrap.test.js",
   "test/authCapabilities.test.js",
+  "test/candidateBinding.test.js",
   "test/commandFreshness.test.js",
   "test/commandRecovery.test.js",
   "test/commandUxOracle.test.js",
@@ -37,19 +39,24 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/paginatedFetch.test.js",
   "test/policyDecisionLogs.test.js",
   "test/polishGate.test.js",
+  "test/processTree.test.js",
   "test/promotionContracts.test.js",
   "test/qualityHarness.test.js",
+  "test/qualificationProfile.test.js",
   "test/releaseChecklistTrust.test.js",
   "test/recentPackages.test.js",
   "test/registryEndpoints.test.js",
   "test/releaseGate.test.js",
   "test/remediationHelper.test.js",
+  "test/reportReadinessModel.test.js",
   "test/runtimeProcessGuard.test.js",
   "test/searchQueryBuilder.test.js",
+  "test/secretScan.test.js",
   "test/ssoDiagnostics.test.js",
   "test/ssoProtocolClient.test.js",
   "test/testHelpers.test.js",
   "test/testInventories.test.js",
+  "test/uiSmokeRunner.test.js",
   "test/upstreamFormats.test.js",
   "test/upstreamOperationScheduler.test.js",
   "test/upstreamPresentation.test.js",
@@ -131,7 +138,7 @@ const CREDENTIAL_BOUNDARY_EXCLUDED_TESTS = Object.freeze([
   "test/integration/ssoAuthentication.test.js",
 ]);
 
-const CREDENTIAL_BOUNDARY_SKIP_REASON = "Credential-bearing automated live suites are excluded from qualification; live acceptance may use only an existing authenticated session and sanitized evidence.";
+const CREDENTIAL_BOUNDARY_SKIP_REASON = "General credential-bearing live suites are excluded from deterministic qualification; authenticated acceptance uses only the dedicated pre-authenticated local profile or the reviewed step-scoped ephemeral CI handoff/bootstrap lane, with value-blind evidence.";
 const CREDENTIAL_LIKE_ENVIRONMENT = /(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSCODE|MFA|CREDENTIAL|KEYCHAIN|ONEPASSWORD|1PASSWORD|PRIVATE_?KEY|ACCESS_?KEY|REFRESH_?TOKEN)/iu;
 const QUALIFICATION_ENVIRONMENT_ALLOWLIST = Object.freeze([
   "PATH",

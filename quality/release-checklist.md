@@ -1,69 +1,168 @@
 # Release qualification checklist
 
-The deterministic release gate and authenticated live qualification are both
-required. Passing the first does not imply the second happened.
+The deterministic/hermetic and authenticated release-qualification lanes are
+both required. Passing one never implies that the other ran.
 
-## Candidate identity
+## Candidate and profile identity
 
-- [ ] Baseline and candidate SHA recorded.
-- [ ] Extension, VS Code, Electron, Node, OS, and architecture recorded.
-- [ ] Workspace, repositories, project fixtures, and credential kind recorded
-      without reading or recording a secret.
+- [ ] Branch, candidate SHA/fingerprint, extension version, platform, and
+      architecture recorded.
+- [ ] Exact source SHA/fingerprint to VSIX path/SHA-256 to installed extension
+      ID/version binding recorded by the candidate receipt.
+- [ ] Local qualification uses exactly
+      `$HOME/.cloudsmith-vscode-qualification/{user-data,extensions}` and not a
+      normal VS Code profile.
+- [ ] Local authenticated profile was reused, or the user completed one-time
+      authentication outside all agent/UI observation.
+- [ ] Expected designated test workspace and repositories recorded without a
+      credential value.
+- [ ] CI uses an ephemeral creator-owned profile and dedicated non-human,
+      least-privileged qualification identity.
+- [ ] Cross-step CI cleanup accepted only a `csvq-` profile directly beneath
+      the canonical real `RUNNER_TEMP`/platform temporary base, not an arbitrary
+      self-fingerprinted parent.
+- [ ] The workflow declares `cloudsmith-release-qualification`; required
+      reviewers, deployment branches, and other GitHub environment protections
+      were confirmed in repository settings rather than inferred from YAML.
+- [ ] Exact authenticated candidate preparation/validation ran in a
+      credential-free step; only the minimal direct-Node bootstrap/product step
+      received the step-scoped Actions secret, with no npm lifecycle boundary.
+- [ ] Ephemeral authenticated-CI evidence and persistent local live-candidate
+      evidence remain separate; only immutable product/source/VSIX/current-
+      VS-Code identity is reconciled across them.
 
-## Deterministic gates
+## Security boundary and durable exposure
+
+- [ ] The only automated credential-value transport was the reviewed owner-only
+      one-use handoff into the same-ID bootstrap and normal production
+      `SecretStorage`; its environment entry and handoff were deleted, mutable
+      byte buffers were zeroed, and transient string references were released
+      at their defined boundary.
+- [ ] Outside that approved transport/storage path, no operator-visible,
+      agent-readable, durable, logged, reported, or uploaded surface inspected,
+      printed, copied, serialized, replayed, hashed, or exposed a credential or
+      SecretStorage/Keychain value.
+- [ ] Production extension used its normal authentication and SecretStorage
+      path; no production test bypass was added.
+- [ ] `npm run quality:secrets` passed for Git-visible current content.
+- [ ] `npm run quality:secrets:artifacts` passed for generated evidence and
+      raw/expanded VSIX contents.
+- [ ] `npm run quality:secrets:history` passed or every value-blind location is
+      recorded as an explicit open security blocker.
+- [ ] PR/issue/review text, Actions logs, and Actions artifacts were scanned
+      with authenticated tooling, or each unavailable surface is marked
+      `PARTIAL` without a false clean claim.
+- [ ] Credential rotation/revocation is separately confirmed before QH-010 or
+      an equivalent credential-exposure finding is closed; until confirmation,
+      QH-010 remains open without blocking other non-destructive qualification.
+- [ ] Test bootstrap is excluded from the VSIX; `SecretStorage` deletion was
+      attempted immediately after the product verifier and before exposure
+      scans, and handoff/log cleanup was attempted independently on every
+      outcome. Profile cleanup was attempted only after owned process-tree exit
+      was proven.
+- [ ] When owned process-tree exit was unproven, in-run profile cleanup was not
+      invoked or recorded as passed, and `authenticated-session.json` retained
+      ownership for the workflow's always-run cleanup retry.
+- [ ] When `SecretStorage` deletion failed after process-tree exit was proven,
+      the profile was removed before long scans and the external scan consumed
+      only its one-use metadata proof; failed early removal was retried.
+- [ ] Authenticated CI used current VS Code with no development path, observed
+      `dl-technology-consulting` through the rendered production workspace
+      selection surface, and returned no arbitrary DOM or child-process output.
+- [ ] Every owned bootstrap and product process tree was proven exited; the
+      Linux/macOS detached process group (or Windows Job Object adapter) failed
+      closed on timeout, thrown proof, or incomplete cleanup. No sandbox-
+      disabling launch flag was used.
+- [ ] The current Git-visible worktree passed a value-blind scan and its
+      content-free path/status state was unchanged before any post-auth source
+      fingerprint was computed.
+- [ ] Authenticated generated evidence, raw/expanded VSIX, and the separate
+      private runtime-log directory passed the value-blind scan before cleanup;
+      every scanner used private HOME/XDG/application-data/temp roots, and the
+      profile itself was checked by metadata only and never read.
+
+## Deterministic and black-box gates
 
 - [ ] `npm run quality:impact -- --base origin/main`
+- [ ] `npm run quality:fast`
 - [ ] `npm run quality:full`
 - [ ] `npm run test:mutation:changed`
-- [ ] `npm run test:ui:smoke`
 - [ ] `npm run test:zero-guard`
 - [ ] `npm run package:verify`
-- [ ] No open deterministic gate failure or meaningful mutation survivor in
-      changed high-risk code.
+- [ ] `npm run test:ui:smoke` executed more than zero tests against its exact
+      packaged candidate.
+- [ ] The intentionally wrong ExTester selector failed for the expected reason,
+      user data was reset, and the restored suite passed.
+- [ ] No deterministic gate failure, evidence-binding failure, meaningful
+      changed-code survivor, uncovered mutant, timeout, or false-green remains.
 
-## Live authoritative outcomes
+## Authenticated authoritative outcomes
 
-- [ ] Activation and three reloads settle truthfully.
-- [ ] Authentication state and supported credential modes remain truthful.
-- [ ] Both designated repositories publish packages/groups or an explicit
-      empty, partial, failed/retry, or cancelled package terminal.
+- [ ] Fresh schema-v5 attestation binds the exact local candidate receipt,
+      stable VSIX bytes, installed identity/version, source, dedicated local
+      profile identity, exact findings bytes, independent review, and all
+      required evidence.
+- [ ] Authenticated CI binds its distinct ephemeral-profile candidate receipt;
+      local and CI receipts agree on immutable source, VSIX, extension/install,
+      development-path, and current VS Code identity without equating profile
+      roots or receipt fingerprints.
+- [ ] Final PASS loaded `.quality/secrets/authenticated-ci.json` and validated
+      its exact generated-evidence, candidate-VSIX, runtime-log, and profile-
+      metadata-only components against the authenticated candidate receipt.
+- [ ] Every live `PASS` row, visible-action pass, and independent-review pass
+      names the same candidate receipt fingerprint; missing or stale candidate
+      metadata fails closed.
+- [ ] Every manifest workflow with `liveFixture.required: true` has one nonblank
+      `PASS`, `FAIL`, `PARTIAL`, or `BLOCKED` row.
+- [ ] Activation/reload and authentication state settle truthfully.
+- [ ] Designated repositories publish primary packages before supplementary
+      metadata settles, with explicit empty/partial/failed/cancelled terminals.
 - [ ] Search first page, Load More, exhaustion, duplicate-only continuation,
-      and supersession settle within bounds.
-- [ ] Every registered resolver family reaches a terminal scan and preserves
-      format-native qualifiers.
-- [ ] Direct, Flat, Tree, filters, cancellation, rescan, and supersession do
-      not publish stale or false-complete state.
-- [ ] Dependency, Compliance, Vulnerability, and Quarantine surfaces agree.
-- [ ] Every enabled Quarantine and Vulnerability WebView action reaches its
-      advertised final outcome.
-- [ ] Find safe version fails closed on repository scope and proves a positive
-      in-scope candidate when a fixture exists.
-- [ ] Show and Copy install guidance agree and target Cloudsmith for every
+      retained actions, and supersession settle within bounds.
+- [ ] Every registered resolver family reaches a terminal result and preserves
+      format-native identity and qualifiers.
+- [ ] Direct/Flat/Tree, filters, cancellation, rescan, coverage/enrichment, and
+      supersession do not publish stale or false-complete state.
+- [ ] Dependency, Compliance, Vulnerability, Quarantine, and detail surfaces
+      agree on canonical current truth.
+- [ ] Show/Copy install guidance agree and target Cloudsmith for every current
       supported format without secrets.
-- [ ] Upstream inventory and preview are truthful; optional metadata failure
-      does not hide primary package content.
-- [ ] Pull-through success is counted only after exact presence and refreshed
+- [ ] Every currently enabled Quarantine/Vulnerability rendered action reaches
+      its advertised final outcome; stale panel replacement is safe.
+- [ ] Upstream inventory/preview are truthful and supplementary failure does
+      not hide primary content.
+- [ ] Pull-through is successful only after exact target presence and refreshed
       Dependency Health coverage.
-- [ ] Promotion reaches preflight and stops before mutation unless a disposable
-      fixture is explicitly authorized.
-- [ ] Settings, Help, documentation navigation, keyboard operation, zoom,
-      focus, cancellation, and progress teardown are checked.
-- [ ] Visible enabled actions were enumerated and none silently no-op.
+- [ ] Promotion reaches preflight/cancel only; no final mutation occurs without
+      separate authorization.
+- [ ] Settings and Help render on required VS Code versions.
+- [ ] Keyboard, focus, cancel, zoom, labels, and progress teardown checked;
+      VoiceOver is `PARTIAL` when reliable speech evidence is unavailable.
 
-## Findings and review
+## Findings and independent review
 
-- [ ] First-pass findings were frozen before product fixes.
-- [ ] Every P0/P1/core P2 has escape analysis, red-before-green regression,
-      false-green or mutation proof, live verification, and fixed SHA.
-- [ ] Independent quality, Extension Host, provenance, async, identity,
-      security, UX/accessibility, and mutation reviewers completed review.
-- [ ] Blocking and in-scope Recommended review findings are resolved and
-      material corrections were re-reviewed.
-- [ ] Final full qualification was rerun from activation, not only failed rows.
+- [ ] Pending product set derived from the current ledger, not a historical
+      hard-coded list.
+- [ ] Finding counts reported separately by primary domain, severity,
+      deterministic state, and live state.
+- [ ] `releaseBlocking` re-derived from policy and matches every stored record.
+- [ ] New live escapes frozen before product edits and assigned stable QH IDs.
+- [ ] Every P0/P1/core P2 product fix has root-cause evidence, red-before-green,
+      escaped-boundary regression, mutation/false-green proof, and targeted live
+      re-verification.
+- [ ] Product truth, test effectiveness/mutation, async lifecycle, security,
+      and VS Code UI/accessibility reviewers completed independent review.
+- [ ] Blocking and in-scope Recommended findings resolved and material changes
+      re-reviewed.
 
-## Verdict
+## Final gate and verdict
 
-- [ ] No P0, P1, unresolved core P2, dead enabled action, false success/clean/
-      complete behavior, deterministic gate failure, or required evidence gap.
+- [ ] `npm run quality:release` completed against the final candidate; a history
+      or QH-010 blocker is reported as open rather than bypassed.
+- [ ] Final pushed-head CI and highest-risk live requalification completed before
+      a ready verdict.
+- [ ] No P0, P1 product, core P2 product, dead enabled action, false
+      success/clean/complete, required live failure, deterministic failure,
+      evidence-invalidating CI defect, or unresolved security blocker remains.
 - [ ] Verdict is exactly `TEAM-TEST READY`, `NOT TEAM-TEST READY`, or
       `TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS`.

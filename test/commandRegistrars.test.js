@@ -684,16 +684,13 @@ suite("Command registrars", () => {
     });
 
     await recorder.handlers.get("cloudsmith-vsc.openSettings")();
-    await recorder.handlers.get("cloudsmith-vscode-extension.cloudsmithDocs")();
-    await recorder.handlers.get("cloudsmith-vscode-extension.cloudsmithDocs")("gettingStarted");
+    const openDocumentation = recorder.handlers.get("cloudsmith-vscode-extension.cloudsmithDocs");
+    for (const link of HELP_LINKS) await openDocumentation(link.id);
     assert.deepStrictEqual(commands, [[
       "workbench.action.openSettings",
       "@ext:Cloudsmith.cloudsmith-vsc",
     ]]);
-    assert.deepStrictEqual(opened, [
-      HELP_LINKS.find(link => link.id === "extensionDocs").url,
-      HELP_LINKS.find(link => link.id === "gettingStarted").url,
-    ]);
+    assert.deepStrictEqual(opened, HELP_LINKS.map(link => link.url));
   });
 
   test("Help navigation reports refused and rejected external opens", async () => {

@@ -1,0 +1,27 @@
+---
+name: Set up pinned Gitleaks
+description: Install the reviewed Gitleaks release with an exact archive digest.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Gitleaks 8.30.1
+      shell: bash
+      run: |
+        set -euo pipefail
+        readonly version="8.30.1"
+        readonly archive="gitleaks_${version}_linux_x64.tar.gz"
+        readonly expected_sha256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        readonly download_path="${RUNNER_TEMP}/${archive}"
+        readonly install_dir="${RUNNER_TEMP}/cloudsmith-gitleaks-${version}"
+
+        curl --fail --location --silent --show-error \
+          "https://github.com/gitleaks/gitleaks/releases/download/v${version}/${archive}" \
+          --output "$download_path"
+        echo "${expected_sha256}  ${download_path}" | sha256sum --check --strict
+        mkdir --mode=0700 "$install_dir"
+        tar --extract --gzip --file "$download_path" --directory "$install_dir" gitleaks
+        chmod 0700 "$install_dir/gitleaks"
+        rm --force "$download_path"
+        echo "$install_dir" >> "$GITHUB_PATH"
+        [[ "$($install_dir/gitleaks version)" == "$version" ]]

@@ -39,6 +39,47 @@ const REQUIRED_FAILURE_CLASSES = [
   "documentation-drift",
 ];
 
+const EXPECTED_QUALITY_SCRIPT_ENTRYPOINTS = Object.freeze({
+  "audit:dev": "node scripts/release/verify-dependency-audit.js development",
+  "audit:runtime": "node scripts/release/verify-dependency-audit.js runtime",
+  build: "node scripts/verify-build.js",
+  check: "npm run lint && npm run syntax && npm run build"
+    + " && npm run verify:architecture && npm run verify:polish && npm run verify:version",
+  lint: "eslint . --max-warnings 0",
+  package: "node scripts/release/package-vsix.js",
+  "package:list":
+    "node scripts/release/verify-vsix.js --require-sidecars --current-source --list",
+  "package:verify": "node scripts/release/verify-vsix.js --require-sidecars --current-source",
+  pretest: "npm run lint",
+  "quality:fast": "node scripts/quality/gate.js fast",
+  "quality:full": "node scripts/quality/gate.js full",
+  "quality:qualification:launch": "node scripts/quality/prepare-qualification.js --launch",
+  "quality:qualification:prepare": "node scripts/quality/prepare-qualification.js",
+  "quality:qualification:prepare-authenticated-ci":
+    "node scripts/quality/authenticated-candidate-session.js prepare",
+  "quality:qualification:reset": "node scripts/quality/reset-qualification-profile.js",
+  "quality:release": "node scripts/quality/gate.js release",
+  "quality:secrets:artifacts": "node scripts/quality/secret-scan.js artifacts",
+  "quality:secrets:evidence": "node scripts/quality/secret-scan.js evidence",
+  "quality:secrets:history": "node scripts/quality/secret-scan.js history",
+  "quality:verify-authenticated-evidence":
+    "node scripts/quality/verify-authenticated-evidence.js",
+  "quality:verify-evidence": "node scripts/quality/verify-handoff.js",
+  "quality:verify-mutation-evidence": "node scripts/quality/verify-mutation-handoff.js",
+  test: "node scripts/run-tests.js",
+  "test:mutation:changed": "node scripts/quality/run-mutation.js changed",
+  "test:mutation:core": "node scripts/quality/run-mutation.js core",
+  "test:node": "node scripts/run-node-tests.js",
+  "test:ui:smoke": "node scripts/quality/run-ui-smoke.js",
+  "test:zero-guard": "node scripts/run-tests.js --zero-probe",
+  syntax: "node scripts/check-syntax.js",
+  "verify:architecture": "node scripts/architecture/verify.js",
+  "verify:polish": "node scripts/polish/verify.js",
+  "verify:quality": "node scripts/quality/verify.js",
+  "verify:version": "node scripts/release/verify-version.js",
+  "vscode:prepublish": "npm run check",
+});
+
 function verifyQualityContracts(options = {}) {
   const root = options.root || ROOT;
   const workflowsDocument = options.workflows || readJson("quality/critical-workflows.json", root);
@@ -105,31 +146,50 @@ function verifyEvidenceHandoffContract(
 ) {
   const verifierPath = "scripts/quality/verify-handoff.js";
   const mutationVerifierPath = "scripts/quality/verify-mutation-handoff.js";
+  const uiVerifierPath = "scripts/quality/verify-ui-evidence.js";
+  const authenticatedVerifierPath = "scripts/quality/verify-authenticated-evidence.js";
+  const authenticatedSessionPath = "scripts/quality/authenticated-candidate-session.js";
+  const processTreePath = "scripts/quality/process-tree.js";
+  const gitleaksActionPath = ".github/actions/setup-gitleaks/action.yml";
   const deepWorkflowPath = ".github/workflows/deep-quality.yml";
   const workflowPath = ".github/workflows/main.yml";
-  if (manifest?.scripts?.["quality:verify-evidence"]
-    !== "node scripts/quality/verify-handoff.js") {
-    errors.push("Package scripts must expose the exact quality evidence handoff verifier.");
-  }
-  if (manifest?.scripts?.["quality:verify-mutation-evidence"]
-    !== "node scripts/quality/verify-mutation-handoff.js") {
-    errors.push("Package scripts must expose the exact mutation evidence handoff verifier.");
-  }
+  verifyQualityManifestEntrypoints(manifest, errors);
   let deepWorkflowTarget;
+  let gitleaksActionTarget;
   let workflowTarget;
   try {
     resolveGitVisibleRegularFile(verifierPath, repositoryFiles, root);
     resolveGitVisibleRegularFile(mutationVerifierPath, repositoryFiles, root);
+    resolveGitVisibleRegularFile(uiVerifierPath, repositoryFiles, root);
+    resolveGitVisibleRegularFile(authenticatedVerifierPath, repositoryFiles, root);
+    resolveGitVisibleRegularFile(authenticatedSessionPath, repositoryFiles, root);
+    resolveGitVisibleRegularFile(processTreePath, repositoryFiles, root);
+    gitleaksActionTarget = resolveGitVisibleRegularFile(
+      gitleaksActionPath,
+      repositoryFiles,
+      root
+    );
     deepWorkflowTarget = resolveGitVisibleRegularFile(deepWorkflowPath, repositoryFiles, root);
     workflowTarget = resolveGitVisibleRegularFile(workflowPath, repositoryFiles, root);
   } catch {
-    errors.push("Quality evidence handoff source and CI workflow must be Git-visible regular files.");
+    errors.push(
+      "Quality evidence handoff, pinned scanner setup, and CI workflow sources must be Git-visible regular files."
+    );
     return;
   }
+  const gitleaksAction = verifiedSource(
+    gitleaksActionPath,
+    gitleaksActionTarget,
+    sourceOverrides
+  );
   const deepWorkflow = verifiedSource(deepWorkflowPath, deepWorkflowTarget, sourceOverrides);
   const workflow = verifiedSource(workflowPath, workflowTarget, sourceOverrides);
+  const gitleaksActionDocument = parseCiWorkflow(gitleaksAction);
   const workflowDocument = parseCiWorkflow(workflow);
   const deepWorkflowDocument = parseCiWorkflow(deepWorkflow);
+  if (!isDeepStrictEqual(gitleaksActionDocument, expectedPinnedGitleaksAction())) {
+    errors.push("CI secret scanning must use the exact reviewed Gitleaks release and archive digest.");
+  }
   if (!validMainWorkflowEnvelope(workflowDocument)
     || !isDeepStrictEqual(workflowDocument?.jobs?.quality, expectedQualityJob())) {
     errors.push(
@@ -149,18 +209,67 @@ function verifyEvidenceHandoffContract(
       "CI must verify the exact changed-mutation evidence immediately before a verifier-gated upload."
     );
   }
+  if (!validMainWorkflowEnvelope(workflowDocument)
+    || !isDeepStrictEqual(
+      workflowDocument?.jobs?.["extension-tests"],
+      expectedExtensionTestsJob()
+    )) {
+    errors.push("CI must execute the exact extension-test matrix and zero-test guard.");
+  }
+  if (!validMainWorkflowEnvelope(workflowDocument)
+    || !isDeepStrictEqual(workflowDocument?.jobs?.package, expectedPackageJob())) {
+    errors.push("CI must build, verify, scan, and upload the exact reproducible VSIX inputs.");
+  }
+  if (!validMainWorkflowEnvelope(workflowDocument)
+    || !isDeepStrictEqual(
+      workflowDocument?.jobs?.["build-candidate"],
+      expectedBuildCandidateJob()
+    )) {
+    errors.push("CI build-candidate must require every deterministic input to succeed.");
+  }
   if (!validDeepWorkflowEnvelope(deepWorkflowDocument)
     || !isDeepStrictEqual(
       deepWorkflowDocument?.jobs?.["core-mutation"],
       expectedCoreMutationJob()
     )
     || !validArtifactUploadInventory(deepWorkflowDocument, {
-      "core-mutation": 1,
-      "black-box-ui-boundary": 1,
+      "core-mutation": 2,
     })) {
     errors.push(
       "Deep CI must verify exact core-mutation evidence before a verifier-gated upload."
     );
+  }
+  if (!validDeepWorkflowEnvelope(deepWorkflowDocument)
+    || !isDeepStrictEqual(
+      deepWorkflowDocument?.jobs?.["signed-out-black-box-ui"],
+      expectedSignedOutUiJob()
+    )
+    || !validArtifactUploadInventory(deepWorkflowDocument, {
+      "signed-out-black-box-ui": 1,
+    })) {
+    errors.push(
+      "Deep CI must bind and secret-scan signed-out packaged UI evidence before upload."
+    );
+  }
+  if (!validDeepWorkflowEnvelope(deepWorkflowDocument)
+    || !isDeepStrictEqual(
+      deepWorkflowDocument?.jobs?.["authenticated-production-ui"],
+      expectedAuthenticatedUiJob()
+    )
+    || !validArtifactUploadInventory(deepWorkflowDocument, {
+      "authenticated-production-ui": 1,
+    })) {
+    errors.push(
+      "Deep CI must verify production authenticated UI through the value-blind bootstrap boundary."
+    );
+  }
+}
+
+function verifyQualityManifestEntrypoints(manifest, errors) {
+  for (const [name, expected] of Object.entries(EXPECTED_QUALITY_SCRIPT_ENTRYPOINTS)) {
+    if (manifest?.scripts?.[name] !== expected) {
+      errors.push(`Package script ${name} must expose its exact reviewed quality entrypoint.`);
+    }
   }
 }
 
@@ -203,8 +312,9 @@ function validDeepWorkflowEnvelope(document) {
     && isDeepStrictEqual(document.permissions, { contents: "read" })
     && isDeepStrictEqual(document.env, { NODE_VERSION: "22.23.2" })
     && isDeepStrictEqual(Object.keys(document.jobs || {}).sort(), [
-      "black-box-ui-boundary",
+      "authenticated-production-ui",
       "core-mutation",
+      "signed-out-black-box-ui",
     ]);
 }
 
@@ -218,6 +328,10 @@ function expectedQualityJob() {
       setupNodeStep(),
       installStep(),
       {
+        name: "Set up the pinned secret scanner",
+        uses: "./.github/actions/setup-gitleaks",
+      },
+      {
         name: "Log toolchain",
         run: "node -e \"console.log({node:process.version,npm:process.env.npm_config_user_agent,platform:process.platform,arch:process.arch})\"",
       },
@@ -230,6 +344,12 @@ function expectedQualityJob() {
         run: "npm run quality:fast",
       },
       {
+        name: "Scan upload-eligible quality evidence",
+        id: "quality_evidence_secret_scan",
+        if: "${{ always() }}",
+        run: "npm run quality:secrets:evidence",
+      },
+      {
         name: "Verify exact quality evidence handoff",
         id: "quality_evidence_handoff",
         if: "${{ always() }}",
@@ -237,11 +357,11 @@ function expectedQualityJob() {
       },
       {
         name: "Upload quality impact and report evidence",
-        if: "${{ always() && steps.quality_evidence_handoff.outcome == 'success' }}",
+        if: "${{ always() && steps.quality_evidence_handoff.outcome == 'success' && steps.quality_evidence_secret_scan.outcome == 'success' }}",
         uses: UPLOAD_ACTION,
         with: {
           name: "quality-evidence-${{ github.sha }}-${{ github.run_attempt }}",
-          path: ".quality/impact.json\n.quality/gates/fast.json\n.quality/gates/fast/*.json\n.quality/report.json\n.quality/report.md\n",
+          path: ".quality/impact.json\n.quality/gates/fast.json\n.quality/gates/fast/*.json\n.quality/report.json\n.quality/report.md\n.quality/secrets/current.json\n.quality/secrets/evidence.json\n",
           "if-no-files-found": "error",
           "include-hidden-files": true,
           "retention-days": 30,
@@ -294,11 +414,119 @@ function expectedChangedMutationJob() {
   };
 }
 
+function expectedExtensionTestsJob() {
+  return {
+    name: "Extension tests (${{ matrix.os }}, VS Code ${{ matrix.vscode }}, ${{ matrix.label }})",
+    "runs-on": "${{ matrix.os }}",
+    "timeout-minutes": 20,
+    strategy: {
+      "fail-fast": false,
+      matrix: {
+        include: [
+          { os: "ubuntu-24.04", vscode: "1.99.0", label: "core" },
+          { os: "ubuntu-24.04", vscode: "1.99.0", label: "smoke" },
+          { os: "ubuntu-24.04", vscode: "1.134.0", label: "core" },
+          { os: "windows-2025", vscode: "1.134.0", label: "smoke" },
+          { os: "macos-15", vscode: "1.134.0", label: "smoke" },
+        ],
+      },
+    },
+    env: {
+      VSCODE_TEST_VERSION: "${{ matrix.vscode }}",
+      VSCODE_TEST_LABEL: "${{ matrix.label }}",
+    },
+    steps: [
+      checkoutStep("Checkout exact source", false),
+      setupNodeStep(),
+      installStep(),
+      {
+        name: "Log test runtime",
+        run: "node -e \"console.log({node:process.version,platform:process.platform,arch:process.arch,vscode:process.env.VSCODE_TEST_VERSION,label:process.env.VSCODE_TEST_LABEL})\"",
+      },
+      { name: "Run deterministic extension suite", run: "npm test" },
+      {
+        name: "Prove the real test entrypoint rejects zero tests",
+        run: "npm run test:zero-guard",
+      },
+    ],
+  };
+}
+
+function expectedPackageJob() {
+  return {
+    name: "Reproducible VSIX",
+    needs: ["quality", "mutation", "extension-tests"],
+    "runs-on": "ubuntu-24.04",
+    "timeout-minutes": 20,
+    steps: [
+      checkoutStep("Checkout exact source in a fresh job", false),
+      setupNodeStep(),
+      installStep(),
+      {
+        name: "Set up the pinned secret scanner",
+        uses: "./.github/actions/setup-gitleaks",
+      },
+      {
+        name: "Build and verify byte-reproducible VSIX twice",
+        id: "package",
+        env: {
+          M9_REQUIRE_CLEAN: 1,
+          M9_SOURCE_SHA: "${{ github.sha }}",
+        },
+        run: "npm run package -- --github-output \"$GITHUB_OUTPUT\"",
+      },
+      {
+        name: "Re-verify artifact and sidecars before handoff",
+        env: {
+          EXPECTED_SOURCE_SHA: "${{ github.sha }}",
+          VSIX_PATH: "${{ steps.package.outputs.vsix_path }}",
+        },
+        run: "npm run package:verify -- --expected-source-sha \"$EXPECTED_SOURCE_SHA\" --require-publishable \"$VSIX_PATH\"",
+      },
+      {
+        name: "Scan archive bytes and expanded VSIX contents",
+        run: "npm run quality:secrets:artifacts",
+      },
+      {
+        name: "Upload exact verified release inputs",
+        uses: UPLOAD_ACTION,
+        with: {
+          name: "vsix-${{ github.sha }}",
+          path: "${{ steps.package.outputs.vsix_path }}\n${{ steps.package.outputs.checksum_path }}\n${{ steps.package.outputs.provenance_path }}\n.quality/secrets/artifacts.json\n",
+          "if-no-files-found": "error",
+          "retention-days": 90,
+          "compression-level": 0,
+        },
+      },
+    ],
+  };
+}
+
+function expectedBuildCandidateJob() {
+  return {
+    name: "Deterministic build candidate",
+    needs: ["quality", "mutation", "extension-tests", "package"],
+    if: "${{ always() }}",
+    "runs-on": "ubuntu-24.04",
+    "timeout-minutes": 5,
+    steps: [{
+      name: "Require every deterministic candidate input to succeed",
+      env: {
+        QUALITY_RESULT: "${{ needs.quality.result }}",
+        MUTATION_RESULT: "${{ needs.mutation.result }}",
+        TEST_RESULT: "${{ needs.extension-tests.result }}",
+        PACKAGE_RESULT: "${{ needs.package.result }}",
+      },
+      run: "if [[ \"$QUALITY_RESULT\" != \"success\" || \"$MUTATION_RESULT\" != \"success\" || \"$TEST_RESULT\" != \"success\" || \"$PACKAGE_RESULT\" != \"success\" ]]; then\n  echo \"A deterministic build-candidate input failed, was canceled, or was skipped.\"\n  exit 1\nfi\necho \"Every deterministic build-candidate input succeeded; production release readiness remains blocked pending separately sourced UI and live qualification.\"\n",
+    }],
+  };
+}
+
 function expectedCoreMutationJob() {
   return {
     name: "Core mutation",
     "runs-on": "ubuntu-24.04",
-    "timeout-minutes": 45,
+    "timeout-minutes": 60,
     steps: [
       checkoutStep("Checkout exact source", true),
       setupNodeStep(),
@@ -332,7 +560,173 @@ function expectedCoreMutationJob() {
           "retention-days": 30,
         },
       },
+      {
+        name: "Set up the pinned secret scanner after mutation evidence",
+        if: "${{ always() }}",
+        uses: "./.github/actions/setup-gitleaks",
+      },
+      {
+        name: "Scan complete Git history without suppressing mutation work",
+        id: "history_secret_scan",
+        if: "${{ always() }}",
+        run: "npm run quality:secrets:history",
+      },
+      {
+        name: "Upload only the value-blind history receipt",
+        if: "${{ always() }}",
+        uses: UPLOAD_ACTION,
+        with: {
+          name: "history-secret-receipt-${{ github.sha }}-${{ github.run_attempt }}",
+          path: ".quality/secrets/history.json",
+          "if-no-files-found": "error",
+          "include-hidden-files": true,
+          "retention-days": 30,
+        },
+      },
     ],
+  };
+}
+
+function expectedSignedOutUiJob() {
+  return {
+    name: "Signed-out packaged black-box UI",
+    "runs-on": "ubuntu-24.04",
+    "timeout-minutes": 30,
+    steps: [
+      checkoutStep("Checkout exact source", true),
+      setupNodeStep(),
+      installStep(),
+      {
+        name: "Set up the pinned secret scanner",
+        uses: "./.github/actions/setup-gitleaks",
+      },
+      {
+        name: "Run signed-out packaged black-box UI",
+        id: "ui_smoke",
+        run: "xvfb-run -a npm run test:ui:smoke",
+      },
+      {
+        name: "Verify exact candidate and UI result binding",
+        id: "ui_evidence_handoff",
+        if: "${{ always() }}",
+        run: "node scripts/quality/verify-ui-evidence.js",
+      },
+      {
+        name: "Scan upload-eligible signed-out UI evidence",
+        id: "ui_evidence_secret_scan",
+        if: "${{ always() }}",
+        run: "npm run quality:secrets:evidence",
+      },
+      {
+        name: "Upload safe signed-out UI receipts",
+        if: "${{ always() && steps.ui_evidence_handoff.outcome == 'success' && steps.ui_evidence_secret_scan.outcome == 'success' }}",
+        uses: UPLOAD_ACTION,
+        with: {
+          name: "signed-out-ui-evidence-${{ github.sha }}-${{ github.run_attempt }}",
+          path: ".quality/qualification/candidate.json\n.quality/ui/result.json\n.quality/secrets/evidence.json\n",
+          "if-no-files-found": "error",
+          "include-hidden-files": true,
+          "retention-days": 30,
+        },
+      },
+    ],
+  };
+}
+
+function expectedAuthenticatedUiJob() {
+  return {
+    name: "Authenticated packaged production UI",
+    "runs-on": "ubuntu-24.04",
+    environment: "cloudsmith-release-qualification",
+    "timeout-minutes": 45,
+    steps: [
+      checkoutStep("Checkout exact source", true),
+      setupNodeStep(),
+      installStep(),
+      {
+        name: "Set up the pinned secret scanner",
+        uses: "./.github/actions/setup-gitleaks",
+      },
+      {
+        name: "Prepare and validate exact authenticated candidate without credentials",
+        run: "npm run quality:qualification:prepare-authenticated-ci",
+      },
+      {
+        name: "Run authenticated packaged production UI",
+        id: "authenticated_qualification",
+        "timeout-minutes": 15,
+        env: {
+          CLOUDSMITH_QUALIFICATION_API_KEY:
+            "${{ secrets.CLOUDSMITH_QUALIFICATION_API_KEY }}",
+        },
+        run: "xvfb-run -a node scripts/quality/run-authenticated-ci.js",
+      },
+      {
+        name: "Always clean the authenticated profile session",
+        id: "authenticated_profile_cleanup",
+        if: "${{ always() }}",
+        run: "node scripts/quality/authenticated-candidate-session.js cleanup",
+      },
+      {
+        name: "Verify exact authenticated evidence binding",
+        id: "authenticated_evidence_handoff",
+        if: "${{ always() }}",
+        env: { EXPECTED_SOURCE_SHA: "${{ github.sha }}" },
+        run: "npm run quality:verify-authenticated-evidence",
+      },
+      {
+        name: "Scan upload-eligible authenticated evidence",
+        id: "authenticated_evidence_secret_scan",
+        if: "${{ always() }}",
+        run: "npm run quality:secrets:evidence",
+      },
+      {
+        name: "Upload safe authenticated UI receipts",
+        if: "${{ always() && steps.authenticated_evidence_handoff.outcome == 'success' && steps.authenticated_evidence_secret_scan.outcome == 'success' }}",
+        uses: UPLOAD_ACTION,
+        with: {
+          name: "authenticated-ui-evidence-${{ github.sha }}-${{ github.run_attempt }}",
+          path: ".quality/qualification/authenticated-candidate.json\n.quality/qualification/authenticated-candidate.vsix\n.quality/qualification/authenticated-ci.json\n.quality/secrets/authenticated-ci.json\n.quality/secrets/evidence.json\n",
+          "if-no-files-found": "error",
+          "include-hidden-files": true,
+          "retention-days": 30,
+        },
+      },
+    ],
+  };
+}
+
+function expectedPinnedGitleaksAction() {
+  return {
+    name: "Set up pinned Gitleaks",
+    description: "Install the reviewed Gitleaks release with an exact archive digest.",
+    runs: {
+      using: "composite",
+      steps: [{
+        name: "Install Gitleaks 8.30.1",
+        shell: "bash",
+        run: [
+          "set -euo pipefail",
+          "readonly version=\"8.30.1\"",
+          "readonly archive=\"gitleaks_${version}_linux_x64.tar.gz\"",
+          "readonly expected_sha256=\"551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb\"",
+          "readonly download_path=\"${RUNNER_TEMP}/${archive}\"",
+          "readonly install_dir=\"${RUNNER_TEMP}/cloudsmith-gitleaks-${version}\"",
+          "",
+          "curl --fail --location --silent --show-error \\",
+          "  \"https://github.com/gitleaks/gitleaks/releases/download/v${version}/${archive}\" \\",
+          "  --output \"$download_path\"",
+          "echo \"${expected_sha256}  ${download_path}\" | sha256sum --check --strict",
+          "mkdir --mode=0700 \"$install_dir\"",
+          "tar --extract --gzip --file \"$download_path\" --directory \"$install_dir\" gitleaks",
+          "chmod 0700 \"$install_dir/gitleaks\"",
+          "rm --force \"$download_path\"",
+          "echo \"$install_dir\" >> \"$GITHUB_PATH\"",
+          "[[ \"$($install_dir/gitleaks version)\" == \"$version\" ]]",
+          "",
+        ].join("\n"),
+      }],
+    },
   };
 }
 
@@ -396,6 +790,37 @@ function verifyTaxonomy(taxonomy, findingSchema, errors) {
   }
   if (findingSchema.additionalProperties !== false) {
     errors.push("Finding schema must reject unknown fields.");
+  }
+  const enumParity = [
+    ["domain", Object.keys(taxonomy.domains || {}), findingSchema.properties?.domain?.enum],
+    ["status", taxonomy.statuses, findingSchema.properties?.status?.enum],
+    ["deterministicStatus", taxonomy.deterministicStatuses,
+      findingSchema.properties?.deterministicStatus?.enum],
+    ["liveStatus", taxonomy.liveStatuses, findingSchema.properties?.liveStatus?.enum],
+    ["severity", Object.keys(taxonomy.severities || {}),
+      findingSchema.properties?.severity?.enum],
+    ["failureClasses", taxonomy.failureClasses,
+      findingSchema.properties?.failureClasses?.items?.enum],
+    ["reproductionConfidence", taxonomy.reproductionConfidences,
+      findingSchema.properties?.reproductionConfidence?.enum],
+    ["rootCauseStatus", taxonomy.rootCauseStatuses,
+      findingSchema.properties?.rootCauseStatus?.enum],
+    ["testLayerThatShouldHaveCaughtIt", taxonomy.testLayers,
+      findingSchema.properties?.testLayerThatShouldHaveCaughtIt?.enum],
+    ["mutationProof.status", taxonomy.mutationProofStatuses,
+      findingSchema.properties?.mutationProof?.properties?.status?.enum],
+  ];
+  for (const [label, taxonomyValues, schemaValues] of enumParity) {
+    if (JSON.stringify(uniqueSorted(taxonomyValues || []))
+      !== JSON.stringify(uniqueSorted(schemaValues || []))) {
+      errors.push(`Finding schema ${label} values do not match the defect taxonomy.`);
+    }
+  }
+  if (findingSchema.properties?.id?.pattern !== taxonomy.idPattern) {
+    errors.push("Finding schema ID pattern does not match the defect taxonomy.");
+  }
+  if (findingSchema.properties?.releaseBlocking?.type !== "boolean") {
+    errors.push("Finding schema releaseBlocking must be a boolean policy assertion.");
   }
 }
 
@@ -463,6 +888,15 @@ function verifyWorkflows(
       if (requiredLayer === "live-protocol" && workflow?.liveFixture?.required !== true) {
         errors.push(`Workflow ${label} requires live-protocol evidence but has no required live fixture.`);
       }
+    }
+    if (!isPlainObject(workflow?.liveFixture)
+      || workflow.liveFixture.required !== true
+      || !requireNonEmptyString(workflow.liveFixture.kind)
+      || !requireNonEmptyString(workflow.liveFixture.description)
+      || workflow.liveFixture.destructive !== false) {
+      errors.push(
+        `Workflow ${label} must declare a required, non-destructive authenticated live fixture.`
+      );
     }
     for (const item of evidence) {
       verifyInteractionClassification(
@@ -540,8 +974,12 @@ function verifyInteractionClassification(
   if (mode === "rendered-dom-activation" && evidence?.layer !== "black-box-ui") {
     errors.push(`Workflow ${workflowId} rendered DOM activation evidence must be classified as black-box-ui.`);
   }
-  if (evidence?.layer === "black-box-ui" && mode !== "rendered-dom-activation") {
-    errors.push(`Workflow ${workflowId} black-box-ui evidence must prove rendered DOM activation.`);
+  if (mode === "rendered-keyboard-navigation" && evidence?.layer !== "black-box-ui") {
+    errors.push(`Workflow ${workflowId} rendered keyboard navigation evidence must be classified as black-box-ui.`);
+  }
+  if (evidence?.layer === "black-box-ui"
+    && !new Set(["rendered-dom-activation", "rendered-keyboard-navigation"]).has(mode)) {
+    errors.push(`Workflow ${workflowId} black-box-ui evidence must prove a rendered interaction.`);
   }
   if (evidence?.testFile === "test/webviewPackageActionFlow.test.js"
     && (mode !== "synthetic-host-message" || evidence?.layer !== "extension-host")) {

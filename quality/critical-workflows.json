@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "criticalityValues": ["release-critical", "high", "standard"],
   "layerValues": ["unit", "contract", "extension-host", "live-protocol", "black-box-ui"],
-  "proofValues": ["auth-capability", "authoritative-outcome", "boundedness", "canonical-identity", "canonical-query", "cross-surface-parity", "documentation", "false-clean-prevention", "format-matrix", "format-native-semantics", "freshness", "manifest-parity", "negative-path", "pagination", "producer-consumer", "provenance", "publication-order", "security-boundary", "stale-state", "state-transition", "terminal-state", "validation", "visible-publication"],
-  "interactionModeValues": ["synthetic-host-message", "rendered-dom-activation"],
+  "proofValues": ["auth-capability", "authoritative-outcome", "boundedness", "canonical-identity", "canonical-query", "cross-surface-parity", "documentation", "false-clean-prevention", "format-matrix", "format-native-semantics", "freshness", "keyboard-focus", "manifest-parity", "negative-path", "pagination", "producer-consumer", "provenance", "publication-order", "security-boundary", "stale-state", "state-transition", "terminal-state", "validation", "visible-publication"],
+  "interactionModeValues": ["synthetic-host-message", "rendered-dom-activation", "rendered-keyboard-navigation"],
   "extensionHostExecutionModeValues": ["manual-production-composition"],
   "productionFileRoots": ["extension.js", "package.json", "commands", "domain", "models", "util", "views"],
   "workflows": [
@@ -22,7 +22,7 @@
       ],
       "productionAreas": ["extension.js", "package.json", "util/activationOwner.js", "util/accountLifecycle.js", "views/cloudsmithProvider.js"],
       "targetCommands": ["npm run test:vscode", "npm run test:ui:smoke"],
-      "liveFixture": { "required": true, "kind": "existing-authenticated-profile", "description": "Existing authorized Extension Development Host profile; three reloads; never read SecretStorage.", "destructive": false },
+      "liveFixture": { "required": true, "kind": "dedicated-authenticated-profile", "description": "Reusable dedicated qualification profile authenticated through the extension's normal SecretStorage path; the operator establishes or reuses the session, the harness never reads credential storage or values, and the candidate survives three reloads.", "destructive": false },
       "destructive": false
     },
     {
@@ -40,7 +40,7 @@
       ],
       "productionAreas": ["commands/authentication.js", "commands/dependencyHealth.js", "domain/authCapabilities.js", "models/connectionStatusNode.js", "util/connectionManager.js", "util/connectionPresentation.js", "util/credentialEnvelope.js", "util/ssoAuthManager.js", "package.json"],
       "targetCommands": ["npm run test:node", "npm run test:vscode"],
-      "liveFixture": { "required": true, "kind": "existing-authenticated-profile", "description": "Existing API-key session; SSO only when already authenticated. Do not open credential stores or login UI during automated qualification.", "destructive": false },
+      "liveFixture": { "required": true, "kind": "dedicated-authenticated-profile", "description": "Reusable dedicated qualification profile authenticated only through the extension's normal SecretStorage path; credential entry and session establishment remain an operator boundary, and the harness never reads credential storage or values.", "destructive": false },
       "destructive": false
     },
     {
@@ -429,7 +429,7 @@
       ],
       "productionAreas": ["commands/settingsHelp.js", "package.json", "extension.js", "util/contextKeyProjector.js", "README.md"],
       "targetCommands": ["npm run test:vscode", "npm run test:ui:smoke"],
-      "liveFixture": { "required": true, "kind": "local-ui", "description": "Current Extension Development Host settings editor; no secret values opened.", "destructive": false },
+      "liveFixture": { "required": true, "kind": "local-ui", "description": "Packaged candidate in the dedicated qualification profile; open the settings editor without opening credential storage or exposing values.", "destructive": false },
       "destructive": false,
       "actionContractIds": ["ACT-SETTINGS-OPEN"]
     },
@@ -442,9 +442,10 @@
       "requiredLayers": ["contract", "extension-host", "black-box-ui", "live-protocol"],
       "testFiles": ["test/commandRegistrars.test.js", "test/polishGate.test.js", "ui-test/smoke.test.js"],
       "evidence": [
-        { "layer": "extension-host", "testFile": "test/commandRegistrars.test.js", "testNames": ["settings/help callbacks invoke only their injected platform services"], "proves": ["producer-consumer"] },
+        { "layer": "extension-host", "testFile": "test/commandRegistrars.test.js", "testNames": ["settings/help callbacks invoke only their injected platform services"], "proves": ["producer-consumer", "authoritative-outcome"] },
         { "layer": "contract", "testFile": "test/polishGate.test.js", "testNames": ["production repository satisfies the closed documentation and media contract"], "proves": ["documentation", "manifest-parity"] },
-        { "layer": "black-box-ui", "interactionMode": "rendered-dom-activation", "testFile": "ui-test/smoke.test.js", "testNames": ["opens every extension-owned view without a blank container", "lists release-critical commands in the real Command Palette"], "proves": ["authoritative-outcome", "visible-publication"] }
+        { "layer": "black-box-ui", "interactionMode": "rendered-dom-activation", "testFile": "ui-test/smoke.test.js", "testNames": ["opens every extension-owned view without a blank container", "publishes the exact signed-out command set in the real Command Palette"], "proves": ["visible-publication"] },
+        { "layer": "black-box-ui", "interactionMode": "rendered-keyboard-navigation", "testFile": "ui-test/smoke.test.js", "testNames": ["moves keyboard focus through the rendered Help tree"], "proves": ["keyboard-focus"] }
       ],
       "productionAreas": ["views/helpProvider.js", "models/helpNode.js", "commands/settingsHelp.js", "util/helpLinks.js", "util/externalNavigation.js", "package.json", "README.md"],
       "targetCommands": ["npm run test:vscode", "npm run test:ui:smoke"],
