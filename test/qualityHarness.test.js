@@ -41,7 +41,6 @@ const { aggregateStatuses, fingerprint, sourceIdentity } = require("../scripts/q
 const {
   CREDENTIAL_LIKE_ENVIRONMENT_NAME,
   NON_AUTH_AMBIENT_CAPABILITY_NAMES,
-  NON_AUTH_BOUNDARY_PREFIX,
   NON_AUTH_QUALITY_ENVIRONMENT_ALLOWLIST,
   NON_AUTH_QUALITY_OVERRIDE_NAMES,
   assertActiveNonAuthQualityBoundary,
@@ -1614,33 +1613,6 @@ suite("Quality change-impact analyzer", () => {
 });
 
 suite("Quality gate runner", () => {
-  test("default non-auth temp boundaries preserve the macOS IPC socket budget", () => {
-    const boundary = createNonAuthQualityEnvironment({
-      environment: { PATH: process.env.PATH || "/usr/bin:/bin" },
-    });
-    try {
-      const expectedParent = fs.realpathSync(
-        process.platform === "darwin" ? "/tmp" : os.tmpdir()
-      );
-      assert.strictEqual(path.dirname(boundary.root), expectedParent);
-      assert.strictEqual(
-        boundary.paths.temporary.startsWith(`${boundary.root}${path.sep}`),
-        true
-      );
-      if (process.platform === "darwin") {
-        const socketPath = path.join(
-          boundary.paths.temporary,
-          "csv-s-xxxxxx",
-          "user-data",
-          "1.13-main.sock",
-        );
-        assert.ok(Buffer.byteLength(socketPath, "utf8") <= 103);
-      }
-    } finally {
-      cleanupNonAuthQualityEnvironment(boundary);
-    }
-  });
-
   test("non-auth process environment uses a credential-free closed allowlist", () => {
     assert.strictEqual(
       [...NON_AUTH_QUALITY_ENVIRONMENT_ALLOWLIST, ...NON_AUTH_QUALITY_OVERRIDE_NAMES]
@@ -3637,11 +3609,38 @@ suite("Quality gate runner", () => {
         assert.strictEqual(JSON.stringify(receipt).includes(syntheticEnvironment[name]), false);
       }
       assert.strictEqual(
-        fs.readdirSync(temporaryRoot).some(name => name.startsWith(NON_AUTH_BOUNDARY_PREFIX)),
+        fs.readdirSync(temporaryRoot).some(name => name.startsWith("cloudsmith-non-auth-")),
         false
       );
     } finally {
       fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("default non-auth temp boundaries preserve the macOS IPC socket budget", () => {
+    const boundary = createNonAuthQualityEnvironment({
+      environment: { PATH: process.env.PATH || "/usr/bin:/bin" },
+    });
+    try {
+      const expectedParent = fs.realpathSync(
+        process.platform === "darwin" ? "/tmp" : os.tmpdir()
+      );
+      assert.strictEqual(path.dirname(boundary.root), expectedParent);
+      assert.strictEqual(
+        boundary.paths.temporary.startsWith(`${boundary.root}${path.sep}`),
+        true
+      );
+      if (process.platform === "darwin") {
+        const socketPath = path.join(
+          boundary.paths.temporary,
+          "csv-s-xxxxxx",
+          "user-data",
+          "1.13-main.sock",
+        );
+        assert.ok(Buffer.byteLength(socketPath, "utf8") <= 103);
+      }
+    } finally {
+      cleanupNonAuthQualityEnvironment(boundary);
     }
   });
 
