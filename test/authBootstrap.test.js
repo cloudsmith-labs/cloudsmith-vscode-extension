@@ -7,6 +7,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const yaml = require("js-yaml");
+const { withExpectedCleanupTaint } = require("./helpers/expectedCleanupTaint");
 const { writeJson } = require("../scripts/quality/common");
 const { fingerprint } = require("../scripts/quality/evidence");
 const { isApprovedSourcePath } = require("../scripts/release/verify-vsix");
@@ -783,10 +784,12 @@ suite("authenticated CI SecretStorage bootstrap", () => {
         }
         return originalRmdir.call(fs, target, options);
       };
-      assert.throws(
-        () => destroyRuntimeLogRoot(logRoot),
-        /unsafe or changed tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => destroyRuntimeLogRoot(logRoot),
+          /unsafe or changed tree/u,
+        );
+      });
     } finally {
       fs.rmdirSync = originalRmdir;
     }
@@ -2025,10 +2028,12 @@ suite("authenticated CI SecretStorage bootstrap", () => {
         }
         return originalRmdir.call(fs, target, options);
       };
-      assert.throws(
-        () => cleanupPreparedAuthenticatedCandidate(repositoryRoot, { environment }),
-        /unsafe or changed tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => cleanupPreparedAuthenticatedCandidate(repositoryRoot, { environment }),
+          /unsafe or changed tree/u,
+        );
+      });
     } finally {
       fs.rmdirSync = originalRmdir;
     }

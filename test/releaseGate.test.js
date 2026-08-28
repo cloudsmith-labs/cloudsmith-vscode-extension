@@ -5,6 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const { withExpectedCleanupTaint } = require("./helpers/expectedCleanupTaint");
 const { applyAuditPolicy } = require("../scripts/release/verify-dependency-audit");
 const {
   assertCanonicalNpmRuntime,
@@ -785,17 +786,19 @@ suite("M9 release gate helpers", () => {
       fs.mkdirSync(victim);
       fs.writeFileSync(path.join(victim, "preserve.txt"), "unrelated bytes survive\n");
       let launcherDirectory;
-      assert.throws(() => withCanonicalNpmLauncher({
-        nodeExecutable: fixture.nodeExecutable,
-        npm,
-        platform: fixture.platform,
-        temporaryParent: fixtureRoot,
-      }, launcher => {
-        launcherDirectory = launcher.directory;
-        const snapshotLib = path.join(launcher.directory, "npm-runtime", "lib");
-        fs.renameSync(snapshotLib, `${snapshotLib}-owned`);
-        fs.renameSync(victim, snapshotLib);
-      }), /Canonical npm launcher is unsafe or invalid/u);
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => withCanonicalNpmLauncher({
+          nodeExecutable: fixture.nodeExecutable,
+          npm,
+          platform: fixture.platform,
+          temporaryParent: fixtureRoot,
+        }, launcher => {
+          launcherDirectory = launcher.directory;
+          const snapshotLib = path.join(launcher.directory, "npm-runtime", "lib");
+          fs.renameSync(snapshotLib, `${snapshotLib}-owned`);
+          fs.renameSync(victim, snapshotLib);
+        }), /Canonical npm launcher is unsafe or invalid/u);
+      });
       assert.strictEqual(
         fs.readFileSync(
           path.join(launcherDirectory, "npm-runtime", "lib", "preserve.txt"),
@@ -819,21 +822,25 @@ suite("M9 release gate helpers", () => {
       fs.mkdirSync(victim);
       fs.writeFileSync(path.join(victim, "preserve.txt"), "outer unrelated bytes survive\n");
       let launcherName;
-      assert.throws(() => withCanonicalNpmLauncher({
-        nodeExecutable: fixture.nodeExecutable,
-        npm,
-        platform: fixture.platform,
-        temporaryParent: boundary.paths.temporary,
-      }, launcher => {
-        launcherName = path.basename(launcher.directory);
-        const snapshotLib = path.join(launcher.directory, "npm-runtime", "lib");
-        fs.renameSync(snapshotLib, `${snapshotLib}-owned`);
-        fs.renameSync(victim, snapshotLib);
-      }), /Canonical npm launcher is unsafe or invalid/u);
-      assert.throws(
-        () => cleanupNonAuthQualityEnvironment(boundary),
-        /preserved an unsafe or changed tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => withCanonicalNpmLauncher({
+          nodeExecutable: fixture.nodeExecutable,
+          npm,
+          platform: fixture.platform,
+          temporaryParent: boundary.paths.temporary,
+        }, launcher => {
+          launcherName = path.basename(launcher.directory);
+          const snapshotLib = path.join(launcher.directory, "npm-runtime", "lib");
+          fs.renameSync(snapshotLib, `${snapshotLib}-owned`);
+          fs.renameSync(victim, snapshotLib);
+        }), /Canonical npm launcher is unsafe or invalid/u);
+      });
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => cleanupNonAuthQualityEnvironment(boundary),
+          /preserved an unsafe or changed tree/u,
+        );
+      });
       const quarantineName = fs.readdirSync(fixtureRoot).find(
         name => name.startsWith(`.${boundaryName}.cleanup-`),
       );
@@ -893,17 +900,19 @@ suite("M9 release gate helpers", () => {
         platform: fixture.platform,
       });
       let launcherDirectory;
-      assert.throws(() => withCanonicalNpmLauncher({
-        nodeExecutable: fixture.nodeExecutable,
-        npm,
-        platform: fixture.platform,
-        temporaryParent: fixtureRoot,
-      }, launcher => {
-        launcherDirectory = launcher.directory;
-        const snapshotDependency = path.join(launcher.directory, "npm-runtime", "lib", "cli.js");
-        fs.chmodSync(snapshotDependency, 0o600);
-        fs.writeFileSync(snapshotDependency, "module.exports = process => process.exit(99)\n");
-      }), /Canonical npm launcher is unsafe or invalid/u);
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => withCanonicalNpmLauncher({
+          nodeExecutable: fixture.nodeExecutable,
+          npm,
+          platform: fixture.platform,
+          temporaryParent: fixtureRoot,
+        }, launcher => {
+          launcherDirectory = launcher.directory;
+          const snapshotDependency = path.join(launcher.directory, "npm-runtime", "lib", "cli.js");
+          fs.chmodSync(snapshotDependency, 0o600);
+          fs.writeFileSync(snapshotDependency, "module.exports = process => process.exit(99)\n");
+        }), /Canonical npm launcher is unsafe or invalid/u);
+      });
       assert.strictEqual(fs.existsSync(launcherDirectory), true);
     });
   });
@@ -987,15 +996,17 @@ suite("M9 release gate helpers", () => {
         platform: fixture.platform,
       });
       let launcherDirectory;
-      assert.throws(() => withCanonicalNpmLauncher({
-        nodeExecutable: runtime,
-        npm,
-        platform: "linux",
-        temporaryParent: fixtureRoot,
-      }, launcher => {
-        launcherDirectory = launcher.directory;
-        fs.writeFileSync(path.join(launcher.directory, "unexpected"), "do not remove\n");
-      }), /Canonical npm launcher cleanup refused/u);
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => withCanonicalNpmLauncher({
+          nodeExecutable: runtime,
+          npm,
+          platform: "linux",
+          temporaryParent: fixtureRoot,
+        }, launcher => {
+          launcherDirectory = launcher.directory;
+          fs.writeFileSync(path.join(launcher.directory, "unexpected"), "do not remove\n");
+        }), /Canonical npm launcher cleanup refused/u);
+      });
       assert.strictEqual(fs.readFileSync(
         path.join(launcherDirectory, "unexpected"),
         "utf8",
@@ -1075,10 +1086,12 @@ suite("M9 release gate helpers", () => {
         }
         return originalRmdir.call(fs, target, options);
       };
-      assert.throws(
-        () => removePackageBuildDirectory(ownedRoot, identity, expectedEntries),
-        /temporary cleanup refused an unsafe or changed tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => removePackageBuildDirectory(ownedRoot, identity, expectedEntries),
+          /temporary cleanup refused an unsafe or changed tree/u,
+        );
+      });
     } finally {
       fs.rmdirSync = originalRmdir;
     }
@@ -1110,10 +1123,12 @@ suite("M9 release gate helpers", () => {
     const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
     fs.renameSync(victim, path.join(ownedRoot, "moved-victim"));
     try {
-      assert.throws(
-        () => removePackageBuildDirectory(ownedRoot, identity, expectedEntries),
-        /temporary cleanup refused an unsafe or changed tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => removePackageBuildDirectory(ownedRoot, identity, expectedEntries),
+          /temporary cleanup refused an unsafe or changed tree/u,
+        );
+      });
       assert.strictEqual(
         fs.readFileSync(path.join(ownedRoot, "moved-victim", "preserve.txt"), "utf8"),
         "moved victim survives\n",

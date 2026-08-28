@@ -24,6 +24,7 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/dependencyManifestDiscovery.test.js",
   "test/dependencyPolicyEnricher.test.js",
   "test/dependencyRecord.test.js",
+  "test/expectedCleanupTaint.test.js",
   "test/externalNavigation.test.js",
   "test/foundDependencyKey.test.js",
   "test/formatIconInventory.test.js",

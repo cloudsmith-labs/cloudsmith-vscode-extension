@@ -8,6 +8,7 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 const Mocha = require("mocha");
 const yaml = require("js-yaml");
+const { withExpectedCleanupTaint } = require("./helpers/expectedCleanupTaint");
 const {
   ROOT,
   gitVisibleFiles,
@@ -1947,22 +1948,24 @@ suite("Quality gate runner", () => {
       assert.strictEqual(fs.existsSync(failureRoot), false);
 
       let dualFailureRoot;
-      assert.throws(() => withNonAuthQualityEnvironment({
-        environment: hostileEnvironment,
-        temporaryParent: scratch,
-      }, (_environment, boundary) => {
-        dualFailureRoot = boundary.root;
-        fs.writeFileSync(
-          path.join(boundary.root, "unexpected-cleanup-entry"),
-          "synthetic refused cleanup bytes\n",
-        );
-        throw new Error("synthetic callback and cleanup failure");
-      }), error => {
-        assert.strictEqual(error instanceof AggregateError, true);
-        assert.strictEqual(error.errors.length, 2);
-        assert.match(error.errors[0].message, /synthetic callback and cleanup failure/u);
-        assert.match(error.errors[1].message, /unsafe or changed tree/u);
-        return true;
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => withNonAuthQualityEnvironment({
+          environment: hostileEnvironment,
+          temporaryParent: scratch,
+        }, (_environment, boundary) => {
+          dualFailureRoot = boundary.root;
+          fs.writeFileSync(
+            path.join(boundary.root, "unexpected-cleanup-entry"),
+            "synthetic refused cleanup bytes\n",
+          );
+          throw new Error("synthetic callback and cleanup failure");
+        }), error => {
+          assert.strictEqual(error instanceof AggregateError, true);
+          assert.strictEqual(error.errors.length, 2);
+          assert.match(error.errors[0].message, /synthetic callback and cleanup failure/u);
+          assert.match(error.errors[1].message, /unsafe or changed tree/u);
+          return true;
+        });
       });
       const dualFailureQuarantine = fs.readdirSync(scratch).find(
         name => name.startsWith(`.${path.basename(dualFailureRoot)}.cleanup-`),
@@ -2017,10 +2020,12 @@ suite("Quality gate runner", () => {
         () => assertActiveNonAuthQualityBoundary(owned, { ...owned.environment }),
         /exact active environment/u,
       );
-      assert.throws(
-        () => cleanupNonAuthQualityEnvironment({ root: owned.root }),
-        /unknown boundary/u
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => cleanupNonAuthQualityEnvironment({ root: owned.root }),
+          /unknown boundary/u
+        );
+      });
       assert.strictEqual(fs.existsSync(owned.root), true);
       assert.strictEqual(cleanupNonAuthQualityEnvironment(owned), true);
       assert.strictEqual(fs.existsSync(owned.root), false);
@@ -2092,10 +2097,12 @@ suite("Quality gate runner", () => {
         }
         return originalRmdir.call(fs, target, options);
       };
-      assert.throws(
-        () => cleanupNonAuthQualityEnvironment(boundary),
-        /path was reoccupied/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => cleanupNonAuthQualityEnvironment(boundary),
+          /path was reoccupied/u,
+        );
+      });
     } finally {
       fs.rmdirSync = originalRmdir;
     }
@@ -2133,12 +2140,16 @@ suite("Quality gate runner", () => {
     const renamed = path.join(boundary.paths.temporary, "renamed-launcher");
     fs.mkdirSync(original);
     fs.writeFileSync(path.join(original, "preserve.txt"), "renamed bytes survive\n");
-    assert.strictEqual(preserveNonAuthCleanupSubtree(original), true);
+    withExpectedCleanupTaint(() => {
+      assert.strictEqual(preserveNonAuthCleanupSubtree(original), true);
+    });
     fs.renameSync(original, renamed);
-    assert.throws(
-      () => cleanupNonAuthQualityEnvironment(boundary),
-      /preserved an unsafe or changed tree/u,
-    );
+    withExpectedCleanupTaint(() => {
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(boundary),
+        /preserved an unsafe or changed tree/u,
+      );
+    });
     const quarantineName = fs.readdirSync(scratch).find(
       name => name.startsWith(`.${path.basename(boundary.root)}.cleanup-`),
     );
@@ -2171,11 +2182,15 @@ suite("Quality gate runner", () => {
     fs.mkdirSync(original);
     fs.writeFileSync(path.join(original, "preserve.txt"), "pre-renamed bytes survive\n");
     fs.renameSync(original, renamed);
-    assert.strictEqual(preserveNonAuthCleanupSubtree(original), true);
-    assert.throws(
-      () => cleanupNonAuthQualityEnvironment(boundary),
-      /preserved an unsafe or changed tree/u,
-    );
+    withExpectedCleanupTaint(() => {
+      assert.strictEqual(preserveNonAuthCleanupSubtree(original), true);
+    });
+    withExpectedCleanupTaint(() => {
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(boundary),
+        /preserved an unsafe or changed tree/u,
+      );
+    });
     const quarantineName = fs.readdirSync(scratch).find(
       name => name.startsWith(`.${path.basename(boundary.root)}.cleanup-`),
     );
@@ -2210,21 +2225,25 @@ suite("Quality gate runner", () => {
     const preserved = path.join(inner.paths.temporary, "tainted-launcher");
     fs.mkdirSync(preserved);
     fs.writeFileSync(path.join(preserved, "preserve.txt"), "nested bytes survive\n");
-    assert.strictEqual(preserveNonAuthCleanupSubtree(preserved), true);
-
-    assert.throws(
-      () => cleanupNonAuthQualityEnvironment(inner),
-      /preserved an unsafe or changed tree/u,
-    );
+    withExpectedCleanupTaint(() => {
+      assert.strictEqual(preserveNonAuthCleanupSubtree(preserved), true);
+    });
+    withExpectedCleanupTaint(() => {
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(inner),
+        /preserved an unsafe or changed tree/u,
+      );
+    });
     const innerQuarantineName = fs.readdirSync(outer.paths.temporary).find(
       name => name.startsWith(`.${path.basename(inner.root)}.cleanup-`),
     );
     assert.strictEqual(typeof innerQuarantineName, "string");
-
-    assert.throws(
-      () => cleanupNonAuthQualityEnvironment(outer),
-      /preserved an unsafe or changed tree/u,
-    );
+    withExpectedCleanupTaint(() => {
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(outer),
+        /preserved an unsafe or changed tree/u,
+      );
+    });
     const outerQuarantineName = fs.readdirSync(scratch).find(
       name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
     );
@@ -2265,16 +2284,19 @@ suite("Quality gate runner", () => {
     fs.renameSync(inner.paths.home, displacedHome);
     fs.renameSync(victim, inner.paths.home);
 
-    assert.throws(
-      () => cleanupNonAuthQualityEnvironment(inner),
-      /exact creator-owned private directory/u,
-    );
+    withExpectedCleanupTaint(() => {
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(inner),
+        /exact creator-owned private directory/u,
+      );
+    });
     assert.strictEqual(fs.existsSync(inner.root), true);
-
-    assert.throws(
-      () => cleanupNonAuthQualityEnvironment(outer),
-      /preserved an unsafe or changed tree/u,
-    );
+    withExpectedCleanupTaint(() => {
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(outer),
+        /preserved an unsafe or changed tree/u,
+      );
+    });
     const outerQuarantineName = fs.readdirSync(scratch).find(
       name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
     );
@@ -2308,37 +2330,40 @@ suite("Quality gate runner", () => {
     fs.writeFileSync(path.join(victim, "preserve.txt"), "rollback bytes survive\n");
     const originalWriteFile = fs.writeFileSync;
     let partialRoot = null;
-    try {
-      fs.writeFileSync = function interceptOwnershipMarker(target, ...args) {
-        if (!partialRoot
-          && typeof target === "string"
-          && path.basename(target) === ".cloudsmith-non-auth-owner.json"
-          && path.dirname(path.dirname(target)) === outer.paths.temporary) {
-          partialRoot = path.dirname(target);
-          fs.renameSync(victim, path.join(partialRoot, "unexpected-victim"));
-          throw new Error("synthetic marker creation failure");
-        }
-        return originalWriteFile.call(fs, target, ...args);
-      };
-      assert.throws(
-        () => createNonAuthQualityEnvironment({
-          environment: { PATH: "/fixture/bin" },
-          temporaryParent: outer.paths.temporary,
-        }),
-        /unsafe or changed tree/u,
-      );
-    } finally {
-      fs.writeFileSync = originalWriteFile;
-    }
+    withExpectedCleanupTaint(() => {
+      try {
+        fs.writeFileSync = function interceptOwnershipMarker(target, ...args) {
+          if (!partialRoot
+            && typeof target === "string"
+            && path.basename(target) === ".cloudsmith-non-auth-owner.json"
+            && path.dirname(path.dirname(target)) === outer.paths.temporary) {
+            partialRoot = path.dirname(target);
+            fs.renameSync(victim, path.join(partialRoot, "unexpected-victim"));
+            throw new Error("synthetic marker creation failure");
+          }
+          return originalWriteFile.call(fs, target, ...args);
+        };
+        assert.throws(
+          () => createNonAuthQualityEnvironment({
+            environment: { PATH: "/fixture/bin" },
+            temporaryParent: outer.paths.temporary,
+          }),
+          /unsafe or changed tree/u,
+        );
+      } finally {
+        fs.writeFileSync = originalWriteFile;
+      }
+    });
     const innerQuarantineName = fs.readdirSync(outer.paths.temporary).find(
       name => name.startsWith(`.${path.basename(partialRoot)}.cleanup-`),
     );
     assert.strictEqual(typeof innerQuarantineName, "string");
-
-    assert.throws(
-      () => cleanupNonAuthQualityEnvironment(outer),
-      /preserved an unsafe or changed tree/u,
-    );
+    withExpectedCleanupTaint(() => {
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(outer),
+        /preserved an unsafe or changed tree/u,
+      );
+    });
     const outerQuarantineName = fs.readdirSync(scratch).find(
       name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
     );
@@ -2374,45 +2399,48 @@ suite("Quality gate runner", () => {
     const originalRename = fs.renameSync;
     let partialRoot = null;
     let reoccupied = false;
-    try {
-      fs.writeFileSync = function interceptOwnershipMarker(target, ...args) {
-        if (!partialRoot
-          && typeof target === "string"
-          && path.basename(target) === ".cloudsmith-non-auth-owner.json"
-          && path.dirname(path.dirname(target)) === outer.paths.temporary) {
-          partialRoot = path.dirname(target);
-          throw new Error("synthetic marker creation failure");
-        }
-        return originalWriteFile.call(fs, target, ...args);
-      };
-      fs.renameSync = function interceptRollbackQuarantine(source, destination) {
-        originalRename.call(fs, source, destination);
-        if (!reoccupied
-          && source === partialRoot
-          && path.dirname(destination) === outer.paths.temporary
-          && path.basename(destination).startsWith(`.${path.basename(partialRoot)}.cleanup-`)) {
-          originalRename.call(fs, victim, partialRoot);
-          reoccupied = true;
-        }
-      };
-      assert.throws(
-        () => createNonAuthQualityEnvironment({
-          environment: { PATH: "/fixture/bin" },
-          temporaryParent: outer.paths.temporary,
-        }),
-        /reoccupied during creation rollback/u,
-      );
-    } finally {
-      fs.writeFileSync = originalWriteFile;
-      fs.renameSync = originalRename;
-    }
+    withExpectedCleanupTaint(() => {
+      try {
+        fs.writeFileSync = function interceptOwnershipMarker(target, ...args) {
+          if (!partialRoot
+            && typeof target === "string"
+            && path.basename(target) === ".cloudsmith-non-auth-owner.json"
+            && path.dirname(path.dirname(target)) === outer.paths.temporary) {
+            partialRoot = path.dirname(target);
+            throw new Error("synthetic marker creation failure");
+          }
+          return originalWriteFile.call(fs, target, ...args);
+        };
+        fs.renameSync = function interceptRollbackQuarantine(source, destination) {
+          originalRename.call(fs, source, destination);
+          if (!reoccupied
+            && source === partialRoot
+            && path.dirname(destination) === outer.paths.temporary
+            && path.basename(destination).startsWith(`.${path.basename(partialRoot)}.cleanup-`)) {
+            originalRename.call(fs, victim, partialRoot);
+            reoccupied = true;
+          }
+        };
+        assert.throws(
+          () => createNonAuthQualityEnvironment({
+            environment: { PATH: "/fixture/bin" },
+            temporaryParent: outer.paths.temporary,
+          }),
+          /reoccupied during creation rollback/u,
+        );
+      } finally {
+        fs.writeFileSync = originalWriteFile;
+        fs.renameSync = originalRename;
+      }
+    });
     assert.strictEqual(reoccupied, true);
     assert.strictEqual(fs.existsSync(partialRoot), true);
-
-    assert.throws(
-      () => cleanupNonAuthQualityEnvironment(outer),
-      /preserved an unsafe or changed tree/u,
-    );
+    withExpectedCleanupTaint(() => {
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(outer),
+        /preserved an unsafe or changed tree/u,
+      );
+    });
     const outerQuarantineName = fs.readdirSync(scratch).find(
       name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
     );
@@ -2452,18 +2480,22 @@ suite("Quality gate runner", () => {
       fs.writeFileSync(path.join(victim, "preserve.txt"), `${label} bytes survive\n`);
       fs.renameSync(victim, path.join(exactRoot, "unexpected-victim"));
 
-      assert.throws(
-        () => cleanup(exactRoot, {
-          errorMessage: `Synthetic ${label} cleanup refused an unsafe tree.`,
-          expectedRootEntries: [],
-          expectedRootIdentity: rootIdentity,
-        }),
-        new RegExp(`Synthetic ${label} cleanup refused an unsafe tree\\.`, "u"),
-      );
-      assert.throws(
-        () => cleanupNonAuthQualityEnvironment(outer),
-        /preserved an unsafe or changed tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => cleanup(exactRoot, {
+            errorMessage: `Synthetic ${label} cleanup refused an unsafe tree.`,
+            expectedRootEntries: [],
+            expectedRootIdentity: rootIdentity,
+          }),
+          new RegExp(`Synthetic ${label} cleanup refused an unsafe tree\\.`, "u"),
+        );
+      });
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => cleanupNonAuthQualityEnvironment(outer),
+          /preserved an unsafe or changed tree/u,
+        );
+      });
       const outerQuarantineName = fs.readdirSync(scratch).find(
         name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
       );
@@ -2520,10 +2552,12 @@ suite("Quality gate runner", () => {
     );
     assert.strictEqual(typeof innerQuarantineName, "string");
 
-    assert.throws(
-      () => cleanupNonAuthQualityEnvironment(outer),
-      /unsafe or changed tree/u,
-    );
+    withExpectedCleanupTaint(() => {
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(outer),
+        /unsafe or changed tree/u,
+      );
+    });
     const outerQuarantineName = fs.readdirSync(scratch).find(
       name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
     );
@@ -2597,10 +2631,12 @@ suite("Quality gate runner", () => {
         fs.lstatSync(path.join(displacedRoot, path.basename(outer.paths.cleanupTaint))).size,
         1,
       );
-      assert.throws(
-        () => cleanupNonAuthQualityEnvironment(outer),
-        /exact creator-owned private directory/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => cleanupNonAuthQualityEnvironment(outer),
+          /exact creator-owned private directory/u,
+        );
+      });
       assert.deepStrictEqual(fs.readdirSync(outer.root), ["keep.txt"]);
       assert.strictEqual(
         fs.readFileSync(path.join(outer.root, "keep.txt"), "utf8"),
@@ -2646,10 +2682,12 @@ suite("Quality gate runner", () => {
         }
         return originalRmdir.call(fs, target, options);
       };
-      assert.throws(
-        () => cleanupNonAuthQualityEnvironment(boundary),
-        /unsafe or changed tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => cleanupNonAuthQualityEnvironment(boundary),
+          /unsafe or changed tree/u,
+        );
+      });
     } finally {
       fs.rmdirSync = originalRmdir;
     }
@@ -2685,14 +2723,16 @@ suite("Quality gate runner", () => {
         }
         return originalRmdir.call(fs, target, options);
       };
-      assert.throws(
-        () => removeExactOwnedDirectoryTree(root, {
-          errorMessage: "Synthetic exact cleanup rejected tree drift.",
-          expectedRootEntries: [],
-          expectedRootIdentity: rootIdentity,
-        }),
-        /rejected tree drift/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => removeExactOwnedDirectoryTree(root, {
+            errorMessage: "Synthetic exact cleanup rejected tree drift.",
+            expectedRootEntries: [],
+            expectedRootIdentity: rootIdentity,
+          }),
+          /rejected tree drift/u,
+        );
+      });
     } finally {
       fs.rmdirSync = originalRmdir;
     }
@@ -4342,19 +4382,23 @@ suite("Quality gate runner", () => {
     const socketStat = fs.lstatSync(socket);
     assert.strictEqual(socketStat.isSocket(), true);
     assert.strictEqual(socketStat.nlink, 1);
-      assert.throws(
-        () => removeExactOwnedDirectoryTree(socketRoot, {
-          allowAdditionalRootEntries: true,
-          errorMessage: "Synthetic generic cleanup rejected an unscoped Unix socket.",
-          expectedRootEntries: [],
-          expectedRootIdentity: fs.lstatSync(socketRoot),
-        }),
-        /rejected an unscoped Unix socket/u,
-      );
-      assert.throws(
-        () => cleanupNonAuthQualityEnvironment(boundary),
-        /preserved an unsafe or changed tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => removeExactOwnedDirectoryTree(socketRoot, {
+            allowAdditionalRootEntries: true,
+            errorMessage: "Synthetic generic cleanup rejected an unscoped Unix socket.",
+            expectedRootEntries: [],
+            expectedRootIdentity: fs.lstatSync(socketRoot),
+          }),
+          /rejected an unscoped Unix socket/u,
+        );
+      });
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => cleanupNonAuthQualityEnvironment(boundary),
+          /preserved an unsafe or changed tree/u,
+        );
+      });
       assert.strictEqual(fs.existsSync(boundary.root), false);
 
       const allowedBoundary = createNonAuthQualityEnvironment({
@@ -4380,16 +4424,18 @@ suite("Quality gate runner", () => {
       const fifo = path.join(fifoRoot, "x.fifo");
       fs.mkdirSync(fifoRoot, { mode: 0o700 });
       assert.strictEqual(spawnSync("mkfifo", [fifo], { encoding: "utf8" }).status, 0);
-      assert.throws(
-        () => removeExactOwnedDirectoryTree(fifoRoot, {
-          allowAdditionalRootEntries: true,
-          allowSingleLinkUnixSockets: true,
-          errorMessage: "Synthetic socket-enabled cleanup rejected an unsafe entry type.",
-          expectedRootEntries: [],
-          expectedRootIdentity: fs.lstatSync(fifoRoot),
-        }),
-        /rejected an unsafe entry type/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => removeExactOwnedDirectoryTree(fifoRoot, {
+            allowAdditionalRootEntries: true,
+            allowSingleLinkUnixSockets: true,
+            errorMessage: "Synthetic socket-enabled cleanup rejected an unsafe entry type.",
+            expectedRootEntries: [],
+            expectedRootIdentity: fs.lstatSync(fifoRoot),
+          }),
+          /rejected an unsafe entry type/u,
+        );
+      });
       assert.strictEqual(fs.lstatSync(fifo).isFIFO(), true);
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
@@ -4434,16 +4480,18 @@ suite("Quality gate runner", () => {
         }
         return originalLstat.call(fs, target, options);
       };
-      assert.throws(
-        () => removeExactOwnedDirectoryTree(root, {
-          allowAdditionalRootEntries: true,
-          allowSingleLinkUnixSockets: true,
-          errorMessage: "Synthetic exact cleanup rejected socket identity drift.",
-          expectedRootEntries: [],
-          expectedRootIdentity: originalLstat.call(fs, root),
-        }),
-        /rejected socket identity drift/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => removeExactOwnedDirectoryTree(root, {
+            allowAdditionalRootEntries: true,
+            allowSingleLinkUnixSockets: true,
+            errorMessage: "Synthetic exact cleanup rejected socket identity drift.",
+            expectedRootEntries: [],
+            expectedRootIdentity: originalLstat.call(fs, root),
+          }),
+          /rejected socket identity drift/u,
+        );
+      });
     } finally {
       fs.lstatSync = originalLstat;
     }
@@ -7917,11 +7965,20 @@ suite("Quality contract verifier fixtures", function () {
     const repositoryFiles = gitVisibleFiles(root);
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-quality-source-"));
     const outsideFile = path.join(outside, "linked.test.js");
-    const relativeLink = `test/quality-linked-${process.pid}.test.js`;
+    // Keep the transient adversarial link outside the runnable test inventory
+    // so concurrent qualification processes cannot discover one another's fixture.
+    const relativeLink = `quality/quality-linked-${crypto.randomBytes(16).toString("hex")}.test.js`;
     const link = path.join(root, relativeLink);
+    let linkIdentity = null;
+    const errors = [];
     try {
       fs.writeFileSync(outsideFile, `test(${JSON.stringify(evidence.testNames[0])}, () => {});\n`);
       fs.symlinkSync(outsideFile, link, "file");
+      const linkStat = fs.lstatSync(link, { bigint: true });
+      assert.strictEqual(linkStat.isSymbolicLink(), true);
+      linkIdentity = Object.freeze(Object.fromEntries([
+        "ctimeNs", "dev", "ino", "mode", "mtimeNs", "nlink", "size",
+      ].map(key => [key, String(linkStat[key])])));
       evidence.testFile = relativeLink;
       workflow.testFiles = uniqueSorted(workflow.evidence.map(item => item.testFile));
 
@@ -7934,9 +7991,38 @@ suite("Quality contract verifier fixtures", function () {
       assert.ok(result.errors.some(error => (
         error.includes(relativeLink) && /normalized Git-visible regular file/.test(error)
       )));
-    } finally {
-      fs.rmSync(link, { force: true });
+    } catch (error) {
+      errors.push(error);
+    }
+    if (linkIdentity) {
+      try {
+        const linkStat = fs.lstatSync(link, { bigint: true });
+        const currentIdentity = Object.fromEntries([
+          "ctimeNs", "dev", "ino", "mode", "mtimeNs", "nlink", "size",
+        ].map(key => [key, String(linkStat[key])]));
+        if (!linkStat.isSymbolicLink()
+          || Object.keys(linkIdentity).some(
+            key => currentIdentity[key] !== linkIdentity[key],
+          )) {
+          throw new Error("Synthetic quality symlink fixture changed before cleanup.");
+        }
+        fs.unlinkSync(link);
+        assert.throws(
+          () => fs.lstatSync(link),
+          error => error?.code === "ENOENT",
+        );
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    try {
       fs.rmSync(outside, { force: true, recursive: true });
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(errors, "Synthetic quality symlink fixture failed and could not clean safely.");
     }
   });
 
@@ -8584,16 +8670,18 @@ suite("Quality contract verifier fixtures", function () {
         return originalLstat.call(fs, target, ...args);
       };
       let executions = 0;
-      assert.throws(() => runGate({
-        root: temporaryRoot,
-        profile: "fast",
-        plan: [fixtureArtifactStep()],
-        source: SOURCE_IDENTITY,
-        execute() {
-          executions += 1;
-          return { status: 0, signal: null, stdout: "", stderr: "" };
-        },
-      }), /cleanup refused an unsafe or changed tree/u);
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => runGate({
+          root: temporaryRoot,
+          profile: "fast",
+          plan: [fixtureArtifactStep()],
+          source: SOURCE_IDENTITY,
+          execute() {
+            executions += 1;
+            return { status: 0, signal: null, stdout: "", stderr: "" };
+          },
+        }), /cleanup refused an unsafe or changed tree/u);
+      });
       assert.strictEqual(executions, 0);
       assert.strictEqual(fs.readFileSync(summaryPath, "utf8"), "synthetic prior summary\n");
       assert.strictEqual(fs.readFileSync(receipt, "utf8"), "concurrent replacement\n");
@@ -8627,16 +8715,18 @@ suite("Quality contract verifier fixtures", function () {
         return originalLstat.call(fs, target, ...args);
       };
       let executions = 0;
-      assert.throws(() => runGate({
-        root: temporaryRoot,
-        profile: "fast",
-        plan: [fixtureArtifactStep()],
-        source: SOURCE_IDENTITY,
-        execute() {
-          executions += 1;
-          return { status: 0, signal: null, stdout: "", stderr: "" };
-        },
-      }), /cleanup refused an unsafe or changed tree/u);
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => runGate({
+          root: temporaryRoot,
+          profile: "fast",
+          plan: [fixtureArtifactStep()],
+          source: SOURCE_IDENTITY,
+          execute() {
+            executions += 1;
+            return { status: 0, signal: null, stdout: "", stderr: "" };
+          },
+        }), /cleanup refused an unsafe or changed tree/u);
+      });
       const rewrittenIdentity = originalLstat.call(fs, receipt, { bigint: true });
       assert.strictEqual(executions, 0);
       assert.strictEqual(String(rewrittenIdentity.ino), String(originalIdentity.ino));
@@ -8718,16 +8808,18 @@ suite("Quality contract verifier fixtures", function () {
         return originalRename.call(fs, source, destination);
       };
       let executions = 0;
-      assert.throws(() => runGate({
-        root: temporaryRoot,
-        profile: "fast",
-        plan: [fixtureArtifactStep()],
-        source: SOURCE_IDENTITY,
-        execute() {
-          executions += 1;
-          return { status: 0, signal: null, stdout: "", stderr: "" };
-        },
-      }), /cleanup refused an unsafe or changed tree/u);
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => runGate({
+          root: temporaryRoot,
+          profile: "fast",
+          plan: [fixtureArtifactStep()],
+          source: SOURCE_IDENTITY,
+          execute() {
+            executions += 1;
+            return { status: 0, signal: null, stdout: "", stderr: "" };
+          },
+        }), /cleanup refused an unsafe or changed tree/u);
+      });
       assert.strictEqual(swapped, true);
       assert.strictEqual(executions, 0);
       assert.strictEqual(fs.existsSync(summaryPath), false);

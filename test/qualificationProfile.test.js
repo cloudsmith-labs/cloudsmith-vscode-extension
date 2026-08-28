@@ -6,6 +6,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const { withExpectedCleanupTaint } = require("./helpers/expectedCleanupTaint");
 const { exactFileIdentity } = require("../scripts/quality/candidate-binding");
 const { fingerprint } = require("../scripts/quality/evidence");
 const {
@@ -326,10 +327,12 @@ suite("qualification candidate isolation", () => {
         }
         return originalRmdir.call(fs, target, options);
       };
-      assert.throws(
-        () => resetLocalQualificationProfile({ homeDirectory: home }),
-        /unsafe or changed profile tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => resetLocalQualificationProfile({ homeDirectory: home }),
+          /unsafe or changed profile tree/u,
+        );
+      });
     } finally {
       fs.rmdirSync = originalRmdir;
     }
@@ -410,10 +413,12 @@ suite("qualification candidate isolation", () => {
         }
         return originalRmdir.call(fs, target, options);
       };
-      assert.throws(
-        () => cleanupCiQualificationProfile(profile),
-        /unsafe or changed profile tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => cleanupCiQualificationProfile(profile),
+          /unsafe or changed profile tree/u,
+        );
+      });
     } finally {
       fs.rmdirSync = originalRmdir;
     }
@@ -431,10 +436,12 @@ suite("qualification candidate isolation", () => {
     const displacedSettings = path.join(parent, "owned-settings-displaced");
     fs.renameSync(profile.userDataDir, displacedSettings);
     fs.writeFileSync(profile.userDataDir, "synthetic wrong-type bytes\n");
-    assert.throws(
-      () => cleanupCiQualificationProfile(profile),
-      /unsafe or changed profile tree/u,
-    );
+    withExpectedCleanupTaint(() => {
+      assert.throws(
+        () => cleanupCiQualificationProfile(profile),
+        /unsafe or changed profile tree/u,
+      );
+    });
     assert.strictEqual(
       fs.readFileSync(profile.userDataDir, "utf8"),
       "synthetic wrong-type bytes\n",
@@ -446,10 +453,12 @@ suite("qualification candidate isolation", () => {
       path.join(profile.userDataDir, "preserve.txt"),
       "synthetic replacement survives\n",
     );
-    assert.throws(
-      () => cleanupCiQualificationProfile(profile),
-      /unsafe or changed profile tree/u,
-    );
+    withExpectedCleanupTaint(() => {
+      assert.throws(
+        () => cleanupCiQualificationProfile(profile),
+        /unsafe or changed profile tree/u,
+      );
+    });
     assert.strictEqual(
       fs.readFileSync(path.join(profile.userDataDir, "preserve.txt"), "utf8"),
       "synthetic replacement survives\n",
@@ -490,10 +499,12 @@ suite("qualification candidate isolation", () => {
         }
         return originalRmdir.call(fs, target, options);
       };
-      assert.throws(
-        () => swapped.cleanup(),
-        /unsafe or changed tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => swapped.cleanup(),
+          /unsafe or changed tree/u,
+        );
+      });
     } finally {
       fs.rmdirSync = originalRmdir;
     }
@@ -595,10 +606,12 @@ suite("qualification candidate isolation", () => {
         }
         return originalUnlink.call(fs, target);
       };
-      assert.throws(
-        () => resetCiQualificationUserData(profile),
-        /unsafe or changed user-data tree/u,
-      );
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => resetCiQualificationUserData(profile),
+          /unsafe or changed user-data tree/u,
+        );
+      });
     } finally {
       fs.unlinkSync = originalUnlink;
     }
