@@ -20,6 +20,7 @@ const {
   LIVE_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_RECEIPT,
+  digestStableSingleLinkFile,
   exactFileIdentity,
 } = require("../scripts/quality/candidate-binding");
 const {
@@ -3492,6 +3493,169 @@ suite("secret exposure gate", () => {
         entry.path === excluded || entry.path.startsWith(`${excluded}/`)
       ))
     )));
+  });
+
+  test("permits only the exact in-flight release-checklist self-output proof", () => {
+    const fixture = createReleaseExposureFixture(scratch);
+    const releasePlan = writeReleaseProgressAtSecretScan(scratch, fixture.source);
+    writePreservedFullGateFromRelease(scratch, fixture.source);
+    const manifest = captureGeneratedEvidenceManifest(scratch, null, {
+      source: fixture.source,
+    });
+    const secretReleaseStep = releasePlan.find(step => step.id === "secret-release");
+    const secretReleaseReceiptPath = receiptPath({
+      profile: "release",
+      sequence: secretReleaseStep.sequence,
+      stepId: secretReleaseStep.id,
+    });
+    const secretReleaseOutput = { status: "synthetic-safe-release-exposure" };
+    writeJson(secretReleaseStep.artifactPath, secretReleaseOutput, scratch, {
+      subtree: ".quality/secrets",
+    });
+    const secretReleaseReceipt = JSON.parse(fs.readFileSync(
+      path.join(scratch, ...secretReleaseReceiptPath.split("/")),
+      "utf8",
+    ));
+    writeJson(secretReleaseReceiptPath, {
+      ...secretReleaseReceipt,
+      status: "passed",
+      exitCode: 0,
+      reason: null,
+      outputFingerprint: crypto.createHash("sha256").update("").digest("hex"),
+      testEvidence: null,
+      testEvidenceFingerprint: null,
+      artifactFingerprint: artifactFingerprintForStep(secretReleaseStep, scratch),
+    }, scratch, { subtree: ".quality/gates/release" });
+    const checklistStep = releasePlan.find(step => step.id === "release-checklist");
+    const checklistOutputPath = checklistStep.artifactPath;
+    const checklistTarget = path.join(scratch, ...checklistOutputPath.split("/"));
+    const checklistBytes = Buffer.from(`${JSON.stringify({ status: "partial" }, null, 2)}\n`);
+    fs.writeFileSync(checklistTarget, checklistBytes);
+    const checklistDigest = digestStableSingleLinkFile(checklistTarget, {
+      maximumBytes: 1024 * 1024,
+      minimumBytes: 1,
+    });
+    const proof = {
+      stepId: checklistStep.id,
+      path: checklistOutputPath,
+      sha256: checklistDigest.sha256,
+      identity: checklistDigest.identity,
+    };
+
+    assert.throws(
+      () => validateGeneratedEvidenceAcceptance(scratch, manifest, {
+        source: fixture.source,
+      }),
+      /generated release evidence changed across the pre-acceptance boundary/iu,
+    );
+    assert.strictEqual(validateGeneratedEvidenceAcceptance(scratch, manifest, {
+      releaseChecklistOutputProof: proof,
+      source: fixture.source,
+    }), true);
+    for (const invalidProof of [
+      { ...proof, stepId: "secret-history" },
+      { ...proof, path: ".quality/gates/not-the-checklist.json" },
+      { ...proof, sha256: "0".repeat(64) },
+      { ...proof, unexpected: true },
+    ]) {
+      assert.throws(
+        () => validateGeneratedEvidenceAcceptance(scratch, manifest, {
+          releaseChecklistOutputProof: invalidProof,
+          source: fixture.source,
+        }),
+        /generated release evidence changed across the pre-acceptance boundary/iu,
+      );
+    }
+
+    const historyStep = releasePlan.find(step => step.id === "secret-history");
+    const historyReceiptPath = receiptPath({
+      profile: "release",
+      sequence: historyStep.sequence,
+      stepId: historyStep.id,
+    });
+    const plannedHistoryReceipt = JSON.parse(fs.readFileSync(
+      path.join(scratch, ...historyReceiptPath.split("/")),
+      "utf8",
+    ));
+    const historyTarget = path.join(scratch, ...historyStep.artifactPath.split("/"));
+    fs.writeFileSync(historyTarget, "synthetic history artifact\n");
+    writeJson(historyReceiptPath, {
+      ...plannedHistoryReceipt,
+      status: "passed",
+      exitCode: 0,
+      reason: null,
+      outputFingerprint: crypto.createHash("sha256").update("").digest("hex"),
+      testEvidence: null,
+      testEvidenceFingerprint: null,
+      artifactFingerprint: artifactFingerprintForStep(historyStep, scratch),
+    }, scratch, { subtree: ".quality/gates/release" });
+    assert.throws(
+      () => validateGeneratedEvidenceAcceptance(scratch, manifest, {
+        releaseChecklistOutputProof: proof,
+        source: fixture.source,
+      }),
+      /generated release evidence changed across the pre-acceptance boundary/iu,
+    );
+    writeJson(historyReceiptPath, plannedHistoryReceipt, scratch, {
+      subtree: ".quality/gates/release",
+    });
+    fs.rmSync(historyTarget);
+
+    const replacement = path.join(scratch, ".quality", "gates", "replacement.json");
+    fs.writeFileSync(replacement, checklistBytes);
+    fs.renameSync(replacement, checklistTarget);
+    assert.throws(
+      () => validateGeneratedEvidenceAcceptance(scratch, manifest, {
+        releaseChecklistOutputProof: proof,
+        source: fixture.source,
+      }),
+      /generated release evidence changed across the pre-acceptance boundary/iu,
+    );
+
+    const currentDigest = digestStableSingleLinkFile(checklistTarget, {
+      maximumBytes: 1024 * 1024,
+      minimumBytes: 1,
+    });
+    const checklistReceiptPath = receiptPath({
+      profile: "release",
+      sequence: checklistStep.sequence,
+      stepId: checklistStep.id,
+    });
+    const checklistReceipt = JSON.parse(fs.readFileSync(
+      path.join(scratch, ...checklistReceiptPath.split("/")),
+      "utf8",
+    ));
+    writeJson(checklistReceiptPath, {
+      ...checklistReceipt,
+      status: "blocked",
+      exitCode: 2,
+      reason: null,
+      outputFingerprint: crypto.createHash("sha256").update("").digest("hex"),
+      testEvidence: null,
+      testEvidenceFingerprint: null,
+      artifactFingerprint: currentDigest.sha256,
+    }, scratch, { subtree: ".quality/gates/release" });
+    assert.throws(
+      () => validateGeneratedEvidenceAcceptance(scratch, manifest, {
+        releaseChecklistOutputProof: {
+          ...proof,
+          sha256: currentDigest.sha256,
+          identity: currentDigest.identity,
+        },
+        source: fixture.source,
+      }),
+      /generated release evidence changed across the pre-acceptance boundary/iu,
+    );
+    assert.strictEqual(validateGeneratedEvidenceAcceptance(scratch, manifest, {
+      source: fixture.source,
+    }), true);
+    fs.writeFileSync(checklistTarget, "changed checklist output\n");
+    assert.throws(
+      () => validateGeneratedEvidenceAcceptance(scratch, manifest, {
+        source: fixture.source,
+      }),
+      /generated release evidence changed across the pre-acceptance boundary/iu,
+    );
   });
 
   test("release progress rejects forged receipts without preserved fast or full trees", () => {

@@ -524,7 +524,11 @@ function validateReleaseExposureBinding(document, source, errors, context) {
     validateGeneratedEvidenceAcceptance(
       context.root,
       context.releaseExposureReceipt.generatedEvidence,
-      { fileSystem: context.fileSystem },
+      {
+        fileSystem: context.fileSystem,
+        releaseChecklistOutputProof: context.releaseChecklistOutputProof,
+        source,
+      },
     );
   } catch (error) {
     errors.push(`Release exposure proof is invalid: ${error.message}`);
@@ -873,6 +877,7 @@ function createValidationContext(options = {}) {
     uiResult: options.uiResult || null,
     uiResultSha256: options.uiResultSha256 || null,
     attestationFingerprint: options.attestationFingerprint || null,
+    releaseChecklistOutputProof: options.releaseChecklistOutputProof || null,
     inputPath: options.inputPath || DEFAULT_INPUT,
     workflows: options.workflows || null,
     qualificationHomeDirectory: options.qualificationHomeDirectory,
@@ -1299,6 +1304,7 @@ function evaluateDiskLiveQualification(options = {}) {
     authenticatedCandidateArtifactPath,
     fileSystem: options.fileSystem,
     qualificationHomeDirectory: options.qualificationHomeDirectory,
+    releaseChecklistOutputProof: options.releaseChecklistOutputProof,
     repositoryState,
   });
 }
@@ -1311,13 +1317,14 @@ function runChecklist(options = {}) {
   if (Object.prototype.hasOwnProperty.call(options, "document")) {
     throw new Error("Release-checklist output requires an exact disk-backed attestation.");
   }
-  const evaluate = () => evaluateDiskLiveQualification({
+  const evaluate = releaseChecklistOutputProof => evaluateDiskLiveQualification({
     inputPath,
     now: options.now,
     source: options.source,
     workflows: options.workflows,
     fileSystem: options.fileSystem,
     qualificationHomeDirectory: options.qualificationHomeDirectory,
+    releaseChecklistOutputProof,
     root,
   });
   removeOutputFile(outputPath, root, { subtree: ".quality/gates" });
@@ -1326,12 +1333,12 @@ function runChecklist(options = {}) {
   result = evaluate();
   writeJson(outputPath, result, root, { subtree: ".quality/gates" });
   try {
-    assertExactPersistedChecklist(root, outputPath, result, options);
+    const outputProof = assertExactPersistedChecklist(root, outputPath, result, options);
     if (typeof options.afterPersist === "function") {
       options.afterPersist({ outputPath, result, root });
     }
-    const persistedBoundary = evaluate();
-    assertExactPersistedChecklist(root, outputPath, result, options);
+    const persistedBoundary = evaluate(outputPath === DEFAULT_OUTPUT ? outputProof : null);
+    assertExactPersistedChecklist(root, outputPath, result, options, outputProof);
     if (JSON.stringify(persistedBoundary) !== JSON.stringify(result)) {
       throw new Error(ACCEPTANCE_BOUNDARY_DRIFT_REASON);
     }
@@ -1341,20 +1348,37 @@ function runChecklist(options = {}) {
   }
 }
 
-function assertExactPersistedChecklist(root, outputPath, result, options = {}) {
+function assertExactPersistedChecklist(
+  root,
+  outputPath,
+  result,
+  options = {},
+  expectedProof = null,
+) {
   const target = resolveExistingRepositoryFile(outputPath, root, {
     subtree: ".quality/gates",
   });
   const expected = Buffer.from(`${JSON.stringify(result, null, 2)}\n`);
-  const matches = withStableSingleLinkFile(target, {
+  const proof = withStableSingleLinkFile(target, {
     errorMessage: ACCEPTANCE_BOUNDARY_DRIFT_REASON,
     expectedBytes: expected.length,
+    expectedIdentity: expectedProof?.identity,
     fileSystem: options.fileSystem,
     maximumBytes: EVIDENCE_MAX_BYTES,
     minimumBytes: 1,
-  }, bytes => bytes.equals(expected));
-  if (!matches) throw new Error(ACCEPTANCE_BOUNDARY_DRIFT_REASON);
-  return true;
+  }, (bytes, identity) => bytes.equals(expected) ? Object.freeze({
+    stepId: "release-checklist",
+    path: outputPath,
+    sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+    identity,
+  }) : null);
+  if (!proof
+    || (expectedProof
+      && (proof.path !== expectedProof.path
+        || proof.sha256 !== expectedProof.sha256))) {
+    throw new Error(ACCEPTANCE_BOUNDARY_DRIFT_REASON);
+  }
+  return proof;
 }
 
 function acceptanceBoundaryFailure(result) {

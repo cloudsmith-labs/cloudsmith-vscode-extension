@@ -67,6 +67,17 @@ const SECRET_RELEASE_PLAN_INDEX = RELEASE_GATE_PLAN.findIndex(step => (
 if (SECRET_RELEASE_PLAN_INDEX < 0) {
   throw new Error("Canonical release gate plan is missing secret-release.");
 }
+const RELEASE_CHECKLIST_STEP_ID = "release-checklist";
+const RELEASE_CHECKLIST_PLAN_INDEX = RELEASE_GATE_PLAN.findIndex(step => (
+  step.id === RELEASE_CHECKLIST_STEP_ID
+));
+const RELEASE_CHECKLIST_ARTIFACT_PATH = ".quality/gates/live-qualification-status.json";
+if (RELEASE_CHECKLIST_PLAN_INDEX < 0
+  || RELEASE_GATE_PLAN[RELEASE_CHECKLIST_PLAN_INDEX].artifactPath
+    !== RELEASE_CHECKLIST_ARTIFACT_PATH
+  || RELEASE_GATE_PLAN[RELEASE_CHECKLIST_PLAN_INDEX].artifactPaths) {
+  throw new Error("Canonical release gate plan has an invalid release-checklist artifact.");
+}
 const RELEASE_GATE_CIRCULAR_PATHS = Object.freeze([
   ...RELEASE_GATE_RECEIPT_PATHS.slice(SECRET_RELEASE_PLAN_INDEX),
   ".quality/gates/live-qualification-status.json",
@@ -288,7 +299,9 @@ function validateReleaseGateOwner(root, source, options = {}) {
   }
   const summaryPath = ".quality/gates/release.json";
   const summaryTarget = path.join(root, ".quality", "gates", "release.json");
-  if (optionalPathStat(summaryTarget, fileSystem)) {
+  const hasSummary = Boolean(optionalPathStat(summaryTarget, fileSystem));
+  if (hasSummary) {
+    if (options.releaseChecklistOutputProof) failReleaseGateTree();
     const loadedSummary = readBoundedJson(summaryPath, root, ".quality/gates", options);
     const summary = assertCanonicalGateJson(loadedSummary);
     validateGateGenerationSemantics(summary, context);
@@ -297,16 +310,101 @@ function validateReleaseGateOwner(root, source, options = {}) {
   } else {
     validateGateGenerationProgress(receipts, context);
   }
+  const releaseChecklistOutputProof = validateReleaseChecklistOutputProof(
+    receipts,
+    context,
+    options.releaseChecklistOutputProof,
+  );
   for (let index = 0; index < plan.length; index += 1) {
     validateGateStepArtifactClaim(receipts[index], plan[index]);
-    validateStepArtifacts(receipts[index], plan[index], root);
+    const provisionalIdentity = validateOwnerStepArtifacts(
+      receipts[index],
+      plan[index],
+      context,
+      releaseChecklistOutputProof,
+    );
+    if (provisionalIdentity) {
+      identities.push(Object.freeze({
+        path: RELEASE_CHECKLIST_ARTIFACT_PATH,
+        identity: provisionalIdentity,
+      }));
+    }
     validateStepTestEvidence(receipts[index], plan[index], root);
   }
   return Object.freeze({
     context: Object.freeze(context),
     identities: Object.freeze(identities),
+    releaseChecklistOutputProof,
     receipts: Object.freeze(receipts),
   });
+}
+
+function validateReleaseChecklistOutputProof(receipts, context, proof) {
+  if (!proof) return null;
+  const step = context.plan[RELEASE_CHECKLIST_PLAN_INDEX];
+  const receipt = receipts[RELEASE_CHECKLIST_PLAN_INDEX];
+  const firstPendingIndex = receipts.findIndex(candidate => (
+    candidate.status === "not-run" && candidate.reason === "not-started"
+  ));
+  if (!hasExactKeys(proof, ["identity", "path", "sha256", "stepId"])
+    || proof.stepId !== RELEASE_CHECKLIST_STEP_ID
+    || proof.path !== RELEASE_CHECKLIST_ARTIFACT_PATH
+    || !/^[a-f0-9]{64}$/u.test(proof.sha256 || "")
+    || !hasExactKeys(proof.identity, EXACT_FILE_IDENTITY_KEYS)
+    || firstPendingIndex !== RELEASE_CHECKLIST_PLAN_INDEX
+    || step.id !== RELEASE_CHECKLIST_STEP_ID
+    || step.artifactPath !== RELEASE_CHECKLIST_ARTIFACT_PATH
+    || step.artifactPaths
+    || receipt.status !== "not-run"
+    || receipt.reason !== "not-started"
+    || receipt.exitCode !== null
+    || receipt.signal !== null
+    || receipt.testCounts !== null
+    || receipt.artifactFingerprint !== null
+    || Object.prototype.hasOwnProperty.call(receipt, "outputFingerprint")
+    || Object.prototype.hasOwnProperty.call(receipt, "testEvidence")
+    || Object.prototype.hasOwnProperty.call(receipt, "testEvidenceFingerprint")
+    || !RELEASE_GATE_CIRCULAR_PATHS.includes(RELEASE_CHECKLIST_ARTIFACT_PATH)) {
+    failReleaseGateTree();
+  }
+  validateProvisionalReleaseChecklistArtifact(context, proof);
+  return Object.freeze({
+    identity: Object.freeze({ ...proof.identity }),
+    path: proof.path,
+    sha256: proof.sha256,
+    stepId: proof.stepId,
+  });
+}
+
+function validateProvisionalReleaseChecklistArtifact(context, proof) {
+  const target = resolveExistingRepositoryFile(
+    RELEASE_CHECKLIST_ARTIFACT_PATH,
+    context.root,
+    { subtree: ".quality/gates" },
+  );
+  const current = digestStableSingleLinkFile(target, {
+    errorMessage: "Provisional release-checklist output is unsafe or changed.",
+    expectedIdentity: proof.identity,
+    fileSystem: context.fileSystem,
+    maximumBytes: MAX_GENERATED_FILE_BYTES,
+    minimumBytes: 1,
+  });
+  if (current.sha256 !== proof.sha256
+    || !sameFileIdentity(current.identity, proof.identity)) {
+    failReleaseGateTree();
+  }
+  return current.identity;
+}
+
+function validateOwnerStepArtifacts(receipt, step, context, releaseChecklistOutputProof) {
+  if (releaseChecklistOutputProof && step.id === RELEASE_CHECKLIST_STEP_ID) {
+    return validateProvisionalReleaseChecklistArtifact(
+      context,
+      releaseChecklistOutputProof,
+    );
+  }
+  validateStepArtifacts(receipt, step, context.root);
+  return null;
 }
 
 function validatePreservedGateBindings(generations, owner) {
@@ -344,10 +442,11 @@ function validatePreservedGateBindings(generations, owner) {
       }
     }
     for (let index = 0; index < owner.context.plan.length; index += 1) {
-      validateStepArtifacts(
+      validateOwnerStepArtifacts(
         owner.receipts[index],
         owner.context.plan[index],
-        owner.context.root,
+        owner.context,
+        owner.releaseChecklistOutputProof,
       );
     }
   } catch {

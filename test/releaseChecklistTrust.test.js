@@ -6,7 +6,14 @@ const { spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { writeJson } = require("../scripts/quality/common");
 const { fingerprint } = require("../scripts/quality/evidence");
+const {
+  artifactFingerprintForStep,
+  getGatePlan,
+  receiptPath,
+} = require("../scripts/quality/gate");
+const TEST_INVENTORIES = require("./testInventories");
 const {
   AUTHENTICATED_CANDIDATE_ARTIFACT,
   AUTHENTICATED_CANDIDATE_RECEIPT,
@@ -409,6 +416,106 @@ function evaluate(fixture, document = fixture.document, overrides = {}) {
   });
 }
 
+function writeReleaseProgressAtSecretScan(root, source) {
+  const plan = getGatePlan("release");
+  const inventoryByStep = {
+    "standalone-tests": TEST_INVENTORIES.STANDALONE_NODE_TESTS,
+    "extension-host-core": TEST_INVENTORIES.VSCODE_CORE_TESTS,
+    "extension-host-smoke": TEST_INVENTORIES.VSCODE_SMOKE_TESTS,
+  };
+  let reachedExposureScan = false;
+  for (const step of plan) {
+    if (step.id === "secret-release") reachedExposureScan = true;
+    let receipt = {
+      schemaVersion: 1,
+      profile: "release",
+      sequence: step.sequence,
+      stepId: step.id,
+      category: step.category,
+      command: step.command,
+      source,
+      status: "not-run",
+      exitCode: null,
+      signal: null,
+      reason: "not-started",
+      testCounts: null,
+      artifactFingerprint: null,
+    };
+    if (!reachedExposureScan) {
+      let testEvidence = null;
+      let testEvidenceFingerprint = null;
+      if (step.evidencePath) {
+        const tests = inventoryByStep[step.id].map(file => ({
+          file,
+          title: `synthetic ${file}`,
+          fullTitle: `synthetic suite ${file}`,
+          status: "passed",
+        }));
+        testEvidence = {
+          schemaVersion: 1,
+          source,
+          suite: step.id,
+          counts: { passed: tests.length, failed: 0, pending: 0 },
+          tests,
+        };
+        writeJson(step.evidencePath, testEvidence, root, {
+          subtree: ".quality/test-results",
+        });
+        testEvidenceFingerprint = crypto.createHash("sha256")
+          .update(`${JSON.stringify(testEvidence, null, 2)}\n`)
+          .digest("hex");
+      }
+      for (const artifactPath of [
+        ...(step.artifactPaths || []),
+        ...(step.artifactPath ? [step.artifactPath] : []),
+      ]) {
+        const target = path.join(root, ...artifactPath.split("/"));
+        if (!fs.existsSync(target)) {
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          fs.writeFileSync(target, `synthetic ${step.id} artifact\n`);
+        }
+      }
+      receipt = {
+        ...receipt,
+        status: "passed",
+        exitCode: 0,
+        reason: null,
+        outputFingerprint: crypto.createHash("sha256").update("").digest("hex"),
+        testEvidence,
+        testEvidenceFingerprint,
+        artifactFingerprint: artifactFingerprintForStep(step, root),
+      };
+    }
+    writeJson(receiptPath(receipt), receipt, root, {
+      subtree: ".quality/gates/release",
+    });
+  }
+  return plan;
+}
+
+function completeReleaseStep(root, plan, stepId, status = "passed") {
+  const step = plan.find(candidate => candidate.id === stepId);
+  const relativePath = receiptPath({
+    profile: "release",
+    sequence: step.sequence,
+    stepId: step.id,
+  });
+  const receipt = JSON.parse(fs.readFileSync(
+    path.join(root, ...relativePath.split("/")),
+    "utf8",
+  ));
+  writeJson(relativePath, {
+    ...receipt,
+    status,
+    exitCode: status === "blocked" ? 2 : 0,
+    reason: null,
+    outputFingerprint: crypto.createHash("sha256").update("").digest("hex"),
+    testEvidence: null,
+    testEvidenceFingerprint: null,
+    artifactFingerprint: artifactFingerprintForStep(step, root),
+  }, root, { subtree: ".quality/gates/release" });
+}
+
 function writeReleaseExposureFixture(fixture, document, inputPath, overrides = {}) {
   const uiCandidateBytes = fs.readFileSync(fixture.authenticatedCandidateArtifactPath);
   const uiCandidateBase = clone(fixture.authenticatedCandidateReceipt);
@@ -456,7 +563,12 @@ function writeReleaseExposureFixture(fixture, document, inputPath, overrides = {
     overrides,
     "evidenceManifest",
   ) ? overrides.evidenceManifest : qualificationEvidenceManifest(document);
-  const generatedEvidence = captureGeneratedEvidenceManifest(fixture.root);
+  if (typeof overrides.beforeCaptureGeneratedEvidence === "function") {
+    overrides.beforeCaptureGeneratedEvidence({ fixture, uiResultBytes });
+  }
+  const generatedEvidence = captureGeneratedEvidenceManifest(fixture.root, null, {
+    source: SOURCE,
+  });
   const receipt = buildReleaseExposureResult({
     source: SOURCE,
     candidateReceiptFingerprint: overrides.candidateReceiptFingerprint
@@ -879,6 +991,41 @@ suite("Release checklist trust receipts", () => {
     );
   });
 
+  test("persists its exact result while the parent release receipt is still pending", () => {
+    const inputPath = "internal_docs/quality/live-qualification.json";
+    const outputPath = ".quality/gates/live-qualification-status.json";
+    fs.writeFileSync(
+      path.join(fixture.root, inputPath),
+      `${JSON.stringify(fixture.document, null, 2)}\n`,
+    );
+    let releasePlan;
+    writeReleaseExposureFixture(fixture, fixture.document, inputPath, {
+      beforeCaptureGeneratedEvidence() {
+        releasePlan = writeReleaseProgressAtSecretScan(fixture.root, SOURCE);
+      },
+    });
+    completeReleaseStep(fixture.root, releasePlan, "secret-release");
+
+    const result = runChecklist({
+      inputPath,
+      now: NOW,
+      outputPath,
+      root: fixture.root,
+      source: SOURCE,
+      workflows: WORKFLOWS,
+      qualificationHomeDirectory: fixture.qualificationHomeDirectory,
+    });
+    const persisted = JSON.parse(fs.readFileSync(
+      path.join(fixture.root, outputPath),
+      "utf8",
+    ));
+
+    assert.strictEqual(result.status, "passed");
+    assert.notStrictEqual(result.reason, ACCEPTANCE_BOUNDARY_DRIFT_REASON);
+    assert.deepStrictEqual(persisted, result);
+    completeReleaseStep(fixture.root, releasePlan, "release-checklist");
+  });
+
   test("rejects missing, crossed, and omitted disk release-exposure proof", () => {
     const inputPath = "internal_docs/quality/live-qualification.json";
     fs.writeFileSync(
@@ -1058,6 +1205,17 @@ suite("Release checklist trust receipts", () => {
         const replacement = `${generatedMarkerPath}.replacement`;
         fs.writeFileSync(replacement, generatedMarkerBytes);
         fs.renameSync(replacement, generatedMarkerPath);
+      },
+      "checklist-same-byte-replacement"({ rowFixture }) {
+        const checklistPath = path.join(
+          rowFixture.root,
+          ".quality",
+          "gates",
+          "live-qualification-status.json",
+        );
+        const replacement = `${checklistPath}.replacement`;
+        fs.writeFileSync(replacement, fs.readFileSync(checklistPath));
+        fs.renameSync(replacement, checklistPath);
       },
     };
 
