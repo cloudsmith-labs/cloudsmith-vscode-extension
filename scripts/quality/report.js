@@ -1,7 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const crypto = require("crypto");
-const fs = require("fs");
 const path = require("path");
 const { isDeepStrictEqual } = require("util");
 const {
@@ -21,7 +20,12 @@ const {
   fingerprint,
   sourceIdentity,
 } = require("./evidence");
-const { getGatePlan, receiptPath, validateTestEvidence } = require("./gate");
+const {
+  getGatePlan,
+  receiptPath,
+  validateTestEvidence,
+  validateTestEvidenceBinding,
+} = require("./gate");
 const { impactFingerprint } = require("./impact");
 const {
   decodeFindingsBytes,
@@ -38,7 +42,10 @@ const {
   requiredLiveWorkflowIds,
 } = require("./release-checklist");
 const { validateMutationSummary } = require("./run-mutation");
-const { validateCandidateBinding } = require("./candidate-binding");
+const {
+  validateCandidateBinding,
+  withStableSingleLinkFile,
+} = require("./candidate-binding");
 
 const DEFAULT_JSON_OUTPUT = ".quality/report.json";
 const DEFAULT_MARKDOWN_OUTPUT = ".quality/report.md";
@@ -46,6 +53,7 @@ const DEFAULT_FINDINGS = "internal_docs/quality/findings.jsonl";
 const DEFAULT_LIVE_STATUS = ".quality/gates/live-qualification-status.json";
 const DEFAULT_UI_RESULT = ".quality/ui/result.json";
 const DEFAULT_CANDIDATE_RECEIPT = ".quality/qualification/candidate.json";
+const MAX_REPORT_INPUT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_EXTENSION_VERSION = require("../../package.json").version;
 const UI_BLOCKED_REASON = "Black-box UI qualification is blocked by the current host environment.";
 const FINDING_DOMAINS = Object.freeze([
@@ -208,6 +216,7 @@ function normalizeGateReceipt(receipt, step, source) {
     exitCode: null,
     signal: null,
     testCounts: null,
+    testEvidenceFingerprint: null,
     artifactFingerprint: null,
     reason: "missing-receipt",
     present: false,
@@ -227,6 +236,12 @@ function normalizeGateReceipt(receipt, step, source) {
   if (receipt.status === "passed" && requiresTestEvidence) {
     const evidenceError = validateTestEvidence(receipt.testEvidence, step, source);
     if (evidenceError) integrityErrors.push(`test-evidence:${evidenceError}`);
+    if (!/^[a-f0-9]{64}$/u.test(receipt.testEvidenceFingerprint || "")) {
+      integrityErrors.push("missing-or-invalid-test-evidence-fingerprint");
+    }
+  } else if (!requiresTestEvidence && receipt.testEvidenceFingerprint !== null
+    && receipt.testEvidenceFingerprint !== undefined) {
+    integrityErrors.push("unexpected-test-evidence-fingerprint");
   }
   if (["passed", "blocked"].includes(receipt.status) && stepRequiresArtifacts(step)
     && !/^[a-f0-9]{64}$/u.test(receipt.artifactFingerprint || "")) {
@@ -247,6 +262,7 @@ function normalizeGateReceipt(receipt, step, source) {
     signal: receipt.signal || null,
     testCounts,
     testEvidence: receipt.testEvidence || null,
+    testEvidenceFingerprint: receipt.testEvidenceFingerprint || null,
     artifactFingerprint: receipt.artifactFingerprint || null,
     reason: integrityErrors.length > 0
       ? `receipt-integrity:${integrityErrors.join(",")}`
@@ -1316,7 +1332,20 @@ function loadReportInputs(options = {}) {
     profile,
     sequence: step.sequence,
     stepId: step.id,
-  }), root, ".quality/gates")).filter(Boolean);
+  }), root, ".quality/gates", options)).filter(Boolean);
+  const receiptByStep = new Map(receipts.map(receipt => [receipt?.stepId, receipt]));
+  for (const step of plan.filter(item => item.evidencePath)) {
+    const receipt = receiptByStep.get(step.id);
+    if (!receipt || (receipt.status !== "passed"
+      && (receipt.testEvidenceFingerprint === null
+        || receipt.testEvidenceFingerprint === undefined))) {
+      continue;
+    }
+    const bindingError = validateTestEvidenceBinding(receipt, step, root);
+    if (bindingError) {
+      throw new Error(`Quality report test evidence ${step.id} is untrusted: ${bindingError}.`);
+    }
+  }
   const findingsPath = options.findingsPath || DEFAULT_FINDINGS;
   let findings = [];
   let findingsStatus = "not-run";
@@ -1333,7 +1362,9 @@ function loadReportInputs(options = {}) {
   }
   if (findingsTarget) {
     try {
-      const findingsBytes = readBoundedFindingsBytes(findingsTarget);
+      const findingsBytes = readBoundedFindingsBytes(findingsTarget, {
+        fileSystem: options.fileSystem,
+      });
       findingsFingerprint = crypto.createHash("sha256").update(findingsBytes).digest("hex");
       findings = parseFindingsJsonl(decodeFindingsBytes(findingsBytes));
       if (findings.length === 0) throw new Error("Findings ledger must not be empty.");
@@ -1352,37 +1383,43 @@ function loadReportInputs(options = {}) {
   const mutationArtifact = readOptionalRepositoryJsonArtifact(
     ".quality/mutation/summary-changed.json",
     root,
-    ".quality/mutation"
+    ".quality/mutation",
+    options,
   ) || readOptionalRepositoryJsonArtifact(
     ".quality/mutation/summary-core.json",
     root,
-    ".quality/mutation"
+    ".quality/mutation",
+    options,
   );
   const liveArtifact = profile === "release"
     ? readOptionalRepositoryJsonArtifact(
       DEFAULT_LIVE_STATUS,
       root,
-      ".quality/gates"
+      ".quality/gates",
+      options,
     )
     : null;
   const uiArtifact = profile === "release"
     ? readOptionalRepositoryJsonArtifact(
       DEFAULT_UI_RESULT,
       root,
-      ".quality/ui"
+      ".quality/ui",
+      options,
     )
     : null;
   const candidateArtifact = profile === "release"
     ? readOptionalRepositoryJsonArtifact(
       DEFAULT_CANDIDATE_RECEIPT,
       root,
-      ".quality/qualification"
+      ".quality/qualification",
+      options,
     )
     : null;
   const impactArtifact = readOptionalRepositoryJsonArtifact(
     ".quality/impact.json",
     root,
-    ".quality"
+    ".quality",
+    options,
   );
   return {
     root,
@@ -1412,19 +1449,30 @@ function loadReportInputs(options = {}) {
   };
 }
 
-function readOptionalRepositoryJson(relativePath, root, subtree) {
+function readOptionalRepositoryJson(relativePath, root, subtree, options = {}) {
   const target = resolveOptionalRepositoryFile(relativePath, root, { subtree });
-  return target ? JSON.parse(fs.readFileSync(target, "utf8")) : null;
+  return target
+    ? JSON.parse(readBoundedReportInputBytes(target, relativePath, options).toString("utf8"))
+    : null;
 }
 
-function readOptionalRepositoryJsonArtifact(relativePath, root, subtree) {
+function readOptionalRepositoryJsonArtifact(relativePath, root, subtree, options = {}) {
   const target = resolveOptionalRepositoryFile(relativePath, root, { subtree });
   if (!target) return null;
-  const bytes = fs.readFileSync(target);
+  const bytes = readBoundedReportInputBytes(target, relativePath, options);
   return {
     value: JSON.parse(bytes.toString("utf8")),
     fingerprint: crypto.createHash("sha256").update(bytes).digest("hex"),
   };
+}
+
+function readBoundedReportInputBytes(target, relativePath, options = {}) {
+  return withStableSingleLinkFile(target, {
+    errorMessage: `Quality report input is unsafe or changed: ${relativePath}.`,
+    fileSystem: options.fileSystem,
+    maximumBytes: MAX_REPORT_INPUT_BYTES,
+    minimumBytes: 0,
+  }, bytes => Buffer.from(bytes));
 }
 
 function discoverUiArtifacts(root) {

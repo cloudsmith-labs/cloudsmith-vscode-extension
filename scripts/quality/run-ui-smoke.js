@@ -17,6 +17,10 @@ const {
   writeJson,
 } = require("./common");
 const { fingerprint, sourceIdentity } = require("./evidence");
+const {
+  cleanupNonAuthQualityEnvironment,
+  createNonAuthQualityEnvironment,
+} = require("./non-auth-environment");
 const { sanitizeQualificationEnvironment } = require("../../test/testInventories");
 
 const RESULT_PATH = ".quality/ui/result.json";
@@ -43,6 +47,19 @@ const DIRECT_ENTRY_SENTINEL_TEXT = "This regular-file sentinel makes direct ExTe
 const MAX_EVIDENCE_BYTES = 64 * 1024;
 const MAX_VSIX_BYTES = 12 * 1024 * 1024;
 const MAX_VSIX_ENTRIES = 1250;
+const PRIVATE_NON_AUTH_TOOL_ENVIRONMENT_NAMES = Object.freeze([
+  "NPM_CONFIG_USERCONFIG",
+  "NPM_CONFIG_GLOBALCONFIG",
+  "NPM_CONFIG_CACHE",
+  "NPM_CONFIG_UPDATE_NOTIFIER",
+  "NPM_CONFIG_FUND",
+  "GIT_CONFIG_NOSYSTEM",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_COUNT",
+  "GIT_ATTR_NOSYSTEM",
+  "GIT_TERMINAL_PROMPT",
+  "GCM_INTERACTIVE",
+]);
 const SAFE_FAILURE_MESSAGES = Object.freeze({
   UI_CANDIDATE_INVALID: "The black-box UI candidate failed closed before launch.",
   UI_DRIVER_INVALID: "The black-box UI driver setup failed closed before launch.",
@@ -62,6 +79,20 @@ async function runUiSmoke(options = {}) {
   const architecture = options.architecture || process.arch;
   const spawn = options.spawnSync || spawnSync;
   const readSource = options.sourceIdentity || sourceIdentity;
+  let nonAuthBoundary;
+  try {
+    nonAuthBoundary = createNonAuthQualityEnvironment({
+      environment: options.environment || process.env,
+      platform,
+      temporaryParent: options.temporaryParent,
+    });
+  } catch {
+    throw safeFailure("UI_SMOKE_FAILED");
+  }
+  // Linux phases invoke xvfb-run below. The complete direct runner lifecycle
+  // owns one private home, temporary tree, and empty npm/Git configuration;
+  // only a fresh per-phase Xvfb capability reaches an individual UI child.
+  const bootstrapEnvironment = nonAuthBoundary.environment;
   let candidate = null;
   let result = null;
   let failure = null;
@@ -82,7 +113,7 @@ async function runUiSmoke(options = {}) {
       options.toolPackage,
       options.nodeVersion || process.versions.node
     );
-    const xvfb = resolveXvfb(platform, options.environment || process.env, options.xvfbPath);
+    const xvfb = resolveXvfb(platform, bootstrapEnvironment, options.xvfbPath);
     const extestCli = options.extestCli || resolveExtestCli(root);
     validateDeclaredInventory(root);
     safeStageCode = "UI_CANDIDATE_INVALID";
@@ -90,7 +121,8 @@ async function runUiSmoke(options = {}) {
       root,
       mode: "ci",
       launch: false,
-      environment: options.environment || process.env,
+      environment: bootstrapEnvironment,
+      nonAuthBoundary,
       prepareCode: options.prepareCode || (context => prepareExTesterCode(context, {
         spawn,
         extestCli,
@@ -98,11 +130,11 @@ async function runUiSmoke(options = {}) {
       })),
       adapters: options.candidateAdapters,
     });
-    const source = readSource(root, options.gitSpawn || spawn);
+    const source = readSource(root, options.gitSpawn || spawn, bootstrapEnvironment);
     const binding = validateCandidate(candidate, { root, source, tool, platform, architecture });
     validateLaunchArguments(launchArguments(candidate.profile), candidate.profile);
     const baseEnvironment = buildUiEnvironment(
-      options.environment || process.env,
+      bootstrapEnvironment,
       candidate.profile,
       source,
       platform
@@ -161,7 +193,7 @@ async function runUiSmoke(options = {}) {
     });
     validateSuiteEvidence(suite.evidence, source, suite.nonce);
     safeStageCode = "UI_SOURCE_DRIFT";
-    const finalSource = readSource(root, options.gitSpawn || spawn);
+    const finalSource = readSource(root, options.gitSpawn || spawn, bootstrapEnvironment);
     if (!sameSource(finalSource, source)) throw safeFailure("UI_SOURCE_DRIFT");
 
     result = passedReceipt(source, tool, binding, platform, architecture);
@@ -169,16 +201,23 @@ async function runUiSmoke(options = {}) {
     failure = normalizeFailure(error, safeStageCode);
   }
 
-  if (candidate?.cleanup) {
-    try {
+  try {
+    const cleanupCandidate = candidate?.cleanup;
+    if (cleanupCandidate) {
       const profileRoot = candidate.profile?.root;
-      const cleaned = await candidate.cleanup();
+      const cleaned = await cleanupCandidate.call(candidate);
       if (cleaned !== true || typeof profileRoot !== "string" || fs.existsSync(profileRoot)) {
         throw safeFailure("UI_PROFILE_CLEANUP_FAILED");
       }
-    } catch {
-      failure = safeFailure("UI_PROFILE_CLEANUP_FAILED");
     }
+  } catch {
+    failure = safeFailure("UI_PROFILE_CLEANUP_FAILED");
+  }
+
+  try {
+    cleanupNonAuthQualityEnvironment(nonAuthBoundary);
+  } catch {
+    failure = safeFailure("UI_SMOKE_FAILED");
   }
 
   if (failure) {
@@ -524,6 +563,10 @@ function buildUiEnvironment(environment, profile, source, platform) {
     CLOUDSMITH_QUALITY_SOURCE_SHA: source.sha,
     CLOUDSMITH_QUALITY_SOURCE_FINGERPRINT: source.fingerprint,
   });
+  for (const name of PRIVATE_NON_AUTH_TOOL_ENVIRONMENT_NAMES) {
+    if (typeof environment[name] !== "string") throw safeFailure("UI_DRIVER_INVALID");
+    sanitized[name] = environment[name];
+  }
   return Object.freeze(sanitized);
 }
 

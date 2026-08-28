@@ -4,6 +4,8 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
+const { exactFileIdentity } = require("../scripts/quality/candidate-binding");
 const { fingerprint } = require("../scripts/quality/evidence");
 const {
   LOCAL_PROFILE_BASENAME,
@@ -18,6 +20,7 @@ const {
 } = require("../scripts/quality/qualification-profile");
 const {
   assertStableSource,
+  createVerifiedInstallArtifact,
   discoverLocalCodePaths,
   exactVersionState,
   installAndVerifyCandidate,
@@ -28,6 +31,8 @@ const {
   qualificationEnvironment,
   qualificationLaunchArguments,
   resolveCodeInstallation,
+  verifyQualificationArtifact,
+  verifyQualificationSidecars,
 } = require("../scripts/quality/prepare-qualification");
 
 const temporaryRoots = [];
@@ -70,6 +75,23 @@ function writeCandidateRepository(root, vscodeVersion = "1.131.0") {
     path.join(root, ".vscode-test.mjs"),
     "const version = process.env.VSCODE_TEST_VERSION || \"1.134.0\";\n",
   );
+}
+
+function packageOutputFixture() {
+  const root = temporaryRoot("cloudsmith-package-output-");
+  const relative = "out/development/cloudsmith-vsc-2.3.0.vsix";
+  fs.mkdirSync(path.join(root, "out", "development"), { recursive: true });
+  for (const suffix of ["", ".sha256", ".provenance.json"]) {
+    fs.writeFileSync(path.join(root, `${relative}${suffix}`), "synthetic fixture bytes\n");
+  }
+  const bytes = Buffer.from(
+    `vsix_path=${relative}\nchecksum_path=${relative}.sha256\n`
+      + `provenance_path=${relative}.provenance.json\n`,
+    "utf8",
+  );
+  const output = path.join(root, "package-output");
+  fs.writeFileSync(output, bytes);
+  return { bytes, output, relative, root };
 }
 
 suite("qualification candidate isolation", () => {
@@ -237,6 +259,43 @@ suite("qualification candidate isolation", () => {
     assert.strictEqual(resetLocalQualificationProfile({ homeDirectory: home }), false);
   });
 
+  test("local reset fails closed on final persistent-root substitution", () => {
+    const parent = temporaryRoot("cloudsmith-local-profile-reset-swap-");
+    const home = path.join(parent, "home");
+    fs.mkdirSync(home, { mode: 0o700 });
+    const profile = prepareLocalQualificationProfile({ homeDirectory: home });
+    fs.writeFileSync(path.join(profile.userDataDir, "owned.txt"), "synthetic owned bytes\n");
+    const victim = path.join(home, "synthetic-local-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "synthetic victim survives\n");
+    const displaced = path.join(home, "owned-profile-displaced");
+    const originalRename = fs.renameSync;
+    const originalRmdir = fs.rmdirSync;
+    let substituted = false;
+    try {
+      fs.rmdirSync = function interceptFinalLocalProfileRemoval(target, options) {
+        if (!substituted && target === profile.root) {
+          originalRename.call(fs, target, displaced);
+          originalRename.call(fs, victim, target);
+          substituted = true;
+        }
+        return originalRmdir.call(fs, target, options);
+      };
+      assert.throws(
+        () => resetLocalQualificationProfile({ homeDirectory: home }),
+        /unsafe or changed profile tree/u,
+      );
+    } finally {
+      fs.rmdirSync = originalRmdir;
+    }
+    assert.strictEqual(substituted, true);
+    assert.strictEqual(fs.existsSync(displaced), true);
+    assert.strictEqual(
+      fs.readFileSync(path.join(profile.root, "preserve.txt"), "utf8"),
+      "synthetic victim survives\n",
+    );
+  });
+
   test("local reset refuses a symbolic-link or unknown ownership marker", () => {
     const parent = temporaryRoot();
     const home = path.join(parent, "home");
@@ -282,6 +341,125 @@ suite("qualification candidate isolation", () => {
     assert.throws(() => cleanupCiQualificationProfile(profile), /did not create/);
   });
 
+  test("CI profile cleanup fails closed on final root substitution", () => {
+    const parent = temporaryRoot("cloudsmith-ci-profile-cleanup-swap-");
+    const profile = createCiQualificationProfile({ temporaryParent: parent });
+    fs.mkdirSync(path.join(profile.userDataDir, "nested"));
+    fs.writeFileSync(
+      path.join(profile.userDataDir, "nested", "owned.txt"),
+      "synthetic owned profile bytes\n",
+    );
+    const victim = path.join(parent, "synthetic-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "synthetic victim survives\n");
+    const displaced = path.join(parent, "owned-profile-displaced");
+    const originalRename = fs.renameSync;
+    const originalRmdir = fs.rmdirSync;
+    let substituted = false;
+    try {
+      fs.rmdirSync = function interceptFinalProfileRemoval(target, options) {
+        if (!substituted && target === profile.root) {
+          originalRename.call(fs, target, displaced);
+          originalRename.call(fs, victim, target);
+          substituted = true;
+        }
+        return originalRmdir.call(fs, target, options);
+      };
+      assert.throws(
+        () => cleanupCiQualificationProfile(profile),
+        /unsafe or changed profile tree/u,
+      );
+    } finally {
+      fs.rmdirSync = originalRmdir;
+    }
+    assert.strictEqual(substituted, true);
+    assert.strictEqual(fs.existsSync(displaced), true);
+    assert.strictEqual(
+      fs.readFileSync(path.join(profile.root, "preserve.txt"), "utf8"),
+      "synthetic victim survives\n",
+    );
+  });
+
+  test("CI profile cleanup rejects creator type and identity drift", () => {
+    const parent = temporaryRoot("cloudsmith-ci-profile-cleanup-drift-");
+    const profile = createCiQualificationProfile({ temporaryParent: parent });
+    const displacedSettings = path.join(parent, "owned-settings-displaced");
+    fs.renameSync(profile.userDataDir, displacedSettings);
+    fs.writeFileSync(profile.userDataDir, "synthetic wrong-type bytes\n");
+    assert.throws(
+      () => cleanupCiQualificationProfile(profile),
+      /unsafe or changed profile tree/u,
+    );
+    assert.strictEqual(
+      fs.readFileSync(profile.userDataDir, "utf8"),
+      "synthetic wrong-type bytes\n",
+    );
+    fs.unlinkSync(profile.userDataDir);
+
+    fs.mkdirSync(profile.userDataDir, { mode: 0o700 });
+    fs.writeFileSync(
+      path.join(profile.userDataDir, "preserve.txt"),
+      "synthetic replacement survives\n",
+    );
+    assert.throws(
+      () => cleanupCiQualificationProfile(profile),
+      /unsafe or changed profile tree/u,
+    );
+    assert.strictEqual(
+      fs.readFileSync(path.join(profile.userDataDir, "preserve.txt"), "utf8"),
+      "synthetic replacement survives\n",
+    );
+    fs.rmSync(profile.userDataDir, { recursive: true, force: true });
+    fs.renameSync(displacedSettings, profile.userDataDir);
+    assert.strictEqual(cleanupCiQualificationProfile(profile), true);
+  });
+
+  test("verified install cleanup is exact and fails closed on final root substitution", () => {
+    const parent = temporaryRoot("cloudsmith-install-cleanup-swap-");
+    const bytes = Buffer.from("synthetic verified VSIX bytes\n", "utf8");
+    const verification = Object.freeze({
+      archiveBytes: bytes.length,
+      buffer: bytes,
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+    });
+    const exact = createVerifiedInstallArtifact(verification, { temporaryParent: parent });
+    const exactRoot = path.dirname(exact.file);
+    exact.cleanup();
+    assert.strictEqual(fs.existsSync(exactRoot), false);
+
+    const swapped = createVerifiedInstallArtifact(verification, { temporaryParent: parent });
+    const swappedRoot = path.dirname(swapped.file);
+    const victim = path.join(parent, "synthetic-install-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "synthetic victim survives\n");
+    const displaced = path.join(parent, "owned-install-displaced");
+    const originalRename = fs.renameSync;
+    const originalRmdir = fs.rmdirSync;
+    let substituted = false;
+    try {
+      fs.rmdirSync = function interceptFinalInstallRemoval(target, options) {
+        if (!substituted && target === swappedRoot) {
+          originalRename.call(fs, target, displaced);
+          originalRename.call(fs, victim, target);
+          substituted = true;
+        }
+        return originalRmdir.call(fs, target, options);
+      };
+      assert.throws(
+        () => swapped.cleanup(),
+        /unsafe or changed tree/u,
+      );
+    } finally {
+      fs.rmdirSync = originalRmdir;
+    }
+    assert.strictEqual(substituted, true);
+    assert.strictEqual(fs.existsSync(displaced), true);
+    assert.strictEqual(
+      fs.readFileSync(path.join(swappedRoot, "preserve.txt"), "utf8"),
+      "synthetic victim survives\n",
+    );
+  });
+
   test("default CI profile keeps the macOS VS Code IPC socket path below its limit", () => {
     const profile = createCiQualificationProfile();
     try {
@@ -314,6 +492,45 @@ suite("qualification candidate isolation", () => {
       /refuses persistent/,
     );
     cleanupCiQualificationProfile(profile);
+  });
+
+  test("CI probe user-data reset fails closed on final settings substitution", () => {
+    const parent = temporaryRoot("cloudsmith-ci-settings-reset-swap-");
+    const profile = createCiQualificationProfile({ temporaryParent: parent });
+    fs.mkdirSync(path.join(profile.userDataDir, "nested"));
+    fs.writeFileSync(
+      path.join(profile.userDataDir, "nested", "owned.txt"),
+      "synthetic owned settings bytes\n",
+    );
+    const victim = path.join(parent, "synthetic-settings-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "synthetic victim survives\n");
+    const displaced = path.join(parent, "owned-settings-displaced");
+    const originalRename = fs.renameSync;
+    const originalRmdir = fs.rmdirSync;
+    let substituted = false;
+    try {
+      fs.rmdirSync = function interceptFinalSettingsRemoval(target, options) {
+        if (!substituted && target === profile.userDataDir) {
+          originalRename.call(fs, target, displaced);
+          originalRename.call(fs, victim, target);
+          substituted = true;
+        }
+        return originalRmdir.call(fs, target, options);
+      };
+      assert.throws(
+        () => resetCiQualificationUserData(profile),
+        /unsafe or changed user-data tree/u,
+      );
+    } finally {
+      fs.rmdirSync = originalRmdir;
+    }
+    assert.strictEqual(substituted, true);
+    assert.strictEqual(fs.existsSync(displaced), true);
+    assert.strictEqual(
+      fs.readFileSync(path.join(profile.userDataDir, "preserve.txt"), "utf8"),
+      "synthetic victim survives\n",
+    );
   });
 
   test("Apple metadata cleanup removes only Git-listed real metadata files", () => {
@@ -456,6 +673,189 @@ suite("qualification candidate isolation", () => {
     assert.throws(
       () => parsePackageOutput(output, root, "cloudsmith-vsc", "2.3.0"),
       /unexpected or duplicate/,
+    );
+  });
+
+  test("package output stays bound to one pathname inode through parsing", () => {
+    const fixture = packageOutputFixture();
+    const displaced = `${fixture.output}.opened`;
+    let swapped = false;
+    const fileSystem = Object.create(fs);
+    fileSystem.readSync = (...arguments_) => {
+      const bytesRead = fs.readSync(...arguments_);
+      if (!swapped) {
+        fs.renameSync(fixture.output, displaced);
+        fs.writeFileSync(fixture.output, fixture.bytes);
+        swapped = true;
+      }
+      return bytesRead;
+    };
+    assert.throws(
+      () => parsePackageOutput(
+        fixture.output,
+        fixture.root,
+        "cloudsmith-vsc",
+        "2.3.0",
+        { fileSystem },
+      ),
+      /exact bounded single-link file/u,
+    );
+    assert.strictEqual(swapped, true);
+  });
+
+  test("package output rejects symbolic and multiply-linked files", () => {
+    for (const kind of ["symbolic", "hard"]) {
+      const fixture = packageOutputFixture();
+      const source = `${fixture.output}.source`;
+      fs.renameSync(fixture.output, source);
+      if (kind === "symbolic") fs.symlinkSync(source, fixture.output);
+      else fs.linkSync(source, fixture.output);
+      assert.throws(
+        () => parsePackageOutput(
+          fixture.output,
+          fixture.root,
+          "cloudsmith-vsc",
+          "2.3.0",
+        ),
+        /exact bounded single-link file/u,
+        `${kind} package output must fail closed`,
+      );
+    }
+  });
+
+  test("package output opens a post-check FIFO nonblocking and fails closed", function fifoTest() {
+    if (process.platform === "win32") this.skip();
+    const fixture = packageOutputFixture();
+    const displaced = `${fixture.output}.regular`;
+    let substituted = false;
+    const fileSystem = Object.create(fs);
+    fileSystem.openSync = (target, flags) => {
+      if (!substituted && target === fixture.output) {
+        fs.renameSync(fixture.output, displaced);
+        const created = spawnSync("mkfifo", [fixture.output]);
+        assert.strictEqual(created.status, 0);
+        substituted = true;
+      }
+      return fs.openSync(target, flags);
+    };
+    assert.throws(
+      () => parsePackageOutput(
+        fixture.output,
+        fixture.root,
+        "cloudsmith-vsc",
+        "2.3.0",
+        { fileSystem },
+      ),
+      /exact bounded single-link file/u,
+    );
+    assert.strictEqual(substituted, true);
+  });
+
+  test("package output detects growth beyond its opened descriptor size", () => {
+    const fixture = packageOutputFixture();
+    let grew = false;
+    const fileSystem = Object.create(fs);
+    fileSystem.readSync = (...arguments_) => {
+      const bytesRead = fs.readSync(...arguments_);
+      if (!grew) {
+        fs.appendFileSync(fixture.output, "\n");
+        grew = true;
+      }
+      return bytesRead;
+    };
+    assert.throws(
+      () => parsePackageOutput(
+        fixture.output,
+        fixture.root,
+        "cloudsmith-vsc",
+        "2.3.0",
+        { fileSystem },
+      ),
+      /exact bounded single-link file/u,
+    );
+    assert.strictEqual(grew, true);
+  });
+
+  test("package output enforces its byte bound before opening", () => {
+    const fixture = packageOutputFixture();
+    let opened = false;
+    const fileSystem = Object.create(fs);
+    fileSystem.lstatSync = (target, options) => {
+      const stat = fs.lstatSync(target, options);
+      if (target === fixture.output) stat.size = BigInt(16 * 1024 + 1);
+      return stat;
+    };
+    fileSystem.openSync = (...arguments_) => {
+      opened = true;
+      return fs.openSync(...arguments_);
+    };
+    assert.throws(
+      () => parsePackageOutput(
+        fixture.output,
+        fixture.root,
+        "cloudsmith-vsc",
+        "2.3.0",
+        { fileSystem },
+      ),
+      /exact bounded single-link file/u,
+    );
+    assert.strictEqual(opened, false);
+  });
+
+  test("injected artifact verifier rejects identityless and forged results", async () => {
+    const fixture = packageOutputFixture();
+    const artifact = path.join(fixture.root, fixture.relative);
+    const buffer = fs.readFileSync(artifact);
+    const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
+    const base = {
+      archiveBytes: buffer.length,
+      buffer,
+      entryCount: 1,
+      manifest: { name: "cloudsmith-vsc", publisher: "Cloudsmith", version: "2.3.0" },
+      sha256,
+      totalUncompressedBytes: buffer.length,
+    };
+    await assert.rejects(
+      verifyQualificationArtifact(artifact, {}, async () => ({ ...base })),
+      /descriptor-proven artifact identity/u,
+    );
+    const forgedIdentity = exactFileIdentity(
+      fs.lstatSync(`${artifact}.sha256`, { bigint: true }),
+    );
+    await assert.rejects(
+      verifyQualificationArtifact(
+        artifact,
+        {},
+        async () => ({ ...base, artifactIdentity: forgedIdentity }),
+      ),
+      /descriptor-proven artifact identity/u,
+    );
+  });
+
+  test("injected sidecar verifier rejects identityless and forged results", () => {
+    const fixture = packageOutputFixture();
+    const artifact = path.join(fixture.root, fixture.relative);
+    const buffer = fs.readFileSync(artifact);
+    const verification = Object.freeze({
+      archiveBytes: buffer.length,
+      artifactIdentity: exactFileIdentity(fs.lstatSync(artifact, { bigint: true })),
+      buffer,
+      entryCount: 1,
+      manifest: { name: "cloudsmith-vsc", publisher: "Cloudsmith", version: "2.3.0" },
+      sha256: crypto.createHash("sha256").update(buffer).digest("hex"),
+      totalUncompressedBytes: buffer.length,
+    });
+    assert.throws(
+      () => verifyQualificationSidecars(artifact, verification, {}, () => ({})),
+      /descriptor-proven identities/u,
+    );
+    assert.throws(
+      () => verifyQualificationSidecars(artifact, verification, {}, () => ({
+        artifactIdentity: verification.artifactIdentity,
+        checksumIdentity: verification.artifactIdentity,
+        provenanceIdentity: verification.artifactIdentity,
+      })),
+      /descriptor-proven identities/u,
     );
   });
 
@@ -735,6 +1135,7 @@ suite("qualification candidate isolation", () => {
             buffer: verifiedBytes,
             sha256: verifiedSha,
             archiveBytes: verifiedBytes.length,
+            artifactIdentity: exactFileIdentity(fs.lstatSync(file, { bigint: true })),
             entryCount: 7,
             manifest: { name: "cloudsmith-vsc", publisher: "Cloudsmith", version: "2.3.0" },
           };
@@ -743,7 +1144,14 @@ suite("qualification candidate isolation", () => {
           assert.strictEqual(file, artifact);
           assert.strictEqual(verification.sha256, verifiedSha);
           assert.strictEqual(sidecarOptions.expectedSourceSha, source.sha);
-          return { provenance: {} };
+          return {
+            artifactIdentity: verification.artifactIdentity,
+            checksumIdentity: exactFileIdentity(fs.lstatSync(`${file}.sha256`, { bigint: true })),
+            provenance: {},
+            provenanceIdentity: exactFileIdentity(
+              fs.lstatSync(`${file}.provenance.json`, { bigint: true }),
+            ),
+          };
         },
       },
     });

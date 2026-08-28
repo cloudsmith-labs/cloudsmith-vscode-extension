@@ -1,6 +1,5 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
-const fs = require("fs");
 const { spawnSync } = require("child_process");
 const { TextDecoder } = require("util");
 const {
@@ -11,16 +10,18 @@ const {
   resolveExistingRepositoryFile,
   uniqueSorted,
 } = require("./common");
+const { withStableSingleLinkFile } = require("./candidate-binding");
 
 const FINDINGS_MAX_BYTES = 16 * 1024 * 1024;
 const CLOSED_FINDING_STATUSES = new Set(["closed", "closed-non-issue"]);
 
-function readBoundedFindingsBytes(target) {
-  const stat = fs.lstatSync(target);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > FINDINGS_MAX_BYTES) {
-    throw new Error("The ignored findings ledger is not a bounded regular file.");
-  }
-  return fs.readFileSync(target);
+function readBoundedFindingsBytes(target, options = {}) {
+  return withStableSingleLinkFile(target, {
+    errorMessage: "The ignored findings ledger is not a bounded single-link regular file.",
+    fileSystem: options.fileSystem,
+    maximumBytes: FINDINGS_MAX_BYTES,
+    minimumBytes: 0,
+  }, bytes => Buffer.from(bytes));
 }
 
 function decodeFindingsBytes(bytes) {

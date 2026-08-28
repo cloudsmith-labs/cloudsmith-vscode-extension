@@ -7,6 +7,8 @@ const { spawnSync } = require("child_process");
 const {
   ROOT,
   readJson,
+  removeOutputFile,
+  resolveExistingRepositoryFile,
   resolveOptionalRepositoryFile,
   uniqueSorted,
   writeJson,
@@ -29,10 +31,12 @@ const {
   UI_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_RECEIPT,
   candidateBindingFromReceipt,
+  digestStableSingleLinkFile,
   validateAuthenticatedExecutionReceipt,
   validateCandidateBinding,
   validateEquivalentCandidateProduct,
   validateEquivalentExtensionArtifact,
+  withStableSingleLinkFile,
 } = require("./candidate-binding");
 const { captureRepositoryState } = require("./prepare-qualification");
 const {
@@ -56,6 +60,19 @@ const EVIDENCE_PATH_PATTERN = /^internal_docs\/quality\/[A-Za-z0-9][A-Za-z0-9._-
 const EVIDENCE_MAX_BYTES = 16 * 1024 * 1024;
 const MAX_QUALIFICATION_AGE_MS = 24 * 60 * 60 * 1000;
 const OPEN_BLOCKER_ERROR = "Live qualification must explicitly record zero open release blockers.";
+const RELEASE_EXPOSURE_FAILURE_REASON = "Release exposure verification failed closed.";
+const ACCEPTANCE_BOUNDARY_DRIFT_REASON =
+  "Release checklist acceptance boundary changed during persistence.";
+const NONPASSING_STATUS_COPY = Object.freeze({
+  blocked: "Authenticated live qualification is declared blocked.",
+  failed: "Authenticated live qualification is declared failed.",
+  "not-run": "Authenticated live qualification is declared not-run.",
+  partial: "Authenticated live qualification is declared partial.",
+});
+
+function hasReleaseExposureFailure(errors) {
+  return errors.some(error => error.startsWith("Release exposure proof is invalid:"));
+}
 
 function requiredLiveWorkflowIds(workflowsDocument) {
   return uniqueSorted((workflowsDocument?.workflows || [])
@@ -137,9 +154,9 @@ function evaluateLiveQualification(options = {}) {
       evidenceManifest,
       candidate: candidateValidation.binding,
       errors,
-      reason: nonEmpty(document.summary)
-        ? document.summary
-        : `Authenticated live qualification is declared ${declaredStatus}.`,
+      reason: hasReleaseExposureFailure(errors)
+        ? RELEASE_EXPOSURE_FAILURE_REASON
+        : NONPASSING_STATUS_COPY[declaredStatus],
     });
   }
 
@@ -183,9 +200,11 @@ function evaluateLiveQualification(options = {}) {
         ? document.visibleEnabledActions.silentNoOpCount
         : null,
     },
-    reason: blockedByOpenFindings
-      ? "Open release blockers prevent authenticated acceptance."
-      : null,
+    reason: hasReleaseExposureFailure(errors)
+      ? RELEASE_EXPOSURE_FAILURE_REASON
+      : blockedByOpenFindings
+        ? "Open release blockers prevent authenticated acceptance."
+        : null,
   });
 }
 
@@ -309,6 +328,7 @@ function validateAttestationCandidate(document, source, context) {
       root: context.root,
       source,
       artifactPath: context.liveCandidateArtifactPath,
+      fileSystem: context.fileSystem,
       repositoryState: context.repositoryState,
       homeDirectory: context.qualificationHomeDirectory,
     });
@@ -338,6 +358,7 @@ function validateAttestationCandidate(document, source, context) {
           root: context.root,
           source,
           artifactPath: context.authenticatedCandidateArtifactPath,
+          fileSystem: context.fileSystem,
         },
       );
       if (authenticatedCandidate.profileMode !== "ci") {
@@ -443,6 +464,9 @@ function validateAttestationEnvelope(document, source, errors, context) {
 
 function validateReleaseExposureBinding(document, source, errors, context) {
   try {
+    if (context.releaseExposureLoadFailed) {
+      throw new Error("Release exposure proof is unreadable.");
+    }
     if (!context.releaseExposureReceipt) {
       throw new Error("Release exposure proof is missing.");
     }
@@ -462,6 +486,7 @@ function validateReleaseExposureBinding(document, source, errors, context) {
       root: context.root,
       source,
       artifactPath: context.uiCandidateArtifactPath,
+      fileSystem: context.fileSystem,
     });
     if (uiCandidate.profileMode !== "ci") {
       throw new Error("Signed-out UI candidate must use an ephemeral CI profile.");
@@ -474,6 +499,7 @@ function validateReleaseExposureBinding(document, source, errors, context) {
       throw new Error("Signed-out UI result proof is missing.");
     }
     const {
+      validateGeneratedEvidenceAcceptance,
       validateReleaseExposureProof,
     } = require("./release-exposure-scan");
     const { verifySignedOutUiEvidence } = require("./verify-ui-evidence");
@@ -483,6 +509,7 @@ function validateReleaseExposureBinding(document, source, errors, context) {
       workflows: context.workflows,
       candidateReceipt: context.uiCandidateReceipt,
       candidateArtifactPath: context.uiCandidateArtifactPath,
+      fileSystem: context.fileSystem,
       ui: context.uiResult,
     });
     validateReleaseExposureProof(context.releaseExposureReceipt, {
@@ -494,6 +521,11 @@ function validateReleaseExposureBinding(document, source, errors, context) {
       attestationSha256: context.attestationFingerprint,
       evidenceManifest: qualificationEvidenceManifest(document),
     });
+    validateGeneratedEvidenceAcceptance(
+      context.root,
+      context.releaseExposureReceipt.generatedEvidence,
+      { fileSystem: context.fileSystem },
+    );
   } catch (error) {
     errors.push(`Release exposure proof is invalid: ${error.message}`);
   }
@@ -824,6 +856,7 @@ function createValidationContext(options = {}) {
   if (!Number.isFinite(nowMs)) throw new Error("Release-checklist validation time is invalid.");
   return {
     root: path.resolve(options.root || ROOT),
+    fileSystem: options.fileSystem,
     nowMs,
     ignoredPathCache: new Map(),
     liveCandidateReceipt: options.liveCandidateReceipt || null,
@@ -833,6 +866,7 @@ function createValidationContext(options = {}) {
     authenticatedCandidateReceipt: options.authenticatedCandidateReceipt || null,
     authenticatedCandidateArtifactPath: options.authenticatedCandidateArtifactPath || null,
     requireReleaseExposureProof: options.requireReleaseExposureProof === true,
+    releaseExposureLoadFailed: options.releaseExposureLoadFailed === true,
     releaseExposureReceipt: options.releaseExposureReceipt || null,
     uiCandidateReceipt: options.uiCandidateReceipt || null,
     uiCandidateArtifactPath: options.uiCandidateArtifactPath || null,
@@ -982,7 +1016,18 @@ function validateEvidenceReferences(value, label, errors, context, timeBounds = 
     }
     const target = validateEvidenceFile(reference.path, referenceLabel, errors, context);
     if (!target) continue;
-    const actual = crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex");
+    let actual;
+    try {
+      actual = digestStableSingleLinkFile(target, {
+        errorMessage: `${referenceLabel} evidence file is unsafe or changed.`,
+        fileSystem: context.fileSystem,
+        maximumBytes: EVIDENCE_MAX_BYTES,
+        minimumBytes: 1,
+      }).sha256;
+    } catch {
+      errors.push(`${referenceLabel} evidence file is missing, unsafe, changed, or unreadable.`);
+      continue;
+    }
     if (actual !== reference.sha256) {
       errors.push(`${referenceLabel} SHA-256 does not match the evidence file.`);
     }
@@ -1080,7 +1125,38 @@ function qualificationEvidenceManifest(document) {
   return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
 }
 
-function loadLiveQualification(root, inputPath) {
+function parseExactJsonProof(target, options = {}) {
+  const errorMessage = options.errorMessage
+    || "Qualification JSON proof is unsafe, changed, or invalid.";
+  const label = options.label || "Qualification proof";
+  const proof = withStableSingleLinkFile(target, {
+    errorMessage,
+    fileSystem: options.fileSystem,
+    maximumBytes: options.maximumBytes,
+    minimumBytes: 1,
+  }, bytes => {
+    let text;
+    try {
+      text = decodeUtf8Bytes(bytes, label);
+    } catch {
+      return Object.freeze({ error: `${label} is not valid UTF-8.` });
+    }
+    let document;
+    try {
+      document = JSON.parse(text);
+    } catch {
+      return Object.freeze({ error: `${label} is not valid JSON.` });
+    }
+    return Object.freeze({
+      document,
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+    });
+  });
+  if (proof.error) throw new Error(proof.error);
+  return proof;
+}
+
+function loadLiveQualification(root, inputPath, options = {}) {
   const target = resolveOptionalRepositoryFile(inputPath, root, {
     subtree: "internal_docs/quality",
   });
@@ -1090,7 +1166,7 @@ function loadLiveQualification(root, inputPath) {
     inputPath,
     "Live qualification input",
     errors,
-    createValidationContext({ root }),
+    createValidationContext({ root, fileSystem: options.fileSystem }),
   );
   if (!validatedTarget) {
     throw new Error(errors.join(" ") || "Live qualification input path is unsafe.");
@@ -1098,61 +1174,89 @@ function loadLiveQualification(root, inputPath) {
   if (validatedTarget !== target) {
     throw new Error("Live qualification input changed during path validation.");
   }
-  const bytes = fs.readFileSync(target);
+  const proof = parseExactJsonProof(target, {
+    errorMessage: "Live qualification input must remain an exact bounded single-link JSON file.",
+    fileSystem: options.fileSystem,
+    label: "Live qualification input",
+    maximumBytes: EVIDENCE_MAX_BYTES,
+  });
   return {
-    document: JSON.parse(decodeUtf8Bytes(bytes, "Live qualification input")),
-    fingerprint: crypto.createHash("sha256").update(bytes).digest("hex"),
+    document: proof.document,
+    fingerprint: proof.sha256,
   };
 }
 
-function loadQualificationJson(root, relativePath, subtree = ".quality/qualification") {
-  return loadQualificationProof(root, relativePath, subtree)?.document || null;
+function loadQualificationJson(
+  root,
+  relativePath,
+  subtree = ".quality/qualification",
+  options = {},
+) {
+  return loadQualificationProof(root, relativePath, subtree, options)?.document || null;
 }
 
-function loadQualificationProof(root, relativePath, subtree = ".quality/qualification") {
+function loadQualificationProof(
+  root,
+  relativePath,
+  subtree = ".quality/qualification",
+  options = {},
+) {
   const target = resolveOptionalRepositoryFile(relativePath, root, {
     subtree,
   });
   if (!target) return null;
-  const stat = fs.lstatSync(target);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > 1024 * 1024) {
-    throw new Error(`Qualification proof is not a bounded regular file: ${relativePath}`);
-  }
-  const bytes = fs.readFileSync(target);
-  return {
-    document: JSON.parse(decodeUtf8Bytes(bytes, "Qualification proof")),
-    sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
-  };
+  return parseExactJsonProof(target, {
+    errorMessage: `Qualification proof is not an exact bounded single-link JSON file: ${relativePath}`,
+    fileSystem: options.fileSystem,
+    label: "Qualification proof",
+    maximumBytes: 1024 * 1024,
+  });
 }
 
 function evaluateDiskLiveQualification(options = {}) {
   const root = options.root || ROOT;
   const inputPath = options.inputPath || DEFAULT_INPUT;
   validateInputPath(inputPath);
-  const loaded = loadLiveQualification(root, inputPath);
+  const loaded = loadLiveQualification(root, inputPath, options);
   const authenticatedProofRequired = loaded
     && (loaded.document?.status === "passed"
       || loaded.document?.authenticatedAcceptance === true);
   const liveCandidateReceipt = loaded
-    ? loadQualificationJson(root, LIVE_CANDIDATE_RECEIPT)
+    ? loadQualificationJson(root, LIVE_CANDIDATE_RECEIPT, ".quality/qualification", options)
     : null;
-  const releaseExposureReceipt = loaded
-    ? loadQualificationJson(root, RELEASE_EXPOSURE_RESULT, ".quality/secrets")
-    : null;
+  let releaseExposureReceipt = null;
+  let releaseExposureLoadFailed = false;
+  if (loaded) {
+    try {
+      releaseExposureReceipt = loadQualificationJson(
+        root,
+        RELEASE_EXPOSURE_RESULT,
+        ".quality/secrets",
+        options,
+      );
+    } catch {
+      releaseExposureLoadFailed = true;
+    }
+  }
   const uiCandidateReceipt = loaded
-    ? loadQualificationJson(root, UI_CANDIDATE_RECEIPT)
+    ? loadQualificationJson(root, UI_CANDIDATE_RECEIPT, ".quality/qualification", options)
     : null;
   const uiResultProof = loaded
-    ? loadQualificationProof(root, UI_RESULT, ".quality/ui")
+    ? loadQualificationProof(root, UI_RESULT, ".quality/ui", options)
     : null;
   const authenticatedReceipt = authenticatedProofRequired
-    ? loadQualificationJson(root, DEFAULT_AUTHENTICATED_RECEIPT)
+    ? loadQualificationJson(root, DEFAULT_AUTHENTICATED_RECEIPT, ".quality/qualification", options)
     : null;
   const authenticatedExposureReceipt = authenticatedProofRequired
-    ? loadQualificationJson(root, AUTHENTICATED_EXPOSURE_RESULT, ".quality/secrets")
+    ? loadQualificationJson(root, AUTHENTICATED_EXPOSURE_RESULT, ".quality/secrets", options)
     : null;
   const authenticatedCandidateReceipt = authenticatedProofRequired
-    ? loadQualificationJson(root, AUTHENTICATED_CANDIDATE_RECEIPT)
+    ? loadQualificationJson(
+      root,
+      AUTHENTICATED_CANDIDATE_RECEIPT,
+      ".quality/qualification",
+      options,
+    )
     : null;
   const liveCandidateArtifactPath = loaded
     ? resolveOptionalRepositoryFile(LIVE_CANDIDATE_ARTIFACT, root, {
@@ -1183,6 +1287,7 @@ function evaluateDiskLiveQualification(options = {}) {
     liveCandidateReceipt,
     liveCandidateArtifactPath,
     requireReleaseExposureProof: Boolean(loaded),
+    releaseExposureLoadFailed,
     releaseExposureReceipt,
     uiCandidateReceipt,
     uiCandidateArtifactPath,
@@ -1192,6 +1297,7 @@ function evaluateDiskLiveQualification(options = {}) {
     authenticatedExposureReceipt,
     authenticatedCandidateReceipt,
     authenticatedCandidateArtifactPath,
+    fileSystem: options.fileSystem,
     qualificationHomeDirectory: options.qualificationHomeDirectory,
     repositoryState,
   });
@@ -1205,16 +1311,82 @@ function runChecklist(options = {}) {
   if (Object.prototype.hasOwnProperty.call(options, "document")) {
     throw new Error("Release-checklist output requires an exact disk-backed attestation.");
   }
-  const result = evaluateDiskLiveQualification({
+  const evaluate = () => evaluateDiskLiveQualification({
     inputPath,
     now: options.now,
     source: options.source,
     workflows: options.workflows,
+    fileSystem: options.fileSystem,
     qualificationHomeDirectory: options.qualificationHomeDirectory,
     root,
   });
-  writeJson(outputPath, result, root);
-  return result;
+  removeOutputFile(outputPath, root, { subtree: ".quality/gates" });
+  let result = evaluate();
+  if (typeof options.beforePersist === "function") options.beforePersist({ result, root });
+  result = evaluate();
+  writeJson(outputPath, result, root, { subtree: ".quality/gates" });
+  try {
+    assertExactPersistedChecklist(root, outputPath, result, options);
+    if (typeof options.afterPersist === "function") {
+      options.afterPersist({ outputPath, result, root });
+    }
+    const persistedBoundary = evaluate();
+    assertExactPersistedChecklist(root, outputPath, result, options);
+    if (JSON.stringify(persistedBoundary) !== JSON.stringify(result)) {
+      throw new Error(ACCEPTANCE_BOUNDARY_DRIFT_REASON);
+    }
+    return result;
+  } catch {
+    return persistAcceptanceBoundaryFailure(root, outputPath, result, options);
+  }
+}
+
+function assertExactPersistedChecklist(root, outputPath, result, options = {}) {
+  const target = resolveExistingRepositoryFile(outputPath, root, {
+    subtree: ".quality/gates",
+  });
+  const expected = Buffer.from(`${JSON.stringify(result, null, 2)}\n`);
+  const matches = withStableSingleLinkFile(target, {
+    errorMessage: ACCEPTANCE_BOUNDARY_DRIFT_REASON,
+    expectedBytes: expected.length,
+    fileSystem: options.fileSystem,
+    maximumBytes: EVIDENCE_MAX_BYTES,
+    minimumBytes: 1,
+  }, bytes => bytes.equals(expected));
+  if (!matches) throw new Error(ACCEPTANCE_BOUNDARY_DRIFT_REASON);
+  return true;
+}
+
+function acceptanceBoundaryFailure(result) {
+  const requiredIds = Array.isArray(result?.requiredWorkflowIds)
+    ? [...result.requiredWorkflowIds]
+    : [];
+  return statusDocument({
+    source: result?.source || null,
+    inputPath: result?.inputPath || DEFAULT_INPUT,
+    status: "failed",
+    requiredIds,
+    workflowMatrix: normalizedWorkflowMatrix([], requiredIds),
+    reason: ACCEPTANCE_BOUNDARY_DRIFT_REASON,
+    errors: [ACCEPTANCE_BOUNDARY_DRIFT_REASON],
+  });
+}
+
+function persistAcceptanceBoundaryFailure(root, outputPath, priorResult, options = {}) {
+  const failed = acceptanceBoundaryFailure(priorResult);
+  try {
+    removeOutputFile(outputPath, root, { subtree: ".quality/gates" });
+    writeJson(outputPath, failed, root, { subtree: ".quality/gates" });
+    assertExactPersistedChecklist(root, outputPath, failed, options);
+    return failed;
+  } catch {
+    try {
+      removeOutputFile(outputPath, root, { subtree: ".quality/gates" });
+    } catch {
+      // A path-level replacement is not safe to remove through the checklist writer.
+    }
+    throw new Error("Release checklist could not persist a fail-closed status.");
+  }
 }
 
 function parseArguments(argv) {
@@ -1258,11 +1430,14 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
+  ACCEPTANCE_BOUNDARY_DRIFT_REASON,
   DEFAULT_AUTHENTICATED_RECEIPT,
   AUTHENTICATED_EXPOSURE_RESULT,
   DEFAULT_FINDINGS,
   DEFAULT_INPUT,
   DEFAULT_OUTPUT,
+  NONPASSING_STATUS_COPY,
+  RELEASE_EXPOSURE_FAILURE_REASON,
   attestationReviewDigest,
   evaluateDiskLiveQualification,
   evaluateLiveQualification,

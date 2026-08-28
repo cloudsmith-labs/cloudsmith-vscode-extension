@@ -5,6 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const { TextDecoder } = require("util");
 const {
   ROOT,
   assertRepositoryRelativePath,
@@ -16,12 +17,18 @@ const {
 } = require("./common");
 const { fingerprint, sourceIdentity } = require("./evidence");
 const {
+  assertActiveNonAuthQualityBoundary,
+  removeExactOwnedDirectoryTree,
+} = require("./non-auth-environment");
+const {
   AUTHENTICATED_CANDIDATE_ARTIFACT,
   AUTHENTICATED_CANDIDATE_RECEIPT,
   LIVE_CANDIDATE_ARTIFACT,
   LIVE_CANDIDATE_RECEIPT,
   UI_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_RECEIPT,
+  sameExactFileIdentity,
+  withStableSingleLinkFile,
 } = require("./candidate-binding");
 const {
   cleanupCiQualificationProfile,
@@ -30,9 +37,16 @@ const {
   removeSafeAppleMetadata,
 } = require("./qualification-profile");
 const { assertVersionState } = require("../release/verify-version");
-const { validateSidecars, verifyVsix } = require("../release/verify-vsix");
+const {
+  readProvenanceSidecar,
+  validateSidecars,
+  verifyVsix,
+  withStableArtifact,
+  withStableSidecarSet,
+} = require("../release/verify-vsix");
 
 const CANDIDATE_RECEIPT = ".quality/qualification/candidate.json";
+const MAX_PACKAGE_OUTPUT_BYTES = 16 * 1024;
 const ALLOWED_ENVIRONMENT = Object.freeze([
   "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC",
   "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
@@ -118,15 +132,20 @@ function assertStableSource(before, after) {
   return before;
 }
 
-function qualificationEnvironment(environment, profile) {
+function qualificationEnvironment(environment, profile, nonAuthBoundary = null) {
   if (!environment || typeof environment !== "object" || Array.isArray(environment)) {
     throw new Error("Qualification environment must be an object.");
   }
   const sanitized = {};
-  for (const name of ALLOWED_ENVIRONMENT) {
-    const value = environment[name];
-    if (typeof value === "string" && value.length <= 32768 && !value.includes("\u0000")) {
-      sanitized[name] = value;
+  if (nonAuthBoundary) {
+    assertActiveNonAuthQualityBoundary(nonAuthBoundary, environment);
+    Object.assign(sanitized, environment);
+  } else {
+    for (const name of ALLOWED_ENVIRONMENT) {
+      const value = environment[name];
+      if (typeof value === "string" && value.length <= 32768 && !value.includes("\u0000")) {
+        sanitized[name] = value;
+      }
     }
   }
   return Object.freeze({
@@ -174,34 +193,65 @@ function removeFreshPackageOutputs(root, name, version) {
   return Object.freeze(removed);
 }
 
-function parsePackageOutput(output, root, name, version) {
-  const text = fs.readFileSync(output, "utf8");
-  if (!text.endsWith("\n")) throw new Error("Canonical package output is incomplete.");
-  const entries = new Map();
-  for (const line of text.slice(0, -1).split("\n")) {
-    const match = /^(vsix_path|checksum_path|provenance_path)=([^\r\n]+)$/u.exec(line);
-    if (!match || entries.has(match[1])) {
-      throw new Error("Canonical package output has unexpected or duplicate fields.");
+function parsePackageOutput(output, root, name, version, options = {}) {
+  const errorMessage = "Canonical package output is not an exact bounded single-link file.";
+  let parseError;
+  let parsed;
+  withStableSingleLinkFile(output, {
+    errorMessage,
+    fileSystem: options.fileSystem,
+    maximumBytes: MAX_PACKAGE_OUTPUT_BYTES,
+    minimumBytes: 1,
+  }, (bytes, identity) => {
+    try {
+      const expectedIdentity = options.expectedIdentity;
+      if (expectedIdentity && (String(expectedIdentity.dev) !== identity.device
+        || String(expectedIdentity.ino) !== identity.inode)) {
+        throw new Error(errorMessage);
+      }
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      if (!text.endsWith("\n")) throw new Error("Canonical package output is incomplete.");
+      const entries = new Map();
+      for (const line of text.slice(0, -1).split("\n")) {
+        const match = /^(vsix_path|checksum_path|provenance_path)=([^\r\n]+)$/u.exec(line);
+        if (!match || entries.has(match[1])) {
+          throw new Error("Canonical package output has unexpected or duplicate fields.");
+        }
+        entries.set(match[1], match[2]);
+      }
+      if (entries.size !== 3) {
+        throw new Error("Canonical package output is missing required fields.");
+      }
+      const filename = `${name}-${version}.vsix`;
+      const vsixPath = assertRepositoryRelativePath(entries.get("vsix_path"), {
+        subtree: "out",
+      });
+      if (!new Set([
+        `out/release/${filename}`,
+        `out/development/${filename}`,
+      ]).has(vsixPath)
+        || entries.get("checksum_path") !== `${vsixPath}.sha256`
+        || entries.get("provenance_path") !== `${vsixPath}.provenance.json`) {
+        throw new Error(
+          "Canonical package output does not identify the exact expected VSIX and sidecars.",
+        );
+      }
+      parsed = Object.freeze({
+        vsixPath,
+        absoluteVsixPath: resolveExistingRepositoryFile(vsixPath, root),
+        absoluteChecksumPath: resolveExistingRepositoryFile(`${vsixPath}.sha256`, root),
+        absoluteProvenancePath: resolveExistingRepositoryFile(
+          `${vsixPath}.provenance.json`,
+          root,
+        ),
+      });
+    } catch (error) {
+      parseError = error;
     }
-    entries.set(match[1], match[2]);
-  }
-  if (entries.size !== 3) throw new Error("Canonical package output is missing required fields.");
-  const filename = `${name}-${version}.vsix`;
-  const vsixPath = assertRepositoryRelativePath(entries.get("vsix_path"), { subtree: "out" });
-  if (!new Set([
-    `out/release/${filename}`,
-    `out/development/${filename}`,
-  ]).has(vsixPath)
-    || entries.get("checksum_path") !== `${vsixPath}.sha256`
-    || entries.get("provenance_path") !== `${vsixPath}.provenance.json`) {
-    throw new Error("Canonical package output does not identify the exact expected VSIX and sidecars.");
-  }
-  return Object.freeze({
-    vsixPath,
-    absoluteVsixPath: resolveExistingRepositoryFile(vsixPath, root),
-    absoluteChecksumPath: resolveExistingRepositoryFile(`${vsixPath}.sha256`, root),
-    absoluteProvenancePath: resolveExistingRepositoryFile(`${vsixPath}.provenance.json`, root),
+    return true;
   });
+  if (parseError) throw parseError;
+  return parsed;
 }
 
 function assertRealExecutable(value, label) {
@@ -227,6 +277,24 @@ function assertRealDirectory(value, label) {
   const stat = fs.lstatSync(value);
   if (stat.isSymbolicLink() || !stat.isDirectory() || fs.realpathSync(value) !== value) {
     throw new Error(`${label} must be an exact real directory.`);
+  }
+  return value;
+}
+
+function assertPathWithinBoundaryTemporary(value, nonAuthBoundary, label) {
+  assertActiveNonAuthQualityBoundary(nonAuthBoundary);
+  if (typeof value !== "string" || !path.isAbsolute(value)
+    || path.resolve(value) !== value || path.normalize(value) !== value
+    || value.includes("\u0000")) {
+    throw new Error(`${label} must be an absolute normalized boundary path.`);
+  }
+  const stat = fs.lstatSync(value);
+  const canonical = fs.realpathSync(value);
+  const temporaryRoot = nonAuthBoundary.paths.temporary;
+  if (stat.isSymbolicLink()
+    || canonical !== value
+    || !canonical.startsWith(`${temporaryRoot}${path.sep}`)) {
+    throw new Error(`${label} escaped the active private non-auth temporary root.`);
   }
   return value;
 }
@@ -443,37 +511,124 @@ function installAndVerifyCandidate(options) {
   });
 }
 
-function createVerifiedInstallArtifact(verification) {
+function createVerifiedInstallArtifact(verification, options = {}) {
   if (!Buffer.isBuffer(verification?.buffer)
     || verification.buffer.length !== verification.archiveBytes
     || crypto.createHash("sha256").update(verification.buffer).digest("hex") !== verification.sha256) {
     throw new Error("VSIX verifier did not return the exact verified artifact bytes.");
   }
-  const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-install-vsix-")));
+  const temporaryParent = options.temporaryParent === undefined
+    ? os.tmpdir()
+    : options.temporaryParent;
+  const canonicalParent = assertRealDirectory(
+    fs.realpathSync(temporaryParent),
+    "Private install artifact temporary parent",
+  );
+  const directory = fs.realpathSync(fs.mkdtempSync(path.join(
+    canonicalParent,
+    "cloudsmith-install-vsix-",
+  )));
   if (process.platform !== "win32") fs.chmodSync(directory, 0o700);
   const directoryStat = fs.lstatSync(directory);
   const file = path.join(directory, "candidate.vsix");
+  let fileStat;
   try {
     fs.writeFileSync(file, verification.buffer, { flag: "wx", mode: 0o400 });
-    const stat = fs.lstatSync(file);
-    if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== verification.archiveBytes) {
+    fileStat = fs.lstatSync(file);
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()
+      || fileStat.size !== verification.archiveBytes) {
       throw new Error("Private install artifact is not the exact verified VSIX.");
     }
   } catch (error) {
-    fs.rmSync(directory, { recursive: true, force: true });
+    removeExactOwnedDirectoryTree(directory, {
+      errorMessage: "Private install artifact rollback refused an unsafe or changed tree.",
+      expectedRootEntries: fileStat ? [{
+        name: path.basename(file),
+        kind: "file",
+        identity: fileStat,
+      }] : [],
+      expectedRootIdentity: directoryStat,
+    });
     throw error;
   }
   return Object.freeze({
     file,
     cleanup() {
-      const stat = fs.lstatSync(directory);
-      if (stat.isSymbolicLink() || !stat.isDirectory()
-        || stat.dev !== directoryStat.dev || stat.ino !== directoryStat.ino) {
-        throw new Error("Private install artifact cleanup refuses a replaced directory.");
-      }
-      fs.rmSync(directory, { recursive: true, force: true });
+      removeExactOwnedDirectoryTree(directory, {
+        errorMessage: "Private install artifact cleanup refuses an unsafe or changed tree.",
+        expectedRootEntries: [{
+          name: path.basename(file),
+          kind: "file",
+          identity: fileStat,
+        }],
+        expectedRootIdentity: directoryStat,
+      });
     },
   });
+}
+
+function assertArtifactVerificationProof(verification, bytes, artifactIdentity) {
+  if (!Buffer.isBuffer(verification?.buffer)
+    || verification.buffer.length !== verification.archiveBytes
+    || !verification.buffer.equals(bytes)
+    || crypto.createHash("sha256").update(verification.buffer).digest("hex")
+      !== verification.sha256
+    || !sameExactFileIdentity(verification.artifactIdentity, artifactIdentity)) {
+    throw new Error("VSIX verifier did not return the exact descriptor-proven artifact identity.");
+  }
+  return verification;
+}
+
+async function verifyQualificationArtifact(filePath, options = {}, verifier = verifyVsix) {
+  if (verifier === verifyVsix) {
+    const verification = await verifier(filePath, options);
+    if (!sameExactFileIdentity(
+      verification?.artifactIdentity,
+      verification?.artifactIdentity,
+    )) {
+      throw new Error("VSIX verifier did not return an exact artifact identity.");
+    }
+    return verification;
+  }
+  return withStableArtifact(filePath, {}, async (bytes, artifactIdentity) => (
+    assertArtifactVerificationProof(
+      await verifier(filePath, options),
+      bytes,
+      artifactIdentity,
+    )
+  ));
+}
+
+function assertSidecarVerificationProof(sidecars, proof) {
+  if (!sameExactFileIdentity(sidecars?.artifactIdentity, proof.artifactIdentity)
+    || !sameExactFileIdentity(sidecars?.checksumIdentity, proof.checksumIdentity)
+    || !sameExactFileIdentity(sidecars?.provenanceIdentity, proof.provenanceIdentity)) {
+    throw new Error("Sidecar verifier did not return exact descriptor-proven identities.");
+  }
+  return sidecars;
+}
+
+function verifyQualificationSidecars(
+  filePath,
+  verification,
+  options = {},
+  verifier = validateSidecars,
+) {
+  if (verifier === validateSidecars) {
+    const sidecars = verifier(filePath, verification, options);
+    if (!sameExactFileIdentity(sidecars?.artifactIdentity, verification.artifactIdentity)
+      || !sameExactFileIdentity(sidecars?.checksumIdentity, sidecars?.checksumIdentity)
+      || !sameExactFileIdentity(sidecars?.provenanceIdentity, sidecars?.provenanceIdentity)) {
+      throw new Error("Sidecar verifier did not return exact descriptor-proven identities.");
+    }
+    return sidecars;
+  }
+  return withStableSidecarSet(filePath, verification, options, proof => (
+    assertSidecarVerificationProof(
+      verifier(filePath, verification, options),
+      proof,
+    )
+  ));
 }
 
 function assertEquivalentVerification(initial, final) {
@@ -484,6 +639,11 @@ function assertEquivalentVerification(initial, final) {
   }
   if (JSON.stringify(initial.manifest) !== JSON.stringify(final.manifest)) {
     throw new Error("Canonical VSIX identity changed after installation verification.");
+  }
+  if (!sameExactFileIdentity(initial.artifactIdentity, initial.artifactIdentity)
+    || !sameExactFileIdentity(final.artifactIdentity, final.artifactIdentity)
+    || !sameExactFileIdentity(initial.artifactIdentity, final.artifactIdentity)) {
+    throw new Error("Canonical VSIX pathname identity changed after installation verification.");
   }
   return final;
 }
@@ -640,6 +800,20 @@ async function prepareQualificationCandidate(options = {}) {
   if (!new Set(["local", "ci"]).has(mode)) {
     throw new Error("Qualification profile mode must be local or ci.");
   }
+  const suppliedEnvironment = Object.prototype.hasOwnProperty.call(options, "environment")
+    ? options.environment
+    : process.env;
+  const nonAuthBoundary = options.nonAuthBoundary === undefined
+    ? null
+    : assertActiveNonAuthQualityBoundary(options.nonAuthBoundary, suppliedEnvironment);
+  if (nonAuthBoundary && mode !== "ci") {
+    throw new Error("A private non-auth boundary is supported only for CI qualification profiles.");
+  }
+  if (nonAuthBoundary && options.temporaryParent !== undefined
+    && options.temporaryParent !== nonAuthBoundary.paths.temporary) {
+    throw new Error("Nested non-auth qualification cannot override its boundary temporary parent.");
+  }
+  const nestedTemporaryParent = nonAuthBoundary?.paths.temporary || options.temporaryParent;
   const qualificationLane = options.qualificationLane
     || (mode === "local" ? "current" : "black-box");
   const proofPaths = qualificationLane === "current"
@@ -658,9 +832,16 @@ async function prepareQualificationCandidate(options = {}) {
         homeDirectory: options.homeDirectory,
         profileRoot: options.profileRoot,
       })
-      : createCiQualificationProfile({ temporaryParent: options.temporaryParent });
-    const environment = qualificationEnvironment(options.environment || process.env, profile);
-    removeSafeAppleMetadata(root, { spawnSync: spawn });
+      : createCiQualificationProfile({ temporaryParent: nestedTemporaryParent });
+    if (nonAuthBoundary) {
+      assertPathWithinBoundaryTemporary(profile.root, nonAuthBoundary, "CI qualification profile");
+    }
+    const environment = qualificationEnvironment(
+      suppliedEnvironment,
+      profile,
+      nonAuthBoundary,
+    );
+    removeSafeAppleMetadata(root, { spawnSync: spawn, environment });
     runChecked(
       spawn,
       process.platform === "win32" ? "npm.cmd" : "npm",
@@ -669,41 +850,72 @@ async function prepareQualificationCandidate(options = {}) {
       "Post-cleanup polish verification",
     );
     const repositoryBefore = captureRepositoryState(root, spawn, environment);
-    const sourceBefore = assertSourceIdentity(identifySource(root, spawn));
+    const sourceBefore = assertSourceIdentity(identifySource(root, spawn, environment, {
+      temporaryParent: nonAuthBoundary?.paths.temporary,
+    }));
     const extension = exactVersionState(root, mode, qualificationLane);
     removeFreshPackageOutputs(root, extension.name, extension.version);
 
-    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-candidate-"));
+    const candidateTemporaryParent = fs.realpathSync(nestedTemporaryParent || os.tmpdir());
+    const temporary = fs.realpathSync(fs.mkdtempSync(path.join(
+      candidateTemporaryParent,
+      "cloudsmith-candidate-",
+    )));
+    const temporaryIdentity = fs.lstatSync(temporary);
+    if (nonAuthBoundary) {
+      assertPathWithinBoundaryTemporary(temporary, nonAuthBoundary, "Candidate package scratch");
+    }
     let packageOutput;
+    let packageOutputFileIdentity;
+    const packageOutputFile = path.join(temporary, "package-output");
     try {
-      packageOutput = path.join(temporary, "package-output");
-      fs.writeFileSync(packageOutput, "", { flag: "wx", mode: 0o600 });
+      fs.writeFileSync(packageOutputFile, "", { flag: "wx", mode: 0o600 });
+      const packageOutputStat = fs.lstatSync(packageOutputFile);
+      packageOutputFileIdentity = Object.freeze({
+        dev: packageOutputStat.dev,
+        ino: packageOutputStat.ino,
+      });
       runChecked(
         spawn,
         process.platform === "win32" ? "npm.cmd" : "npm",
-        ["run", "package", "--", "--github-output", packageOutput],
+        ["run", "package", "--", "--github-output", packageOutputFile],
         { cwd: root, env: environment },
         "Canonical npm package",
       );
       packageOutput = parsePackageOutput(
-        packageOutput, root, extension.name, extension.version
+        packageOutputFile,
+        root,
+        extension.name,
+        extension.version,
+        { expectedIdentity: packageOutputFileIdentity },
       );
     } finally {
-      fs.rmSync(temporary, { recursive: true, force: true });
+      removeExactOwnedDirectoryTree(temporary, {
+        errorMessage: "Candidate package scratch cleanup refused an unsafe or changed tree.",
+        expectedRootEntries: packageOutputFileIdentity ? [{
+          name: path.basename(packageOutputFile),
+          kind: "file",
+          identity: packageOutputFileIdentity,
+        }] : [],
+        expectedRootIdentity: temporaryIdentity,
+      });
     }
 
-    const provenanceStat = fs.lstatSync(packageOutput.absoluteProvenancePath);
-    if (provenanceStat.size > 32 * 1024) {
-      throw new Error("VSIX provenance sidecar exceeds its qualification bound.");
-    }
-    const provenance = JSON.parse(fs.readFileSync(packageOutput.absoluteProvenancePath, "utf8"));
-    const initialVerification = await verifyArtifact(packageOutput.absoluteVsixPath, {
+    const provenanceProof = readProvenanceSidecar(packageOutput.absoluteVsixPath);
+    const provenance = provenanceProof.provenance;
+    const initialVerification = await verifyQualificationArtifact(packageOutput.absoluteVsixPath, {
       sourceSha: provenance.sourceClean ? sourceBefore.sha : null,
-    });
-    verifySidecars(packageOutput.absoluteVsixPath, initialVerification, {
+    }, verifyArtifact);
+    const initialSidecars = verifyQualificationSidecars(
+      packageOutput.absoluteVsixPath,
+      initialVerification,
+      {
       expectedSourceSha: sourceBefore.sha,
+      expectedProvenanceIdentity: provenanceProof.identity,
       requirePublishable: false,
-    });
+      },
+      verifySidecars,
+    );
     if (initialVerification.manifest.name !== extension.name
       || initialVerification.manifest.publisher !== extension.publisher
       || initialVerification.manifest.version !== extension.version) {
@@ -732,7 +944,16 @@ async function prepareQualificationCandidate(options = {}) {
       environment,
       vscodeVersion: extension.vscodeVersion,
     });
-    const privateArtifact = createVerifiedInstallArtifact(initialVerification);
+    const privateArtifact = createVerifiedInstallArtifact(initialVerification, {
+      temporaryParent: nestedTemporaryParent,
+    });
+    if (nonAuthBoundary) {
+      assertPathWithinBoundaryTemporary(
+        privateArtifact.file,
+        nonAuthBoundary,
+        "Verified install artifact",
+      );
+    }
     let installation;
     try {
       installation = installAndVerifyCandidate({
@@ -758,19 +979,31 @@ async function prepareQualificationCandidate(options = {}) {
       );
       launchStatus = "command-accepted";
     }
-    const finalVerification = await verifyArtifact(packageOutput.absoluteVsixPath, {
+    const finalVerification = await verifyQualificationArtifact(packageOutput.absoluteVsixPath, {
       sourceSha: provenance.sourceClean ? sourceBefore.sha : null,
-    });
+    }, verifyArtifact);
     const verification = assertEquivalentVerification(initialVerification, finalVerification);
-    verifySidecars(packageOutput.absoluteVsixPath, verification, {
-      expectedSourceSha: sourceBefore.sha,
-      requirePublishable: false,
-    });
-    assertStableSource(sourceBefore, identifySource(root, spawn));
+    verifyQualificationSidecars(
+      packageOutput.absoluteVsixPath,
+      verification,
+      {
+        expectedChecksumIdentity: initialSidecars.checksumIdentity,
+        expectedProvenanceIdentity: initialSidecars.provenanceIdentity,
+        expectedSourceSha: sourceBefore.sha,
+        requirePublishable: false,
+      },
+      verifySidecars,
+    );
+    assertStableSource(sourceBefore, identifySource(root, spawn, environment, {
+      temporaryParent: nonAuthBoundary?.paths.temporary,
+    }));
     assertStableRepositoryState(
       repositoryBefore,
       captureRepositoryState(root, spawn, environment),
     );
+    if (nonAuthBoundary) {
+      assertActiveNonAuthQualityBoundary(nonAuthBoundary, suppliedEnvironment);
+    }
 
     const receiptBase = {
       schemaVersion: 2,
@@ -897,6 +1130,8 @@ module.exports = {
   qualificationLaunchArguments,
   removeFreshPackageOutputs,
   resolveCodeInstallation,
+  verifyQualificationArtifact,
+  verifyQualificationSidecars,
   writeLiveCandidateProof,
   writeUiCandidateProof,
   writeAuthenticatedCandidateProof,

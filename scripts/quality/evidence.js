@@ -5,7 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
 const { ROOT, normalizePath, uniqueSorted } = require("./common");
-const { buildNonAuthQualityEnvironment } = require("./non-auth-environment");
+const { withNonAuthQualityEnvironment } = require("./non-auth-environment");
 
 const EVIDENCE_STATUSES = Object.freeze([
   "passed",
@@ -16,11 +16,22 @@ const EVIDENCE_STATUSES = Object.freeze([
 ]);
 
 function canonicalize(value) {
-  if (Array.isArray(value)) return value.map(canonicalize);
+  if (Array.isArray(value)) {
+    const normalized = value.map(canonicalize);
+    Object.defineProperty(normalized, "toJSON", {
+      configurable: false,
+      enumerable: false,
+      value: undefined,
+      writable: false,
+    });
+    return normalized;
+  }
   if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.keys(value).sort().map(key => [key, canonicalize(value[key])])
-  );
+  const normalized = Object.create(null);
+  for (const key of Object.keys(value).sort()) {
+    normalized[key] = canonicalize(value[key]);
+  }
+  return normalized;
 }
 
 function fingerprint(value) {
@@ -29,33 +40,44 @@ function fingerprint(value) {
     .digest("hex");
 }
 
-function sourceIdentity(root = ROOT, spawn = spawnSync, environment = process.env) {
-  const head = runGit(root, spawn, ["rev-parse", "HEAD"], "utf8", environment);
-  const diff = runGit(root, spawn, ["diff", "--binary", "HEAD", "--"], null, environment);
-  const untracked = runGit(
-    root,
-    spawn,
-    ["ls-files", "--others", "--exclude-standard", "-z"],
-    null,
-    environment
-  );
-  const sourceSha = head.toString("utf8").trim();
-  const hash = crypto.createHash("sha256");
-  hash.update(`sha\0${sourceSha}\0tracked\0`);
-  hash.update(diff);
-  hash.update("\0untracked\0");
-  const files = uniqueSorted(
-    untracked.toString("utf8").split("\0").filter(Boolean).map(normalizePath)
-  );
-  for (const file of files) hashFileState(hash, root, file);
-  return { sha: sourceSha, fingerprint: hash.digest("hex") };
+function sourceIdentity(
+  root = ROOT,
+  spawn = spawnSync,
+  environment = process.env,
+  options = {}
+) {
+  return withNonAuthQualityEnvironment({
+    environment,
+    platform: options.platform,
+    temporaryParent: options.temporaryParent,
+  }, childEnvironment => {
+    const head = runGit(root, spawn, ["rev-parse", "HEAD"], "utf8", childEnvironment);
+    const diff = runGit(root, spawn, ["diff", "--binary", "HEAD", "--"], null, childEnvironment);
+    const untracked = runGit(
+      root,
+      spawn,
+      ["ls-files", "--others", "--exclude-standard", "-z"],
+      null,
+      childEnvironment
+    );
+    const sourceSha = head.toString("utf8").trim();
+    const hash = crypto.createHash("sha256");
+    hash.update(`sha\0${sourceSha}\0tracked\0`);
+    hash.update(diff);
+    hash.update("\0untracked\0");
+    const files = uniqueSorted(
+      untracked.toString("utf8").split("\0").filter(Boolean).map(normalizePath)
+    );
+    for (const file of files) hashFileState(hash, root, file);
+    return { sha: sourceSha, fingerprint: hash.digest("hex") };
+  });
 }
 
-function runGit(root, spawn, args, encoding = "utf8", environment = process.env) {
+function runGit(root, spawn, args, encoding, environment) {
   const result = spawn("git", args, {
     cwd: root,
     encoding,
-    env: buildNonAuthQualityEnvironment(environment),
+    env: environment,
     maxBuffer: 64 * 1024 * 1024,
   });
   if (result.error) throw result.error;

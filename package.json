@@ -1051,6 +1051,7 @@
     "quality:secrets:artifacts": "node scripts/quality/secret-scan.js artifacts",
     "quality:secrets:evidence": "node scripts/quality/secret-scan.js evidence",
     "quality:secrets:history": "node scripts/quality/secret-scan.js history",
+    "quality:secrets:signed-out-evidence": "node scripts/quality/secret-scan.js evidence --signed-out-bundle",
     "quality:fast": "node scripts/quality/gate.js fast",
     "quality:full": "node scripts/quality/gate.js full",
     "quality:release": "node scripts/quality/gate.js release",

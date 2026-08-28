@@ -1,6 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
-const fs = require("fs");
+const crypto = require("crypto");
 const { isDeepStrictEqual } = require("util");
 const {
   ROOT,
@@ -20,7 +20,9 @@ const {
   sameSource,
   stepArtifactPaths,
   validateArtifactBinding,
+  validateTestEvidenceBinding,
 } = require("./gate");
+const { withStableSingleLinkFile } = require("./candidate-binding");
 const {
   generateReport,
   hasDeterministicReportFailure,
@@ -38,11 +40,16 @@ function verifyEvidenceHandoff(options = {}) {
   const readSource = options.readSource || (() => sourceIdentity(root));
   const source = options.source || readSource();
   const summaryPath = `.quality/gates/${profile}.json`;
-  const summary = readCanonicalJson(summaryPath, root, ".quality/gates").value;
-
-  validateSummary(summary, { profile, plan, source });
-  validateReceiptFiles(summary, { profile, plan, root, source });
-  validateReceiptSequence(summary.steps, plan);
+  const generationContext = {
+    fileSystem: options.fileSystem,
+    summaryPath,
+    profile,
+    plan,
+    root,
+    source,
+  };
+  const initialGeneration = readValidatedGateGeneration(generationContext);
+  const summary = initialGeneration.summary;
 
   const reportStep = plan.find(step => step.id === "quality-report");
   const reportReceipt = summary.steps.find(receipt => receipt.stepId === "quality-report");
@@ -52,13 +59,23 @@ function verifyEvidenceHandoff(options = {}) {
   const bindingError = validateArtifactBinding(reportReceipt, reportStep, root);
   if (bindingError) throw new Error(`Quality report bundle is untrusted: ${bindingError}.`);
 
-  const reportRecord = readCanonicalJson(".quality/report.json", root, ".quality");
-  const markdownBytes = readEvidenceBytes(".quality/report.md", root, ".quality");
-  const expectedReport = generateReport(loadReportInputs({
+  const reportRecord = readCanonicalJson(".quality/report.json", root, ".quality", {
+    fileSystem: options.fileSystem,
+  });
+  const markdownBytes = readEvidenceBytes(".quality/report.md", root, ".quality", {
+    fileSystem: options.fileSystem,
+  });
+  validateReportBundleBytes(reportReceipt, reportStep, reportRecord.bytes, markdownBytes);
+  const reportInputs = loadReportInputs({
+    fileSystem: options.fileSystem,
     root,
     profile,
     source,
-  }));
+  });
+  if (!isDeepStrictEqual(reportInputs.receipts, summary.steps)) {
+    throw new Error("Gate receipts changed while the quality report was regenerated.");
+  }
+  const expectedReport = generateReport(reportInputs);
   const expectedJson = Buffer.from(`${JSON.stringify(expectedReport, null, 2)}\n`);
   const expectedMarkdown = Buffer.from(renderMarkdown(expectedReport));
   if (!reportRecord.bytes.equals(expectedJson)) {
@@ -69,11 +86,81 @@ function verifyEvidenceHandoff(options = {}) {
   }
   validateReportExecution(reportReceipt, expectedReport);
 
+  const finalGeneration = readValidatedGateGeneration(generationContext);
+  if (!finalGeneration.bytes.equals(initialGeneration.bytes)
+    || !isDeepStrictEqual(finalGeneration.summary, summary)) {
+    throw new Error("Gate evidence generation changed during handoff verification.");
+  }
+  const finalReportRecord = readCanonicalJson(".quality/report.json", root, ".quality", {
+    fileSystem: options.fileSystem,
+  });
+  const finalMarkdownBytes = readEvidenceBytes(".quality/report.md", root, ".quality", {
+    fileSystem: options.fileSystem,
+  });
+  if (!finalReportRecord.bytes.equals(reportRecord.bytes)
+    || !finalMarkdownBytes.equals(markdownBytes)) {
+    throw new Error("Quality report bundle changed during handoff verification.");
+  }
+  validateReportBundleBytes(
+    reportReceipt,
+    reportStep,
+    finalReportRecord.bytes,
+    finalMarkdownBytes,
+  );
+
   const finalSource = readSource();
   if (!sameSource(finalSource, source)) {
     throw new Error("Repository source changed during evidence handoff verification.");
   }
   return { profile, report: expectedReport, source, summary };
+}
+
+function readValidatedGateGeneration(context) {
+  const record = readCanonicalJson(
+    context.summaryPath,
+    context.root,
+    ".quality/gates",
+    { fileSystem: context.fileSystem },
+  );
+  const summary = record.value;
+  validateSummary(summary, context);
+  validateReceiptFiles(summary, context);
+  validateReceiptSequence(summary.steps, context.plan);
+  return Object.freeze({
+    bytes: Buffer.from(record.bytes),
+    summary,
+  });
+}
+
+function validateReportBundleBytes(receipt, step, jsonBytes, markdownBytes) {
+  const bytesByPath = new Map([
+    [".quality/report.json", jsonBytes],
+    [".quality/report.md", markdownBytes],
+  ]);
+  const artifactPaths = stepArtifactPaths(step);
+  if (artifactPaths.length !== bytesByPath.size
+    || artifactPaths.some(relativePath => !bytesByPath.has(relativePath))) {
+    throw new Error("Quality report bundle declaration is invalid.");
+  }
+  let actualFingerprint;
+  if (artifactPaths.length === 1) {
+    actualFingerprint = crypto.createHash("sha256")
+      .update(bytesByPath.get(artifactPaths[0]))
+      .digest("hex");
+  } else {
+    const hash = crypto.createHash("sha256");
+    hash.update("cloudsmith-quality-artifact-bundle-v1\0");
+    for (const relativePath of artifactPaths) {
+      const bytes = bytesByPath.get(relativePath);
+      hash.update(`${relativePath}\0${bytes.length}\0`);
+      hash.update(bytes);
+      hash.update("\0");
+    }
+    actualFingerprint = hash.digest("hex");
+  }
+  if (actualFingerprint !== receipt.artifactFingerprint) {
+    throw new Error("Quality report bundle bytes do not match the gate receipt.");
+  }
 }
 
 function validateSummary(summary, context) {
@@ -129,13 +216,15 @@ function validateReceiptFiles(summary, context) {
     const diskReceipt = readCanonicalJson(
       receiptPath(summaryReceipt),
       context.root,
-      receiptDirectory
+      receiptDirectory,
+      { fileSystem: context.fileSystem },
     ).value;
     if (!isDeepStrictEqual(diskReceipt, summaryReceipt)) {
       throw new Error(`Gate receipt ${step.id} differs from the signed summary.`);
     }
     validateReceipt(summaryReceipt, step, context);
     validateStepArtifacts(summaryReceipt, step, context.root);
+    validateStepTestEvidence(summaryReceipt, step, context.root);
   }
 }
 
@@ -155,7 +244,12 @@ function validateReceipt(receipt, step, context) {
     "stepId",
     "testCounts",
   ];
-  const allowedKeys = new Set([...requiredKeys, "outputFingerprint", "testEvidence"]);
+  const allowedKeys = new Set([
+    ...requiredKeys,
+    "outputFingerprint",
+    "testEvidence",
+    "testEvidenceFingerprint",
+  ]);
   const keys = Object.keys(receipt || {});
   if (!requiredKeys.every(key => keys.includes(key))
     || keys.some(key => !allowedKeys.has(key))) {
@@ -180,7 +274,7 @@ function validateReceipt(receipt, step, context) {
     && !/^[a-f0-9]{64}$/u.test(receipt.outputFingerprint || "")) {
     throw new Error(`Gate receipt ${step.id} has an invalid output fingerprint.`);
   }
-  const completedKeys = ["outputFingerprint", "testEvidence"]
+  const completedKeys = ["outputFingerprint", "testEvidence", "testEvidenceFingerprint"]
     .every(key => Object.prototype.hasOwnProperty.call(receipt, key));
   if ((receipt.status === "not-run" && completedKeys)
     || (receipt.status !== "not-run" && !completedKeys)) {
@@ -193,6 +287,24 @@ function validateReceipt(receipt, step, context) {
       || Object.keys(receipt.testCounts).some(key => !["failing", "passing", "pending"].includes(key))
       || Object.values(receipt.testCounts).some(value => !Number.isInteger(value) || value < 0))) {
     throw new Error(`Gate receipt ${step.id} has invalid parsed test counts.`);
+  }
+}
+
+function validateStepTestEvidence(receipt, step, root) {
+  if (receipt.status === "not-run"
+    && !Object.prototype.hasOwnProperty.call(receipt, "testEvidenceFingerprint")) {
+    return;
+  }
+  if (!step.evidencePath) {
+    if (receipt.testEvidenceFingerprint !== null) {
+      throw new Error(`Gate receipt ${step.id} claims undeclared structured evidence.`);
+    }
+    return;
+  }
+  if (receipt.status !== "passed" && receipt.testEvidenceFingerprint === null) return;
+  const bindingError = validateTestEvidenceBinding(receipt, step, root);
+  if (bindingError) {
+    throw new Error(`Gate test evidence ${step.id} is untrusted: ${bindingError}.`);
   }
 }
 
@@ -249,8 +361,8 @@ function validateReportExecution(receipt, report) {
   }
 }
 
-function readCanonicalJson(relativePath, root, subtree) {
-  const bytes = readEvidenceBytes(relativePath, root, subtree);
+function readCanonicalJson(relativePath, root, subtree, options = {}) {
+  const bytes = readEvidenceBytes(relativePath, root, subtree, options);
   let value;
   try {
     value = JSON.parse(bytes.toString("utf8"));
@@ -264,13 +376,14 @@ function readCanonicalJson(relativePath, root, subtree) {
   return { bytes, value };
 }
 
-function readEvidenceBytes(relativePath, root, subtree) {
+function readEvidenceBytes(relativePath, root, subtree, options = {}) {
   const target = resolveExistingRepositoryFile(relativePath, root, { subtree });
-  const stat = fs.lstatSync(target);
-  if (stat.size > MAX_EVIDENCE_BYTES) {
-    throw new Error(`Evidence file exceeds its size bound: ${relativePath}.`);
-  }
-  return fs.readFileSync(target);
+  return withStableSingleLinkFile(target, {
+    errorMessage: `Evidence file is unsafe or changed: ${relativePath}.`,
+    fileSystem: options.fileSystem,
+    maximumBytes: MAX_EVIDENCE_BYTES,
+    minimumBytes: 0,
+  }, bytes => Buffer.from(bytes));
 }
 
 function assertExactKeys(value, expected, label) {

@@ -4,23 +4,96 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
 const { applyAuditPolicy } = require("../scripts/release/verify-dependency-audit");
 const {
+  packageBuildDirectoryIdentity,
+  removePackageBuildDirectory,
   resolveOutputPath,
   runPackageCommand,
 } = require("../scripts/release/package-vsix");
+const {
+  scanAcceptedEvidence,
+} = require("../scripts/quality/release-exposure-scan");
 const { assertVersionState } = require("../scripts/release/verify-version");
+const {
+  NON_AUTH_AMBIENT_CAPABILITY_NAMES,
+} = require("../scripts/quality/non-auth-environment");
+const { exactFileIdentity } = require("../scripts/quality/candidate-binding");
 const {
   assertRelativeModuleClosure,
   isApprovedSourcePath,
   parseCliArguments,
+  readProvenanceSidecar,
   resolveExpectedSourceSha,
   runPackageGitCommand,
   scanSensitiveBytes,
   selectArtifactPath,
+  validateSidecars,
   validateArchivePath,
   verificationSourceSha,
+  withStableArtifact,
 } = require("../scripts/release/verify-vsix");
+
+function sidecarFixture() {
+  const directory = fs.realpathSync(fs.mkdtempSync(path.join(
+    os.tmpdir(),
+    "release-sidecar-transaction-",
+  )));
+  const filePath = path.join(directory, "synthetic.vsix");
+  const buffer = Buffer.from("synthetic bounded VSIX bytes\n", "utf8");
+  fs.writeFileSync(filePath, buffer);
+  const sourceSha = runPackageGitCommand([
+    "rev-parse", "--verify", "HEAD^{commit}",
+  ]).trim();
+  const sourceCommitEpoch = Number(runPackageGitCommand([
+    "show", "-s", "--format=%ct", sourceSha,
+  ]).trim());
+  const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
+  const verification = Object.freeze({
+    archiveBytes: buffer.length,
+    artifactIdentity: exactFileIdentity(fs.lstatSync(filePath, { bigint: true })),
+    buffer,
+    entryCount: 7,
+    manifest: Object.freeze({
+      name: "cloudsmith-vsc",
+      publisher: "Cloudsmith",
+      version: "2.3.0",
+    }),
+    sha256,
+    totalUncompressedBytes: 4096,
+  });
+  const provenance = Object.freeze({
+    archiveBytes: verification.archiveBytes,
+    entryCount: verification.entryCount,
+    filename: path.basename(filePath),
+    name: verification.manifest.name,
+    nodeVersion: process.version,
+    npmVersion: "10.9.2",
+    publishable: false,
+    publisher: verification.manifest.publisher,
+    schemaVersion: 1,
+    sha256,
+    sourceClean: true,
+    sourceCommitEpoch,
+    sourceSha,
+    totalUncompressedBytes: verification.totalUncompressedBytes,
+    version: verification.manifest.version,
+  });
+  const checksumPath = `${filePath}.sha256`;
+  const provenancePath = `${filePath}.provenance.json`;
+  fs.writeFileSync(checksumPath, `${sha256}  ${path.basename(filePath)}\n`);
+  fs.writeFileSync(provenancePath, `${JSON.stringify(provenance)}\n`);
+  return {
+    checksumPath,
+    directory,
+    filePath,
+    provenance,
+    provenancePath,
+    sourceSha,
+    verification,
+  };
+}
 
 function auditLockfile(packageName = "affected") {
   const packages = {
@@ -119,7 +192,8 @@ suite("M9 release gate helpers", () => {
     assert.match(coreMutationJob, /fetch-depth:\s+0/);
     assert.match(signedOutUiJob, /- name: Checkout exact source[\s\S]*persist-credentials:\s+false/);
     assert.match(signedOutUiJob, /- name: Set up exact Node\.js[\s\S]*node-version:\s+\$\{\{ env\.NODE_VERSION \}\}/);
-    assert.match(signedOutUiJob, /run: xvfb-run -a npm run test:ui:smoke/);
+    assert.match(signedOutUiJob, /run: npm run test:ui:smoke/);
+    assert.doesNotMatch(signedOutUiJob, /xvfb-run/);
     assert.match(signedOutUiJob, /id: ui_evidence_handoff[\s\S]*if: \$\{\{ always\(\) \}\}[\s\S]*node scripts\/quality\/verify-ui-evidence\.js/);
     assert.match(signedOutUiJob, /steps\.ui_evidence_handoff\.outcome == 'success'[\s\S]*steps\.ui_evidence_secret_scan\.outcome == 'success'/);
     assert.doesNotMatch(signedOutUiJob, /secrets\.|CLOUDSMITH_QUALIFICATION_API_KEY/);
@@ -275,6 +349,107 @@ suite("M9 release gate helpers", () => {
     );
   });
 
+  test("accepted evidence scanning consumes only descriptor-proven stdin bytes across a swap", () => {
+    const evidenceRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-evidence-stdin-swap-",
+    )));
+    const relativePath = "internal_docs/quality/review.md";
+    const target = path.join(evidenceRoot, ...relativePath.split("/"));
+    const displaced = `${target}.descriptor-proven`;
+    const originalBytes = Buffer.from("authorized synthetic release evidence\n");
+    const replacementBytes = Buffer.from("unaccepted synthetic replacement bytes\n");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, originalBytes);
+    let scannerInput;
+    let scannerInputReference;
+    try {
+      const component = scanAcceptedEvidence(evidenceRoot, [relativePath], {
+        scanWithGitleaks(kind, logicalPath, options) {
+          assert.strictEqual(kind, "stdin");
+          assert.strictEqual(logicalPath, relativePath);
+          assert.strictEqual(options.logicalPath, relativePath);
+          assert.strictEqual(options.scanRoot, evidenceRoot);
+          fs.renameSync(target, displaced);
+          try {
+            fs.writeFileSync(target, replacementBytes);
+            scannerInputReference = options.input;
+            scannerInput = Buffer.from(options.input);
+          } finally {
+            fs.rmSync(target);
+            fs.renameSync(displaced, target);
+          }
+          return [];
+        },
+      });
+
+      assert.deepStrictEqual(scannerInput, originalBytes);
+      assert.deepStrictEqual(component.snapshot[relativePath], originalBytes);
+      assert.strictEqual(scannerInputReference.every(byte => byte === 0), true);
+      assert.deepStrictEqual(fs.readFileSync(target), originalBytes);
+      assert.deepStrictEqual(component.findings, []);
+    } finally {
+      fs.rmSync(evidenceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup fails closed on final owned-root substitution", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-final-swap-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const victim = path.join(scratch, "preserve-victim");
+    const displacedOwnedRoot = path.join(scratch, "displaced-owned-build");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(path.join(ownedRoot, "temporary.vsix"), "synthetic build bytes\n");
+    fs.mkdirSync(victim);
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "synthetic victim survives\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const originalRmdir = fs.rmdirSync;
+    let substituted = false;
+    try {
+      fs.rmdirSync = function substituteAtFinalRemoval(target, options) {
+        if (!substituted && target === ownedRoot) {
+          substituted = true;
+          fs.renameSync(ownedRoot, displacedOwnedRoot);
+          fs.renameSync(victim, ownedRoot);
+        }
+        return originalRmdir.call(fs, target, options);
+      };
+      assert.throws(
+        () => removePackageBuildDirectory(ownedRoot, identity),
+        /temporary cleanup refused an unsafe or changed tree/u,
+      );
+    } finally {
+      fs.rmdirSync = originalRmdir;
+    }
+    try {
+      assert.strictEqual(substituted, true);
+      assert.strictEqual(
+        fs.readFileSync(path.join(ownedRoot, "preserve.txt"), "utf8"),
+        "synthetic victim survives\n",
+      );
+      assert.strictEqual(fs.existsSync(displacedOwnedRoot), true);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release exposure and packaging production cleanup forbid recursive deletion", () => {
+    for (const relativePath of [
+      "scripts/quality/release-exposure-scan.js",
+      "scripts/release/package-vsix.js",
+    ]) {
+      const source = fs.readFileSync(path.join(__dirname, "..", relativePath), "utf8");
+      assert.doesNotMatch(
+        source,
+        /\bfs\.rm(?:Sync)?\s*\([^;]*?\brecursive\s*:\s*true\b/gsu,
+        `${relativePath} must use exact entry-bounded cleanup`,
+      );
+    }
+  });
+
   test("package and VSCE subprocesses receive only the non-auth environment allowlist", () => {
     const syntheticEnvironment = {
       PATH: "/fixture/bin",
@@ -282,6 +457,16 @@ suite("M9 release gate helpers", () => {
       CLOUDSMITH_API_KEY: "synthetic-qh141-package-sentinel",
       ARBITRARY_REFRESH_TOKEN: "synthetic-qh141-refresh-sentinel",
       NODE_OPTIONS: "--require=synthetic-untrusted-hook",
+      DISPLAY: ":synthetic-host-display",
+      WAYLAND_DISPLAY: "synthetic-host-wayland",
+      XAUTHORITY: "/synthetic/host-xauthority",
+      XDG_RUNTIME_DIR: "/synthetic/host-runtime",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/synthetic/host-session-bus",
+      SSH_AUTH_SOCK: "/synthetic/host-agent.sock",
+      SSH_AGENT_PID: "12345",
+      GPG_AGENT_INFO: "/synthetic/host-gpg-agent",
+      KRB5CCNAME: "/synthetic/host-credential-cache",
+      SECURITYSESSIONID: "synthetic-host-security-session",
     };
     let childEnvironment;
     const output = runPackageCommand("fixture-vsce", ["package"], {
@@ -293,6 +478,7 @@ suite("M9 release gate helpers", () => {
           "CLOUDSMITH_API_KEY",
           "ARBITRARY_REFRESH_TOKEN",
           "NODE_OPTIONS",
+          ...NON_AUTH_AMBIENT_CAPABILITY_NAMES,
         ].some(name => Object.prototype.hasOwnProperty.call(options.env, name));
         return {
           status: 0,
@@ -305,12 +491,21 @@ suite("M9 release gate helpers", () => {
     });
 
     assert.strictEqual(output, "safe-package-output");
-    assert.deepStrictEqual(childEnvironment, {
-      PATH: "/fixture/bin",
-      LANG: "en_US.UTF-8",
-      TZ: "UTC",
-      SOURCE_DATE_EPOCH: "1234567890",
-    });
+    const packageBoundaryRoot = path.dirname(childEnvironment.HOME);
+    assert.strictEqual(childEnvironment.PATH, "/fixture/bin");
+    assert.strictEqual(childEnvironment.LANG, "en_US.UTF-8");
+    assert.strictEqual(childEnvironment.TZ, "UTC");
+    assert.strictEqual(childEnvironment.SOURCE_DATE_EPOCH, "1234567890");
+    assert.strictEqual(childEnvironment.HOME, childEnvironment.USERPROFILE);
+    assert.strictEqual(childEnvironment.GIT_CONFIG_NOSYSTEM, "1");
+    assert.strictEqual(childEnvironment.GIT_CONFIG_COUNT, "0");
+    for (const name of NON_AUTH_AMBIENT_CAPABILITY_NAMES) {
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(childEnvironment, name), false);
+    }
+    assert.strictEqual(childEnvironment.NPM_CONFIG_USERCONFIG.startsWith(
+      `${packageBoundaryRoot}${path.sep}`
+    ), true);
+    assert.strictEqual(fs.existsSync(packageBoundaryRoot), false);
     assert.strictEqual(
       crypto.createHash("sha256").update(output).digest("hex"),
       crypto.createHash("sha256").update("safe-package-output").digest("hex")
@@ -328,10 +523,10 @@ suite("M9 release gate helpers", () => {
       environment: syntheticEnvironment,
       spawnSync(_command, _arguments, options) {
         verifierEnvironment = options.env;
-        const unsafe = Object.prototype.hasOwnProperty.call(
-          options.env,
-          "CLOUDSMITH_API_KEY"
-        );
+        const unsafe = [
+          "CLOUDSMITH_API_KEY",
+          ...NON_AUTH_AMBIENT_CAPABILITY_NAMES,
+        ].some(name => Object.prototype.hasOwnProperty.call(options.env, name));
         return {
           status: 0,
           signal: null,
@@ -342,14 +537,36 @@ suite("M9 release gate helpers", () => {
       },
     });
     assert.strictEqual(verifierOutput, "safe-verifier-output");
-    assert.deepStrictEqual(verifierEnvironment, {
-      PATH: "/fixture/bin",
-      LANG: "en_US.UTF-8",
-    });
+    const verifierBoundaryRoot = path.dirname(verifierEnvironment.HOME);
+    assert.strictEqual(verifierEnvironment.PATH, "/fixture/bin");
+    assert.strictEqual(verifierEnvironment.LANG, "en_US.UTF-8");
+    assert.strictEqual(verifierEnvironment.HOME, verifierEnvironment.USERPROFILE);
+    assert.strictEqual(verifierEnvironment.GIT_CONFIG_NOSYSTEM, "1");
+    assert.strictEqual(verifierEnvironment.GIT_CONFIG_COUNT, "0");
+    for (const name of NON_AUTH_AMBIENT_CAPABILITY_NAMES) {
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(verifierEnvironment, name), false);
+    }
+    assert.strictEqual(fs.existsSync(verifierBoundaryRoot), false);
     assert.strictEqual(
       crypto.createHash("sha256").update(verifierOutput).digest("hex"),
       crypto.createHash("sha256").update("safe-verifier-output").digest("hex")
     );
+
+    let failedBoundaryRoot;
+    assert.throws(() => runPackageCommand("fixture-vsce", ["package"], {
+      environment: syntheticEnvironment,
+      spawnSync(_command, _arguments, options) {
+        failedBoundaryRoot = path.dirname(options.env.HOME);
+        return {
+          status: 1,
+          signal: null,
+          error: null,
+          stdout: "",
+          stderr: "",
+        };
+      },
+    }), /failed while building the release artifact/u);
+    assert.strictEqual(fs.existsSync(failedBoundaryRoot), false);
   });
 
   test("artifact verifier does not confuse option values with the VSIX path", () => {
@@ -399,8 +616,258 @@ suite("M9 release gate helpers", () => {
     );
   });
 
+  test("release sidecars are validated inside exact descriptor transactions", () => {
+    const fixture = sidecarFixture();
+    try {
+      const provenanceProof = readProvenanceSidecar(fixture.filePath);
+      assert.deepStrictEqual(provenanceProof.provenance, fixture.provenance);
+      const sidecars = validateSidecars(fixture.filePath, fixture.verification, {
+        expectedProvenanceIdentity: provenanceProof.identity,
+        expectedSourceSha: fixture.sourceSha,
+      });
+      assert.strictEqual(sidecars.checksumPath, fixture.checksumPath);
+      assert.strictEqual(sidecars.provenancePath, fixture.provenancePath);
+      assert.deepStrictEqual(sidecars.provenance, fixture.provenance);
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("VSIX pathname stays rebound to its descriptor through async verification", async () => {
+    const fixture = sidecarFixture();
+    const displaced = `${fixture.filePath}.descriptor`;
+    let consumed = false;
+    try {
+      await assert.rejects(
+        withStableArtifact(fixture.filePath, {}, async bytes => {
+          consumed = true;
+          fs.renameSync(fixture.filePath, displaced);
+          fs.writeFileSync(fixture.filePath, bytes);
+          await Promise.resolve();
+          return Buffer.from(bytes);
+        }),
+        /exact bounded single-link file/u,
+      );
+      assert.strictEqual(consumed, true);
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("VSIX descriptor reads never request bytes beyond the opened size", async () => {
+    const fixture = sidecarFixture();
+    const requests = [];
+    const fileSystem = Object.create(fs);
+    fileSystem.readSync = (descriptor, buffer, offset, length, position) => {
+      requests.push({ length, position });
+      assert.ok(position >= 0);
+      assert.ok(length > 0);
+      assert.ok(position + length <= fixture.verification.archiveBytes);
+      return fs.readSync(descriptor, buffer, offset, length, position);
+    };
+    try {
+      const consumed = await withStableArtifact(
+        fixture.filePath,
+        { fileSystem },
+        async bytes => Buffer.from(bytes),
+      );
+      assert.deepStrictEqual(consumed, fixture.verification.buffer);
+      assert.ok(requests.length >= 1);
+      assert.strictEqual(
+        requests.at(-1).position + requests.at(-1).length,
+        fixture.verification.archiveBytes,
+      );
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("VSIX descriptor postchecks reject growth after the exact-size read", async () => {
+    const fixture = sidecarFixture();
+    let grew = false;
+    const fileSystem = Object.create(fs);
+    fileSystem.readSync = (...arguments_) => {
+      const bytesRead = fs.readSync(...arguments_);
+      if (!grew) {
+        fs.appendFileSync(fixture.filePath, "synthetic growth\n");
+        grew = true;
+      }
+      return bytesRead;
+    };
+    try {
+      await assert.rejects(
+        withStableArtifact(fixture.filePath, { fileSystem }, async bytes => Buffer.from(bytes)),
+        /exact bounded single-link file/u,
+      );
+      assert.strictEqual(grew, true);
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("sidecar validation rejects artifact and sidecar swaps between lstat and open", () => {
+    for (const selected of ["filePath", "checksumPath", "provenancePath"]) {
+      const fixture = sidecarFixture();
+      const target = fixture[selected];
+      const displaced = `${target}.descriptor`;
+      const originalBytes = fs.readFileSync(target);
+      let swapped = false;
+      const fileSystem = Object.create(fs);
+      fileSystem.openSync = (openedPath, flags) => {
+        if (!swapped && openedPath === target) {
+          fs.renameSync(target, displaced);
+          fs.writeFileSync(target, originalBytes);
+          swapped = true;
+        }
+        return fs.openSync(openedPath, flags);
+      };
+      try {
+        assert.throws(
+          () => validateSidecars(fixture.filePath, fixture.verification, {
+            expectedSourceSha: fixture.sourceSha,
+            fileSystem,
+          }),
+          /exact bounded single-link file/u,
+          `${selected} replacement must fail closed`,
+        );
+        assert.strictEqual(swapped, true);
+      } finally {
+        fs.rmSync(fixture.directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("sidecar validation retains prior checksum and provenance pathname identities", () => {
+    const fixture = sidecarFixture();
+    try {
+      const first = validateSidecars(fixture.filePath, fixture.verification, {
+        expectedSourceSha: fixture.sourceSha,
+      });
+      for (const [target, expectedOption, expectedIdentity] of [
+        [fixture.checksumPath, "expectedChecksumIdentity", first.checksumIdentity],
+        [fixture.provenancePath, "expectedProvenanceIdentity", first.provenanceIdentity],
+      ]) {
+        const displaced = `${target}.prior`;
+        const bytes = fs.readFileSync(target);
+        fs.renameSync(target, displaced);
+        fs.writeFileSync(target, bytes);
+        assert.throws(
+          () => validateSidecars(fixture.filePath, fixture.verification, {
+            [expectedOption]: expectedIdentity,
+            expectedSourceSha: fixture.sourceSha,
+          }),
+          /exact bounded single-link file/u,
+        );
+        fs.unlinkSync(target);
+        fs.renameSync(displaced, target);
+      }
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("checksum and provenance sidecars reject symbolic and multiply-linked files", () => {
+    for (const selected of ["checksumPath", "provenancePath"]) {
+      for (const linkKind of ["symbolic", "hard"]) {
+        const fixture = sidecarFixture();
+        const target = fixture[selected];
+        const source = `${target}.source`;
+        fs.renameSync(target, source);
+        if (linkKind === "symbolic") fs.symlinkSync(source, target);
+        else fs.linkSync(source, target);
+        try {
+          assert.throws(
+            () => validateSidecars(fixture.filePath, fixture.verification, {
+              expectedSourceSha: fixture.sourceSha,
+            }),
+            /exact bounded single-link file/u,
+            `${selected} ${linkKind} link must fail closed`,
+          );
+        } finally {
+          fs.rmSync(fixture.directory, { recursive: true, force: true });
+        }
+      }
+    }
+  });
+
+  test("provenance FIFO substitution is opened nonblocking and rejected", function fifoTest() {
+    if (process.platform === "win32") this.skip();
+    const fixture = sidecarFixture();
+    const displaced = `${fixture.provenancePath}.regular`;
+    let substituted = false;
+    const fileSystem = Object.create(fs);
+    fileSystem.openSync = (openedPath, flags) => {
+      if (!substituted && openedPath === fixture.provenancePath) {
+        fs.renameSync(fixture.provenancePath, displaced);
+        const created = spawnSync("mkfifo", [fixture.provenancePath]);
+        assert.strictEqual(created.status, 0);
+        substituted = true;
+      }
+      return fs.openSync(openedPath, flags);
+    };
+    try {
+      assert.throws(
+        () => validateSidecars(fixture.filePath, fixture.verification, {
+          expectedSourceSha: fixture.sourceSha,
+          fileSystem,
+        }),
+        /exact bounded single-link file/u,
+      );
+      assert.strictEqual(substituted, true);
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("provenance descriptor detects growth during its bounded read", () => {
+    const fixture = sidecarFixture();
+    let descriptor;
+    let grew = false;
+    const fileSystem = Object.create(fs);
+    fileSystem.openSync = (openedPath, flags) => {
+      const opened = fs.openSync(openedPath, flags);
+      if (openedPath === fixture.provenancePath) descriptor = opened;
+      return opened;
+    };
+    fileSystem.readSync = (...arguments_) => {
+      const bytesRead = fs.readSync(...arguments_);
+      if (!grew && arguments_[0] === descriptor) {
+        fs.appendFileSync(fixture.provenancePath, " ");
+        grew = true;
+      }
+      return bytesRead;
+    };
+    try {
+      assert.throws(
+        () => validateSidecars(fixture.filePath, fixture.verification, {
+          expectedSourceSha: fixture.sourceSha,
+          fileSystem,
+        }),
+        /exact bounded single-link file/u,
+      );
+      assert.strictEqual(grew, true);
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("provenance sidecar rejects oversized otherwise-valid JSON", () => {
+    const fixture = sidecarFixture();
+    fs.appendFileSync(fixture.provenancePath, " ".repeat(32 * 1024));
+    try {
+      assert.throws(
+        () => validateSidecars(fixture.filePath, fixture.verification, {
+          expectedSourceSha: fixture.sourceSha,
+        }),
+        /exact bounded single-link file/u,
+      );
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
   test("default artifact selection is current-source-bound and unambiguous", () => {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vsix-selection-"));
+    const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "vsix-selection-")));
     const currentSha = "a".repeat(40);
     const staleSha = "b".repeat(40);
     const releasePath = path.join(directory, "release.vsix");

@@ -1,6 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const assert = require("assert");
+const { spawnSync } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
@@ -86,6 +87,13 @@ function temporaryRoot(prefix = "cloudsmith-auth-bootstrap-test-") {
   if (process.platform !== "win32") fs.chmodSync(root, 0o700);
   temporaryRoots.push(root);
   return root;
+}
+
+function authenticatedRuntimeSnapshotRoot(parent) {
+  const snapshots = fs.readdirSync(parent)
+    .filter(name => name.startsWith("cloudsmith-authenticated-runtime-snapshot-"));
+  assert.strictEqual(snapshots.length, 1);
+  return path.join(parent, snapshots[0]);
 }
 
 function executable(target) {
@@ -743,6 +751,41 @@ suite("authenticated CI SecretStorage bootstrap", () => {
     fs.rmSync(candidate.profile.root, { recursive: true, force: true });
   });
 
+  test("runtime-log cleanup fails closed on final root substitution", () => {
+    const parent = temporaryRoot("cloudsmith-runtime-log-cleanup-swap-");
+    const logRoot = createRuntimeLogRoot({ temporaryParent: parent });
+    fs.writeFileSync(path.join(logRoot.root, "owned.log"), "synthetic owned log bytes\n");
+    const victim = path.join(parent, "synthetic-log-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "synthetic victim survives\n");
+    const displaced = path.join(parent, "owned-log-root-displaced");
+    const originalRename = fs.renameSync;
+    const originalRmdir = fs.rmdirSync;
+    let substituted = false;
+    try {
+      fs.rmdirSync = function interceptFinalRuntimeLogRemoval(target, options) {
+        if (!substituted && target === logRoot.root) {
+          originalRename.call(fs, target, displaced);
+          originalRename.call(fs, victim, target);
+          substituted = true;
+        }
+        return originalRmdir.call(fs, target, options);
+      };
+      assert.throws(
+        () => destroyRuntimeLogRoot(logRoot),
+        /unsafe or changed tree/u,
+      );
+    } finally {
+      fs.rmdirSync = originalRmdir;
+    }
+    assert.strictEqual(substituted, true);
+    assert.strictEqual(fs.existsSync(displaced), true);
+    assert.strictEqual(
+      fs.readFileSync(path.join(logRoot.root, "preserve.txt"), "utf8"),
+      "synthetic victim survives\n",
+    );
+  });
+
   test("production workspace proof requires an exact selectable workspace row", () => {
     const exact = {
       placeholder: "Select a default workspace",
@@ -848,7 +891,14 @@ suite("authenticated CI SecretStorage bootstrap", () => {
 
   test("authenticated exposure scan ignores mutable output and reads no profile content", async () => {
     const candidate = candidateFixture();
-    const logRoot = createRuntimeLogRoot({ temporaryParent: temporaryRoot() });
+    const snapshotParent = temporaryRoot("cloudsmith-authenticated-stdin-test-");
+    const logRoot = createRuntimeLogRoot({ temporaryParent: snapshotParent });
+    const runtimeLogFixture = "bounded synthetic runtime-log receipt fixture\n";
+    fs.writeFileSync(
+      path.join(logRoot.root, "runtime.log"),
+      runtimeLogFixture,
+      { mode: 0o600 },
+    );
     let persisted;
     const originalRead = fs.readFileSync;
     fs.readFileSync = function guardedRead(target, ...arguments_) {
@@ -874,6 +924,9 @@ suite("authenticated CI SecretStorage bootstrap", () => {
       },
     };
     let scannedArtifactPath;
+    let scannedRuntimeLogPath;
+    let scannedRuntimeLogInput;
+    let scannedSnapshotRoot;
     let result;
     try {
       result = await runAuthenticatedExposureScan({
@@ -884,6 +937,7 @@ suite("authenticated CI SecretStorage bootstrap", () => {
         runtimeLogRoot: logRoot.root,
         environment: { PATH: process.env.PATH || "" },
       }, {
+        temporaryParent: snapshotParent,
         assertScannerVersion() {},
         scanGeneratedEvidence: () => ({
           id: "authenticated-generated-evidence",
@@ -901,7 +955,24 @@ suite("authenticated CI SecretStorage bootstrap", () => {
             findings: [],
           };
         },
-        writeReceipt(value) { persisted = value; },
+        scanWithGitleaks(kind, target, options) {
+          scannedRuntimeLogPath = target;
+          scannedSnapshotRoot = authenticatedRuntimeSnapshotRoot(snapshotParent);
+          assert.strictEqual(kind, "stdin");
+          assert.strictEqual(target, "runtime.log");
+          assert.strictEqual(path.isAbsolute(target), false);
+          assert.strictEqual(options.logicalPath, target);
+          assert.strictEqual(Object.hasOwn(options, "scanRoot"), false);
+          assert.ok(Buffer.isBuffer(options.input));
+          assert.deepStrictEqual(options.input, Buffer.from(runtimeLogFixture));
+          scannedRuntimeLogInput = options.input;
+          return [];
+        },
+        async writeReceipt(value) {
+          await new Promise(resolve => setImmediate(resolve));
+          assert.strictEqual(fs.existsSync(scannedSnapshotRoot), true);
+          persisted = value;
+        },
       });
     } finally {
       fs.readFileSync = originalRead;
@@ -915,14 +986,583 @@ suite("authenticated CI SecretStorage bootstrap", () => {
       `vsix:${AUTHENTICATED_CANDIDATE_ARTIFACT}`,
     );
     assert.strictEqual(result.components.length, 4);
+    assert.strictEqual(result.components[2].status, "scanned");
+    assert.strictEqual(result.components[2].fileCount, 1);
+    assert.strictEqual(scannedRuntimeLogPath, "runtime.log");
+    assert.ok(scannedRuntimeLogInput.every(byte => byte === 0));
+    assert.ok(scannedSnapshotRoot);
+    assert.strictEqual(fs.existsSync(scannedSnapshotRoot), false);
     assert.strictEqual(result.credentialBoundary.profileContentRead, false);
     assert.strictEqual(result.credentialBoundary.secretStorageRead, false);
     assert.strictEqual(result.credentialBoundary.keychainRead, false);
     assert.strictEqual(result.credentialBoundary.credentialValueRecorded, false);
     assert.strictEqual(result.credentialBoundary.credentialDigestRecorded, false);
+    assert.strictEqual(JSON.stringify(result).includes(runtimeLogFixture.trim()), false);
     assert.strictEqual(persisted.fingerprint, result.fingerprint);
     assert.strictEqual(destroyRuntimeLogRoot(logRoot), true);
     fs.rmSync(candidate.profile.root, { recursive: true, force: true });
+  });
+
+  test("authenticated runtime logs remain descriptor-proven stdin when snapshot paths swap", async () => {
+    const candidate = candidateFixture();
+    const snapshotParent = temporaryRoot("cloudsmith-authenticated-path-swap-test-");
+    const logRoot = createRuntimeLogRoot({ temporaryParent: snapshotParent });
+    const sourceBytes = Buffer.from("bounded authenticated stdin fixture\n");
+    fs.mkdirSync(path.join(logRoot.root, "nested"), { mode: 0o700 });
+    fs.writeFileSync(
+      path.join(logRoot.root, "nested", "runtime.log"),
+      sourceBytes,
+      { mode: 0o600 },
+    );
+    const proofSnapshot = {
+      artifactPath: AUTHENTICATED_CANDIDATE_ARTIFACT,
+      candidateReceiptFingerprint: candidate.receipt.fingerprint,
+      sourceFingerprint: SOURCE.fingerprint,
+      sourceSha: SOURCE.sha,
+      vsixSha256: candidate.receipt.artifact.sha256,
+      identity: {
+        device: "1",
+        inode: "2",
+        size: String(candidate.receipt.artifact.archiveBytes),
+        modifiedNanoseconds: "3",
+        changedNanoseconds: "4",
+      },
+    };
+    let scannerCalls = 0;
+    try {
+      await assert.rejects(runAuthenticatedExposureScan({
+        root: ROOT,
+        source: SOURCE,
+        candidate,
+        candidateReceiptFingerprint: candidate.receipt.fingerprint,
+        runtimeLogRoot: logRoot.root,
+        environment: { PATH: process.env.PATH || "" },
+      }, {
+        temporaryParent: snapshotParent,
+        assertScannerVersion() {},
+        scanGeneratedEvidence: () => ({
+          id: "authenticated-generated-evidence",
+          status: "scanned",
+          fileCount: 2,
+          findings: [],
+        }),
+        captureAuthenticatedCandidateProof: () => proofSnapshot,
+        scanVsix: async (_root, relativePath) => ({
+          id: `vsix:${relativePath}`,
+          status: "scanned",
+          fileCount: 3,
+          findings: [],
+        }),
+        scanWithGitleaks(kind, target, options) {
+          scannerCalls += 1;
+          assert.strictEqual(kind, "stdin");
+          assert.strictEqual(target, "nested/runtime.log");
+          assert.strictEqual(options.logicalPath, target);
+          assert.strictEqual(Object.hasOwn(options, "scanRoot"), false);
+          const snapshotRoot = authenticatedRuntimeSnapshotRoot(snapshotParent);
+          for (const value of Object.values(options)) {
+            if (typeof value === "string") assert.notStrictEqual(value, snapshotRoot);
+          }
+          const snapshotFile = path.join(snapshotRoot, "nested", "runtime.log");
+          const displaced = path.join(snapshotRoot, "nested", "runtime-original.log");
+          fs.renameSync(snapshotFile, displaced);
+          try {
+            fs.writeFileSync(
+              snapshotFile,
+              "substituted path fixture\n",
+            );
+            assert.deepStrictEqual(options.input, sourceBytes);
+          } finally {
+            fs.unlinkSync(snapshotFile);
+            fs.renameSync(displaced, snapshotFile);
+          }
+          return [];
+        },
+        writeReceipt() {},
+      }), /runtime logs changed during snapshot or scanning/u);
+      assert.strictEqual(scannerCalls, 1);
+    } finally {
+      sourceBytes.fill(0);
+      if (fs.existsSync(logRoot.root)) destroyRuntimeLogRoot(logRoot);
+      fs.rmSync(candidate.profile.root, { recursive: true, force: true });
+    }
+  });
+
+  test("authenticated exposure scan rejects a pre-existing runtime-log hard link before scanning", async () => {
+    const candidate = candidateFixture();
+    const snapshotParent = temporaryRoot("cloudsmith-authenticated-hard-link-test-");
+    const logRoot = createRuntimeLogRoot({ temporaryParent: snapshotParent });
+    const logFile = path.join(logRoot.root, "runtime.log");
+    const linkedLogFile = path.join(logRoot.root, "runtime-linked.log");
+    fs.writeFileSync(logFile, "bounded synthetic hard-link fixture\n", { mode: 0o600 });
+    fs.linkSync(logFile, linkedLogFile);
+    assert.strictEqual(fs.statSync(logFile).nlink, 2);
+    let scannerReached = false;
+    let proofCaptureReached = false;
+    let receiptPersistenceReached = false;
+
+    try {
+      await assert.rejects(runAuthenticatedExposureScan({
+        root: ROOT,
+        source: SOURCE,
+        candidate,
+        candidateReceiptFingerprint: candidate.receipt.fingerprint,
+        runtimeLogRoot: logRoot.root,
+        environment: { PATH: process.env.PATH || "" },
+      }, {
+        outputPath: ".quality/secrets/authenticated-hard-link-test.json",
+        temporaryParent: snapshotParent,
+        assertScannerVersion() {},
+        scanGeneratedEvidence() {
+          scannerReached = true;
+          assert.fail("A hard-linked runtime log must fail before generated-evidence scanning.");
+        },
+        captureAuthenticatedCandidateProof() {
+          proofCaptureReached = true;
+          assert.fail("A hard-linked runtime log must fail before proof capture.");
+        },
+        scanVsix: async () => {
+          scannerReached = true;
+          assert.fail("A hard-linked runtime log must fail before VSIX scanning.");
+        },
+        scanWithGitleaks() {
+          scannerReached = true;
+          assert.fail("A hard-linked runtime log must fail before log scanning.");
+        },
+        writeReceipt() {
+          receiptPersistenceReached = true;
+          assert.fail("A hard-linked runtime log must never persist a receipt.");
+        },
+      }), /runtime log regular files must have exactly one hard link/iu);
+
+      assert.strictEqual(scannerReached, false);
+      assert.strictEqual(proofCaptureReached, false);
+      assert.strictEqual(receiptPersistenceReached, false);
+      assert.strictEqual(fs.existsSync(path.join(
+        ROOT,
+        ".quality",
+        "secrets",
+        "authenticated-hard-link-test.json",
+      )), false);
+      assert.deepStrictEqual(fs.readdirSync(snapshotParent), [path.basename(logRoot.root)]);
+      assert.strictEqual(destroyRuntimeLogRoot(logRoot), true);
+      assert.deepStrictEqual(fs.readdirSync(snapshotParent), []);
+    } finally {
+      if (fs.existsSync(logRoot.root)) destroyRuntimeLogRoot(logRoot);
+      fs.rmSync(candidate.profile.root, { recursive: true, force: true });
+    }
+  });
+
+  test("authenticated exposure scan rejects a FIFO replacement without reading it", async function () {
+    if (process.platform === "win32") this.skip();
+    const candidate = candidateFixture();
+    const snapshotParent = temporaryRoot("cloudsmith-authenticated-fifo-test-");
+    const logRoot = createRuntimeLogRoot({ temporaryParent: snapshotParent });
+    const logFile = path.join(logRoot.root, "runtime.log");
+    const displaced = path.join(logRoot.root, "runtime-original.log");
+    fs.writeFileSync(logFile, Buffer.alloc(97, 0x66), { mode: 0o600 });
+    const originalOpen = fs.openSync;
+    const originalRead = fs.readSync;
+    let fifoDescriptor;
+    let replaced = false;
+    let readAttempted = false;
+    let scannerReached = false;
+    try {
+      fs.openSync = function replaceRuntimeLogWithFifo(target, flags, ...arguments_) {
+        if (!replaced && target === logFile) {
+          fs.renameSync(logFile, displaced);
+          const fixture = spawnSync("mkfifo", [logFile], { stdio: "ignore" });
+          if (fixture.status !== 0) {
+            fs.renameSync(displaced, logFile);
+            throw new Error("Synthetic FIFO fixture setup failed.");
+          }
+          replaced = true;
+          assert.notStrictEqual(flags & fs.constants.O_NONBLOCK, 0);
+        }
+        const descriptor = originalOpen.call(fs, target, flags, ...arguments_);
+        if (replaced && target === logFile) fifoDescriptor = descriptor;
+        return descriptor;
+      };
+      fs.readSync = function rejectFifoRead(descriptor, ...arguments_) {
+        if (descriptor === fifoDescriptor) {
+          readAttempted = true;
+          assert.fail("A substituted runtime-log FIFO must be rejected before reading.");
+        }
+        return originalRead.call(fs, descriptor, ...arguments_);
+      };
+      await assert.rejects(runAuthenticatedExposureScan({
+        root: ROOT,
+        source: SOURCE,
+        candidate,
+        candidateReceiptFingerprint: candidate.receipt.fingerprint,
+        runtimeLogRoot: logRoot.root,
+        environment: { PATH: process.env.PATH || "" },
+      }, {
+        temporaryParent: snapshotParent,
+        assertScannerVersion() {},
+        scanGeneratedEvidence() {
+          scannerReached = true;
+          assert.fail("A substituted runtime-log FIFO must fail before scanning.");
+        },
+        captureAuthenticatedCandidateProof() {
+          scannerReached = true;
+          assert.fail("A substituted runtime-log FIFO must fail before proof capture.");
+        },
+        scanVsix: async () => {
+          scannerReached = true;
+          assert.fail("A substituted runtime-log FIFO must fail before VSIX scanning.");
+        },
+        scanWithGitleaks() {
+          scannerReached = true;
+          assert.fail("A substituted runtime-log FIFO must fail before log scanning.");
+        },
+        writeReceipt() {
+          assert.fail("A substituted runtime-log FIFO must never persist a receipt.");
+        },
+      }), error => {
+        assert.strictEqual(
+          error.message,
+          "Authenticated runtime logs changed during snapshot or scanning.",
+        );
+        return true;
+      });
+    } finally {
+      fs.readSync = originalRead;
+      fs.openSync = originalOpen;
+      if (replaced && fs.existsSync(logFile)) fs.unlinkSync(logFile);
+      if (fs.existsSync(displaced)) fs.renameSync(displaced, logFile);
+      if (fs.existsSync(logRoot.root)) destroyRuntimeLogRoot(logRoot);
+      fs.rmSync(candidate.profile.root, { recursive: true, force: true });
+    }
+    assert.strictEqual(replaced, true);
+    assert.strictEqual(readAttempted, false);
+    assert.strictEqual(scannerReached, false);
+  });
+
+  test("authenticated runtime-log copy and comparison reject growth without over-reading", async () => {
+    for (const growthPhase of ["copy", "comparison"]) {
+      const candidate = candidateFixture();
+      const snapshotParent = temporaryRoot(
+        `cloudsmith-authenticated-growth-${growthPhase}-test-`,
+      );
+      const logRoot = createRuntimeLogRoot({ temporaryParent: snapshotParent });
+      const logFile = path.join(logRoot.root, "runtime.log");
+      const capturedBytes = 257;
+      const originalBytes = Buffer.alloc(capturedBytes, 0x62);
+      fs.writeFileSync(logFile, originalBytes, { mode: 0o600 });
+      originalBytes.fill(0);
+      const originalOpen = fs.openSync;
+      const originalRead = fs.readSync;
+      const targetOpen = growthPhase === "copy" ? 1 : 2;
+      let exactOpenCount = 0;
+      let watchedDescriptor;
+      let grew = false;
+      let requestedBytes = 0;
+      let scannerReached = false;
+      try {
+        fs.openSync = function observeExactRuntimeLogOpen(target, flags, ...arguments_) {
+          const descriptor = originalOpen.call(fs, target, flags, ...arguments_);
+          if (target === logFile) {
+            exactOpenCount += 1;
+            assert.notStrictEqual(flags & fs.constants.O_NONBLOCK, 0);
+            if (exactOpenCount === targetOpen) watchedDescriptor = descriptor;
+          }
+          return descriptor;
+        };
+        fs.readSync = function growWithinBoundedRead(
+          descriptor,
+          buffer,
+          offset,
+          length,
+          position,
+        ) {
+          if (descriptor === watchedDescriptor) {
+            requestedBytes += length;
+            assert.ok(requestedBytes <= capturedBytes);
+            if (!grew) {
+              const growth = Buffer.alloc(193, 0x67);
+              const growthDescriptor = originalOpen.call(
+                fs,
+                logFile,
+                fs.constants.O_WRONLY | fs.constants.O_APPEND,
+              );
+              try {
+                fs.writeSync(growthDescriptor, growth, 0, growth.length, null);
+              } finally {
+                growth.fill(0);
+                fs.closeSync(growthDescriptor);
+              }
+              grew = true;
+            }
+          }
+          return originalRead.call(fs, descriptor, buffer, offset, length, position);
+        };
+        await assert.rejects(runAuthenticatedExposureScan({
+          root: ROOT,
+          source: SOURCE,
+          candidate,
+          candidateReceiptFingerprint: candidate.receipt.fingerprint,
+          runtimeLogRoot: logRoot.root,
+          environment: { PATH: process.env.PATH || "" },
+        }, {
+          temporaryParent: snapshotParent,
+          assertScannerVersion() {},
+          scanGeneratedEvidence() {
+            scannerReached = true;
+            assert.fail("A growing runtime log must fail before scanning.");
+          },
+          captureAuthenticatedCandidateProof() {
+            scannerReached = true;
+            assert.fail("A growing runtime log must fail before proof capture.");
+          },
+          scanVsix: async () => {
+            scannerReached = true;
+            assert.fail("A growing runtime log must fail before VSIX scanning.");
+          },
+          scanWithGitleaks() {
+            scannerReached = true;
+            assert.fail("A growing runtime log must fail before log scanning.");
+          },
+          writeReceipt() {
+            assert.fail("A growing runtime log must never persist a receipt.");
+          },
+        }), error => {
+          assert.strictEqual(
+            error.message,
+            "Authenticated runtime logs changed during snapshot or scanning.",
+          );
+          return true;
+        });
+      } finally {
+        fs.readSync = originalRead;
+        fs.openSync = originalOpen;
+        if (fs.existsSync(logRoot.root)) destroyRuntimeLogRoot(logRoot);
+        fs.rmSync(candidate.profile.root, { recursive: true, force: true });
+      }
+      assert.strictEqual(grew, true);
+      assert.strictEqual(requestedBytes, capturedBytes);
+      assert.strictEqual(scannerReached, false);
+    }
+  });
+
+  test("authenticated exposure scan rejects runtime-log add, change, delete, and same-byte replacement", async () => {
+    const originalBytes = Buffer.from("bounded synthetic runtime-log fixture\n");
+    for (const mutation of ["add", "change", "delete", "replace"]) {
+      const candidate = candidateFixture();
+      const snapshotParent = temporaryRoot(
+        `cloudsmith-authenticated-runtime-${mutation}-test-`,
+      );
+      const logRoot = createRuntimeLogRoot({ temporaryParent: snapshotParent });
+      const logFile = path.join(logRoot.root, "runtime.log");
+      fs.writeFileSync(logFile, originalBytes, { mode: 0o600 });
+      const proofSnapshot = {
+        artifactPath: AUTHENTICATED_CANDIDATE_ARTIFACT,
+        candidateReceiptFingerprint: candidate.receipt.fingerprint,
+        sourceFingerprint: SOURCE.fingerprint,
+        sourceSha: SOURCE.sha,
+        vsixSha256: candidate.receipt.artifact.sha256,
+        identity: {
+          device: "1",
+          inode: "2",
+          size: String(candidate.receipt.artifact.archiveBytes),
+          modifiedNanoseconds: "3",
+          changedNanoseconds: "4",
+        },
+      };
+      let scannedSnapshot;
+      try {
+        await assert.rejects(runAuthenticatedExposureScan({
+          root: ROOT,
+          source: SOURCE,
+          candidate,
+          candidateReceiptFingerprint: candidate.receipt.fingerprint,
+          runtimeLogRoot: logRoot.root,
+          environment: { PATH: process.env.PATH || "" },
+        }, {
+          temporaryParent: snapshotParent,
+          assertScannerVersion() {},
+          scanGeneratedEvidence: () => ({
+            id: "authenticated-generated-evidence",
+            status: "scanned",
+            fileCount: 2,
+            findings: [],
+          }),
+          captureAuthenticatedCandidateProof: () => proofSnapshot,
+          scanVsix: async (_root, relativePath) => ({
+            id: `vsix:${relativePath}`,
+            status: "scanned",
+            fileCount: 3,
+            findings: [],
+          }),
+          scanWithGitleaks(kind, target, scanOptions) {
+            scannedSnapshot = authenticatedRuntimeSnapshotRoot(snapshotParent);
+            assert.strictEqual(kind, "stdin");
+            assert.strictEqual(target, "runtime.log");
+            assert.strictEqual(scanOptions.logicalPath, target);
+            assert.strictEqual(Object.hasOwn(scanOptions, "scanRoot"), false);
+            assert.deepStrictEqual(scanOptions.input, originalBytes);
+            if (mutation === "add") {
+              fs.writeFileSync(
+                path.join(logRoot.root, "added.log"),
+                "bounded added runtime-log fixture\n",
+                { mode: 0o600 },
+              );
+            } else if (mutation === "change") {
+              fs.writeFileSync(
+                logFile,
+                "bounded changed runtime-log fixture\n",
+                { mode: 0o600 },
+              );
+            } else if (mutation === "delete") {
+              fs.unlinkSync(logFile);
+            } else {
+              const replacement = path.join(logRoot.root, "replacement.log");
+              fs.writeFileSync(replacement, originalBytes, { mode: 0o600 });
+              fs.renameSync(replacement, logFile);
+            }
+            return [];
+          },
+          writeReceipt() {
+            assert.fail("A drifted runtime-log scan must not persist a receipt.");
+          },
+        }), /runtime logs changed during snapshot or scanning/u);
+        assert.ok(scannedSnapshot);
+        assert.strictEqual(fs.existsSync(scannedSnapshot), false);
+      } finally {
+        if (fs.existsSync(logRoot.root)) destroyRuntimeLogRoot(logRoot);
+        fs.rmSync(candidate.profile.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("authenticated exposure scan removes receipts when source or snapshot drifts during persistence", async () => {
+    const originalBytes = Buffer.from("bounded synthetic persistence fixture\n");
+    const mutations = [
+      "add",
+      "change",
+      "delete",
+      "different-byte-replacement",
+      "same-byte-replacement",
+    ];
+    for (const targetKind of ["source", "snapshot"]) {
+      for (const mutation of mutations) {
+        const candidate = candidateFixture();
+        const snapshotParent = temporaryRoot(
+          `cloudsmith-authenticated-persistence-${targetKind}-${mutation}-test-`,
+        );
+        const logRoot = createRuntimeLogRoot({ temporaryParent: snapshotParent });
+        const sourceLogFile = path.join(logRoot.root, "runtime.log");
+        fs.writeFileSync(sourceLogFile, originalBytes, { mode: 0o600 });
+        const outputPath = [
+          ".quality/secrets/authenticated-runtime-persistence-",
+          targetKind,
+          "-",
+          mutation,
+          ".json",
+        ].join("");
+        const absoluteOutputPath = path.join(ROOT, ...outputPath.split("/"));
+        const proofSnapshot = {
+          artifactPath: AUTHENTICATED_CANDIDATE_ARTIFACT,
+          candidateReceiptFingerprint: candidate.receipt.fingerprint,
+          sourceFingerprint: SOURCE.fingerprint,
+          sourceSha: SOURCE.sha,
+          vsixSha256: candidate.receipt.artifact.sha256,
+          identity: {
+            device: "1",
+            inode: "2",
+            size: String(candidate.receipt.artifact.archiveBytes),
+            modifiedNanoseconds: "3",
+            changedNanoseconds: "4",
+          },
+        };
+        let scannedSnapshot;
+        let snapshotAliveDuringPersistence = false;
+        try {
+          await assert.rejects(runAuthenticatedExposureScan({
+            root: ROOT,
+            source: SOURCE,
+            candidate,
+            candidateReceiptFingerprint: candidate.receipt.fingerprint,
+            runtimeLogRoot: logRoot.root,
+            environment: { PATH: process.env.PATH || "" },
+          }, {
+            outputPath,
+            temporaryParent: snapshotParent,
+            assertScannerVersion() {},
+            scanGeneratedEvidence: () => ({
+              id: "authenticated-generated-evidence",
+              status: "scanned",
+              fileCount: 2,
+              findings: [],
+            }),
+            captureAuthenticatedCandidateProof: () => proofSnapshot,
+            scanVsix: async (_root, relativePath) => ({
+              id: `vsix:${relativePath}`,
+              status: "scanned",
+              fileCount: 3,
+              findings: [],
+            }),
+            scanWithGitleaks(kind, target, scanOptions) {
+              scannedSnapshot = authenticatedRuntimeSnapshotRoot(snapshotParent);
+              assert.strictEqual(kind, "stdin");
+              assert.strictEqual(target, "runtime.log");
+              assert.strictEqual(scanOptions.logicalPath, target);
+              assert.strictEqual(Object.hasOwn(scanOptions, "scanRoot"), false);
+              assert.ok(Buffer.isBuffer(scanOptions.input));
+              return [];
+            },
+            async writeReceipt(value) {
+              await new Promise(resolve => setImmediate(resolve));
+              snapshotAliveDuringPersistence = fs.existsSync(scannedSnapshot);
+              assert.strictEqual(snapshotAliveDuringPersistence, true);
+              writeJson(outputPath, value, ROOT, { subtree: ".quality/secrets" });
+              assert.strictEqual(fs.existsSync(absoluteOutputPath), true);
+              const mutationRoot = targetKind === "source"
+                ? logRoot.root
+                : scannedSnapshot;
+              const logFile = path.join(mutationRoot, "runtime.log");
+              if (mutation === "add") {
+                fs.writeFileSync(
+                  path.join(mutationRoot, "added.log"),
+                  "bounded synthetic added persistence fixture\n",
+                  { mode: 0o600 },
+                );
+              } else if (mutation === "change") {
+                fs.writeFileSync(
+                  logFile,
+                  "bounded synthetic changed persistence fixture\n",
+                  { mode: 0o600 },
+                );
+              } else if (mutation === "delete") {
+                fs.unlinkSync(logFile);
+              } else {
+                const replacement = path.join(mutationRoot, "replacement.log");
+                fs.writeFileSync(
+                  replacement,
+                  mutation === "different-byte-replacement"
+                    ? "bounded synthetic replacement persistence fixture\n"
+                    : originalBytes,
+                  { mode: 0o600 },
+                );
+                fs.renameSync(replacement, logFile);
+              }
+            },
+          }), /runtime logs changed during snapshot or scanning/u);
+          assert.strictEqual(snapshotAliveDuringPersistence, true);
+          assert.ok(scannedSnapshot);
+          assert.strictEqual(fs.existsSync(scannedSnapshot), false);
+          assert.strictEqual(fs.existsSync(absoluteOutputPath), false);
+          assert.deepStrictEqual(
+            fs.readdirSync(snapshotParent),
+            [path.basename(logRoot.root)],
+          );
+        } finally {
+          fs.rmSync(absoluteOutputPath, { force: true });
+          if (fs.existsSync(logRoot.root)) destroyRuntimeLogRoot(logRoot);
+          fs.rmSync(candidate.profile.root, { recursive: true, force: true });
+        }
+      }
+    }
   });
 
   test("authenticated exposure scan fails closed when proof identity changes during scanning", async () => {
@@ -1337,6 +1977,53 @@ suite("authenticated CI SecretStorage bootstrap", () => {
     );
     assert.strictEqual(fs.existsSync(candidate.profile.root), false);
     assert.strictEqual(fs.existsSync(descriptor), false);
+  });
+
+  test("authenticated candidate cleanup fails closed on final profile substitution", () => {
+    const repositoryRoot = temporaryRoot("cloudsmith-authenticated-cleanup-swap-repository-");
+    const runnerTemp = temporaryRoot("cloudsmith-authenticated-cleanup-swap-runner-");
+    const environment = { RUNNER_TEMP: runnerTemp };
+    const candidate = candidateFixture({ temporaryParent: runnerTemp });
+    const session = sessionFromCandidate(candidate, { environment });
+    writeJson(AUTHENTICATED_SESSION, session, repositoryRoot, {
+      subtree: ".quality/qualification",
+    });
+    markPreparedAuthenticatedCandidateProcessExit(
+      "proven",
+      repositoryRoot,
+      { environment },
+    );
+    const descriptor = path.join(repositoryRoot, AUTHENTICATED_SESSION);
+    const victim = path.join(runnerTemp, "synthetic-profile-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "synthetic victim survives\n");
+    const displaced = path.join(runnerTemp, "owned-profile-displaced");
+    const originalRename = fs.renameSync;
+    const originalRmdir = fs.rmdirSync;
+    let substituted = false;
+    try {
+      fs.rmdirSync = function interceptFinalAuthenticatedProfileRemoval(target, options) {
+        if (!substituted && target === candidate.profile.root) {
+          originalRename.call(fs, target, displaced);
+          originalRename.call(fs, victim, target);
+          substituted = true;
+        }
+        return originalRmdir.call(fs, target, options);
+      };
+      assert.throws(
+        () => cleanupPreparedAuthenticatedCandidate(repositoryRoot, { environment }),
+        /unsafe or changed tree/u,
+      );
+    } finally {
+      fs.rmdirSync = originalRmdir;
+    }
+    assert.strictEqual(substituted, true);
+    assert.strictEqual(fs.existsSync(displaced), true);
+    assert.strictEqual(fs.existsSync(descriptor), true);
+    assert.strictEqual(
+      fs.readFileSync(path.join(candidate.profile.root, "preserve.txt"), "utf8"),
+      "synthetic victim survives\n",
+    );
   });
 
   test("candidate session rejects a self-fingerprinted arbitrary cleanup parent", () => {

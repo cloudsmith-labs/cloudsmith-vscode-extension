@@ -17,6 +17,7 @@ const {
   candidateBindingFromReceipt,
 } = require("../scripts/quality/candidate-binding");
 const {
+  ACCEPTANCE_BOUNDARY_DRIFT_REASON,
   attestationReviewDigest,
   evaluateLiveQualification,
   qualificationEvidenceManifest,
@@ -26,6 +27,7 @@ const {
 const {
   RELEASE_EXPOSURE_RESULT,
   buildReleaseExposureResult,
+  captureGeneratedEvidenceManifest,
 } = require("../scripts/quality/release-exposure-scan");
 const { UI_RESULT } = require("../scripts/quality/verify-ui-evidence");
 
@@ -442,6 +444,7 @@ function writeReleaseExposureFixture(fixture, document, inputPath, overrides = {
     overrides,
     "evidenceManifest",
   ) ? overrides.evidenceManifest : qualificationEvidenceManifest(document);
+  const generatedEvidence = captureGeneratedEvidenceManifest(fixture.root);
   const receipt = buildReleaseExposureResult({
     source: SOURCE,
     candidateReceiptFingerprint: overrides.candidateReceiptFingerprint
@@ -450,12 +453,13 @@ function writeReleaseExposureFixture(fixture, document, inputPath, overrides = {
     uiResultSha256: crypto.createHash("sha256").update(uiResultBytes).digest("hex"),
     attestationPath: inputPath,
     attestationSha256: crypto.createHash("sha256").update(attestationBytes).digest("hex"),
+    generatedEvidence,
     evidenceManifest,
     components: [
       {
         id: "post-ui-generated-quality-evidence",
         status: "scanned",
-        fileCount: 3,
+        fileCount: generatedEvidence.files.length,
         findings: [],
       },
       {
@@ -842,7 +846,7 @@ suite("Release checklist trust receipts", () => {
     const result = runChecklist({
       inputPath,
       now: NOW,
-      outputPath: ".quality/live-status.json",
+      outputPath: ".quality/gates/live-qualification-status.json",
       root: fixture.root,
       source: SOURCE,
       workflows: WORKFLOWS,
@@ -875,7 +879,7 @@ suite("Release checklist trust receipts", () => {
     const missing = runChecklist({
       inputPath,
       now: NOW,
-      outputPath: ".quality/live-status.json",
+      outputPath: ".quality/gates/live-qualification-status.json",
       root: fixture.root,
       source: SOURCE,
       workflows: WORKFLOWS,
@@ -890,7 +894,7 @@ suite("Release checklist trust receipts", () => {
     const crossed = runChecklist({
       inputPath,
       now: NOW,
-      outputPath: ".quality/live-status.json",
+      outputPath: ".quality/gates/live-qualification-status.json",
       root: fixture.root,
       source: SOURCE,
       workflows: WORKFLOWS,
@@ -905,7 +909,7 @@ suite("Release checklist trust receipts", () => {
     const omitted = runChecklist({
       inputPath,
       now: NOW,
-      outputPath: ".quality/live-status.json",
+      outputPath: ".quality/gates/live-qualification-status.json",
       root: fixture.root,
       source: SOURCE,
       workflows: WORKFLOWS,
@@ -913,6 +917,252 @@ suite("Release checklist trust receipts", () => {
     });
     assert.strictEqual(omitted.status, "failed");
     assert.ok(omitted.errors.some(error => /Release exposure proof is invalid/u.test(error)));
+  });
+
+  test("rejects generated-evidence add, change, delete, and identity-replacement drift", () => {
+    const mutations = {
+      add(rowFixture) {
+        fs.writeFileSync(
+          path.join(rowFixture.root, ".quality", "qualification", "late-proof.txt"),
+          "late generated proof\n",
+        );
+      },
+      change(rowFixture, markerPath) {
+        fs.writeFileSync(markerPath, "changed generated proof\n");
+      },
+      delete(_rowFixture, markerPath) {
+        fs.rmSync(markerPath);
+      },
+      replace(rowFixture, markerPath, markerBytes) {
+        const replacement = path.join(
+          rowFixture.root,
+          ".quality",
+          "qualification",
+          "replacement-proof.txt",
+        );
+        fs.writeFileSync(replacement, markerBytes);
+        fs.renameSync(replacement, markerPath);
+      },
+    };
+    for (const [name, mutate] of Object.entries(mutations)) {
+      const rowFixture = createFixture();
+      try {
+        const inputPath = "internal_docs/quality/live-qualification.json";
+        fs.writeFileSync(
+          path.join(rowFixture.root, inputPath),
+          `${JSON.stringify(rowFixture.document, null, 2)}\n`,
+        );
+        const markerPath = path.join(
+          rowFixture.root,
+          ".quality",
+          "qualification",
+          "stable-generated-proof.txt",
+        );
+        const markerBytes = Buffer.from("stable generated proof\n");
+        fs.writeFileSync(markerPath, markerBytes);
+        writeReleaseExposureFixture(rowFixture, rowFixture.document, inputPath);
+        mutate(rowFixture, markerPath, markerBytes);
+
+        const result = runChecklist({
+          inputPath,
+          now: NOW,
+          outputPath: ".quality/gates/live-qualification-status.json",
+          root: rowFixture.root,
+          source: SOURCE,
+          workflows: WORKFLOWS,
+          qualificationHomeDirectory: rowFixture.qualificationHomeDirectory,
+        });
+        assert.strictEqual(result.status, "failed", name);
+        assert.strictEqual(result.reason, "Release exposure verification failed closed.", name);
+        assert.ok(result.errors.some(error => (
+          /generated release evidence changed across the pre-acceptance boundary/iu.test(error)
+        )), name);
+      } finally {
+        fs.rmSync(rowFixture.root, { force: true, recursive: true });
+      }
+    }
+  });
+
+  test("revalidates generated evidence after evaluation and before persisting acceptance", () => {
+    const inputPath = "internal_docs/quality/live-qualification.json";
+    fs.writeFileSync(
+      path.join(fixture.root, inputPath),
+      `${JSON.stringify(fixture.document, null, 2)}\n`,
+    );
+    writeReleaseExposureFixture(fixture, fixture.document, inputPath);
+
+    const result = runChecklist({
+      inputPath,
+      now: NOW,
+      outputPath: ".quality/gates/live-qualification-status.json",
+      root: fixture.root,
+      source: SOURCE,
+      workflows: WORKFLOWS,
+      qualificationHomeDirectory: fixture.qualificationHomeDirectory,
+      beforePersist({ root }) {
+        fs.writeFileSync(
+          path.join(root, ".quality", "qualification", "acceptance-race.txt"),
+          "post-evaluation generated proof\n",
+        );
+      },
+    });
+
+    assert.strictEqual(result.status, "failed");
+    assert.strictEqual(result.reason, "Release exposure verification failed closed.");
+    assert.ok(result.errors.some(error => (
+      /generated release evidence changed across the pre-acceptance boundary/iu.test(error)
+    )));
+  });
+
+  test("downgrades writer-boundary UI and generated-evidence races after atomic persistence", () => {
+    const mutations = {
+      "ui-change"({ uiArtifactPath }) {
+        fs.writeFileSync(uiArtifactPath, "UI-CANDIDATE-CHANGED-DURING-PERSISTENCE\n");
+      },
+      "ui-delete"({ uiArtifactPath }) {
+        fs.rmSync(uiArtifactPath);
+      },
+      "ui-same-byte-replacement"({ uiArtifactBytes, uiArtifactPath }) {
+        const replacement = `${uiArtifactPath}.replacement`;
+        fs.writeFileSync(replacement, uiArtifactBytes);
+        fs.renameSync(replacement, uiArtifactPath);
+      },
+      "generated-add"({ rowFixture }) {
+        fs.writeFileSync(
+          path.join(rowFixture.root, ".quality", "qualification", "late-proof.txt"),
+          "GENERATED-EVIDENCE-ADDED-DURING-PERSISTENCE\n",
+        );
+      },
+      "generated-change"({ generatedMarkerPath }) {
+        fs.writeFileSync(
+          generatedMarkerPath,
+          "GENERATED-EVIDENCE-CHANGED-DURING-PERSISTENCE\n",
+        );
+      },
+      "generated-delete"({ generatedMarkerPath }) {
+        fs.rmSync(generatedMarkerPath);
+      },
+      "generated-same-byte-replacement"({ generatedMarkerBytes, generatedMarkerPath }) {
+        const replacement = `${generatedMarkerPath}.replacement`;
+        fs.writeFileSync(replacement, generatedMarkerBytes);
+        fs.renameSync(replacement, generatedMarkerPath);
+      },
+    };
+
+    for (const [name, mutate] of Object.entries(mutations)) {
+      const rowFixture = createFixture();
+      try {
+        const inputPath = "internal_docs/quality/live-qualification.json";
+        const outputPath = ".quality/gates/live-qualification-status.json";
+        fs.writeFileSync(
+          path.join(rowFixture.root, inputPath),
+          `${JSON.stringify(rowFixture.document, null, 2)}\n`,
+        );
+        const generatedMarkerPath = path.join(
+          rowFixture.root,
+          ".quality",
+          "qualification",
+          "stable-generated-proof.txt",
+        );
+        const generatedMarkerBytes = Buffer.from("stable generated proof\n");
+        fs.writeFileSync(generatedMarkerPath, generatedMarkerBytes);
+        writeReleaseExposureFixture(rowFixture, rowFixture.document, inputPath);
+        const uiArtifactPath = path.join(rowFixture.root, UI_CANDIDATE_ARTIFACT);
+        const uiArtifactBytes = fs.readFileSync(uiArtifactPath);
+        let hookObserved = false;
+        let hookPersisted = null;
+        let hookWritten = null;
+
+        const result = runChecklist({
+          inputPath,
+          now: NOW,
+          outputPath,
+          root: rowFixture.root,
+          source: SOURCE,
+          workflows: WORKFLOWS,
+          qualificationHomeDirectory: rowFixture.qualificationHomeDirectory,
+          afterPersist({ result: written }) {
+            hookObserved = true;
+            hookWritten = written;
+            hookPersisted = JSON.parse(fs.readFileSync(
+              path.join(rowFixture.root, outputPath),
+              "utf8",
+            ));
+            mutate({
+              generatedMarkerBytes,
+              generatedMarkerPath,
+              rowFixture,
+              uiArtifactBytes,
+              uiArtifactPath,
+            });
+          },
+        });
+        const persisted = JSON.parse(fs.readFileSync(
+          path.join(rowFixture.root, outputPath),
+          "utf8",
+        ));
+
+        assert.strictEqual(hookObserved, true, name);
+        assert.strictEqual(hookWritten.status, "passed", name);
+        assert.deepStrictEqual(hookPersisted, hookWritten, name);
+        assert.deepStrictEqual(persisted, result, name);
+        assert.strictEqual(result.status, "failed", name);
+        assert.strictEqual(result.authenticatedAcceptance, "not-recorded", name);
+        assert.strictEqual(result.reason, ACCEPTANCE_BOUNDARY_DRIFT_REASON, name);
+        assert.deepStrictEqual(result.errors, [ACCEPTANCE_BOUNDARY_DRIFT_REASON], name);
+        assert.strictEqual(result.candidate, null, name);
+        assert.strictEqual(result.attestationFingerprint, null, name);
+        assert.deepStrictEqual(result.evidenceManifest, [], name);
+        assert.doesNotMatch(
+          JSON.stringify(persisted),
+          /(?:UI-CANDIDATE|GENERATED-EVIDENCE)-.+DURING-PERSISTENCE/u,
+          name,
+        );
+      } finally {
+        fs.rmSync(rowFixture.root, { force: true, recursive: true });
+      }
+    }
+  });
+
+  test("replaces rejected attestation summary text with fixed fail-closed status copy", () => {
+    const inputPath = "internal_docs/quality/live-qualification.json";
+    const outputPath = ".quality/gates/live-qualification-status.json";
+    const sentinel = "ATTESTATION-CONTROLLED-SUMMARY-MUST-NOT-PERSIST";
+    const partial = clone(fixture.document);
+    partial.status = "partial";
+    partial.summary = sentinel;
+    partial.authenticatedAcceptance = false;
+    partial.checklistConfirmed = false;
+    partial.verdict = null;
+    partial.workflowResults[0].status = "PARTIAL";
+    partial.workflowResults[0].authoritativeOutcomeObserved = false;
+    fs.writeFileSync(path.join(fixture.root, inputPath), `${JSON.stringify(partial, null, 2)}\n`);
+    writeReleaseExposureFixture(fixture, partial, inputPath);
+    fs.mkdirSync(path.join(fixture.root, ".quality", "gates"), { recursive: true });
+    fs.writeFileSync(
+      path.join(fixture.root, outputPath),
+      `${JSON.stringify({ reason: sentinel })}\n`,
+    );
+    fs.writeFileSync(
+      path.join(fixture.root, RELEASE_EXPOSURE_RESULT),
+      "{unreadable-release-exposure-proof}\n",
+    );
+
+    const result = runChecklist({
+      inputPath,
+      now: NOW,
+      outputPath,
+      root: fixture.root,
+      source: SOURCE,
+      workflows: WORKFLOWS,
+      qualificationHomeDirectory: fixture.qualificationHomeDirectory,
+    });
+    const persisted = fs.readFileSync(path.join(fixture.root, outputPath), "utf8");
+
+    assert.strictEqual(result.status, "failed");
+    assert.strictEqual(result.reason, "Release exposure verification failed closed.");
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel, "u"));
+    assert.doesNotMatch(persisted, new RegExp(sentinel, "u"));
   });
 
   test("does not load stale authenticated proof for a non-authenticated partial disk result", () => {
@@ -926,16 +1176,16 @@ suite("Release checklist trust receipts", () => {
     partial.workflowResults[0].status = "PARTIAL";
     partial.workflowResults[0].authoritativeOutcomeObserved = false;
     fs.writeFileSync(path.join(fixture.root, inputPath), `${JSON.stringify(partial, null, 2)}\n`);
-    writeReleaseExposureFixture(fixture, partial, inputPath);
     fs.writeFileSync(
       path.join(fixture.root, AUTHENTICATED_CANDIDATE_RECEIPT),
       "{stale-auth-proof}\n",
     );
+    writeReleaseExposureFixture(fixture, partial, inputPath);
 
     const result = runChecklist({
       inputPath,
       now: NOW,
-      outputPath: ".quality/live-status.json",
+      outputPath: ".quality/gates/live-qualification-status.json",
       root: fixture.root,
       source: SOURCE,
       workflows: WORKFLOWS,
@@ -943,6 +1193,11 @@ suite("Release checklist trust receipts", () => {
     });
 
     assert.strictEqual(result.status, "partial");
+    assert.strictEqual(
+      result.reason,
+      "Authenticated live qualification is declared partial.",
+    );
+    assert.doesNotMatch(JSON.stringify(result), /authoritative outcome was only partially/iu);
     assert.deepStrictEqual(result.candidate, fixture.document.candidate);
   });
 
@@ -958,7 +1213,7 @@ suite("Release checklist trust receipts", () => {
     assert.throws(() => runChecklist({
       inputPath,
       now: NOW,
-      outputPath: ".quality/live-status.json",
+      outputPath: ".quality/gates/live-qualification-status.json",
       root: fixture.root,
       source: SOURCE,
       workflows: WORKFLOWS,
@@ -1090,7 +1345,7 @@ suite("Release checklist trust receipts", () => {
         () => runChecklist({
           inputPath,
           now: NOW,
-          outputPath: ".quality/live-status.json",
+          outputPath: ".quality/gates/live-qualification-status.json",
           root: fixture.root,
           source: SOURCE,
           workflows: WORKFLOWS,
@@ -1099,6 +1354,122 @@ suite("Release checklist trust receipts", () => {
       );
     } finally {
       fs.rmSync(outside, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects hard-linked live, qualification, evidence, and artifact proofs", () => {
+    const evidenceTarget = path.join(fixture.root, fixture.qualificationEvidence.path);
+    const evidenceLink = path.join(fixture.root, "hard-linked-evidence.md");
+    fs.linkSync(evidenceTarget, evidenceLink);
+    try {
+      const evidenceResult = evaluate(fixture);
+      assert.strictEqual(evidenceResult.status, "failed");
+      assert.ok(evidenceResult.errors.some(error => (
+        /evidence file is missing, unsafe, changed, or unreadable/u.test(error)
+      )));
+    } finally {
+      fs.rmSync(evidenceLink);
+    }
+
+    const artifactLink = path.join(fixture.root, "hard-linked-candidate.vsix");
+    fs.linkSync(fixture.candidateArtifactPath, artifactLink);
+    try {
+      const artifactResult = evaluate(fixture);
+      assert.strictEqual(artifactResult.status, "failed");
+      assert.ok(artifactResult.errors.some(error => /candidate proof is invalid/iu.test(error)));
+    } finally {
+      fs.rmSync(artifactLink);
+    }
+
+    const inputPath = "internal_docs/quality/live-qualification.json";
+    const inputTarget = path.join(fixture.root, inputPath);
+    const inputLink = path.join(fixture.root, "hard-linked-live-qualification.json");
+    fs.writeFileSync(inputTarget, `${JSON.stringify(fixture.document, null, 2)}\n`);
+    fs.linkSync(inputTarget, inputLink);
+    try {
+      assert.throws(() => runChecklist({
+        inputPath,
+        now: NOW,
+        outputPath: ".quality/gates/live-qualification-status.json",
+        root: fixture.root,
+        source: SOURCE,
+        workflows: WORKFLOWS,
+      }), /exact bounded single-link JSON file/u);
+    } finally {
+      fs.rmSync(inputLink);
+    }
+
+    writeReleaseExposureFixture(fixture, fixture.document, inputPath);
+    const uiReceiptTarget = path.join(fixture.root, UI_CANDIDATE_RECEIPT);
+    const uiReceiptLink = path.join(fixture.root, "hard-linked-ui-candidate.json");
+    fs.linkSync(uiReceiptTarget, uiReceiptLink);
+    try {
+      assert.throws(() => runChecklist({
+        inputPath,
+        now: NOW,
+        outputPath: ".quality/gates/live-qualification-status.json",
+        root: fixture.root,
+        source: SOURCE,
+        workflows: WORKFLOWS,
+        qualificationHomeDirectory: fixture.qualificationHomeDirectory,
+      }), /Qualification proof is not an exact bounded single-link JSON file/u);
+    } finally {
+      fs.rmSync(uiReceiptLink);
+    }
+  });
+
+  test("rejects pre-read live-input symlink and FIFO swaps without reading them", function () {
+    if (process.platform === "win32") this.skip();
+    for (const replacementKind of ["symlink", "fifo"]) {
+      const rowFixture = createFixture();
+      const inputPath = "internal_docs/quality/live-qualification.json";
+      const inputTarget = path.join(rowFixture.root, inputPath);
+      const displacedInput = `${inputTarget}.descriptor-proven`;
+      const replacement = path.join(rowFixture.root, `pre-read-${replacementKind}`);
+      const outside = path.join(rowFixture.root, `outside-${replacementKind}.json`);
+      fs.writeFileSync(inputTarget, `${JSON.stringify(rowFixture.document, null, 2)}\n`);
+      if (replacementKind === "symlink") {
+        fs.writeFileSync(outside, "synthetic unauthorized symlink bytes\n");
+      } else {
+        assert.strictEqual(spawnSync("mkfifo", [replacement], { encoding: "utf8" }).status, 0);
+      }
+      const fileSystem = Object.create(fs);
+      let swapped = false;
+      let descriptorReads = 0;
+      fileSystem.openSync = (...arguments_) => {
+        if (!swapped && arguments_[0] === inputTarget) {
+          swapped = true;
+          fs.renameSync(inputTarget, displacedInput);
+          if (replacementKind === "symlink") fs.symlinkSync(outside, inputTarget);
+          else fs.renameSync(replacement, inputTarget);
+        }
+        return fs.openSync(...arguments_);
+      };
+      fileSystem.readSync = (...arguments_) => {
+        descriptorReads += 1;
+        return fs.readSync(...arguments_);
+      };
+      try {
+        assert.throws(() => runChecklist({
+          fileSystem,
+          inputPath,
+          now: NOW,
+          outputPath: ".quality/gates/live-qualification-status.json",
+          root: rowFixture.root,
+          source: SOURCE,
+          workflows: WORKFLOWS,
+        }), /exact bounded single-link JSON file/u, replacementKind);
+        assert.strictEqual(swapped, true, replacementKind);
+        assert.strictEqual(descriptorReads, 0, replacementKind);
+        if (replacementKind === "symlink") {
+          assert.strictEqual(
+            fs.readFileSync(outside, "utf8"),
+            "synthetic unauthorized symlink bytes\n",
+          );
+        }
+      } finally {
+        fs.rmSync(rowFixture.root, { force: true, recursive: true });
+      }
     }
   });
 

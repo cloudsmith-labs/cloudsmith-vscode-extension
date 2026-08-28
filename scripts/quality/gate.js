@@ -1,8 +1,8 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const crypto = require("crypto");
-const fs = require("fs");
 const { spawnSync } = require("child_process");
+const { isDeepStrictEqual, types } = require("util");
 const {
   ROOT,
   discoverRepositoryOutputFiles,
@@ -10,8 +10,11 @@ const {
   resolveExistingRepositoryFile,
   writeJson,
 } = require("./common");
+const {
+  withStableSingleLinkFile,
+} = require("./candidate-binding");
 const { aggregateStatuses, fingerprint, sourceIdentity } = require("./evidence");
-const { buildNonAuthQualityEnvironment } = require("./non-auth-environment");
+const { withNonAuthQualityEnvironment } = require("./non-auth-environment");
 const {
   STANDALONE_NODE_TESTS,
   VSCODE_CORE_TESTS,
@@ -23,6 +26,19 @@ const TEST_INVENTORIES_BY_SUITE = Object.freeze({
   "extension-host-core": VSCODE_CORE_TESTS,
   "extension-host-smoke": VSCODE_SMOKE_TESTS,
 });
+
+const MAX_GATE_ARTIFACT_BYTES = 64 * 1024 * 1024;
+const MAX_GATE_TEST_EVIDENCE_BYTES = 64 * 1024 * 1024;
+const EXECUTION_ERROR_REASON = "execution-error";
+const EXECUTION_RESULT_FIELDS = Object.freeze([
+  "artifactFingerprint",
+  "signal",
+  "status",
+  "stderr",
+  "stdout",
+  "testEvidence",
+  "testEvidenceFingerprint",
+]);
 
 const PHASE_STEPS = Object.freeze({
   fast: Object.freeze([
@@ -293,7 +309,11 @@ function runGate(options = {}) {
       if (!priorBlocker) priorBlocker = step.id;
       continue;
     }
-    const execution = execute(step, { root, profile, source });
+    const execution = bindExecutionTestEvidence(
+      execute(step, { root, profile, source }),
+      step,
+      root,
+    );
     receipts[index] = completedReceipt(profile, step, source, execution);
     const after = readSource();
     if (sourceChangedBefore) {
@@ -309,31 +329,158 @@ function runGate(options = {}) {
         reason: "source-changed-during-step",
       };
     }
+    receipts[index] = revalidateArtifactReceipt(
+      receipts[index],
+      step,
+      root,
+      "artifact-changed-before-receipt",
+    );
+    receipts[index] = revalidateTestEvidenceReceipt(
+      receipts[index],
+      step,
+      root,
+      "test-evidence-changed-before-receipt",
+    );
     writeReceipt(root, receipts[index]);
+    let persistedReceipt = revalidateArtifactReceipt(
+      receipts[index],
+      step,
+      root,
+      "artifact-changed-during-receipt-persistence",
+    );
+    persistedReceipt = revalidateTestEvidenceReceipt(
+      persistedReceipt,
+      step,
+      root,
+      "test-evidence-changed-during-receipt-persistence",
+    );
+    if (persistedReceipt !== receipts[index]) {
+      receipts[index] = persistedReceipt;
+      invalidateReceipt(root, receipts[index]);
+      writeReceipt(root, receipts[index]);
+    }
     if (["failed", "blocked"].includes(receipts[index].status) && !priorBlocker) {
       priorBlocker = step.id;
     }
   }
 
-  const status = aggregateStatuses(receipts.map(receipt => receipt.status));
+  return persistStableGateSummary(root, profile, source, plan, receipts);
+}
+
+function revalidateArtifactReceipt(receipt, step, root, reason) {
+  if (!["passed", "blocked"].includes(receipt.status)
+    || stepArtifactPaths(step).length === 0) {
+    return receipt;
+  }
+  if (validateArtifactBinding(receipt, step, root) === null) return receipt;
+  return {
+    ...receipt,
+    status: "failed",
+    reason,
+  };
+}
+
+function revalidateTestEvidenceReceipt(receipt, step, root, reason) {
+  if (receipt.status !== "passed" || !step.evidencePath) return receipt;
+  if (validateTestEvidenceBinding(receipt, step, root) === null) return receipt;
+  return {
+    ...receipt,
+    status: "failed",
+    reason,
+  };
+}
+
+function revalidateReceiptBindings(receipts, plan, root, reasons) {
+  const changed = [];
+  for (let index = 0; index < receipts.length; index += 1) {
+    let next = revalidateArtifactReceipt(
+      receipts[index],
+      plan[index],
+      root,
+      reasons.artifact,
+    );
+    next = revalidateTestEvidenceReceipt(
+      next,
+      plan[index],
+      root,
+      reasons.testEvidence,
+    );
+    if (next !== receipts[index]) {
+      receipts[index] = next;
+      changed.push(index);
+    }
+  }
+  return changed;
+}
+
+function gateSummary(profile, source, plan, receipts) {
   const summary = {
     schemaVersion: 1,
     profile,
     source,
-    status,
+    status: aggregateStatuses(receipts.map(receipt => receipt.status)),
     planFingerprint: gatePlanFingerprint(plan),
     steps: receipts,
   };
   summary.key = {
     sha: source.sha,
-    fingerprint: fingerprint(summary),
+    fingerprint: fingerprint(serializationSafeGateValue(summary)),
   };
-  writeJson(`.quality/gates/${profile}.json`, summary, root);
   return summary;
 }
 
+function persistStableGateSummary(root, profile, source, plan, receipts) {
+  const summaryPath = `.quality/gates/${profile}.json`;
+  const maximumAttempts = plan.filter(step => (
+    stepArtifactPaths(step).length > 0 || step.evidencePath
+  )).length + 1;
+  for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+    const changedBefore = revalidateReceiptBindings(
+      receipts,
+      plan,
+      root,
+      {
+        artifact: "artifact-changed-before-summary",
+        testEvidence: "test-evidence-changed-before-summary",
+      },
+    );
+    for (const index of changedBefore) {
+      invalidateReceipt(root, receipts[index]);
+      writeReceipt(root, receipts[index]);
+    }
+    const summary = gateSummary(profile, source, plan, receipts);
+    writeJson(summaryPath, serializationSafeGateValue(summary), root);
+    const changedAfter = revalidateReceiptBindings(
+      receipts,
+      plan,
+      root,
+      {
+        artifact: "artifact-changed-during-summary-persistence",
+        testEvidence: "test-evidence-changed-during-summary-persistence",
+      },
+    );
+    if (changedAfter.length === 0) return summary;
+    invalidateSummary(root, profile);
+    for (const index of changedAfter) invalidateReceipt(root, receipts[index]);
+    for (const index of changedAfter) writeReceipt(root, receipts[index]);
+  }
+  throw new Error("Quality gate artifacts did not stabilize through summary persistence.");
+}
+
+function invalidateReceipt(root, receipt) {
+  return removeOutputFile(receiptPath(receipt), root, {
+    subtree: `.quality/gates/${receipt.profile}`,
+  });
+}
+
+function invalidateSummary(root, profile) {
+  return removeOutputFile(`.quality/gates/${profile}.json`, root, {
+    subtree: ".quality/gates",
+  });
+}
+
 function gatePlanFingerprint(plan) {
-  return fingerprint(plan.map(step => ({
+  return fingerprint(serializationSafeGateValue(plan.map(step => ({
     id: step.id,
     category: step.category,
     command: step.command,
@@ -343,7 +490,7 @@ function gatePlanFingerprint(plan) {
     blockedExitCodes: [...(step.blockedExitCodes || [])],
     evidencePath: step.evidencePath || null,
     runWhenBlocked: step.runWhenBlocked === true,
-  })));
+  }))));
 }
 
 function clearGateReceipts(root, profile) {
@@ -380,22 +527,122 @@ function plannedReceipt(profile, step, source) {
   };
 }
 
+function inspectExecutionProperty(execution, propertyName) {
+  let current = execution;
+  const visited = new Set();
+  try {
+    while ((typeof current === "object" && current !== null)
+      || typeof current === "function") {
+      if (types.isProxy(current) || visited.has(current)) {
+        return Object.freeze({ state: "uninspectable", value: undefined });
+      }
+      visited.add(current);
+      const descriptor = Object.getOwnPropertyDescriptor(current, propertyName);
+      if (descriptor) {
+        if (!Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+          return Object.freeze({ state: "accessor", value: undefined });
+        }
+        return Object.freeze({ state: "data", value: descriptor.value });
+      }
+      current = Object.getPrototypeOf(current);
+    }
+  } catch {
+    return Object.freeze({ state: "uninspectable", value: undefined });
+  }
+  return Object.freeze({ state: "absent", value: undefined });
+}
+
+function validExecutionFieldValue(name, value) {
+  if (value === null || value === undefined) return true;
+  if ((typeof value === "object" || typeof value === "function") && types.isProxy(value)) {
+    return false;
+  }
+  if (name === "status") return Number.isInteger(value);
+  if (name === "signal") return typeof value === "string" && /^SIG[A-Z0-9]+$/u.test(value);
+  if (name === "stdout" || name === "stderr") {
+    return typeof value === "string" || Buffer.isBuffer(value);
+  }
+  if (name === "artifactFingerprint" || name === "testEvidenceFingerprint") {
+    return typeof value === "string";
+  }
+  if (name === "testEvidence") return typeof value === "object";
+  return false;
+}
+
+function inspectExecution(execution) {
+  const errorProperty = inspectExecutionProperty(execution, "error");
+  let executionError = errorProperty.state === "accessor"
+    || errorProperty.state === "uninspectable"
+    || (errorProperty.state === "data"
+      && errorProperty.value !== null
+      && errorProperty.value !== undefined);
+  const values = Object.create(null);
+  for (const name of EXECUTION_RESULT_FIELDS) {
+    const property = inspectExecutionProperty(execution, name);
+    if (property.state === "accessor"
+      || property.state === "uninspectable"
+      || (property.state === "data" && !validExecutionFieldValue(name, property.value))) {
+      executionError = true;
+      values[name] = undefined;
+    } else {
+      values[name] = property.state === "data" ? property.value : undefined;
+    }
+  }
+  return Object.freeze({
+    executionError,
+    values: Object.freeze(values),
+  });
+}
+
+function composeExecution(execution, overrides = {}, options = {}) {
+  const snapshot = options.snapshot || inspectExecution(execution);
+  const executionError = snapshot.executionError || options.forceError === true;
+  const values = Object.create(null);
+  for (const name of EXECUTION_RESULT_FIELDS) values[name] = snapshot.values[name];
+  for (const [name, value] of Object.entries(overrides)) values[name] = value;
+  const composed = {};
+  Object.defineProperty(composed, "error", {
+    configurable: false,
+    enumerable: true,
+    value: executionError ? (options.errorValue || true) : null,
+    writable: false,
+  });
+  for (const [name, value] of Object.entries(values)) {
+    Object.defineProperty(composed, name, {
+      configurable: false,
+      enumerable: true,
+      value,
+      writable: false,
+    });
+  }
+  return composed;
+}
+
 function completedReceipt(profile, step, source, execution = {}) {
-  const exitCode = Number.isInteger(execution.status) ? execution.status : null;
-  const signal = execution.signal || null;
-  const error = execution.error?.message || null;
+  const normalizedExecution = composeExecution(execution);
+  const exitCode = Number.isInteger(normalizedExecution.status)
+    ? normalizedExecution.status
+    : null;
+  const signal = normalizedExecution.signal === undefined ? null : normalizedExecution.signal;
+  const executionError = normalizedExecution.error !== null;
   let status = "failed";
-  if (!error && !signal && exitCode === 0) status = "passed";
-  else if (!error && !signal && step.blockedExitCodes.includes(exitCode)) status = "blocked";
+  if (!executionError && !signal && exitCode === 0) status = "passed";
+  else if (!executionError && !signal && step.blockedExitCodes.includes(exitCode)) {
+    status = "blocked";
+  }
   const evidenceError = status === "passed" && step.evidencePath
-    ? validateTestEvidence(execution.testEvidence, step, source)
+    ? validateTestEvidence(normalizedExecution.testEvidence, step, source)
+    : null;
+  const evidenceProofError = status === "passed" && step.evidencePath
+    && !/^[a-f0-9]{64}$/u.test(normalizedExecution.testEvidenceFingerprint || "")
+    ? "missing-or-invalid-test-evidence-fingerprint"
     : null;
   const artifactError = ["passed", "blocked"].includes(status) && stepArtifactPaths(step).length > 0
-    && !/^[a-f0-9]{64}$/u.test(execution.artifactFingerprint || "")
+    && !/^[a-f0-9]{64}$/u.test(normalizedExecution.artifactFingerprint || "")
     ? "missing-or-invalid-artifact-fingerprint"
     : null;
-  if (evidenceError || artifactError) status = "failed";
-  const output = `${execution.stdout || ""}${execution.stderr || ""}`;
+  if (evidenceError || evidenceProofError || artifactError) status = "failed";
+  const output = `${normalizedExecution.stdout || ""}${normalizedExecution.stderr || ""}`;
   return {
     schemaVersion: 1,
     profile,
@@ -407,12 +654,33 @@ function completedReceipt(profile, step, source, execution = {}) {
     status,
     exitCode,
     signal,
-    reason: error || (signal ? `terminated-by:${signal}` : evidenceError || artifactError),
+    reason: (executionError ? EXECUTION_ERROR_REASON : null) || (signal
+      ? `terminated-by:${signal}`
+      : evidenceProofError || evidenceError || artifactError),
     testCounts: parseTestCounts(output),
     outputFingerprint: crypto.createHash("sha256").update(output).digest("hex"),
-    testEvidence: execution.testEvidence || null,
-    artifactFingerprint: execution.artifactFingerprint || null,
+    testEvidence: normalizedExecution.testEvidence || null,
+    testEvidenceFingerprint: normalizedExecution.testEvidenceFingerprint || null,
+    artifactFingerprint: normalizedExecution.artifactFingerprint || null,
   };
+}
+
+function bindExecutionTestEvidence(execution, step, root) {
+  const snapshot = inspectExecution(execution);
+  if (!step?.evidencePath) {
+    return composeExecution(execution, {}, { snapshot });
+  }
+  const claimedFingerprint = snapshot.values.testEvidenceFingerprint;
+  let durableValue = null;
+  try {
+    durableValue = testEvidenceProofForStep(step, root).value;
+  } catch {
+    durableValue = null;
+  }
+  return composeExecution(execution, {
+    testEvidence: durableValue,
+    testEvidenceFingerprint: claimedFingerprint || null,
+  }, { snapshot });
 }
 
 function executeCommand(step, context = {}) {
@@ -426,17 +694,18 @@ function executeCommand(step, context = {}) {
     CLOUDSMITH_QUALITY_TEST_EVIDENCE: step.evidencePath,
     CLOUDSMITH_QUALITY_TEST_SUITE: step.id,
   } : {};
-  const environment = buildNonAuthQualityEnvironment(
-    context.environment || process.env,
-    evidenceEnvironment,
-    { platform: context.platform }
-  );
-  const result = spawn(executable, step.args, {
+  const rawResult = withNonAuthQualityEnvironment({
+    environment: context.environment || process.env,
+    overrides: evidenceEnvironment,
+    platform: context.platform,
+    temporaryParent: context.temporaryParent,
+  }, environment => spawn(executable, step.args, {
     cwd: root,
     encoding: "utf8",
     env: environment,
     maxBuffer: 64 * 1024 * 1024,
-  });
+  }));
+  const result = composeExecution(rawResult);
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   let artifactFingerprint = null;
@@ -450,30 +719,39 @@ function executeCommand(step, context = {}) {
   }
   if (!step.evidencePath) {
     if (result.status === 0 && artifactError) {
-      return { ...result, error: new Error(artifactError), artifactFingerprint };
+      return composeExecution(result, { artifactFingerprint }, {
+        errorValue: new Error(artifactError),
+        forceError: true,
+      });
     }
-    return { ...result, artifactFingerprint };
+    return composeExecution(result, { artifactFingerprint });
   }
   let testEvidence = null;
+  let testEvidenceFingerprint = null;
   let evidenceError = null;
   try {
-    testEvidence = JSON.parse(fs.readFileSync(
-      resolveExistingRepositoryFile(step.evidencePath, root),
-      "utf8"
-    ));
+    const proof = testEvidenceProofForStep(step, root);
+    testEvidence = proof.value;
+    testEvidenceFingerprint = proof.sha256;
     evidenceError = validateTestEvidence(testEvidence, step, context.source);
   } catch (error) {
     evidenceError = `missing-or-invalid-test-evidence:${error.message}`;
   }
   if (result.status === 0 && (evidenceError || artifactError)) {
-    return {
-      ...result,
-      error: new Error(evidenceError || artifactError),
+    return composeExecution(result, {
       testEvidence,
+      testEvidenceFingerprint,
       artifactFingerprint,
-    };
+    }, {
+      errorValue: new Error(evidenceError || artifactError),
+      forceError: true,
+    });
   }
-  return { ...result, testEvidence, artifactFingerprint };
+  return composeExecution(result, {
+    testEvidence,
+    testEvidenceFingerprint,
+    artifactFingerprint,
+  });
 }
 
 function clearStepOutputs(step, root) {
@@ -499,23 +777,200 @@ function stepArtifactPaths(step) {
   return declared;
 }
 
+function normalizeParsedJsonForPersistence(value) {
+  if (Object.is(value, -0)) return 0;
+  if (value === null || typeof value !== "object") return value;
+
+  const pending = [value];
+  const containers = [];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    containers.push(current);
+    if (Array.isArray(current)) {
+      for (let index = 0; index < current.length; index += 1) {
+        const child = current[index];
+        if (Object.is(child, -0)) {
+          current[index] = 0;
+        } else if (child !== null && typeof child === "object") {
+          pending.push(child);
+        }
+      }
+    } else {
+      for (const key of Object.keys(current)) {
+        const child = current[key];
+        if (Object.is(child, -0)) {
+          current[key] = 0;
+        } else if (child !== null && typeof child === "object") {
+          pending.push(child);
+        }
+      }
+    }
+  }
+  for (let index = containers.length - 1; index >= 0; index -= 1) {
+    Object.freeze(containers[index]);
+  }
+  return value;
+}
+
+function serializationSafeGateValue(value) {
+  const copyScalar = current => {
+    if (current === null || typeof current === "string" || typeof current === "boolean") {
+      return current;
+    }
+    if (typeof current === "number" && Number.isFinite(current)) {
+      return Object.is(current, -0) ? 0 : current;
+    }
+    if (typeof current !== "object") {
+      throw new Error("Gate evidence contains a non-JSON persistence value.");
+    }
+    return undefined;
+  };
+  const scalar = copyScalar(value);
+  if (scalar !== undefined || value === null) return scalar;
+
+  const copies = new Map();
+  const containers = [];
+  const createContainer = source => {
+    const prototype = Object.getPrototypeOf(source);
+    let target;
+    if (Array.isArray(source)) {
+      target = [];
+      Object.defineProperty(target, "toJSON", {
+        configurable: false,
+        enumerable: false,
+        value: undefined,
+        writable: false,
+      });
+    } else if (prototype === Object.prototype || prototype === null) {
+      target = Object.create(null);
+    } else {
+      throw new Error("Gate evidence contains a non-JSON persistence object.");
+    }
+    copies.set(source, target);
+    containers.push(target);
+    return target;
+  };
+  const rootCopy = createContainer(value);
+  const pending = [{ source: value, target: rootCopy }];
+  const assign = (target, key, current) => {
+    const primitive = copyScalar(current);
+    if (primitive !== undefined || current === null) {
+      target[key] = primitive;
+      return;
+    }
+    let child = copies.get(current);
+    if (!child) {
+      child = createContainer(current);
+      pending.push({ source: current, target: child });
+    }
+    target[key] = child;
+  };
+  while (pending.length > 0) {
+    const { source, target } = pending.pop();
+    if (Array.isArray(source)) {
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(source, "length");
+      if (!lengthDescriptor || !Number.isSafeInteger(lengthDescriptor.value)) {
+        throw new Error("Gate evidence contains an invalid JSON array.");
+      }
+      for (let index = 0; index < lengthDescriptor.value; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(source, String(index));
+        if (!descriptor) {
+          target[index] = null;
+        } else if (!Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+          throw new Error("Gate evidence contains an accessor persistence value.");
+        } else {
+          assign(target, index, descriptor.value);
+        }
+      }
+      continue;
+    }
+    for (const key of Object.keys(source)) {
+      const descriptor = Object.getOwnPropertyDescriptor(source, key);
+      if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+        throw new Error("Gate evidence contains an accessor persistence value.");
+      }
+      assign(target, key, descriptor.value);
+    }
+  }
+  for (let index = containers.length - 1; index >= 0; index -= 1) {
+    Object.freeze(containers[index]);
+  }
+  return rootCopy;
+}
+
+function testEvidenceProofForStep(step, root = ROOT, options = {}) {
+  if (typeof step?.evidencePath !== "string") {
+    throw new Error("Quality step does not declare structured test evidence.");
+  }
+  const evidencePath = resolveExistingRepositoryFile(
+    step.evidencePath,
+    root,
+    { subtree: ".quality/test-results" },
+  );
+  return withStableSingleLinkFile(evidencePath, {
+    errorMessage: "Structured test evidence is unsafe or changed.",
+    fileSystem: options.fileSystem,
+    maximumBytes: MAX_GATE_TEST_EVIDENCE_BYTES,
+    minimumBytes: 1,
+  }, bytes => {
+    const parsed = JSON.parse(bytes.toString("utf8"));
+    const durableValue = normalizeParsedJsonForPersistence(parsed);
+    return Object.freeze({
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+      value: durableValue,
+    });
+  });
+}
+
+function validateTestEvidenceBinding(receipt, step, root = ROOT, options = {}) {
+  if (!step?.evidencePath) {
+    return receipt?.testEvidenceFingerprint === null
+      ? null
+      : "unexpected-test-evidence-fingerprint";
+  }
+  if (!/^[a-f0-9]{64}$/u.test(receipt?.testEvidenceFingerprint || "")) {
+    return "missing-or-invalid-test-evidence-fingerprint";
+  }
+  try {
+    const proof = testEvidenceProofForStep(step, root, options);
+    if (proof.sha256 !== receipt.testEvidenceFingerprint
+      || !isDeepStrictEqual(proof.value, receipt.testEvidence)) {
+      return "test-evidence-fingerprint-mismatch";
+    }
+    return null;
+  } catch {
+    return "missing-or-invalid-test-evidence";
+  }
+}
+
 function artifactFingerprintForStep(step, root = ROOT) {
   const artifactPaths = stepArtifactPaths(step);
   if (artifactPaths.length === 0) return null;
   const subtree = step.artifactSubtree || ".quality/mutation";
   const artifacts = artifactPaths.map(relativePath => ({
     relativePath,
-    bytes: fs.readFileSync(resolveExistingRepositoryFile(relativePath, root, { subtree })),
+    absolutePath: resolveExistingRepositoryFile(relativePath, root, { subtree }),
   }));
+  const exactOptions = {
+    errorMessage: "Quality step artifact is unsafe or changed.",
+    maximumBytes: MAX_GATE_ARTIFACT_BYTES,
+    minimumBytes: 0,
+  };
   if (artifacts.length === 1) {
-    return crypto.createHash("sha256").update(artifacts[0].bytes).digest("hex");
+    return withStableSingleLinkFile(
+      artifacts[0].absolutePath,
+      exactOptions,
+      bytes => crypto.createHash("sha256").update(bytes).digest("hex"),
+    );
   }
   const hash = crypto.createHash("sha256");
   hash.update("cloudsmith-quality-artifact-bundle-v1\0");
   for (const artifact of artifacts) {
-    hash.update(`${artifact.relativePath}\0${artifact.bytes.length}\0`);
-    hash.update(artifact.bytes);
-    hash.update("\0");
+    withStableSingleLinkFile(artifact.absolutePath, exactOptions, bytes => {
+      hash.update(`${artifact.relativePath}\0${bytes.length}\0`);
+      hash.update(bytes);
+      hash.update("\0");
+    });
   }
   return hash.digest("hex");
 }
@@ -562,8 +1017,11 @@ function validateTestEvidence(value, step, source) {
     if (value.counts?.[name] !== counted[name]) return "count-mismatch";
   }
   const expectedFiles = TEST_INVENTORIES_BY_SUITE[step.id];
-  if (expectedFiles && JSON.stringify([...seenFiles])
-    !== JSON.stringify(expectedFiles)) return "suite-inventory-mismatch";
+  const seenFileOrder = [...seenFiles];
+  if (expectedFiles && (seenFileOrder.length !== expectedFiles.length
+    || expectedFiles.some((file, index) => seenFileOrder[index] !== file))) {
+    return "suite-inventory-mismatch";
+  }
   if (counted.failed > 0 || counted.pending > 0) return "nonpassing-test-record";
   return null;
 }
@@ -593,7 +1051,7 @@ function receiptPath(receipt) {
 }
 
 function writeReceipt(root, receipt) {
-  return writeJson(receiptPath(receipt), receipt, root);
+  return writeJson(receiptPath(receipt), serializationSafeGateValue(receipt), root);
 }
 
 function parseArguments(argv) {
@@ -630,6 +1088,8 @@ module.exports = {
   runGate,
   sameSource,
   stepArtifactPaths,
+  testEvidenceProofForStep,
   validateArtifactBinding,
+  validateTestEvidenceBinding,
   validateTestEvidence,
 };

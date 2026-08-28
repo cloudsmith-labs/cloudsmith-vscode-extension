@@ -9,6 +9,7 @@ const {
   writeJson,
 } = require("./common");
 const { fingerprint } = require("./evidence");
+const { removeExactOwnedDirectoryTree } = require("./non-auth-environment");
 const {
   AUTHENTICATED_CANDIDATE_ARTIFACT,
   candidateBindingFromReceipt,
@@ -23,6 +24,13 @@ const {
 
 const AUTHENTICATED_EXPOSURE_RESULT = ".quality/secrets/authenticated-ci.json";
 const MAX_RUNTIME_LOG_FILES = 10_000;
+const MAX_RUNTIME_LOG_FILE_BYTES = 64 * 1024 * 1024;
+const RUNTIME_LOG_COPY_BUFFER_BYTES = 64 * 1024;
+const RUNTIME_LOG_READ_FLAGS = fs.constants.O_RDONLY
+  | (fs.constants.O_NOFOLLOW || 0)
+  | (fs.constants.O_NONBLOCK || 0);
+const RUNTIME_LOG_CHANGED_ERROR =
+  "Authenticated runtime logs changed during snapshot or scanning.";
 const profileBoundaryProofs = new WeakSet();
 const PROOF_IDENTITY_KEYS = Object.freeze([
   "changedNanoseconds",
@@ -88,7 +96,12 @@ function destroyRuntimeLogRoot(descriptor) {
   if (stat.dev !== descriptor.dev || stat.ino !== descriptor.ino) {
     throw new Error("Authenticated runtime-log cleanup refuses a replaced directory.");
   }
-  fs.rmSync(descriptor.root, { recursive: true, force: false });
+  removeExactOwnedDirectoryTree(descriptor.root, {
+    allowAdditionalRootEntries: true,
+    errorMessage: "Authenticated runtime-log cleanup refused an unsafe or changed tree.",
+    expectedRootEntries: [],
+    expectedRootIdentity: descriptor,
+  });
   return !fs.existsSync(descriptor.root);
 }
 
@@ -130,36 +143,513 @@ function proofBoundaryShape(proof) {
     && proof.directoryCount === 4 && proof.contentRead === false);
 }
 
-function runtimeLogInventory(root) {
+function runtimeLogIdentity(stat) {
+  return Object.freeze({
+    changedNanoseconds: String(stat.ctimeNs),
+    device: String(stat.dev),
+    group: String(stat.gid),
+    inode: String(stat.ino),
+    links: String(stat.nlink),
+    mode: String(stat.mode),
+    modifiedNanoseconds: String(stat.mtimeNs),
+    owner: String(stat.uid),
+    size: String(stat.size),
+  });
+}
+
+function assertSingleLinkRuntimeLogFile(stat) {
+  const expected = typeof stat.nlink === "bigint" ? 1n : 1;
+  if (stat.isFile() && stat.nlink !== expected) {
+    throw new Error("Authenticated runtime log regular files must have exactly one hard link.");
+  }
+  return stat;
+}
+
+function runtimeLogRelativePath(root, target) {
+  if (target === root) return ".";
+  const relative = path.relative(root, target);
+  if (!relative || path.isAbsolute(relative) || relative === ".."
+    || relative.startsWith(`..${path.sep}`)) {
+    throw new Error("Authenticated runtime log inventory crossed its root.");
+  }
+  return relative;
+}
+
+function runtimeLogTarget(root, relativePath) {
+  if (relativePath === ".") return root;
+  const target = path.resolve(root, relativePath);
+  if (target === root || !target.startsWith(`${root}${path.sep}`)) {
+    throw new Error("Authenticated runtime log snapshot path is invalid.");
+  }
+  return target;
+}
+
+function captureRuntimeLogInventory(root) {
   exactPrivateDirectory(root, "Authenticated runtime-log root");
   const pending = [root];
   let fileCount = 0;
   let directoryCount = 1;
+  const entries = [Object.freeze({
+    path: ".",
+    type: "directory",
+    identity: runtimeLogIdentity(fs.lstatSync(root, { bigint: true })),
+  })];
   while (pending.length > 0) {
     const directory = pending.pop();
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const children = fs.readdirSync(directory, { withFileTypes: true })
+      .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+    for (const entry of children) {
       const target = path.join(directory, entry.name);
-      const stat = fs.lstatSync(target);
+      const stat = fs.lstatSync(target, { bigint: true });
       if (stat.isSymbolicLink()) {
         throw new Error("Authenticated runtime logs reject symbolic links.");
       }
+      let type;
       if (stat.isDirectory()) {
         if (fs.realpathSync(target) !== target) {
           throw new Error("Authenticated runtime log directory is not canonical.");
         }
+        type = "directory";
         directoryCount += 1;
         pending.push(target);
       } else if (stat.isFile()) {
+        assertSingleLinkRuntimeLogFile(stat);
+        type = "file";
         fileCount += 1;
       } else {
         throw new Error("Authenticated runtime logs contain an unsupported entry type.");
       }
+      entries.push(Object.freeze({
+        path: runtimeLogRelativePath(root, target),
+        type,
+        identity: runtimeLogIdentity(stat),
+      }));
       if (fileCount + directoryCount > MAX_RUNTIME_LOG_FILES) {
         throw new Error("Authenticated runtime log inventory exceeded its structural bound.");
       }
     }
   }
-  return Object.freeze({ fileCount, directoryCount });
+  entries.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+  return Object.freeze({
+    fileCount,
+    directoryCount,
+    entries: Object.freeze(entries),
+  });
+}
+
+function runtimeLogInventory(root) {
+  const inventory = captureRuntimeLogInventory(root);
+  return Object.freeze({
+    fileCount: inventory.fileCount,
+    directoryCount: inventory.directoryCount,
+  });
+}
+
+function sameRuntimeLogInventory(left, right) {
+  return left.fileCount === right.fileCount
+    && left.directoryCount === right.directoryCount
+    && JSON.stringify(left.entries) === JSON.stringify(right.entries);
+}
+
+function assertSameRuntimeLogInventory(expected, actual) {
+  if (!sameRuntimeLogInventory(expected, actual)) {
+    throw new Error("Authenticated runtime logs changed during snapshot or scanning.");
+  }
+  return actual;
+}
+
+function assertRuntimeLogStructure(source, snapshot) {
+  const sourceStructure = source.entries.map(entry => [entry.path, entry.type]);
+  const snapshotStructure = snapshot.entries.map(entry => [entry.path, entry.type]);
+  if (JSON.stringify(sourceStructure) !== JSON.stringify(snapshotStructure)) {
+    throw new Error("Authenticated runtime log snapshot structure is incomplete.");
+  }
+}
+
+function runtimeLogExpectedSize(identity) {
+  if (!identity || typeof identity.size !== "string"
+    || !/^(?:0|[1-9]\d*)$/u.test(identity.size)) {
+    throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+  }
+  try {
+    const size = BigInt(identity.size);
+    if (size > BigInt(MAX_RUNTIME_LOG_FILE_BYTES)) {
+      throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+    }
+    return size;
+  } catch {
+    throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+  }
+}
+
+function boundedRuntimeLogRead(descriptor, buffer, remaining) {
+  const requested = Number(remaining > BigInt(buffer.length)
+    ? BigInt(buffer.length)
+    : remaining);
+  const bytesRead = fs.readSync(descriptor, buffer, 0, requested, null);
+  if (!Number.isSafeInteger(bytesRead) || bytesRead <= 0 || bytesRead > requested) {
+    throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+  }
+  return bytesRead;
+}
+
+function writeExactRuntimeLogChunk(descriptor, buffer, bytesRead) {
+  let written = 0;
+  while (written < bytesRead) {
+    const bytesWritten = fs.writeSync(
+      descriptor,
+      buffer,
+      written,
+      bytesRead - written,
+      null,
+    );
+    if (!Number.isSafeInteger(bytesWritten) || bytesWritten <= 0
+      || bytesWritten > bytesRead - written) {
+      throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+    }
+    written += bytesWritten;
+  }
+}
+
+function assertExactRuntimeLogDescriptor(descriptor, identity) {
+  const stat = fs.fstatSync(descriptor, { bigint: true });
+  assertSingleLinkRuntimeLogFile(stat);
+  if (!stat.isFile() || JSON.stringify(runtimeLogIdentity(stat)) !== JSON.stringify(identity)) {
+    throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+  }
+  return stat;
+}
+
+function assertExactRuntimeLogPath(target, identity) {
+  let stat;
+  let realPath;
+  try {
+    stat = fs.lstatSync(target, { bigint: true });
+    realPath = fs.realpathSync(target);
+    assertSingleLinkRuntimeLogFile(stat);
+  } catch {
+    throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+  }
+  if (stat.isSymbolicLink() || !stat.isFile() || realPath !== target
+    || JSON.stringify(runtimeLogIdentity(stat)) !== JSON.stringify(identity)) {
+    throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+  }
+  return stat;
+}
+
+function closeRuntimeLogDescriptors(descriptors) {
+  let failed = false;
+  for (const descriptor of descriptors) {
+    if (descriptor === undefined) continue;
+    try {
+      fs.closeSync(descriptor);
+    } catch {
+      failed = true;
+    }
+  }
+  if (failed) throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+}
+
+function openExactRuntimeLogFile(target, identity) {
+  if (identity?.links !== "1") {
+    throw new Error("Authenticated runtime log regular files must have exactly one hard link.");
+  }
+  let descriptor;
+  try {
+    assertExactRuntimeLogPath(target, identity);
+    descriptor = fs.openSync(target, RUNTIME_LOG_READ_FLAGS);
+    assertExactRuntimeLogDescriptor(descriptor, identity);
+    assertExactRuntimeLogPath(target, identity);
+    return descriptor;
+  } catch {
+    if (descriptor !== undefined) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // The fixed failure below is intentionally value-blind.
+      }
+    }
+    throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+  }
+}
+
+function readExactRuntimeLogFile(target, identity) {
+  let descriptor;
+  let bytes;
+  let failed = false;
+  try {
+    const expectedSize = runtimeLogExpectedSize(identity);
+    descriptor = openExactRuntimeLogFile(target, identity);
+    bytes = Buffer.alloc(Number(expectedSize));
+    let remaining = expectedSize;
+    let offset = 0;
+    while (remaining > 0n) {
+      const windowBytes = Number(remaining > BigInt(RUNTIME_LOG_COPY_BUFFER_BYTES)
+        ? BigInt(RUNTIME_LOG_COPY_BUFFER_BYTES)
+        : remaining);
+      const window = bytes.subarray(offset, offset + windowBytes);
+      const bytesRead = boundedRuntimeLogRead(descriptor, window, remaining);
+      offset += bytesRead;
+      remaining -= BigInt(bytesRead);
+    }
+    assertExactRuntimeLogDescriptor(descriptor, identity);
+    assertExactRuntimeLogPath(target, identity);
+  } catch {
+    failed = true;
+  }
+  if (descriptor !== undefined) {
+    try {
+      fs.closeSync(descriptor);
+    } catch {
+      failed = true;
+    }
+  }
+  if (failed || !Buffer.isBuffer(bytes)) {
+    if (Buffer.isBuffer(bytes)) bytes.fill(0);
+    throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+  }
+  return bytes;
+}
+
+function copyExactRuntimeLogFile(source, destination, identity) {
+  let sourceDescriptor;
+  let destinationDescriptor;
+  const buffer = Buffer.alloc(RUNTIME_LOG_COPY_BUFFER_BYTES);
+  try {
+    const expectedSize = runtimeLogExpectedSize(identity);
+    let remaining = expectedSize;
+    sourceDescriptor = openExactRuntimeLogFile(source, identity);
+    destinationDescriptor = fs.openSync(
+      destination,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600,
+    );
+    const initialDestinationStat = fs.fstatSync(destinationDescriptor, { bigint: true });
+    assertSingleLinkRuntimeLogFile(initialDestinationStat);
+    if (!initialDestinationStat.isFile() || initialDestinationStat.size !== 0n) {
+      throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+    }
+    while (remaining > 0n) {
+      const bytesRead = boundedRuntimeLogRead(sourceDescriptor, buffer, remaining);
+      writeExactRuntimeLogChunk(destinationDescriptor, buffer, bytesRead);
+      buffer.fill(0, 0, bytesRead);
+      remaining -= BigInt(bytesRead);
+    }
+    assertExactRuntimeLogDescriptor(sourceDescriptor, identity);
+    const finalDestinationStat = fs.fstatSync(destinationDescriptor, { bigint: true });
+    assertSingleLinkRuntimeLogFile(finalDestinationStat);
+    if (!finalDestinationStat.isFile() || finalDestinationStat.size !== expectedSize) {
+      throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+    }
+    if (process.platform !== "win32") fs.fchmodSync(destinationDescriptor, 0o600);
+  } catch {
+    throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+  } finally {
+    buffer.fill(0);
+    closeRuntimeLogDescriptors([destinationDescriptor, sourceDescriptor]);
+  }
+}
+
+function exactRuntimeLogBytes(leftPath, leftIdentity, rightPath, rightIdentity) {
+  // Runtime logs can contain credential material. Compare private copies directly;
+  // never hash/stringify their bytes or persist either bytes or identity metadata.
+  let leftDescriptor;
+  let rightDescriptor;
+  const leftBuffer = Buffer.alloc(RUNTIME_LOG_COPY_BUFFER_BYTES);
+  const rightBuffer = Buffer.alloc(RUNTIME_LOG_COPY_BUFFER_BYTES);
+  try {
+    const leftSize = runtimeLogExpectedSize(leftIdentity);
+    const rightSize = runtimeLogExpectedSize(rightIdentity);
+    if (leftSize !== rightSize) throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+    let remaining = leftSize;
+    leftDescriptor = openExactRuntimeLogFile(leftPath, leftIdentity);
+    rightDescriptor = openExactRuntimeLogFile(rightPath, rightIdentity);
+    while (remaining > 0n) {
+      const leftBytes = boundedRuntimeLogRead(leftDescriptor, leftBuffer, remaining);
+      const rightBytes = boundedRuntimeLogRead(rightDescriptor, rightBuffer, remaining);
+      if (leftBytes !== rightBytes
+        || !leftBuffer.subarray(0, leftBytes).equals(rightBuffer.subarray(0, rightBytes))) {
+        throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+      }
+      leftBuffer.fill(0, 0, leftBytes);
+      rightBuffer.fill(0, 0, rightBytes);
+      remaining -= BigInt(leftBytes);
+    }
+    assertExactRuntimeLogDescriptor(leftDescriptor, leftIdentity);
+    assertExactRuntimeLogDescriptor(rightDescriptor, rightIdentity);
+    return true;
+  } catch {
+    throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+  } finally {
+    leftBuffer.fill(0);
+    rightBuffer.fill(0);
+    closeRuntimeLogDescriptors([rightDescriptor, leftDescriptor]);
+  }
+}
+
+function assertExactRuntimeLogBytes(sourceRoot, source, snapshotRoot, snapshot) {
+  const snapshotByPath = new Map(snapshot.entries.map(entry => [entry.path, entry]));
+  for (const sourceEntry of source.entries) {
+    if (sourceEntry.type !== "file") continue;
+    const snapshotEntry = snapshotByPath.get(sourceEntry.path);
+    if (!snapshotEntry || snapshotEntry.type !== "file") {
+      throw new Error("Authenticated runtime log snapshot structure is incomplete.");
+    }
+    exactRuntimeLogBytes(
+      runtimeLogTarget(sourceRoot, sourceEntry.path),
+      sourceEntry.identity,
+      runtimeLogTarget(snapshotRoot, snapshotEntry.path),
+      snapshotEntry.identity,
+    );
+  }
+}
+
+function destroyRuntimeLogSnapshot(descriptor) {
+  if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor)) {
+    throw new Error("Authenticated runtime-log snapshot descriptor is invalid.");
+  }
+  const stat = exactPrivateDirectory(
+    descriptor.snapshotRoot,
+    "Authenticated runtime-log snapshot root",
+  );
+  if (stat.dev !== descriptor.dev || stat.ino !== descriptor.ino) {
+    throw new Error("Authenticated runtime-log snapshot cleanup refuses a replaced directory.");
+  }
+  removeExactOwnedDirectoryTree(descriptor.snapshotRoot, {
+    allowAdditionalRootEntries: true,
+    errorMessage: "Authenticated runtime-log snapshot cleanup refused an unsafe or changed tree.",
+    expectedRootEntries: [],
+    expectedRootIdentity: descriptor,
+  });
+  return !fs.existsSync(descriptor.snapshotRoot);
+}
+
+function captureRuntimeLogSnapshot(root, options = {}) {
+  const source = captureRuntimeLogInventory(root);
+  const parent = fs.realpathSync(options.temporaryParent || os.tmpdir());
+  exactParentDirectory(parent, "Authenticated runtime-log snapshot parent");
+  const snapshotRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+    parent,
+    "cloudsmith-authenticated-runtime-snapshot-",
+  )));
+  if (process.platform !== "win32") fs.chmodSync(snapshotRoot, 0o700);
+  const rootStat = exactPrivateDirectory(
+    snapshotRoot,
+    "Authenticated runtime-log snapshot root",
+  );
+  const ownership = { snapshotRoot, dev: rootStat.dev, ino: rootStat.ino };
+  try {
+    const directories = source.entries
+      .filter(entry => entry.type === "directory" && entry.path !== ".")
+      .sort((left, right) => (
+        left.path.split(path.sep).length - right.path.split(path.sep).length
+        || (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)
+      ));
+    for (const entry of directories) {
+      fs.mkdirSync(runtimeLogTarget(snapshotRoot, entry.path), { mode: 0o700 });
+    }
+    for (const entry of source.entries) {
+      if (entry.type !== "file") continue;
+      if (entry.identity.links !== "1") {
+        throw new Error("Authenticated runtime log regular files must have exactly one hard link.");
+      }
+      copyExactRuntimeLogFile(
+        runtimeLogTarget(root, entry.path),
+        runtimeLogTarget(snapshotRoot, entry.path),
+        entry.identity,
+      );
+    }
+    assertSameRuntimeLogInventory(source, captureRuntimeLogInventory(root));
+    const snapshot = captureRuntimeLogInventory(snapshotRoot);
+    assertRuntimeLogStructure(source, snapshot);
+    assertExactRuntimeLogBytes(root, source, snapshotRoot, snapshot);
+    assertSameRuntimeLogInventory(source, captureRuntimeLogInventory(root));
+    assertSameRuntimeLogInventory(snapshot, captureRuntimeLogInventory(snapshotRoot));
+    return Object.freeze({
+      ...ownership,
+      sourceRoot: root,
+      source,
+      snapshot,
+      fileCount: source.fileCount,
+      directoryCount: source.directoryCount,
+    });
+  } catch (error) {
+    try {
+      destroyRuntimeLogSnapshot(ownership);
+    } catch {
+      throw new Error("Authenticated runtime-log snapshot cleanup failed.");
+    }
+    throw error;
+  }
+}
+
+function assertStableRuntimeLogSnapshot(descriptor) {
+  assertSameRuntimeLogInventory(
+    descriptor.source,
+    captureRuntimeLogInventory(descriptor.sourceRoot),
+  );
+  assertSameRuntimeLogInventory(
+    descriptor.snapshot,
+    captureRuntimeLogInventory(descriptor.snapshotRoot),
+  );
+  assertExactRuntimeLogBytes(
+    descriptor.sourceRoot,
+    descriptor.source,
+    descriptor.snapshotRoot,
+    descriptor.snapshot,
+  );
+  assertSameRuntimeLogInventory(
+    descriptor.source,
+    captureRuntimeLogInventory(descriptor.sourceRoot),
+  );
+  assertSameRuntimeLogInventory(
+    descriptor.snapshot,
+    captureRuntimeLogInventory(descriptor.snapshotRoot),
+  );
+  return descriptor;
+}
+
+function runtimeLogLogicalPath(relativePath) {
+  const logicalPath = relativePath.split(path.sep).join("/");
+  if (!logicalPath || logicalPath === "." || path.posix.isAbsolute(logicalPath)
+    || logicalPath.split("/").some(segment => !segment || segment === "." || segment === "..")
+    || /[\\\u0000-\u001f\u007f]/u.test(logicalPath)) {
+    throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+  }
+  return logicalPath;
+}
+
+async function scanRuntimeLogSnapshot(descriptor, scan, options = {}) {
+  const findings = [];
+  assertStableRuntimeLogSnapshot(descriptor);
+  for (const entry of descriptor.snapshot.entries) {
+    if (entry.type !== "file") continue;
+    let provenBytes;
+    let scannerBytes;
+    try {
+      const logicalPath = runtimeLogLogicalPath(entry.path);
+      provenBytes = readExactRuntimeLogFile(
+        runtimeLogTarget(descriptor.snapshotRoot, entry.path),
+        entry.identity,
+      );
+      scannerBytes = Buffer.from(provenBytes);
+      const result = await scan("stdin", logicalPath, {
+        root: options.root,
+        label: "authenticated-runtime-logs",
+        logicalPath,
+        input: scannerBytes,
+        execute: options.execute,
+        environment: options.environment,
+      });
+      if (!Array.isArray(result)) throw new Error(RUNTIME_LOG_CHANGED_ERROR);
+      findings.push(...result);
+    } finally {
+      if (Buffer.isBuffer(scannerBytes)) scannerBytes.fill(0);
+      if (Buffer.isBuffer(provenBytes)) provenBytes.fill(0);
+    }
+    assertStableRuntimeLogSnapshot(descriptor);
+  }
+  return findings;
 }
 
 function safeComponent(component) {
@@ -355,99 +845,120 @@ async function runAuthenticatedExposureScan(context, options = {}) {
     context.profileBoundaryProof
       || assertProfileMetadataBoundary(context.candidate.profile),
   );
-  const runtimeLogs = runtimeLogInventory(context.runtimeLogRoot);
-  const generated = scanGenerated(root, ".quality", {
-    id: "authenticated-generated-evidence",
-    excludedPrefixes: [".quality/secrets"],
-    execute: options.execute,
-    environment: context.environment,
+  const runtimeLogs = captureRuntimeLogSnapshot(context.runtimeLogRoot, {
+    temporaryParent: options.temporaryParent,
   });
-  const proofBefore = assertAuthenticatedProofSnapshot(
-    await captureProof(root, context.candidate.receipt, context.source, {
-      candidateBindingFromReceipt: options.candidateBindingFromReceipt,
-    }),
-    context.candidate.receipt,
-    context.source,
-  );
-  const artifact = await scanArtifact(root, AUTHENTICATED_CANDIDATE_ARTIFACT, {
-    execute: options.execute,
-    environment: context.environment,
-  });
-  const proofAfter = await captureProof(
-    root,
-    context.candidate.receipt,
-    context.source,
-    { candidateBindingFromReceipt: options.candidateBindingFromReceipt },
-  );
-  assertAuthenticatedProofSnapshot(
-    assertStableAuthenticatedProof(proofBefore, proofAfter),
-    context.candidate.receipt,
-    context.source,
-  );
-  const logFindings = runtimeLogs.fileCount === 0 ? [] : scanLogs(
-    "dir",
-    context.runtimeLogRoot,
-    {
-      root,
-      scanRoot: context.runtimeLogRoot,
-      label: "authenticated-runtime-logs",
-      execute: options.execute,
-      environment: context.environment,
-    },
-  );
-  const components = [
-    safeComponent(generated),
-    safeComponent(artifact),
-    safeComponent({
-      id: "authenticated-runtime-logs",
-      status: runtimeLogs.fileCount === 0 ? "not-present" : "scanned",
-      fileCount: runtimeLogs.fileCount,
-      findings: logFindings,
-    }),
-    safeComponent({
-      id: "profile-boundary-metadata-only",
-      status: "scanned",
-      fileCount: profile.directoryCount,
-      findings: [],
-    }),
-  ];
-  const findingCount = components.reduce((total, component) => (
-    total + component.findingCount
-  ), 0);
-  const base = {
-    schemaVersion: 2,
-    status: findingCount === 0 ? "passed" : "failed",
-    sourceSha: context.source.sha,
-    candidateReceiptFingerprint: context.candidateReceiptFingerprint,
-    vsixSha256: proofBefore.vsixSha256,
-    scanner: {
-      name: "gitleaks",
-      version: GITLEAKS_VERSION,
-      secretBearingFieldsPersisted: false,
-    },
-    credentialBoundary: {
-      profileContentRead: profile.contentRead,
-      secretStorageRead: false,
-      keychainRead: false,
-      credentialValueRecorded: false,
-      credentialDigestRecorded: false,
-    },
-    findingCount,
-    components,
-  };
-  const receipt = validateAuthenticatedExposureProof(
-    assertExposureReceipt({ ...base, fingerprint: fingerprint(base) }),
-    context.candidate.receipt,
-    context.source,
-  );
   const persist = options.writeReceipt || (value => writeJson(
     outputPath,
     value,
     root,
     { subtree: ".quality/secrets" },
   ));
-  persist(receipt);
-  return Object.freeze(receipt);
+  let receipt;
+  let persistenceAttempted = false;
+  try {
+    const generated = scanGenerated(root, ".quality", {
+      id: "authenticated-generated-evidence",
+      excludedPrefixes: [".quality/secrets"],
+      execute: options.execute,
+      environment: context.environment,
+    });
+    const proofBefore = assertAuthenticatedProofSnapshot(
+      await captureProof(root, context.candidate.receipt, context.source, {
+        candidateBindingFromReceipt: options.candidateBindingFromReceipt,
+      }),
+      context.candidate.receipt,
+      context.source,
+    );
+    const artifact = await scanArtifact(root, AUTHENTICATED_CANDIDATE_ARTIFACT, {
+      execute: options.execute,
+      environment: context.environment,
+    });
+    const proofAfter = await captureProof(
+      root,
+      context.candidate.receipt,
+      context.source,
+      { candidateBindingFromReceipt: options.candidateBindingFromReceipt },
+    );
+    assertAuthenticatedProofSnapshot(
+      assertStableAuthenticatedProof(proofBefore, proofAfter),
+      context.candidate.receipt,
+      context.source,
+    );
+    const logFindings = runtimeLogs.fileCount === 0 ? []
+      : await scanRuntimeLogSnapshot(runtimeLogs, scanLogs, {
+        root,
+        execute: options.execute,
+        environment: context.environment,
+      });
+    assertStableRuntimeLogSnapshot(runtimeLogs);
+    const components = [
+      safeComponent(generated),
+      safeComponent(artifact),
+      safeComponent({
+        id: "authenticated-runtime-logs",
+        status: runtimeLogs.fileCount === 0 ? "not-present" : "scanned",
+        fileCount: runtimeLogs.fileCount,
+        findings: logFindings,
+      }),
+      safeComponent({
+        id: "profile-boundary-metadata-only",
+        status: "scanned",
+        fileCount: profile.directoryCount,
+        findings: [],
+      }),
+    ];
+    const findingCount = components.reduce((total, component) => (
+      total + component.findingCount
+    ), 0);
+    const base = {
+      schemaVersion: 2,
+      status: findingCount === 0 ? "passed" : "failed",
+      sourceSha: context.source.sha,
+      candidateReceiptFingerprint: context.candidateReceiptFingerprint,
+      vsixSha256: proofBefore.vsixSha256,
+      scanner: {
+        name: "gitleaks",
+        version: GITLEAKS_VERSION,
+        secretBearingFieldsPersisted: false,
+      },
+      credentialBoundary: {
+        profileContentRead: profile.contentRead,
+        secretStorageRead: false,
+        keychainRead: false,
+        credentialValueRecorded: false,
+        credentialDigestRecorded: false,
+      },
+      findingCount,
+      components,
+    };
+    receipt = validateAuthenticatedExposureProof(
+      assertExposureReceipt({ ...base, fingerprint: fingerprint(base) }),
+      context.candidate.receipt,
+      context.source,
+    );
+    assertStableRuntimeLogSnapshot(runtimeLogs);
+    persistenceAttempted = true;
+    await persist(receipt);
+    assertStableRuntimeLogSnapshot(runtimeLogs);
+    if (!destroyRuntimeLogSnapshot(runtimeLogs)) {
+      throw new Error("Authenticated runtime-log snapshot cleanup failed.");
+    }
+    return Object.freeze(receipt);
+  } catch (error) {
+    if (persistenceAttempted) {
+      try {
+        removeOutputFile(outputPath, root, { subtree: ".quality/secrets" });
+      } catch {
+        throw new Error("Authenticated exposure receipt cleanup failed.");
+      }
+    }
+    throw error;
+  } finally {
+    if (fs.existsSync(runtimeLogs.snapshotRoot)) {
+      destroyRuntimeLogSnapshot(runtimeLogs);
+    }
+  }
 }
 
 module.exports = {

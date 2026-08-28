@@ -2,7 +2,6 @@
 
 const crypto = require("crypto");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const {
   ROOT,
@@ -16,18 +15,25 @@ const {
 const { fingerprint, sourceIdentity } = require("./evidence");
 const { decodeUtf8Bytes } = require("./findings");
 const {
+  EXACT_FILE_IDENTITY_KEYS,
   UI_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_RECEIPT,
   candidateBindingFromReceipt,
+  digestStableSingleLinkFile,
+  exactFileIdentity: descriptorFileIdentity,
+  readStableSingleLinkFile,
+  sameExactFileIdentity,
 } = require("./candidate-binding");
 const {
   GITLEAKS_VERSION,
+  MAX_GENERATED_FILE_BYTES,
   assertScannerVersion,
-  copyFileIntoSnapshot,
   scanGeneratedEvidence,
   scanVsix,
   scanWithGitleaks,
+  walkGeneratedFiles,
 } = require("./secret-scan");
+const { getGatePlan, receiptPath } = require("./gate");
 const {
   UI_RESULT,
   verifySignedOutUiEvidence,
@@ -36,6 +42,61 @@ const {
 const RELEASE_EXPOSURE_RESULT = ".quality/secrets/release.json";
 const LIVE_ATTESTATION = "internal_docs/quality/live-qualification.json";
 const OUTPUT_ROOT = ".quality/secrets";
+const GENERATED_EVIDENCE_ROOT = ".quality";
+const GENERATED_EVIDENCE_BOUNDARY = "immutable-pre-acceptance-v1";
+const RELEASE_GATE_PLAN = Object.freeze(getGatePlan("release"));
+const RELEASE_GATE_RECEIPT_PATHS = Object.freeze(RELEASE_GATE_PLAN.map(step => receiptPath({
+  profile: "release",
+  sequence: step.sequence,
+  stepId: step.id,
+})));
+const SECRET_RELEASE_PLAN_INDEX = RELEASE_GATE_PLAN.findIndex(step => (
+  step.id === "secret-release"
+));
+if (SECRET_RELEASE_PLAN_INDEX < 0) {
+  throw new Error("Canonical release gate plan is missing secret-release.");
+}
+const RELEASE_GATE_CIRCULAR_PATHS = Object.freeze([
+  ...RELEASE_GATE_RECEIPT_PATHS.slice(SECRET_RELEASE_PLAN_INDEX),
+  ".quality/gates/live-qualification-status.json",
+  ".quality/gates/release.json",
+]);
+const RELEASE_GATE_EXPECTED_PATHS = Object.freeze([
+  ...RELEASE_GATE_RECEIPT_PATHS,
+  ".quality/gates/live-qualification-status.json",
+  ".quality/gates/release.json",
+]);
+const GENERATED_EVIDENCE_CIRCULAR_OUTPUTS = Object.freeze([
+  ...RELEASE_GATE_CIRCULAR_PATHS.map(outputPath => Object.freeze({
+    path: outputPath,
+    owner: "release-gate",
+    justification: "This exact canonical release-gate output is planned before scanning or written after exposure acceptance.",
+  })),
+  Object.freeze({
+    path: ".quality/report.json",
+    owner: "quality-report",
+    justification: "The final report revalidates release evidence before it writes its own JSON bytes.",
+  }),
+  Object.freeze({
+    path: ".quality/report.md",
+    owner: "quality-report",
+    justification: "The final report revalidates release evidence before it writes its own Markdown bytes.",
+  }),
+  Object.freeze({
+    path: ".quality/secrets/history.json",
+    owner: "secret-history",
+    justification: "The canonical history scan runs after release exposure and before the final report.",
+  }),
+  Object.freeze({
+    path: RELEASE_EXPOSURE_RESULT,
+    owner: "secret-release",
+    justification: "The release-exposure receipt cannot include its own bytes without a circular digest.",
+  }),
+]);
+const GENERATED_EVIDENCE_EXCLUDED_FILES = Object.freeze(
+  GENERATED_EVIDENCE_CIRCULAR_OUTPUTS.map(output => output.path).sort(),
+);
+const GENERATED_EVIDENCE_EXCLUDED_PREFIXES = Object.freeze([]);
 const EVIDENCE_PATH_PATTERN = /^internal_docs\/quality\/[A-Za-z0-9][A-Za-z0-9._-]*\.(?:json|jsonl|md|png|txt|webp)$/u;
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
 const MAX_EVIDENCE_BYTES = 16 * 1024 * 1024;
@@ -66,36 +127,176 @@ function sha256(bytes) {
   return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
-function exactFileIdentity(filePath) {
-  const stat = fs.lstatSync(filePath, { bigint: true });
-  const realPath = fs.realpathSync(filePath);
-  if (stat.isSymbolicLink() || !stat.isFile() || realPath !== filePath) {
-    throw new Error("Release exposure candidate proof must be an exact real file.");
+function exactFileIdentity(
+  filePath,
+  label = "Release exposure candidate proof",
+  fileSystem = fs,
+) {
+  const stat = fileSystem.lstatSync(filePath, { bigint: true });
+  const realPath = fileSystem.realpathSync(filePath);
+  if (stat.isSymbolicLink() || !stat.isFile() || realPath !== filePath
+    || stat.nlink !== 1n || stat.size > BigInt(MAX_GENERATED_FILE_BYTES)) {
+    throw new Error(`${label} must be an exact real file.`);
   }
-  return Object.freeze({
-    changedNanoseconds: String(stat.ctimeNs),
-    device: String(stat.dev),
-    inode: String(stat.ino),
-    modifiedNanoseconds: String(stat.mtimeNs),
-    size: String(stat.size),
-  });
+  return descriptorFileIdentity(stat);
 }
 
 function sameFileIdentity(left, right) {
+  return sameExactFileIdentity(left, right);
+}
+
+function assertExactCircularOutputFiles(root, options = {}) {
+  const fileSystem = options.fileSystem || fs;
+  const failure = () => {
+    throw new Error("Circular release output must be absent or an exact bounded single-link file.");
+  };
+  for (const relativePath of GENERATED_EVIDENCE_EXCLUDED_FILES) {
+    const target = path.join(root, ...relativePath.split("/"));
+    let stat;
+    try {
+      stat = fileSystem.lstatSync(target, { bigint: true });
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isFile()
+      || stat.nlink !== 1n || stat.size <= 0n
+      || stat.size > BigInt(MAX_GENERATED_FILE_BYTES)
+      || fileSystem.realpathSync(target) !== target) {
+      failure();
+    }
+  }
+  return true;
+}
+
+function assertExactReleaseGateTree(root) {
+  const gateRoot = path.join(root, ".quality", "gates");
+  let rootStat;
+  try {
+    rootStat = fs.lstatSync(gateRoot);
+  } catch (error) {
+    if (error.code === "ENOENT") return true;
+    throw error;
+  }
+  const failure = () => {
+    throw new Error("Release gate output tree contains an unexpected or unsafe entry.");
+  };
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()
+    || fs.realpathSync(gateRoot) !== gateRoot) failure();
+  const allowedFiles = new Set(RELEASE_GATE_EXPECTED_PATHS);
+  const allowedDirectories = new Set([".quality/gates", ".quality/gates/release"]);
+  const pending = [gateRoot];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    for (const name of fs.readdirSync(directory)) {
+      const absolute = path.join(directory, name);
+      const relative = path.relative(root, absolute).split(path.sep).join("/");
+      const stat = fs.lstatSync(absolute);
+      if (stat.isSymbolicLink()) failure();
+      if (stat.isDirectory()) {
+        if (!allowedDirectories.has(relative) || fs.realpathSync(absolute) !== absolute) failure();
+        pending.push(absolute);
+      } else if (stat.isFile()) {
+        if (!allowedFiles.has(relative) || stat.nlink !== 1
+          || stat.size > MAX_GENERATED_FILE_BYTES
+          || fs.realpathSync(absolute) !== absolute) failure();
+      } else {
+        failure();
+      }
+    }
+  }
+  return true;
+}
+
+function generatedEvidenceInventory(root, options = {}) {
+  const repositoryRoot = assertRealRepositoryRoot(root);
+  assertExactReleaseGateTree(repositoryRoot);
+  assertExactCircularOutputFiles(repositoryRoot, options);
+  const excludedFiles = new Set(GENERATED_EVIDENCE_EXCLUDED_FILES);
+  return walkGeneratedFiles(repositoryRoot, GENERATED_EVIDENCE_ROOT, {
+    excludedPrefixes: GENERATED_EVIDENCE_EXCLUDED_PREFIXES,
+    excludedFiles: GENERATED_EVIDENCE_EXCLUDED_FILES,
+  }).filter(relativePath => !excludedFiles.has(relativePath)).map(relativePath => Object.freeze({
+    path: relativePath,
+    identity: exactFileIdentity(
+      path.join(repositoryRoot, ...relativePath.split("/")),
+      "Generated release evidence",
+      options.fileSystem,
+    ),
+  }));
+}
+
+function sameGeneratedEvidenceInventory(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function readBoundedBytes(relativePath, root, subtree, maximumBytes) {
-  const target = resolveExistingRepositoryFile(relativePath, root, { subtree });
-  const stat = fs.lstatSync(target);
-  if (stat.isSymbolicLink() || !stat.isFile() || stat.size <= 0 || stat.size > maximumBytes) {
-    throw new Error("Release exposure input must be a bounded regular file.");
+function assertExpectedGeneratedEvidenceInventory(root, expected, options = {}) {
+  const current = generatedEvidenceInventory(root, options);
+  if (!sameGeneratedEvidenceInventory(current, expected)) {
+    throw new Error("Generated release evidence changed across the pre-acceptance boundary.");
   }
-  return Object.freeze({ target, bytes: fs.readFileSync(target) });
+  return current;
 }
 
-function readBoundedJson(relativePath, root, subtree) {
-  const loaded = readBoundedBytes(relativePath, root, subtree, MAX_JSON_BYTES);
+function captureGeneratedEvidenceManifest(root, expectedInventory = null, options = {}) {
+  const repositoryRoot = assertRealRepositoryRoot(root);
+  const inventory = expectedInventory || generatedEvidenceInventory(repositoryRoot, options);
+  assertExpectedGeneratedEvidenceInventory(repositoryRoot, inventory, options);
+  const files = inventory.map(entry => {
+    const target = path.join(repositoryRoot, ...entry.path.split("/"));
+    let proof;
+    try {
+      proof = digestStableSingleLinkFile(target, {
+        digestBytes: options.digestBytes,
+        errorMessage: "Generated release evidence changed while its manifest was captured.",
+        expectedIdentity: entry.identity,
+        fileSystem: options.fileSystem,
+        maximumBytes: MAX_GENERATED_FILE_BYTES,
+        minimumBytes: 0,
+      });
+    } catch {
+      throw new Error("Generated release evidence changed while its manifest was captured.");
+    }
+    return Object.freeze({
+      path: entry.path,
+      sha256: proof.sha256,
+      identity: entry.identity,
+    });
+  });
+  assertExpectedGeneratedEvidenceInventory(repositoryRoot, inventory, options);
+  return Object.freeze({
+    boundary: Object.freeze({
+      id: GENERATED_EVIDENCE_BOUNDARY,
+      root: GENERATED_EVIDENCE_ROOT,
+      excludedFiles: [...GENERATED_EVIDENCE_EXCLUDED_FILES],
+      excludedPrefixes: [...GENERATED_EVIDENCE_EXCLUDED_PREFIXES],
+    }),
+    files,
+  });
+}
+
+function readBoundedBytes(relativePath, root, subtree, maximumBytes, options = {}) {
+  const target = resolveExistingRepositoryFile(relativePath, root, { subtree });
+  const errorMessage = "Release exposure input must remain an exact bounded single-link file.";
+  try {
+    const proof = readStableSingleLinkFile(target, {
+      errorMessage,
+      fileSystem: options.fileSystem,
+      maximumBytes,
+      minimumBytes: 1,
+    });
+    return Object.freeze({
+      target,
+      bytes: proof.bytes,
+      identity: proof.identity,
+    });
+  } catch {
+    throw new Error(errorMessage);
+  }
+}
+
+function readBoundedJson(relativePath, root, subtree, options = {}) {
+  const loaded = readBoundedBytes(relativePath, root, subtree, MAX_JSON_BYTES, options);
   return Object.freeze({
     ...loaded,
     document: JSON.parse(decodeUtf8Bytes(loaded.bytes, "Release exposure input")),
@@ -122,19 +323,18 @@ function releaseEvidenceManifest(document) {
   return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
 }
 
-function validateEvidenceSource(relativePath, root) {
+function readBoundedEvidenceBytes(relativePath, root, options = {}) {
   if (!EVIDENCE_PATH_PATTERN.test(relativePath)
     || path.posix.normalize(relativePath) !== relativePath) {
     throw new Error("Release exposure evidence path is invalid.");
   }
-  const target = resolveExistingRepositoryFile(relativePath, root, {
-    subtree: "internal_docs/quality",
-  });
-  const stat = fs.lstatSync(target);
-  if (stat.isSymbolicLink() || !stat.isFile() || stat.size <= 0 || stat.size > MAX_EVIDENCE_BYTES) {
-    throw new Error("Release exposure evidence must be a bounded regular file.");
-  }
-  return target;
+  return readBoundedBytes(
+    relativePath,
+    root,
+    "internal_docs/quality",
+    MAX_EVIDENCE_BYTES,
+    options,
+  );
 }
 
 function scanAcceptedEvidence(root, paths, options = {}) {
@@ -147,24 +347,40 @@ function scanAcceptedEvidence(root, paths, options = {}) {
       snapshot: null,
     };
   }
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-release-evidence-"));
-  fs.chmodSync(scratch, 0o700);
-  const snapshot = path.join(scratch, "evidence");
-  fs.mkdirSync(snapshot, { mode: 0o700 });
+  const scan = options.scanWithGitleaks || scanWithGitleaks;
+  const snapshotBytes = {};
+  const findings = [];
+  let completed = false;
   try {
     for (const relativePath of paths) {
-      copyFileIntoSnapshot(validateEvidenceSource(relativePath, root), relativePath, snapshot);
+      let loadedBytes;
+      let scannerBytes;
+      try {
+        const loaded = readBoundedEvidenceBytes(relativePath, root, options);
+        loadedBytes = loaded.bytes;
+        snapshotBytes[relativePath] = Buffer.from(loadedBytes);
+        scannerBytes = Buffer.from(loadedBytes);
+        const scanned = scan("stdin", relativePath, {
+          ...options,
+          root,
+          input: scannerBytes,
+          logicalPath: relativePath,
+          scanRoot: root,
+          label: "accepted-live-evidence",
+        });
+        if (scanned && typeof scanned.then === "function") {
+          throw new Error("Accepted release evidence scanner must complete synchronously.");
+        }
+        if (!Array.isArray(scanned)) {
+          throw new Error("Accepted release evidence scanner returned an invalid result.");
+        }
+        findings.push(...scanned);
+      } finally {
+        if (Buffer.isBuffer(scannerBytes)) scannerBytes.fill(0);
+        if (Buffer.isBuffer(loadedBytes)) loadedBytes.fill(0);
+      }
     }
-    const findings = scanWithGitleaks("dir", snapshot, {
-      ...options,
-      root,
-      scanRoot: snapshot,
-      label: "accepted-live-evidence",
-    });
-    const snapshotBytes = Object.fromEntries(paths.map(relativePath => [
-      relativePath,
-      fs.readFileSync(path.join(snapshot, ...relativePath.split("/"))),
-    ]));
+    completed = true;
     return {
       id: "accepted-live-evidence",
       status: "scanned",
@@ -173,7 +389,9 @@ function scanAcceptedEvidence(root, paths, options = {}) {
       snapshot: snapshotBytes,
     };
   } finally {
-    fs.rmSync(scratch, { recursive: true, force: true });
+    if (!completed) {
+      for (const bytes of Object.values(snapshotBytes)) bytes.fill(0);
+    }
   }
 }
 
@@ -186,6 +404,130 @@ function normalizeComponent(component) {
   };
 }
 
+function validateGeneratedEvidenceManifest(value) {
+  if (!hasExactKeys(value, ["boundary", "files"])
+    || !hasExactKeys(value.boundary, ["excludedFiles", "excludedPrefixes", "id", "root"])
+    || value.boundary.id !== GENERATED_EVIDENCE_BOUNDARY
+    || value.boundary.root !== GENERATED_EVIDENCE_ROOT
+    || JSON.stringify(value.boundary.excludedPrefixes)
+      !== JSON.stringify(GENERATED_EVIDENCE_EXCLUDED_PREFIXES)
+    || JSON.stringify(value.boundary.excludedFiles)
+      !== JSON.stringify(GENERATED_EVIDENCE_EXCLUDED_FILES)
+    || !Array.isArray(value.files)
+    || value.files.length < 1) {
+    failReleaseExposureProof();
+  }
+  const paths = [];
+  for (const entry of value.files) {
+    if (!hasExactKeys(entry, ["identity", "path", "sha256"])
+      || typeof entry.path !== "string"
+      || path.posix.normalize(entry.path) !== entry.path
+      || !entry.path.startsWith(`${GENERATED_EVIDENCE_ROOT}/`)
+      || GENERATED_EVIDENCE_EXCLUDED_FILES.some(excluded => (
+        entry.path === excluded || entry.path.startsWith(`${excluded}/`)
+      ))
+      || GENERATED_EVIDENCE_EXCLUDED_PREFIXES.some(prefix => (
+        entry.path === prefix || entry.path.startsWith(`${prefix}/`)
+      ))
+      || !/^[a-f0-9]{64}$/u.test(entry.sha256 || "")
+      || !hasExactKeys(entry.identity, EXACT_FILE_IDENTITY_KEYS)
+      || entry.identity.links !== "1"
+      || Object.values(entry.identity).some(valuePart => (
+        typeof valuePart !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(valuePart)
+      ))) {
+      failReleaseExposureProof();
+    }
+    paths.push(entry.path);
+  }
+  if (JSON.stringify(paths) !== JSON.stringify([...new Set(paths)].sort())) {
+    failReleaseExposureProof();
+  }
+  return true;
+}
+
+function generatedEvidenceFromScan(component, expectedInventory) {
+  if (component?.status !== "scanned"
+    || !Number.isInteger(component.fileCount)
+    || !Array.isArray(component.snapshotManifest)
+    || component.fileCount !== component.snapshotManifest.length) {
+    throw new Error("Generated release evidence scan did not return its exact snapshot manifest.");
+  }
+  const manifest = Object.freeze({
+    boundary: Object.freeze({
+      id: GENERATED_EVIDENCE_BOUNDARY,
+      root: GENERATED_EVIDENCE_ROOT,
+      excludedFiles: [...GENERATED_EVIDENCE_EXCLUDED_FILES],
+      excludedPrefixes: [...GENERATED_EVIDENCE_EXCLUDED_PREFIXES],
+    }),
+    files: component.snapshotManifest.map(entry => Object.freeze({
+      path: entry?.path,
+      identity: isPlainObject(entry?.identity)
+        ? Object.freeze({ ...entry.identity })
+        : entry?.identity,
+      sha256: entry?.sha256,
+    })),
+  });
+  try {
+    validateGeneratedEvidenceManifest(manifest);
+  } catch {
+    throw new Error("Generated release evidence scan did not return its exact snapshot manifest.");
+  }
+  const scannedInventory = manifest.files.map(entry => ({
+    path: entry.path,
+    identity: entry.identity,
+  }));
+  if (!sameGeneratedEvidenceInventory(scannedInventory, expectedInventory)) {
+    throw new Error("Generated release evidence scan did not cover the exact manifest boundary.");
+  }
+  return manifest;
+}
+
+function validateCandidateSnapshotComponent(component, expectedIdentity, expectedSha256) {
+  const snapshot = component?.snapshot;
+  if (component?.status !== "scanned"
+    || !Number.isInteger(component.fileCount) || component.fileCount < 2
+    || !hasExactKeys(snapshot, ["identity", "path", "sha256"])
+    || snapshot.path !== UI_CANDIDATE_ARTIFACT
+    || snapshot.sha256 !== expectedSha256
+    || !hasExactKeys(snapshot.identity, EXACT_FILE_IDENTITY_KEYS)
+    || snapshot.identity.links !== "1"
+    || !sameFileIdentity(snapshot.identity, expectedIdentity)) {
+    throw new Error("VSIX release exposure scan did not bind the accepted candidate snapshot.");
+  }
+  return true;
+}
+
+function validateGeneratedEvidenceAcceptance(root, generatedEvidence, options = {}) {
+  validateGeneratedEvidenceManifest(generatedEvidence);
+  const repositoryRoot = assertRealRepositoryRoot(root);
+  const expectedInventory = generatedEvidence.files.map(entry => ({
+    path: entry.path,
+    identity: entry.identity,
+  }));
+  try {
+    assertExpectedGeneratedEvidenceInventory(repositoryRoot, expectedInventory, options);
+    for (const entry of generatedEvidence.files) {
+      const target = path.join(repositoryRoot, ...entry.path.split("/"));
+      const proof = digestStableSingleLinkFile(target, {
+        digestBytes: options.digestBytes,
+        errorMessage: "Generated release evidence changed across the pre-acceptance boundary.",
+        expectedIdentity: entry.identity,
+        fileSystem: options.fileSystem,
+        maximumBytes: MAX_GENERATED_FILE_BYTES,
+        minimumBytes: 0,
+      });
+      if (proof.sha256 !== entry.sha256
+        || !sameFileIdentity(entry.identity, proof.identity)) {
+        throw new Error("Generated release evidence changed across the pre-acceptance boundary.");
+      }
+    }
+    assertExpectedGeneratedEvidenceInventory(repositoryRoot, expectedInventory, options);
+    return true;
+  } catch {
+    throw new Error("Generated release evidence changed across the pre-acceptance boundary.");
+  }
+}
+
 function buildReleaseExposureResult(options = {}) {
   const components = options.components || [];
   const findings = components.flatMap(component => component.findings.map(finding => ({
@@ -194,7 +536,7 @@ function buildReleaseExposureResult(options = {}) {
   })));
   const status = findings.length === 0 ? "passed" : "failed";
   const base = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status,
     source: options.source,
     scanner: {
@@ -205,15 +547,18 @@ function buildReleaseExposureResult(options = {}) {
     },
     capturedAt: (options.now || new Date()).toISOString(),
     candidate: {
-      candidateReceiptFingerprint: options.candidateReceiptFingerprint || null,
-      uiResultSha256: options.uiResultSha256 || null,
-      vsixSha256: options.vsixSha256 || null,
+      candidateReceiptFingerprint: status === "passed"
+        ? options.candidateReceiptFingerprint || null
+        : null,
+      uiResultSha256: status === "passed" ? options.uiResultSha256 || null : null,
+      vsixSha256: status === "passed" ? options.vsixSha256 || null : null,
     },
     attestation: options.attestationPath ? {
       path: options.attestationPath,
-      sha256: options.attestationSha256 || null,
+      sha256: status === "passed" ? options.attestationSha256 || null : null,
     } : null,
-    evidence: [...(options.evidenceManifest || [])],
+    generatedEvidence: status === "passed" ? options.generatedEvidence || null : null,
+    evidence: status === "passed" ? [...(options.evidenceManifest || [])] : [],
     findingCount: findings.length,
     components: components.map(normalizeComponent),
     findings,
@@ -235,9 +580,10 @@ function validateReleaseExposureProof(value, expected = {}) {
       : 0;
     if (!hasExactKeys(value, [
       "attestation", "candidate", "capturedAt", "components", "evidence", "findingCount",
-      "findings", "fingerprint", "scanner", "schemaVersion", "source", "status",
+      "findings", "fingerprint", "generatedEvidence", "scanner", "schemaVersion", "source",
+      "status",
     ])
-      || value.schemaVersion !== 1
+      || value.schemaVersion !== 2
       || value.status !== "passed"
       || value.findingCount !== 0
       || !Array.isArray(value.findings) || value.findings.length !== 0
@@ -269,13 +615,19 @@ function validateReleaseExposureProof(value, expected = {}) {
         !== JSON.stringify(RELEASE_COMPONENT_IDS)
       || value.components[0].status !== "scanned"
       || !Number.isInteger(value.components[0].fileCount)
-      || value.components[0].fileCount < 1
+      || !isPlainObject(value.generatedEvidence)
+      || value.components[0].fileCount !== value.generatedEvidence.files?.length
       || value.components[1].status !== "scanned"
       || !Number.isInteger(value.components[1].fileCount)
       || value.components[1].fileCount < 2
       || value.components[2].status !== (expected.attestationPath ? "scanned" : "not-present")
       || value.components[2].fileCount !== expectedEvidenceFileCount
       || JSON.stringify(value.evidence) !== JSON.stringify(expected.evidenceManifest || [])) {
+      failReleaseExposureProof();
+    }
+    validateGeneratedEvidenceManifest(value.generatedEvidence);
+    if (expected.generatedEvidence
+      && JSON.stringify(value.generatedEvidence) !== JSON.stringify(expected.generatedEvidence)) {
       failReleaseExposureProof();
     }
     const unsigned = { ...value };
@@ -301,13 +653,13 @@ function validateReleaseExposureProof(value, expected = {}) {
   }
 }
 
-function assertStableEvidence(root, evidenceManifest, attestation, snapshot) {
+function assertStableEvidence(root, evidenceManifest, attestation, snapshot, options = {}) {
   const expected = new Map([
     [attestation.path, attestation.sha256],
     ...evidenceManifest.map(reference => [reference.path, reference.sha256]),
   ]);
   for (const [relativePath, expectedSha256] of expected) {
-    const original = fs.readFileSync(validateEvidenceSource(relativePath, root));
+    const original = readBoundedEvidenceBytes(relativePath, root, options).bytes;
     const copied = snapshot?.[relativePath];
     if (!Buffer.isBuffer(copied)
       || !original.equals(copied)
@@ -322,7 +674,7 @@ async function executeReleaseExposureScan(options = {}) {
   const source = options.source || sourceIdentity(root);
   const candidateLoaded = options.candidateReceipt
     ? { document: options.candidateReceipt }
-    : readBoundedJson(UI_CANDIDATE_RECEIPT, root, ".quality/qualification");
+    : readBoundedJson(UI_CANDIDATE_RECEIPT, root, ".quality/qualification", options);
   const candidateArtifactPath = options.candidateArtifactPath
     || resolveExistingRepositoryFile(UI_CANDIDATE_ARTIFACT, root, {
       subtree: ".quality/qualification",
@@ -330,7 +682,7 @@ async function executeReleaseExposureScan(options = {}) {
   const candidateIdentityBefore = exactFileIdentity(candidateArtifactPath);
   const uiLoaded = options.ui
     ? { document: options.ui, bytes: Buffer.from(JSON.stringify(options.ui)) }
-    : readBoundedJson(UI_RESULT, root, ".quality/ui");
+    : readBoundedJson(UI_RESULT, root, ".quality/ui", options);
   const candidateBinding = candidateBindingFromReceipt(candidateLoaded.document, {
     root,
     source,
@@ -357,7 +709,12 @@ async function executeReleaseExposureScan(options = {}) {
           subtree: "internal_docs/quality",
         });
         if (!target) return null;
-        const loaded = readBoundedJson(LIVE_ATTESTATION, root, "internal_docs/quality");
+        const loaded = readBoundedJson(
+          LIVE_ATTESTATION,
+          root,
+          "internal_docs/quality",
+          options,
+        );
         return { path: LIVE_ATTESTATION, ...loaded };
       })();
   const evidenceManifest = optionalAttestation
@@ -367,6 +724,7 @@ async function executeReleaseExposureScan(options = {}) {
     ? [...new Set([optionalAttestation.path, ...evidenceManifest.map(reference => reference.path)])].sort()
     : [];
 
+  const generatedInventoryBefore = generatedEvidenceInventory(root, options);
   (options.assertScannerVersion || assertScannerVersion)({ ...options, root });
   const generatedComponent = (options.scanGeneratedEvidence || scanGeneratedEvidence)(
     root,
@@ -374,13 +732,28 @@ async function executeReleaseExposureScan(options = {}) {
     {
       ...options,
       id: "post-ui-generated-quality-evidence",
-      excludedPrefixes: [OUTPUT_ROOT],
+      excludedFiles: GENERATED_EVIDENCE_EXCLUDED_FILES,
+      excludedPrefixes: GENERATED_EVIDENCE_EXCLUDED_PREFIXES,
+      expectedInventory: generatedInventoryBefore,
     }
+  );
+  const generatedEvidence = generatedEvidenceFromScan(
+    generatedComponent,
+    generatedInventoryBefore,
   );
   const candidateComponent = await (options.scanVsix || scanVsix)(
     root,
     UI_CANDIDATE_ARTIFACT,
-    options
+    {
+      ...options,
+      expectedVsixIdentity: candidateIdentityBefore,
+      expectedVsixSha256: candidateBinding.vsixSha256,
+    }
+  );
+  validateCandidateSnapshotComponent(
+    candidateComponent,
+    candidateIdentityBefore,
+    candidateBinding.vsixSha256,
   );
   const evidenceComponent = options.scanAcceptedEvidence
     ? options.scanAcceptedEvidence(root, evidencePaths, options)
@@ -404,9 +777,13 @@ async function executeReleaseExposureScan(options = {}) {
       || !sameFileIdentity(candidateIdentityBefore, exactFileIdentity(candidateArtifactPath))) {
       throw new Error("Signed-out candidate changed during release exposure scanning.");
     }
-    const currentUi = fs.readFileSync(resolveExistingRepositoryFile(UI_RESULT, root, {
-      subtree: ".quality/ui",
-    }));
+    const currentUi = readBoundedBytes(
+      UI_RESULT,
+      root,
+      ".quality/ui",
+      MAX_JSON_BYTES,
+      options,
+    ).bytes;
     if (uiLoaded.bytes && !currentUi.equals(uiLoaded.bytes)) {
       throw new Error("Signed-out UI evidence changed during release exposure scanning.");
     }
@@ -418,8 +795,11 @@ async function executeReleaseExposureScan(options = {}) {
         evidenceManifest,
         { path: optionalAttestation.path, sha256: attestationSha256 },
         evidenceComponent.snapshot,
+        options,
       );
     }
+    assertExpectedGeneratedEvidenceInventory(root, generatedInventoryBefore, options);
+    validateGeneratedEvidenceAcceptance(root, generatedEvidence, options);
   }
   return buildReleaseExposureResult({
     source,
@@ -428,6 +808,7 @@ async function executeReleaseExposureScan(options = {}) {
     uiResultSha256,
     attestationPath: optionalAttestation?.path || null,
     attestationSha256,
+    generatedEvidence,
     evidenceManifest,
     components,
     now: options.now || new Date(),
@@ -453,12 +834,25 @@ async function main() {
 if (require.main === module) main();
 
 module.exports = {
+  GENERATED_EVIDENCE_BOUNDARY,
+  GENERATED_EVIDENCE_CIRCULAR_OUTPUTS,
+  GENERATED_EVIDENCE_EXCLUDED_FILES,
+  GENERATED_EVIDENCE_EXCLUDED_PREFIXES,
+  GENERATED_EVIDENCE_ROOT,
   LIVE_ATTESTATION,
   RELEASE_COMPONENT_IDS,
   RELEASE_EXPOSURE_RESULT,
+  RELEASE_GATE_CIRCULAR_PATHS,
+  RELEASE_GATE_EXPECTED_PATHS,
+  assertExactReleaseGateTree,
   buildReleaseExposureResult,
+  captureGeneratedEvidenceManifest,
   executeReleaseExposureScan,
+  generatedEvidenceInventory,
   releaseEvidenceManifest,
+  readBoundedBytes,
+  readBoundedJson,
   scanAcceptedEvidence,
+  validateGeneratedEvidenceAcceptance,
   validateReleaseExposureProof,
 };

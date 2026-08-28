@@ -62,6 +62,8 @@ const EXPECTED_QUALITY_SCRIPT_ENTRYPOINTS = Object.freeze({
   "quality:secrets:artifacts": "node scripts/quality/secret-scan.js artifacts",
   "quality:secrets:evidence": "node scripts/quality/secret-scan.js evidence",
   "quality:secrets:history": "node scripts/quality/secret-scan.js history",
+  "quality:secrets:signed-out-evidence":
+    "node scripts/quality/secret-scan.js evidence --signed-out-bundle",
   "quality:verify-authenticated-evidence":
     "node scripts/quality/verify-authenticated-evidence.js",
   "quality:verify-evidence": "node scripts/quality/verify-handoff.js",
@@ -603,7 +605,7 @@ function expectedSignedOutUiJob() {
       {
         name: "Run signed-out packaged black-box UI",
         id: "ui_smoke",
-        run: "xvfb-run -a npm run test:ui:smoke",
+        run: "npm run test:ui:smoke",
       },
       {
         name: "Verify exact candidate and UI result binding",
@@ -615,15 +617,27 @@ function expectedSignedOutUiJob() {
         name: "Scan upload-eligible signed-out UI evidence",
         id: "ui_evidence_secret_scan",
         if: "${{ always() }}",
-        run: "npm run quality:secrets:evidence",
+        run: "npm run quality:secrets:signed-out-evidence",
+      },
+      {
+        name: "Verify detached staged signed-out UI evidence",
+        id: "ui_evidence_bundle",
+        if: "${{ always() }}",
+        env: { EXPECTED_SOURCE_SHA: "${{ github.sha }}" },
+        run: "node scripts/quality/verify-ui-evidence.js --bundle .quality/upload/signed-out-ui",
       },
       {
         name: "Upload safe signed-out UI receipts",
-        if: "${{ always() && steps.ui_evidence_handoff.outcome == 'success' && steps.ui_evidence_secret_scan.outcome == 'success' }}",
+        if: "${{ always() && steps.ui_evidence_handoff.outcome == 'success' && steps.ui_evidence_secret_scan.outcome == 'success' && steps.ui_evidence_bundle.outcome == 'success' }}",
         uses: UPLOAD_ACTION,
         with: {
           name: "signed-out-ui-evidence-${{ github.sha }}-${{ github.run_attempt }}",
-          path: ".quality/qualification/candidate.json\n.quality/ui/result.json\n.quality/secrets/evidence.json\n",
+          path: [
+            ".quality/upload/signed-out-ui/evidence.json",
+            ".quality/upload/signed-out-ui/result.json",
+            ".quality/upload/signed-out-ui/ui-candidate.json",
+            ".quality/upload/signed-out-ui/ui-candidate.vsix",
+          ].join("\n"),
           "if-no-files-found": "error",
           "include-hidden-files": true,
           "retention-days": 30,

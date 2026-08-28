@@ -3,7 +3,10 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
-const { buildNonAuthQualityEnvironment } = require("../quality/non-auth-environment");
+const {
+  removeExactOwnedDirectoryTree,
+  withNonAuthQualityEnvironment,
+} = require("../quality/non-auth-environment");
 const { assertVersionState } = require("./verify-version");
 const { validateSidecars, verifyVsix } = require("./verify-vsix");
 
@@ -11,24 +14,26 @@ const root = path.resolve(__dirname, "../..");
 
 function run(command, arguments_, options = {}) {
   const spawn = options.spawnSync || spawnSync;
-  const environment = buildNonAuthQualityEnvironment(
-    options.environment || process.env,
-    options.environmentOverrides || {},
-    { platform: options.platform }
-  );
-  const result = spawn(command, arguments_, {
-    cwd: options.cwd || root,
-    encoding: "utf8",
-    maxBuffer: 32 * 1024 * 1024,
-    windowsHide: true,
-    env: environment,
+  return withNonAuthQualityEnvironment({
+    environment: options.environment || process.env,
+    overrides: options.environmentOverrides || {},
+    platform: options.platform,
+    temporaryParent: options.temporaryParent,
+  }, environment => {
+    const result = spawn(command, arguments_, {
+      cwd: options.cwd || root,
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
+      windowsHide: true,
+      env: environment,
+    });
+    if (result.error || result.signal || result.status !== 0) {
+      process.stderr.write(result.stdout || "");
+      process.stderr.write(result.stderr || "");
+      throw new Error(`${path.basename(command)} failed while building the release artifact`);
+    }
+    return result.stdout.trim();
   });
-  if (result.error || result.signal || result.status !== 0) {
-    process.stderr.write(result.stdout || "");
-    process.stderr.write(result.stderr || "");
-    throw new Error(`${path.basename(command)} failed while building the release artifact`);
-  }
-  return result.stdout.trim();
 }
 
 function gitStatus() {
@@ -63,6 +68,25 @@ function resolveOutputPath(directory, filename) {
   return resolved;
 }
 
+function packageBuildDirectoryIdentity(directory) {
+  const stat = fs.lstatSync(directory, { bigint: true });
+  if (stat.isSymbolicLink() || !stat.isDirectory()
+    || fs.realpathSync(directory) !== directory) {
+    throw new Error("Release package temporary directory must remain an exact real directory.");
+  }
+  return Object.freeze({ dev: stat.dev, ino: stat.ino });
+}
+
+function removePackageBuildDirectory(directory, identity) {
+  removeExactOwnedDirectoryTree(directory, {
+    allowAdditionalRootEntries: true,
+    errorMessage: "Release package temporary cleanup refused an unsafe or changed tree.",
+    expectedRootEntries: [],
+    expectedRootIdentity: identity,
+  });
+  return !fs.existsSync(directory);
+}
+
 async function main() {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
   const lockfile = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "utf8"));
@@ -84,7 +108,11 @@ async function main() {
     throw new Error("Could not derive a valid source commit epoch");
   }
 
-  const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-vsix-"));
+  const tempDirectory = fs.realpathSync(fs.mkdtempSync(
+    path.join(os.tmpdir(), "cloudsmith-vsix-"),
+  ));
+  if (process.platform !== "win32") fs.chmodSync(tempDirectory, 0o700);
+  const tempDirectoryIdentity = packageBuildDirectoryIdentity(tempDirectory);
   const filename = `${name}-${version}.vsix`;
   const firstPath = resolveOutputPath(tempDirectory, `first-${filename}`);
   const secondPath = resolveOutputPath(tempDirectory, `second-${filename}`);
@@ -171,7 +199,7 @@ async function main() {
       console.log("Release mode was not requested; this development artifact is explicitly non-publishable.");
     }
   } finally {
-    fs.rmSync(tempDirectory, { recursive: true, force: true });
+    removePackageBuildDirectory(tempDirectory, tempDirectoryIdentity);
   }
 }
 
@@ -183,6 +211,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  packageBuildDirectoryIdentity,
+  removePackageBuildDirectory,
   runPackageCommand: run,
   resolveOutputPath,
 };

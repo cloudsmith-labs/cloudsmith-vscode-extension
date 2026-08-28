@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
 const {
   AUTHENTICATED_CANDIDATE_ARTIFACT,
   AUTHENTICATED_CANDIDATE_RECEIPT,
@@ -13,6 +14,7 @@ const {
   LIVE_CANDIDATE_ARTIFACT,
   LIVE_CANDIDATE_RECEIPT,
   candidateBindingFromReceipt,
+  digestStableSingleLinkFile,
   profileRootIdentity,
   validateAuthenticatedExecutionReceipt,
   validateCandidateBinding,
@@ -108,11 +110,11 @@ suite("live qualification candidate binding", () => {
       fixture.bytes,
       Buffer.from("extra"),
     ]));
-    const originalReadFileSync = fs.readFileSync;
+    const originalReadSync = fs.readSync;
     let proofRead = false;
-    fs.readFileSync = (...args) => {
-      if (args[0] === fixture.artifactPath) proofRead = true;
-      return originalReadFileSync(...args);
+    fs.readSync = (...args) => {
+      proofRead = true;
+      return originalReadSync(...args);
     };
     try {
       assert.throws(
@@ -122,9 +124,233 @@ suite("live qualification candidate binding", () => {
         /VSIX proof is stale or mismatched/u,
       );
     } finally {
-      fs.readFileSync = originalReadFileSync;
+      fs.readSync = originalReadSync;
     }
     assert.strictEqual(proofRead, false);
+  });
+
+  test("rejects hard links and special-file proofs without reading or hashing bytes", function () {
+    if (process.platform === "win32") this.skip();
+    const fixture = candidateFixture(roots);
+    const hardLink = path.join(fixture.root, "candidate-hard-link.vsix");
+    fs.linkSync(fixture.artifactPath, hardLink);
+    assert.throws(
+      () => candidateBindingFromReceipt(fixture.receipt, {
+        artifactPath: fixture.artifactPath,
+      }),
+      /VSIX proof is stale or mismatched/u,
+    );
+    fs.rmSync(hardLink);
+
+    const symlink = path.join(fixture.root, "candidate-symlink.vsix");
+    const fifo = path.join(fixture.root, "candidate-fifo.vsix");
+    fs.symlinkSync(fixture.artifactPath, symlink);
+    const fifoResult = spawnSync("mkfifo", [fifo], { encoding: "utf8" });
+    assert.strictEqual(fifoResult.status, 0, fifoResult.stderr);
+    let opened = 0;
+    let descriptorReads = 0;
+    let digests = 0;
+    const fileSystem = Object.create(fs);
+    fileSystem.openSync = (...arguments_) => {
+      opened += 1;
+      return fs.openSync(...arguments_);
+    };
+    fileSystem.readSync = (...arguments_) => {
+      descriptorReads += 1;
+      return fs.readSync(...arguments_);
+    };
+    for (const target of [symlink, fifo, "/dev/null"]) {
+      assert.throws(
+        () => digestStableSingleLinkFile(target, {
+          digestBytes() {
+            digests += 1;
+            return "a".repeat(64);
+          },
+          errorMessage: "Synthetic exact-file rejection.",
+          fileSystem,
+          maximumBytes: 12 * 1024 * 1024,
+          minimumBytes: 1,
+        }),
+        /Synthetic exact-file rejection/u,
+      );
+    }
+    assert.strictEqual(opened, 0);
+    assert.strictEqual(descriptorReads, 0);
+    assert.strictEqual(digests, 0);
+  });
+
+  test("rejects a regular-file path swap before reading or hashing replacement bytes", () => {
+    const fixture = candidateFixture(roots);
+    const original = path.join(fixture.root, "original-candidate.vsix");
+    const replacement = path.join(fixture.root, "replacement-candidate.vsix");
+    fs.writeFileSync(replacement, Buffer.alloc(fixture.bytes.length, 0x5a));
+    let replaced = false;
+    let descriptorReads = 0;
+    let digests = 0;
+    const fileSystem = Object.create(fs);
+    fileSystem.openSync = (target, flags, mode) => {
+      if (target === fixture.artifactPath && !replaced) {
+        replaced = true;
+        fs.renameSync(fixture.artifactPath, original);
+        fs.renameSync(replacement, fixture.artifactPath);
+      }
+      return fs.openSync(target, flags, mode);
+    };
+    fileSystem.readSync = (...arguments_) => {
+      descriptorReads += 1;
+      return fs.readSync(...arguments_);
+    };
+
+    assert.throws(
+      () => digestStableSingleLinkFile(fixture.artifactPath, {
+        digestBytes() {
+          digests += 1;
+          return "a".repeat(64);
+        },
+        errorMessage: "Synthetic exact-file rejection.",
+        fileSystem,
+        maximumBytes: 12 * 1024 * 1024,
+        minimumBytes: 1,
+      }),
+      /Synthetic exact-file rejection/u,
+    );
+    assert.strictEqual(replaced, true);
+    assert.strictEqual(descriptorReads, 0);
+    assert.strictEqual(digests, 0);
+  });
+
+  test("rejects a symlink path swap without following or hashing its target", function () {
+    if (process.platform === "win32") this.skip();
+    const fixture = candidateFixture(roots);
+    const original = path.join(fixture.root, "original-symlink-candidate.vsix");
+    const replacement = path.join(fixture.root, "symlink-target.vsix");
+    fs.writeFileSync(replacement, "unauthorized synthetic symlink target\n");
+    let descriptorReads = 0;
+    let digests = 0;
+    const fileSystem = Object.create(fs);
+    fileSystem.openSync = (target, flags, mode) => {
+      if (target === fixture.artifactPath) {
+        fs.renameSync(fixture.artifactPath, original);
+        fs.symlinkSync(replacement, fixture.artifactPath);
+      }
+      return fs.openSync(target, flags, mode);
+    };
+    fileSystem.readSync = (...arguments_) => {
+      descriptorReads += 1;
+      return fs.readSync(...arguments_);
+    };
+
+    assert.throws(
+      () => digestStableSingleLinkFile(fixture.artifactPath, {
+        digestBytes() {
+          digests += 1;
+          return "a".repeat(64);
+        },
+        errorMessage: "Synthetic exact-file rejection.",
+        fileSystem,
+        maximumBytes: 12 * 1024 * 1024,
+        minimumBytes: 1,
+      }),
+      /Synthetic exact-file rejection/u,
+    );
+    assert.strictEqual(descriptorReads, 0);
+    assert.strictEqual(digests, 0);
+  });
+
+  test("revalidates the opened descriptor after reading and before hashing", () => {
+    const fixture = candidateFixture(roots);
+    let descriptorReads = 0;
+    let digests = 0;
+    const fileSystem = Object.create(fs);
+    fileSystem.readSync = (...arguments_) => {
+      const bytesRead = fs.readSync(...arguments_);
+      descriptorReads += 1;
+      fs.appendFileSync(fixture.artifactPath, "synthetic post-read drift\n");
+      return bytesRead;
+    };
+
+    assert.throws(
+      () => digestStableSingleLinkFile(fixture.artifactPath, {
+        digestBytes() {
+          digests += 1;
+          return "a".repeat(64);
+        },
+        errorMessage: "Synthetic exact-file rejection.",
+        fileSystem,
+        maximumBytes: 12 * 1024 * 1024,
+        minimumBytes: 1,
+      }),
+      /Synthetic exact-file rejection/u,
+    );
+    assert.strictEqual(descriptorReads, 1);
+    assert.strictEqual(digests, 0);
+  });
+
+  test("caps descriptor reads at the opened size and rejects concurrent growth before hashing", () => {
+    const fixture = candidateFixture(roots);
+    const fileSystem = Object.create(fs);
+    let descriptorBytesRequested = 0;
+    let digests = 0;
+    let grew = false;
+    fileSystem.readSync = (...arguments_) => {
+      descriptorBytesRequested += arguments_[3];
+      const bytesRead = fs.readSync(...arguments_);
+      if (!grew) {
+        grew = true;
+        fs.appendFileSync(fixture.artifactPath, Buffer.alloc(4096, 0x47));
+      }
+      return bytesRead;
+    };
+
+    assert.throws(
+      () => digestStableSingleLinkFile(fixture.artifactPath, {
+        digestBytes() {
+          digests += 1;
+          return "a".repeat(64);
+        },
+        errorMessage: "Synthetic bounded-read rejection.",
+        fileSystem,
+        maximumBytes: fixture.bytes.length,
+        minimumBytes: 1,
+      }),
+      /Synthetic bounded-read rejection/u,
+    );
+    assert.strictEqual(grew, true);
+    assert.ok(descriptorBytesRequested <= fixture.bytes.length);
+    assert.strictEqual(digests, 0);
+  });
+
+  test("rejects a same-byte path replacement during hashing and zeroes the read buffer", () => {
+    const fixture = candidateFixture(roots);
+    const original = path.join(fixture.root, "digest-original-candidate.vsix");
+    const replacement = path.join(fixture.root, "digest-replacement-candidate.vsix");
+    fs.writeFileSync(replacement, fixture.bytes);
+    let digestCalls = 0;
+    let consumedBytes;
+
+    assert.throws(
+      () => digestStableSingleLinkFile(fixture.artifactPath, {
+        digestBytes(bytes) {
+          digestCalls += 1;
+          consumedBytes = bytes;
+          const digest = crypto.createHash("sha256").update(bytes).digest("hex");
+          fs.renameSync(fixture.artifactPath, original);
+          fs.renameSync(replacement, fixture.artifactPath);
+          return digest;
+        },
+        errorMessage: "Synthetic post-hash identity rejection.",
+        maximumBytes: 12 * 1024 * 1024,
+        minimumBytes: 1,
+      }),
+      /Synthetic post-hash identity rejection/u,
+    );
+    assert.strictEqual(digestCalls, 1);
+    assert.ok(Buffer.isBuffer(consumedBytes));
+    assert.strictEqual(consumedBytes.every(byte => byte === 0), true);
+    assert.notStrictEqual(
+      fs.lstatSync(fixture.artifactPath).ino,
+      fs.lstatSync(original).ino,
+    );
   });
 
   test("rejects non-canonical or oversized VSIX metadata even with a valid receipt hash", () => {

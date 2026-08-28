@@ -10,6 +10,7 @@ const {
   writeJson,
 } = require("./common");
 const { fingerprint } = require("./evidence");
+const { removeExactOwnedDirectoryTree } = require("./non-auth-environment");
 const {
   AUTHENTICATED_CANDIDATE_ARTIFACT,
   AUTHENTICATED_CANDIDATE_RECEIPT,
@@ -241,7 +242,21 @@ function cleanupPreparedAuthenticatedCandidate(root = ROOT, options = {}) {
   }
   if (fs.existsSync(session.profile.root)) {
     assertPreparedSession(session, { environment: options.environment });
-    fs.rmSync(session.profile.root, { recursive: true, force: false, maxRetries: 3 });
+    const expectedRootEntries = [
+      session.profile.homeDir,
+      session.profile.userDataDir,
+      session.profile.extensionsDir,
+    ].map(directory => Object.freeze({
+      name: path.basename(directory),
+      kind: "directory",
+      identity: fs.lstatSync(directory),
+    }));
+    removeExactOwnedDirectoryTree(session.profile.root, {
+      allowAdditionalRootEntries: true,
+      errorMessage: "Authenticated candidate profile cleanup refused an unsafe or changed tree.",
+      expectedRootEntries,
+      expectedRootIdentity: session.ownership,
+    });
   }
   if (fs.existsSync(session.profile.root)) {
     throw new Error("Authenticated candidate profile cleanup did not complete.");

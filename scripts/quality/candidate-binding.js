@@ -19,6 +19,18 @@ const UI_CANDIDATE_RECEIPT = ".quality/qualification/ui-candidate.json";
 const UI_CANDIDATE_ARTIFACT = ".quality/qualification/ui-candidate.vsix";
 const MAX_VSIX_BYTES = 12 * 1024 * 1024;
 const MAX_VSIX_ENTRIES = 1250;
+const EXACT_FILE_READ_FLAGS = fs.constants.O_RDONLY
+  | (fs.constants.O_NOFOLLOW || 0)
+  | (fs.constants.O_NONBLOCK || 0);
+const EXACT_FILE_IDENTITY_KEYS = Object.freeze([
+  "changedNanoseconds",
+  "device",
+  "inode",
+  "links",
+  "mode",
+  "modifiedNanoseconds",
+  "size",
+]);
 const CANDIDATE_BINDING_KEYS = Object.freeze([
   "developmentPath",
   "extensionId",
@@ -62,6 +74,200 @@ function exactSource(value) {
 function sameSource(left, right) {
   return exactSource(left) && exactSource(right)
     && left.sha === right.sha && left.fingerprint === right.fingerprint;
+}
+
+function sameFilesystemPath(left, right) {
+  const normalizedLeft = path.normalize(left);
+  const normalizedRight = path.normalize(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+function exactFileIdentity(stat) {
+  return Object.freeze({
+    changedNanoseconds: String(stat.ctimeNs),
+    device: String(stat.dev),
+    inode: String(stat.ino),
+    links: String(stat.nlink),
+    mode: String(stat.mode),
+    modifiedNanoseconds: String(stat.mtimeNs),
+    size: String(stat.size),
+  });
+}
+
+function sameExactFileIdentity(left, right) {
+  return Boolean(left && right && EXACT_FILE_IDENTITY_KEYS.every(key => {
+    const leftDescriptor = Object.getOwnPropertyDescriptor(left, key);
+    const rightDescriptor = Object.getOwnPropertyDescriptor(right, key);
+    return leftDescriptor && rightDescriptor
+      && Object.prototype.hasOwnProperty.call(leftDescriptor, "value")
+      && Object.prototype.hasOwnProperty.call(rightDescriptor, "value")
+      && leftDescriptor.value === rightDescriptor.value;
+  }));
+}
+
+function assertBoundedSingleLinkFile(stat, minimumBytes, maximumBytes, errorMessage) {
+  const one = typeof stat.nlink === "bigint" ? 1n : 1;
+  const size = typeof stat.size === "bigint" ? stat.size : BigInt(stat.size);
+  if (!stat.isFile() || stat.nlink !== one
+    || size < BigInt(minimumBytes) || size > BigInt(maximumBytes)) {
+    throw new Error(errorMessage);
+  }
+  return stat;
+}
+
+function withStableSingleLinkFile(file, options = {}, consume) {
+  const fileSystem = options.fileSystem || fs;
+  const errorMessage = options.errorMessage || "Exact file proof is unsafe or changed.";
+  const minimumBytes = options.minimumBytes === undefined ? 0 : options.minimumBytes;
+  const maximumBytes = options.maximumBytes;
+  const expectedBytes = options.expectedBytes;
+  if (!Number.isSafeInteger(minimumBytes) || minimumBytes < 0
+    || !Number.isSafeInteger(maximumBytes) || maximumBytes < minimumBytes
+    || !(expectedBytes === undefined
+      || (Number.isSafeInteger(expectedBytes)
+        && expectedBytes >= minimumBytes && expectedBytes <= maximumBytes))) {
+    throw new Error(errorMessage);
+  }
+  if (typeof consume !== "function") throw new Error(errorMessage);
+  let descriptor;
+  let bytes;
+  let result;
+  let completed = false;
+  try {
+    const pathStat = assertBoundedSingleLinkFile(
+      fileSystem.lstatSync(file, { bigint: true }),
+      minimumBytes,
+      maximumBytes,
+      errorMessage,
+    );
+    if (expectedBytes !== undefined && pathStat.size !== BigInt(expectedBytes)) {
+      throw new Error(errorMessage);
+    }
+    if (pathStat.isSymbolicLink()
+      || !sameFilesystemPath(fileSystem.realpathSync(file), file)) {
+      throw new Error(errorMessage);
+    }
+    const pathIdentity = exactFileIdentity(pathStat);
+    if (options.expectedIdentity
+      && !sameExactFileIdentity(options.expectedIdentity, pathIdentity)) {
+      throw new Error(errorMessage);
+    }
+
+    descriptor = fileSystem.openSync(file, EXACT_FILE_READ_FLAGS);
+    const openedStat = assertBoundedSingleLinkFile(
+      fileSystem.fstatSync(descriptor, { bigint: true }),
+      minimumBytes,
+      maximumBytes,
+      errorMessage,
+    );
+    const openedIdentity = exactFileIdentity(openedStat);
+    if (!sameExactFileIdentity(pathIdentity, openedIdentity)) throw new Error(errorMessage);
+
+    const openedBytes = Number(openedStat.size);
+    bytes = Buffer.allocUnsafe(openedBytes);
+    let offset = 0;
+    while (offset < openedBytes) {
+      const bytesRead = fileSystem.readSync(
+        descriptor,
+        bytes,
+        offset,
+        openedBytes - offset,
+        offset,
+      );
+      if (!Number.isSafeInteger(bytesRead) || bytesRead <= 0
+        || bytesRead > openedBytes - offset) {
+        throw new Error(errorMessage);
+      }
+      offset += bytesRead;
+    }
+
+    assertStableOpenFile(
+      file,
+      descriptor,
+      openedIdentity,
+      minimumBytes,
+      maximumBytes,
+      fileSystem,
+      errorMessage,
+    );
+    result = consume(bytes, openedIdentity);
+    if (result && typeof result.then === "function") throw new Error(errorMessage);
+    assertStableOpenFile(
+      file,
+      descriptor,
+      openedIdentity,
+      minimumBytes,
+      maximumBytes,
+      fileSystem,
+      errorMessage,
+    );
+    completed = true;
+  } catch {
+    completed = false;
+  } finally {
+    if (Buffer.isBuffer(bytes)) bytes.fill(0);
+    if (descriptor !== undefined) {
+      try {
+        fileSystem.closeSync(descriptor);
+      } catch {
+        completed = false;
+      }
+    }
+  }
+  if (!completed) throw new Error(errorMessage);
+  return result;
+}
+
+function assertStableOpenFile(
+  file,
+  descriptor,
+  openedIdentity,
+  minimumBytes,
+  maximumBytes,
+  fileSystem,
+  errorMessage,
+) {
+  const descriptorStat = assertBoundedSingleLinkFile(
+    fileSystem.fstatSync(descriptor, { bigint: true }),
+    minimumBytes,
+    maximumBytes,
+    errorMessage,
+  );
+  const pathStat = assertBoundedSingleLinkFile(
+    fileSystem.lstatSync(file, { bigint: true }),
+    minimumBytes,
+    maximumBytes,
+    errorMessage,
+  );
+  if (pathStat.isSymbolicLink()
+    || !sameFilesystemPath(fileSystem.realpathSync(file), file)
+    || !sameExactFileIdentity(openedIdentity, exactFileIdentity(descriptorStat))
+    || !sameExactFileIdentity(openedIdentity, exactFileIdentity(pathStat))) {
+    throw new Error(errorMessage);
+  }
+  return true;
+}
+
+function readStableSingleLinkFile(file, options = {}) {
+  return withStableSingleLinkFile(file, options, (bytes, identity) => Object.freeze({
+    bytes: Buffer.from(bytes),
+    identity,
+  }));
+}
+
+function digestStableSingleLinkFile(file, options = {}) {
+  const digestBytes = options.digestBytes || (bytes => (
+    crypto.createHash("sha256").update(bytes).digest("hex")
+  ));
+  return withStableSingleLinkFile(file, options, (bytes, identity) => {
+    const sha256 = digestBytes(bytes);
+    if (!/^[a-f0-9]{64}$/u.test(sha256 || "")) {
+      throw new Error(options.errorMessage || "Exact file proof is unsafe or changed.");
+    }
+    return Object.freeze({ identity, sha256 });
+  });
 }
 
 function profileRootIdentity(mode, root) {
@@ -160,6 +366,7 @@ function candidateBindingFromReceipt(receipt, options = {}) {
       proofPath,
       artifact,
       "Qualification candidate VSIX proof is stale or mismatched.",
+      { fileSystem: options.fileSystem },
     );
   }
 
@@ -237,23 +444,22 @@ function containedRealProofPath(file, root) {
   }
 }
 
-function assertVsixProof(file, artifact, errorMessage) {
-  let stat;
-  let digest;
+function assertVsixProof(file, artifact, errorMessage, options = {}) {
   try {
-    stat = fs.lstatSync(file);
+    const proof = digestStableSingleLinkFile(file, {
+      errorMessage,
+      expectedBytes: artifact.archiveBytes,
+      fileSystem: options.fileSystem,
+      maximumBytes: MAX_VSIX_BYTES,
+      minimumBytes: 1,
+    });
+    if (proof.identity.size !== String(artifact.archiveBytes)
+      || proof.sha256 !== artifact.sha256) {
+      throw new Error(errorMessage);
+    }
   } catch {
     throw new Error(errorMessage);
   }
-  if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== artifact.archiveBytes) {
-    throw new Error(errorMessage);
-  }
-  try {
-    digest = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
-  } catch {
-    throw new Error(errorMessage);
-  }
-  if (digest !== artifact.sha256) throw new Error(errorMessage);
 }
 
 function validateCandidateBinding(value, expected = null) {
@@ -376,6 +582,7 @@ module.exports = {
   AUTHENTICATED_CANDIDATE_ARTIFACT,
   AUTHENTICATED_CANDIDATE_RECEIPT,
   CANDIDATE_BINDING_KEYS,
+  EXACT_FILE_IDENTITY_KEYS,
   IMMUTABLE_EXTENSION_ARTIFACT_KEYS,
   IMMUTABLE_CANDIDATE_KEYS,
   LIVE_CANDIDATE_ARTIFACT,
@@ -383,10 +590,15 @@ module.exports = {
   UI_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_RECEIPT,
   candidateBindingFromReceipt,
+  digestStableSingleLinkFile,
+  exactFileIdentity,
   profileRootIdentity,
+  readStableSingleLinkFile,
+  sameExactFileIdentity,
   sameSource,
   validateAuthenticatedExecutionReceipt,
   validateCandidateBinding,
   validateEquivalentCandidateProduct,
   validateEquivalentExtensionArtifact,
+  withStableSingleLinkFile,
 };

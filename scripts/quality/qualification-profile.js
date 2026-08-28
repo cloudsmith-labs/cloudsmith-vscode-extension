@@ -5,6 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const { removeExactOwnedDirectoryTree } = require("./non-auth-environment");
 
 const LOCAL_PROFILE_BASENAME = ".cloudsmith-vscode-qualification";
 const CI_PROFILE_PREFIX = "csvq-";
@@ -56,16 +57,27 @@ function createPrivateDirectory(directory) {
   assertPrivateRealDirectory(directory, "Qualification profile directory");
 }
 
-function createOwnedSubdirectory(root, name) {
+function createOwnedSubdirectory(root, name, cleanupEntries = null) {
   const target = path.join(root, name);
   if (!fs.existsSync(target)) {
     createPrivateDirectory(target);
+    const stat = fs.lstatSync(target);
+    cleanupEntries?.push(Object.freeze({
+      name,
+      kind: "directory",
+      identity: Object.freeze({ dev: stat.dev, ino: stat.ino }),
+    }));
     return target;
   }
-  assertPrivateRealDirectory(target, `Qualification ${name} directory`);
+  const stat = assertPrivateRealDirectory(target, `Qualification ${name} directory`);
   if (path.dirname(target) !== root) {
     throw new Error(`Qualification ${name} directory escaped its owned profile.`);
   }
+  cleanupEntries?.push(Object.freeze({
+    name,
+    kind: "directory",
+    identity: Object.freeze({ dev: stat.dev, ino: stat.ino }),
+  }));
   return target;
 }
 
@@ -255,6 +267,36 @@ function validateProfileLayout(root, mode, proof) {
   return stat;
 }
 
+function ciProfileCleanupEntries(root) {
+  return Object.freeze([
+    Object.freeze({
+      name: PROFILE_MARKER,
+      kind: "file",
+      identity: fs.lstatSync(markerPath(root)),
+    }),
+    ...CI_PROFILE_SUBDIRECTORIES.map(name => Object.freeze({
+      name,
+      kind: "directory",
+      identity: fs.lstatSync(path.join(root, name)),
+    })),
+  ]);
+}
+
+function localProfileCleanupEntries(root) {
+  return Object.freeze([
+    Object.freeze({
+      name: PROFILE_MARKER,
+      kind: "file",
+      identity: fs.lstatSync(markerPath(root)),
+    }),
+    ...LOCAL_PROFILE_SUBDIRECTORIES.map(name => Object.freeze({
+      name,
+      kind: "directory",
+      identity: fs.lstatSync(path.join(root, name)),
+    })),
+  ]);
+}
+
 function prepareLocalQualificationProfile(options = {}) {
   const homeDirectory = options.homeDirectory || os.homedir();
   const expectedRoot = canonicalLocalProfileRoot(homeDirectory);
@@ -268,13 +310,25 @@ function prepareLocalQualificationProfile(options = {}) {
   let marker;
   if (!fs.existsSync(expectedRoot)) {
     createPrivateDirectory(expectedRoot);
+    const createdRootIdentity = fs.lstatSync(expectedRoot);
+    const createdRootEntries = [];
     try {
       marker = writeMarker(expectedRoot, "local", crypto.randomBytes(32).toString("hex"));
+      const markerIdentity = fs.lstatSync(markerPath(expectedRoot));
+      createdRootEntries.push(Object.freeze({
+        name: PROFILE_MARKER,
+        kind: "file",
+        identity: Object.freeze({ dev: markerIdentity.dev, ino: markerIdentity.ino }),
+      }));
       for (const name of LOCAL_PROFILE_SUBDIRECTORIES) {
-        createOwnedSubdirectory(expectedRoot, name);
+        createOwnedSubdirectory(expectedRoot, name, createdRootEntries);
       }
     } catch (error) {
-      fs.rmSync(expectedRoot, { recursive: true, force: true });
+      removeExactOwnedDirectoryTree(expectedRoot, {
+        errorMessage: "Local qualification profile rollback refused an unsafe or changed tree.",
+        expectedRootEntries: createdRootEntries,
+        expectedRootIdentity: createdRootIdentity,
+      });
       throw error;
     }
   } else {
@@ -326,7 +380,12 @@ function resetLocalQualificationProfile(options = {}) {
     || current.dev !== rootStat.dev || current.ino !== rootStat.ino) {
     throw new Error("Local qualification reset refuses a replaced profile root.");
   }
-  fs.rmSync(expectedRoot, { recursive: true, force: true, maxRetries: 3 });
+  removeExactOwnedDirectoryTree(expectedRoot, {
+    allowAdditionalRootEntries: true,
+    errorMessage: "Local qualification reset refuses an unsafe or changed profile tree.",
+    expectedRootEntries: localProfileCleanupEntries(expectedRoot),
+    expectedRootIdentity: rootStat,
+  });
   return true;
 }
 
@@ -342,21 +401,37 @@ function createCiQualificationProfile(options = {}) {
     throw new Error("CI temporary parent must resolve to a real directory.");
   }
   const root = fs.mkdtempSync(path.join(parent, CI_PROFILE_PREFIX));
+  const createdRootIdentity = fs.lstatSync(root);
+  const createdRootEntries = [];
   try {
     if (process.platform !== "win32") fs.chmodSync(root, 0o700);
     const proof = crypto.randomBytes(32).toString("hex");
     writeMarker(root, "ci", proof);
-    for (const name of CI_PROFILE_SUBDIRECTORIES) createOwnedSubdirectory(root, name);
+    const markerIdentity = fs.lstatSync(markerPath(root));
+    createdRootEntries.push(Object.freeze({
+      name: PROFILE_MARKER,
+      kind: "file",
+      identity: Object.freeze({ dev: markerIdentity.dev, ino: markerIdentity.ino }),
+    }));
+    for (const name of CI_PROFILE_SUBDIRECTORIES) {
+      createOwnedSubdirectory(root, name, createdRootEntries);
+    }
     const stat = validateProfileLayout(root, "ci", proof);
     activeCiProfiles.set(root, Object.freeze({
       device: stat.dev,
+      entries: ciProfileCleanupEntries(root),
       inode: stat.ino,
       parent,
       proof,
+      rootIdentity: stat,
     }));
     return profileDescriptor(root, "ci", proof);
   } catch (error) {
-    fs.rmSync(root, { recursive: true, force: true });
+    removeExactOwnedDirectoryTree(root, {
+      errorMessage: "CI qualification profile rollback refused an unsafe or changed tree.",
+      expectedRootEntries: createdRootEntries,
+      expectedRootIdentity: createdRootIdentity,
+    });
     throw error;
   }
 }
@@ -381,7 +456,12 @@ function cleanupCiQualificationProfile(profile) {
     || stat.dev !== identity.device || stat.ino !== identity.inode) {
     throw new Error("Qualification cleanup refuses a replaced profile root.");
   }
-  fs.rmSync(root, { recursive: true, force: true, maxRetries: 3 });
+  removeExactOwnedDirectoryTree(root, {
+    allowAdditionalRootEntries: true,
+    errorMessage: "Qualification cleanup refuses an unsafe or changed profile tree.",
+    expectedRootEntries: identity.entries,
+    expectedRootIdentity: identity.rootIdentity,
+  });
   activeCiProfiles.delete(root);
   return true;
 }
@@ -404,15 +484,16 @@ function resetCiQualificationUserData(profile) {
     throw new Error("Qualification reset refuses a replaced profile root.");
   }
   const userDataDir = profile.userDataDir;
-  try {
-    const stat = fs.lstatSync(userDataDir);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
-      throw new Error("Qualification reset refuses a replaced user-data directory.");
-    }
-    fs.rmSync(userDataDir, { recursive: true, force: true, maxRetries: 3 });
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+  const userDataIdentity = identity.entries.find(entry => entry.name === "settings");
+  if (!userDataIdentity || userDataIdentity.kind !== "directory") {
+    throw new Error("Qualification reset refuses an unknown user-data directory.");
   }
+  removeExactOwnedDirectoryTree(userDataDir, {
+    allowAdditionalRootEntries: true,
+    errorMessage: "Qualification reset refuses an unsafe or changed user-data tree.",
+    expectedRootEntries: [],
+    expectedRootIdentity: userDataIdentity.identity,
+  });
   const currentRoot = fs.lstatSync(root);
   if (currentRoot.isSymbolicLink() || !currentRoot.isDirectory()
     || currentRoot.dev !== identity.device || currentRoot.ino !== identity.inode) {
@@ -423,6 +504,10 @@ function resetCiQualificationUserData(profile) {
   if (resetStat.dev !== identity.device) {
     throw new Error("Reset qualification user-data must remain on the owned filesystem.");
   }
+  activeCiProfiles.set(root, Object.freeze({
+    ...identity,
+    entries: ciProfileCleanupEntries(root),
+  }));
   return userDataDir;
 }
 
@@ -430,7 +515,7 @@ function parseNulList(value) {
   return String(value || "").split("\u0000").filter(Boolean);
 }
 
-function gitListedAppleMetadata(repositoryRoot, spawn = spawnSync) {
+function gitListedAppleMetadata(repositoryRoot, spawn = spawnSync, environment = undefined) {
   const pathspecs = ["--", ".DS_Store", ":(glob)**/.DS_Store", ":(glob)**/._*"];
   const commands = [
     ["ls-files", "--others", "--exclude-standard", "-z", ...pathspecs],
@@ -441,6 +526,7 @@ function gitListedAppleMetadata(repositoryRoot, spawn = spawnSync) {
     const result = spawn("git", arguments_, {
       cwd: repositoryRoot,
       encoding: "utf8",
+      env: environment,
       maxBuffer: 4 * 1024 * 1024,
     });
     if (result.error) throw result.error;
@@ -458,7 +544,11 @@ function removeSafeAppleMetadata(repositoryRoot, options = {}) {
   if (stat.isSymbolicLink() || !stat.isDirectory() || fs.realpathSync(root) !== root) {
     throw new Error("Apple metadata cleanup requires an exact real repository root.");
   }
-  const listed = gitListedAppleMetadata(root, options.spawnSync || spawnSync);
+  const listed = gitListedAppleMetadata(
+    root,
+    options.spawnSync || spawnSync,
+    options.environment,
+  );
   const removed = [];
   for (const relative of listed) {
     if (typeof relative !== "string"

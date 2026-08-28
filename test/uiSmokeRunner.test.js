@@ -7,6 +7,9 @@ const os = require("os");
 const path = require("path");
 const { fingerprint } = require("../scripts/quality/evidence");
 const {
+  NON_AUTH_AMBIENT_CAPABILITY_NAMES,
+} = require("../scripts/quality/non-auth-environment");
+const {
   DECLARED_TESTS,
   PROBE_TEST,
   SUITE_TESTS,
@@ -28,6 +31,19 @@ const TOOL_PACKAGE = Object.freeze({
     "vscode-max": "1.131.0",
   }),
 });
+
+function exactTestFileIdentity(file) {
+  const stat = fs.statSync(file, { bigint: true });
+  return {
+    changedNanoseconds: String(stat.ctimeNs),
+    device: String(stat.dev),
+    inode: String(stat.ino),
+    links: String(stat.nlink),
+    mode: String(stat.mode),
+    modifiedNanoseconds: String(stat.mtimeNs),
+    size: String(stat.size),
+  };
+}
 
 suite("signed-out black-box UI runner contract", function () {
   this.timeout(20_000);
@@ -66,6 +82,27 @@ suite("signed-out black-box UI runner contract", function () {
     assert.strictEqual(harness.cleanupCalls(), 1);
     assert.strictEqual(fs.existsSync(harness.profileRoot), false);
     assert.deepStrictEqual(harness.phases(), ["driver", "probe", "reset", "suite"]);
+    const candidateEnvironment = harness.candidateEnvironment();
+    const nonAuthBoundaryRoot = path.dirname(candidateEnvironment.HOME);
+    assert.strictEqual(fs.existsSync(nonAuthBoundaryRoot), false);
+    for (const name of [
+      "HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+      "XDG_DATA_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA",
+      "TMPDIR", "TMP", "TEMP", "NPM_CONFIG_CACHE",
+    ]) {
+      assert.strictEqual(candidateEnvironment[name].startsWith(
+        `${nonAuthBoundaryRoot}${path.sep}`
+      ), true);
+    }
+    for (const name of [
+      "NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG", "GIT_CONFIG_GLOBAL",
+    ]) {
+      assert.strictEqual(candidateEnvironment[name].startsWith(
+        `${nonAuthBoundaryRoot}${path.sep}`
+      ), true);
+    }
+    assert.strictEqual(candidateEnvironment.GIT_CONFIG_NOSYSTEM, "1");
+    assert.strictEqual(candidateEnvironment.GIT_CONFIG_COUNT, "0");
     for (const environment of harness.childEnvironments()) {
       assert.strictEqual(environment.CLOUDSMITH_API_KEY, undefined);
       assert.strictEqual(environment.CLOUDSMITH_TOKEN, undefined);
@@ -74,6 +111,25 @@ suite("signed-out black-box UI runner contract", function () {
       assert.strictEqual(environment.USERPROFILE, path.join(harness.profileRoot, "home"));
       assert.strictEqual(environment.EXTENSIONS_FOLDER, path.join(harness.profileRoot, "extensions"));
       assert.strictEqual(environment.TEST_RESOURCES, harness.profileRoot);
+      for (const name of [
+        "TMPDIR", "TMP", "TEMP", "NPM_CONFIG_CACHE", "NPM_CONFIG_USERCONFIG",
+        "NPM_CONFIG_GLOBALCONFIG", "GIT_CONFIG_GLOBAL",
+      ]) {
+        assert.strictEqual(environment[name].startsWith(
+          `${nonAuthBoundaryRoot}${path.sep}`
+        ), true);
+      }
+      assert.strictEqual(environment.GIT_CONFIG_NOSYSTEM, "1");
+      assert.strictEqual(environment.GIT_CONFIG_COUNT, "0");
+      for (const name of NON_AUTH_AMBIENT_CAPABILITY_NAMES) {
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(environment, name), false);
+      }
+    }
+    for (const name of NON_AUTH_AMBIENT_CAPABILITY_NAMES) {
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(harness.candidateEnvironment(), name),
+        false,
+      );
     }
     const persisted = JSON.parse(fs.readFileSync(
       path.join(harness.repositoryRoot, ".quality", "ui", "result.json"),
@@ -99,6 +155,62 @@ suite("signed-out black-box UI runner contract", function () {
     assert.deepStrictEqual(harness.phases(), ["driver", "probe"]);
     assert.strictEqual(harness.cleanupCalls(), 1);
     assert.strictEqual(fs.existsSync(harness.resultPath), false);
+    assert.strictEqual(fs.existsSync(harness.nonAuthBoundaryRoot()), false);
+  });
+
+  test("direct execution replaces ambient temp and tool configuration on every outcome", async () => {
+    const harness = createHarness(repositories, { probeStatus: 0 });
+    await assertSafeRejection(harness.run, "UI_PROBE_INVALID");
+
+    const candidateEnvironment = harness.candidateEnvironment();
+    const serialized = JSON.stringify({
+      candidateEnvironment,
+      childEnvironments: harness.childEnvironments(),
+    });
+    for (const sentinel of [
+      "/operator/tmp",
+      "/operator/npm-userconfig",
+      "/operator/npm-globalconfig",
+      "/operator/npm-cache",
+      "/operator/git-global-config",
+    ]) assert.strictEqual(serialized.includes(sentinel), false);
+    assert.strictEqual(fs.existsSync(harness.nonAuthBoundaryRoot()), false);
+  });
+
+  test("real nested candidate preparation stays inside the authenticated private boundary", async () => {
+    const harness = createRealNestedCandidateHarness(repositories);
+    const result = await harness.run();
+
+    assert.strictEqual(result.status, "passed");
+    assert.deepStrictEqual(harness.phases(), ["driver", "probe", "suite"]);
+    assert.ok(harness.boundaryRoot());
+    assert.strictEqual(fs.existsSync(harness.boundaryRoot()), false);
+    for (const target of harness.nestedTemporaryPaths()) {
+      assert.strictEqual(
+        target.startsWith(`${harness.boundaryTemporaryRoot()}${path.sep}`),
+        true,
+      );
+      assert.strictEqual(fs.existsSync(target), false);
+    }
+    assert.deepStrictEqual(harness.toolConfigObservations(), {
+      gitGlobalConfig: path.join(harness.boundaryRoot(), "git-global-config"),
+      npmGlobalConfig: path.join(harness.boundaryRoot(), "npm-globalconfig"),
+      npmUserConfig: path.join(harness.boundaryRoot(), "npm-userconfig"),
+      observedEmptyEveryTime: true,
+    });
+    assert.strictEqual(
+      harness.candidateEnvironments().every(environment => (
+        environment.NPM_CONFIG_USERCONFIG
+          === path.join(harness.boundaryRoot(), "npm-userconfig")
+        && environment.NPM_CONFIG_GLOBALCONFIG
+          === path.join(harness.boundaryRoot(), "npm-globalconfig")
+        && environment.GIT_CONFIG_GLOBAL
+          === path.join(harness.boundaryRoot(), "git-global-config")
+        && environment.GIT_CONFIG_NOSYSTEM === "1"
+        && environment.GIT_CONFIG_COUNT === "0"
+      )),
+      true,
+    );
   });
 
   test("rejects forged probe semantics even when the process exits one", async () => {
@@ -116,6 +228,7 @@ suite("signed-out black-box UI runner contract", function () {
     assert.deepStrictEqual(harness.phases(), []);
     assert.strictEqual(harness.cleanupCalls(), 1);
     assert.strictEqual(fs.existsSync(harness.resultPath), false);
+    assert.strictEqual(fs.existsSync(harness.nonAuthBoundaryRoot()), false);
   });
 
   test("rejects missing or extra suite execution evidence despite exit zero", async () => {
@@ -148,6 +261,7 @@ suite("signed-out black-box UI runner contract", function () {
     assert.strictEqual(harness.cleanupCalls(), 1);
     assert.strictEqual(fs.existsSync(harness.profileRoot), true);
     assert.strictEqual(fs.existsSync(harness.resultPath), false);
+    assert.strictEqual(fs.existsSync(harness.nonAuthBoundaryRoot()), false);
   });
 
   test("rejects VS Code pins outside the installed ExTester compatibility range", () => {
@@ -266,6 +380,7 @@ function createHarness(repositories, options = {}) {
   };
   const receipt = { ...receiptBase, fingerprint: fingerprint(receiptBase) };
   let cleanupCalls = 0;
+  let candidateEnvironment = null;
   const candidate = {
     receipt,
     profile,
@@ -328,6 +443,8 @@ function createHarness(repositories, options = {}) {
     profileRoot,
     resultPath,
     candidate,
+    candidateEnvironment: () => ({ ...candidateEnvironment }),
+    nonAuthBoundaryRoot: () => path.dirname(candidateEnvironment.HOME),
     cleanupCalls: () => cleanupCalls,
     phases: () => [...phases],
     childEnvironments: () => childEnvironments.map(value => ({ ...value })),
@@ -342,6 +459,24 @@ function createHarness(repositories, options = {}) {
         CLOUDSMITH_TOKEN: "do-not-persist-this-value",
         CLOUDSMITH_UI_EVIDENCE_NONCE: "ambient-forgery",
         VSCODE_TEST_VERSION: "9.9.9",
+        TMPDIR: "/operator/tmp",
+        TMP: "/operator/tmp",
+        TEMP: "/operator/tmp",
+        NPM_CONFIG_USERCONFIG: "/operator/npm-userconfig",
+        NPM_CONFIG_GLOBALCONFIG: "/operator/npm-globalconfig",
+        NPM_CONFIG_CACHE: "/operator/npm-cache",
+        GIT_CONFIG_GLOBAL: "/operator/git-global-config",
+        GIT_CONFIG_COUNT: "1",
+        DISPLAY: ":synthetic-host-display",
+        WAYLAND_DISPLAY: "synthetic-host-wayland",
+        XAUTHORITY: "/synthetic/host-xauthority",
+        XDG_RUNTIME_DIR: "/synthetic/host-runtime",
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/synthetic/host-session-bus",
+        SSH_AUTH_SOCK: "/synthetic/host-agent.sock",
+        SSH_AGENT_PID: "12345",
+        GPG_AGENT_INFO: "/synthetic/host-gpg-agent",
+        KRB5CCNAME: "/synthetic/host-credential-cache",
+        SECURITYSESSIONID: "synthetic-host-security-session",
       },
       toolPackage: TOOL_PACKAGE,
       nodeVersion: "22.23.2",
@@ -349,7 +484,10 @@ function createHarness(repositories, options = {}) {
       spawnSync: spawn,
       sourceIdentity: () => sourceIdentities[Math.min(sourceIndex++, sourceIdentities.length - 1)],
       randomBytes: size => Buffer.alloc(size, ++randomIndex),
-      prepareQualificationCandidate: async () => candidate,
+      prepareQualificationCandidate: async context => {
+        candidateEnvironment = context.environment;
+        return candidate;
+      },
       resetCiQualificationUserData: value => {
         phases.push("reset");
         assert.strictEqual(value, profile);
@@ -368,12 +506,242 @@ function createHarness(repositories, options = {}) {
   };
 }
 
+function createRealNestedCandidateHarness(repositories) {
+  const repositoryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+    os.tmpdir(),
+    "ui-runner-real-candidate-",
+  )));
+  if (process.platform !== "win32") fs.chmodSync(repositoryRoot, 0o700);
+  repositories.push(repositoryRoot);
+  writeRepositoryFixture(repositoryRoot);
+  const temporaryParent = fs.realpathSync(fs.mkdtempSync(path.join(
+    os.tmpdir(),
+    "ui-runner-real-boundary-parent-",
+  )));
+  if (process.platform !== "win32") fs.chmodSync(temporaryParent, 0o700);
+  repositories.push(temporaryParent);
+
+  const artifactRelative = "out/development/cloudsmith-vsc-2.3.0.vsix";
+  const artifactPath = path.join(repositoryRoot, ...artifactRelative.split("/"));
+  const artifactBytes = Buffer.from("real nested deterministic fixture VSIX bytes", "utf8");
+  const artifactSha = crypto.createHash("sha256").update(artifactBytes).digest("hex");
+  let activeBoundaryRoot = null;
+  let profileRoot = null;
+  let packageScratch = null;
+  let installScratch = null;
+  let configPaths = null;
+  let observedEmptyEveryTime = true;
+  const candidateEnvironments = [];
+  const phases = [];
+  let randomIndex = 0;
+
+  function observeCandidateEnvironment(environment) {
+    assert.ok(environment && typeof environment === "object");
+    candidateEnvironments.push({ ...environment });
+    const currentConfigPaths = {
+      npmUserConfig: environment.NPM_CONFIG_USERCONFIG,
+      npmGlobalConfig: environment.NPM_CONFIG_GLOBALCONFIG,
+      gitGlobalConfig: environment.GIT_CONFIG_GLOBAL,
+    };
+    const currentBoundaryRoot = path.dirname(currentConfigPaths.npmUserConfig);
+    if (activeBoundaryRoot === null) activeBoundaryRoot = currentBoundaryRoot;
+    assert.strictEqual(currentBoundaryRoot, activeBoundaryRoot);
+    assert.strictEqual(path.dirname(currentConfigPaths.npmGlobalConfig), activeBoundaryRoot);
+    assert.strictEqual(path.dirname(currentConfigPaths.gitGlobalConfig), activeBoundaryRoot);
+    assert.strictEqual(environment.TMPDIR, path.join(activeBoundaryRoot, "tmp"));
+    assert.strictEqual(environment.TMP, environment.TMPDIR);
+    assert.strictEqual(environment.TEMP, environment.TMPDIR);
+    assert.strictEqual(environment.NPM_CONFIG_CACHE, path.join(activeBoundaryRoot, "npm-cache"));
+    assert.strictEqual(environment.GIT_CONFIG_NOSYSTEM, "1");
+    assert.strictEqual(environment.GIT_CONFIG_COUNT, "0");
+    if (configPaths === null) configPaths = currentConfigPaths;
+    else assert.deepStrictEqual(currentConfigPaths, configPaths);
+    for (const target of Object.values(currentConfigPaths)) {
+      if (fs.readFileSync(target, "utf8") !== "") observedEmptyEveryTime = false;
+    }
+    for (const name of NON_AUTH_AMBIENT_CAPABILITY_NAMES) {
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(environment, name), false);
+    }
+  }
+
+  const candidateSpawn = (command, arguments_, spawnOptions) => {
+    observeCandidateEnvironment(spawnOptions.env);
+    if (command === "git") {
+      if (arguments_[0] === "branch") {
+        return processResultWithOutput(0, "test/release-quality-harness\n");
+      }
+      if (arguments_[0] === "status") {
+        return processResultWithOutput(0, " M bounded-fixture.js\n");
+      }
+      return processResultWithOutput(0, "");
+    }
+    if (new Set(["npm", "npm.cmd"]).has(path.basename(command))) {
+      if (JSON.stringify(arguments_) === JSON.stringify(["run", "verify:polish"])) {
+        return processResultWithOutput(0, "polish passed\n");
+      }
+      assert.deepStrictEqual(arguments_.slice(0, 4), [
+        "run", "package", "--", "--github-output",
+      ]);
+      const packageOutput = arguments_[4];
+      packageScratch = path.dirname(packageOutput);
+      assert.strictEqual(packageScratch.startsWith(
+        `${path.join(activeBoundaryRoot, "tmp")}${path.sep}`
+      ), true);
+      fs.mkdirSync(path.dirname(artifactPath), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(artifactPath, artifactBytes);
+      fs.writeFileSync(`${artifactPath}.sha256`, "synthetic sidecar\n");
+      fs.writeFileSync(`${artifactPath}.provenance.json`, JSON.stringify({
+        sourceClean: false,
+        sourceSha: SOURCE.sha,
+      }));
+      fs.appendFileSync(
+        packageOutput,
+        `vsix_path=${artifactRelative}\n`
+          + `checksum_path=${artifactRelative}.sha256\n`
+          + `provenance_path=${artifactRelative}.provenance.json\n`,
+      );
+      return processResultWithOutput(0, "packaged\n");
+    }
+    if (arguments_.includes("--version")) {
+      return processResultWithOutput(0, `${VSCODE_VERSION}\nfixture\narm64\n`);
+    }
+    if (arguments_.includes("--list-extensions")) {
+      return processResultWithOutput(0, "cloudsmith.cloudsmith-vsc@2.3.0\n");
+    }
+    const installIndex = arguments_.indexOf("--install-extension");
+    assert.notStrictEqual(installIndex, -1);
+    const installArtifact = arguments_[installIndex + 1];
+    installScratch = path.dirname(installArtifact);
+    assert.strictEqual(installScratch.startsWith(
+      `${path.join(activeBoundaryRoot, "tmp")}${path.sep}`
+    ), true);
+    assert.deepStrictEqual(fs.readFileSync(installArtifact), artifactBytes);
+    return processResultWithOutput(0, "installed\n");
+  };
+
+  const uiSpawn = (_command, arguments_, spawnOptions) => {
+    observeCandidateEnvironment(spawnOptions.env);
+    if (arguments_.includes("get-chromedriver")) {
+      phases.push("driver");
+      const driver = path.join(profileRoot, "chromedriver-mac-arm64");
+      fs.mkdirSync(driver, { mode: 0o700 });
+      fs.writeFileSync(path.join(driver, "chromedriver"), "driver\n", { mode: 0o700 });
+      return processResult(0);
+    }
+    const phase = spawnOptions.env.CLOUDSMITH_UI_EVIDENCE_PHASE;
+    phases.push(phase);
+    if (phase === "probe") {
+      fs.writeFileSync(path.join(profileRoot, "settings", "probe-state"), "reset me\n");
+      writeEvidence(spawnOptions.env, [{
+        name: PROBE_TEST,
+        status: "failed",
+        errorKind: "fresh-wrong-selector-rejected",
+      }]);
+      return processResult(1);
+    }
+    assert.strictEqual(fs.existsSync(path.join(profileRoot, "settings", "probe-state")), false);
+    writeEvidence(spawnOptions.env, SUITE_TESTS.map(name => ({
+      name,
+      status: "passed",
+      errorKind: null,
+    })));
+    return processResult(0);
+  };
+
+  return {
+    boundaryRoot: () => activeBoundaryRoot,
+    boundaryTemporaryRoot: () => path.join(activeBoundaryRoot, "tmp"),
+    candidateEnvironments: () => candidateEnvironments.map(value => ({ ...value })),
+    nestedTemporaryPaths: () => [profileRoot, packageScratch, installScratch],
+    phases: () => [...phases],
+    toolConfigObservations: () => ({ ...configPaths, observedEmptyEveryTime }),
+    run: () => runUiSmoke({
+      root: repositoryRoot,
+      platform: "darwin",
+      architecture: "arm64",
+      temporaryParent,
+      environment: {
+        PATH: process.env.PATH || "/usr/bin",
+        HOME: "/operator/profile",
+        CLOUDSMITH_API_KEY: "synthetic-real-nested-sentinel",
+        TMPDIR: "/operator/tmp",
+        NPM_CONFIG_USERCONFIG: "/operator/npm-userconfig",
+        NPM_CONFIG_GLOBALCONFIG: "/operator/npm-globalconfig",
+        NPM_CONFIG_CACHE: "/operator/npm-cache",
+        GIT_CONFIG_GLOBAL: "/operator/git-global-config",
+        GIT_CONFIG_COUNT: "1",
+        DISPLAY: ":synthetic-host-display",
+        XAUTHORITY: "/synthetic/host-xauthority",
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/synthetic/host-session-bus",
+      },
+      toolPackage: TOOL_PACKAGE,
+      nodeVersion: "22.23.2",
+      extestCli: path.join(repositoryRoot, "fixture-extest.js"),
+      spawnSync: uiSpawn,
+      sourceIdentity: () => SOURCE,
+      randomBytes: size => Buffer.alloc(size, ++randomIndex),
+      prepareCode: ({ profile, environment }) => {
+        observeCandidateEnvironment(environment);
+        profileRoot = profile.root;
+        const executable = path.join(profile.root, "Code");
+        const cli = path.join(profile.root, "bin", "code");
+        fs.mkdirSync(path.dirname(cli), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(executable, "fixture executable\n", { mode: 0o700 });
+        fs.writeFileSync(cli, "fixture cli\n", { mode: 0o700 });
+        return { executable, cli };
+      },
+      candidateAdapters: {
+        spawnSync: candidateSpawn,
+        sourceIdentity: (_root, _spawn, environment, sourceOptions) => {
+          observeCandidateEnvironment(environment);
+          assert.strictEqual(sourceOptions.temporaryParent, path.join(activeBoundaryRoot, "tmp"));
+          return SOURCE;
+        },
+        now: () => new Date("2026-08-27T00:00:00.000Z"),
+        verifyVsix: async file => {
+          assert.strictEqual(file, artifactPath);
+          return {
+            artifactIdentity: exactTestFileIdentity(file),
+            buffer: artifactBytes,
+            sha256: artifactSha,
+            archiveBytes: artifactBytes.length,
+            entryCount: 12,
+            totalUncompressedBytes: artifactBytes.length,
+            manifest: { name: "cloudsmith-vsc", publisher: "Cloudsmith", version: "2.3.0" },
+          };
+        },
+        validateSidecars: (file, verification, sidecarOptions) => {
+          assert.strictEqual(file, artifactPath);
+          assert.strictEqual(verification.sha256, artifactSha);
+          assert.strictEqual(sidecarOptions.expectedSourceSha, SOURCE.sha);
+          return {
+            artifactIdentity: exactTestFileIdentity(file),
+            checksumIdentity: exactTestFileIdentity(`${file}.sha256`),
+            provenance: {},
+            provenanceIdentity: exactTestFileIdentity(`${file}.provenance.json`),
+          };
+        },
+      },
+    }),
+  };
+}
+
 function writeRepositoryFixture(root) {
   writeJson(root, "package.json", {
     name: "cloudsmith-vsc",
     publisher: "Cloudsmith",
     version: "2.3.0",
   });
+  writeJson(root, "package-lock.json", {
+    name: "cloudsmith-vsc",
+    version: "2.3.0",
+    packages: { "": { name: "cloudsmith-vsc", version: "2.3.0" } },
+  });
+  writeText(
+    root,
+    "CHANGELOG.md",
+    "## Unreleased\n\n## 2.3.0 - August 2026\n\n## 2.2.0 - August 2026\n",
+  );
   writeJson(root, "extester.config.json", {
     $schema: "./node_modules/vscode-extension-tester/resources/extester.schema.json",
     setup: {
@@ -466,6 +834,14 @@ function processResult(status) {
     error: null,
     stdout: "",
     stderr: "do-not-persist-this-value",
+  };
+}
+
+function processResultWithOutput(status, stdout) {
+  return {
+    ...processResult(status),
+    stdout,
+    stderr: "",
   };
 }
 

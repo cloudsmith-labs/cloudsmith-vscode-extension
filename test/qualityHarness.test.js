@@ -5,9 +5,11 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
 const Mocha = require("mocha");
 const yaml = require("js-yaml");
 const {
+  ROOT,
   gitVisibleFiles,
   uniqueSorted,
   writeJson,
@@ -30,14 +32,23 @@ const {
   getGatePlan,
   receiptPath,
   runGate,
+  stepArtifactPaths,
+  testEvidenceProofForStep,
   validateArtifactBinding,
+  validateTestEvidenceBinding,
 } = require("../scripts/quality/gate");
 const { aggregateStatuses, fingerprint, sourceIdentity } = require("../scripts/quality/evidence");
 const {
   CREDENTIAL_LIKE_ENVIRONMENT_NAME,
+  NON_AUTH_AMBIENT_CAPABILITY_NAMES,
   NON_AUTH_QUALITY_ENVIRONMENT_ALLOWLIST,
   NON_AUTH_QUALITY_OVERRIDE_NAMES,
+  assertActiveNonAuthQualityBoundary,
   buildNonAuthQualityEnvironment,
+  cleanupNonAuthQualityEnvironment,
+  createNonAuthQualityEnvironment,
+  removeExactOwnedDirectoryTree,
+  withNonAuthQualityEnvironment,
 } = require("../scripts/quality/non-auth-environment");
 const {
   AUTHENTICATED_CANDIDATE_ARTIFACT,
@@ -47,6 +58,7 @@ const {
   UI_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_RECEIPT,
   candidateBindingFromReceipt,
+  withStableSingleLinkFile,
 } = require("../scripts/quality/candidate-binding");
 const {
   assertValidMutationBaseline,
@@ -84,6 +96,7 @@ const {
 const {
   RELEASE_EXPOSURE_RESULT,
   buildReleaseExposureResult,
+  captureGeneratedEvidenceManifest,
 } = require("../scripts/quality/release-exposure-scan");
 const { UI_RESULT } = require("../scripts/quality/verify-ui-evidence");
 const {
@@ -91,12 +104,14 @@ const {
   expectedBlackBoxUiTests,
   generateReport,
   hasDeterministicReportFailure,
+  loadReportInputs,
   renderMarkdown,
   validateFindingRecord,
   validateFindings,
   validateImpactArtifact,
   writeReport,
 } = require("../scripts/quality/report");
+const { readBoundedFindingsBytes } = require("../scripts/quality/findings");
 const { verifyQualityContracts } = require("../scripts/quality/verify-workflows");
 const { verifyEvidenceHandoff } = require("../scripts/quality/verify-handoff");
 const {
@@ -146,6 +161,7 @@ function passedReceipt(step, source = SOURCE_IDENTITY) {
     "release-checklist": mutationArtifactFingerprint(validLiveStatus()),
     "quality-report": "e".repeat(64),
   };
+  const evidence = step.evidencePath ? testEvidence(step, source) : null;
   return {
     stepId: step.id,
     category: step.category,
@@ -155,12 +171,25 @@ function passedReceipt(step, source = SOURCE_IDENTITY) {
     signal: null,
     reason: null,
     testCounts: null,
-    testEvidence: step.evidencePath ? testEvidence(step, source) : null,
+    testEvidence: evidence,
+    testEvidenceFingerprint: evidence ? testEvidenceFileFingerprint(evidence) : null,
     artifactFingerprint: step.artifactPath || step.artifactPaths
       ? artifactFingerprints[step.id]
       : null,
     source,
   };
+}
+
+function testEvidenceFileBytes(value) {
+  return Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function alternateTestEvidenceFileBytes(value) {
+  return Buffer.from(`${JSON.stringify(value)} \n`);
+}
+
+function testEvidenceFileFingerprint(value) {
+  return crypto.createHash("sha256").update(testEvidenceFileBytes(value)).digest("hex");
 }
 
 function testEvidence(step, source = SOURCE_IDENTITY) {
@@ -189,6 +218,43 @@ function testEvidence(step, source = SOURCE_IDENTITY) {
     suite: step.id,
     counts: { passed: tests.length, failed: 0, pending: 0 },
     tests,
+  };
+}
+
+function materializeStepArtifacts(step, fixtureRoot, suffix = "initial") {
+  const paths = stepArtifactPaths(step);
+  if (paths.length === 0) return null;
+  for (const relativePath of paths) {
+    const target = path.join(fixtureRoot, ...relativePath.split("/"));
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, `${step.id}:${relativePath}:${suffix}\n`);
+  }
+  return artifactFingerprintForStep(step, fixtureRoot);
+}
+
+function materializeStepTestEvidence(step, fixtureRoot) {
+  if (!step.evidencePath) return { fingerprint: null, value: null };
+  const value = testEvidence(step);
+  writeJson(step.evidencePath, value, fixtureRoot, {
+    subtree: ".quality/test-results",
+  });
+  return {
+    fingerprint: testEvidenceFileFingerprint(value),
+    value,
+  };
+}
+
+function fixtureArtifactStep() {
+  return {
+    id: "fixture-artifact",
+    category: "fixture",
+    executable: "node",
+    args: ["fixture"],
+    command: "node fixture",
+    artifactPath: ".quality/fixture/artifact.json",
+    artifactSubtree: ".quality/fixture",
+    blockedExitCodes: [],
+    sequence: 1,
   };
 }
 
@@ -733,6 +799,7 @@ function writeReleaseExposureFixture(fixture, document, inputPath) {
   fs.writeFileSync(path.join(fixture.root, UI_RESULT), uiResultBytes);
   const attestationBytes = fs.readFileSync(path.join(fixture.root, inputPath));
   const evidenceManifest = qualificationEvidenceManifest(document);
+  const generatedEvidence = captureGeneratedEvidenceManifest(fixture.root);
   const receipt = buildReleaseExposureResult({
     source: SOURCE_IDENTITY,
     candidateReceiptFingerprint: uiCandidateReceipt.fingerprint,
@@ -740,12 +807,13 @@ function writeReleaseExposureFixture(fixture, document, inputPath) {
     uiResultSha256: crypto.createHash("sha256").update(uiResultBytes).digest("hex"),
     attestationPath: inputPath,
     attestationSha256: crypto.createHash("sha256").update(attestationBytes).digest("hex"),
+    generatedEvidence,
     evidenceManifest,
     components: [
       {
         id: "post-ui-generated-quality-evidence",
         status: "scanned",
-        fileCount: 3,
+        fileCount: generatedEvidence.files.length,
         findings: [],
       },
       {
@@ -1267,6 +1335,10 @@ function createEvidenceHandoffFixture(options = {}) {
     }
     const failed = options.failedStep === step.id;
     if (failed) blocker = step.id;
+    const evidence = step.evidencePath ? testEvidence(step) : null;
+    if (evidence) writeJson(step.evidencePath, evidence, fixtureRoot, {
+      subtree: ".quality/test-results",
+    });
     return {
       schemaVersion: 1,
       profile,
@@ -1281,7 +1353,8 @@ function createEvidenceHandoffFixture(options = {}) {
       reason: null,
       testCounts: null,
       outputFingerprint: "d".repeat(64),
-      testEvidence: step.evidencePath ? testEvidence(step) : null,
+      testEvidence: evidence,
+      testEvidenceFingerprint: evidence ? testEvidenceFileFingerprint(evidence) : null,
       artifactFingerprint: step.id === "change-impact"
         ? impactArtifactFingerprint
         : step.id === "secret-current"
@@ -1546,12 +1619,25 @@ suite("Quality gate runner", () => {
         .some(name => CREDENTIAL_LIKE_ENVIRONMENT_NAME.test(name)),
       false
     );
+    assert.strictEqual(
+      [...NON_AUTH_QUALITY_ENVIRONMENT_ALLOWLIST, ...NON_AUTH_QUALITY_OVERRIDE_NAMES]
+        .some(name => NON_AUTH_AMBIENT_CAPABILITY_NAMES.includes(name)),
+      false
+    );
     const sanitized = buildNonAuthQualityEnvironment({
       PATH: "/fixture/bin",
       QUALITY_BASE: "fixture-base",
       CLOUDSMITH_API_KEY: "synthetic-qh141-helper-sentinel",
       NODE_OPTIONS: "--require=synthetic-untrusted-hook",
       HOME: "/untrusted/profile",
+      DISPLAY: ":synthetic-host-display",
+      WAYLAND_DISPLAY: "synthetic-host-wayland",
+      XAUTHORITY: "/synthetic/host-xauthority",
+      XDG_RUNTIME_DIR: "/synthetic/host-runtime",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/synthetic/host-session-bus",
+      SSH_AUTH_SOCK: "/synthetic/host-agent.sock",
+      GPG_AGENT_INFO: "/synthetic/host-gpg-agent",
+      KRB5CCNAME: "/synthetic/host-credential-cache",
     }, {
       CLOUDSMITH_QUALITY_TEST_SUITE: "fixture-suite",
     });
@@ -1590,15 +1676,409 @@ suite("Quality gate runner", () => {
       CLOUDSMITH_API_KEY: "synthetic-qh141-source-sentinel",
     });
     assert.strictEqual(identity.sha, SOURCE_SHA);
-    assert.deepStrictEqual(gitChildEnvironments, [
-      { PATH: "/fixture/bin" },
-      { PATH: "/fixture/bin" },
-      { PATH: "/fixture/bin" },
-    ]);
+    assert.strictEqual(gitChildEnvironments.length, 3);
+    const sourceBoundaryRoot = path.dirname(gitChildEnvironments[0].HOME);
+    for (const environment of gitChildEnvironments) {
+      assert.strictEqual(environment.PATH, "/fixture/bin");
+      assert.strictEqual(path.dirname(environment.HOME), sourceBoundaryRoot);
+      assert.strictEqual(environment.HOME, environment.USERPROFILE);
+      assert.strictEqual(environment.GIT_CONFIG_NOSYSTEM, "1");
+      assert.strictEqual(environment.GIT_CONFIG_COUNT, "0");
+      assert.strictEqual(environment.GIT_CONFIG_GLOBAL.startsWith(
+        `${sourceBoundaryRoot}${path.sep}`
+      ), true);
+      assert.strictEqual(
+        JSON.stringify(environment).includes("synthetic-qh141-source-sentinel"),
+        false
+      );
+    }
+    assert.strictEqual(fs.existsSync(sourceBoundaryRoot), false);
     assert.strictEqual(
       JSON.stringify(identity).includes("synthetic-qh141-source-sentinel"),
       false
     );
+    let failedSourceBoundaryRoot;
+    assert.throws(() => sourceIdentity(root, (_command, _arguments, options) => {
+      failedSourceBoundaryRoot = path.dirname(options.env.HOME);
+      throw new Error("synthetic source Git failure");
+    }, {
+      PATH: "/fixture/bin",
+      GIT_CONFIG_GLOBAL: "/untrusted/config",
+    }), /synthetic source Git failure/u);
+    assert.strictEqual(fs.existsSync(failedSourceBoundaryRoot), false);
+  });
+
+  test("private non-auth homes block OS config fallback and clean every outcome", () => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-non-auth-test-"));
+    const ambientHome = path.join(scratch, "ambient-home");
+    fs.mkdirSync(ambientHome, { mode: 0o700 });
+    const ambientNpmConfig = path.join(ambientHome, ".npmrc");
+    const ambientGitConfig = path.join(ambientHome, ".gitconfig");
+    fs.writeFileSync(ambientNpmConfig, "qh146-untrusted-npm-config\n", { mode: 0o600 });
+    fs.writeFileSync(ambientGitConfig, "qh146-untrusted-git-config\n", { mode: 0o600 });
+    const hostileEnvironment = {
+      PATH: "/fixture/bin",
+      HOME: ambientHome,
+      USERPROFILE: ambientHome,
+      XDG_CONFIG_HOME: ambientHome,
+      APPDATA: ambientHome,
+      LOCALAPPDATA: ambientHome,
+      NPM_CONFIG_USERCONFIG: ambientNpmConfig,
+      GIT_CONFIG_GLOBAL: ambientGitConfig,
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "credential.helper",
+      GIT_CONFIG_VALUE_0: "synthetic-helper",
+      CLOUDSMITH_API_KEY: "synthetic-qh146-ambient-sentinel",
+      NODE_OPTIONS: "--require=synthetic-untrusted-hook",
+      DISPLAY: ":synthetic-host-display",
+      WAYLAND_DISPLAY: "synthetic-host-wayland",
+      XAUTHORITY: "/synthetic/host-xauthority",
+      XDG_RUNTIME_DIR: "/synthetic/host-runtime",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/synthetic/host-session-bus",
+      SSH_AUTH_SOCK: "/synthetic/host-agent.sock",
+      GPG_AGENT_INFO: "/synthetic/host-gpg-agent",
+      KRB5CCNAME: "/synthetic/host-credential-cache",
+    };
+    let successRoot;
+    let failureRoot;
+    try {
+      const value = withNonAuthQualityEnvironment({
+        environment: hostileEnvironment,
+        temporaryParent: scratch,
+      }, (environment, boundary) => {
+        successRoot = boundary.root;
+        assert.notStrictEqual(environment.HOME, ambientHome);
+        assert.strictEqual(environment.HOME, environment.USERPROFILE);
+        if (process.platform !== "win32") {
+          assert.strictEqual(fs.lstatSync(boundary.root).mode & 0o077, 0);
+        }
+        for (const name of [
+          "HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+          "XDG_DATA_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA",
+          "TMPDIR", "TMP", "TEMP", "NPM_CONFIG_CACHE",
+        ]) {
+          assert.strictEqual(environment[name].startsWith(`${boundary.root}${path.sep}`), true);
+          assert.strictEqual(fs.lstatSync(environment[name]).isDirectory(), true);
+          if (process.platform !== "win32") {
+            assert.strictEqual(fs.lstatSync(environment[name]).mode & 0o077, 0);
+          }
+        }
+        for (const name of [
+          "NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG", "GIT_CONFIG_GLOBAL",
+        ]) {
+          assert.strictEqual(environment[name].startsWith(`${boundary.root}${path.sep}`), true);
+          assert.strictEqual(fs.readFileSync(environment[name], "utf8"), "");
+          if (process.platform !== "win32") {
+            assert.strictEqual(fs.lstatSync(environment[name]).mode & 0o077, 0);
+          }
+        }
+        assert.strictEqual(environment.GIT_CONFIG_NOSYSTEM, "1");
+        assert.strictEqual(environment.GIT_CONFIG_COUNT, "0");
+        assert.strictEqual(environment.GIT_TERMINAL_PROMPT, "0");
+        assert.strictEqual(environment.GCM_INTERACTIVE, "never");
+        assert.strictEqual(JSON.stringify(environment).includes(ambientHome), false);
+        assert.strictEqual(
+          JSON.stringify(environment).includes(hostileEnvironment.CLOUDSMITH_API_KEY),
+          false
+        );
+        for (const name of NON_AUTH_AMBIENT_CAPABILITY_NAMES) {
+          assert.strictEqual(Object.prototype.hasOwnProperty.call(environment, name), false);
+        }
+        return "boundary-result";
+      });
+      assert.strictEqual(value, "boundary-result");
+      assert.strictEqual(fs.existsSync(successRoot), false);
+
+      assert.throws(() => withNonAuthQualityEnvironment({
+        environment: hostileEnvironment,
+        temporaryParent: scratch,
+      }, (_environment, boundary) => {
+        failureRoot = boundary.root;
+        throw new Error("synthetic child failure");
+      }), /synthetic child failure/u);
+      assert.strictEqual(fs.existsSync(failureRoot), false);
+
+      let windowsBoundaryRoot;
+      const windowsResult = withNonAuthQualityEnvironment({
+        environment: {
+          Path: "/fixture/windows-bin",
+          hOmE: ambientHome,
+          UserProfile: ambientHome,
+          Npm_Config_UserConfig: ambientNpmConfig,
+          Git_Config_Global: ambientGitConfig,
+          Cloudsmith_Api_Key: "synthetic-qh146-mixed-case-sentinel",
+        },
+        platform: "win32",
+        temporaryParent: scratch,
+      }, (environment, boundary) => {
+        windowsBoundaryRoot = boundary.root;
+        assert.strictEqual(environment.PATH, "/fixture/windows-bin");
+        assert.strictEqual(environment.HOME, environment.USERPROFILE);
+        assert.notStrictEqual(environment.HOME, ambientHome);
+        assert.strictEqual(
+          JSON.stringify(environment).includes("synthetic-qh146-mixed-case-sentinel"),
+          false
+        );
+        return "windows-boundary-result";
+      });
+      assert.strictEqual(windowsResult, "windows-boundary-result");
+      assert.strictEqual(fs.existsSync(windowsBoundaryRoot), false);
+
+      const owned = createNonAuthQualityEnvironment({
+        environment: { PATH: "/fixture/bin" },
+        temporaryParent: scratch,
+      });
+      assert.strictEqual(
+        assertActiveNonAuthQualityBoundary(owned, owned.environment),
+        owned,
+      );
+      assert.throws(
+        () => assertActiveNonAuthQualityBoundary({ ...owned }, owned.environment),
+        /unknown boundary/u,
+      );
+      assert.throws(
+        () => assertActiveNonAuthQualityBoundary(owned, { ...owned.environment }),
+        /exact active environment/u,
+      );
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment({ root: owned.root }),
+        /unknown boundary/u
+      );
+      assert.strictEqual(fs.existsSync(owned.root), true);
+      assert.strictEqual(cleanupNonAuthQualityEnvironment(owned), true);
+      assert.strictEqual(fs.existsSync(owned.root), false);
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(owned),
+        /unknown boundary/u
+      );
+
+      const unreadableHostileEnvironment = { PATH: "/fixture/bin" };
+      for (const name of ["HOME", "NPM_CONFIG_USERCONFIG", "CLOUDSMITH_API_KEY"]) {
+        Object.defineProperty(unreadableHostileEnvironment, name, {
+          enumerable: true,
+          get() {
+            throw new Error("hostile ambient value was inspected");
+          },
+        });
+      }
+      assert.strictEqual(withNonAuthQualityEnvironment({
+        environment: unreadableHostileEnvironment,
+        temporaryParent: scratch,
+      }, environment => environment.PATH), "/fixture/bin");
+
+      assert.throws(() => withNonAuthQualityEnvironment({
+        environment: { PATH: "/fixture/one", Path: "/fixture/two" },
+        platform: "win32",
+        temporaryParent: scratch,
+      }, () => null), /case-colliding key/u);
+      assert.deepStrictEqual(
+        fs.readdirSync(scratch).sort(),
+        ["ambient-home"]
+      );
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("private non-auth cleanup quarantines the owned inode before entry-bounded removal", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-non-auth-cleanup-race-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const boundary = createNonAuthQualityEnvironment({
+      environment: { PATH: "/fixture/bin" },
+      temporaryParent: scratch,
+    });
+    const ownedIdentity = fs.lstatSync(boundary.root);
+    const victim = path.join(scratch, "synthetic-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "synthetic victim survives\n");
+    const originalRmdir = fs.rmdirSync;
+    const originalRename = fs.renameSync;
+    let quarantinedRoot = null;
+    let substituted = false;
+    try {
+      fs.rmdirSync = function interceptedFinalRemoval(target, options) {
+        if (!substituted
+          && typeof target === "string"
+          && path.dirname(target) === scratch
+          && path.basename(target).includes(".cleanup-")) {
+          quarantinedRoot = target;
+          const movedIdentity = fs.lstatSync(target);
+          assert.notStrictEqual(target, boundary.root);
+          assert.strictEqual(movedIdentity.dev, ownedIdentity.dev);
+          assert.strictEqual(movedIdentity.ino, ownedIdentity.ino);
+          assert.strictEqual(fs.existsSync(boundary.root), false);
+          originalRename.call(fs, victim, boundary.root);
+          substituted = true;
+        }
+        return originalRmdir.call(fs, target, options);
+      };
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(boundary),
+        /path was reoccupied/u,
+      );
+    } finally {
+      fs.rmdirSync = originalRmdir;
+    }
+    try {
+      assert.strictEqual(substituted, true);
+      assert.strictEqual(fs.existsSync(quarantinedRoot), false);
+      assert.strictEqual(
+        fs.readFileSync(path.join(boundary.root, "preserve.txt"), "utf8"),
+        "synthetic victim survives\n",
+      );
+      assert.strictEqual(
+        fs.existsSync(path.join(boundary.root, ".cloudsmith-non-auth-owner.json")),
+        false,
+      );
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(boundary),
+        /unknown boundary/u,
+      );
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("private non-auth cleanup fails closed on final quarantine substitution", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-non-auth-cleanup-final-swap-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const boundary = createNonAuthQualityEnvironment({
+      environment: { PATH: "/fixture/bin" },
+      temporaryParent: scratch,
+    });
+    fs.mkdirSync(path.join(boundary.paths.temporary, "nested"));
+    fs.writeFileSync(
+      path.join(boundary.paths.temporary, "nested", "owned.txt"),
+      "synthetic owned cleanup bytes\n",
+    );
+    const victim = path.join(scratch, "synthetic-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "synthetic victim survives\n");
+    const originalRename = fs.renameSync;
+    const originalRmdir = fs.rmdirSync;
+    let displacedOwnedRoot;
+    let substitutedRoot;
+    try {
+      fs.rmdirSync = function interceptFinalQuarantineRemoval(target, options) {
+        if (!substitutedRoot
+          && typeof target === "string"
+          && path.dirname(target) === scratch
+          && path.basename(target).includes(".cleanup-")) {
+          substitutedRoot = target;
+          displacedOwnedRoot = `${target}.owned-displaced`;
+          originalRename.call(fs, target, displacedOwnedRoot);
+          originalRename.call(fs, victim, target);
+        }
+        return originalRmdir.call(fs, target, options);
+      };
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(boundary),
+        /unsafe or changed tree/u,
+      );
+    } finally {
+      fs.rmdirSync = originalRmdir;
+    }
+    try {
+      assert.strictEqual(typeof substitutedRoot, "string");
+      assert.strictEqual(fs.existsSync(displacedOwnedRoot), true);
+      assert.strictEqual(
+        fs.readFileSync(path.join(substitutedRoot, "preserve.txt"), "utf8"),
+        "synthetic victim survives\n",
+      );
+      assert.strictEqual(fs.existsSync(boundary.root), false);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("entry-bounded cleanup rejects an entry injected after its exact inventory", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-exact-cleanup-injected-entry-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const root = path.join(scratch, "owned-root");
+    fs.mkdirSync(root, { mode: 0o700 });
+    const rootIdentity = fs.lstatSync(root);
+    const originalRmdir = fs.rmdirSync;
+    let injected = false;
+    try {
+      fs.rmdirSync = function injectEntryAtFinalRemoval(target, options) {
+        if (!injected && target === root) {
+          fs.writeFileSync(path.join(root, "late-entry"), "synthetic late bytes\n");
+          injected = true;
+        }
+        return originalRmdir.call(fs, target, options);
+      };
+      assert.throws(
+        () => removeExactOwnedDirectoryTree(root, {
+          errorMessage: "Synthetic exact cleanup rejected tree drift.",
+          expectedRootEntries: [],
+          expectedRootIdentity: rootIdentity,
+        }),
+        /rejected tree drift/u,
+      );
+    } finally {
+      fs.rmdirSync = originalRmdir;
+    }
+    try {
+      assert.strictEqual(injected, true);
+      assert.strictEqual(
+        fs.readFileSync(path.join(root, "late-entry"), "utf8"),
+        "synthetic late bytes\n",
+      );
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("entry-bounded cleanup unlinks only its inventoried hard-link name", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-exact-cleanup-hard-link-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const root = path.join(scratch, "owned-root");
+    const outside = path.join(scratch, "outside-file");
+    const linked = path.join(root, "linked-file");
+    fs.mkdirSync(root, { mode: 0o700 });
+    fs.writeFileSync(outside, "synthetic hard-link bytes\n");
+    fs.linkSync(outside, linked);
+    try {
+      assert.strictEqual(removeExactOwnedDirectoryTree(root, {
+        allowAdditionalRootEntries: true,
+        errorMessage: "Synthetic exact cleanup rejected unsafe entry type.",
+        expectedRootEntries: [],
+        expectedRootIdentity: fs.lstatSync(root),
+      }), true);
+      assert.strictEqual(fs.existsSync(linked), false);
+      assert.strictEqual(fs.existsSync(root), false);
+      assert.strictEqual(fs.readFileSync(outside, "utf8"), "synthetic hard-link bytes\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("QH-168 production cleanup paths forbid recursive pathname deletion", () => {
+    for (const relative of [
+      "scripts/quality/authenticated-candidate-session.js",
+      "scripts/quality/authenticated-exposure-scan.js",
+      "scripts/quality/prepare-qualification.js",
+      "scripts/quality/qualification-profile.js",
+    ]) {
+      const source = fs.readFileSync(path.join(ROOT, relative), "utf8");
+      assert.doesNotMatch(
+        source,
+        /\bfs\.rm(?:Sync)?\s*\([^;]*?\brecursive\s*:\s*true\b/gsu,
+        `${relative} must use exact entry-bounded cleanup`,
+      );
+    }
   });
 
   test("composes fast, full, and release plans without hiding either Extension Host label", () => {
@@ -1676,15 +2156,16 @@ suite("Quality gate runner", () => {
         profile: "fast",
         source: SOURCE_IDENTITY,
         execute(step) {
+          const artifactFingerprint = materializeStepArtifacts(step, temporaryRoot);
+          const evidence = materializeStepTestEvidence(step, temporaryRoot);
           return {
             status: step.id === "repository-check" ? 7 : 0,
             signal: null,
             stdout: step.id === "repository-check" ? "1 failing\n" : "2 passing\n",
             stderr: "",
-            testEvidence: step.evidencePath ? testEvidence(step) : null,
-            artifactFingerprint: step.artifactPath || step.artifactPaths
-              ? "b".repeat(64)
-              : null,
+            testEvidence: evidence.value,
+            testEvidenceFingerprint: evidence.fingerprint,
+            artifactFingerprint,
           };
         },
       });
@@ -1699,6 +2180,429 @@ suite("Quality gate runner", () => {
       const target = path.join(temporaryRoot, receiptPath(failed));
       assert.strictEqual(JSON.parse(fs.readFileSync(target, "utf8")).exitCode, 7);
       assert.strictEqual(fs.existsSync(staleReceipt), false);
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty execution Error cannot produce a passing gate", () => {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-empty-error-gate-"));
+    const step = {
+      id: "fixture-empty-execution-error",
+      category: "fixture",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    try {
+      const summary = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        execute: () => ({
+          status: 0,
+          signal: null,
+          error: new Error(""),
+          stdout: "",
+          stderr: "",
+        }),
+      });
+      const diskReceipt = JSON.parse(fs.readFileSync(
+        path.join(temporaryRoot, receiptPath(summary.steps[0])),
+        "utf8",
+      ));
+      assert.strictEqual(summary.status, "failed");
+      assert.strictEqual(summary.steps[0].status, "failed");
+      assert.strictEqual(summary.steps[0].reason, "execution-error");
+      assert.strictEqual(diskReceipt.status, "failed");
+      assert.strictEqual(diskReceipt.reason, "execution-error");
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("execution errors persist a fixed reason without inspecting hostile messages", () => {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-hostile-error-gate-"));
+    const step = {
+      id: "fixture-hostile-execution-error",
+      category: "fixture",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    let getterCalls = 0;
+    let reflectionCalls = 0;
+    const accessorError = Object.create(null);
+    Object.defineProperty(accessorError, "message", {
+      configurable: false,
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("execution error message getter must not run");
+      },
+    });
+    const hostileError = new Proxy(Object.create(null), {
+      get() {
+        getterCalls += 1;
+        throw new Error("execution error property trap must not run");
+      },
+      getOwnPropertyDescriptor() {
+        reflectionCalls += 1;
+        throw new Error("execution error descriptor trap must not run");
+      },
+      getPrototypeOf() {
+        reflectionCalls += 1;
+        throw new Error("execution error prototype trap must not run");
+      },
+      ownKeys() {
+        reflectionCalls += 1;
+        throw new Error("execution error key trap must not run");
+      },
+    });
+    const execution = error => ({
+      status: 0,
+      signal: null,
+      error,
+      stdout: "",
+      stderr: "",
+    });
+    try {
+      for (const error of [{ message: 17 }, accessorError, hostileError]) {
+        const receipt = completedReceipt(
+          "fast",
+          step,
+          SOURCE_IDENTITY,
+          execution(error),
+        );
+        assert.strictEqual(receipt.status, "failed");
+        assert.strictEqual(receipt.reason, "execution-error");
+      }
+      const summary = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        execute: () => execution(hostileError),
+      });
+      const diskReceipt = JSON.parse(fs.readFileSync(
+        path.join(temporaryRoot, receiptPath(summary.steps[0])),
+        "utf8",
+      ));
+      assert.strictEqual(summary.status, "failed");
+      assert.strictEqual(summary.steps[0].reason, "execution-error");
+      assert.strictEqual(diskReceipt.reason, "execution-error");
+      assert.strictEqual(getterCalls, 0);
+      assert.strictEqual(reflectionCalls, 0);
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("structured-evidence binding preserves an accessor execution error without invoking it", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-evidence-execution-error-",
+    )));
+    const step = {
+      id: "fixture-evidence-execution-error",
+      category: "tests",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      evidencePath: ".quality/test-results/execution-error.json",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    let getterCalls = 0;
+    try {
+      const summary = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        execute() {
+          const evidence = testEvidence(step);
+          writeJson(step.evidencePath, evidence, temporaryRoot, {
+            subtree: ".quality/test-results",
+          });
+          const execution = {
+            status: 0,
+            signal: null,
+            stdout: "",
+            stderr: "",
+            testEvidenceFingerprint: testEvidenceFileFingerprint(evidence),
+          };
+          Object.defineProperty(execution, "error", {
+            configurable: false,
+            enumerable: true,
+            get() {
+              getterCalls += 1;
+              return undefined;
+            },
+          });
+          return execution;
+        },
+      });
+      const diskReceipt = JSON.parse(fs.readFileSync(
+        path.join(temporaryRoot, receiptPath(summary.steps[0])),
+        "utf8",
+      ));
+      assert.strictEqual(summary.status, "failed");
+      assert.strictEqual(summary.steps[0].status, "failed");
+      assert.strictEqual(summary.steps[0].reason, "execution-error");
+      assert.strictEqual(diskReceipt.reason, "execution-error");
+      assert.strictEqual(getterCalls, 0);
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("command execution preserves inherited and uninspectable error presence", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-command-execution-error-",
+    )));
+    const step = {
+      id: "fixture-command-execution-error",
+      category: "fixture",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    let reflectionCalls = 0;
+    const inheritedError = { error: new Error("") };
+    const uninspectableError = new Proxy(Object.create(null), {
+      getOwnPropertyDescriptor(_target, propertyName) {
+        if (propertyName === "error") {
+          reflectionCalls += 1;
+          throw new Error("execution error descriptor is uninspectable");
+        }
+        return undefined;
+      },
+      getPrototypeOf() {
+        return null;
+      },
+    });
+    try {
+      for (const prototype of [inheritedError, uninspectableError]) {
+        const rawResult = Object.assign(Object.create(prototype), {
+          status: 0,
+          signal: null,
+          stdout: "",
+          stderr: "",
+        });
+        const execution = executeCommand(step, {
+          root: temporaryRoot,
+          temporaryParent: temporaryRoot,
+          spawnSync: () => rawResult,
+        });
+        const receipt = completedReceipt(
+          "fast",
+          step,
+          SOURCE_IDENTITY,
+          execution,
+        );
+        assert.strictEqual(receipt.status, "failed");
+        assert.strictEqual(receipt.reason, "execution-error");
+      }
+      assert.strictEqual(reflectionCalls, 0);
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("command execution rejects hostile expected fields and invalid signals", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-command-field-shape-",
+    )));
+    const step = {
+      id: "fixture-command-field-shape",
+      category: "fixture",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    const validFields = {
+      artifactFingerprint: null,
+      error: null,
+      signal: null,
+      status: 0,
+      stderr: "",
+      stdout: "",
+      testEvidence: null,
+      testEvidenceFingerprint: null,
+    };
+    let getterCalls = 0;
+    let reflectionCalls = 0;
+    const accessorResult = propertyName => {
+      const result = { ...validFields };
+      delete result[propertyName];
+      Object.defineProperty(result, propertyName, {
+        configurable: false,
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          throw new Error(`${propertyName} getter must not run`);
+        },
+      });
+      return result;
+    };
+    const throwingSignalPrototype = new Proxy(Object.create(null), {
+      getOwnPropertyDescriptor(_target, propertyName) {
+        if (propertyName === "signal") {
+          reflectionCalls += 1;
+          throw new Error("signal descriptor trap must not run");
+        }
+        return undefined;
+      },
+      getPrototypeOf() {
+        reflectionCalls += 1;
+        throw new Error("signal prototype trap must not run");
+      },
+    });
+    const proxySignalResult = Object.assign(
+      Object.create(throwingSignalPrototype),
+      validFields,
+    );
+    delete proxySignalResult.signal;
+    const emptySignalResult = { ...validFields, signal: "" };
+    try {
+      for (const rawResult of [
+        accessorResult("signal"),
+        proxySignalResult,
+        emptySignalResult,
+        accessorResult("status"),
+        accessorResult("stdout"),
+        accessorResult("stderr"),
+      ]) {
+        const execution = executeCommand(step, {
+          root: temporaryRoot,
+          temporaryParent: temporaryRoot,
+          spawnSync: () => rawResult,
+        });
+        const receipt = completedReceipt(
+          "fast",
+          step,
+          SOURCE_IDENTITY,
+          execution,
+        );
+        assert.strictEqual(receipt.status, "failed");
+        assert.strictEqual(receipt.reason, "execution-error");
+      }
+      assert.strictEqual(getterCalls, 0);
+      assert.strictEqual(reflectionCalls, 0);
+
+      const inheritedExecution = executeCommand(step, {
+        root: temporaryRoot,
+        temporaryParent: temporaryRoot,
+        spawnSync: () => Object.create(validFields),
+      });
+      assert.strictEqual(
+        completedReceipt("fast", step, SOURCE_IDENTITY, inheritedExecution).status,
+        "passed",
+      );
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("injected gate execution rejects hostile status, output, signal, and evidence fields", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-injected-field-shape-",
+    )));
+    const step = {
+      id: "fixture-injected-field-shape",
+      category: "tests",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      evidencePath: ".quality/test-results/injected-field-shape.json",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    let getterCalls = 0;
+    let reflectionCalls = 0;
+    const cases = [
+      { kind: "accessor", propertyName: "signal" },
+      { kind: "proxy-signal" },
+      { kind: "empty-signal" },
+      { kind: "accessor", propertyName: "status" },
+      { kind: "accessor", propertyName: "stdout" },
+      { kind: "accessor", propertyName: "stderr" },
+      { kind: "accessor", propertyName: "testEvidence" },
+      { kind: "accessor", propertyName: "testEvidenceFingerprint" },
+    ];
+    try {
+      for (const testCase of cases) {
+        const summary = runGate({
+          root: temporaryRoot,
+          profile: "fast",
+          plan: [step],
+          source: SOURCE_IDENTITY,
+          execute() {
+            const evidence = testEvidence(step);
+            const evidenceFingerprint = testEvidenceFileFingerprint(evidence);
+            writeJson(step.evidencePath, evidence, temporaryRoot, {
+              subtree: ".quality/test-results",
+            });
+            const fields = {
+              artifactFingerprint: null,
+              error: null,
+              signal: null,
+              status: 0,
+              stderr: "",
+              stdout: "",
+              testEvidence: evidence,
+              testEvidenceFingerprint: evidenceFingerprint,
+            };
+            if (testCase.kind === "empty-signal") return { ...fields, signal: "" };
+            if (testCase.kind === "proxy-signal") {
+              delete fields.signal;
+              const prototype = new Proxy(Object.create(null), {
+                getOwnPropertyDescriptor(_target, propertyName) {
+                  if (propertyName === "signal") {
+                    reflectionCalls += 1;
+                    throw new Error("signal descriptor trap must not run");
+                  }
+                  return undefined;
+                },
+                getPrototypeOf() {
+                  reflectionCalls += 1;
+                  throw new Error("signal prototype trap must not run");
+                },
+              });
+              return Object.assign(Object.create(prototype), fields);
+            }
+            const propertyName = testCase.propertyName;
+            delete fields[propertyName];
+            Object.defineProperty(fields, propertyName, {
+              configurable: false,
+              enumerable: true,
+              get() {
+                getterCalls += 1;
+                throw new Error(`${propertyName} getter must not run`);
+              },
+            });
+            return fields;
+          },
+        });
+        assert.strictEqual(summary.status, "failed");
+        assert.strictEqual(summary.steps[0].status, "failed");
+        assert.strictEqual(summary.steps[0].reason, "execution-error");
+      }
+      assert.strictEqual(getterCalls, 0);
+      assert.strictEqual(reflectionCalls, 0);
     } finally {
       fs.rmSync(temporaryRoot, { recursive: true, force: true });
     }
@@ -1756,33 +2660,942 @@ suite("Quality gate runner", () => {
     }
   });
 
+  test("rejects hard-linked gate artifacts before fingerprint acceptance", () => {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-artifact-link-"));
+    const step = fixtureArtifactStep();
+    const target = path.join(temporaryRoot, step.artifactPath);
+    const outside = path.join(temporaryRoot, "outside-artifact.json");
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(outside, "synthetic shared artifact bytes\n");
+      fs.linkSync(outside, target);
+      assert.throws(
+        () => artifactFingerprintForStep(step, temporaryRoot),
+        /unsafe or changed/u,
+      );
+      assert.strictEqual(fs.readFileSync(outside, "utf8"), "synthetic shared artifact bytes\n");
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("fails a gate artifact changed after its command fingerprint", () => {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-artifact-drift-"));
+    const step = fixtureArtifactStep();
+    const target = path.join(temporaryRoot, step.artifactPath);
+    let sourceReads = 0;
+    try {
+      const summary = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        readSource() {
+          sourceReads += 1;
+          if (sourceReads === 2) fs.appendFileSync(target, "synthetic post-fingerprint drift\n");
+          return SOURCE_IDENTITY;
+        },
+        execute(currentStep) {
+          return {
+            status: 0,
+            signal: null,
+            stdout: "",
+            stderr: "",
+            artifactFingerprint: materializeStepArtifacts(currentStep, temporaryRoot),
+          };
+        },
+      });
+      assert.strictEqual(summary.status, "failed");
+      assert.strictEqual(summary.steps[0].status, "failed");
+      assert.strictEqual(summary.steps[0].reason, "artifact-changed-before-receipt");
+      assert.strictEqual(
+        JSON.parse(fs.readFileSync(
+          path.join(temporaryRoot, receiptPath(summary.steps[0])),
+          "utf8",
+        )).status,
+        "failed",
+      );
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("downgrades an artifact changed during receipt persistence", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-artifact-receipt-drift-",
+    )));
+    const step = fixtureArtifactStep();
+    const target = path.join(temporaryRoot, step.artifactPath);
+    const receiptTarget = path.join(temporaryRoot, `.quality/gates/fast/01-${step.id}.json`);
+    const originalRename = fs.renameSync;
+    let armed = false;
+    let drifted = false;
+    try {
+      fs.renameSync = function interceptReceiptPersistence(source, destination) {
+        const result = originalRename.call(fs, source, destination);
+        if (armed && destination === receiptTarget) {
+          fs.appendFileSync(target, "synthetic receipt-persistence drift\n");
+          armed = false;
+          drifted = true;
+        }
+        return result;
+      };
+      const summary = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        execute(currentStep) {
+          const artifactFingerprint = materializeStepArtifacts(currentStep, temporaryRoot);
+          armed = true;
+          return { status: 0, signal: null, stdout: "", stderr: "", artifactFingerprint };
+        },
+      });
+      assert.strictEqual(drifted, true);
+      assert.strictEqual(summary.status, "failed");
+      assert.strictEqual(
+        summary.steps[0].reason,
+        "artifact-changed-during-receipt-persistence",
+      );
+    } finally {
+      fs.renameSync = originalRename;
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("invalidates a passed receipt before a failing downgrade write", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-artifact-receipt-write-failure-",
+    )));
+    const step = fixtureArtifactStep();
+    const target = path.join(temporaryRoot, step.artifactPath);
+    const receiptTarget = path.join(temporaryRoot, `.quality/gates/fast/01-${step.id}.json`);
+    const originalRename = fs.renameSync;
+    let armed = false;
+    let receiptWrites = 0;
+    try {
+      fs.renameSync = function interceptReceiptDowngrade(source, destination) {
+        if (armed && destination === receiptTarget) {
+          receiptWrites += 1;
+          if (receiptWrites === 2) {
+            const error = new Error("synthetic receipt downgrade write failure");
+            error.code = "EIO";
+            throw error;
+          }
+          const result = originalRename.call(fs, source, destination);
+          fs.appendFileSync(target, "synthetic receipt drift before failed downgrade\n");
+          return result;
+        }
+        return originalRename.call(fs, source, destination);
+      };
+      assert.throws(() => runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        execute(currentStep) {
+          const artifactFingerprint = materializeStepArtifacts(currentStep, temporaryRoot);
+          armed = true;
+          return { status: 0, signal: null, stdout: "", stderr: "", artifactFingerprint };
+        },
+      }), /synthetic receipt downgrade write failure/u);
+      assert.strictEqual(receiptWrites, 2);
+      assert.strictEqual(fs.existsSync(receiptTarget), false);
+    } finally {
+      fs.renameSync = originalRename;
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("downgrades an artifact changed during summary persistence", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-artifact-summary-drift-",
+    )));
+    const step = fixtureArtifactStep();
+    const target = path.join(temporaryRoot, step.artifactPath);
+    const summaryTarget = path.join(temporaryRoot, ".quality/gates/fast.json");
+    const originalRename = fs.renameSync;
+    let armed = false;
+    let drifted = false;
+    try {
+      fs.renameSync = function interceptSummaryPersistence(source, destination) {
+        const result = originalRename.call(fs, source, destination);
+        if (armed && destination === summaryTarget) {
+          fs.appendFileSync(target, "synthetic summary-persistence drift\n");
+          armed = false;
+          drifted = true;
+        }
+        return result;
+      };
+      const summary = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        execute(currentStep) {
+          const artifactFingerprint = materializeStepArtifacts(currentStep, temporaryRoot);
+          armed = true;
+          return { status: 0, signal: null, stdout: "", stderr: "", artifactFingerprint };
+        },
+      });
+      assert.strictEqual(drifted, true);
+      assert.strictEqual(summary.status, "failed");
+      assert.strictEqual(
+        summary.steps[0].reason,
+        "artifact-changed-during-summary-persistence",
+      );
+      assert.strictEqual(
+        JSON.parse(fs.readFileSync(summaryTarget, "utf8")).status,
+        "failed",
+      );
+    } finally {
+      fs.renameSync = originalRename;
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("invalidates a passed summary before a failing downgrade write", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-artifact-summary-write-failure-",
+    )));
+    const step = fixtureArtifactStep();
+    const target = path.join(temporaryRoot, step.artifactPath);
+    const summaryTarget = path.join(temporaryRoot, ".quality/gates/fast.json");
+    const originalRename = fs.renameSync;
+    let armed = false;
+    let summaryWrites = 0;
+    try {
+      fs.renameSync = function interceptSummaryDowngrade(source, destination) {
+        if (armed && destination === summaryTarget) {
+          summaryWrites += 1;
+          if (summaryWrites === 2) {
+            const error = new Error("synthetic summary downgrade write failure");
+            error.code = "EIO";
+            throw error;
+          }
+          const result = originalRename.call(fs, source, destination);
+          fs.appendFileSync(target, "synthetic summary drift before failed downgrade\n");
+          return result;
+        }
+        return originalRename.call(fs, source, destination);
+      };
+      assert.throws(() => runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        execute(currentStep) {
+          const artifactFingerprint = materializeStepArtifacts(currentStep, temporaryRoot);
+          armed = true;
+          return { status: 0, signal: null, stdout: "", stderr: "", artifactFingerprint };
+        },
+      }), /synthetic summary downgrade write failure/u);
+      assert.strictEqual(summaryWrites, 2);
+      assert.strictEqual(fs.existsSync(summaryTarget), false);
+    } finally {
+      fs.renameSync = originalRename;
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects hard-linked and oversized structured test evidence", () => {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-evidence-bound-"));
+    const evidencePath = ".quality/test-results/fixture-evidence.json";
+    const evidenceTarget = path.join(temporaryRoot, evidencePath);
+    const outside = path.join(temporaryRoot, "outside-evidence.json");
+    const step = {
+      id: "fixture-evidence",
+      category: "tests",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      evidencePath,
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    try {
+      const linked = executeCommand(step, {
+        root: temporaryRoot,
+        source: SOURCE_IDENTITY,
+        temporaryParent: temporaryRoot,
+        spawnSync() {
+          fs.mkdirSync(path.dirname(evidenceTarget), { recursive: true });
+          fs.writeFileSync(outside, `${JSON.stringify(testEvidence(step))}\n`);
+          fs.linkSync(outside, evidenceTarget);
+          return { status: 0, signal: null, error: null, stdout: "", stderr: "" };
+        },
+      });
+      assert.match(linked.error.message, /Structured test evidence is unsafe or changed/u);
+
+      fs.unlinkSync(evidenceTarget);
+      fs.unlinkSync(outside);
+      const oversized = executeCommand(step, {
+        root: temporaryRoot,
+        source: SOURCE_IDENTITY,
+        temporaryParent: temporaryRoot,
+        spawnSync() {
+          fs.mkdirSync(path.dirname(evidenceTarget), { recursive: true });
+          const descriptor = fs.openSync(evidenceTarget, "w");
+          try {
+            fs.writeSync(descriptor, testEvidenceFileBytes(testEvidence(step)));
+            const spaces = Buffer.alloc(64 * 1024, 0x20);
+            for (let index = 0; index < 1024; index += 1) {
+              fs.writeSync(descriptor, spaces);
+            }
+          } finally {
+            fs.closeSync(descriptor);
+          }
+          return { status: 0, signal: null, error: null, stdout: "", stderr: "" };
+        },
+      });
+      assert.match(oversized.error.message, /Structured test evidence is unsafe or changed/u);
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("caps structured-evidence reads at the opened size and rejects growth", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-evidence-growth-",
+    )));
+    const step = {
+      id: "fixture-growth",
+      evidencePath: ".quality/test-results/fixture-growth.json",
+    };
+    const target = path.join(temporaryRoot, step.evidencePath);
+    const value = testEvidence(step);
+    writeJson(step.evidencePath, value, temporaryRoot, {
+      subtree: ".quality/test-results",
+    });
+    const openedBytes = fs.lstatSync(target).size;
+    const fileSystem = Object.create(fs);
+    const originalRead = fs.readSync;
+    let grew = false;
+    let requestedBytes = 0;
+    fileSystem.readSync = function growDuringRead(descriptor, buffer, offset, length, position) {
+      requestedBytes += length;
+      if (!grew) {
+        fs.appendFileSync(target, "synthetic post-open growth\n");
+        grew = true;
+      }
+      return originalRead.call(fs, descriptor, buffer, offset, length, position);
+    };
+    try {
+      assert.throws(
+        () => testEvidenceProofForStep(step, temporaryRoot, { fileSystem }),
+        /unsafe or changed/u,
+      );
+      assert.strictEqual(grew, true);
+      assert.ok(requestedBytes <= openedBytes, `${requestedBytes} exceeded ${openedBytes}`);
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("binds structured evidence through receipt persistence", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-evidence-lifecycle-",
+    )));
+    const step = {
+      id: "fixture-evidence-lifecycle",
+      category: "tests",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      evidencePath: ".quality/test-results/fixture-lifecycle.json",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    const target = path.join(temporaryRoot, step.evidencePath);
+    let sourceReads = 0;
+    try {
+      const summary = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        readSource() {
+          sourceReads += 1;
+          if (sourceReads === 2) {
+            fs.writeFileSync(target, alternateTestEvidenceFileBytes(testEvidence(step)));
+          }
+          return SOURCE_IDENTITY;
+        },
+        execute(currentStep, context) {
+          return executeCommand(currentStep, {
+            ...context,
+            temporaryParent: temporaryRoot,
+            spawnSync() {
+              writeJson(currentStep.evidencePath, testEvidence(currentStep), temporaryRoot, {
+                subtree: ".quality/test-results",
+              });
+              return { status: 0, signal: null, error: null, stdout: "", stderr: "" };
+            },
+          });
+        },
+      });
+      assert.strictEqual(summary.status, "failed");
+      assert.strictEqual(summary.steps[0].reason, "test-evidence-changed-before-receipt");
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("downgrades structured evidence changed during receipt persistence", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-evidence-receipt-drift-",
+    )));
+    const step = {
+      id: "fixture-evidence-receipt-drift",
+      category: "tests",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      evidencePath: ".quality/test-results/fixture-receipt-drift.json",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    const evidenceTarget = path.join(temporaryRoot, step.evidencePath);
+    const receiptTarget = path.join(temporaryRoot, `.quality/gates/fast/01-${step.id}.json`);
+    const originalRename = fs.renameSync;
+    let armed = false;
+    try {
+      fs.renameSync = function interceptEvidenceReceipt(source, destination) {
+        const result = originalRename.call(fs, source, destination);
+        if (armed && destination === receiptTarget) {
+          fs.writeFileSync(
+            evidenceTarget,
+            alternateTestEvidenceFileBytes(testEvidence(step)),
+          );
+          armed = false;
+        }
+        return result;
+      };
+      const summary = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        execute(currentStep, context) {
+          const execution = executeCommand(currentStep, {
+            ...context,
+            temporaryParent: temporaryRoot,
+            spawnSync() {
+              writeJson(currentStep.evidencePath, testEvidence(currentStep), temporaryRoot, {
+                subtree: ".quality/test-results",
+              });
+              return { status: 0, signal: null, error: null, stdout: "", stderr: "" };
+            },
+          });
+          armed = true;
+          return execution;
+        },
+      });
+      assert.strictEqual(summary.status, "failed");
+      assert.strictEqual(
+        summary.steps[0].reason,
+        "test-evidence-changed-during-receipt-persistence",
+      );
+    } finally {
+      fs.renameSync = originalRename;
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("downgrades structured evidence changed during summary persistence", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-evidence-summary-drift-",
+    )));
+    const step = {
+      id: "fixture-evidence-summary-drift",
+      category: "tests",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      evidencePath: ".quality/test-results/fixture-summary-drift.json",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    const evidenceTarget = path.join(temporaryRoot, step.evidencePath);
+    const summaryTarget = path.join(temporaryRoot, ".quality/gates/fast.json");
+    const originalRename = fs.renameSync;
+    let armed = false;
+    try {
+      fs.renameSync = function interceptEvidenceSummary(source, destination) {
+        const result = originalRename.call(fs, source, destination);
+        if (armed && destination === summaryTarget) {
+          fs.writeFileSync(
+            evidenceTarget,
+            alternateTestEvidenceFileBytes(testEvidence(step)),
+          );
+          armed = false;
+        }
+        return result;
+      };
+      const summary = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        execute(currentStep, context) {
+          const execution = executeCommand(currentStep, {
+            ...context,
+            temporaryParent: temporaryRoot,
+            spawnSync() {
+              writeJson(currentStep.evidencePath, testEvidence(currentStep), temporaryRoot, {
+                subtree: ".quality/test-results",
+              });
+              return { status: 0, signal: null, error: null, stdout: "", stderr: "" };
+            },
+          });
+          armed = true;
+          return execution;
+        },
+      });
+      assert.strictEqual(summary.status, "failed");
+      assert.strictEqual(
+        summary.steps[0].reason,
+        "test-evidence-changed-during-summary-persistence",
+      );
+      assert.strictEqual(JSON.parse(fs.readFileSync(summaryTarget, "utf8")).status, "failed");
+    } finally {
+      fs.renameSync = originalRename;
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("injected gate execution cannot bypass the structured-evidence proof", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-evidence-injected-",
+    )));
+    const step = {
+      id: "fixture-injected-evidence",
+      category: "tests",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      evidencePath: ".quality/test-results/injected.json",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    try {
+      const missingProof = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        execute: () => ({
+          status: 0,
+          signal: null,
+          stdout: "",
+          stderr: "",
+          testEvidence: testEvidence(step),
+        }),
+      });
+      assert.strictEqual(missingProof.status, "failed");
+      assert.strictEqual(
+        missingProof.steps[0].reason,
+        "missing-or-invalid-test-evidence-fingerprint",
+      );
+
+      const forgedProof = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [step],
+        source: SOURCE_IDENTITY,
+        execute() {
+          writeJson(step.evidencePath, testEvidence(step), temporaryRoot, {
+            subtree: ".quality/test-results",
+          });
+          return {
+            status: 0,
+            signal: null,
+            stdout: "",
+            stderr: "",
+            testEvidence: testEvidence(step),
+            testEvidenceFingerprint: "b".repeat(64),
+          };
+        },
+      });
+      assert.strictEqual(forgedProof.status, "failed");
+      assert.strictEqual(forgedProof.steps[0].reason, "test-evidence-changed-before-receipt");
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("normalizes structured evidence to its exact durable JSON value", () => {
+    const negativeZeroRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-evidence-negative-zero-",
+    )));
+    const negativeZeroStep = {
+      id: "fixture-negative-zero",
+      category: "tests",
+      executable: "node",
+      args: ["fixture"],
+      command: "node fixture",
+      evidencePath: ".quality/test-results/negative-zero.json",
+      blockedExitCodes: [],
+      sequence: 1,
+    };
+    const negativeZeroValue = testEvidence(negativeZeroStep);
+    const negativeZeroBytes = Buffer.from(`${JSON.stringify(negativeZeroValue)
+      .replace("\"failed\":0", "\"failed\":-0")
+      .replace("\"pending\":0", "\"pending\":-0")}\n`);
+    const negativeZeroTarget = path.join(negativeZeroRoot, negativeZeroStep.evidencePath);
+    try {
+      assert.strictEqual(
+        Object.is(JSON.parse(negativeZeroBytes.toString("utf8")).counts.failed, -0),
+        true,
+      );
+      const summary = runGate({
+        root: negativeZeroRoot,
+        profile: "fast",
+        plan: [negativeZeroStep],
+        source: SOURCE_IDENTITY,
+        execute(currentStep, context) {
+          return executeCommand(currentStep, {
+            ...context,
+            temporaryParent: negativeZeroRoot,
+            spawnSync() {
+              fs.mkdirSync(path.dirname(negativeZeroTarget), { recursive: true });
+              fs.writeFileSync(negativeZeroTarget, negativeZeroBytes);
+              return { status: 0, signal: null, error: null, stdout: "", stderr: "" };
+            },
+          });
+        },
+      });
+      const diskReceipt = JSON.parse(fs.readFileSync(
+        path.join(negativeZeroRoot, receiptPath(summary.steps[0])),
+        "utf8",
+      ));
+      assert.strictEqual(summary.status, "passed");
+      assert.strictEqual(Object.is(summary.steps[0].testEvidence.counts.failed, -0), false);
+      assert.strictEqual(Object.is(diskReceipt.testEvidence.counts.failed, -0), false);
+      assert.strictEqual(
+        summary.steps[0].testEvidenceFingerprint,
+        crypto.createHash("sha256").update(negativeZeroBytes).digest("hex"),
+      );
+      assert.strictEqual(
+        validateTestEvidenceBinding(diskReceipt, negativeZeroStep, negativeZeroRoot),
+        null,
+      );
+    } finally {
+      fs.rmSync(negativeZeroRoot, { recursive: true, force: true });
+    }
+
+    const hostileRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-evidence-hostile-json-",
+    )));
+    const hostileStep = {
+      ...negativeZeroStep,
+      id: "fixture-hostile-json",
+      evidencePath: ".quality/test-results/hostile-json.json",
+    };
+    const durableEvidence = testEvidence(hostileStep);
+    const durableBytes = testEvidenceFileBytes(durableEvidence);
+    const hostileEvidence = JSON.parse(JSON.stringify(durableEvidence));
+    let hostileSerializationCalls = 0;
+    Object.defineProperty(hostileEvidence, "toJSON", {
+      enumerable: false,
+      value() {
+        hostileSerializationCalls += 1;
+        return { ...durableEvidence, suite: "forged-suite" };
+      },
+    });
+    const hostileTarget = path.join(hostileRoot, hostileStep.evidencePath);
+    try {
+      const summary = runGate({
+        root: hostileRoot,
+        profile: "fast",
+        plan: [hostileStep],
+        source: SOURCE_IDENTITY,
+        execute() {
+          fs.mkdirSync(path.dirname(hostileTarget), { recursive: true });
+          fs.writeFileSync(hostileTarget, durableBytes);
+          return {
+            status: 0,
+            signal: null,
+            stdout: "",
+            stderr: "",
+            testEvidence: hostileEvidence,
+            testEvidenceFingerprint: crypto.createHash("sha256")
+              .update(durableBytes)
+              .digest("hex"),
+          };
+        },
+      });
+      const diskReceipt = JSON.parse(fs.readFileSync(
+        path.join(hostileRoot, receiptPath(summary.steps[0])),
+        "utf8",
+      ));
+      assert.strictEqual(summary.status, "passed");
+      assert.strictEqual(hostileSerializationCalls, 0);
+      assert.strictEqual(diskReceipt.testEvidence.suite, hostileStep.id);
+      assert.strictEqual(
+        validateTestEvidenceBinding(diskReceipt, hostileStep, hostileRoot),
+        null,
+      );
+    } finally {
+      fs.rmSync(hostileRoot, { recursive: true, force: true });
+    }
+
+    const inheritedRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-evidence-inherited-json-",
+    )));
+    const inheritedStep = {
+      ...negativeZeroStep,
+      id: "fixture-inherited-json",
+      evidencePath: ".quality/test-results/inherited-json.json",
+    };
+    const inheritedEvidence = testEvidence(inheritedStep);
+    const inheritedEvidenceBytes = testEvidenceFileBytes(inheritedEvidence);
+    const inheritedTarget = path.join(inheritedRoot, inheritedStep.evidencePath);
+    const previousToJson = Object.getOwnPropertyDescriptor(Object.prototype, "toJSON");
+    let inheritedSerializationCalls = 0;
+    let persistedSummary;
+    let persistedReceipt;
+    try {
+      fs.mkdirSync(path.dirname(inheritedTarget), { recursive: true });
+      fs.writeFileSync(inheritedTarget, inheritedEvidenceBytes);
+      Object.defineProperty(Object.prototype, "toJSON", {
+        configurable: true,
+        enumerable: false,
+        value() {
+          inheritedSerializationCalls += 1;
+          return { injected: true };
+        },
+      });
+      const proof = testEvidenceProofForStep(inheritedStep, inheritedRoot);
+      assert.strictEqual(inheritedSerializationCalls, 0);
+      assert.deepStrictEqual(proof.value, inheritedEvidence);
+      assert.strictEqual(Object.isFrozen(proof.value), true);
+      assert.strictEqual(Object.isFrozen(proof.value.counts), true);
+      assert.strictEqual(validateTestEvidenceBinding({
+        testEvidence: proof.value,
+        testEvidenceFingerprint: proof.sha256,
+      }, inheritedStep, inheritedRoot), null);
+      assert.strictEqual(inheritedSerializationCalls, 0);
+
+      const summary = runGate({
+        root: inheritedRoot,
+        profile: "fast",
+        plan: [inheritedStep],
+        source: SOURCE_IDENTITY,
+        execute() {
+          fs.mkdirSync(path.dirname(inheritedTarget), { recursive: true });
+          fs.writeFileSync(inheritedTarget, inheritedEvidenceBytes);
+          return {
+            status: 0,
+            signal: null,
+            stdout: "",
+            stderr: "",
+            testEvidence: inheritedEvidence,
+            testEvidenceFingerprint: proof.sha256,
+          };
+        },
+      });
+      persistedReceipt = JSON.parse(fs.readFileSync(
+        path.join(inheritedRoot, receiptPath(summary.steps[0])),
+        "utf8",
+      ));
+      persistedSummary = JSON.parse(fs.readFileSync(
+        path.join(inheritedRoot, ".quality/gates/fast.json"),
+        "utf8",
+      ));
+      assert.strictEqual(summary.status, "passed");
+      assert.strictEqual(persistedReceipt.status, "passed");
+      assert.strictEqual(persistedSummary.status, "passed");
+      assert.strictEqual(Object.hasOwn(persistedReceipt, "injected"), false);
+      assert.strictEqual(Object.hasOwn(persistedSummary, "injected"), false);
+      assert.strictEqual(inheritedSerializationCalls, 0);
+    } finally {
+      if (previousToJson) {
+        Object.defineProperty(Object.prototype, "toJSON", previousToJson);
+      } else {
+        delete Object.prototype.toJSON;
+      }
+      fs.rmSync(inheritedRoot, { recursive: true, force: true });
+    }
+    const { key: persistedKey, ...persistedSummaryBase } = persistedSummary;
+    assert.strictEqual(persistedKey.fingerprint, fingerprint(persistedSummaryBase));
+    assert.strictEqual(
+      validateTestEvidenceBinding(persistedReceipt, inheritedStep, inheritedRoot),
+      "missing-or-invalid-test-evidence",
+    );
+  });
+
+  test("rejects a FIFO substituted at the structured-evidence open boundary", function () {
+    if (process.platform === "win32") this.skip();
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-evidence-fifo-",
+    )));
+    const gatePath = path.join(root, "scripts/quality/gate.js");
+    const fifoEvidence = `${JSON.stringify(testEvidence({ id: "fifo" }))}\n`;
+    const script = `
+      const fs = require("fs");
+      const path = require("path");
+      const { spawnSync: systemSpawn } = require("child_process");
+      const { executeCommand } = require(${JSON.stringify(gatePath)});
+      const fixtureRoot = ${JSON.stringify(temporaryRoot)};
+      const relative = ".quality/test-results/fifo.json";
+      const target = path.join(fixtureRoot, relative);
+      const step = { id: "fifo", category: "tests", executable: "node", args: ["fixture"], command: "node fixture", evidencePath: relative, blockedExitCodes: [], sequence: 1 };
+      const source = { sha: ${JSON.stringify(SOURCE_SHA)}, fingerprint: ${JSON.stringify("a".repeat(64))} };
+      const originalOpen = fs.openSync;
+      let swapped = false;
+      try {
+        fs.openSync = function swapAtOpen(file, flags, ...rest) {
+          if (!swapped && file === target) {
+            fs.unlinkSync(target);
+            const made = systemSpawn("mkfifo", [target], { encoding: "utf8" });
+            if (made.status !== 0) throw new Error("synthetic FIFO creation failed");
+            swapped = true;
+          }
+          return originalOpen.call(fs, file, flags, ...rest);
+        };
+        const result = executeCommand(step, {
+          root: fixtureRoot,
+          source,
+          temporaryParent: fixtureRoot,
+          spawnSync() {
+            fs.mkdirSync(path.dirname(target), { recursive: true });
+            const descriptor = originalOpen.call(
+              fs,
+              target,
+              fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+              0o600,
+            );
+            try {
+              fs.writeSync(descriptor, ${JSON.stringify(fifoEvidence)});
+            } finally {
+              fs.closeSync(descriptor);
+            }
+            return { status: 0, signal: null, error: null, stdout: "", stderr: "" };
+          },
+        });
+        process.exitCode = swapped
+          && result.error
+          && result.error.message.includes("Structured test evidence is unsafe or changed.")
+          ? 0 : 1;
+      } finally {
+        fs.openSync = originalOpen;
+      }
+    `;
+    try {
+      const result = spawnSync(process.execPath, ["-e", script], {
+        encoding: "utf8",
+        timeout: 5000,
+      });
+      assert.ifError(result.error);
+      assert.strictEqual(result.signal, null, result.stderr);
+      assert.strictEqual(result.status, 0, result.stderr);
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a live FIFO independently of EOF and minimum-size checks", function () {
+    if (process.platform === "win32") this.skip();
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-evidence-live-fifo-",
+    )));
+    const target = path.join(temporaryRoot, "evidence.fifo");
+    let writer;
+    try {
+      const made = spawnSync("mkfifo", [target], { encoding: "utf8" });
+      assert.strictEqual(made.status, 0, made.stderr);
+      writer = fs.openSync(
+        target,
+        fs.constants.O_RDWR | (fs.constants.O_NONBLOCK || 0),
+      );
+      fs.writeSync(writer, testEvidenceFileBytes(testEvidence({ id: "live-fifo" })));
+      let consumed = false;
+      assert.throws(() => withStableSingleLinkFile(target, {
+        errorMessage: "Synthetic FIFO must not be accepted as structured evidence.",
+        maximumBytes: 1024 * 1024,
+        minimumBytes: 0,
+      }, () => {
+        consumed = true;
+        return "accepted";
+      }), /must not be accepted/u);
+      assert.strictEqual(consumed, false);
+    } finally {
+      if (writer !== undefined) fs.closeSync(writer);
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   test("non-auth gate children cannot inherit credential-shaped ambient values", () => {
     const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-gate-env-"));
+    const ambientHome = path.join(temporaryRoot, "ambient-home");
+    fs.mkdirSync(ambientHome, { mode: 0o700 });
+    const ambientNpmConfig = path.join(ambientHome, ".npmrc");
+    const ambientGitConfig = path.join(ambientHome, ".gitconfig");
+    fs.writeFileSync(ambientNpmConfig, "qh146_marker=ambient\n", { mode: 0o600 });
+    fs.writeFileSync(
+      ambientGitConfig,
+      "[qh146]\n\tmarker = ambient\n",
+      { mode: 0o600 }
+    );
     const syntheticNames = [
       "CLOUDSMITH_API_KEY",
       "ARBITRARY_ACCESS_TOKEN",
       "FIXTURE_PASSWORD",
+      ...NON_AUTH_AMBIENT_CAPABILITY_NAMES,
     ];
-    const previous = Object.fromEntries(syntheticNames.map(name => [name, process.env[name]]));
+    const syntheticEnvironment = {
+      PATH: process.env.PATH || "/usr/bin:/bin",
+      HOME: ambientHome,
+      USERPROFILE: ambientHome,
+      NPM_CONFIG_USERCONFIG: ambientNpmConfig,
+      GIT_CONFIG_GLOBAL: ambientGitConfig,
+      CLOUDSMITH_API_KEY: "synthetic-qh146-gate-api-sentinel",
+      ARBITRARY_ACCESS_TOKEN: "synthetic-qh146-gate-token-sentinel",
+      FIXTURE_PASSWORD: "synthetic-qh146-gate-password-sentinel",
+      DISPLAY: ":synthetic-host-display",
+      WAYLAND_DISPLAY: "synthetic-host-wayland",
+      XAUTHORITY: "/synthetic/host-xauthority",
+      XDG_RUNTIME_DIR: "/synthetic/host-runtime",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/synthetic/host-session-bus",
+      SSH_AUTH_SOCK: "/synthetic/host-agent.sock",
+      SSH_AGENT_PID: "12345",
+      GPG_AGENT_INFO: "/synthetic/host-gpg-agent",
+      KRB5CCNAME: "/synthetic/host-credential-cache",
+      SECURITYSESSIONID: "synthetic-host-security-session",
+    };
     const step = {
       id: "fixture-environment-boundary",
       category: "security",
       executable: "node",
       args: [
         "-e",
-        `const forbidden = ${JSON.stringify(syntheticNames)}; process.stdout.write(forbidden.some(name => Object.prototype.hasOwnProperty.call(process.env, name)) ? "unsafe-child-environment" : "safe-child-environment");`,
+        `const fs=require("fs"); const os=require("os"); const {spawnSync}=require("child_process"); const forbidden=${JSON.stringify(syntheticNames)}; const directories=["HOME","USERPROFILE","XDG_CONFIG_HOME","XDG_CACHE_HOME","XDG_DATA_HOME","XDG_STATE_HOME","APPDATA","LOCALAPPDATA","TMPDIR","TMP","TEMP","NPM_CONFIG_CACHE"]; const configs=["NPM_CONFIG_USERCONFIG","NPM_CONFIG_GLOBALCONFIG","GIT_CONFIG_GLOBAL"]; const git=spawnSync("git",["config","--global","--get","qh146.marker"],{encoding:"utf8"}); const npm=spawnSync(process.platform==="win32"?"npm.cmd":"npm",["config","get","userconfig"],{encoding:"utf8"}); const unsafe=forbidden.some(name=>Object.prototype.hasOwnProperty.call(process.env,name))||os.homedir()!==process.env.HOME||os.homedir()===${JSON.stringify(ambientHome)}||directories.some(name=>!process.env[name]||!fs.lstatSync(process.env[name]).isDirectory())||configs.some(name=>!process.env[name]||fs.readFileSync(process.env[name],"utf8")!=="")||process.env.GIT_CONFIG_NOSYSTEM!=="1"||process.env.GIT_CONFIG_COUNT!=="0"||git.status!==1||git.stdout.trim()!==""||npm.status!==0||npm.stdout.trim()!==process.env.NPM_CONFIG_USERCONFIG; process.stdout.write(unsafe?"unsafe-child-environment":"safe-child-environment");`,
       ],
       command: "node credential-boundary-probe",
       blockedExitCodes: [],
       sequence: 1,
     };
     try {
-      syntheticNames.forEach((name, index) => {
-        process.env[name] = `synthetic-qh141-sentinel-${index}`;
-      });
       const execution = executeCommand(step, {
         root: temporaryRoot,
         source: SOURCE_IDENTITY,
+        environment: syntheticEnvironment,
+        temporaryParent: temporaryRoot,
       });
       const receipt = completedReceipt("fast", step, SOURCE_IDENTITY, execution);
       assert.strictEqual(execution.stdout, "safe-child-environment");
@@ -1792,14 +3605,14 @@ suite("Quality gate runner", () => {
         crypto.createHash("sha256").update("safe-child-environment").digest("hex")
       );
       for (const name of syntheticNames) {
-        assert.strictEqual(JSON.stringify(execution).includes(process.env[name]), false);
-        assert.strictEqual(JSON.stringify(receipt).includes(process.env[name]), false);
+        assert.strictEqual(JSON.stringify(execution).includes(syntheticEnvironment[name]), false);
+        assert.strictEqual(JSON.stringify(receipt).includes(syntheticEnvironment[name]), false);
       }
+      assert.strictEqual(
+        fs.readdirSync(temporaryRoot).some(name => name.startsWith("cloudsmith-non-auth-")),
+        false
+      );
     } finally {
-      for (const name of syntheticNames) {
-        if (previous[name] === undefined) delete process.env[name];
-        else process.env[name] = previous[name];
-      }
       fs.rmSync(temporaryRoot, { recursive: true, force: true });
     }
   });
@@ -1841,6 +3654,266 @@ suite("Quality gate runner", () => {
       );
     } finally {
       fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("report receipt loading rejects symlink and FIFO substitutions at open", function () {
+    const substitutions = process.platform === "win32"
+      ? ["symlink"]
+      : ["symlink", "fifo"];
+    for (const kind of substitutions) {
+      const fixture = createEvidenceHandoffFixture();
+      const relative = receiptPath(fixture.summary.steps[0]);
+      const fixtureRoot = fs.realpathSync(fixture.root);
+      const target = path.join(fixtureRoot, relative);
+      const displaced = `${target}.original`;
+      const replacement = `${target}.${kind}`;
+      const outside = path.join(fixtureRoot, `outside-${kind}.json`);
+      const fileSystem = Object.create(fs);
+      const originalOpen = fs.openSync;
+      const originalRead = fs.readSync;
+      let swapped = false;
+      let readCalls = 0;
+      try {
+        if (kind === "symlink") {
+          fs.writeFileSync(outside, fs.readFileSync(target));
+          fs.symlinkSync(outside, replacement);
+        } else {
+          const made = spawnSync("mkfifo", [replacement], { encoding: "utf8" });
+          assert.strictEqual(made.status, 0, made.stderr);
+        }
+        fileSystem.openSync = function substituteReceiptAtOpen(file, flags, ...rest) {
+          if (!swapped && file === target) {
+            fs.renameSync(target, displaced);
+            fs.renameSync(replacement, target);
+            swapped = true;
+          }
+          return originalOpen.call(fs, file, flags, ...rest);
+        };
+        fileSystem.readSync = function countReceiptReads(...arguments_) {
+          readCalls += 1;
+          return originalRead.call(fs, ...arguments_);
+        };
+        assert.throws(
+          () => loadReportInputs({
+            fileSystem,
+            profile: fixture.profile,
+            root: fixture.root,
+            source: fixture.source,
+          }),
+          /Quality report input is unsafe or changed/u,
+        );
+        assert.strictEqual(swapped, true, `${kind} substitution did not run`);
+        assert.strictEqual(readCalls, 0, `${kind} replacement was read`);
+      } finally {
+        fixture.cleanup();
+      }
+    }
+  });
+
+  test("report artifact loading caps reads at the opened size and rejects growth", () => {
+    const fixture = createEvidenceHandoffFixture();
+    const target = path.join(fs.realpathSync(fixture.root), ".quality/impact.json");
+    const openedBytes = fs.lstatSync(target).size;
+    const fileSystem = Object.create(fs);
+    const originalOpen = fs.openSync;
+    const originalRead = fs.readSync;
+    let targetDescriptor;
+    let grew = false;
+    let requestedBytes = 0;
+    fileSystem.openSync = function rememberImpactDescriptor(file, flags, ...rest) {
+      const descriptor = originalOpen.call(fs, file, flags, ...rest);
+      if (file === target) targetDescriptor = descriptor;
+      return descriptor;
+    };
+    fileSystem.readSync = function growImpactDuringRead(
+      descriptor,
+      buffer,
+      offset,
+      length,
+      position,
+    ) {
+      if (descriptor === targetDescriptor) {
+        requestedBytes += length;
+        if (!grew) {
+          fs.appendFileSync(target, "synthetic post-open growth\n");
+          grew = true;
+        }
+      }
+      return originalRead.call(fs, descriptor, buffer, offset, length, position);
+    };
+    try {
+      assert.throws(
+        () => loadReportInputs({
+          fileSystem,
+          profile: fixture.profile,
+          root: fixture.root,
+          source: fixture.source,
+        }),
+        /Quality report input is unsafe or changed: \.quality\/impact\.json/u,
+      );
+      assert.strictEqual(grew, true);
+      assert.ok(requestedBytes <= openedBytes, `${requestedBytes} exceeded ${openedBytes}`);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("evidence handoff rejects a same-byte gate summary replacement at open", () => {
+    const fixture = createEvidenceHandoffFixture();
+    const target = path.join(
+      fs.realpathSync(fixture.root),
+      `.quality/gates/${fixture.profile}.json`,
+    );
+    const displaced = `${target}.original`;
+    const replacement = `${target}.replacement`;
+    fs.copyFileSync(target, replacement);
+    const fileSystem = Object.create(fs);
+    const originalOpen = fs.openSync;
+    const originalRead = fs.readSync;
+    let swapped = false;
+    let readCalls = 0;
+    fileSystem.openSync = function substituteSummaryAtOpen(file, flags, ...rest) {
+      if (!swapped && file === target) {
+        fs.renameSync(target, displaced);
+        fs.renameSync(replacement, target);
+        swapped = true;
+      }
+      return originalOpen.call(fs, file, flags, ...rest);
+    };
+    fileSystem.readSync = function countSummaryReads(...arguments_) {
+      readCalls += 1;
+      return originalRead.call(fs, ...arguments_);
+    };
+    try {
+      assert.throws(
+        () => verifyEvidenceHandoff({
+          fileSystem,
+          profile: fixture.profile,
+          readSource: () => fixture.source,
+          root: fixture.root,
+          source: fixture.source,
+        }),
+        /Evidence file is unsafe or changed: \.quality\/gates\/fast\.json/u,
+      );
+      assert.strictEqual(swapped, true);
+      assert.strictEqual(readCalls, 0);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("evidence handoff rejects a coherent report-generation swap after initial validation", () => {
+    const fixture = createEvidenceHandoffFixture();
+    const fixtureRoot = fs.realpathSync(fixture.root);
+    const evidenceReceipt = fixture.summary.steps.find(receipt => (
+      receipt.stepId === "standalone-tests"
+    ));
+    const evidencePath = path.join(
+      fixtureRoot,
+      ...getGatePlan(fixture.profile)
+        .find(step => step.id === "standalone-tests")
+        .evidencePath.split("/"),
+    );
+    const receiptFile = path.join(fixtureRoot, ...receiptPath(evidenceReceipt).split("/"));
+    const reportJson = path.join(fixtureRoot, ".quality/report.json");
+    const reportMarkdown = path.join(fixtureRoot, ".quality/report.md");
+    const targets = [evidencePath, receiptFile, reportJson, reportMarkdown];
+    const generationA = new Map(targets.map(target => [target, fs.readFileSync(target)]));
+    const generationB = new Map();
+    const fileSystem = Object.create(fs);
+    const originalLstat = fs.lstatSync;
+    let swapped = false;
+    try {
+      const replacementEvidence = clone(evidenceReceipt.testEvidence);
+      replacementEvidence.tests[0].title = "generation B title";
+      replacementEvidence.tests[0].fullTitle = "generation B full title";
+      const replacementEvidenceBytes = testEvidenceFileBytes(replacementEvidence);
+      fs.writeFileSync(evidencePath, replacementEvidenceBytes);
+      const replacementReceipt = clone(evidenceReceipt);
+      replacementReceipt.testEvidence = replacementEvidence;
+      replacementReceipt.testEvidenceFingerprint = crypto.createHash("sha256")
+        .update(replacementEvidenceBytes)
+        .digest("hex");
+      writeJson(receiptPath(replacementReceipt), replacementReceipt, fixtureRoot);
+      const replacementReport = generateReport(loadReportInputs({
+        profile: fixture.profile,
+        root: fixture.root,
+        source: fixture.source,
+      }));
+      writeReport(replacementReport, { root: fixture.root });
+      for (const target of targets) generationB.set(target, fs.readFileSync(target));
+      assert.strictEqual(generationB.get(reportJson).equals(generationA.get(reportJson)), false);
+      for (const target of targets) fs.writeFileSync(target, generationA.get(target));
+
+      fileSystem.lstatSync = function swapGenerationAtReportRead(target, ...arguments_) {
+        if (!swapped && target === reportJson) {
+          for (const candidate of targets) {
+            fs.writeFileSync(candidate, generationB.get(candidate));
+          }
+          swapped = true;
+        }
+        return originalLstat.call(fs, target, ...arguments_);
+      };
+      assert.throws(
+        () => verifyEvidenceHandoff({
+          fileSystem,
+          profile: fixture.profile,
+          readSource: () => fixture.source,
+          root: fixture.root,
+          source: fixture.source,
+        }),
+        /bundle bytes do not match|Gate receipts changed|generation changed/u,
+      );
+      assert.strictEqual(swapped, true);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("findings loading rejects symlinks and growth without over-reading", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-findings-boundary-",
+    )));
+    const target = path.join(scratch, "findings.jsonl");
+    const linked = path.join(scratch, "findings-link.jsonl");
+    const bytes = Buffer.from("{\"synthetic\":true}\n");
+    fs.writeFileSync(target, bytes);
+    fs.symlinkSync(target, linked);
+    try {
+      assert.throws(
+        () => readBoundedFindingsBytes(linked),
+        /bounded single-link regular file/u,
+      );
+
+      const openedBytes = fs.lstatSync(target).size;
+      const fileSystem = Object.create(fs);
+      const originalRead = fs.readSync;
+      let grew = false;
+      let requestedBytes = 0;
+      fileSystem.readSync = function growFindingsDuringRead(
+        descriptor,
+        buffer,
+        offset,
+        length,
+        position,
+      ) {
+        requestedBytes += length;
+        if (!grew) {
+          fs.appendFileSync(target, "synthetic post-open growth\n");
+          grew = true;
+        }
+        return originalRead.call(fs, descriptor, buffer, offset, length, position);
+      };
+      assert.throws(
+        () => readBoundedFindingsBytes(target, { fileSystem }),
+        /bounded single-link regular file/u,
+      );
+      assert.strictEqual(grew, true);
+      assert.ok(requestedBytes <= openedBytes, `${requestedBytes} exceeded ${openedBytes}`);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
     }
   });
 
@@ -2089,15 +4162,16 @@ suite("Quality gate runner", () => {
         execute(step) {
           called.push(step.id);
           const blocked = ["black-box-ui-smoke", "release-checklist"].includes(step.id);
+          const artifactFingerprint = materializeStepArtifacts(step, temporaryRoot);
+          const evidence = materializeStepTestEvidence(step, temporaryRoot);
           return {
             status: blocked ? 2 : 0,
             signal: null,
             stdout: "",
             stderr: "",
-            testEvidence: step.evidencePath ? testEvidence(step) : null,
-            artifactFingerprint: step.artifactPath || step.artifactPaths
-              ? "b".repeat(64)
-              : null,
+            testEvidence: evidence.value,
+            testEvidenceFingerprint: evidence.fingerprint,
+            artifactFingerprint,
           };
         },
       });
@@ -4542,39 +6616,56 @@ suite("Quality contract verifier fixtures", function () {
   test("rejects signed-out UI workflow bypasses and profile uploads", () => {
     const deepWorkflowPath = ".github/workflows/deep-quality.yml";
     const deepWorkflow = fs.readFileSync(path.join(root, deepWorkflowPath), "utf8");
+    const exactUiUploadPaths = [
+      "          path: |-",
+      "            .quality/upload/signed-out-ui/evidence.json",
+      "            .quality/upload/signed-out-ui/result.json",
+      "            .quality/upload/signed-out-ui/ui-candidate.json",
+      "            .quality/upload/signed-out-ui/ui-candidate.vsix",
+    ].join("\n");
     const uiError =
       "Deep CI must bind and secret-scan signed-out packaged UI evidence before upload.";
     const mutations = [
       deepWorkflow.replace(
-        "run: xvfb-run -a npm run test:ui:smoke",
-        "run: npm run test:ui:smoke"
+        "run: npm run test:ui:smoke",
+        "run: xvfb-run -a npm run test:ui:smoke"
       ),
       deepWorkflow.replace(
         "run: node scripts/quality/verify-ui-evidence.js",
         "run: npm run quality:report"
       ),
       deepWorkflow.replace(
-        "run: npm run quality:secrets:evidence",
+        "run: npm run quality:secrets:signed-out-evidence",
         "run: npm run quality:secrets:current"
       ),
       deepWorkflow.replace(
-        "if: ${{ always() && steps.ui_evidence_handoff.outcome == 'success' && steps.ui_evidence_secret_scan.outcome == 'success' }}",
-        "if: ${{ always() }}"
+        "run: node scripts/quality/verify-ui-evidence.js --bundle .quality/upload/signed-out-ui",
+        "run: node scripts/quality/verify-ui-evidence.js"
       ),
       deepWorkflow.replace(
-        "            .quality/secrets/evidence.json\n",
-        "            .quality/secrets/evidence.json\n            .quality/qualification-profile\n"
+        "        env:\n          EXPECTED_SOURCE_SHA: ${{ github.sha }}\n        run: node scripts/quality/verify-ui-evidence.js --bundle .quality/upload/signed-out-ui",
+        "        env:\n          EXPECTED_SOURCE_SHA: invented\n        run: node scripts/quality/verify-ui-evidence.js --bundle .quality/upload/signed-out-ui"
+      ),
+      deepWorkflow.replace(
+        "if: ${{ always() && steps.ui_evidence_handoff.outcome == 'success' && steps.ui_evidence_secret_scan.outcome == 'success' && steps.ui_evidence_bundle.outcome == 'success' }}",
+        "if: ${{ always() }}"
+      ),
+      deepWorkflow.replace(exactUiUploadPaths, "          path: .quality/upload/signed-out-ui"),
+      deepWorkflow.replace(exactUiUploadPaths, "          path: .quality/qualification/ui-candidate.vsix"),
+      deepWorkflow.replace(
+        exactUiUploadPaths,
+        `${exactUiUploadPaths}\n            .quality/upload/signed-out-ui/unexpected.txt`,
       ),
       deepWorkflow.replace(
         "  signed-out-black-box-ui:\n    name: Signed-out packaged black-box UI\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    steps:\n      - name: Checkout exact source\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          fetch-depth: 0\n          persist-credentials: false",
         "  signed-out-black-box-ui:\n    name: Signed-out packaged black-box UI\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    steps:\n      - name: Checkout exact source\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          persist-credentials: false"
       ),
     ];
-    for (const changed of mutations) {
+    for (const [index, changed] of mutations.entries()) {
       assert.ok(verifyQualityContracts({
         root,
         sourceOverrides: { [deepWorkflowPath]: changed },
-      }).errors.includes(uiError));
+      }).errors.includes(uiError), `signed-out workflow mutation ${index}`);
     }
   });
 
