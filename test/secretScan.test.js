@@ -9,7 +9,12 @@ const path = require("path");
 const yazl = require("yazl");
 const { writeJson } = require("../scripts/quality/common");
 const { fingerprint } = require("../scripts/quality/evidence");
-const { getGatePlan } = require("../scripts/quality/gate");
+const {
+  artifactFingerprintForStep,
+  getGatePlan,
+  receiptPath,
+} = require("../scripts/quality/gate");
+const TEST_INVENTORIES = require("./testInventories");
 const {
   LIVE_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_ARTIFACT,
@@ -61,6 +66,31 @@ const {
   validateGeneratedEvidenceAcceptance,
   validateReleaseExposureProof,
 } = require("../scripts/quality/release-exposure-scan");
+
+const ROOT = path.resolve(__dirname, "..");
+const NODE_VERSION_BYTES = fs.readFileSync(path.join(ROOT, ".node-version"));
+const NPM_VERSION_BYTES = fs.readFileSync(path.join(ROOT, ".npm-version"));
+const NPM_INTEGRITY_BYTES = fs.readFileSync(path.join(ROOT, ".npm-integrity"));
+const NODE_VERSION = NODE_VERSION_BYTES.toString("utf8").trim();
+const NPM_VERSION = NPM_VERSION_BYTES.toString("utf8").trim();
+const NPM_INTEGRITY = JSON.parse(NPM_INTEGRITY_BYTES.toString("utf8"));
+
+function writeToolchainPins(root) {
+  fs.writeFileSync(path.join(root, ".node-version"), NODE_VERSION_BYTES);
+  fs.writeFileSync(path.join(root, ".npm-version"), NPM_VERSION_BYTES);
+  fs.writeFileSync(path.join(root, ".npm-integrity"), NPM_INTEGRITY_BYTES);
+}
+
+function fixtureToolchain() {
+  return {
+    nodeVersion: `v${NODE_VERSION}`,
+    npmVersion: NPM_VERSION,
+    npmInstallationSha256: NPM_INTEGRITY[
+      process.platform === "win32" ? "win32" : "posix"
+    ],
+    platform: process.platform,
+  };
+}
 
 function syntheticGeneratedEvidence(count = 1) {
   return {
@@ -121,6 +151,7 @@ async function createUiCandidateScanFixture(root) {
   });
   fs.mkdirSync(path.join(root, ".quality", "qualification"), { recursive: true });
   fs.mkdirSync(path.join(root, ".quality", "ui"), { recursive: true });
+  writeToolchainPins(root);
   fs.writeFileSync(path.join(root, "package.json"), `${JSON.stringify({
     publisher: "Cloudsmith",
     name: "cloudsmith-vsc",
@@ -138,11 +169,12 @@ async function createUiCandidateScanFixture(root) {
   const artifactBytes = fs.readFileSync(artifactPath);
   const artifactSha256 = crypto.createHash("sha256").update(artifactBytes).digest("hex");
   const receiptBase = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     status: "passed",
     capturedAt: "2026-08-27T12:00:00.000Z",
     source,
     repository: { branch: "test/release-quality-harness", dirty: true, status: "dirty" },
+    toolchain: fixtureToolchain(),
     extension: {
       id: "Cloudsmith.cloudsmith-vsc",
       publisher: "Cloudsmith",
@@ -249,6 +281,7 @@ function createReleaseExposureFixture(root) {
   fs.mkdirSync(path.join(root, ".quality", "ui"), { recursive: true });
   fs.mkdirSync(path.join(root, "quality"), { recursive: true });
   fs.mkdirSync(path.join(root, "internal_docs", "quality"), { recursive: true });
+  writeToolchainPins(root);
   fs.writeFileSync(path.join(root, "package.json"), `${JSON.stringify({
     publisher: "Cloudsmith",
     name: "cloudsmith-vsc",
@@ -267,11 +300,12 @@ function createReleaseExposureFixture(root) {
   }));
   const outputPath = path.join(root, "out", "development", "cloudsmith-vsc-2.3.0.vsix");
   const receiptBase = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     status: "passed",
     capturedAt: "2026-08-27T12:00:00.000Z",
     source,
     repository: { branch: "test/release-quality-harness", dirty: true, status: "dirty" },
+    toolchain: fixtureToolchain(),
     extension: {
       id: "Cloudsmith.cloudsmith-vsc",
       publisher: "Cloudsmith",
@@ -402,6 +436,83 @@ function createReleaseExposureFixture(root) {
     ui,
     uiBytes,
   };
+}
+
+function writeReleaseProgressAtSecretScan(root, source) {
+  const plan = getGatePlan("release");
+  const inventoryByStep = {
+    "standalone-tests": TEST_INVENTORIES.STANDALONE_NODE_TESTS,
+    "extension-host-core": TEST_INVENTORIES.VSCODE_CORE_TESTS,
+    "extension-host-smoke": TEST_INVENTORIES.VSCODE_SMOKE_TESTS,
+  };
+  let reachedExposureScan = false;
+  for (const step of plan) {
+    if (step.id === "secret-release") reachedExposureScan = true;
+    let receipt = {
+      profile: "release",
+      schemaVersion: 1,
+      sequence: step.sequence,
+      stepId: step.id,
+      category: step.category,
+      command: step.command,
+      source,
+      status: "not-run",
+      exitCode: null,
+      signal: null,
+      reason: "not-started",
+      testCounts: null,
+      artifactFingerprint: null,
+    };
+    if (!reachedExposureScan) {
+      let testEvidence = null;
+      let testEvidenceFingerprint = null;
+      if (step.evidencePath) {
+        const tests = inventoryByStep[step.id].map(file => ({
+          file,
+          title: `synthetic ${file}`,
+          fullTitle: `synthetic suite ${file}`,
+          status: "passed",
+        }));
+        testEvidence = {
+          schemaVersion: 1,
+          source,
+          suite: step.id,
+          counts: { passed: tests.length, failed: 0, pending: 0 },
+          tests,
+        };
+        writeJson(step.evidencePath, testEvidence, root, {
+          subtree: ".quality/test-results",
+        });
+        testEvidenceFingerprint = crypto.createHash("sha256")
+          .update(`${JSON.stringify(testEvidence, null, 2)}\n`)
+          .digest("hex");
+      }
+      for (const artifactPath of [
+        ...(step.artifactPaths || []),
+        ...(step.artifactPath ? [step.artifactPath] : []),
+      ]) {
+        const target = path.join(root, ...artifactPath.split("/"));
+        if (!fs.existsSync(target)) {
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          fs.writeFileSync(target, `synthetic ${step.id} artifact\n`);
+        }
+      }
+      receipt = {
+        ...receipt,
+        status: "passed",
+        exitCode: 0,
+        reason: null,
+        outputFingerprint: crypto.createHash("sha256").update("").digest("hex"),
+        testEvidence,
+        testEvidenceFingerprint,
+        artifactFingerprint: artifactFingerprintForStep(step, root),
+      };
+    }
+    writeJson(receiptPath(receipt), receipt, root, {
+      subtree: ".quality/gates/release",
+    });
+  }
+  return plan;
 }
 
 function makeTreeRemovable(root) {
@@ -1747,6 +1858,57 @@ suite("secret exposure gate", () => {
       scanWithGitleaks() { return []; },
     });
     const stage = path.join(scratch, ...SIGNED_OUT_BUNDLE_DIRECTORY.split("/"));
+    const forgedParent = fs.realpathSync(fs.mkdtempSync(path.join(
+      scratch,
+      "verify-toolchain-",
+    )));
+    const forgedBundle = path.join(forgedParent, "bundle");
+    fs.cpSync(stage, forgedBundle, { recursive: true });
+    if (process.platform !== "win32") {
+      fs.chmodSync(forgedBundle, 0o700);
+      for (const name of SIGNED_OUT_BUNDLE_NAMES) {
+        fs.chmodSync(path.join(forgedBundle, name), 0o600);
+      }
+    }
+    const candidatePath = path.join(forgedBundle, "ui-candidate.json");
+    const forgedCandidate = JSON.parse(fs.readFileSync(candidatePath, "utf8"));
+    forgedCandidate.toolchain.npmInstallationSha256 = "0".repeat(64);
+    const candidateUnsigned = { ...forgedCandidate };
+    delete candidateUnsigned.fingerprint;
+    forgedCandidate.fingerprint = fingerprint(candidateUnsigned);
+    const forgedCandidateBytes = Buffer.from(`${JSON.stringify(forgedCandidate, null, 2)}\n`);
+    fs.writeFileSync(candidatePath, forgedCandidateBytes);
+
+    const evidencePath = path.join(forgedBundle, "evidence.json");
+    const forgedEvidence = JSON.parse(fs.readFileSync(evidencePath, "utf8"));
+    forgedEvidence.candidate.receiptFingerprint = forgedCandidate.fingerprint;
+    forgedEvidence.candidate.receiptSha256 = crypto.createHash("sha256")
+      .update(forgedCandidateBytes)
+      .digest("hex");
+    forgedEvidence.bundle.candidateReceiptFingerprint = forgedCandidate.fingerprint;
+    const candidateFile = forgedEvidence.bundle.files.find(
+      entry => entry.name === "ui-candidate.json",
+    );
+    candidateFile.bytes = forgedCandidateBytes.length;
+    candidateFile.sha256 = forgedEvidence.candidate.receiptSha256;
+    const evidenceUnsigned = { ...forgedEvidence };
+    delete evidenceUnsigned.fingerprint;
+    forgedEvidence.fingerprint = fingerprint(evidenceUnsigned);
+    const forgedEvidenceBytes = Buffer.from(`${JSON.stringify(forgedEvidence, null, 2)}\n`);
+    assert.strictEqual(forgedEvidenceBytes.length, forgedEvidence.bundle.receipt.bytes);
+    fs.writeFileSync(evidencePath, forgedEvidenceBytes);
+    if (process.platform !== "win32") {
+      for (const name of SIGNED_OUT_BUNDLE_NAMES) {
+        fs.chmodSync(path.join(forgedBundle, name), 0o400);
+      }
+      fs.chmodSync(forgedBundle, 0o500);
+    }
+    assert.throws(() => verifyDetachedSignedOutUiBundle({
+      bundleRoot: forgedBundle,
+      contractRoot: scratch,
+      expectedSourceSha: fixture.source.sha,
+    }), /toolchain provenance is stale or mismatched/u);
+
     for (const mutation of ["add", "change", "delete", "different", "same"]) {
       const parent = fs.realpathSync(fs.mkdtempSync(path.join(scratch, `verify-${mutation}-`)));
       const bundle = path.join(parent, "bundle");
@@ -3101,30 +3263,21 @@ suite("secret exposure gate", () => {
     assert.strictEqual(descriptorReads, 0);
   });
 
-  test("completed canonical release outputs preserve the exact pre-acceptance proof", () => {
+  test("planned canonical release outputs preserve the exact pre-acceptance proof", () => {
     const fixture = createReleaseExposureFixture(scratch);
+    const releasePlan = writeReleaseProgressAtSecretScan(scratch, fixture.source);
     const stableReceiptPaths = RELEASE_GATE_EXPECTED_PATHS.filter(relativePath => (
       !RELEASE_GATE_CIRCULAR_PATHS.includes(relativePath)
     ));
-    for (const relativePath of stableReceiptPaths) {
-      const target = path.join(scratch, ...relativePath.split("/"));
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, "stable pre-boundary receipt\n");
-    }
-    const manifest = captureGeneratedEvidenceManifest(scratch);
-    fs.mkdirSync(path.join(scratch, ".quality", "secrets"), { recursive: true });
-    for (const relativePath of RELEASE_GATE_CIRCULAR_PATHS) {
-      const target = path.join(scratch, ...relativePath.split("/"));
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, "{}\n");
-    }
-    fs.writeFileSync(path.join(scratch, ".quality", "secrets", "release.json"), "{}\n");
-    fs.writeFileSync(path.join(scratch, ".quality", "secrets", "history.json"), "{}\n");
-    fs.writeFileSync(path.join(scratch, ".quality", "report.json"), "{}\n");
-    fs.writeFileSync(path.join(scratch, ".quality", "report.md"), "# Synthetic report\n");
+    const manifest = captureGeneratedEvidenceManifest(scratch, null, {
+      source: fixture.source,
+    });
 
-    assert.strictEqual(validateGeneratedEvidenceAcceptance(scratch, manifest), true);
-    const releasePlan = getGatePlan("release");
+    assert.strictEqual(validateGeneratedEvidenceAcceptance(
+      scratch,
+      manifest,
+      { source: fixture.source },
+    ), true);
     assert.deepStrictEqual(
       releasePlan.slice(releasePlan.findIndex(step => step.id === "secret-release"))
         .map(step => step.id),
@@ -3161,6 +3314,26 @@ suite("secret exposure gate", () => {
     )));
   });
 
+  test("release progress rejects forged receipts without preserved fast or full trees", () => {
+    const fixture = createReleaseExposureFixture(scratch);
+    const releasePlan = writeReleaseProgressAtSecretScan(scratch, fixture.source);
+    const first = releasePlan[0];
+    const relativePath = receiptPath({
+      profile: "release",
+      sequence: first.sequence,
+      stepId: first.id,
+    });
+    const target = path.join(scratch, ...relativePath.split("/"));
+    const forged = JSON.parse(fs.readFileSync(target, "utf8"));
+    forged.exitCode = 7;
+    writeJson(relativePath, forged, scratch, { subtree: ".quality/gates/release" });
+
+    assert.throws(
+      () => generatedEvidenceInventory(scratch, { source: fixture.source }),
+      /unexpected, stale, or unsafe entry/u,
+    );
+  });
+
   test("exact circular report outputs cannot hide rogue descendants", () => {
     for (const relativePath of [
       ".quality/report.json",
@@ -3180,7 +3353,7 @@ suite("secret exposure gate", () => {
     }
   });
 
-  test("generated release evidence rejects every unowned gate-tree entry", () => {
+  test("generated release evidence rejects every orphaned or unowned gate-tree entry", () => {
     for (const relativePath of [
       ".quality/gates/fast.json",
       ".quality/gates/release/99-unowned.json",
@@ -3193,7 +3366,7 @@ suite("secret exposure gate", () => {
       fs.writeFileSync(target, "synthetic gate bytes\n");
       assert.throws(
         () => generatedEvidenceInventory(caseRoot),
-        /unexpected or unsafe entry/u,
+        /unexpected, stale, or unsafe entry/u,
         relativePath,
       );
     }

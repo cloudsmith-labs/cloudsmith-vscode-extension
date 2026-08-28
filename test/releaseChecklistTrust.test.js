@@ -84,6 +84,12 @@ function createFixture() {
     name: "cloudsmith-vsc",
     version: "2.3.0",
   })}\n`);
+  fs.writeFileSync(path.join(root, ".node-version"), "22.23.2\n");
+  fs.writeFileSync(path.join(root, ".npm-version"), "10.9.8\n");
+  fs.writeFileSync(path.join(root, ".npm-integrity"), `${JSON.stringify({
+    posix: "4".repeat(64),
+    win32: "4".repeat(64),
+  })}\n`);
   for (const filename of [
     "critical-workflows.json",
     "defect-taxonomy.json",
@@ -152,7 +158,7 @@ function createFixture() {
   fs.mkdirSync(path.dirname(repositoryArtifactPath), { recursive: true });
   fs.writeFileSync(repositoryArtifactPath, candidateBytes);
   const candidateBase = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     status: "passed",
     capturedAt: CAPTURED_AT,
     source: SOURCE,
@@ -160,6 +166,12 @@ function createFixture() {
       branch: "test/release-quality-harness",
       dirty: true,
       status: "dirty",
+    },
+    toolchain: {
+      nodeVersion: "v22.23.2",
+      npmVersion: "10.9.8",
+      npmInstallationSha256: "4".repeat(64),
+      platform: "darwin",
     },
     extension: {
       id: "Cloudsmith.cloudsmith-vsc",

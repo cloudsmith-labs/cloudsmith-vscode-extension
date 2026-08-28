@@ -30,6 +30,7 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/installCommandBuilder.test.js",
   "test/installGuidanceSupport.test.js",
   "test/manifestParser.test.js",
+  "test/mutationEntrypoint.test.js",
   "test/packageDomain.test.js",
   "test/packageActionCapabilities.test.js",
   "test/packageQuery.test.js",

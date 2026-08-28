@@ -294,15 +294,16 @@ function verifyDetachedSignedOutUiBundle(options = {}) {
       captured.get("result.json"),
       "Detached signed-out UI result is not canonical JSON.",
     );
+    const contractRoot = options.contractRoot || ROOT;
     const candidate = candidateBindingFromReceipt(candidateReceipt, {
       source: binding.source,
       artifactPath: path.join(bundle.root, "ui-candidate.vsix"),
+      toolchainRoot: contractRoot,
     });
     if (candidate.receiptFingerprint !== binding.candidateReceiptFingerprint
       || candidate.vsixSha256 !== captured.get("ui-candidate.vsix").sha256) {
       throw new Error("Detached signed-out UI candidate proof is stale or mismatched.");
     }
-    const contractRoot = options.contractRoot || ROOT;
     const manifest = options.manifest || readJson("package.json", contractRoot);
     const workflows = options.workflows || readJson("quality/critical-workflows.json", contractRoot);
     const errors = validateUiResult(ui, binding.source, expectedBlackBoxUiTests(workflows), {

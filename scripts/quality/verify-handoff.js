@@ -132,6 +132,63 @@ function readValidatedGateGeneration(context) {
   });
 }
 
+function validateGateGenerationSemantics(summary, context) {
+  validateSummary(summary, context);
+  for (let index = 0; index < context.plan.length; index += 1) {
+    validateReceipt(summary.steps[index], context.plan[index], context);
+  }
+  validateReceiptSequence(summary.steps, context.plan);
+  return true;
+}
+
+function validateGateGenerationProgress(receipts, context) {
+  if (!Array.isArray(receipts) || receipts.length !== context.plan.length) {
+    throw new Error("Gate receipt progress does not match the exact gate plan.");
+  }
+  for (let index = 0; index < context.plan.length; index += 1) {
+    validateReceipt(receipts[index], context.plan[index], context);
+  }
+  let blocker = null;
+  let pending = false;
+  for (let index = 0; index < context.plan.length; index += 1) {
+    const step = context.plan[index];
+    const receipt = receipts[index];
+    if (blocker && !step.runWhenBlocked) {
+      if (receipt.status !== "not-run" || receipt.reason !== `blocked-by:${blocker}`) {
+        throw new Error(`Gate receipt ${step.id} does not preserve blocker ordering.`);
+      }
+      continue;
+    }
+    if (receipt.status === "not-run") {
+      if (receipt.reason !== "not-started") {
+        throw new Error(`Gate receipt ${step.id} has invalid pending execution evidence.`);
+      }
+      pending = true;
+      continue;
+    }
+    if (pending) {
+      throw new Error(`Gate receipt ${step.id} completed after a pending plan slot.`);
+    }
+    if (!blocker && ["failed", "blocked"].includes(receipt.status)) blocker = step.id;
+  }
+  return true;
+}
+
+function validateGateStepArtifactClaim(receipt, step) {
+  const artifactPaths = stepArtifactPaths(step);
+  if (artifactPaths.length === 0) {
+    if (receipt.artifactFingerprint !== null) {
+      throw new Error(`Gate receipt ${step.id} claims an undeclared artifact.`);
+    }
+    return true;
+  }
+  if (receipt.artifactFingerprint !== null
+    && !/^[a-f0-9]{64}$/u.test(receipt.artifactFingerprint || "")) {
+    throw new Error(`Gate receipt ${step.id} has an invalid artifact fingerprint.`);
+  }
+  return true;
+}
+
 function validateReportBundleBytes(receipt, step, jsonBytes, markdownBytes) {
   const bytesByPath = new Map([
     [".quality/report.json", jsonBytes],
@@ -274,9 +331,13 @@ function validateReceipt(receipt, step, context) {
     && !/^[a-f0-9]{64}$/u.test(receipt.outputFingerprint || "")) {
     throw new Error(`Gate receipt ${step.id} has an invalid output fingerprint.`);
   }
-  const completedKeys = ["outputFingerprint", "testEvidence", "testEvidenceFingerprint"]
-    .every(key => Object.prototype.hasOwnProperty.call(receipt, key));
-  if ((receipt.status === "not-run" && completedKeys)
+  const completionFields = ["outputFingerprint", "testEvidence", "testEvidenceFingerprint"];
+  const completedFieldCount = completionFields.filter(key => (
+    Object.prototype.hasOwnProperty.call(receipt, key)
+  )).length;
+  const completedKeys = completedFieldCount === completionFields.length;
+  if ((completedFieldCount > 0 && !completedKeys)
+    || (receipt.status === "not-run" && completedKeys)
     || (receipt.status !== "not-run" && !completedKeys)) {
     throw new Error(`Gate receipt ${step.id} completion fields are inconsistent.`);
   }
@@ -426,6 +487,11 @@ if (require.main === module) main();
 module.exports = {
   parseArguments,
   readCanonicalJson,
+  validateGateGenerationProgress,
+  validateGateGenerationSemantics,
+  validateGateStepArtifactClaim,
+  validateStepArtifacts,
+  validateStepTestEvidence,
   validateReportExecution,
   verifyEvidenceHandoff,
 };

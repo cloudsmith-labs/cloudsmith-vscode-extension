@@ -7,26 +7,97 @@ const {
   removeExactOwnedDirectoryTree,
   withNonAuthQualityEnvironment,
 } = require("../quality/non-auth-environment");
+const {
+  assertCanonicalNpmRuntime,
+  assertCanonicalNodeRuntime,
+  assertExactNodeExecutable,
+  assertNoNpmToolchainShadowing,
+  canonicalToolchainEnvironment,
+  withCanonicalNpmLauncher,
+} = require("../quality/canonical-node-runtime");
 const { assertVersionState } = require("./verify-version");
 const { validateSidecars, verifyVsix } = require("./verify-vsix");
 
 const root = path.resolve(__dirname, "../..");
+const VSCE_ENTRY_EVAL = "require(process.argv[1])(process.argv);";
+
+function exactAbsolutePath(value, errorMessage) {
+  if (typeof value !== "string" || !path.isAbsolute(value)
+    || path.resolve(value) !== value || path.normalize(value) !== value
+    || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error(errorMessage);
+  }
+  return value;
+}
+
+function canonicalVscePackageInvocation(outputPath, options = {}) {
+  const nodeExecutable = assertExactNodeExecutable(
+    options.nodeExecutable || process.execPath,
+  );
+  const vsceEntry = exactAbsolutePath(
+    options.vsceEntry || require.resolve("@vscode/vsce/out/main"),
+    "Canonical VSCE entry is invalid",
+  );
+  const output = exactAbsolutePath(outputPath, "Canonical VSCE output path is invalid");
+  return Object.freeze({
+    command: nodeExecutable,
+    arguments_: Object.freeze([
+      "--eval",
+      VSCE_ENTRY_EVAL,
+      vsceEntry,
+      "package",
+      "--no-dependencies",
+      "--out",
+      output,
+    ]),
+  });
+}
 
 function run(command, arguments_, options = {}) {
   const spawn = options.spawnSync || spawnSync;
+  const suppliedEnvironment = options.environment || process.env;
+  const nodeExecutable = options.nodeExecutable
+    ? assertExactNodeExecutable(options.nodeExecutable, { platform: options.platform })
+    : null;
+  const environment = nodeExecutable
+    ? canonicalToolchainEnvironment(suppliedEnvironment, {
+      nodeExecutable,
+      platform: options.platform,
+    })
+    : suppliedEnvironment;
+  const repositoryRoot = options.npm?.repositoryRoot
+    || options.repositoryRoot || options.cwd || root;
+  if (options.npm) {
+    if (!nodeExecutable) throw new Error("Canonical npm packaging requires an exact Node.js runtime");
+    if (options.repositoryRoot && options.repositoryRoot !== repositoryRoot) {
+      throw new Error("Canonical npm packaging repository binding is unsafe or invalid");
+    }
+    assertNoNpmToolchainShadowing(repositoryRoot, { platform: options.platform });
+  }
   return withNonAuthQualityEnvironment({
-    environment: options.environment || process.env,
+    environment,
     overrides: options.environmentOverrides || {},
     platform: options.platform,
     temporaryParent: options.temporaryParent,
-  }, environment => {
-    const result = spawn(command, arguments_, {
+  }, (boundaryEnvironment, boundary) => {
+    const spawnChild = launcher => spawn(command, arguments_, {
       cwd: options.cwd || root,
       encoding: "utf8",
       maxBuffer: 32 * 1024 * 1024,
       windowsHide: true,
-      env: environment,
+      env: nodeExecutable ? canonicalToolchainEnvironment(boundaryEnvironment, {
+        launcherDirectory: launcher?.directory,
+        nodeExecutable,
+        platform: options.platform,
+        scriptShell: launcher?.scriptShell,
+      }) : boundaryEnvironment,
     });
+    const result = options.npm ? withCanonicalNpmLauncher({
+      nodeExecutable,
+      npm: options.npm,
+      platform: options.platform,
+      temporaryParent: boundary.paths.temporary,
+    }, launcher => spawnChild(launcher)) : spawnChild(null);
     if (result.error || result.signal || result.status !== 0) {
       process.stderr.write(result.stdout || "");
       process.stderr.write(result.stderr || "");
@@ -77,17 +148,21 @@ function packageBuildDirectoryIdentity(directory) {
   return Object.freeze({ dev: stat.dev, ino: stat.ino });
 }
 
-function removePackageBuildDirectory(directory, identity) {
+function removePackageBuildDirectory(directory, identity, expectedRootEntries = []) {
   removeExactOwnedDirectoryTree(directory, {
-    allowAdditionalRootEntries: true,
     errorMessage: "Release package temporary cleanup refused an unsafe or changed tree.",
-    expectedRootEntries: [],
+    expectedRootEntries,
     expectedRootIdentity: identity,
   });
   return !fs.existsSync(directory);
 }
 
 async function main() {
+  assertCanonicalNodeRuntime(root, process.version);
+  const nodeExecutable = assertExactNodeExecutable(process.execPath);
+  canonicalToolchainEnvironment(process.env, { nodeExecutable });
+  const npm = assertCanonicalNpmRuntime(root, process.env.npm_execpath, { nodeExecutable });
+  assertNoNpmToolchainShadowing(root);
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
   const lockfile = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "utf8"));
   const changelog = fs.readFileSync(path.join(root, "CHANGELOG.md"), "utf8");
@@ -97,10 +172,6 @@ async function main() {
   }
 
   const requireClean = process.env.M9_REQUIRE_CLEAN === "1";
-  const canonicalNodeVersion = `v${fs.readFileSync(path.join(root, ".node-version"), "utf8").trim()}`;
-  if (requireClean && process.version !== canonicalNodeVersion) {
-    throw new Error(`Release packaging requires Node.js ${canonicalNodeVersion}`);
-  }
   const { clean, sourceSha } = assertCleanSource(requireClean, process.env.M9_SOURCE_SHA);
   const releaseBuild = requireClean && clean;
   const sourceCommitEpoch = Number(run("git", ["show", "-s", "--format=%ct", sourceSha]));
@@ -116,25 +187,36 @@ async function main() {
   const filename = `${name}-${version}.vsix`;
   const firstPath = resolveOutputPath(tempDirectory, `first-${filename}`);
   const secondPath = resolveOutputPath(tempDirectory, `second-${filename}`);
-  const vsce = path.join(root, "node_modules", ".bin", process.platform === "win32" ? "vsce.cmd" : "vsce");
   const environmentOverrides = {
     SOURCE_DATE_EPOCH: String(sourceCommitEpoch),
     TZ: "UTC",
   };
+  const buildResults = [];
+  const expectedBuildEntries = [];
 
   try {
+    const sourceReference = clean ? sourceSha : null;
     for (const outputPath of [firstPath, secondPath]) {
-      run(vsce, ["package", "--no-dependencies", "--out", outputPath], {
+      const invocation = canonicalVscePackageInvocation(outputPath);
+      run(invocation.command, invocation.arguments_, {
         environmentOverrides,
+        nodeExecutable,
+        npm,
+        repositoryRoot: root,
       });
       if (requireClean && gitStatus() !== "") {
         throw new Error("VSCE prepublish changed the clean source checkout");
       }
+      const verification = await verifyVsix(outputPath, { sourceSha: sourceReference });
+      buildResults.push(verification);
+      expectedBuildEntries.push(Object.freeze({
+        identity: verification.artifactIdentity,
+        kind: "file",
+        name: path.basename(outputPath),
+      }));
     }
 
-    const sourceReference = clean ? sourceSha : null;
-    const first = await verifyVsix(firstPath, { sourceSha: sourceReference });
-    const second = await verifyVsix(secondPath, { sourceSha: sourceReference });
+    const [first, second] = buildResults;
     if (first.sha256 !== second.sha256 || !first.buffer.equals(second.buffer)) {
       throw new Error("Two canonical VSIX builds from the same source were not byte-identical");
     }
@@ -145,7 +227,7 @@ async function main() {
     const checksumPath = `${outputPath}.sha256`;
     const provenancePath = `${outputPath}.provenance.json`;
     const provenance = {
-      schemaVersion: 1,
+      schemaVersion: 3,
       sourceSha,
       sourceCommitEpoch,
       sourceClean: clean,
@@ -159,7 +241,9 @@ async function main() {
       entryCount: first.entryCount,
       totalUncompressedBytes: first.totalUncompressedBytes,
       nodeVersion: process.version,
-      npmVersion: run(process.platform === "win32" ? "npm.cmd" : "npm", ["--version"]),
+      npmVersion: npm.version,
+      npmInstallationSha256: npm.installation.sha256,
+      platform: process.platform,
     };
 
     writeAtomically(outputPath, first.buffer);
@@ -199,7 +283,11 @@ async function main() {
       console.log("Release mode was not requested; this development artifact is explicitly non-publishable.");
     }
   } finally {
-    removePackageBuildDirectory(tempDirectory, tempDirectoryIdentity);
+    removePackageBuildDirectory(
+      tempDirectory,
+      tempDirectoryIdentity,
+      Object.freeze([...expectedBuildEntries]),
+    );
   }
 }
 
@@ -211,6 +299,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  canonicalVscePackageInvocation,
   packageBuildDirectoryIdentity,
   removePackageBuildDirectory,
   runPackageCommand: run,

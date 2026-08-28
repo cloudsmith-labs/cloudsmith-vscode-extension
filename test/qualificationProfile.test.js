@@ -59,6 +59,7 @@ function writeCandidateRepository(root, vscodeVersion = "1.131.0") {
     version: "2.3.0",
   };
   fs.writeFileSync(path.join(root, "package.json"), JSON.stringify(manifest));
+  fs.writeFileSync(path.join(root, ".node-version"), `${process.versions.node}\n`);
   fs.writeFileSync(path.join(root, "package-lock.json"), JSON.stringify({
     name: manifest.name,
     version: manifest.version,
@@ -76,6 +77,49 @@ function writeCandidateRepository(root, vscodeVersion = "1.131.0") {
     path.join(root, ".vscode-test.mjs"),
     "const version = process.env.VSCODE_TEST_VERSION || \"1.134.0\";\n",
   );
+}
+
+function qualificationNpmAdapters(root) {
+  const cliPath = path.join(root, "fixture-npm-cli.js");
+  const npm = Object.freeze({
+    cliPath,
+    installation: Object.freeze({ sha256: "4".repeat(64) }),
+    nodeExecutable: process.execPath,
+    repositoryRoot: root,
+    version: "10.9.8",
+  });
+  return {
+    assertCanonicalNpmRuntime(repositoryRoot, _claimedCli, options) {
+      assert.strictEqual(repositoryRoot, root);
+      assert.strictEqual(options.nodeExecutable, process.execPath);
+      assert.strictEqual(options.platform, process.platform);
+      return npm;
+    },
+    assertNoNpmToolchainShadowing(repositoryRoot, options) {
+      assert.strictEqual(repositoryRoot, root);
+      assert.strictEqual(options.platform, process.platform);
+      return true;
+    },
+    withCanonicalNpmLauncher(options, callback) {
+      assert.strictEqual(options.nodeExecutable, process.execPath);
+      assert.strictEqual(options.npm, npm);
+      assert.strictEqual(options.platform, process.platform);
+      return callback(Object.freeze({
+        directory: path.join(root, "fixture-npm-launcher"),
+        nodeCommand: process.platform === "win32" ? "node.cmd" : "node",
+        npmCommand: process.platform === "win32" ? "npm.cmd" : "npm",
+        npmCliPath: npm.cliPath,
+        scriptShell: null,
+      }));
+    },
+  };
+}
+
+function fixtureNpmArguments(root, command, arguments_) {
+  if (command !== process.execPath || arguments_[0] !== path.join(root, "fixture-npm-cli.js")) {
+    return null;
+  }
+  return arguments_.slice(1);
 }
 
 function packageOutputFixture() {
@@ -639,7 +683,10 @@ suite("qualification candidate isolation", () => {
       CLOUDSMITH_API_KEY: "must-not-pass",
       NODE_OPTIONS: "--require=unexpected",
     }, profile);
-    assert.strictEqual(environment.PATH, "/fixture/bin");
+    assert.deepStrictEqual(environment.PATH.split(path.delimiter), [
+      path.dirname(process.execPath),
+      "/fixture/bin",
+    ]);
     assert.strictEqual(environment.HOME, profile.homeDir);
     assert.strictEqual(environment.CLOUDSMITH_API_KEY, undefined);
     assert.strictEqual(environment.NODE_OPTIONS, undefined);
@@ -651,6 +698,32 @@ suite("qualification candidate isolation", () => {
       "--disable-updates", "--skip-welcome", "--skip-release-notes", "--new-window",
     ]);
     assert.strictEqual(arguments_.some(value => value.includes("extensionDevelopmentPath")), false);
+  });
+
+  test("Windows qualification environment canonicalizes Path and PATHEXT", () => {
+    const root = temporaryRoot();
+    const profile = {
+      mode: "ci",
+      root,
+      testResourcesDir: root,
+      homeDir: path.join(root, "home"),
+      userDataDir: path.join(root, "settings"),
+      extensionsDir: path.join(root, "extensions"),
+    };
+    const environment = qualificationEnvironment({
+      Path: "/fixture/git-bin",
+      Pathext: ".EXE;.CMD",
+    }, profile, null, "win32");
+    assert.strictEqual(environment.Path, undefined);
+    assert.deepStrictEqual(environment.PATH.split(path.delimiter), [
+      path.dirname(process.execPath),
+      "/fixture/git-bin",
+    ]);
+    assert.strictEqual(environment.PATHEXT, ".CMD;.EXE");
+    assert.throws(
+      () => qualificationEnvironment({ PATH: "/first", Path: "/second" }, profile, null, "win32"),
+      /PATH has case-colliding keys/u,
+    );
   });
 
   test("actual local preparation cold-launches with host identity only at the final boundary", async () => {
@@ -693,8 +766,9 @@ suite("qualification candidate isolation", () => {
         }
         return { status: 0, signal: null, stdout: "", stderr: "" };
       }
-      if (new Set(["npm", "npm.cmd"]).has(path.basename(command))) {
-        if (JSON.stringify(arguments_) === JSON.stringify(["run", "verify:polish"])) {
+      const npmArguments = fixtureNpmArguments(root, command, arguments_);
+      if (npmArguments) {
+        if (JSON.stringify(npmArguments) === JSON.stringify(["run", "verify:polish"])) {
           polishPassed = true;
           return { status: 0, signal: null, stdout: "polish passed\n", stderr: "" };
         }
@@ -707,7 +781,7 @@ suite("qualification candidate isolation", () => {
           sourceSha: source.sha,
         }));
         fs.appendFileSync(
-          arguments_[4],
+          npmArguments[4],
           `vsix_path=${artifactRelative}\nchecksum_path=${artifactRelative}.sha256\n`
             + `provenance_path=${artifactRelative}.provenance.json\n`,
         );
@@ -755,6 +829,7 @@ suite("qualification candidate isolation", () => {
         CLOUDSMITH_API_KEY: "must-not-pass",
       },
       adapters: {
+        ...qualificationNpmAdapters(root),
         spawnSync: spawnSyncFixture,
         spawn(command, arguments_, options) {
           assert.strictEqual(artifactVerificationCount, (launchAttempts + 1) * 2);
@@ -1290,13 +1365,14 @@ suite("qualification candidate isolation", () => {
         }
         return { status: 0, signal: null, stdout: "", stderr: "" };
       }
-      if (new Set(["npm", "npm.cmd"]).has(path.basename(command))) {
-        if (JSON.stringify(arguments_) === JSON.stringify(["run", "verify:polish"])) {
+      const npmArguments = fixtureNpmArguments(root, command, arguments_);
+      if (npmArguments) {
+        if (JSON.stringify(npmArguments) === JSON.stringify(["run", "verify:polish"])) {
           polishPassed = true;
           return { status: 0, signal: null, stdout: "polish passed\n", stderr: "" };
         }
         assert.strictEqual(polishPassed, true, "polish must pass before packaging");
-        assert.deepStrictEqual(arguments_.slice(0, 4), ["run", "package", "--", "--github-output"]);
+        assert.deepStrictEqual(npmArguments.slice(0, 4), ["run", "package", "--", "--github-output"]);
         assert.strictEqual(fs.existsSync(artifact), false, "stale artifact must be invalidated");
         fs.writeFileSync(artifact, verifiedBytes);
         fs.writeFileSync(`${artifact}.sha256`, "verified-sidecar");
@@ -1305,7 +1381,7 @@ suite("qualification candidate isolation", () => {
           sourceSha: source.sha,
         }));
         fs.appendFileSync(
-          arguments_[4],
+          npmArguments[4],
           `vsix_path=${artifactRelative}\nchecksum_path=${artifactRelative}.sha256\nprovenance_path=${artifactRelative}.provenance.json\n`,
         );
         return { status: 0, signal: null, stdout: "packaged\n", stderr: "" };
@@ -1343,6 +1419,7 @@ suite("qualification candidate isolation", () => {
       },
       environment: { PATH: process.env.PATH || "", CLOUDSMITH_API_KEY: "must-not-pass" },
       adapters: {
+        ...qualificationNpmAdapters(root),
         spawnSync: spawn,
         spawn(command, arguments_, options) {
           ciLaunchCall = { command, arguments_, environment: options.env };
@@ -1385,7 +1462,7 @@ suite("qualification candidate isolation", () => {
     const persisted = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
     const { fingerprint: persistedFingerprint, ...withoutFingerprint } = persisted;
     assert.strictEqual(persistedFingerprint, fingerprint(withoutFingerprint));
-    assert.strictEqual(persisted.schemaVersion, 2);
+    assert.strictEqual(persisted.schemaVersion, 3);
     assert.strictEqual(persisted.capturedAt, capturedAt);
     assert.deepStrictEqual(persisted.source, source);
     assert.deepStrictEqual(persisted.repository, repository);
@@ -1428,6 +1505,7 @@ suite("qualification candidate isolation", () => {
   test("post-cleanup polish failure stops before source capture and packaging", async () => {
     const root = temporaryRoot();
     const temporaryParent = temporaryRoot("cloudsmith-ci-parent-");
+    fs.writeFileSync(path.join(root, ".node-version"), `${process.versions.node}\n`);
     const receipt = path.join(root, ".quality", "qualification", "candidate.json");
     fs.mkdirSync(path.dirname(receipt), { recursive: true });
     fs.writeFileSync(receipt, "{\"stale\":true}\n");
@@ -1440,6 +1518,7 @@ suite("qualification candidate isolation", () => {
         temporaryParent,
         environment: { PATH: process.env.PATH || "" },
         adapters: {
+          ...qualificationNpmAdapters(root),
           sourceIdentity: () => {
             sourceCaptures += 1;
             return { sha: "a".repeat(40), fingerprint: "b".repeat(64) };
@@ -1448,8 +1527,9 @@ suite("qualification candidate isolation", () => {
             if (command === "git") {
               return { status: 0, signal: null, stdout: "", stderr: "" };
             }
-            if (new Set(["npm", "npm.cmd"]).has(path.basename(command))) {
-              if (arguments_.includes("package")) packageCalls += 1;
+            const npmArguments = fixtureNpmArguments(root, command, arguments_);
+            if (npmArguments) {
+              if (npmArguments.includes("package")) packageCalls += 1;
               return { status: 1, signal: null, stdout: "", stderr: "" };
             }
             throw new Error("unexpected command");
@@ -1463,15 +1543,70 @@ suite("qualification candidate isolation", () => {
     assert.strictEqual(fs.existsSync(receipt), false);
   });
 
-  test("stale candidate receipt is invalidated before argument failure", async () => {
+  test("invalid arguments preserve prior candidate evidence", async () => {
     const root = temporaryRoot();
+    fs.writeFileSync(path.join(root, ".node-version"), `${process.versions.node}\n`);
     const receipt = path.join(root, ".quality", "qualification", "candidate.json");
     fs.mkdirSync(path.dirname(receipt), { recursive: true });
     fs.writeFileSync(receipt, "{\"stale\":true}\n");
     await assert.rejects(
-      prepareQualificationCandidate({ root, mode: "unsupported" }),
+      prepareQualificationCandidate({
+        root,
+        mode: "unsupported",
+        adapters: qualificationNpmAdapters(root),
+      }),
       /must be local or ci/,
     );
-    assert.strictEqual(fs.existsSync(receipt), false);
+    assert.strictEqual(fs.readFileSync(receipt, "utf8"), "{\"stale\":true}\n");
+  });
+
+  test("npm provenance failure preserves prior candidate evidence", async () => {
+    const root = temporaryRoot();
+    fs.writeFileSync(path.join(root, ".node-version"), `${process.versions.node}\n`);
+    const receipt = path.join(root, ".quality", "qualification", "candidate.json");
+    fs.mkdirSync(path.dirname(receipt), { recursive: true });
+    fs.writeFileSync(receipt, "{\"stale\":true}\n");
+    await assert.rejects(
+      prepareQualificationCandidate({
+        root,
+        mode: "local",
+        adapters: {
+          ...qualificationNpmAdapters(root),
+          assertCanonicalNpmRuntime(repositoryRoot, _claimedCli, options) {
+            assert.strictEqual(repositoryRoot, root);
+            assert.strictEqual(options.nodeExecutable, process.execPath);
+            throw new Error("Canonical npm runtime is unsafe or invalid");
+          },
+        },
+      }),
+      /Canonical npm runtime is unsafe or invalid/u,
+    );
+    assert.strictEqual(fs.readFileSync(receipt, "utf8"), "{\"stale\":true}\n");
+  });
+
+  test("runtime mismatch fails before candidate evidence invalidation", async () => {
+    const root = temporaryRoot();
+    fs.writeFileSync(path.join(root, ".node-version"), "22.23.2\n");
+    const receipt = path.join(root, ".quality", "qualification", "candidate.json");
+    const staleEvidence = "{\"stale\":true}\n";
+    fs.mkdirSync(path.dirname(receipt), { recursive: true });
+    fs.writeFileSync(receipt, staleEvidence);
+
+    await assert.rejects(
+      prepareQualificationCandidate({
+        root,
+        mode: "unsupported",
+        adapters: {
+          ...qualificationNpmAdapters(root),
+          assertCanonicalNodeRuntime(repositoryRoot, actualVersion) {
+            assert.strictEqual(repositoryRoot, root);
+            assert.strictEqual(actualVersion, process.version);
+            throw new Error("Canonical Node.js runtime does not match the exact version pin");
+          },
+        },
+      }),
+      /runtime does not match the exact version pin/u,
+    );
+    assert.strictEqual(fs.readFileSync(receipt, "utf8"), staleEvidence);
   });
 });

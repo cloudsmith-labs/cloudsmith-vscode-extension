@@ -24,10 +24,11 @@ const SOURCE = Object.freeze({
   sha: "1".repeat(40),
   fingerprint: "2".repeat(64),
 });
+const NPM_INTEGRITY = JSON.parse(fs.readFileSync(path.join(__dirname, "../.npm-integrity"), "utf8"));
 
 function candidateReceipt(overrides = {}) {
   const base = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     status: "passed",
     capturedAt: "2026-08-27T00:00:00.000Z",
     source: SOURCE,
@@ -35,6 +36,12 @@ function candidateReceipt(overrides = {}) {
       branch: "test/release-quality-harness",
       dirty: true,
       status: "dirty",
+    },
+    toolchain: {
+      nodeVersion: "v22.23.2",
+      npmVersion: "10.9.8",
+      npmInstallationSha256: NPM_INTEGRITY[process.platform === "win32" ? "win32" : "posix"],
+      platform: process.platform,
     },
     extension: {
       id: "Cloudsmith.cloudsmith-vsc",
@@ -300,6 +307,12 @@ suite("two-lane release-readiness model", () => {
         name: "cloudsmith-vsc",
         version: "2.3.0",
       }));
+      fs.writeFileSync(path.join(fixtureRoot, ".node-version"), "22.23.2\n");
+      fs.writeFileSync(path.join(fixtureRoot, ".npm-version"), "10.9.8\n");
+      fs.writeFileSync(
+        path.join(fixtureRoot, ".npm-integrity"),
+        `${JSON.stringify(NPM_INTEGRITY)}\n`,
+      );
       const artifactBytes = Buffer.from("signed-out candidate A");
       const artifactPath = path.join(developmentDir, "cloudsmith-vsc-2.3.0.vsix");
       fs.writeFileSync(artifactPath, artifactBytes);

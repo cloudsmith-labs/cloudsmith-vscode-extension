@@ -305,6 +305,68 @@ suite("signed-out black-box UI runner contract", function () {
     );
   });
 
+  test("runtime rejection preserves seeded UI evidence before creating a boundary", async () => {
+    let boundaryCreations = 0;
+    let runtimeValidations = 0;
+    const harness = createHarness(repositories, {
+      assertCanonicalNodeRuntime(root, version) {
+        runtimeValidations += 1;
+        assert.strictEqual(root, harness.repositoryRoot);
+        assert.strictEqual(version, process.version);
+        throw new Error("synthetic canonical runtime rejection");
+      },
+      createNonAuthQualityEnvironment() {
+        boundaryCreations += 1;
+        throw new Error("runtime validation must precede boundary creation");
+      },
+    });
+    const seeded = new Map([
+      [harness.resultPath, Buffer.from("seeded UI result evidence\n")],
+      [
+        path.join(harness.repositoryRoot, ".quality", "qualification", "ui-candidate.json"),
+        Buffer.from("seeded UI candidate receipt\n"),
+      ],
+      [
+        path.join(harness.repositoryRoot, ".quality", "qualification", "ui-candidate.vsix"),
+        Buffer.from("seeded UI candidate archive\n"),
+      ],
+    ]);
+    for (const [target, bytes] of seeded) {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, bytes);
+    }
+
+    await assertSafeRejection(harness.run, "UI_TOOL_UNSUPPORTED");
+
+    assert.strictEqual(boundaryCreations, 0);
+    assert.strictEqual(runtimeValidations, 1);
+    assert.strictEqual(harness.cleanupCalls(), 0);
+    assert.deepStrictEqual(harness.phases(), []);
+    for (const [target, bytes] of seeded) {
+      assert.deepStrictEqual(fs.readFileSync(target), bytes);
+    }
+  });
+
+  test("npm provenance preflight rejection preserves seeded UI evidence", async () => {
+    let preflights = 0;
+    const harness = createHarness(repositories, {
+      qualificationToolchainPreflight() {
+        preflights += 1;
+        throw new Error("synthetic npm provenance rejection");
+      },
+    });
+    const seeded = Buffer.from("seeded UI result evidence\n");
+    fs.mkdirSync(path.dirname(harness.resultPath), { recursive: true });
+    fs.writeFileSync(harness.resultPath, seeded);
+
+    await assertSafeRejection(harness.run, "UI_SMOKE_FAILED");
+
+    assert.strictEqual(preflights, 1);
+    assert.strictEqual(harness.cleanupCalls(), 0);
+    assert.deepStrictEqual(harness.phases(), []);
+    assert.deepStrictEqual(fs.readFileSync(harness.resultPath), seeded);
+  });
+
   test("the UI reporter maps arbitrary raw errors to a fixed value-blind kind", () => {
     const kind = classifyFailure(
       { phase: "suite", nonce: "d".repeat(64) },
@@ -329,7 +391,10 @@ suite("signed-out black-box UI runner contract", function () {
 });
 
 function createHarness(repositories, options = {}) {
-  const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ui-runner-repo-"));
+  const repositoryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+    os.tmpdir(),
+    "ui-runner-repo-",
+  )));
   fs.chmodSync(repositoryRoot, 0o700);
   repositories.push(repositoryRoot);
   writeRepositoryFixture(repositoryRoot);
@@ -364,7 +429,7 @@ function createHarness(repositories, options = {}) {
   const artifactBytes = Buffer.from("bound deterministic fixture VSIX bytes", "utf8");
   fs.writeFileSync(artifactPath, artifactBytes);
   const receiptBase = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     status: "passed",
     capturedAt: "2026-08-27T00:00:00.000Z",
     source: SOURCE,
@@ -372,6 +437,12 @@ function createHarness(repositories, options = {}) {
       branch: "test/release-quality-harness",
       dirty: true,
       status: "dirty",
+    },
+    toolchain: {
+      nodeVersion: "v22.23.2",
+      npmVersion: "10.9.8",
+      npmInstallationSha256: "4".repeat(64),
+      platform: process.platform,
     },
     extension: {
       id: "Cloudsmith.cloudsmith-vsc",
@@ -502,7 +573,9 @@ function createHarness(repositories, options = {}) {
         SECURITYSESSIONID: "synthetic-host-security-session",
       },
       toolPackage: TOOL_PACKAGE,
-      nodeVersion: "22.23.2",
+      assertCanonicalNodeRuntime: options.assertCanonicalNodeRuntime,
+      qualificationToolchainPreflight: options.qualificationToolchainPreflight || (() => true),
+      createNonAuthQualityEnvironment: options.createNonAuthQualityEnvironment,
       extestCli: path.join(repositoryRoot, "fixture-extest.js"),
       spawnSync: spawn,
       sourceIdentity: () => sourceIdentities[Math.min(sourceIndex++, sourceIdentities.length - 1)],
@@ -562,6 +635,13 @@ function createRealNestedCandidateHarness(repositories) {
   const phases = [];
   let settingsReplacements = 0;
   let randomIndex = 0;
+  const npm = Object.freeze({
+    cliPath: path.join(repositoryRoot, "fixture-npm-cli.js"),
+    installation: Object.freeze({ sha256: "4".repeat(64) }),
+    nodeExecutable: process.execPath,
+    repositoryRoot,
+    version: "10.9.8",
+  });
 
   function observeCandidateEnvironment(environment) {
     assert.ok(environment && typeof environment === "object");
@@ -603,14 +683,15 @@ function createRealNestedCandidateHarness(repositories) {
       }
       return processResultWithOutput(0, "");
     }
-    if (new Set(["npm", "npm.cmd"]).has(path.basename(command))) {
-      if (JSON.stringify(arguments_) === JSON.stringify(["run", "verify:polish"])) {
+    if (command === process.execPath && arguments_[0] === npm.cliPath) {
+      const npmArguments = arguments_.slice(1);
+      if (JSON.stringify(npmArguments) === JSON.stringify(["run", "verify:polish"])) {
         return processResultWithOutput(0, "polish passed\n");
       }
-      assert.deepStrictEqual(arguments_.slice(0, 4), [
+      assert.deepStrictEqual(npmArguments.slice(0, 4), [
         "run", "package", "--", "--github-output",
       ]);
-      const packageOutput = arguments_[4];
+      const packageOutput = npmArguments[4];
       packageScratch = path.dirname(packageOutput);
       assert.strictEqual(packageScratch.startsWith(
         `${path.join(activeBoundaryRoot, "tmp")}${path.sep}`
@@ -713,7 +794,6 @@ function createRealNestedCandidateHarness(repositories) {
         DBUS_SESSION_BUS_ADDRESS: "unix:path=/synthetic/host-session-bus",
       },
       toolPackage: TOOL_PACKAGE,
-      nodeVersion: "22.23.2",
       extestCli: path.join(repositoryRoot, "fixture-extest.js"),
       spawnSync: uiSpawn,
       resetCiQualificationUserData: profile => {
@@ -733,6 +813,29 @@ function createRealNestedCandidateHarness(repositories) {
         return { executable, cli };
       },
       candidateAdapters: {
+        assertCanonicalNpmRuntime(root, _claimedCli, options) {
+          assert.strictEqual(root, repositoryRoot);
+          assert.strictEqual(options.nodeExecutable, process.execPath);
+          assert.strictEqual(options.platform, process.platform);
+          return npm;
+        },
+        assertNoNpmToolchainShadowing(root, options) {
+          assert.strictEqual(root, repositoryRoot);
+          assert.strictEqual(options.platform, process.platform);
+          return true;
+        },
+        withCanonicalNpmLauncher(options, callback) {
+          assert.strictEqual(options.nodeExecutable, process.execPath);
+          assert.strictEqual(options.npm, npm);
+          assert.strictEqual(options.platform, process.platform);
+          return callback(Object.freeze({
+            directory: path.join(repositoryRoot, "fixture-npm-launcher"),
+            nodeCommand: process.platform === "win32" ? "node.cmd" : "node",
+            npmCommand: process.platform === "win32" ? "npm.cmd" : "npm",
+            npmCliPath: npm.cliPath,
+            scriptShell: null,
+          }));
+        },
         spawnSync: candidateSpawn,
         sourceIdentity: (_root, _spawn, environment, sourceOptions) => {
           observeCandidateEnvironment(environment);
@@ -769,6 +872,7 @@ function createRealNestedCandidateHarness(repositories) {
 }
 
 function writeRepositoryFixture(root) {
+  writeText(root, ".node-version", "22.23.2\n");
   writeJson(root, "package.json", {
     name: "cloudsmith-vsc",
     publisher: "Cloudsmith",

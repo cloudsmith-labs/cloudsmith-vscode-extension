@@ -611,15 +611,15 @@ async function verifyVsix(filePath, options = {}) {
 function validateProvenance(provenance, filePath, verification, options) {
   const allowedFields = new Set([
     "archiveBytes", "entryCount", "filename", "name", "nodeVersion", "npmVersion",
-    "publishable", "publisher", "schemaVersion", "sha256", "sourceClean",
-    "sourceCommitEpoch", "sourceSha", "totalUncompressedBytes", "version",
+    "npmInstallationSha256", "platform", "publishable", "publisher", "schemaVersion", "sha256",
+    "sourceClean", "sourceCommitEpoch", "sourceSha", "totalUncompressedBytes", "version",
   ]);
   const provenanceFields = Object.keys(provenance);
   if (
     provenanceFields.length !== allowedFields.size
     || provenanceFields.some((field) => !allowedFields.has(field))
   ) {
-    throw new Error("Provenance sidecar fields do not match schema version 1");
+    throw new Error("Provenance sidecar fields do not match schema version 3");
   }
   const expected = {
     filename: path.basename(filePath),
@@ -636,7 +636,7 @@ function validateProvenance(provenance, filePath, verification, options) {
       throw new Error(`Provenance sidecar field ${field} does not match the verified VSIX`);
     }
   }
-  if (provenance.schemaVersion !== 1 || !/^[0-9a-f]{40,64}$/.test(provenance.sourceSha || "")) {
+  if (provenance.schemaVersion !== 3 || !/^[0-9a-f]{40,64}$/.test(provenance.sourceSha || "")) {
     throw new Error("Provenance sidecar has an unsupported schema or invalid source SHA");
   }
   if (
@@ -648,14 +648,11 @@ function validateProvenance(provenance, filePath, verification, options) {
   ) {
     throw new Error("Provenance sidecar has invalid source cleanliness or commit metadata");
   }
-  if (!/^v\d+\.\d+\.\d+$/.test(provenance.nodeVersion || "") || !/^\d+\.\d+\.\d+$/.test(provenance.npmVersion || "")) {
+  if (!/^v\d+\.\d+\.\d+$/.test(provenance.nodeVersion || "")
+    || !/^\d+\.\d+\.\d+$/.test(provenance.npmVersion || "")
+    || !/^[a-f0-9]{64}$/u.test(provenance.npmInstallationSha256 || "")
+    || !new Set(["darwin", "linux", "win32"]).has(provenance.platform)) {
     throw new Error("Provenance sidecar has invalid Node.js or npm version metadata");
-  }
-  if (options.expectedSourceSha && provenance.sourceSha !== options.expectedSourceSha) {
-    throw new Error("Provenance source SHA does not match the expected workflow source");
-  }
-  if (options.requirePublishable && (!provenance.sourceClean || !provenance.publishable)) {
-    throw new Error("Artifact handoff requires clean, publishable provenance");
   }
   const git = options.runGitCommand || runGit;
   const resolvedCommit = git(["rev-parse", "--verify", `${provenance.sourceSha}^{commit}`]).trim();
@@ -665,6 +662,66 @@ function validateProvenance(provenance, filePath, verification, options) {
   const commitEpoch = Number(git(["show", "-s", "--format=%ct", provenance.sourceSha]).trim());
   if (commitEpoch !== provenance.sourceCommitEpoch) {
     throw new Error("Provenance commit epoch does not match the recorded source commit");
+  }
+  const repositoryRoot = path.resolve(options.repositoryRoot || root);
+  const fileSystem = options.fileSystem || fs;
+  const parseVersionPin = bytes => {
+    const match = /^(\d+\.\d+\.\d+)(?:\r?\n)?$/u.exec(bytes.toString("utf8"));
+    if (!match) throw new Error("Canonical toolchain provenance pin is unsafe or invalid");
+    return match[1];
+  };
+  const parseIntegrityPins = bytes => {
+    const pins = JSON.parse(bytes.toString("utf8"));
+    if (!pins || typeof pins !== "object" || Array.isArray(pins)
+      || JSON.stringify(Object.keys(pins).sort()) !== JSON.stringify(["posix", "win32"])
+      || !/^[a-f0-9]{64}$/u.test(pins.posix || "")
+      || !/^[a-f0-9]{64}$/u.test(pins.win32 || "")) {
+      throw new Error("Canonical toolchain provenance pin is unsafe or invalid");
+    }
+    return pins;
+  };
+  const readWorktreePin = (name, maximumBytes, parse) => withStableSingleLinkFile(
+    path.join(repositoryRoot, name),
+    {
+      errorMessage: "Canonical toolchain provenance pin is unsafe or invalid",
+      fileSystem,
+      maximumBytes,
+      minimumBytes: 1,
+    },
+    parse,
+  );
+  const readCommitPin = (name, maximumBytes, parse) => {
+    const object = `${provenance.sourceSha}:${name}`;
+    const sizeText = git(["cat-file", "-s", object]).trim();
+    if (!/^[1-9]\d*$/u.test(sizeText)) {
+      throw new Error("Canonical toolchain provenance pin is unsafe or invalid");
+    }
+    const size = Number(sizeText);
+    if (!Number.isSafeInteger(size) || size > maximumBytes) {
+      throw new Error("Canonical toolchain provenance pin is unsafe or invalid");
+    }
+    const value = git(["show", object]);
+    const bytes = Buffer.isBuffer(value) ? Buffer.from(value) : Buffer.from(value, "utf8");
+    if (bytes.length !== size) {
+      throw new Error("Canonical toolchain provenance pin is unsafe or invalid");
+    }
+    return parse(bytes);
+  };
+  const readPin = provenance.sourceClean ? readCommitPin : readWorktreePin;
+  const nodeVersion = readPin(".node-version", 64, parseVersionPin);
+  const npmVersion = readPin(".npm-version", 64, parseVersionPin);
+  const npmIntegrityPins = readPin(".npm-integrity", 256, parseIntegrityPins);
+  const npmIntegrity = npmIntegrityPins[provenance.platform === "win32" ? "win32" : "posix"];
+  if (provenance.nodeVersion !== `v${nodeVersion}`
+    || provenance.npmVersion !== npmVersion
+    || provenance.npmInstallationSha256 !== npmIntegrity) {
+    throw new Error("Provenance toolchain does not match the exact repository pins");
+  }
+  if (options.expectedSourceSha && provenance.sourceSha !== options.expectedSourceSha) {
+    throw new Error("Provenance source SHA does not match the expected workflow source");
+  }
+  if (options.requirePublishable && (!provenance.sourceClean || !provenance.publishable)) {
+    throw new Error("Artifact handoff requires clean, publishable provenance");
   }
   return provenance;
 }

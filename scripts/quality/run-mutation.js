@@ -18,6 +18,7 @@ const {
   uniqueSorted,
   writeJson,
 } = require("./common");
+const { assertCanonicalNodeRuntime } = require("./canonical-node-runtime");
 const { fingerprint, sourceIdentity } = require("./evidence");
 const { validateMutationToolchain } = require("./mutation-toolchain");
 
@@ -70,12 +71,15 @@ const STRYKER_REPORT_CONFIG_KEYS = Object.freeze([
   "warnings",
 ]);
 const MUTATION_GLOBAL_OWNERS = Object.freeze([
+  ".npm-integrity",
+  ".npm-version",
   ".node-version",
   ".github/workflows/deep-quality.yml",
   ".github/workflows/main.yml",
   "package-lock.json",
   "package.json",
   "quality/mutation-baseline.json",
+  "scripts/quality/canonical-node-runtime.js",
   "scripts/quality/common.js",
   "scripts/quality/evidence.js",
   "scripts/quality/mutation-baseline.js",
@@ -86,30 +90,35 @@ const MUTATION_GLOBAL_OWNERS = Object.freeze([
   "stryker.config.mjs",
 ]);
 
-function main() {
-  const mode = process.argv[2] || "changed";
+function runMutation(options = {}) {
+  const root = options.root || ROOT;
+  const validateRuntime = options.assertCanonicalNodeRuntime
+    || assertCanonicalNodeRuntime;
+  validateRuntime(root, process.version);
+  const entrypointArguments = options.argumentsList || process.argv.slice(2);
+  const mode = entrypointArguments[0] || "changed";
   if (!new Set(["core", "changed"]).has(mode)) {
     throw new Error(`Unknown mutation mode: ${mode}`);
   }
-  prepareOutputDirectory(".quality/mutation");
-  removeOutputFile(`.quality/mutation/summary-${mode}.json`);
-  removeOutputFile(REPORT);
-  const baseline = readJson("quality/mutation-baseline.json");
-  assertCanonicalMutationRuntime(baseline);
-  assertValidMutationBaseline(baseline);
-  assertMutationTestOwners(baseline);
-  const argumentsList = process.argv.slice(3);
+  const baseline = readJson("quality/mutation-baseline.json", root);
+  assertCanonicalMutationRuntime(baseline, root, process);
+  assertValidMutationBaseline(baseline, root);
+  assertMutationTestOwners(baseline, root);
+  const argumentsList = entrypointArguments.slice(1);
   assertMutationGateArguments(mode, argumentsList);
-  const source = sourceIdentity(ROOT);
+  const source = sourceIdentity(root);
   const selection = mode === "changed"
-    ? resolveMutationSelection(argumentsList)
-    : fullMutationSelection();
-  assertMutationRunStable(source, selection, mode, argumentsList);
+    ? resolveMutationSelection(argumentsList, root)
+    : fullMutationSelection(root);
+  assertMutationRunStable(source, selection, mode, argumentsList, root);
   const targets = mode === "core"
     ? baseline.scope
     : selectMutationTargets(baseline.scope, selection.changedFiles, baseline.files);
+  prepareOutputDirectory(".quality/mutation", root);
+  removeOutputFile(`.quality/mutation/summary-${mode}.json`, root);
+  removeOutputFile(REPORT, root);
   if (targets.length === 0) {
-    assertMutationRunStable(source, selection, mode, argumentsList);
+    assertMutationRunStable(source, selection, mode, argumentsList, root);
     const summary = receipt(mode, targets, {
       status: "not-applicable",
       reason: "no-configured-mutation-target-changed",
@@ -126,29 +135,30 @@ function main() {
       survivors: [],
       strykerExitCode: null,
     }, { source, selection, rawReportFingerprint: null });
-    writeStableMutationSummary(mode, summary, source, selection, argumentsList);
+    writeStableMutationSummary(mode, summary, source, selection, argumentsList, root);
     console.log("Mutation gate is not applicable: no configured mutation target changed.");
     return;
   }
 
-  const cli = path.join(ROOT, "node_modules", "@stryker-mutator", "core", "bin", "stryker.js");
+  const cli = path.join(root, "node_modules", "@stryker-mutator", "core", "bin", "stryker.js");
   const args = [cli, "run", "stryker.config.mjs", "--mutate", targets.join(",")];
   if (mode === "changed") args.push("--incremental", "--force");
-  const result = spawnSync(process.execPath, args, { cwd: ROOT, encoding: "utf8", stdio: "inherit" });
+  const spawn = options.spawnSync || spawnSync;
+  const result = spawn(process.execPath, args, { cwd: root, encoding: "utf8", stdio: "inherit" });
   if (result.error) throw result.error;
   if (result.signal) throw new Error(`Stryker terminated by signal ${result.signal}.`);
   if (!Number.isInteger(result.status) || result.status < 0 || result.status > 255) {
     throw new Error("Stryker produced no canonical process exit status.");
   }
-  assertMutationRunStable(source, selection, mode, argumentsList);
+  assertMutationRunStable(source, selection, mode, argumentsList, root);
   let reportArtifact;
   try {
-    reportArtifact = readMutationReportArtifact();
+    reportArtifact = readMutationReportArtifact(root);
   } catch {
     throw new Error(`Stryker did not write a safe ${REPORT} (exit ${String(result.status)}).`);
   }
   const report = reportArtifact.value;
-  validateMutationTestOwnership(report, targets, baseline, ROOT, mode);
+  validateMutationTestOwnership(report, targets, baseline, root, mode);
   const derived = deriveMutationEvidence(report, targets);
   const candidate = receipt(mode, targets, {
     status: "passed",
@@ -166,7 +176,7 @@ function main() {
       throw failure;
     }
     validateMutationSummary(candidate, baseline, mode);
-    writeStableMutationSummary(mode, candidate, source, selection, argumentsList);
+    writeStableMutationSummary(mode, candidate, source, selection, argumentsList, root);
   } catch (error) {
     const failedValues = {
       ...candidate,
@@ -175,7 +185,7 @@ function main() {
     };
     delete failedValues.key;
     const failed = bindMutationSummaryKey(failedValues);
-    writeStableMutationSummary(mode, failed, source, selection, argumentsList);
+    writeStableMutationSummary(mode, failed, source, selection, argumentsList, root);
     throw error;
   }
 }
@@ -1151,6 +1161,7 @@ module.exports = {
   perFileCounts,
   readMutationReportArtifact,
   receipt,
+  runMutation,
   resolveMutationSelection,
   selectMutationTargets,
   survivorFingerprint,
@@ -1164,7 +1175,7 @@ module.exports = {
 
 if (require.main === module) {
   try {
-    main();
+    runMutation();
   } catch (error) {
     console.error(`mutation: ${error.message}`);
     process.exitCode = Number.isInteger(error.mutationExitCode)

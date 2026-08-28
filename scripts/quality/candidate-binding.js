@@ -285,9 +285,9 @@ function profileRootIdentity(mode, root) {
 function candidateBindingFromReceipt(receipt, options = {}) {
   if (!hasExactKeys(receipt, [
     "artifact", "capturedAt", "extension", "fingerprint", "installation", "launch",
-    "profile", "repository", "schemaVersion", "source", "status", "vscode",
+    "profile", "repository", "schemaVersion", "source", "status", "toolchain", "vscode",
   ])
-    || receipt.schemaVersion !== 2
+    || receipt.schemaVersion !== 3
     || receipt.status !== "passed"
     || !canonicalTimestamp(receipt.capturedAt)
     || !/^[a-f0-9]{64}$/u.test(receipt.fingerprint || "")) {
@@ -309,6 +309,48 @@ function candidateBindingFromReceipt(receipt, options = {}) {
     if (!validRepositoryState(options.repositoryState)
       || JSON.stringify(receipt.repository) !== JSON.stringify(options.repositoryState)) {
       throw new Error("Qualification candidate repository state is stale or mismatched.");
+    }
+  }
+
+  const toolchain = receipt.toolchain;
+  if (!hasExactKeys(toolchain, [
+    "nodeVersion", "npmInstallationSha256", "npmVersion", "platform",
+  ])
+    || !/^v\d+\.\d+\.\d+$/u.test(toolchain.nodeVersion || "")
+    || !/^\d+\.\d+\.\d+$/u.test(toolchain.npmVersion || "")
+    || !/^[a-f0-9]{64}$/u.test(toolchain.npmInstallationSha256 || "")
+    || !new Set(["darwin", "linux", "win32"]).has(toolchain.platform)) {
+    throw new Error("Qualification candidate toolchain provenance is invalid.");
+  }
+  const toolchainRoot = options.toolchainRoot || options.root;
+  if (toolchainRoot) {
+    const readVersionPin = name => withStableSingleLinkFile(
+      path.join(toolchainRoot, name),
+      { errorMessage: "Qualification candidate toolchain pin is invalid.", maximumBytes: 64 },
+      bytes => {
+        const match = /^(\d+\.\d+\.\d+)(?:\r?\n)?$/u.exec(bytes.toString("utf8"));
+        if (!match) throw new Error("Qualification candidate toolchain pin is invalid.");
+        return match[1];
+      },
+    );
+    const integrityPins = withStableSingleLinkFile(
+      path.join(toolchainRoot, ".npm-integrity"),
+      { errorMessage: "Qualification candidate toolchain pin is invalid.", maximumBytes: 256 },
+      bytes => {
+        const pins = JSON.parse(bytes.toString("utf8"));
+        if (!hasExactKeys(pins, ["posix", "win32"])
+          || !/^[a-f0-9]{64}$/u.test(pins.posix || "")
+          || !/^[a-f0-9]{64}$/u.test(pins.win32 || "")) {
+          throw new Error("Qualification candidate toolchain pin is invalid.");
+        }
+        return pins;
+      },
+    );
+    const integrityKey = toolchain.platform === "win32" ? "win32" : "posix";
+    if (toolchain.nodeVersion !== `v${readVersionPin(".node-version")}`
+      || toolchain.npmVersion !== readVersionPin(".npm-version")
+      || toolchain.npmInstallationSha256 !== integrityPins[integrityKey]) {
+      throw new Error("Qualification candidate toolchain provenance is stale or mismatched.");
     }
   }
 

@@ -445,6 +445,11 @@ function expectedExtensionTestsJob() {
         name: "Log test runtime",
         run: "node -e \"console.log({node:process.version,platform:process.platform,arch:process.arch,vscode:process.env.VSCODE_TEST_VERSION,label:process.env.VSCODE_TEST_LABEL})\"",
       },
+      {
+        name: "Preflight canonical npm launcher and packaging on Windows",
+        if: "runner.os == 'Windows'",
+        run: "npm run package",
+      },
       { name: "Run deterministic extension suite", run: "npm test" },
       {
         name: "Prove the real test entrypoint rejects zero tests",

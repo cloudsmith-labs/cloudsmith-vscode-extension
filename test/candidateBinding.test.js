@@ -76,6 +76,27 @@ suite("live qualification candidate binding", () => {
     );
   });
 
+  test("rejects candidate toolchain provenance that does not match repository pins", () => {
+    const fixture = candidateFixture(roots);
+    const base = {
+      ...fixture.receipt,
+      toolchain: {
+        ...fixture.receipt.toolchain,
+        npmInstallationSha256: "5".repeat(64),
+      },
+    };
+    delete base.fingerprint;
+    const receipt = { ...base, fingerprint: fingerprint(base) };
+    assert.throws(
+      () => candidateBindingFromReceipt(receipt, {
+        root: fixture.root,
+        source: SOURCE,
+        artifactPath: fixture.artifactPath,
+      }),
+      /toolchain provenance is stale or mismatched/u,
+    );
+  });
+
   test("rejects a repository VSIX whose out ancestor redirects outside", function () {
     if (process.platform === "win32") this.skip();
     const fixture = candidateFixture(roots);
@@ -661,6 +682,12 @@ function candidateFixture(roots) {
     name: "cloudsmith-vsc",
     version: "2.3.0",
   })}\n`);
+  fs.writeFileSync(path.join(root, ".node-version"), "22.23.2\n");
+  fs.writeFileSync(path.join(root, ".npm-version"), "10.9.8\n");
+  fs.writeFileSync(path.join(root, ".npm-integrity"), `${JSON.stringify({
+    posix: "4".repeat(64),
+    win32: "4".repeat(64),
+  })}\n`);
   const bytes = Buffer.from("verified candidate bytes");
   const artifactPath = path.join(root, "candidate.vsix");
   fs.writeFileSync(artifactPath, bytes);
@@ -673,7 +700,7 @@ function candidateFixture(roots) {
   fs.mkdirSync(path.dirname(repositoryArtifactPath), { recursive: true });
   fs.writeFileSync(repositoryArtifactPath, bytes);
   const base = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     status: "passed",
     capturedAt: "2026-08-27T00:00:00.000Z",
     source: SOURCE,
@@ -681,6 +708,12 @@ function candidateFixture(roots) {
       branch: "test/candidate-binding",
       dirty: true,
       status: "dirty",
+    },
+    toolchain: {
+      nodeVersion: "v22.23.2",
+      npmVersion: "10.9.8",
+      npmInstallationSha256: "4".repeat(64),
+      platform: process.platform,
     },
     extension: {
       id: "Cloudsmith.cloudsmith-vsc",

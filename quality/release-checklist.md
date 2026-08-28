@@ -9,6 +9,13 @@ both required. Passing one never implies that the other ran.
       architecture recorded.
 - [ ] Exact source SHA/fingerprint to VSIX path/SHA-256 to installed extension
       ID/version binding recorded by the candidate receipt.
+- [ ] Candidate preparation, canonical packaging, black-box UI, mutation, and
+      quality-gate entrypoints ran with the exact Node.js runtime declared by
+      `.node-version`; a mismatch failed before invalidating prior evidence.
+- [ ] Quality-gate and packaging npm children ran under the exact Node.js
+      executable with npm from that runtime distribution, matching
+      `.npm-version` and the platform-specific `.npm-integrity` fingerprint;
+      conflicting PATH, local-bin, or standalone npm entries were rejected.
 - [ ] Local qualification uses exactly
       `$HOME/.cloudsmith-vscode-qualification/{user-data,extensions}` and not a
       normal VS Code profile.
@@ -169,6 +176,10 @@ both required. Passing one never implies that the other ran.
 
 - [ ] `npm run quality:release` completed against the final candidate; a history
       or QH-010 blocker is reported as open rather than bypassed.
+- [ ] The release-profile run preserved any prior fast/full receipt trees and
+      accepted them only when complete, canonical, current-source,
+      current-plan, and byte-stable; every unsafe or changed gate-tree entry was
+      rejected.
 - [ ] Final pushed-head CI and highest-risk live requalification completed before
       a ready verdict.
 - [ ] No P0, P1 product, core P2 product, dead enabled action, false

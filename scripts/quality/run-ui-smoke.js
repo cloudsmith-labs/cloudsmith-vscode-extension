@@ -17,6 +17,7 @@ const {
   writeJson,
 } = require("./common");
 const { fingerprint, sourceIdentity } = require("./evidence");
+const { assertCanonicalNodeRuntime } = require("./canonical-node-runtime");
 const {
   cleanupNonAuthQualityEnvironment,
   createNonAuthQualityEnvironment,
@@ -75,13 +76,22 @@ const SAFE_FAILURE_MESSAGES = Object.freeze({
 
 async function runUiSmoke(options = {}) {
   const root = options.root || ROOT;
+  const validateRuntime = options.assertCanonicalNodeRuntime
+    || assertCanonicalNodeRuntime;
+  try {
+    validateRuntime(root, process.version);
+  } catch {
+    throw safeFailure("UI_TOOL_UNSUPPORTED");
+  }
   const platform = options.platform || process.platform;
   const architecture = options.architecture || process.arch;
   const spawn = options.spawnSync || spawnSync;
   const readSource = options.sourceIdentity || sourceIdentity;
+  const createBoundary = options.createNonAuthQualityEnvironment
+    || createNonAuthQualityEnvironment;
   let nonAuthBoundary;
   try {
-    nonAuthBoundary = createNonAuthQualityEnvironment({
+    nonAuthBoundary = createBoundary({
       environment: options.environment || process.env,
       platform,
       temporaryParent: options.temporaryParent,
@@ -96,26 +106,35 @@ async function runUiSmoke(options = {}) {
   let candidate = null;
   let result = null;
   let failure = null;
+  let evidenceInvalidated = false;
   let safeStageCode = "UI_SMOKE_FAILED";
 
   try {
-    removeOutputFile(RESULT_PATH, root, { subtree: ".quality/ui" });
     const candidateApi = options.prepareQualificationCandidate
       && options.qualificationLaunchArguments ? null : loadCandidateApi();
     const prepareCandidate = options.prepareQualificationCandidate
       || candidateApi.prepareQualificationCandidate;
+    const preflightCandidate = options.qualificationToolchainPreflight
+      || candidateApi?.qualificationToolchainPreflight
+      || loadCandidateApi().qualificationToolchainPreflight;
     const launchArguments = options.qualificationLaunchArguments
       || candidateApi.qualificationLaunchArguments;
     const resetUserData = options.resetCiQualificationUserData
       || loadProfileApi().resetCiQualificationUserData;
     const tool = validateToolContract(
       root,
-      options.toolPackage,
-      options.nodeVersion || process.versions.node
+      options.toolPackage
     );
     const xvfb = resolveXvfb(platform, bootstrapEnvironment, options.xvfbPath);
     const extestCli = options.extestCli || resolveExtestCli(root);
     validateDeclaredInventory(root);
+    preflightCandidate({
+      root,
+      adapters: options.candidateAdapters,
+      environment: bootstrapEnvironment,
+    });
+    removeOutputFile(RESULT_PATH, root, { subtree: ".quality/ui" });
+    evidenceInvalidated = true;
     safeStageCode = "UI_CANDIDATE_INVALID";
     candidate = await prepareCandidate({
       root,
@@ -230,7 +249,9 @@ async function runUiSmoke(options = {}) {
 
   if (failure) {
     try {
-      removeOutputFile(RESULT_PATH, root, { subtree: ".quality/ui" });
+      if (evidenceInvalidated) {
+        removeOutputFile(RESULT_PATH, root, { subtree: ".quality/ui" });
+      }
     } catch {
       // The safe failure below never includes the raw filesystem error.
     }
@@ -424,9 +445,9 @@ function validateCandidate(candidate, context) {
   const receipt = candidate.receipt;
   if (!hasExactKeys(receipt, [
     "artifact", "capturedAt", "extension", "fingerprint", "installation", "launch",
-    "profile", "repository", "schemaVersion", "source", "status", "vscode",
+    "profile", "repository", "schemaVersion", "source", "status", "toolchain", "vscode",
   ])
-    || receipt.schemaVersion !== 2 || receipt.status !== "passed"
+    || receipt.schemaVersion !== 3 || receipt.status !== "passed"
     || !canonicalTimestamp(receipt.capturedAt)
     || !hasExactKeys(receipt.repository, ["branch", "dirty", "status"])
     || !(receipt.repository.branch === null
@@ -448,7 +469,14 @@ function validateCandidate(candidate, context) {
 
   const manifest = readJson("package.json", root);
   const extensionId = `${manifest.publisher}.${manifest.name}`;
-  if (!hasExactKeys(receipt.extension, ["id", "name", "publisher", "version"])
+  if (!hasExactKeys(receipt.toolchain, [
+    "nodeVersion", "npmInstallationSha256", "npmVersion", "platform",
+  ])
+    || receipt.toolchain.nodeVersion !== `v${NODE_VERSION}`
+    || !/^\d+\.\d+\.\d+$/u.test(receipt.toolchain.npmVersion || "")
+    || !/^[a-f0-9]{64}$/u.test(receipt.toolchain.npmInstallationSha256 || "")
+    || receipt.toolchain.platform !== process.platform
+    || !hasExactKeys(receipt.extension, ["id", "name", "publisher", "version"])
     || receipt.extension.id !== extensionId
     || receipt.extension.publisher !== manifest.publisher
     || receipt.extension.name !== manifest.name

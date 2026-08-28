@@ -36,6 +36,14 @@ const {
   prepareLocalQualificationProfile,
   removeSafeAppleMetadata,
 } = require("./qualification-profile");
+const {
+  assertCanonicalNpmRuntime,
+  assertCanonicalNodeRuntime,
+  assertExactNodeExecutable,
+  assertNoNpmToolchainShadowing,
+  canonicalToolchainEnvironment,
+  withCanonicalNpmLauncher,
+} = require("./canonical-node-runtime");
 const { assertVersionState } = require("../release/verify-version");
 const {
   readProvenanceSidecar,
@@ -132,7 +140,12 @@ function assertStableSource(before, after) {
   return before;
 }
 
-function qualificationEnvironment(environment, profile, nonAuthBoundary = null) {
+function qualificationEnvironment(
+  environment,
+  profile,
+  nonAuthBoundary = null,
+  platform = process.platform,
+) {
   if (!environment || typeof environment !== "object" || Array.isArray(environment)) {
     throw new Error("Qualification environment must be an object.");
   }
@@ -142,12 +155,41 @@ function qualificationEnvironment(environment, profile, nonAuthBoundary = null) 
     Object.assign(sanitized, environment);
   } else {
     for (const name of ALLOWED_ENVIRONMENT) {
+      if (name === "PATH" || (platform === "win32" && name === "PATHEXT")) continue;
       const value = environment[name];
       if (typeof value === "string" && value.length <= 32768 && !value.includes("\u0000")) {
         sanitized[name] = value;
       }
     }
   }
+  const canonicalPaths = canonicalToolchainEnvironment(toolchainPathEnvironment(environment), {
+    nodeExecutable: process.execPath,
+    platform,
+  });
+  if (platform === "win32") {
+    for (const name of Object.keys(sanitized)) {
+      if ([
+        "COMSPEC",
+        "NPM_CONFIG_SCRIPT_SHELL",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+      ].includes(name.toUpperCase())) {
+        delete sanitized[name];
+      }
+    }
+    for (const name of [
+      "COMSPEC",
+      "NPM_CONFIG_SCRIPT_SHELL",
+      "PATHEXT",
+      "SYSTEMROOT",
+      "WINDIR",
+    ]) {
+      if (canonicalPaths[name]) sanitized[name] = canonicalPaths[name];
+    }
+  }
+  sanitized.PATH = canonicalPaths.PATH;
   return Object.freeze({
     ...sanitized,
     HOME: profile.homeDir,
@@ -203,6 +245,69 @@ function runChecked(spawn, command, arguments_, options, label) {
     throw new Error(`${label} failed without producing candidate evidence.`);
   }
   return String(result.stdout || "");
+}
+
+function toolchainPathEnvironment(environment) {
+  const selected = {};
+  for (const name of Object.keys(environment || {})) {
+    if (["COMSPEC", "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR"].includes(name.toUpperCase())) {
+      selected[name] = environment[name];
+    }
+  }
+  return selected;
+}
+
+function qualificationToolchainPreflight(options = {}) {
+  const root = options.root || ROOT;
+  const adapters = options.adapters || {};
+  const suppliedEnvironment = Object.prototype.hasOwnProperty.call(options, "environment")
+    ? options.environment
+    : process.env;
+  if (!suppliedEnvironment || typeof suppliedEnvironment !== "object"
+    || Array.isArray(suppliedEnvironment)) {
+    throw new Error("Qualification environment must be an object.");
+  }
+  const validateRuntime = adapters.assertCanonicalNodeRuntime || assertCanonicalNodeRuntime;
+  validateRuntime(root, process.version);
+  const validateNodeExecutable = adapters.assertExactNodeExecutable || assertExactNodeExecutable;
+  const authenticateNpm = adapters.assertCanonicalNpmRuntime || assertCanonicalNpmRuntime;
+  const assertNoShadow = adapters.assertNoNpmToolchainShadowing
+    || assertNoNpmToolchainShadowing;
+  const nodeExecutable = validateNodeExecutable(process.execPath, { platform: process.platform });
+  canonicalToolchainEnvironment(toolchainPathEnvironment(suppliedEnvironment), {
+    nodeExecutable,
+    platform: process.platform,
+  });
+  const npm = authenticateNpm(root, suppliedEnvironment?.npm_execpath, {
+    nodeExecutable,
+    platform: process.platform,
+  });
+  assertNoShadow(root, { platform: process.platform });
+  return Object.freeze({ assertNoShadow, nodeExecutable, npm });
+}
+
+function runCanonicalNpm(spawn, arguments_, options, label, toolchain) {
+  toolchain.assertNoShadow(toolchain.root, { platform: process.platform });
+  return toolchain.withLauncher({
+    nodeExecutable: toolchain.nodeExecutable,
+    npm: toolchain.npm,
+    platform: process.platform,
+    temporaryParent: toolchain.temporaryParent,
+  }, launcher => runChecked(
+    spawn,
+    toolchain.nodeExecutable,
+    [launcher.npmCliPath, ...arguments_],
+    {
+      ...options,
+      env: canonicalToolchainEnvironment(options.env, {
+        launcherDirectory: launcher.directory,
+        nodeExecutable: toolchain.nodeExecutable,
+        platform: process.platform,
+        scriptShell: launcher.scriptShell,
+      }),
+    },
+    label,
+  ));
 }
 
 function removeFreshPackageOutputs(root, name, version) {
@@ -880,6 +985,13 @@ async function prepareCodePaths(options) {
 async function prepareQualificationCandidate(options = {}) {
   const root = options.root || ROOT;
   const adapters = options.adapters || {};
+  const suppliedEnvironment = Object.prototype.hasOwnProperty.call(options, "environment")
+    ? options.environment
+    : process.env;
+  const toolchain = qualificationToolchainPreflight({ root, adapters, environment: suppliedEnvironment });
+  const { assertNoShadow, nodeExecutable } = toolchain;
+  const authenticateNpm = adapters.assertCanonicalNpmRuntime || assertCanonicalNpmRuntime;
+  let npm = toolchain.npm;
   const spawn = adapters.spawnSync || spawnSync;
   const spawnDetached = adapters.spawn || spawnProcess;
   const userInfo = adapters.userInfo || os.userInfo;
@@ -888,14 +1000,10 @@ async function prepareQualificationCandidate(options = {}) {
   const verifyArtifact = adapters.verifyVsix || verifyVsix;
   const verifySidecars = adapters.validateSidecars || validateSidecars;
   const now = adapters.now || (() => new Date());
-  removeOutputFile(CANDIDATE_RECEIPT, root, { subtree: ".quality/qualification" });
   const mode = options.mode || "local";
   if (!new Set(["local", "ci"]).has(mode)) {
     throw new Error("Qualification profile mode must be local or ci.");
   }
-  const suppliedEnvironment = Object.prototype.hasOwnProperty.call(options, "environment")
-    ? options.environment
-    : process.env;
   const nonAuthBoundary = options.nonAuthBoundary === undefined
     ? null
     : assertActiveNonAuthQualityBoundary(options.nonAuthBoundary, suppliedEnvironment);
@@ -909,14 +1017,14 @@ async function prepareQualificationCandidate(options = {}) {
   const nestedTemporaryParent = nonAuthBoundary?.paths.temporary || options.temporaryParent;
   const qualificationLane = options.qualificationLane
     || (mode === "local" ? "current" : "black-box");
+  if (!new Set(["current", "black-box"]).has(qualificationLane)) {
+    throw new Error("Qualification lane must be current or black-box.");
+  }
   const proofPaths = qualificationLane === "current"
     ? mode === "local"
       ? [LIVE_CANDIDATE_RECEIPT, LIVE_CANDIDATE_ARTIFACT]
       : [AUTHENTICATED_CANDIDATE_RECEIPT, AUTHENTICATED_CANDIDATE_ARTIFACT]
     : [UI_CANDIDATE_RECEIPT, UI_CANDIDATE_ARTIFACT];
-  for (const proofPath of proofPaths) {
-    removeOutputFile(proofPath, root, { subtree: ".quality/qualification" });
-  }
   let profile;
   let succeeded = false;
   try {
@@ -933,14 +1041,32 @@ async function prepareQualificationCandidate(options = {}) {
       suppliedEnvironment,
       profile,
       nonAuthBoundary,
+      process.platform,
     );
+    npm = authenticateNpm(root, npm.cliPath, {
+      nodeExecutable,
+      platform: process.platform,
+    });
+    assertNoShadow(root, { platform: process.platform });
+    const npmToolchain = Object.freeze({
+      assertNoShadow,
+      nodeExecutable,
+      npm,
+      root,
+      temporaryParent: fs.realpathSync(nestedTemporaryParent || os.tmpdir()),
+      withLauncher: adapters.withCanonicalNpmLauncher || withCanonicalNpmLauncher,
+    });
+    removeOutputFile(CANDIDATE_RECEIPT, root, { subtree: ".quality/qualification" });
+    for (const proofPath of proofPaths) {
+      removeOutputFile(proofPath, root, { subtree: ".quality/qualification" });
+    }
     removeSafeAppleMetadata(root, { spawnSync: spawn, environment });
-    runChecked(
+    runCanonicalNpm(
       spawn,
-      process.platform === "win32" ? "npm.cmd" : "npm",
       ["run", "verify:polish"],
       { cwd: root, env: environment },
       "Post-cleanup polish verification",
+      npmToolchain,
     );
     const repositoryBefore = captureRepositoryState(root, spawn, environment);
     const sourceBefore = assertSourceIdentity(identifySource(root, spawn, environment, {
@@ -968,12 +1094,12 @@ async function prepareQualificationCandidate(options = {}) {
         dev: packageOutputStat.dev,
         ino: packageOutputStat.ino,
       });
-      runChecked(
+      runCanonicalNpm(
         spawn,
-        process.platform === "win32" ? "npm.cmd" : "npm",
         ["run", "package", "--", "--github-output", packageOutputFile],
         { cwd: root, env: environment },
         "Canonical npm package",
+        npmToolchain,
       );
       packageOutput = parsePackageOutput(
         packageOutputFile,
@@ -1115,11 +1241,17 @@ async function prepareQualificationCandidate(options = {}) {
     }
 
     const receiptBase = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       status: "passed",
       capturedAt: capturedAt(now),
       source: sourceBefore,
       repository: repositoryBefore,
+      toolchain: {
+        nodeVersion: process.version,
+        npmVersion: npm.version,
+        npmInstallationSha256: npm.installation.sha256,
+        platform: process.platform,
+      },
       extension: {
         id: extension.id,
         publisher: extension.publisher,
@@ -1235,6 +1367,7 @@ module.exports = {
   parsePackageOutput,
   prepareCodePaths,
   prepareQualificationCandidate,
+  qualificationToolchainPreflight,
   qualificationEnvironment,
   qualificationLaunchArguments,
   removeFreshPackageOutputs,

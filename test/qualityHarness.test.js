@@ -27,26 +27,34 @@ const {
 const {
   artifactFingerprintForStep,
   completedReceipt,
+  exactRuntimeExecutable,
   executeCommand,
+  gateChildEnvironment,
   gatePlanFingerprint,
   getGatePlan,
   receiptPath,
-  runGate,
+  runGate: runGateWithoutFixturePin,
   stepArtifactPaths,
   testEvidenceProofForStep,
   validateArtifactBinding,
   validateTestEvidenceBinding,
 } = require("../scripts/quality/gate");
+const {
+  npmInstallationFingerprint,
+} = require("../scripts/quality/canonical-node-runtime");
 const { aggregateStatuses, fingerprint, sourceIdentity } = require("../scripts/quality/evidence");
 const {
   CREDENTIAL_LIKE_ENVIRONMENT_NAME,
   NON_AUTH_AMBIENT_CAPABILITY_NAMES,
+  NON_AUTH_CLEANUP_TAINT_ENV,
   NON_AUTH_QUALITY_ENVIRONMENT_ALLOWLIST,
   NON_AUTH_QUALITY_OVERRIDE_NAMES,
   assertActiveNonAuthQualityBoundary,
   buildNonAuthQualityEnvironment,
   cleanupNonAuthQualityEnvironment,
   createNonAuthQualityEnvironment,
+  emptyExactOwnedDirectory,
+  preserveNonAuthCleanupSubtree,
   removeExactOwnedDirectoryTree,
   withNonAuthQualityEnvironment,
 } = require("../scripts/quality/non-auth-environment");
@@ -70,6 +78,7 @@ const {
   filterMutationReport,
   fullMutationSelection,
   gitChangedFiles,
+  MUTATION_GLOBAL_OWNERS,
   perFileCounts,
   receipt: mutationReceipt,
   validateMutationSummary,
@@ -95,8 +104,10 @@ const {
 } = require("../scripts/quality/authenticated-exposure-scan");
 const {
   RELEASE_EXPOSURE_RESULT,
+  assertExactReleaseGateTree,
   buildReleaseExposureResult,
   captureGeneratedEvidenceManifest,
+  generatedEvidenceInventory,
 } = require("../scripts/quality/release-exposure-scan");
 const { UI_RESULT } = require("../scripts/quality/verify-ui-evidence");
 const {
@@ -118,6 +129,7 @@ const {
   validateMutationEvidenceArtifacts,
 } = require("../scripts/quality/verify-mutation-handoff");
 const TEST_INVENTORIES = require("./testInventories");
+const NPM_INTEGRITY = JSON.parse(fs.readFileSync(path.join(__dirname, "../.npm-integrity"), "utf8"));
 
 const root = path.resolve(__dirname, "..");
 const SOURCE_SHA = "1111111111111111111111111111111111111111";
@@ -128,6 +140,54 @@ const SOURCE_IDENTITY = Object.freeze({
 });
 const LIVE_FIXTURE_NOW = new Date("2026-08-26T00:03:00.000Z");
 const QUALITY_FIXTURE_HOME = fs.realpathSync(os.tmpdir());
+
+function runGate(options = {}) {
+  const fixtureOptions = options.root
+    ? { ...options, root: fs.realpathSync(options.root) }
+    : options;
+  if (fixtureOptions.root) {
+    const pin = path.join(fixtureOptions.root, ".node-version");
+    if (!fs.existsSync(pin)) fs.writeFileSync(pin, `${process.versions.node}\n`);
+  }
+  return runGateWithoutFixturePin(fixtureOptions);
+}
+
+function writeCanonicalNpmFixture(fixtureRoot, options = {}) {
+  const version = options.version || "10.9.8";
+  const platform = options.platform || "linux";
+  const nodeExecutable = options.nodeExecutable
+    || path.join(fixtureRoot, "runtime", "bin", "node");
+  fs.mkdirSync(path.dirname(nodeExecutable), { recursive: true });
+  if (!fs.existsSync(nodeExecutable)) {
+    fs.writeFileSync(nodeExecutable, "synthetic exact node runtime\n", { mode: 0o700 });
+  }
+  const packageRoot = platform === "win32"
+    ? path.join(path.dirname(nodeExecutable), "node_modules", "npm")
+    : path.join(path.dirname(path.dirname(nodeExecutable)), "lib", "node_modules", "npm");
+  const cliPath = path.join(packageRoot, "bin", "npm-cli.js");
+  fs.mkdirSync(path.dirname(cliPath), { recursive: true });
+  fs.mkdirSync(path.join(packageRoot, "lib"), { recursive: true });
+  fs.writeFileSync(path.join(fixtureRoot, ".npm-version"), `${version}\n`);
+  const newline = platform === "win32" ? "\r\n" : "\n";
+  fs.writeFileSync(
+    cliPath,
+    `#!/usr/bin/env node${newline}require('../lib/cli.js')(process)${newline}`,
+  );
+  fs.writeFileSync(path.join(packageRoot, "lib", "cli.js"), "module.exports = () => {}\n");
+  fs.writeFileSync(path.join(packageRoot, "package.json"), `${JSON.stringify({
+    name: "npm",
+    version,
+    main: "./index.js",
+    bin: { npm: "bin/npm-cli.js", npx: "bin/npx-cli.js" },
+    engines: { node: "^18.17.0 || >=20.5.0" },
+  }, null, 2)}\n`);
+  const installation = npmInstallationFingerprint(packageRoot, { platform });
+  fs.writeFileSync(path.join(fixtureRoot, ".npm-integrity"), `${JSON.stringify({
+    posix: installation.sha256,
+    win32: installation.sha256,
+  })}\n`);
+  return { cliPath, nodeExecutable, packageRoot, platform, version };
+}
 
 function analyzeFiles(files) {
   const changeSet = explicitChanges(files, {
@@ -312,7 +372,7 @@ function validLiveStatus(overrides = {}) {
 
 function validCandidateReceipt(overrides = {}) {
   const base = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     status: "passed",
     capturedAt: "2026-08-27T00:00:00.000Z",
     source: SOURCE_IDENTITY,
@@ -320,6 +380,12 @@ function validCandidateReceipt(overrides = {}) {
       branch: "test/release-quality-harness",
       dirty: true,
       status: "dirty",
+    },
+    toolchain: {
+      nodeVersion: "v22.23.2",
+      npmVersion: "10.9.8",
+      npmInstallationSha256: NPM_INTEGRITY[process.platform === "win32" ? "win32" : "posix"],
+      platform: process.platform,
     },
     extension: {
       id: "Cloudsmith.cloudsmith-vsc",
@@ -465,6 +531,9 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
     { cwd: fixtureRoot, stdio: "ignore" },
   ).status, 0);
   fs.writeFileSync(path.join(fixtureRoot, ".gitignore"), ".quality/\ninternal_docs/\n");
+  for (const filename of [".node-version", ".npm-version", ".npm-integrity"]) {
+    fs.copyFileSync(path.join(root, filename), path.join(fixtureRoot, filename));
+  }
   fs.mkdirSync(path.join(fixtureRoot, "quality"), { recursive: true });
   fs.copyFileSync(path.join(root, "package.json"), path.join(fixtureRoot, "package.json"));
   for (const filename of [
@@ -531,7 +600,7 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
   );
   const candidateBytes = Buffer.from("live candidate fixture");
   const candidateBase = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     status: "passed",
     capturedAt,
     source,
@@ -539,6 +608,14 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
       branch: "test/release-quality-harness",
       dirty: true,
       status: "dirty",
+    },
+    toolchain: {
+      nodeVersion: "v22.23.2",
+      npmVersion: "10.9.8",
+      npmInstallationSha256: NPM_INTEGRITY[
+        process.platform === "win32" ? "win32" : "posix"
+      ],
+      platform: process.platform,
     },
     extension: {
       id: "Cloudsmith.cloudsmith-vsc",
@@ -1477,6 +1554,77 @@ suite("Quality change-impact analyzer", () => {
     assert.ok(report.riskCategories.includes("context-value-menu-when"));
   });
 
+  test("toolchain pins select verifier, packaging, Node, UI, and mutation evidence", () => {
+    for (const file of [".node-version", ".npm-version", ".npm-integrity"]) {
+      const report = analyzeFiles([file]);
+      assert.strictEqual(report.ok, true, file);
+      assert.deepStrictEqual(report.manifestFiles, [file]);
+      assert.deepStrictEqual(report.requiredLayers, ["black-box-ui", "contract", "unit"]);
+      for (const command of [
+        "node scripts/quality/verify.js",
+        "npm run package",
+        "npm run test:mutation:core",
+        "npm run test:node",
+        "npm run test:ui:smoke",
+      ]) {
+        assert.ok(report.commands.includes(command), `${file}: ${command}`);
+      }
+    }
+  });
+
+  test("toolchain implementation owners force verifier, package, UI, and mutation evidence", () => {
+    for (const file of [
+      "scripts/quality/candidate-binding.js",
+      "scripts/quality/canonical-node-runtime.js",
+      "scripts/quality/gate.js",
+      "scripts/quality/non-auth-environment.js",
+      "scripts/quality/prepare-qualification.js",
+      "scripts/quality/run-mutation.js",
+      "scripts/quality/run-ui-smoke.js",
+      "scripts/quality/verify-ui-evidence.js",
+      "scripts/release/package-vsix.js",
+      "scripts/release/verify-vsix.js",
+    ]) {
+      const report = analyzeFiles([file]);
+      assert.strictEqual(report.ok, true, file);
+      assert.deepStrictEqual(report.requiredLayers, ["black-box-ui", "contract", "unit"], file);
+      for (const command of [
+        "node scripts/quality/verify.js",
+        "npm run package",
+        "npm run test:mutation:core",
+        "npm run test:node",
+        "npm run test:ui:smoke",
+      ]) {
+        assert.ok(report.commands.includes(command), `${file}: ${command}`);
+      }
+    }
+  });
+
+  test("mutation toolchain owners force the core mutation gate", () => {
+    const report = analyzeFiles(["scripts/quality/mutation-toolchain.js"]);
+    assert.strictEqual(report.ok, true);
+    assert.ok(report.requiredLayers.includes("unit"));
+    assert.ok(report.commands.includes("npm run test:node"));
+    assert.ok(report.commands.includes("npm run test:mutation:core"));
+  });
+
+  test("test inventory dependencies retain their mapped owner commands", () => {
+    const report = analyzeFiles(["test/testInventories.js"]);
+    assert.strictEqual(report.ok, true);
+    assert.ok(report.requiredLayers.includes("unit"));
+    assert.ok(report.commands.includes("npm run test:node"));
+  });
+
+  test("impact and mutation selection share every global mutation owner", () => {
+    for (const file of MUTATION_GLOBAL_OWNERS) {
+      const report = analyzeFiles([file]);
+      assert.strictEqual(report.ok, true, file);
+      assert.ok(report.requiredLayers.includes("unit"), file);
+      assert.ok(report.commands.includes("npm run test:node"), file);
+      assert.ok(report.commands.includes("npm run test:mutation:core"), file);
+    }
+  });
+
   test("hard-fails an unmapped runtime file while retaining deterministic evidence", () => {
     const first = analyzeFiles(["util/newUnmappedRuntime.js"]);
     const second = analyzeFiles(["util/newUnmappedRuntime.js"]);
@@ -1798,6 +1946,35 @@ suite("Quality gate runner", () => {
       }), /synthetic child failure/u);
       assert.strictEqual(fs.existsSync(failureRoot), false);
 
+      let dualFailureRoot;
+      assert.throws(() => withNonAuthQualityEnvironment({
+        environment: hostileEnvironment,
+        temporaryParent: scratch,
+      }, (_environment, boundary) => {
+        dualFailureRoot = boundary.root;
+        fs.writeFileSync(
+          path.join(boundary.root, "unexpected-cleanup-entry"),
+          "synthetic refused cleanup bytes\n",
+        );
+        throw new Error("synthetic callback and cleanup failure");
+      }), error => {
+        assert.strictEqual(error instanceof AggregateError, true);
+        assert.strictEqual(error.errors.length, 2);
+        assert.match(error.errors[0].message, /synthetic callback and cleanup failure/u);
+        assert.match(error.errors[1].message, /unsafe or changed tree/u);
+        return true;
+      });
+      const dualFailureQuarantine = fs.readdirSync(scratch).find(
+        name => name.startsWith(`.${path.basename(dualFailureRoot)}.cleanup-`),
+      );
+      assert.strictEqual(typeof dualFailureQuarantine, "string");
+      assert.strictEqual(fs.readFileSync(path.join(
+        scratch,
+        dualFailureQuarantine,
+        "unexpected-cleanup-entry",
+      ), "utf8"), "synthetic refused cleanup bytes\n");
+      fs.rmSync(path.join(scratch, dualFailureQuarantine), { recursive: true, force: true });
+
       let windowsBoundaryRoot;
       const windowsResult = withNonAuthQualityEnvironment({
         environment: {
@@ -1936,6 +2113,498 @@ suite("Quality gate runner", () => {
       assert.throws(
         () => cleanupNonAuthQualityEnvironment(boundary),
         /unknown boundary/u,
+      );
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("a registered unsafe subtree taints outer cleanup across a later rename", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-non-auth-preserved-rename-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const boundary = createNonAuthQualityEnvironment({
+      environment: { PATH: "/fixture/bin" },
+      temporaryParent: scratch,
+    });
+    const original = path.join(boundary.paths.temporary, "tainted-launcher");
+    const renamed = path.join(boundary.paths.temporary, "renamed-launcher");
+    fs.mkdirSync(original);
+    fs.writeFileSync(path.join(original, "preserve.txt"), "renamed bytes survive\n");
+    assert.strictEqual(preserveNonAuthCleanupSubtree(original), true);
+    fs.renameSync(original, renamed);
+    assert.throws(
+      () => cleanupNonAuthQualityEnvironment(boundary),
+      /preserved an unsafe or changed tree/u,
+    );
+    const quarantineName = fs.readdirSync(scratch).find(
+      name => name.startsWith(`.${path.basename(boundary.root)}.cleanup-`),
+    );
+    try {
+      assert.strictEqual(typeof quarantineName, "string");
+      assert.strictEqual(fs.readFileSync(path.join(
+        scratch,
+        quarantineName,
+        "tmp",
+        "renamed-launcher",
+        "preserve.txt",
+      ), "utf8"), "renamed bytes survive\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("an unsafe subtree renamed before registration still taints outer cleanup", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-non-auth-preserved-prerename-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const boundary = createNonAuthQualityEnvironment({
+      environment: { PATH: "/fixture/bin" },
+      temporaryParent: scratch,
+    });
+    const original = path.join(boundary.paths.temporary, "tainted-launcher");
+    const renamed = path.join(boundary.paths.temporary, "renamed-launcher");
+    fs.mkdirSync(original);
+    fs.writeFileSync(path.join(original, "preserve.txt"), "pre-renamed bytes survive\n");
+    fs.renameSync(original, renamed);
+    assert.strictEqual(preserveNonAuthCleanupSubtree(original), true);
+    assert.throws(
+      () => cleanupNonAuthQualityEnvironment(boundary),
+      /preserved an unsafe or changed tree/u,
+    );
+    const quarantineName = fs.readdirSync(scratch).find(
+      name => name.startsWith(`.${path.basename(boundary.root)}.cleanup-`),
+    );
+    try {
+      assert.strictEqual(typeof quarantineName, "string");
+      assert.strictEqual(fs.readFileSync(path.join(
+        scratch,
+        quarantineName,
+        "tmp",
+        "renamed-launcher",
+        "preserve.txt",
+      ), "utf8"), "pre-renamed bytes survive\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("a preserved subtree taints every containing active cleanup boundary", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-non-auth-preserved-nested-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const outer = createNonAuthQualityEnvironment({
+      environment: { PATH: "/fixture/bin" },
+      temporaryParent: scratch,
+    });
+    const inner = createNonAuthQualityEnvironment({
+      environment: { PATH: "/fixture/bin" },
+      temporaryParent: outer.paths.temporary,
+    });
+    const preserved = path.join(inner.paths.temporary, "tainted-launcher");
+    fs.mkdirSync(preserved);
+    fs.writeFileSync(path.join(preserved, "preserve.txt"), "nested bytes survive\n");
+    assert.strictEqual(preserveNonAuthCleanupSubtree(preserved), true);
+
+    assert.throws(
+      () => cleanupNonAuthQualityEnvironment(inner),
+      /preserved an unsafe or changed tree/u,
+    );
+    const innerQuarantineName = fs.readdirSync(outer.paths.temporary).find(
+      name => name.startsWith(`.${path.basename(inner.root)}.cleanup-`),
+    );
+    assert.strictEqual(typeof innerQuarantineName, "string");
+
+    assert.throws(
+      () => cleanupNonAuthQualityEnvironment(outer),
+      /preserved an unsafe or changed tree/u,
+    );
+    const outerQuarantineName = fs.readdirSync(scratch).find(
+      name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
+    );
+    try {
+      assert.strictEqual(typeof outerQuarantineName, "string");
+      assert.strictEqual(fs.readFileSync(path.join(
+        scratch,
+        outerQuarantineName,
+        "tmp",
+        innerQuarantineName,
+        "tmp",
+        "tainted-launcher",
+        "preserve.txt",
+      ), "utf8"), "nested bytes survive\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("an inner cleanup refusal taints every containing active boundary", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-non-auth-refused-nested-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const outer = createNonAuthQualityEnvironment({
+      environment: { PATH: "/fixture/bin" },
+      temporaryParent: scratch,
+    });
+    const inner = createNonAuthQualityEnvironment({
+      environment: { PATH: "/fixture/bin" },
+      temporaryParent: outer.paths.temporary,
+    });
+    const displacedHome = path.join(scratch, "displaced-inner-home");
+    const victim = path.join(scratch, "synthetic-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "refused bytes survive\n");
+    fs.renameSync(inner.paths.home, displacedHome);
+    fs.renameSync(victim, inner.paths.home);
+
+    assert.throws(
+      () => cleanupNonAuthQualityEnvironment(inner),
+      /exact creator-owned private directory/u,
+    );
+    assert.strictEqual(fs.existsSync(inner.root), true);
+
+    assert.throws(
+      () => cleanupNonAuthQualityEnvironment(outer),
+      /preserved an unsafe or changed tree/u,
+    );
+    const outerQuarantineName = fs.readdirSync(scratch).find(
+      name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
+    );
+    try {
+      assert.strictEqual(typeof outerQuarantineName, "string");
+      assert.strictEqual(fs.readFileSync(path.join(
+        scratch,
+        outerQuarantineName,
+        "tmp",
+        path.basename(inner.root),
+        "home",
+        "preserve.txt",
+      ), "utf8"), "refused bytes survive\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("a refused inner creation rollback taints every containing active boundary", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-non-auth-create-refused-nested-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const outer = createNonAuthQualityEnvironment({
+      environment: { PATH: "/fixture/bin" },
+      temporaryParent: scratch,
+    });
+    const victim = path.join(scratch, "synthetic-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "rollback bytes survive\n");
+    const originalWriteFile = fs.writeFileSync;
+    let partialRoot = null;
+    try {
+      fs.writeFileSync = function interceptOwnershipMarker(target, ...args) {
+        if (!partialRoot
+          && typeof target === "string"
+          && path.basename(target) === ".cloudsmith-non-auth-owner.json"
+          && path.dirname(path.dirname(target)) === outer.paths.temporary) {
+          partialRoot = path.dirname(target);
+          fs.renameSync(victim, path.join(partialRoot, "unexpected-victim"));
+          throw new Error("synthetic marker creation failure");
+        }
+        return originalWriteFile.call(fs, target, ...args);
+      };
+      assert.throws(
+        () => createNonAuthQualityEnvironment({
+          environment: { PATH: "/fixture/bin" },
+          temporaryParent: outer.paths.temporary,
+        }),
+        /unsafe or changed tree/u,
+      );
+    } finally {
+      fs.writeFileSync = originalWriteFile;
+    }
+    const innerQuarantineName = fs.readdirSync(outer.paths.temporary).find(
+      name => name.startsWith(`.${path.basename(partialRoot)}.cleanup-`),
+    );
+    assert.strictEqual(typeof innerQuarantineName, "string");
+
+    assert.throws(
+      () => cleanupNonAuthQualityEnvironment(outer),
+      /preserved an unsafe or changed tree/u,
+    );
+    const outerQuarantineName = fs.readdirSync(scratch).find(
+      name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
+    );
+    try {
+      assert.strictEqual(typeof outerQuarantineName, "string");
+      assert.strictEqual(fs.readFileSync(path.join(
+        scratch,
+        outerQuarantineName,
+        "tmp",
+        innerQuarantineName,
+        "unexpected-victim",
+        "preserve.txt",
+      ), "utf8"), "rollback bytes survive\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("a reoccupied inner creation rollback taints every containing active boundary", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-non-auth-create-reoccupied-nested-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const outer = createNonAuthQualityEnvironment({
+      environment: { PATH: "/fixture/bin" },
+      temporaryParent: scratch,
+    });
+    const victim = path.join(scratch, "synthetic-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "reoccupied bytes survive\n");
+    const originalWriteFile = fs.writeFileSync;
+    const originalRename = fs.renameSync;
+    let partialRoot = null;
+    let reoccupied = false;
+    try {
+      fs.writeFileSync = function interceptOwnershipMarker(target, ...args) {
+        if (!partialRoot
+          && typeof target === "string"
+          && path.basename(target) === ".cloudsmith-non-auth-owner.json"
+          && path.dirname(path.dirname(target)) === outer.paths.temporary) {
+          partialRoot = path.dirname(target);
+          throw new Error("synthetic marker creation failure");
+        }
+        return originalWriteFile.call(fs, target, ...args);
+      };
+      fs.renameSync = function interceptRollbackQuarantine(source, destination) {
+        originalRename.call(fs, source, destination);
+        if (!reoccupied
+          && source === partialRoot
+          && path.dirname(destination) === outer.paths.temporary
+          && path.basename(destination).startsWith(`.${path.basename(partialRoot)}.cleanup-`)) {
+          originalRename.call(fs, victim, partialRoot);
+          reoccupied = true;
+        }
+      };
+      assert.throws(
+        () => createNonAuthQualityEnvironment({
+          environment: { PATH: "/fixture/bin" },
+          temporaryParent: outer.paths.temporary,
+        }),
+        /reoccupied during creation rollback/u,
+      );
+    } finally {
+      fs.writeFileSync = originalWriteFile;
+      fs.renameSync = originalRename;
+    }
+    assert.strictEqual(reoccupied, true);
+    assert.strictEqual(fs.existsSync(partialRoot), true);
+
+    assert.throws(
+      () => cleanupNonAuthQualityEnvironment(outer),
+      /preserved an unsafe or changed tree/u,
+    );
+    const outerQuarantineName = fs.readdirSync(scratch).find(
+      name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
+    );
+    try {
+      assert.strictEqual(typeof outerQuarantineName, "string");
+      assert.strictEqual(fs.readFileSync(path.join(
+        scratch,
+        outerQuarantineName,
+        "tmp",
+        path.basename(partialRoot),
+        "preserve.txt",
+      ), "utf8"), "reoccupied bytes survive\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("exact sub-cleanup refusals taint their active outer boundary", () => {
+    for (const [label, cleanup] of [
+      ["remove", removeExactOwnedDirectoryTree],
+      ["empty", emptyExactOwnedDirectory],
+    ]) {
+      const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+        os.tmpdir(),
+        `cloudsmith-non-auth-${label}-refused-`,
+      )));
+      if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+      const outer = createNonAuthQualityEnvironment({
+        environment: { PATH: "/fixture/bin" },
+        temporaryParent: scratch,
+      });
+      const exactRoot = path.join(outer.paths.temporary, `${label}-scratch`);
+      fs.mkdirSync(exactRoot, { mode: 0o700 });
+      const rootIdentity = fs.lstatSync(exactRoot);
+      const victim = path.join(scratch, `${label}-victim`);
+      fs.mkdirSync(victim, { mode: 0o700 });
+      fs.writeFileSync(path.join(victim, "preserve.txt"), `${label} bytes survive\n`);
+      fs.renameSync(victim, path.join(exactRoot, "unexpected-victim"));
+
+      assert.throws(
+        () => cleanup(exactRoot, {
+          errorMessage: `Synthetic ${label} cleanup refused an unsafe tree.`,
+          expectedRootEntries: [],
+          expectedRootIdentity: rootIdentity,
+        }),
+        new RegExp(`Synthetic ${label} cleanup refused an unsafe tree\\.`, "u"),
+      );
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(outer),
+        /preserved an unsafe or changed tree/u,
+      );
+      const outerQuarantineName = fs.readdirSync(scratch).find(
+        name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
+      );
+      try {
+        assert.strictEqual(typeof outerQuarantineName, "string");
+        assert.strictEqual(fs.readFileSync(path.join(
+          scratch,
+          outerQuarantineName,
+          "tmp",
+          path.basename(exactRoot),
+          "unexpected-victim",
+          "preserve.txt",
+        ), "utf8"), `${label} bytes survive\n`);
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("a child cleanup refusal durably taints its parent process boundary", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-non-auth-cross-process-refused-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const outer = createNonAuthQualityEnvironment({
+      environment: { PATH: process.env.PATH || "/usr/bin:/bin" },
+      temporaryParent: scratch,
+    });
+    const childScript = [
+      "const fs=require('fs');",
+      "const path=require('path');",
+      `const boundaryModule=require(${JSON.stringify(path.join(
+        ROOT,
+        "scripts/quality/non-auth-environment.js",
+      ))});`,
+      "const inner=boundaryModule.createNonAuthQualityEnvironment({",
+      "environment:process.env,temporaryParent:process.env.TMPDIR});",
+      "const target=path.join(inner.paths.temporary,'tainted-launcher');",
+      "fs.mkdirSync(target);",
+      "fs.writeFileSync(path.join(target,'preserve.txt'),'child bytes survive\\n');",
+      "boundaryModule.preserveNonAuthCleanupSubtree(target);",
+      "try{boundaryModule.cleanupNonAuthQualityEnvironment(inner);}catch{}",
+    ].join("");
+    const child = spawnSync(process.execPath, ["-e", childScript], {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: outer.environment,
+    });
+    assert.strictEqual(child.status, 0, child.stderr);
+    assert.strictEqual(child.stdout, "");
+    const innerQuarantineName = fs.readdirSync(outer.paths.temporary).find(
+      name => name.startsWith(".cloudsmith-non-auth-") && name.includes(".cleanup-"),
+    );
+    assert.strictEqual(typeof innerQuarantineName, "string");
+
+    assert.throws(
+      () => cleanupNonAuthQualityEnvironment(outer),
+      /unsafe or changed tree/u,
+    );
+    const outerQuarantineName = fs.readdirSync(scratch).find(
+      name => name.startsWith(`.${path.basename(outer.root)}.cleanup-`),
+    );
+    try {
+      assert.strictEqual(typeof outerQuarantineName, "string");
+      assert.strictEqual(fs.readFileSync(path.join(
+        scratch,
+        outerQuarantineName,
+        "tmp",
+        innerQuarantineName,
+        "tmp",
+        "tainted-launcher",
+        "preserve.txt",
+      ), "utf8"), "child bytes survive\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("cross-process taint writes only the verified receipt after root substitution", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-non-auth-cross-process-substitution-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    const outer = createNonAuthQualityEnvironment({
+      environment: { PATH: process.env.PATH || "/usr/bin:/bin" },
+      temporaryParent: scratch,
+    });
+    const displacedRoot = path.join(scratch, "displaced-owned-root");
+    const victim = path.join(scratch, "synthetic-victim");
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, "keep.txt"), "foreign bytes remain exact\n");
+    const originalWrite = fs.writeSync;
+    const hadCapability = Object.prototype.hasOwnProperty.call(
+      process.env,
+      NON_AUTH_CLEANUP_TAINT_ENV,
+    );
+    const priorCapability = process.env[NON_AUTH_CLEANUP_TAINT_ENV];
+    let substituted = false;
+    try {
+      process.env[NON_AUTH_CLEANUP_TAINT_ENV] = outer.environment[NON_AUTH_CLEANUP_TAINT_ENV];
+      fs.writeSync = function interceptVerifiedReceiptWrite(descriptor, ...args) {
+        if (!substituted) {
+          fs.renameSync(outer.root, displacedRoot);
+          fs.renameSync(victim, outer.root);
+          substituted = true;
+        }
+        return originalWrite.call(fs, descriptor, ...args);
+      };
+      assert.strictEqual(
+        preserveNonAuthCleanupSubtree(path.join(outer.paths.temporary, "future-refusal")),
+        true,
+      );
+    } finally {
+      fs.writeSync = originalWrite;
+      if (hadCapability) {
+        process.env[NON_AUTH_CLEANUP_TAINT_ENV] = priorCapability;
+      } else {
+        delete process.env[NON_AUTH_CLEANUP_TAINT_ENV];
+      }
+    }
+    try {
+      assert.strictEqual(substituted, true);
+      assert.deepStrictEqual(fs.readdirSync(outer.root), ["keep.txt"]);
+      assert.strictEqual(
+        fs.readFileSync(path.join(outer.root, "keep.txt"), "utf8"),
+        "foreign bytes remain exact\n",
+      );
+      assert.strictEqual(
+        fs.lstatSync(path.join(displacedRoot, path.basename(outer.paths.cleanupTaint))).size,
+        1,
+      );
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(outer),
+        /exact creator-owned private directory/u,
+      );
+      assert.deepStrictEqual(fs.readdirSync(outer.root), ["keep.txt"]);
+      assert.strictEqual(
+        fs.readFileSync(path.join(outer.root, "keep.txt"), "utf8"),
+        "foreign bytes remain exact\n",
       );
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
@@ -3682,8 +4351,30 @@ suite("Quality gate runner", () => {
         }),
         /rejected an unscoped Unix socket/u,
       );
-      assert.strictEqual(cleanupNonAuthQualityEnvironment(boundary), true);
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(boundary),
+        /preserved an unsafe or changed tree/u,
+      );
       assert.strictEqual(fs.existsSync(boundary.root), false);
+
+      const allowedBoundary = createNonAuthQualityEnvironment({
+        environment: { PATH: "/fixture/bin" },
+        temporaryParent: scratch,
+      });
+      const allowedSocketRoot = path.join(allowedBoundary.paths.temporary, "s");
+      const allowedSocket = path.join(allowedSocketRoot, "g.sock");
+      fs.mkdirSync(allowedSocketRoot, { mode: 0o700 });
+      const allowedSocketProcess = spawnSync(process.execPath, [
+        "-e",
+        "const net=require('net');const server=net.createServer();"
+          + "server.listen(process.argv[1],()=>process.kill(process.pid,'SIGKILL'));",
+        allowedSocket,
+      ], { encoding: "utf8", env: {}, timeout: 5_000 });
+      assert.strictEqual(allowedSocketProcess.status, null, allowedSocketProcess.stderr);
+      assert.strictEqual(allowedSocketProcess.signal, "SIGKILL", allowedSocketProcess.stderr);
+      assert.strictEqual(fs.lstatSync(allowedSocket).isSocket(), true);
+      assert.strictEqual(cleanupNonAuthQualityEnvironment(allowedBoundary), true);
+      assert.strictEqual(fs.existsSync(allowedBoundary.root), false);
 
       const fifoRoot = path.join(scratch, "f");
       const fifo = path.join(fifoRoot, "x.fifo");
@@ -5096,6 +5787,8 @@ suite("Quality mutation and UI harness boundaries", () => {
       scope
     );
     for (const owner of [
+      ".npm-integrity",
+      ".npm-version",
       ".github/workflows/deep-quality.yml",
       ".github/workflows/main.yml",
       ".node-version",
@@ -7433,5 +8126,861 @@ suite("Quality contract verifier fixtures", function () {
       renderMarkdown(report),
       /manual-production-composition in a real VS Code host\. Packaged-candidate activation is independently covered by the signed-out black-box UI lane\./
     );
+  });
+
+  test("fast, full, and release profiles preserve exact current prior receipt trees", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-release-gate-lifecycle-",
+    )));
+    const execute = step => {
+      const artifactFingerprint = materializeStepArtifacts(step, temporaryRoot);
+      const evidence = materializeStepTestEvidence(step, temporaryRoot);
+      return {
+        status: 0,
+        signal: null,
+        stdout: "1 passing\n",
+        stderr: "",
+        testEvidence: evidence.value,
+        testEvidenceFingerprint: evidence.fingerprint,
+        artifactFingerprint,
+      };
+    };
+    const preservedPaths = ["fast", "full"].flatMap(profile => [
+      `.quality/gates/${profile}.json`,
+      ...getGatePlan(profile).map(step => receiptPath({
+        profile,
+        sequence: step.sequence,
+        stepId: step.id,
+      })),
+    ]);
+    const snapshot = () => Object.fromEntries(preservedPaths.map(relativePath => {
+      const target = path.join(temporaryRoot, ...relativePath.split("/"));
+      const stat = fs.lstatSync(target, { bigint: true });
+      return [relativePath, {
+        bytes: fs.readFileSync(target),
+        identity: [stat.dev, stat.ino, stat.ctimeNs, stat.mtimeNs, stat.size].map(String),
+      }];
+    }));
+    try {
+      assert.strictEqual(runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        source: SOURCE_IDENTITY,
+        execute,
+      }).status, "passed");
+      assert.strictEqual(runGate({
+        root: temporaryRoot,
+        profile: "full",
+        source: SOURCE_IDENTITY,
+        execute,
+      }).status, "passed");
+      assert.strictEqual(assertExactReleaseGateTree(
+        temporaryRoot,
+        { source: SOURCE_IDENTITY },
+      ), true);
+      const beforeRelease = snapshot();
+      let releaseExecutions = 0;
+      const summary = runGate({
+        root: temporaryRoot,
+        profile: "release",
+        source: SOURCE_IDENTITY,
+        execute(step) {
+          releaseExecutions += 1;
+          if (step.id === "secret-release") {
+            assert.strictEqual(assertExactReleaseGateTree(
+              temporaryRoot,
+              { source: SOURCE_IDENTITY },
+            ), true);
+          }
+          const duringRelease = snapshot();
+          for (const relativePath of preservedPaths) {
+            assert.deepStrictEqual(
+              duringRelease[relativePath].identity,
+              beforeRelease[relativePath].identity,
+              relativePath,
+            );
+            assert.deepStrictEqual(
+              duringRelease[relativePath].bytes,
+              beforeRelease[relativePath].bytes,
+              relativePath,
+            );
+          }
+          return execute(step);
+        },
+      });
+
+      assert.strictEqual(releaseExecutions, getGatePlan("release").length);
+      assert.strictEqual(summary.status, "passed");
+      assert.strictEqual(assertExactReleaseGateTree(
+        temporaryRoot,
+        { source: SOURCE_IDENTITY },
+      ), true);
+      const afterRelease = snapshot();
+      for (const relativePath of preservedPaths) {
+        assert.deepStrictEqual(
+          afterRelease[relativePath].identity,
+          beforeRelease[relativePath].identity,
+          relativePath,
+        );
+        assert.deepStrictEqual(
+          afterRelease[relativePath].bytes,
+          beforeRelease[relativePath].bytes,
+          relativePath,
+        );
+      }
+
+      const staleSummaryPath = path.join(temporaryRoot, ".quality", "gates", "fast.json");
+      const staleSummary = JSON.parse(fs.readFileSync(staleSummaryPath, "utf8"));
+      staleSummary.source = { ...SOURCE_IDENTITY, fingerprint: "b".repeat(64) };
+      fs.writeFileSync(staleSummaryPath, `${JSON.stringify(staleSummary, null, 2)}\n`);
+      assert.throws(
+        () => assertExactReleaseGateTree(temporaryRoot, { source: SOURCE_IDENTITY }),
+        /unexpected, stale, or unsafe entry/u,
+      );
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("failed fast receipts with null artifact claims can be superseded by full", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-failed-fast-supersession-",
+    )));
+    const executePassing = step => {
+      const artifactFingerprint = materializeStepArtifacts(step, temporaryRoot);
+      const evidence = materializeStepTestEvidence(step, temporaryRoot);
+      return {
+        status: 0,
+        signal: null,
+        stdout: "1 passing\n",
+        stderr: "",
+        testEvidence: evidence.value,
+        testEvidenceFingerprint: evidence.fingerprint,
+        artifactFingerprint,
+      };
+    };
+    try {
+      const failed = runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        source: SOURCE_IDENTITY,
+        execute(step) {
+          if (step.sequence === 1) {
+            return { status: 1, signal: null, stdout: "", stderr: "synthetic failure\n" };
+          }
+          return executePassing(step);
+        },
+      });
+      assert.strictEqual(failed.status, "failed");
+      assert.strictEqual(runGate({
+        root: temporaryRoot,
+        profile: "full",
+        source: SOURCE_IDENTITY,
+        execute: executePassing,
+      }).status, "passed");
+      assert.strictEqual(assertExactReleaseGateTree(
+        temporaryRoot,
+        { source: SOURCE_IDENTITY },
+      ), true);
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("failed full receipts remain valid when release reaches its exposure scan", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-failed-full-supersession-",
+    )));
+    const executePassing = step => {
+      const artifactFingerprint = materializeStepArtifacts(step, temporaryRoot);
+      const evidence = materializeStepTestEvidence(step, temporaryRoot);
+      return {
+        status: 0,
+        signal: null,
+        stdout: "1 passing\n",
+        stderr: "",
+        testEvidence: evidence.value,
+        testEvidenceFingerprint: evidence.fingerprint,
+        artifactFingerprint,
+      };
+    };
+    try {
+      const failed = runGate({
+        root: temporaryRoot,
+        profile: "full",
+        source: SOURCE_IDENTITY,
+        execute(step) {
+          if (step.sequence === 1) {
+            return { status: 1, signal: null, stdout: "", stderr: "synthetic failure\n" };
+          }
+          return executePassing(step);
+        },
+      });
+      assert.strictEqual(failed.status, "failed");
+      let reachedExposureScan = false;
+      const release = runGate({
+        root: temporaryRoot,
+        profile: "release",
+        source: SOURCE_IDENTITY,
+        execute(step) {
+          if (step.id === "secret-release") {
+            reachedExposureScan = true;
+            assert.strictEqual(assertExactReleaseGateTree(
+              temporaryRoot,
+              { source: SOURCE_IDENTITY },
+            ), true);
+          }
+          return executePassing(step);
+        },
+      });
+      assert.strictEqual(reachedExposureScan, true);
+      assert.strictEqual(release.status, "passed");
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("preserved gate trees reject self-consistent execution and binding forgeries", () => {
+    const cases = [
+      {
+        name: "passed-nonzero",
+        profile: "fast",
+        supersededByFull: true,
+        stepId: "quality-contract-verifier",
+        mutate(receipt) {
+          receipt.exitCode = 7;
+        },
+      },
+      {
+        name: "not-run-with-completion",
+        stepId: "quality-contract-verifier",
+        mutate(receipt) {
+          receipt.status = "not-run";
+          receipt.exitCode = null;
+          receipt.reason = "not-started";
+        },
+      },
+      {
+        name: "broken-blocker-order",
+        stepId: "quality-contract-verifier",
+        mutate(receipt) {
+          receipt.status = "failed";
+          receipt.exitCode = 1;
+        },
+      },
+      {
+        name: "forged-artifact-binding",
+        stepId: "change-impact",
+        mutate(receipt) {
+          receipt.artifactFingerprint = "f".repeat(64);
+        },
+      },
+      {
+        name: "forged-superseded-artifact-binding",
+        profile: "fast",
+        supersededByFull: true,
+        stepId: "change-impact",
+        mutate(receipt) {
+          receipt.artifactFingerprint = "f".repeat(64);
+        },
+      },
+      {
+        name: "forged-test-evidence-binding",
+        stepId: "standalone-tests",
+        mutate(receipt) {
+          receipt.testEvidenceFingerprint = "f".repeat(64);
+        },
+      },
+    ];
+    for (const fixture of cases) {
+      const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+        os.tmpdir(),
+        `cloudsmith-preserved-forgery-${fixture.name}-`,
+      )));
+      try {
+        const execute = step => {
+            const artifactFingerprint = materializeStepArtifacts(step, temporaryRoot);
+            const evidence = materializeStepTestEvidence(step, temporaryRoot);
+            return {
+              status: 0,
+              signal: null,
+              stdout: "1 passing\n",
+              stderr: "",
+              testEvidence: evidence.value,
+              testEvidenceFingerprint: evidence.fingerprint,
+              artifactFingerprint,
+            };
+        };
+        const profile = fixture.profile || "full";
+        const summary = runGate({
+          root: temporaryRoot,
+          profile,
+          source: SOURCE_IDENTITY,
+          execute,
+        });
+        if (fixture.supersededByFull) runGate({
+          root: temporaryRoot,
+          profile: "full",
+          source: SOURCE_IDENTITY,
+          execute,
+        });
+        assert.strictEqual(summary.status, "passed", fixture.name);
+        const summaryPath = path.join(
+          temporaryRoot,
+          ".quality",
+          "gates",
+          `${profile}.json`,
+        );
+        const forgedSummary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+        const receiptIndex = forgedSummary.steps.findIndex(receipt => (
+          receipt.stepId === fixture.stepId
+        ));
+        const forgedReceipt = forgedSummary.steps[receiptIndex];
+        fixture.mutate(forgedReceipt);
+        forgedSummary.status = aggregateStatuses(
+          forgedSummary.steps.map(receipt => receipt.status),
+        );
+        const unsigned = { ...forgedSummary };
+        delete unsigned.key;
+        forgedSummary.key = {
+          sha: forgedSummary.source.sha,
+          fingerprint: fingerprint(unsigned),
+        };
+        writeJson(receiptPath(forgedReceipt), forgedReceipt, temporaryRoot, {
+          subtree: `.quality/gates/${profile}`,
+        });
+        writeJson(`.quality/gates/${profile}.json`, forgedSummary, temporaryRoot, {
+          subtree: ".quality/gates",
+        });
+
+        assert.throws(
+          () => assertExactReleaseGateTree(temporaryRoot, { source: SOURCE_IDENTITY }),
+          /unexpected, stale, or unsafe entry/u,
+          fixture.name,
+        );
+      } finally {
+        fs.rmSync(temporaryRoot, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("preserved gate validation rejects a same-byte receipt path swap", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-preserved-path-swap-",
+    )));
+    try {
+      runGate({
+        root: temporaryRoot,
+        profile: "full",
+        source: SOURCE_IDENTITY,
+        execute(step) {
+          const artifactFingerprint = materializeStepArtifacts(step, temporaryRoot);
+          const evidence = materializeStepTestEvidence(step, temporaryRoot);
+          return {
+            status: 0,
+            signal: null,
+            stdout: "1 passing\n",
+            stderr: "",
+            testEvidence: evidence.value,
+            testEvidenceFingerprint: evidence.fingerprint,
+            artifactFingerprint,
+          };
+        },
+      });
+      const firstStep = getGatePlan("full")[0];
+      const target = path.join(temporaryRoot, receiptPath({
+        profile: "full",
+        sequence: firstStep.sequence,
+        stepId: firstStep.id,
+      }));
+      const original = path.join(temporaryRoot, "original-preserved-receipt.json");
+      const bytes = fs.readFileSync(target);
+      const fileSystem = Object.create(fs);
+      let targetStats = 0;
+      let swapped = false;
+      fileSystem.lstatSync = (...arguments_) => {
+        if (arguments_[0] === target && ++targetStats === 5) {
+          fs.renameSync(target, original);
+          fs.writeFileSync(target, bytes);
+          swapped = true;
+        }
+        return fs.lstatSync(...arguments_);
+      };
+      assert.throws(
+        () => generatedEvidenceInventory(temporaryRoot, {
+          fileSystem,
+          source: SOURCE_IDENTITY,
+        }),
+        /unexpected, stale, or unsafe entry/u,
+      );
+      assert.strictEqual(swapped, true);
+      assert.strictEqual(fs.readFileSync(target).equals(bytes), true);
+      assert.strictEqual(fs.readFileSync(original).equals(bytes), true);
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("own-profile cleanup rejects a nested file before unlinking any receipt", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-gate-nested-cleanup-",
+    )));
+    const summaryPath = path.join(temporaryRoot, ".quality", "gates", "fast.json");
+    const nestedPath = path.join(
+      temporaryRoot,
+      ".quality",
+      "gates",
+      "fast",
+      "unexpected-directory",
+      "nested-proof.json",
+    );
+    try {
+      fs.mkdirSync(path.dirname(nestedPath), { recursive: true });
+      fs.writeFileSync(summaryPath, "synthetic prior summary\n");
+      fs.writeFileSync(nestedPath, "synthetic nested proof\n");
+      let executions = 0;
+      assert.throws(() => runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [fixtureArtifactStep()],
+        source: SOURCE_IDENTITY,
+        execute() {
+          executions += 1;
+          return { status: 0, signal: null, stdout: "", stderr: "" };
+        },
+      }), /cleanup refused an unsafe or changed tree/u);
+      assert.strictEqual(executions, 0);
+      assert.strictEqual(fs.readFileSync(summaryPath, "utf8"), "synthetic prior summary\n");
+      assert.strictEqual(fs.readFileSync(nestedPath, "utf8"), "synthetic nested proof\n");
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("own-profile cleanup fails closed when a receipt is substituted after inventory", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-gate-substitution-cleanup-",
+    )));
+    const summaryPath = path.join(temporaryRoot, ".quality", "gates", "fast.json");
+    const receipt = path.join(temporaryRoot, ".quality", "gates", "fast", "01-fixture.json");
+    const displaced = path.join(temporaryRoot, "displaced-original.json");
+    const originalLstat = fs.lstatSync;
+    let receiptStats = 0;
+    try {
+      fs.mkdirSync(path.dirname(receipt), { recursive: true });
+      fs.writeFileSync(summaryPath, "synthetic prior summary\n");
+      fs.writeFileSync(receipt, "inventoried receipt\n");
+      fs.lstatSync = function substituteAfterInventory(target, ...args) {
+        if (target === receipt && ++receiptStats === 2) {
+          fs.renameSync(receipt, displaced);
+          fs.writeFileSync(receipt, "concurrent replacement\n");
+        }
+        return originalLstat.call(fs, target, ...args);
+      };
+      let executions = 0;
+      assert.throws(() => runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [fixtureArtifactStep()],
+        source: SOURCE_IDENTITY,
+        execute() {
+          executions += 1;
+          return { status: 0, signal: null, stdout: "", stderr: "" };
+        },
+      }), /cleanup refused an unsafe or changed tree/u);
+      assert.strictEqual(executions, 0);
+      assert.strictEqual(fs.readFileSync(summaryPath, "utf8"), "synthetic prior summary\n");
+      assert.strictEqual(fs.readFileSync(receipt, "utf8"), "concurrent replacement\n");
+      assert.strictEqual(fs.readFileSync(displaced, "utf8"), "inventoried receipt\n");
+    } finally {
+      fs.lstatSync = originalLstat;
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("own-profile cleanup rejects a same-inode same-size receipt rewrite", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-gate-receipt-rewrite-",
+    )));
+    const summaryPath = path.join(temporaryRoot, ".quality", "gates", "fast.json");
+    const receipt = path.join(temporaryRoot, ".quality", "gates", "fast", "01-fixture.json");
+    const originalReceipt = Buffer.from("inventoried receipt\n");
+    const rewrittenReceipt = Buffer.alloc(originalReceipt.length, 0x78);
+    const originalLstat = fs.lstatSync;
+    let receiptStats = 0;
+    try {
+      fs.mkdirSync(path.dirname(receipt), { recursive: true });
+      fs.writeFileSync(summaryPath, "synthetic prior summary\n");
+      fs.writeFileSync(receipt, originalReceipt);
+      const originalIdentity = originalLstat.call(fs, receipt, { bigint: true });
+      fs.lstatSync = function rewriteAfterInventory(target, ...args) {
+        if (target === receipt && ++receiptStats === 2) {
+          fs.writeFileSync(receipt, rewrittenReceipt);
+        }
+        return originalLstat.call(fs, target, ...args);
+      };
+      let executions = 0;
+      assert.throws(() => runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [fixtureArtifactStep()],
+        source: SOURCE_IDENTITY,
+        execute() {
+          executions += 1;
+          return { status: 0, signal: null, stdout: "", stderr: "" };
+        },
+      }), /cleanup refused an unsafe or changed tree/u);
+      const rewrittenIdentity = originalLstat.call(fs, receipt, { bigint: true });
+      assert.strictEqual(executions, 0);
+      assert.strictEqual(String(rewrittenIdentity.ino), String(originalIdentity.ino));
+      assert.strictEqual(String(rewrittenIdentity.size), String(originalIdentity.size));
+      assert.notStrictEqual(String(rewrittenIdentity.ctimeNs), String(originalIdentity.ctimeNs));
+      assert.deepStrictEqual(fs.readFileSync(receipt), rewrittenReceipt);
+    } finally {
+      fs.lstatSync = originalLstat;
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("own-profile cleanup rejects a same-inode same-size summary rewrite", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-gate-summary-rewrite-",
+    )));
+    const summaryPath = path.join(temporaryRoot, ".quality", "gates", "fast.json");
+    const receipt = path.join(temporaryRoot, ".quality", "gates", "fast", "01-fixture.json");
+    const originalSummary = Buffer.from("inventoried summary\n");
+    const rewrittenSummary = Buffer.alloc(originalSummary.length, 0x79);
+    const originalLstat = fs.lstatSync;
+    let summaryStats = 0;
+    try {
+      fs.mkdirSync(path.dirname(receipt), { recursive: true });
+      fs.writeFileSync(summaryPath, originalSummary);
+      fs.writeFileSync(receipt, "inventoried receipt\n");
+      const originalIdentity = originalLstat.call(fs, summaryPath, { bigint: true });
+      fs.lstatSync = function rewriteAfterInventory(target, ...args) {
+        if (target === summaryPath && ++summaryStats === 2) {
+          fs.writeFileSync(summaryPath, rewrittenSummary);
+        }
+        return originalLstat.call(fs, target, ...args);
+      };
+      let executions = 0;
+      assert.throws(() => runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [fixtureArtifactStep()],
+        source: SOURCE_IDENTITY,
+        execute() {
+          executions += 1;
+          return { status: 0, signal: null, stdout: "", stderr: "" };
+        },
+      }), /cleanup refused an unsafe or changed tree/u);
+      const rewrittenIdentity = originalLstat.call(fs, summaryPath, { bigint: true });
+      assert.strictEqual(executions, 0);
+      assert.strictEqual(String(rewrittenIdentity.ino), String(originalIdentity.ino));
+      assert.strictEqual(String(rewrittenIdentity.size), String(originalIdentity.size));
+      assert.notStrictEqual(String(rewrittenIdentity.ctimeNs), String(originalIdentity.ctimeNs));
+      assert.deepStrictEqual(fs.readFileSync(summaryPath), rewrittenSummary);
+    } finally {
+      fs.lstatSync = originalLstat;
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("own-profile cleanup never deletes a final-summary substitution", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-gate-summary-substitution-",
+    )));
+    const summaryPath = path.join(temporaryRoot, ".quality", "gates", "fast.json");
+    const receipt = path.join(temporaryRoot, ".quality", "gates", "fast", "01-fixture.json");
+    const displaced = path.join(temporaryRoot, "displaced-summary.json");
+    const originalRename = fs.renameSync;
+    let swapped = false;
+    try {
+      fs.mkdirSync(path.dirname(receipt), { recursive: true });
+      fs.writeFileSync(summaryPath, "inventoried summary\n");
+      fs.writeFileSync(receipt, "inventoried receipt\n");
+      fs.renameSync = function substituteFinalSummary(source, destination) {
+        if (!swapped && source === summaryPath
+          && path.basename(path.dirname(destination)).startsWith(".gate-summary-cleanup-fast-")) {
+          originalRename.call(fs, summaryPath, displaced);
+          fs.writeFileSync(summaryPath, "concurrent summary replacement\n");
+          swapped = true;
+        }
+        return originalRename.call(fs, source, destination);
+      };
+      let executions = 0;
+      assert.throws(() => runGate({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [fixtureArtifactStep()],
+        source: SOURCE_IDENTITY,
+        execute() {
+          executions += 1;
+          return { status: 0, signal: null, stdout: "", stderr: "" };
+        },
+      }), /cleanup refused an unsafe or changed tree/u);
+      assert.strictEqual(swapped, true);
+      assert.strictEqual(executions, 0);
+      assert.strictEqual(fs.existsSync(summaryPath), false);
+      const quarantineNames = fs.readdirSync(path.dirname(summaryPath)).filter(name => (
+        name.startsWith(".gate-summary-cleanup-fast-")
+      ));
+      assert.strictEqual(quarantineNames.length, 1);
+      assert.strictEqual(fs.readFileSync(path.join(
+        path.dirname(summaryPath),
+        quarantineNames[0],
+        "summary.json",
+      ), "utf8"), "concurrent summary replacement\n");
+      assert.strictEqual(fs.readFileSync(displaced, "utf8"), "inventoried summary\n");
+    } finally {
+      fs.renameSync = originalRename;
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("wrong runtime rejects seeded gate and step outputs without mutation", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-gate-wrong-runtime-",
+    )));
+    const seeded = {
+      ".quality/gates/fast.json": "seeded summary\n",
+      ".quality/gates/fast/01-fixture-artifact.json": "seeded receipt\n",
+      ".quality/fixture/artifact.json": "seeded step artifact\n",
+    };
+    try {
+      fs.writeFileSync(path.join(temporaryRoot, ".node-version"), "22.23.2\n");
+      for (const [relativePath, bytes] of Object.entries(seeded)) {
+        const target = path.join(temporaryRoot, ...relativePath.split("/"));
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, bytes);
+      }
+      let executions = 0;
+      assert.throws(() => runGateWithoutFixturePin({
+        root: temporaryRoot,
+        assertCanonicalNodeRuntime() {
+          throw new Error("Canonical Node.js runtime does not match the exact version pin");
+        },
+        profile: "fast",
+        plan: [fixtureArtifactStep()],
+        source: SOURCE_IDENTITY,
+        execute() {
+          executions += 1;
+          return { status: 0, signal: null, stdout: "", stderr: "" };
+        },
+      }), /Canonical Node\.js runtime does not match the exact version pin/u);
+      assert.strictEqual(executions, 0);
+      for (const [relativePath, bytes] of Object.entries(seeded)) {
+        assert.strictEqual(
+          fs.readFileSync(path.join(temporaryRoot, ...relativePath.split("/")), "utf8"),
+          bytes,
+          relativePath,
+        );
+      }
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("npm gate children use a hard-linked node-only runtime ahead of conflicting PATH", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-gate-child-runtime-",
+    )));
+    const runtime = path.join(temporaryRoot, "runtime", "bin", "node");
+    const runtimeLink = path.join(temporaryRoot, "runtime-node-hard-link");
+    const conflictingPath = path.join(temporaryRoot, "conflicting", "bin");
+    let spawned = null;
+    let launcherDirectory = null;
+    try {
+      fs.mkdirSync(path.dirname(runtime), { recursive: true });
+      fs.mkdirSync(conflictingPath, { recursive: true });
+      fs.writeFileSync(runtime, "synthetic exact node runtime\n");
+      fs.linkSync(runtime, runtimeLink);
+      const npmFixture = writeCanonicalNpmFixture(temporaryRoot, { nodeExecutable: runtime });
+      assert.strictEqual(fs.existsSync(path.join(path.dirname(runtime), "npm")), false);
+      assert.strictEqual(fs.lstatSync(runtime).nlink, 2);
+      assert.strictEqual(exactRuntimeExecutable(runtime), runtime);
+
+      const result = executeCommand({
+        id: "fixture-npm-runtime",
+        category: "fixture",
+        executable: "npm",
+        args: ["run", "fixture"],
+        command: "npm run fixture",
+        blockedExitCodes: [],
+        sequence: 1,
+      }, {
+        root: temporaryRoot,
+        runtimeExecutable: runtime,
+        npmExecPath: npmFixture.cliPath,
+        temporaryParent: temporaryRoot,
+        environment: { PATH: conflictingPath },
+        spawnSync(executable, args, options) {
+          spawned = { executable, args, environment: options.env };
+          launcherDirectory = options.env.PATH.split(path.delimiter)[0];
+          assert.strictEqual(fs.lstatSync(path.join(launcherDirectory, "node")).isFile(), true);
+          assert.strictEqual(fs.lstatSync(path.join(launcherDirectory, "npm")).isFile(), true);
+          return { status: 0, signal: null, stdout: "", stderr: "" };
+        },
+      });
+      assert.strictEqual(result.status, 0);
+      assert.strictEqual(spawned.executable, runtime);
+      assert.deepStrictEqual(spawned.args.slice(1), ["run", "fixture"]);
+      assert.strictEqual(
+        spawned.args[0],
+        path.join(launcherDirectory, "npm-runtime", "bin", "npm-cli.js"),
+      );
+      assert.strictEqual(
+        spawned.environment.PATH.split(path.delimiter)[0],
+        launcherDirectory,
+      );
+      assert.strictEqual(
+        spawned.environment.PATH.split(path.delimiter)[1],
+        path.dirname(runtime),
+      );
+      assert.strictEqual(
+        spawned.environment.PATH.split(path.delimiter)[2],
+        conflictingPath,
+      );
+      assert.strictEqual(
+        gateChildEnvironment({ PATH: conflictingPath }, runtime).PATH,
+        [path.dirname(runtime), conflictingPath].join(path.delimiter),
+      );
+      assert.strictEqual(fs.existsSync(launcherDirectory), false);
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("npm gate children reject local toolchain shadowing before step output mutation", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-gate-shadowed-runtime-",
+    )));
+    const seededArtifact = path.join(temporaryRoot, ".quality", "fixture", "artifact.json");
+    let spawns = 0;
+    try {
+      const npmFixture = writeCanonicalNpmFixture(temporaryRoot);
+      const shadow = path.join(temporaryRoot, "node_modules", ".bin", "npm");
+      fs.mkdirSync(path.dirname(shadow), { recursive: true });
+      fs.writeFileSync(shadow, "#!/bin/sh\nexit 99\n", { mode: 0o700 });
+      fs.mkdirSync(path.dirname(seededArtifact), { recursive: true });
+      fs.writeFileSync(seededArtifact, "seeded artifact\n");
+      assert.throws(() => executeCommand({
+        id: "fixture-npm-shadow",
+        category: "fixture",
+        executable: "npm",
+        args: ["run", "fixture"],
+        command: "npm run fixture",
+        artifactPath: ".quality/fixture/artifact.json",
+        artifactSubtree: ".quality/fixture",
+        blockedExitCodes: [],
+        sequence: 1,
+      }, {
+        root: temporaryRoot,
+        runtimeExecutable: npmFixture.nodeExecutable,
+        npmExecPath: npmFixture.cliPath,
+        environment: { PATH: path.dirname(npmFixture.nodeExecutable) },
+        spawnSync() {
+          spawns += 1;
+          return { status: 0, signal: null, stdout: "", stderr: "" };
+        },
+      }), /toolchain command resolution is unsafe or invalid/u);
+      assert.strictEqual(spawns, 0);
+      assert.strictEqual(fs.readFileSync(seededArtifact, "utf8"), "seeded artifact\n");
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("forged npm CLI is rejected before seeded gate and step outputs are mutated", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-gate-forged-npm-",
+    )));
+    const npmCli = path.join(temporaryRoot, "npm-cli.js");
+    const seeded = {
+      ".quality/gates/fast.json": "seeded summary\n",
+      ".quality/gates/fast/01-fixture-artifact.json": "seeded receipt\n",
+      ".quality/fixture/artifact.json": "seeded step artifact\n",
+    };
+    try {
+      fs.writeFileSync(path.join(temporaryRoot, ".node-version"), `${process.versions.node}\n`);
+      fs.writeFileSync(path.join(temporaryRoot, ".npm-version"), "10.9.8\n");
+      fs.writeFileSync(npmCli, "process.exit(0)\n");
+      for (const [relativePath, bytes] of Object.entries(seeded)) {
+        const target = path.join(temporaryRoot, ...relativePath.split("/"));
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, bytes);
+      }
+      assert.throws(() => runGateWithoutFixturePin({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [{
+          id: "fixture-artifact",
+          category: "fixture",
+          executable: "npm",
+          args: ["run", "fixture"],
+          command: "npm run fixture",
+          artifactPath: ".quality/fixture/artifact.json",
+          artifactSubtree: ".quality/fixture",
+          blockedExitCodes: [],
+          sequence: 1,
+        }],
+        source: SOURCE_IDENTITY,
+        npmExecPath: npmCli,
+      }), /Canonical npm runtime is unsafe or invalid/u);
+      for (const [relativePath, bytes] of Object.entries(seeded)) {
+        assert.strictEqual(
+          fs.readFileSync(path.join(temporaryRoot, ...relativePath.split("/")), "utf8"),
+          bytes,
+          relativePath,
+        );
+      }
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("Windows PATH case collision is rejected before gate output mutation", () => {
+    const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-gate-path-collision-",
+    )));
+    const seededSummary = path.join(temporaryRoot, ".quality", "gates", "fast.json");
+    try {
+      fs.writeFileSync(path.join(temporaryRoot, ".node-version"), `${process.versions.node}\n`);
+      fs.mkdirSync(path.dirname(seededSummary), { recursive: true });
+      fs.writeFileSync(seededSummary, "seeded summary\n");
+      assert.throws(() => runGateWithoutFixturePin({
+        root: temporaryRoot,
+        profile: "fast",
+        plan: [{
+          id: "fixture-npm-runtime",
+          category: "fixture",
+          executable: "npm",
+          args: ["run", "fixture"],
+          command: "npm run fixture",
+          blockedExitCodes: [],
+          sequence: 1,
+        }],
+        source: SOURCE_IDENTITY,
+        platform: "win32",
+        environment: { PATH: "first", Path: "second" },
+      }), /PATH has case-colliding keys/u);
+      assert.strictEqual(fs.readFileSync(seededSummary, "utf8"), "seeded summary\n");
+    } finally {
+      fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
   });
 });

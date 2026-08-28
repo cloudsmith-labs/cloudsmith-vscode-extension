@@ -12,10 +12,29 @@ const {
   writeJson,
 } = require("./common");
 const { sourceIdentity } = require("./evidence");
+const { MUTATION_GLOBAL_OWNERS } = require("./run-mutation");
 
 const DEFAULT_BASE = "origin/main";
 const DEFAULT_OUTPUT = ".quality/impact.json";
 const QUALITY_VERIFY_COMMAND = "node scripts/quality/verify.js";
+const CANONICAL_TOOLCHAIN_PIN_FILES = new Set([
+  ".node-version",
+  ".npm-integrity",
+  ".npm-version",
+]);
+const CANONICAL_TOOLCHAIN_FILES = new Set([
+  ...CANONICAL_TOOLCHAIN_PIN_FILES,
+  "scripts/quality/candidate-binding.js",
+  "scripts/quality/canonical-node-runtime.js",
+  "scripts/quality/gate.js",
+  "scripts/quality/non-auth-environment.js",
+  "scripts/quality/prepare-qualification.js",
+  "scripts/quality/run-mutation.js",
+  "scripts/quality/run-ui-smoke.js",
+  "scripts/quality/verify-ui-evidence.js",
+  "scripts/release/package-vsix.js",
+  "scripts/release/verify-vsix.js",
+]);
 const TEST_COMMANDS_BY_LAYER = Object.freeze({
   unit: "npm run test:node",
   contract: "npm run test:node",
@@ -204,7 +223,8 @@ function isTestFile(file) {
 }
 
 function isManifestFile(file) {
-  return file === "package.json"
+  return CANONICAL_TOOLCHAIN_PIN_FILES.has(file)
+    || file === "package.json"
     || file === "package-lock.json"
     || file === ".vscode-test.mjs"
     || file === "stryker.config.mjs"
@@ -480,18 +500,18 @@ function requiredEvidence(files, selection, testCommandMap, testOwnershipMap = n
     }
   }
   for (const file of files.filter(isTestFile)) {
-    if (testOwnershipMap.has(file)) continue;
-    const mappedCommands = testCommandMap.get(file);
-    if (mappedCommands) {
+    const commandFiles = uniqueSorted([file, ...(testOwnershipMap.get(file) || [])]);
+    const mappedCommands = new Set(commandFiles.flatMap(commandFile => (
+      [...(testCommandMap.get(commandFile) || [])]
+    )));
+    if (mappedCommands.size > 0) {
       for (const command of mappedCommands) commands.add(command);
-      if (!evidencedTestFiles.has(file)) {
-        if (mappedCommands.has("npm run test:vscode")) layers.add("extension-host");
-        if (mappedCommands.has("npm run test:ui:smoke")) layers.add("black-box-ui");
-        if (mappedCommands.has("npm run test:live")
-          || mappedCommands.has("npm run test:sso-live")) layers.add("live-protocol");
-        if (mappedCommands.has("npm run test:node")) layers.add("unit");
-      }
-    } else if (!evidencedTestFiles.has(file)) {
+      if (mappedCommands.has("npm run test:vscode")) layers.add("extension-host");
+      if (mappedCommands.has("npm run test:ui:smoke")) layers.add("black-box-ui");
+      if (mappedCommands.has("npm run test:live")
+        || mappedCommands.has("npm run test:sso-live")) layers.add("live-protocol");
+      if (mappedCommands.has("npm run test:node")) layers.add("unit");
+    } else if (!commandFiles.some(candidate => evidencedTestFiles.has(candidate))) {
       const layer = inferTestLayer(file);
       layers.add(layer);
       const command = TEST_COMMANDS_BY_LAYER[layer];
@@ -502,11 +522,17 @@ function requiredEvidence(files, selection, testCommandMap, testOwnershipMap = n
     layers.add("unit");
     commands.add("npm run test:node");
   }
-  if (files.some(file => [
-    "stryker.config.mjs",
-    "quality/mutation-baseline.json",
-    "scripts/quality/run-mutation.js",
-  ].includes(file))) {
+  if (files.some(file => CANONICAL_TOOLCHAIN_FILES.has(file))) {
+    layers.add("black-box-ui");
+    layers.add("contract");
+    layers.add("unit");
+    commands.add(QUALITY_VERIFY_COMMAND);
+    commands.add("npm run package");
+    commands.add("npm run test:mutation:core");
+    commands.add("npm run test:node");
+    commands.add("npm run test:ui:smoke");
+  }
+  if (files.some(file => MUTATION_GLOBAL_OWNERS.includes(file))) {
     layers.add("unit");
     commands.add("npm run test:node");
     commands.add("npm run test:mutation:core");

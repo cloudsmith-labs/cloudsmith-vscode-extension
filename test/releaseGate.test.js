@@ -7,6 +7,14 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 const { applyAuditPolicy } = require("../scripts/release/verify-dependency-audit");
 const {
+  assertCanonicalNpmRuntime,
+  assertCanonicalNodeRuntime,
+  canonicalToolchainEnvironment,
+  npmInstallationFingerprint,
+  withCanonicalNpmLauncher,
+} = require("../scripts/quality/canonical-node-runtime");
+const {
+  canonicalVscePackageInvocation,
   packageBuildDirectoryIdentity,
   removePackageBuildDirectory,
   resolveOutputPath,
@@ -18,6 +26,9 @@ const {
 const { assertVersionState } = require("../scripts/release/verify-version");
 const {
   NON_AUTH_AMBIENT_CAPABILITY_NAMES,
+  cleanupNonAuthQualityEnvironment,
+  createNonAuthQualityEnvironment,
+  expectedExactCleanupTreeEntry,
 } = require("../scripts/quality/non-auth-environment");
 const { exactFileIdentity } = require("../scripts/quality/candidate-binding");
 const {
@@ -63,18 +74,21 @@ function sidecarFixture() {
     sha256,
     totalUncompressedBytes: 4096,
   });
+  const npmIntegrityPins = JSON.parse(fs.readFileSync(path.join(__dirname, "../.npm-integrity"), "utf8"));
   const provenance = Object.freeze({
     archiveBytes: verification.archiveBytes,
     entryCount: verification.entryCount,
     filename: path.basename(filePath),
     name: verification.manifest.name,
-    nodeVersion: process.version,
-    npmVersion: "10.9.2",
+    nodeVersion: "v22.23.2",
+    npmVersion: "10.9.8",
+    npmInstallationSha256: npmIntegrityPins[process.platform === "win32" ? "win32" : "posix"],
+    platform: process.platform,
     publishable: false,
     publisher: verification.manifest.publisher,
-    schemaVersion: 1,
+    schemaVersion: 3,
     sha256,
-    sourceClean: true,
+    sourceClean: false,
     sourceCommitEpoch,
     sourceSha,
     totalUncompressedBytes: verification.totalUncompressedBytes,
@@ -151,6 +165,65 @@ function exception(overrides = {}) {
     expiresOn: "2026-08-31",
     rationale: "Development-only fixture.",
     ...overrides,
+  };
+}
+
+function withNodeVersionPin(contents, callback) {
+  const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+    os.tmpdir(),
+    "cloudsmith-node-version-pin-",
+  )));
+  try {
+    fs.writeFileSync(path.join(fixtureRoot, ".node-version"), contents);
+    return callback(fixtureRoot);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+}
+
+function createCanonicalNpmFixture(fixtureRoot, options = {}) {
+  const version = options.version || "10.9.8";
+  const platform = options.platform || "linux";
+  const nodeExecutable = options.nodeExecutable
+    || path.join(fixtureRoot, "runtime", "bin", "node");
+  fs.mkdirSync(path.dirname(nodeExecutable), { recursive: true });
+  if (!fs.existsSync(nodeExecutable)) {
+    fs.writeFileSync(nodeExecutable, "synthetic exact node runtime\n", { mode: 0o700 });
+  }
+  const packageRoot = platform === "win32"
+    ? path.join(path.dirname(nodeExecutable), "node_modules", "npm")
+    : path.join(path.dirname(path.dirname(nodeExecutable)), "lib", "node_modules", "npm");
+  const cliPath = path.join(packageRoot, "bin", "npm-cli.js");
+  const packageJsonPath = path.join(packageRoot, "package.json");
+  fs.mkdirSync(path.dirname(cliPath), { recursive: true });
+  fs.mkdirSync(path.join(packageRoot, "lib"), { recursive: true });
+  fs.writeFileSync(path.join(fixtureRoot, ".npm-version"), `${version}\n`);
+  const newline = platform === "win32" ? "\r\n" : "\n";
+  fs.writeFileSync(
+    cliPath,
+    `#!/usr/bin/env node${newline}require('../lib/cli.js')(process)${newline}`,
+  );
+  fs.writeFileSync(path.join(packageRoot, "lib", "cli.js"), "module.exports = () => {}\n");
+  fs.writeFileSync(packageJsonPath, `${JSON.stringify({
+    name: options.name || "npm",
+    version: options.metadataVersion || version,
+    main: "./index.js",
+    bin: options.bin || { npm: "bin/npm-cli.js", npx: "bin/npx-cli.js" },
+    engines: { node: "^18.17.0 || >=20.5.0" },
+  }, null, 2)}\n`);
+  const installation = npmInstallationFingerprint(packageRoot, { platform });
+  fs.writeFileSync(path.join(fixtureRoot, ".npm-integrity"), `${JSON.stringify({
+    posix: installation.sha256,
+    win32: installation.sha256,
+  })}\n`);
+  return {
+    cliPath,
+    installation,
+    nodeExecutable,
+    packageJsonPath,
+    packageRoot,
+    platform,
+    version,
   };
 }
 
@@ -349,6 +422,545 @@ suite("M9 release gate helpers", () => {
     );
   });
 
+  test("canonical package runtime accepts the exact Node version pin", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      assert.strictEqual(
+        assertCanonicalNodeRuntime(fixtureRoot, "v22.23.2"),
+        "v22.23.2",
+      );
+    });
+  });
+
+  test("canonical package runtime rejects a Node version mismatch", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      assert.throws(
+        () => assertCanonicalNodeRuntime(fixtureRoot, "v22.23.1"),
+        /runtime does not match the exact version pin/u,
+      );
+    });
+  });
+
+  test("canonical package runtime rejects malformed Node version pins", () => {
+    for (const contents of [
+      "",
+      "22.23\n",
+      "v22.23.2\n",
+      "22.23.2 \n",
+      "22.23.2\n23.0.0\n",
+    ]) {
+      withNodeVersionPin(contents, fixtureRoot => {
+        assert.throws(
+          () => assertCanonicalNodeRuntime(fixtureRoot, "v22.23.2"),
+          /version pin is unsafe or invalid/u,
+        );
+      });
+    }
+  });
+
+  test("canonical package runtime rejects unsafe Node version pin files", function() {
+    const runtimeModule = path.join(__dirname, "../scripts/quality/canonical-node-runtime.js");
+    const unsafeError = /version pin is unsafe or invalid/u;
+
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const pin = path.join(fixtureRoot, ".node-version");
+      const target = path.join(fixtureRoot, "pin-target");
+      fs.renameSync(pin, target);
+      fs.symlinkSync(target, pin);
+      assert.throws(
+        () => assertCanonicalNodeRuntime(fixtureRoot, "v22.23.2"),
+        unsafeError,
+      );
+    });
+
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const pin = path.join(fixtureRoot, ".node-version");
+      fs.linkSync(pin, path.join(fixtureRoot, "pin-hard-link"));
+      assert.throws(
+        () => assertCanonicalNodeRuntime(fixtureRoot, "v22.23.2"),
+        unsafeError,
+      );
+    });
+
+    withNodeVersionPin("1".repeat(65), fixtureRoot => {
+      assert.throws(
+        () => assertCanonicalNodeRuntime(fixtureRoot, "v22.23.2"),
+        unsafeError,
+      );
+    });
+
+    if (process.platform === "win32") return;
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const pin = path.join(fixtureRoot, ".node-version");
+      fs.unlinkSync(pin);
+      const fifo = spawnSync("mkfifo", [pin]);
+      assert.strictEqual(fifo.status, 0);
+      const probe = spawnSync(process.execPath, [
+        "-e",
+        "const {assertCanonicalNodeRuntime}=require(process.argv[1]);"
+          + "try{assertCanonicalNodeRuntime(process.argv[2],'v22.23.2');process.exit(0)}"
+          + "catch(error){process.stderr.write(error.message);process.exit(7)}",
+        runtimeModule,
+        fixtureRoot,
+      ], {
+        encoding: "utf8",
+        env: {},
+        timeout: 2_000,
+      });
+      assert.strictEqual(probe.error, undefined);
+      assert.strictEqual(probe.status, 7);
+      assert.match(probe.stderr, unsafeError);
+    });
+  });
+
+  test("VSCE packaging anchors its exact Node executable ahead of conflicting PATH", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const nodeExecutable = path.join(fixtureRoot, "canonical-node", "bin", "node");
+      const conflictingBin = path.join(fixtureRoot, "conflicting-node", "bin");
+      const vsceEntry = path.join(
+        fixtureRoot,
+        "node_modules",
+        "@vscode",
+        "vsce",
+        "out",
+        "main.js",
+      );
+      const outputPath = path.join(fixtureRoot, "candidate.vsix");
+      fs.mkdirSync(path.dirname(nodeExecutable), { recursive: true });
+      fs.writeFileSync(nodeExecutable, "synthetic exact node runtime\n", { mode: 0o700 });
+      const invocation = canonicalVscePackageInvocation(outputPath, {
+        nodeExecutable,
+        vsceEntry,
+      });
+      assert.strictEqual(invocation.command, nodeExecutable);
+      assert.deepStrictEqual(invocation.arguments_, [
+        "--eval",
+        "require(process.argv[1])(process.argv);",
+        vsceEntry,
+        "package",
+        "--no-dependencies",
+        "--out",
+        outputPath,
+      ]);
+
+      let child;
+      runPackageCommand(invocation.command, invocation.arguments_, {
+        environment: { PATH: conflictingBin },
+        nodeExecutable,
+        spawnSync(command, arguments_, options) {
+          child = { command, arguments_, environment: options.env };
+          return { status: 0, signal: null, stdout: "packaged\n", stderr: "" };
+        },
+      });
+      assert.strictEqual(child.command, nodeExecutable);
+      assert.deepStrictEqual(child.arguments_, invocation.arguments_);
+      assert.deepStrictEqual(child.environment.PATH.split(path.delimiter), [
+        path.dirname(nodeExecutable),
+        conflictingBin,
+      ]);
+    });
+  });
+
+  test("VSCE packaging exposes only its exact validated npm launcher to prepublish", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      const npm = assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+        nodeExecutable: fixture.nodeExecutable,
+        platform: fixture.platform,
+      });
+      const conflictingBin = path.join(fixtureRoot, "conflicting", "bin");
+      fs.mkdirSync(conflictingBin, { recursive: true });
+      let launcherDirectory;
+      runPackageCommand(fixture.nodeExecutable, ["fixture-vsce-entry"], {
+        cwd: fixtureRoot,
+        environment: { PATH: conflictingBin },
+        nodeExecutable: fixture.nodeExecutable,
+        npm,
+        platform: fixture.platform,
+        temporaryParent: fixtureRoot,
+        spawnSync(command, arguments_, options) {
+          launcherDirectory = options.env.PATH.split(path.delimiter)[0];
+          assert.strictEqual(command, fixture.nodeExecutable);
+          assert.deepStrictEqual(arguments_, ["fixture-vsce-entry"]);
+          assert.deepStrictEqual(options.env.PATH.split(path.delimiter).slice(0, 3), [
+            launcherDirectory,
+            path.dirname(fixture.nodeExecutable),
+            conflictingBin,
+          ]);
+          assert.strictEqual(fs.lstatSync(path.join(launcherDirectory, "node")).isFile(), true);
+          assert.strictEqual(fs.lstatSync(path.join(launcherDirectory, "npm")).isFile(), true);
+          assert.strictEqual(
+            fs.lstatSync(path.join(launcherDirectory, "script-shell")).isFile(),
+            true,
+          );
+          assert.strictEqual(
+            options.env.NPM_CONFIG_SCRIPT_SHELL,
+            path.join(launcherDirectory, "script-shell"),
+          );
+          return { status: 0, signal: null, stdout: "packaged\n", stderr: "" };
+        },
+      });
+      assert.strictEqual(fs.existsSync(launcherDirectory), false);
+    });
+  });
+
+  test("canonical npm runtime binds the exact pin, owner metadata, and bin contract", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      const npm = assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+        nodeExecutable: fixture.nodeExecutable,
+        platform: fixture.platform,
+      });
+      assert.strictEqual(npm.cliPath, fixture.cliPath);
+      assert.strictEqual(npm.packageJsonPath, fixture.packageJsonPath);
+      assert.strictEqual(npm.packageRoot, fixture.packageRoot);
+      assert.strictEqual(npm.version, fixture.version);
+      assert.deepStrictEqual(npm.installation, fixture.installation);
+      assert.strictEqual(Object.isFrozen(npm.identities), true);
+    });
+  });
+
+  test("canonical npm runtime rejects standalone and metadata-forged npm CLI files", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      const standalone = path.join(fixtureRoot, "npm-cli.js");
+      fs.writeFileSync(standalone, "process.exit(0)\n");
+      assert.throws(
+        () => assertCanonicalNpmRuntime(fixtureRoot, standalone, {
+          nodeExecutable: fixture.nodeExecutable,
+          platform: fixture.platform,
+        }),
+        /Canonical npm runtime is unsafe or invalid/u,
+      );
+    });
+    for (const options of [
+      { name: "not-npm" },
+      { metadataVersion: "10.9.7" },
+      { bin: { npm: "bin/not-the-cli.js", npx: "bin/npx-cli.js" } },
+    ]) {
+      withNodeVersionPin("22.23.2\n", fixtureRoot => {
+        const fixture = createCanonicalNpmFixture(fixtureRoot, options);
+        assert.throws(
+          () => assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+            nodeExecutable: fixture.nodeExecutable,
+            platform: fixture.platform,
+          }),
+          /Canonical npm runtime is unsafe or invalid/u,
+        );
+      });
+    }
+  });
+
+  test("canonical npm runtime rejects CLI replacement at its descriptor boundary", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      const displaced = path.join(fixtureRoot, "original-npm-cli.js");
+      let replaced = false;
+      const fileSystem = Object.create(fs);
+      fileSystem.openSync = (target, flags, mode) => {
+        if (target === fixture.cliPath && !replaced) {
+          replaced = true;
+          fs.renameSync(fixture.cliPath, displaced);
+          fs.writeFileSync(fixture.cliPath, "process.exit(0)\n");
+        }
+        return fs.openSync(target, flags, mode);
+      };
+      assert.throws(
+        () => assertCanonicalNpmRuntime(
+          fixtureRoot,
+          fixture.cliPath,
+          {
+            fileSystem,
+            nodeExecutable: fixture.nodeExecutable,
+            platform: fixture.platform,
+          },
+        ),
+        /Canonical npm runtime is unsafe or invalid/u,
+      );
+      assert.strictEqual(replaced, true);
+    });
+  });
+
+  test("canonical npm runtime rejects changed installation content despite valid metadata", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      fs.writeFileSync(
+        path.join(fixture.packageRoot, "lib", "cli.js"),
+        "module.exports = process => process.exit(99)\n",
+      );
+      assert.throws(
+        () => assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+          nodeExecutable: fixture.nodeExecutable,
+          platform: fixture.platform,
+        }),
+        /Canonical npm runtime is unsafe or invalid/u,
+      );
+    });
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      fs.mkdirSync(path.join(fixture.packageRoot, "unexpected-empty-directory"));
+      assert.throws(
+        () => assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+          nodeExecutable: fixture.nodeExecutable,
+          platform: fixture.platform,
+        }),
+        /Canonical npm runtime is unsafe or invalid/u,
+      );
+    });
+  });
+
+  test("canonical npm launcher revalidates the owned installation after its child", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      const npm = assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+        nodeExecutable: fixture.nodeExecutable,
+        platform: fixture.platform,
+      });
+      let launcherDirectory;
+      assert.throws(() => withCanonicalNpmLauncher({
+        nodeExecutable: fixture.nodeExecutable,
+        npm,
+        platform: fixture.platform,
+        temporaryParent: fixtureRoot,
+      }, launcher => {
+        launcherDirectory = launcher.directory;
+        fs.writeFileSync(
+          path.join(fixture.packageRoot, "lib", "cli.js"),
+          "module.exports = process => process.exit(99)\n",
+        );
+      }), /Canonical npm launcher is unsafe or invalid/u);
+      assert.strictEqual(fs.existsSync(launcherDirectory), false);
+    });
+  });
+
+  test("canonical npm cleanup preserves an unrelated directory moved into its snapshot", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      const npm = assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+        nodeExecutable: fixture.nodeExecutable,
+        platform: fixture.platform,
+      });
+      const victim = path.join(fixtureRoot, "unrelated-victim");
+      fs.mkdirSync(victim);
+      fs.writeFileSync(path.join(victim, "preserve.txt"), "unrelated bytes survive\n");
+      let launcherDirectory;
+      assert.throws(() => withCanonicalNpmLauncher({
+        nodeExecutable: fixture.nodeExecutable,
+        npm,
+        platform: fixture.platform,
+        temporaryParent: fixtureRoot,
+      }, launcher => {
+        launcherDirectory = launcher.directory;
+        const snapshotLib = path.join(launcher.directory, "npm-runtime", "lib");
+        fs.renameSync(snapshotLib, `${snapshotLib}-owned`);
+        fs.renameSync(victim, snapshotLib);
+      }), /Canonical npm launcher is unsafe or invalid/u);
+      assert.strictEqual(
+        fs.readFileSync(
+          path.join(launcherDirectory, "npm-runtime", "lib", "preserve.txt"),
+          "utf8",
+        ),
+        "unrelated bytes survive\n",
+      );
+    });
+  });
+
+  test("outer non-auth cleanup quarantines a tainted npm snapshot without deleting it", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      const npm = assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+        nodeExecutable: fixture.nodeExecutable,
+        platform: fixture.platform,
+      });
+      const boundary = createNonAuthQualityEnvironment({ temporaryParent: fixtureRoot });
+      const boundaryName = path.basename(boundary.root);
+      const victim = path.join(fixtureRoot, "outer-unrelated-victim");
+      fs.mkdirSync(victim);
+      fs.writeFileSync(path.join(victim, "preserve.txt"), "outer unrelated bytes survive\n");
+      let launcherName;
+      assert.throws(() => withCanonicalNpmLauncher({
+        nodeExecutable: fixture.nodeExecutable,
+        npm,
+        platform: fixture.platform,
+        temporaryParent: boundary.paths.temporary,
+      }, launcher => {
+        launcherName = path.basename(launcher.directory);
+        const snapshotLib = path.join(launcher.directory, "npm-runtime", "lib");
+        fs.renameSync(snapshotLib, `${snapshotLib}-owned`);
+        fs.renameSync(victim, snapshotLib);
+      }), /Canonical npm launcher is unsafe or invalid/u);
+      assert.throws(
+        () => cleanupNonAuthQualityEnvironment(boundary),
+        /preserved an unsafe or changed tree/u,
+      );
+      const quarantineName = fs.readdirSync(fixtureRoot).find(
+        name => name.startsWith(`.${boundaryName}.cleanup-`),
+      );
+      assert.strictEqual(typeof quarantineName, "string");
+      assert.strictEqual(
+        fs.readFileSync(path.join(
+          fixtureRoot,
+          quarantineName,
+          "tmp",
+          launcherName,
+          "npm-runtime",
+          "lib",
+          "preserve.txt",
+        ), "utf8"),
+        "outer unrelated bytes survive\n",
+      );
+    });
+  });
+
+  test("canonical npm launcher executes only its private snapshot across source substitution", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      const sourceDependency = path.join(fixture.packageRoot, "lib", "cli.js");
+      const sourceBytes = fs.readFileSync(sourceDependency);
+      const npm = assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+        nodeExecutable: fixture.nodeExecutable,
+        platform: fixture.platform,
+      });
+      let launcherDirectory;
+      assert.throws(() => withCanonicalNpmLauncher({
+        nodeExecutable: fixture.nodeExecutable,
+        npm,
+        platform: fixture.platform,
+        temporaryParent: fixtureRoot,
+      }, launcher => {
+        launcherDirectory = launcher.directory;
+        const snapshotDependency = path.join(launcher.directory, "npm-runtime", "lib", "cli.js");
+        assert.strictEqual(launcher.npmCliPath, path.join(
+          launcher.directory,
+          "npm-runtime",
+          "bin",
+          "npm-cli.js",
+        ));
+        fs.writeFileSync(sourceDependency, Buffer.alloc(sourceBytes.length, 0x78));
+        fs.writeFileSync(sourceDependency, sourceBytes);
+        assert.deepStrictEqual(fs.readFileSync(snapshotDependency), sourceBytes);
+      }), /Canonical npm launcher is unsafe or invalid/u);
+      assert.strictEqual(fs.existsSync(launcherDirectory), false);
+    });
+  });
+
+  test("canonical npm launcher rejects and preserves a changed private snapshot", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      const npm = assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+        nodeExecutable: fixture.nodeExecutable,
+        platform: fixture.platform,
+      });
+      let launcherDirectory;
+      assert.throws(() => withCanonicalNpmLauncher({
+        nodeExecutable: fixture.nodeExecutable,
+        npm,
+        platform: fixture.platform,
+        temporaryParent: fixtureRoot,
+      }, launcher => {
+        launcherDirectory = launcher.directory;
+        const snapshotDependency = path.join(launcher.directory, "npm-runtime", "lib", "cli.js");
+        fs.chmodSync(snapshotDependency, 0o600);
+        fs.writeFileSync(snapshotDependency, "module.exports = process => process.exit(99)\n");
+      }), /Canonical npm launcher is unsafe or invalid/u);
+      assert.strictEqual(fs.existsSync(launcherDirectory), true);
+    });
+  });
+
+  test("canonical npm launcher covers node-only POSIX and Windows runtimes and cleans up", () => {
+    for (const platform of ["linux", "win32"]) {
+      withNodeVersionPin("22.23.2\n", fixtureRoot => {
+        const fixture = createCanonicalNpmFixture(fixtureRoot, { platform });
+        const runtime = fixture.nodeExecutable;
+        const npm = assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+          nodeExecutable: runtime,
+          platform,
+        });
+        let launcherDirectory;
+        withCanonicalNpmLauncher({
+          nodeExecutable: runtime,
+          npm,
+          platform,
+          temporaryParent: fixtureRoot,
+        }, launcher => {
+          launcherDirectory = launcher.directory;
+          const npmName = platform === "win32" ? "npm.cmd" : "npm";
+          const nodeName = platform === "win32" ? "node.cmd" : "node";
+          assert.strictEqual(fs.lstatSync(path.join(launcher.directory, npmName)).isFile(), true);
+          assert.strictEqual(fs.lstatSync(path.join(launcher.directory, nodeName)).isFile(), true);
+          assert.strictEqual(launcher.npmCliPath, path.join(
+            launcher.directory,
+            "npm-runtime",
+            "bin",
+            "npm-cli.js",
+          ));
+          assert.strictEqual(fs.existsSync(path.join(path.dirname(runtime), npmName)), false);
+          const environment = canonicalToolchainEnvironment(
+            { PATH: path.join(fixtureRoot, "conflicting", "bin") },
+            {
+              launcherDirectory: launcher.directory,
+              nodeExecutable: runtime,
+              platform,
+            },
+          );
+          assert.deepStrictEqual(environment.PATH.split(path.delimiter).slice(0, 2), [
+            launcher.directory,
+            path.dirname(runtime),
+          ]);
+        });
+        assert.strictEqual(fs.existsSync(launcherDirectory), false);
+      });
+    }
+  });
+
+  test("canonical toolchain environment rejects Windows PATH key collisions", () => {
+    assert.throws(
+      () => canonicalToolchainEnvironment(
+        { PATH: "first", Path: "second" },
+        {
+          launcherDirectory: path.resolve(os.tmpdir(), "fixture-launcher"),
+          nodeExecutable: process.execPath,
+          platform: "win32",
+        },
+      ),
+      /PATH has case-colliding keys/u,
+    );
+  });
+
+  test("canonical toolchain environment rejects Windows PATHEXT key collisions", () => {
+    assert.throws(
+      () => canonicalToolchainEnvironment(
+        { PATH: path.dirname(process.execPath), PATHEXT: ".EXE", Pathext: ".CMD" },
+        { nodeExecutable: process.execPath, platform: "win32" },
+      ),
+      /PATHEXT has case-colliding keys/u,
+    );
+  });
+
+  test("canonical npm launcher cleanup rejects unexpected entries", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      const runtime = fixture.nodeExecutable;
+      const npm = assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+        nodeExecutable: runtime,
+        platform: fixture.platform,
+      });
+      let launcherDirectory;
+      assert.throws(() => withCanonicalNpmLauncher({
+        nodeExecutable: runtime,
+        npm,
+        platform: "linux",
+        temporaryParent: fixtureRoot,
+      }, launcher => {
+        launcherDirectory = launcher.directory;
+        fs.writeFileSync(path.join(launcher.directory, "unexpected"), "do not remove\n");
+      }), /Canonical npm launcher cleanup refused/u);
+      assert.strictEqual(fs.readFileSync(
+        path.join(launcherDirectory, "unexpected"),
+        "utf8",
+      ), "do not remove\n");
+    });
+  });
+
   test("accepted evidence scanning consumes only descriptor-proven stdin bytes across a swap", () => {
     const evidenceRoot = fs.realpathSync(fs.mkdtempSync(path.join(
       os.tmpdir(),
@@ -406,6 +1018,10 @@ suite("M9 release gate helpers", () => {
     fs.mkdirSync(victim);
     fs.writeFileSync(path.join(victim, "preserve.txt"), "synthetic victim survives\n");
     const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(path.join(
+      ownedRoot,
+      "temporary.vsix",
+    ))];
     const originalRmdir = fs.rmdirSync;
     let substituted = false;
     try {
@@ -418,7 +1034,7 @@ suite("M9 release gate helpers", () => {
         return originalRmdir.call(fs, target, options);
       };
       assert.throws(
-        () => removePackageBuildDirectory(ownedRoot, identity),
+        () => removePackageBuildDirectory(ownedRoot, identity, expectedEntries),
         /temporary cleanup refused an unsafe or changed tree/u,
       );
     } finally {
@@ -431,6 +1047,36 @@ suite("M9 release gate helpers", () => {
         "synthetic victim survives\n",
       );
       assert.strictEqual(fs.existsSync(displacedOwnedRoot), true);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup preserves an unrelated directory moved into its build root", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-moved-victim-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    const victim = path.join(scratch, "preserve-victim");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    fs.mkdirSync(victim);
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "moved victim survives\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    fs.renameSync(victim, path.join(ownedRoot, "moved-victim"));
+    try {
+      assert.throws(
+        () => removePackageBuildDirectory(ownedRoot, identity, expectedEntries),
+        /temporary cleanup refused an unsafe or changed tree/u,
+      );
+      assert.strictEqual(
+        fs.readFileSync(path.join(ownedRoot, "moved-victim", "preserve.txt"), "utf8"),
+        "moved victim survives\n",
+      );
+      assert.strictEqual(fs.existsSync(artifact), true);
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
@@ -628,6 +1274,93 @@ suite("M9 release gate helpers", () => {
       assert.strictEqual(sidecars.checksumPath, fixture.checksumPath);
       assert.strictEqual(sidecars.provenancePath, fixture.provenancePath);
       assert.deepStrictEqual(sidecars.provenance, fixture.provenance);
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("release provenance binds the exact Node, npm, and npm installation pins", () => {
+    for (const mutation of [
+      { nodeVersion: "v22.23.1" },
+      { npmVersion: "10.9.7" },
+      { npmInstallationSha256: "0".repeat(64) },
+      { platform: process.platform === "win32" ? "linux" : "win32" },
+    ]) {
+      const fixture = sidecarFixture();
+      try {
+        fs.writeFileSync(
+          fixture.provenancePath,
+          `${JSON.stringify({ ...fixture.provenance, ...mutation })}\n`,
+        );
+        assert.throws(
+          () => validateSidecars(fixture.filePath, fixture.verification, {
+            expectedSourceSha: fixture.sourceSha,
+          }),
+          /toolchain does not match the exact repository pins/u,
+        );
+      } finally {
+        fs.rmSync(fixture.directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("clean release provenance binds platform pins from its exact source commit", () => {
+    const fixture = sidecarFixture();
+    const sourcePins = {
+      ".node-version": "22.23.2\n",
+      ".npm-version": "10.9.8\n",
+      ".npm-integrity": `${JSON.stringify({
+        posix: "7".repeat(64),
+        win32: "8".repeat(64),
+      })}\n`,
+    };
+    const queries = [];
+    const runGitCommand = arguments_ => {
+      queries.push([...arguments_]);
+      if (arguments_[0] === "rev-parse") return `${fixture.sourceSha}\n`;
+      if (arguments_[0] === "show" && arguments_[1] === "-s") {
+        return `${fixture.provenance.sourceCommitEpoch}\n`;
+      }
+      const object = arguments_[arguments_.length - 1];
+      const name = Object.keys(sourcePins).find(candidate => object.endsWith(`:${candidate}`));
+      if (!name) throw new Error("Unexpected synthetic Git provenance query");
+      if (arguments_[0] === "cat-file" && arguments_[1] === "-s") {
+        return `${Buffer.byteLength(sourcePins[name])}\n`;
+      }
+      if (arguments_[0] === "show") return sourcePins[name];
+      throw new Error("Unexpected synthetic Git provenance query");
+    };
+    const provenance = {
+      ...fixture.provenance,
+      npmInstallationSha256: "7".repeat(64),
+      platform: "linux",
+      sourceClean: true,
+    };
+    try {
+      fs.writeFileSync(fixture.provenancePath, `${JSON.stringify(provenance)}\n`);
+      const validated = validateSidecars(fixture.filePath, fixture.verification, {
+        expectedSourceSha: fixture.sourceSha,
+        runGitCommand,
+      });
+      assert.strictEqual(validated.provenance.platform, "linux");
+      for (const name of Object.keys(sourcePins)) {
+        assert.ok(queries.some(arguments_ => (
+          arguments_[0] === "show"
+          && arguments_[1] === `${fixture.sourceSha}:${name}`
+        )), name);
+      }
+
+      fs.writeFileSync(fixture.provenancePath, `${JSON.stringify({
+        ...provenance,
+        npmInstallationSha256: "8".repeat(64),
+      })}\n`);
+      assert.throws(
+        () => validateSidecars(fixture.filePath, fixture.verification, {
+          expectedSourceSha: fixture.sourceSha,
+          runGitCommand,
+        }),
+        /toolchain does not match the exact repository pins/u,
+      );
     } finally {
       fs.rmSync(fixture.directory, { recursive: true, force: true });
     }

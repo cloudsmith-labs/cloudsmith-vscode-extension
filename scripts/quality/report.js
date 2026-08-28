@@ -617,7 +617,7 @@ function validateUiCandidate(candidate, ui, source, options = {}) {
   }
   const receipt = options.candidateReceipt;
   if (!isPlainObject(receipt)
-    || receipt.schemaVersion !== 2
+    || receipt.schemaVersion !== 3
     || receipt.status !== "passed"
     || receipt.fingerprint !== candidate.candidateReceiptFingerprint
     || receipt.source?.sha !== candidate.sourceSha

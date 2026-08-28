@@ -9,6 +9,8 @@ const CREDENTIAL_LIKE_ENVIRONMENT_NAME = /(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASS
 const NON_AUTH_BOUNDARY_PREFIX = "cloudsmith-non-auth-";
 const NON_AUTH_BOUNDARY_MARKER = ".cloudsmith-non-auth-owner.json";
 const NON_AUTH_BOUNDARY_OWNER = "cloudsmith-vscode-non-auth-quality";
+const NON_AUTH_BOUNDARY_TAINT_FILE = ".cloudsmith-non-auth-cleanup-taint";
+const NON_AUTH_CLEANUP_TAINT_ENV = "CLOUDSMITH_QUALITY_CLEANUP_TAINT";
 const EXACT_CLEANUP_MAX_ENTRIES = 100_000;
 const EXACT_CLEANUP_MAX_DEPTH = 128;
 const EXACT_CLEANUP_MAX_NAME_BYTES = 1024;
@@ -24,6 +26,7 @@ const NON_AUTH_BOUNDARY_DIRECTORY_PATHS = Object.freeze([
   "npmCache",
 ]);
 const NON_AUTH_BOUNDARY_EMPTY_FILE_PATHS = Object.freeze([
+  "cleanupTaint",
   "npmUserConfig",
   "npmGlobalConfig",
   "gitGlobalConfig",
@@ -93,6 +96,7 @@ const NON_AUTH_QUALITY_ENVIRONMENT_ALLOWLIST = Object.freeze([
   "M9_SOURCE_SHA",
   "VSCODE_TEST_VERSION",
   "VSCODE_TEST_LABEL",
+  NON_AUTH_CLEANUP_TAINT_ENV,
 ]);
 
 const NON_AUTH_QUALITY_OVERRIDE_NAMES = Object.freeze([
@@ -288,9 +292,15 @@ function matchesExpectedCleanupEntry(stat, kind, expected) {
     return false;
   }
   if (kind === "directory") return true;
-  for (const key of ["mode", "nlink", "size"]) {
-    if (expected.identity[key] !== undefined
-      && String(stat[key]) !== String(expected.identity[key])) {
+  for (const [primary, alternate, statKey] of [
+    ["mode", "mode", "mode"],
+    ["nlink", "links", "nlink"],
+    ["size", "size", "size"],
+    ["changedNanoseconds", "ctimeNs", "ctimeNs"],
+    ["modifiedNanoseconds", "mtimeNs", "mtimeNs"],
+  ]) {
+    const expectedValue = expectedIdentityValue(expected.identity, primary, alternate);
+    if (expectedValue !== null && String(stat[statKey]) !== expectedValue) {
       return false;
     }
   }
@@ -333,19 +343,26 @@ function sameCleanupNames(left, right) {
   return left.length === right.length && left.every((name, index) => name === right[index]);
 }
 
-function expectedRootCleanupEntries(entries, errorMessage) {
+function expectedRootCleanupEntries(entries, errorMessage, depth = 0, state = { entries: 0 }) {
   if (!Array.isArray(entries) || entries.length > EXACT_CLEANUP_MAX_ENTRIES) {
     return exactCleanupError(errorMessage);
   }
   const expected = new Map();
   for (const entry of entries) {
+    state.entries += 1;
     if (!entry || typeof entry.name !== "string"
       || !new Set(["directory", "file", "link"]).has(entry.kind)
       || entry.name !== cleanupName(Buffer.from(entry.name, "utf8"), errorMessage)
-      || expected.has(entry.name)) {
+      || expected.has(entry.name)
+      || depth > EXACT_CLEANUP_MAX_DEPTH
+      || state.entries > EXACT_CLEANUP_MAX_ENTRIES
+      || (entry.children !== undefined && entry.kind !== "directory")) {
       return exactCleanupError(errorMessage);
     }
-    expected.set(entry.name, entry);
+    const children = entry.children === undefined
+      ? null
+      : expectedRootCleanupEntries(entry.children, errorMessage, depth + 1, state);
+    expected.set(entry.name, Object.freeze({ ...entry, expectedChildren: children }));
   }
   return expected;
 }
@@ -387,15 +404,18 @@ function snapshotCleanupEntry(
       return exactCleanupError(errorMessage);
     }
   }
-  const children = names.map(name => snapshotCleanupEntry(
-    path.join(target, name),
-    depth + 1,
-    state,
-    expectedChildren?.get(name),
-    null,
-    false,
-    errorMessage,
-  ));
+  const children = names.map(name => {
+    const childExpected = expectedChildren?.get(name);
+    return snapshotCleanupEntry(
+      path.join(target, name),
+      depth + 1,
+      state,
+      childExpected,
+      childExpected?.expectedChildren || null,
+      false,
+      errorMessage,
+    );
+  });
   const current = fs.lstatSync(target, { bigint: true });
   if (!sameCleanupIdentity(current, kind, identity)
     || !sameCleanupNames(
@@ -497,6 +517,11 @@ function emptyExactOwnedDirectory(root, options = {}) {
     removeCleanupDirectoryChildren(snapshot, errorMessage);
     return true;
   } catch {
+    if (typeof root === "string" && path.isAbsolute(root)
+      && path.normalize(root) === root && path.resolve(root) === root
+      && !root.includes("\u0000")) {
+      preserveNonAuthCleanupSubtree(root);
+    }
     throw new Error(errorMessage);
   }
 }
@@ -507,6 +532,40 @@ function removeExactOwnedDirectoryTree(root, options = {}) {
     const snapshot = snapshotExactOwnedTree(root, options, errorMessage);
     removeCleanupSnapshot(snapshot, errorMessage);
     return true;
+  } catch {
+    if (typeof root === "string" && path.isAbsolute(root)
+      && path.normalize(root) === root && path.resolve(root) === root
+      && !root.includes("\u0000")) {
+      preserveNonAuthCleanupSubtree(root);
+    }
+    throw new Error(errorMessage);
+  }
+}
+
+function expectedExactCleanupTreeEntry(target, options = {}) {
+  const errorMessage = options.errorMessage || "Exact cleanup refused an unsafe or changed tree.";
+  try {
+    const snapshot = snapshotCleanupEntry(
+      target,
+      0,
+      {
+        allowSingleLinkUnixSockets: options.allowSingleLinkUnixSockets === true,
+        entries: 0,
+      },
+      null,
+      null,
+      false,
+      errorMessage,
+    );
+    const expected = node => Object.freeze({
+      ...(node.kind === "directory"
+        ? { children: Object.freeze(node.children.map(expected)) }
+        : {}),
+      identity: node.identity,
+      kind: node.kind,
+      name: path.basename(node.target),
+    });
+    return expected(snapshot);
   } catch {
     throw new Error(errorMessage);
   }
@@ -557,7 +616,8 @@ function activeBoundaryIdentity(boundary) {
       `Non-auth quality ${name}`,
       identity.pathIdentities[name],
     );
-    if (stat.size !== 0) {
+    if (stat.nlink !== 1
+      || (name === "cleanupTaint" ? !new Set([0, 1]).has(stat.size) : stat.size !== 0)) {
       throw new Error(`Non-auth quality ${name} must remain exactly empty.`);
     }
   }
@@ -572,7 +632,7 @@ function assertActiveNonAuthQualityBoundary(boundary, environment = boundary?.en
   return boundary;
 }
 
-function removeCreatedBoundary(root, identity, expectedRootEntries = undefined, options = {}) {
+function quarantineCreatedBoundary(root, identity) {
   if (!root || !identity) return Object.freeze({ reoccupied: false });
   privateDirectory(root, "Non-auth quality boundary", identity);
   const quarantine = path.join(
@@ -584,7 +644,16 @@ function removeCreatedBoundary(root, identity, expectedRootEntries = undefined, 
   }
   fs.renameSync(root, quarantine);
   privateDirectory(quarantine, "Quarantined non-auth quality boundary", identity);
-  removeExactOwnedDirectoryTree(quarantine, {
+  return Object.freeze({
+    quarantine,
+    reoccupied: fs.existsSync(root),
+  });
+}
+
+function removeCreatedBoundary(root, identity, expectedRootEntries = undefined, options = {}) {
+  if (!root || !identity) return Object.freeze({ reoccupied: false });
+  const quarantined = quarantineCreatedBoundary(root, identity);
+  removeExactOwnedDirectoryTree(quarantined.quarantine, {
     allowSingleLinkUnixSockets: options.allowSingleLinkUnixSockets === true,
     errorMessage: "Non-auth quality boundary cleanup refused an unsafe or changed tree.",
     expectedRootEntries,
@@ -603,7 +672,9 @@ function nonAuthBoundaryCleanupEntries(identity) {
     ...NON_AUTH_BOUNDARY_EMPTY_FILE_PATHS.map(name => Object.freeze({
       name: path.basename(identity.paths[name]),
       kind: "file",
-      identity: identity.pathIdentities[name],
+      identity: name === "cleanupTaint"
+        ? identity.cleanupTaintIdentity
+        : identity.pathIdentities[name],
     })),
     Object.freeze({
       name: path.basename(identity.marker),
@@ -611,6 +682,101 @@ function nonAuthBoundaryCleanupEntries(identity) {
       identity: identity.markerIdentity,
     }),
   ]);
+}
+
+function preserveNonAuthCleanupSubtree(target) {
+  if (typeof target !== "string" || !path.isAbsolute(target)
+    || path.normalize(target) !== target || path.resolve(target) !== target
+    || target.includes("\u0000")) {
+    throw new Error("Non-auth quality cleanup preservation target is invalid.");
+  }
+  let registered = false;
+  for (const identity of activeBoundaries.values()) {
+    const relative = path.relative(identity.boundary.root, target);
+    if (relative && relative !== ".." && !relative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(relative)) {
+      identity.preservedCleanupSubtrees.add(target);
+      registered = true;
+    }
+  }
+  signalInheritedNonAuthCleanupRefusal();
+  return registered;
+}
+
+function signalInheritedNonAuthCleanupRefusal(environment = process.env) {
+  // A child receives the exact identity of a pre-created parent receipt. It
+  // mutates only the verified open descriptor, so a pathname substitution can
+  // never redirect the signal into a foreign directory.
+  let descriptor = null;
+  try {
+    const encoded = environment?.[NON_AUTH_CLEANUP_TAINT_ENV];
+    if (typeof encoded !== "string" || encoded.length < 1 || encoded.length > 4096) {
+      return false;
+    }
+    const capability = JSON.parse(encoded);
+    const identityKeys = [
+      "changedNanoseconds", "device", "group", "inode", "links", "mode",
+      "modifiedNanoseconds", "owner", "size",
+    ];
+    if (!capability || typeof capability !== "object" || Array.isArray(capability)
+      || Object.keys(capability).sort().join(",") !== "identity,path,schemaVersion"
+      || capability.schemaVersion !== 1
+      || typeof capability.path !== "string"
+      || !path.isAbsolute(capability.path)
+      || path.normalize(capability.path) !== capability.path
+      || path.resolve(capability.path) !== capability.path
+      || capability.path.includes("\u0000")
+      || path.basename(capability.path) !== NON_AUTH_BOUNDARY_TAINT_FILE
+      || !path.basename(path.dirname(capability.path)).startsWith(NON_AUTH_BOUNDARY_PREFIX)
+      || !capability.identity || typeof capability.identity !== "object"
+      || Array.isArray(capability.identity)
+      || Object.keys(capability.identity).sort().join(",") !== identityKeys.sort().join(",")
+      || identityKeys.some(key => !/^\d+$/u.test(capability.identity[key] || ""))
+      || capability.identity.links !== "1"
+      || capability.identity.size !== "0") {
+      return false;
+    }
+    const noFollow = fs.constants.O_NOFOLLOW || 0;
+    descriptor = fs.openSync(capability.path, fs.constants.O_RDWR | noFollow);
+    const before = fs.fstatSync(descriptor, { bigint: true });
+    const beforeIdentity = cleanupEntryIdentity(before, cleanupEntryKind(
+      before,
+      "Inherited non-auth quality cleanup receipt is unsafe.",
+    ));
+    if (!before.isFile()
+      || Object.keys(capability.identity).some(
+        key => beforeIdentity[key] !== capability.identity[key],
+      )) {
+      return false;
+    }
+    const signal = Buffer.from([1]);
+    try {
+      if (fs.writeSync(descriptor, signal, 0, signal.length, 0) !== signal.length) return false;
+      fs.fsyncSync(descriptor);
+    } finally {
+      signal.fill(0);
+    }
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    const afterIdentity = cleanupEntryIdentity(after, cleanupEntryKind(
+      after,
+      "Inherited non-auth quality cleanup receipt is unsafe.",
+    ));
+    for (const key of ["device", "group", "inode", "links", "mode", "owner"]) {
+      if (afterIdentity[key] !== capability.identity[key]) return false;
+    }
+    if (!after.isFile() || afterIdentity.size !== "1") return false;
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (descriptor !== null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // The original cleanup refusal remains authoritative.
+      }
+    }
+  }
 }
 
 function createNonAuthQualityEnvironment(options = {}) {
@@ -659,6 +825,11 @@ function createNonAuthQualityEnvironment(options = {}) {
       localAppData: createPrivateDirectory(root, "local-app-data", createdRootEntries),
       temporary: createPrivateDirectory(root, "tmp", createdRootEntries),
       npmCache: createPrivateDirectory(root, "npm-cache", createdRootEntries),
+      cleanupTaint: createPrivateEmptyFile(
+        root,
+        NON_AUTH_BOUNDARY_TAINT_FILE,
+        createdRootEntries,
+      ),
       npmUserConfig: createPrivateEmptyFile(root, "npm-userconfig", createdRootEntries),
       npmGlobalConfig: createPrivateEmptyFile(root, "npm-globalconfig", createdRootEntries),
       gitGlobalConfig: createPrivateEmptyFile(root, "git-global-config", createdRootEntries),
@@ -680,6 +851,10 @@ function createNonAuthQualityEnvironment(options = {}) {
     const pathIdentities = Object.freeze(Object.fromEntries(
       Object.entries(paths).map(([name, target]) => [name, exactIdentity(fs.lstatSync(target))])
     ));
+    const cleanupTaintIdentity = cleanupEntryIdentity(
+      fs.lstatSync(paths.cleanupTaint, { bigint: true }),
+      "file",
+    );
 
     const childEnvironment = Object.freeze({
       ...baseEnvironment,
@@ -705,6 +880,11 @@ function createNonAuthQualityEnvironment(options = {}) {
       GIT_ATTR_NOSYSTEM: "1",
       GIT_TERMINAL_PROMPT: "0",
       GCM_INTERACTIVE: "never",
+      [NON_AUTH_CLEANUP_TAINT_ENV]: JSON.stringify({
+        schemaVersion: 1,
+        path: paths.cleanupTaint,
+        identity: cleanupTaintIdentity,
+      }),
     });
     const boundary = Object.freeze({ root, paths, environment: childEnvironment });
     activeBoundaries.set(root, Object.freeze({
@@ -717,27 +897,68 @@ function createNonAuthQualityEnvironment(options = {}) {
       rootIdentity,
       marker,
       markerIdentity,
+      cleanupTaintIdentity,
+      preservedCleanupSubtrees: new Set(),
     }));
     return boundary;
   } catch (error) {
-    removeCreatedBoundary(root, rootIdentity, createdRootEntries);
+    let rollbackError = null;
+    try {
+      const rollback = removeCreatedBoundary(root, rootIdentity, createdRootEntries);
+      if (rollback.reoccupied) {
+        rollbackError = new Error(
+          "Non-auth quality boundary path was reoccupied during creation rollback.",
+        );
+      }
+    } catch (cleanupError) {
+      rollbackError = cleanupError;
+    }
+    if (rollbackError) {
+      preserveNonAuthCleanupSubtree(root);
+      throw rollbackError;
+    }
     throw error;
   }
 }
 
 function cleanupNonAuthQualityEnvironment(boundary) {
-  const identity = activeBoundaryIdentity(boundary);
-  const removal = removeCreatedBoundary(
-    boundary.root,
-    identity.rootIdentity,
-    nonAuthBoundaryCleanupEntries(identity),
-    { allowSingleLinkUnixSockets: true },
-  );
-  activeBoundaries.delete(boundary.root);
-  if (removal.reoccupied) {
-    throw new Error("Non-auth quality boundary path was reoccupied during cleanup.");
+  const activeRoot = typeof boundary?.root === "string"
+    && activeBoundaries.has(boundary.root)
+    ? boundary.root
+    : null;
+  try {
+    const identity = activeBoundaryIdentity(boundary);
+    const cleanupTaint = privateFile(
+      boundary.paths.cleanupTaint,
+      "Non-auth quality cleanup taint receipt",
+      identity.pathIdentities.cleanupTaint,
+    );
+    if (identity.preservedCleanupSubtrees.size > 0 || cleanupTaint.size !== 0) {
+      try {
+        const preserved = quarantineCreatedBoundary(boundary.root, identity.rootIdentity);
+        if (preserved.reoccupied) {
+          throw new Error("Non-auth quality boundary path was reoccupied during cleanup.");
+        }
+      } finally {
+        activeBoundaries.delete(boundary.root);
+      }
+      throw new Error("Non-auth quality boundary preserved an unsafe or changed tree.");
+    }
+    const removal = removeCreatedBoundary(
+      boundary.root,
+      identity.rootIdentity,
+      nonAuthBoundaryCleanupEntries(identity),
+      { allowSingleLinkUnixSockets: true },
+    );
+    activeBoundaries.delete(boundary.root);
+    if (removal.reoccupied) {
+      throw new Error("Non-auth quality boundary path was reoccupied during cleanup.");
+    }
+    return true;
+  } catch (error) {
+    if (activeRoot) preserveNonAuthCleanupSubtree(activeRoot);
+    throw error;
   }
-  return true;
 }
 
 function withNonAuthQualityEnvironment(options, callback) {
@@ -745,21 +966,38 @@ function withNonAuthQualityEnvironment(options, callback) {
     throw new TypeError("Non-auth quality boundary callback must be a function.");
   }
   const boundary = createNonAuthQualityEnvironment(options);
+  let callbackError = null;
+  let cleanupError = null;
+  let result;
   try {
-    const result = callback(boundary.environment, boundary);
+    result = callback(boundary.environment, boundary);
     if (result && typeof result.then === "function") {
       throw new Error("Non-auth quality boundary callback must remain synchronous.");
     }
-    return result;
-  } finally {
-    cleanupNonAuthQualityEnvironment(boundary);
+  } catch (error) {
+    callbackError = error;
   }
+  try {
+    cleanupNonAuthQualityEnvironment(boundary);
+  } catch (error) {
+    cleanupError = error;
+  }
+  if (callbackError && cleanupError) {
+    throw new AggregateError(
+      [callbackError, cleanupError],
+      `Non-auth quality callback and cleanup both failed: ${callbackError.message}; ${cleanupError.message}`,
+    );
+  }
+  if (callbackError) throw callbackError;
+  if (cleanupError) throw cleanupError;
+  return result;
 }
 
 module.exports = {
   CREDENTIAL_LIKE_ENVIRONMENT_NAME,
   NON_AUTH_AMBIENT_CAPABILITY_NAMES,
   NON_AUTH_BOUNDARY_PREFIX,
+  NON_AUTH_CLEANUP_TAINT_ENV,
   NON_AUTH_QUALITY_ENVIRONMENT_ALLOWLIST,
   NON_AUTH_QUALITY_OVERRIDE_NAMES,
   assertActiveNonAuthQualityBoundary,
@@ -767,6 +1005,8 @@ module.exports = {
   cleanupNonAuthQualityEnvironment,
   createNonAuthQualityEnvironment,
   emptyExactOwnedDirectory,
+  expectedExactCleanupTreeEntry,
+  preserveNonAuthCleanupSubtree,
   removeExactOwnedDirectoryTree,
   withNonAuthQualityEnvironment,
 };

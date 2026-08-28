@@ -1,11 +1,13 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const { spawnSync } = require("child_process");
 const { isDeepStrictEqual, types } = require("util");
 const {
   ROOT,
-  discoverRepositoryOutputFiles,
+  assertRealRepositoryRoot,
   removeOutputFile,
   resolveExistingRepositoryFile,
   writeJson,
@@ -14,7 +16,18 @@ const {
   withStableSingleLinkFile,
 } = require("./candidate-binding");
 const { aggregateStatuses, fingerprint, sourceIdentity } = require("./evidence");
-const { withNonAuthQualityEnvironment } = require("./non-auth-environment");
+const {
+  removeExactOwnedDirectoryTree,
+  withNonAuthQualityEnvironment,
+} = require("./non-auth-environment");
+const {
+  assertCanonicalNpmRuntime,
+  assertCanonicalNodeRuntime,
+  assertExactNodeExecutable,
+  assertNoNpmToolchainShadowing,
+  canonicalToolchainEnvironment,
+  withCanonicalNpmLauncher,
+} = require("./canonical-node-runtime");
 const {
   STANDALONE_NODE_TESTS,
   VSCODE_CORE_TESTS,
@@ -29,6 +42,7 @@ const TEST_INVENTORIES_BY_SUITE = Object.freeze({
 
 const MAX_GATE_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const MAX_GATE_TEST_EVIDENCE_BYTES = 64 * 1024 * 1024;
+const GATE_RECEIPT_FILENAME = /^\d{2,}-[a-z0-9][a-z0-9-]*\.json$/u;
 const EXECUTION_ERROR_REASON = "execution-error";
 const EXECUTION_RESULT_FIELDS = Object.freeze([
   "artifactFingerprint",
@@ -274,13 +288,50 @@ function getGatePlan(profile) {
 }
 
 function runGate(options = {}) {
-  const root = options.root || ROOT;
+  const root = assertRealRepositoryRoot(options.root || ROOT);
+  const validateRuntime = options.assertCanonicalNodeRuntime || assertCanonicalNodeRuntime;
+  validateRuntime(root, process.version);
   const profile = options.profile || "fast";
+  if (!Object.prototype.hasOwnProperty.call(PHASE_STEPS, profile)) {
+    throw new Error("Quality gate profile must be fast, full, or release.");
+  }
   const plan = options.plan || getGatePlan(profile);
+  assertGateReceiptPlan(profile, plan);
+  const execute = options.execute || executeCommand;
+  const runtimeExecutable = process.execPath;
+  const npmExecPath = options.npmExecPath ?? process.env.npm_execpath;
+  let npm;
+  if (execute === executeCommand) {
+    assertExactNodeExecutable(runtimeExecutable, { platform: options.platform });
+    canonicalToolchainEnvironment(options.environment || process.env, {
+      nodeExecutable: runtimeExecutable,
+      platform: options.platform,
+    });
+    if (plan.some(step => step.executable === "npm")) {
+      npm = assertCanonicalNpmRuntime(root, npmExecPath, {
+        nodeExecutable: runtimeExecutable,
+        platform: options.platform,
+      });
+      assertNoNpmToolchainShadowing(root, { platform: options.platform });
+    }
+    for (const step of plan) resolveGateExecution(step, {
+      npm,
+      npmExecPath,
+      platform: options.platform,
+      root,
+      runtimeExecutable,
+    });
+  }
   const readSource = options.readSource
     || (options.source ? () => options.source : () => sourceIdentity(root));
   const source = options.source || readSource();
-  const execute = options.execute || executeCommand;
+  if (npm) {
+    npm = assertCanonicalNpmRuntime(root, npm.cliPath, {
+      nodeExecutable: runtimeExecutable,
+      platform: options.platform,
+    });
+    assertNoNpmToolchainShadowing(root, { platform: options.platform });
+  }
   clearGateReceipts(root, profile);
   for (const step of plan) clearStepOutputs(step, root);
   const receipts = plan.map(step => plannedReceipt(profile, step, source));
@@ -310,7 +361,18 @@ function runGate(options = {}) {
       continue;
     }
     const execution = bindExecutionTestEvidence(
-      execute(step, { root, profile, source }),
+      execute(step, {
+        environment: options.environment,
+        npm,
+        npmExecPath,
+        platform: options.platform,
+        profile,
+        root,
+        runtimeExecutable,
+        source,
+        spawnSync: options.spawnSync,
+        temporaryParent: options.temporaryParent,
+      }),
       step,
       root,
     );
@@ -365,6 +427,25 @@ function runGate(options = {}) {
   }
 
   return persistStableGateSummary(root, profile, source, plan, receipts);
+}
+
+function assertGateReceiptPlan(profile, plan) {
+  if (!Array.isArray(plan) || plan.length === 0) {
+    throw new Error("Quality gate plan cannot produce a safe exact receipt tree.");
+  }
+  const paths = plan.map(step => receiptPath({
+    profile,
+    sequence: step?.sequence,
+    stepId: step?.id,
+  }));
+  if (paths.length !== new Set(paths).size || paths.some(relativePath => (
+    path.posix.normalize(relativePath) !== relativePath
+    || path.posix.dirname(relativePath) !== `.quality/gates/${profile}`
+    || !GATE_RECEIPT_FILENAME.test(path.posix.basename(relativePath))
+  ))) {
+    throw new Error("Quality gate plan cannot produce a safe exact receipt tree.");
+  }
+  return true;
 }
 
 function revalidateArtifactReceipt(receipt, step, root, reason) {
@@ -494,14 +575,158 @@ function gatePlanFingerprint(plan) {
 }
 
 function clearGateReceipts(root, profile) {
-  removeOutputFile(`.quality/gates/${profile}.json`, root, {
-    subtree: ".quality/gates",
+  const repositoryRoot = assertRealRepositoryRoot(root);
+  const directory = path.join(repositoryRoot, ".quality", "gates", profile);
+  const summaryPath = path.join(repositoryRoot, ".quality", "gates", `${profile}.json`);
+  const errorMessage = "Quality gate receipt cleanup refused an unsafe or changed tree.";
+  let summaryIdentity = null;
+  let directoryStat = null;
+  try {
+    try {
+      const summaryStat = fs.lstatSync(summaryPath, { bigint: true });
+      if (summaryStat.isSymbolicLink() || !summaryStat.isFile()
+        || summaryStat.nlink !== 1n || summaryStat.size < 1n
+        || summaryStat.size > BigInt(MAX_GATE_ARTIFACT_BYTES)
+        || fs.realpathSync(summaryPath) !== summaryPath) {
+        throw new Error(errorMessage);
+      }
+      summaryIdentity = gateCleanupIdentity(summaryStat);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    try {
+      directoryStat = fs.lstatSync(directory, { bigint: true });
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (directoryStat && (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()
+      || fs.realpathSync(directory) !== directory)) {
+      throw new Error(errorMessage);
+    }
+    if (directoryStat) {
+      const names = fs.readdirSync(directory).sort();
+      const expectedRootEntries = names.map(name => {
+        if (!GATE_RECEIPT_FILENAME.test(name)) throw new Error(errorMessage);
+        const target = path.join(directory, name);
+        const entry = fs.lstatSync(target, { bigint: true });
+        if (entry.isSymbolicLink() || !entry.isFile() || entry.nlink !== 1n
+          || entry.size < 1n || entry.size > BigInt(MAX_GATE_ARTIFACT_BYTES)
+          || fs.realpathSync(target) !== target) {
+          throw new Error(errorMessage);
+        }
+        return Object.freeze({
+          name,
+          kind: "file",
+          identity: gateCleanupIdentity(entry),
+        });
+      });
+      if (summaryIdentity) assertGateCleanupIdentity(summaryPath, summaryIdentity, errorMessage);
+      removeExactOwnedDirectoryTree(directory, {
+        errorMessage,
+        expectedRootEntries,
+        expectedRootIdentity: gateCleanupIdentity(directoryStat),
+      });
+    }
+    if (summaryIdentity) {
+      removeExactGateSummary(
+        repositoryRoot,
+        summaryPath,
+        summaryIdentity,
+        profile,
+        errorMessage,
+      );
+    }
+  } catch {
+    throw new Error(errorMessage);
+  }
+  return Boolean(directoryStat || summaryIdentity);
+}
+
+function gateCleanupIdentity(stat) {
+  return Object.freeze({
+    changedNanoseconds: String(stat.ctimeNs),
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    mode: String(stat.mode),
+    modifiedNanoseconds: String(stat.mtimeNs),
+    nlink: String(stat.nlink),
+    size: String(stat.size),
   });
-  const directory = `.quality/gates/${profile}`;
-  for (const relativePath of discoverRepositoryOutputFiles(directory, root, {
-    subtree: directory,
-  })) {
-    removeOutputFile(relativePath, root, { subtree: directory });
+}
+
+function assertGateCleanupIdentity(target, expected, errorMessage) {
+  const stat = fs.lstatSync(target, { bigint: true });
+  const current = gateCleanupIdentity(stat);
+  if (stat.isSymbolicLink() || !stat.isFile()
+    || fs.realpathSync(target) !== target
+    || Object.keys(expected).some(key => expected[key] !== current[key])) {
+    throw new Error(errorMessage);
+  }
+  return true;
+}
+
+function gateCleanupRenameIdentity(target, expected, errorMessage) {
+  const stat = fs.lstatSync(target, { bigint: true });
+  const current = gateCleanupIdentity(stat);
+  const stableKeys = Object.keys(expected).filter(key => key !== "changedNanoseconds");
+  if (stat.isSymbolicLink() || !stat.isFile()
+    || fs.realpathSync(target) !== target
+    || stableKeys.some(key => expected[key] !== current[key])) {
+    throw new Error(errorMessage);
+  }
+  return current;
+}
+
+function removeExactGateSummary(
+  repositoryRoot,
+  summaryPath,
+  summaryIdentity,
+  profile,
+  errorMessage,
+) {
+  const gateRoot = path.join(repositoryRoot, ".quality", "gates");
+  const quarantine = path.join(
+    gateRoot,
+    `.gate-summary-cleanup-${profile}-${crypto.randomBytes(16).toString("hex")}`,
+  );
+  const movedSummary = path.join(quarantine, "summary.json");
+  let quarantineIdentity = null;
+  let movedSummaryIdentity = null;
+  try {
+    fs.mkdirSync(quarantine, { mode: 0o700 });
+    const quarantineStat = fs.lstatSync(quarantine, { bigint: true });
+    if (!quarantineStat.isDirectory() || quarantineStat.isSymbolicLink()
+      || fs.realpathSync(quarantine) !== quarantine) {
+      throw new Error(errorMessage);
+    }
+    quarantineIdentity = gateCleanupIdentity(quarantineStat);
+    assertGateCleanupIdentity(summaryPath, summaryIdentity, errorMessage);
+    fs.renameSync(summaryPath, movedSummary);
+    movedSummaryIdentity = gateCleanupRenameIdentity(movedSummary, summaryIdentity, errorMessage);
+    removeExactOwnedDirectoryTree(quarantine, {
+      errorMessage,
+      expectedRootEntries: [{
+        name: "summary.json",
+        kind: "file",
+        identity: movedSummaryIdentity,
+      }],
+      expectedRootIdentity: quarantineIdentity,
+    });
+    return true;
+  } catch {
+    if (quarantineIdentity) {
+      try {
+        removeExactOwnedDirectoryTree(quarantine, {
+          errorMessage,
+          expectedRootEntries: [],
+          expectedRootIdentity: quarantineIdentity,
+        });
+      } catch {
+        // Preserve a reoccupied quarantine rather than moving or deleting an
+        // unexpected entry through another non-atomic path transition.
+      }
+    }
+    throw new Error(errorMessage);
   }
 }
 
@@ -685,8 +910,18 @@ function bindExecutionTestEvidence(execution, step, root) {
 
 function executeCommand(step, context = {}) {
   const root = context.root || ROOT;
-  const executable = resolveExecutable(step.executable);
+  const runtimeExecutable = context.runtimeExecutable || process.execPath;
+  const execution = resolveGateExecution(step, {
+    root,
+    runtimeExecutable,
+    npm: context.npm,
+    npmExecPath: context.npmExecPath ?? process.env.npm_execpath,
+    platform: context.platform,
+  });
   const spawn = context.spawnSync || spawnSync;
+  if (execution.npm) {
+    assertNoNpmToolchainShadowing(root, { platform: context.platform });
+  }
   clearStepOutputs(step, root);
   const evidenceEnvironment = step.evidencePath ? {
     CLOUDSMITH_QUALITY_SOURCE_SHA: context.source?.sha || "",
@@ -699,12 +934,29 @@ function executeCommand(step, context = {}) {
     overrides: evidenceEnvironment,
     platform: context.platform,
     temporaryParent: context.temporaryParent,
-  }, environment => spawn(executable, step.args, {
-    cwd: root,
-    encoding: "utf8",
-    env: environment,
-    maxBuffer: 64 * 1024 * 1024,
-  }));
+  }, (environment, boundary) => {
+    const spawnChild = launcher => spawn(execution.executable, execution.npm
+      ? [launcher.npmCliPath, ...execution.args.slice(1)]
+      : execution.args, {
+      cwd: root,
+      encoding: "utf8",
+      env: canonicalToolchainEnvironment(environment, {
+        launcherDirectory: launcher?.directory,
+        nodeExecutable: runtimeExecutable,
+        platform: context.platform,
+        scriptShell: launcher?.scriptShell,
+      }),
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    if (!execution.npm) return spawnChild(null);
+    assertNoNpmToolchainShadowing(root, { platform: context.platform });
+    return withCanonicalNpmLauncher({
+      nodeExecutable: runtimeExecutable,
+      npm: execution.npm,
+      platform: context.platform,
+      temporaryParent: boundary.paths.temporary,
+    }, launcher => spawnChild(launcher));
+  });
   const result = composeExecution(rawResult);
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
@@ -1026,10 +1278,45 @@ function validateTestEvidence(value, step, source) {
   return null;
 }
 
-function resolveExecutable(executable) {
-  if (executable === "node") return process.execPath;
-  if (executable === "npm" && process.platform === "win32") return "npm.cmd";
-  return executable;
+function exactRuntimeExecutable(executable = process.execPath) {
+  try {
+    return assertExactNodeExecutable(executable);
+  } catch {
+    throw new Error("Canonical gate runtime executable is unsafe or invalid.");
+  }
+}
+
+function resolveGateExecution(step, options = {}) {
+  if (step.executable === "node") {
+    return Object.freeze({
+      executable: exactRuntimeExecutable(options.runtimeExecutable),
+      args: Object.freeze([...step.args]),
+    });
+  }
+  if (step.executable === "npm") {
+    const runtime = exactRuntimeExecutable(options.runtimeExecutable);
+    const claimedNpmCli = options.npm?.cliPath ?? options.npmExecPath;
+    const npm = assertCanonicalNpmRuntime(options.root || ROOT, claimedNpmCli, {
+      nodeExecutable: runtime,
+      platform: options.platform,
+    });
+    return Object.freeze({
+      executable: runtime,
+      args: Object.freeze([npm.cliPath, ...step.args]),
+      npm,
+    });
+  }
+  return Object.freeze({
+    executable: step.executable,
+    args: Object.freeze([...step.args]),
+  });
+}
+
+function gateChildEnvironment(environment, runtimeExecutable = process.execPath, platform) {
+  return canonicalToolchainEnvironment(environment, {
+    nodeExecutable: exactRuntimeExecutable(runtimeExecutable),
+    platform,
+  });
 }
 
 function parseTestCounts(output) {
@@ -1079,12 +1366,15 @@ module.exports = {
   STEP_CATALOG,
   artifactFingerprintForStep,
   completedReceipt,
+  exactRuntimeExecutable,
   executeCommand,
+  gateChildEnvironment,
   gatePlanFingerprint,
   getGatePlan,
   parseArguments,
   parseTestCounts,
   receiptPath,
+  resolveGateExecution,
   runGate,
   sameSource,
   stepArtifactPaths,

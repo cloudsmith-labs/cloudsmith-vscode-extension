@@ -58,6 +58,30 @@ every workflow whose `liveFixture.required` value is `true`.
 
 ## Everyday and release commands
 
+Run candidate packaging, black-box UI, mutation, and qualification commands
+with the exact Node.js version declared by `.node-version`. Their production
+entrypoints check that pin before invalidating prior evidence, and canonical
+packaging rejects every other runtime because Node's compression implementation
+participates in the byte identity of the VSIX. Quality gates and packaging also
+require npm 10.9.8 from that exact Node.js distribution, as declared by
+`.npm-version`; `.npm-integrity` binds the complete official npm installation
+with separate exact POSIX and Windows fingerprints. PATH-provided or standalone
+npm installations are not qualification toolchains. Each launcher first copies
+the validated installation into a creator-private snapshot, executes only that
+snapshot, and revalidates every snapshot and source file/directory identity
+after the child exits. Windows additionally binds `COMSPEC` and npm's script
+shell to the exact `%SystemRoot%\\System32\\cmd.exe`; the Windows CI row runs a
+real package preflight rather than relying on platform-simulated unit fixtures.
+
+The integrity pins are derived only from the official Node 22.23.2 platform
+archives after their archive digests match Node's published `SHASUMS256.txt`.
+For each extracted archive, run `npmInstallationFingerprint()` from
+`scripts/quality/canonical-node-runtime.js` against the distribution-owned npm
+package root (`lib/node_modules/npm` on POSIX and `node_modules/npm` on Windows),
+confirm the complete entry counts and bytes, and commit the resulting POSIX or
+Windows content digest. Never derive a pin from a global, Homebrew, or standalone
+npm installation.
+
 ```bash
 npm run quality:impact -- --base origin/main
 npm run quality:fast
@@ -79,7 +103,10 @@ npm run quality:release
 black-box UI smoke, validates the authenticated attestation, and runs the full
 history secret scan. A missing authenticated attestation or an open external
 security finding remains a blocker; neither is disguised as deterministic
-failure.
+failure. The release profile never deletes fast/full profile receipts. If those
+trees are present, release exposure accepts them only when they are complete,
+canonical, current-source, current-plan, and byte-stable; stale, partial, unsafe,
+or changed trees fail closed.
 
 ## Secret-exposure gates
 
@@ -119,6 +146,14 @@ the current process did not create. Use `npm run quality:qualification:reset`
 only to remove the validated dedicated local profile when an intentional clean
 reauthentication is needed.
 
+Nested non-auth tooling propagates cleanup refusal across process boundaries
+through a pre-created empty parent receipt. A child opens that receipt with
+no-follow semantics, verifies its complete non-secret file identity, and writes
+only through the verified descriptor. The parent then quarantines the complete
+boundary instead of recursively deleting a child quarantine. The receipt
+contains no runtime output, credential, or digest, and a pathname substitution
+cannot redirect the write into a foreign tree.
+
 Preparation, packaging, installation, and signed-out/CI execution keep their
 private synthetic home. The interactive local launch starts the exact app
 executable as a cold process and restores only the canonical OS account
@@ -155,6 +190,9 @@ preparation, so deletion, partial preparation, source drift, or artifact drift
 cannot reuse a prior live PASS. The local and CI profile identities and receipt
 fingerprints intentionally differ; validation requires their immutable
 source/VSIX/extension/install/current-VS-Code identities to match exactly.
+Candidate receipt schema v3 also binds the exact Node version, npm version,
+full npm-installation fingerprint, and producer platform to the repository's
+reviewed toolchain pins.
 
 On macOS, the no-argument prepare and launch commands first resolve
 `command -v code`, canonicalize it to a real app-bundled CLI, and then fall back

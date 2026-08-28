@@ -3,6 +3,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { isDeepStrictEqual } = require("util");
 const {
   ROOT,
   assertRealRepositoryRoot,
@@ -33,11 +34,21 @@ const {
   scanWithGitleaks,
   walkGeneratedFiles,
 } = require("./secret-scan");
-const { getGatePlan, receiptPath } = require("./gate");
+const {
+  getGatePlan,
+  receiptPath,
+} = require("./gate");
 const {
   UI_RESULT,
   verifySignedOutUiEvidence,
 } = require("./verify-ui-evidence");
+const {
+  validateGateGenerationProgress,
+  validateGateGenerationSemantics,
+  validateGateStepArtifactClaim,
+  validateStepArtifacts,
+  validateStepTestEvidence,
+} = require("./verify-handoff");
 
 const RELEASE_EXPOSURE_RESULT = ".quality/secrets/release.json";
 const LIVE_ATTESTATION = "internal_docs/quality/live-qualification.json";
@@ -65,6 +76,28 @@ const RELEASE_GATE_EXPECTED_PATHS = Object.freeze([
   ...RELEASE_GATE_RECEIPT_PATHS,
   ".quality/gates/live-qualification-status.json",
   ".quality/gates/release.json",
+]);
+const PRESERVED_GATE_PROFILES = Object.freeze(["fast", "full"]);
+const PRESERVED_GATE_PLANS = Object.freeze(Object.fromEntries(
+  PRESERVED_GATE_PROFILES.map(profile => [profile, Object.freeze(getGatePlan(profile))]),
+));
+const PRESERVED_GATE_RECEIPT_PATHS = Object.freeze(Object.fromEntries(
+  PRESERVED_GATE_PROFILES.map(profile => [profile, Object.freeze(
+    PRESERVED_GATE_PLANS[profile].map(step => receiptPath({
+      profile,
+      sequence: step.sequence,
+      stepId: step.id,
+    })),
+  )]),
+));
+const PRESERVED_GATE_EXPECTED_PATHS = Object.freeze(PRESERVED_GATE_PROFILES.flatMap(profile => [
+  `.quality/gates/${profile}.json`,
+  ...PRESERVED_GATE_RECEIPT_PATHS[profile],
+]));
+const INTENTIONALLY_VARIANT_SUPERSEDED_ARTIFACT_STEPS = new Set([
+  "quality-report",
+  "secret-artifacts",
+  "secret-current",
 ]);
 const GENERATED_EVIDENCE_CIRCULAR_OUTPUTS = Object.freeze([
   ...RELEASE_GATE_CIRCULAR_PATHS.map(outputPath => Object.freeze({
@@ -169,51 +202,259 @@ function assertExactCircularOutputFiles(root, options = {}) {
   return true;
 }
 
-function assertExactReleaseGateTree(root) {
+function failReleaseGateTree() {
+  throw new Error("Release gate output tree contains an unexpected, stale, or unsafe entry.");
+}
+
+function optionalPathStat(target, fileSystem = fs) {
+  try {
+    return fileSystem.lstatSync(target);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function assertCanonicalGateJson(loaded) {
+  const canonical = Buffer.from(`${JSON.stringify(loaded.document, null, 2)}\n`);
+  if (!loaded.bytes.equals(canonical)) failReleaseGateTree();
+  return loaded.document;
+}
+
+function validatePreservedGateProfile(root, profile, source, options = {}) {
+  const fileSystem = options.fileSystem || fs;
+  const summaryPath = `.quality/gates/${profile}.json`;
+  const directoryPath = `.quality/gates/${profile}`;
+  const summaryTarget = path.join(root, ...summaryPath.split("/"));
+  const directoryTarget = path.join(root, ...directoryPath.split("/"));
+  const summaryStat = optionalPathStat(summaryTarget, fileSystem);
+  const directoryStat = optionalPathStat(directoryTarget, fileSystem);
+  if (!summaryStat && !directoryStat) return null;
+  if (!summaryStat || !directoryStat) failReleaseGateTree();
+
+  const plan = PRESERVED_GATE_PLANS[profile];
+  const loadedSummary = readBoundedJson(summaryPath, root, ".quality/gates", options);
+  const summary = assertCanonicalGateJson(loadedSummary);
+  const context = { fileSystem, plan, profile, root, source };
+  try {
+    validateGateGenerationSemantics(summary, context);
+  } catch {
+    failReleaseGateTree();
+  }
+
+  const identities = [{ path: summaryPath, identity: loadedSummary.identity }];
+  for (let index = 0; index < plan.length; index += 1) {
+    const expectedPath = PRESERVED_GATE_RECEIPT_PATHS[profile][index];
+    const loadedReceipt = readBoundedJson(
+      expectedPath,
+      root,
+      `.quality/gates/${profile}`,
+      options,
+    );
+    const receipt = assertCanonicalGateJson(loadedReceipt);
+    if (!isDeepStrictEqual(receipt, summary.steps[index])) {
+      failReleaseGateTree();
+    }
+    identities.push({ path: expectedPath, identity: loadedReceipt.identity });
+  }
+  return Object.freeze({
+    context: Object.freeze(context),
+    identities: Object.freeze(identities.map(entry => Object.freeze(entry))),
+    receipts: summary.steps,
+  });
+}
+
+function validateReleaseGateOwner(root, source, options = {}) {
+  const fileSystem = options.fileSystem || fs;
+  const profile = "release";
+  const plan = RELEASE_GATE_PLAN;
+  const context = { fileSystem, plan, profile, root, source };
+  const receipts = [];
+  const identities = [];
+  for (let index = 0; index < plan.length; index += 1) {
+    const relativePath = RELEASE_GATE_RECEIPT_PATHS[index];
+    const loaded = readBoundedJson(
+      relativePath,
+      root,
+      ".quality/gates/release",
+      options,
+    );
+    receipts.push(assertCanonicalGateJson(loaded));
+    identities.push(Object.freeze({ path: relativePath, identity: loaded.identity }));
+  }
+  const summaryPath = ".quality/gates/release.json";
+  const summaryTarget = path.join(root, ".quality", "gates", "release.json");
+  if (optionalPathStat(summaryTarget, fileSystem)) {
+    const loadedSummary = readBoundedJson(summaryPath, root, ".quality/gates", options);
+    const summary = assertCanonicalGateJson(loadedSummary);
+    validateGateGenerationSemantics(summary, context);
+    if (!isDeepStrictEqual(receipts, summary.steps)) failReleaseGateTree();
+    identities.unshift(Object.freeze({ path: summaryPath, identity: loadedSummary.identity }));
+  } else {
+    validateGateGenerationProgress(receipts, context);
+  }
+  for (let index = 0; index < plan.length; index += 1) {
+    validateGateStepArtifactClaim(receipts[index], plan[index]);
+    validateStepArtifacts(receipts[index], plan[index], root);
+    validateStepTestEvidence(receipts[index], plan[index], root);
+  }
+  return Object.freeze({
+    context: Object.freeze(context),
+    identities: Object.freeze(identities),
+    receipts: Object.freeze(receipts),
+  });
+}
+
+function validatePreservedGateBindings(generations, owner) {
+  try {
+    // Gate profiles intentionally reuse artifact paths. Only the latest exact
+    // canonical generation (release progress, otherwise full, otherwise fast)
+    // owns those current bytes. Historical claims retain strict declaration
+    // semantics; structured test evidence remains current-path bound because
+    // its canonical bytes are stable across profile reruns.
+    const ownerByStep = new Map(owner.context.plan.map((step, index) => (
+      [step.id, owner.receipts[index]]
+    )));
+    for (const generation of generations) {
+      for (let index = 0; index < generation.context.plan.length; index += 1) {
+        const step = generation.context.plan[index];
+        const receipt = generation.receipts[index];
+        validateGateStepArtifactClaim(
+          receipt,
+          step,
+        );
+        validateStepTestEvidence(
+          receipt,
+          step,
+          generation.context.root,
+        );
+        const ownerReceipt = ownerByStep.get(step.id);
+        if (generation !== owner
+          && step.artifactPath
+          && receipt.artifactFingerprint !== null
+          && !INTENTIONALLY_VARIANT_SUPERSEDED_ARTIFACT_STEPS.has(step.id)
+          && (!ownerReceipt
+            || receipt.artifactFingerprint !== ownerReceipt.artifactFingerprint)) {
+          failReleaseGateTree();
+        }
+      }
+    }
+    for (let index = 0; index < owner.context.plan.length; index += 1) {
+      validateStepArtifacts(
+        owner.receipts[index],
+        owner.context.plan[index],
+        owner.context.root,
+      );
+    }
+  } catch {
+    failReleaseGateTree();
+  }
+  return true;
+}
+
+function exactReleaseGateTreeSnapshot(root, options = {}) {
+  const fileSystem = options.fileSystem || fs;
   const gateRoot = path.join(root, ".quality", "gates");
   let rootStat;
   try {
-    rootStat = fs.lstatSync(gateRoot);
+    rootStat = fileSystem.lstatSync(gateRoot);
   } catch (error) {
-    if (error.code === "ENOENT") return true;
+    if (error.code === "ENOENT") {
+      return Object.freeze({ preservedIdentities: [], semanticIdentities: [] });
+    }
     throw error;
   }
-  const failure = () => {
-    throw new Error("Release gate output tree contains an unexpected or unsafe entry.");
-  };
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()
-    || fs.realpathSync(gateRoot) !== gateRoot) failure();
-  const allowedFiles = new Set(RELEASE_GATE_EXPECTED_PATHS);
-  const allowedDirectories = new Set([".quality/gates", ".quality/gates/release"]);
+    || fileSystem.realpathSync(gateRoot) !== gateRoot) failReleaseGateTree();
+  const allowedFiles = new Set([
+    ...RELEASE_GATE_EXPECTED_PATHS,
+    ...PRESERVED_GATE_EXPECTED_PATHS,
+  ]);
+  const allowedDirectories = new Set([
+    ".quality/gates",
+    ".quality/gates/release",
+    ...PRESERVED_GATE_PROFILES.map(profile => `.quality/gates/${profile}`),
+  ]);
   const pending = [gateRoot];
   while (pending.length > 0) {
     const directory = pending.pop();
-    for (const name of fs.readdirSync(directory)) {
+    for (const name of fileSystem.readdirSync(directory)) {
       const absolute = path.join(directory, name);
       const relative = path.relative(root, absolute).split(path.sep).join("/");
-      const stat = fs.lstatSync(absolute);
-      if (stat.isSymbolicLink()) failure();
+      const stat = fileSystem.lstatSync(absolute);
+      if (stat.isSymbolicLink()) failReleaseGateTree();
       if (stat.isDirectory()) {
-        if (!allowedDirectories.has(relative) || fs.realpathSync(absolute) !== absolute) failure();
+        if (!allowedDirectories.has(relative)
+          || fileSystem.realpathSync(absolute) !== absolute) failReleaseGateTree();
         pending.push(absolute);
       } else if (stat.isFile()) {
         if (!allowedFiles.has(relative) || stat.nlink !== 1
           || stat.size > MAX_GENERATED_FILE_BYTES
-          || fs.realpathSync(absolute) !== absolute) failure();
+          || fileSystem.realpathSync(absolute) !== absolute) failReleaseGateTree();
       } else {
-        failure();
+        failReleaseGateTree();
       }
     }
   }
+  let expectedSource = options.source || null;
+  const preservedIdentities = [];
+  const semanticIdentities = [];
+  const preservedGenerations = [];
+  for (const profile of PRESERVED_GATE_PROFILES) {
+    const summaryTarget = path.join(root, ".quality", "gates", `${profile}.json`);
+    const directoryTarget = path.join(root, ".quality", "gates", profile);
+    const hasSummary = Boolean(optionalPathStat(summaryTarget, fileSystem));
+    const hasDirectory = Boolean(optionalPathStat(directoryTarget, fileSystem));
+    if (hasSummary !== hasDirectory) failReleaseGateTree();
+    if (hasSummary) {
+      if (!expectedSource) expectedSource = sourceIdentity(root);
+      let generation;
+      try {
+        generation = validatePreservedGateProfile(root, profile, expectedSource, options);
+      } catch {
+        failReleaseGateTree();
+      }
+      preservedGenerations.push(generation);
+      preservedIdentities.push(...generation.identities);
+      semanticIdentities.push(...generation.identities);
+    }
+  }
+  const releaseSummary = path.join(root, ".quality", "gates", "release.json");
+  const releaseDirectory = path.join(root, ".quality", "gates", "release");
+  const hasReleaseSummary = Boolean(optionalPathStat(releaseSummary, fileSystem));
+  const hasReleaseDirectory = Boolean(optionalPathStat(releaseDirectory, fileSystem));
+  if (hasReleaseSummary && !hasReleaseDirectory) failReleaseGateTree();
+  let releaseOwner = null;
+  if (hasReleaseDirectory) {
+    if (!expectedSource) expectedSource = sourceIdentity(root);
+    try {
+      releaseOwner = validateReleaseGateOwner(root, expectedSource, options);
+    } catch {
+      failReleaseGateTree();
+    }
+    semanticIdentities.push(...releaseOwner.identities);
+  }
+  if (preservedGenerations.length > 0) {
+    const owner = releaseOwner || preservedGenerations[preservedGenerations.length - 1];
+    validatePreservedGateBindings(preservedGenerations, owner);
+  }
+  return Object.freeze({
+    preservedIdentities: Object.freeze(preservedIdentities),
+    semanticIdentities: Object.freeze(semanticIdentities),
+  });
+}
+
+function assertExactReleaseGateTree(root, options = {}) {
+  exactReleaseGateTreeSnapshot(root, options);
   return true;
 }
 
 function generatedEvidenceInventory(root, options = {}) {
   const repositoryRoot = assertRealRepositoryRoot(root);
-  assertExactReleaseGateTree(repositoryRoot);
+  const gateTreeBefore = exactReleaseGateTreeSnapshot(repositoryRoot, options);
   assertExactCircularOutputFiles(repositoryRoot, options);
   const excludedFiles = new Set(GENERATED_EVIDENCE_EXCLUDED_FILES);
-  return walkGeneratedFiles(repositoryRoot, GENERATED_EVIDENCE_ROOT, {
+  const inventory = walkGeneratedFiles(repositoryRoot, GENERATED_EVIDENCE_ROOT, {
     excludedPrefixes: GENERATED_EVIDENCE_EXCLUDED_PREFIXES,
     excludedFiles: GENERATED_EVIDENCE_EXCLUDED_FILES,
   }).filter(relativePath => !excludedFiles.has(relativePath)).map(relativePath => Object.freeze({
@@ -224,6 +465,23 @@ function generatedEvidenceInventory(root, options = {}) {
       options.fileSystem,
     ),
   }));
+  const gateTreeAfter = exactReleaseGateTreeSnapshot(repositoryRoot, options);
+  const byPath = new Map(inventory.map(entry => [entry.path, entry.identity]));
+  const afterSemantic = new Map(gateTreeAfter.semanticIdentities.map(entry => (
+    [entry.path, entry.identity]
+  )));
+  const preservedPaths = new Set(gateTreeBefore.preservedIdentities.map(entry => entry.path));
+  if (gateTreeBefore.semanticIdentities.length !== gateTreeAfter.semanticIdentities.length) {
+    failReleaseGateTree();
+  }
+  for (const before of gateTreeBefore.semanticIdentities) {
+    if (!sameFileIdentity(before.identity, afterSemantic.get(before.path))
+      || (preservedPaths.has(before.path)
+        && !sameFileIdentity(before.identity, byPath.get(before.path)))) {
+      failReleaseGateTree();
+    }
+  }
+  return inventory;
 }
 
 function sameGeneratedEvidenceInventory(left, right) {
@@ -724,7 +982,8 @@ async function executeReleaseExposureScan(options = {}) {
     ? [...new Set([optionalAttestation.path, ...evidenceManifest.map(reference => reference.path)])].sort()
     : [];
 
-  const generatedInventoryBefore = generatedEvidenceInventory(root, options);
+  const boundaryOptions = { ...options, source };
+  const generatedInventoryBefore = generatedEvidenceInventory(root, boundaryOptions);
   (options.assertScannerVersion || assertScannerVersion)({ ...options, root });
   const generatedComponent = (options.scanGeneratedEvidence || scanGeneratedEvidence)(
     root,
@@ -798,8 +1057,8 @@ async function executeReleaseExposureScan(options = {}) {
         options,
       );
     }
-    assertExpectedGeneratedEvidenceInventory(root, generatedInventoryBefore, options);
-    validateGeneratedEvidenceAcceptance(root, generatedEvidence, options);
+    assertExpectedGeneratedEvidenceInventory(root, generatedInventoryBefore, boundaryOptions);
+    validateGeneratedEvidenceAcceptance(root, generatedEvidence, boundaryOptions);
   }
   return buildReleaseExposureResult({
     source,

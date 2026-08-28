@@ -78,6 +78,10 @@ const {
 } = require("./auth-bootstrap/runner");
 
 const ROOT = path.resolve(__dirname, "..");
+const NPM_INTEGRITY = JSON.parse(fs.readFileSync(
+  path.join(ROOT, ".npm-integrity"),
+  "utf8",
+));
 const SYNTHETIC_SENTINEL = "SYNTHETIC_QUALIFICATION_SENTINEL";
 const SOURCE = Object.freeze({ sha: "a".repeat(40), fingerprint: "b".repeat(64) });
 const temporaryRoots = [];
@@ -137,7 +141,7 @@ function candidateFixture(options = {}) {
     vscodeVersion: CURRENT_VSCODE_VERSION,
   };
   const receiptBase = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     status: "passed",
     capturedAt: "2026-08-27T00:00:00.000Z",
     source: SOURCE,
@@ -145,6 +149,14 @@ function candidateFixture(options = {}) {
       branch: "test/release-quality-harness",
       dirty: true,
       status: "dirty",
+    },
+    toolchain: {
+      nodeVersion: "v22.23.2",
+      npmVersion: "10.9.8",
+      npmInstallationSha256: NPM_INTEGRITY[
+        process.platform === "win32" ? "win32" : "posix"
+      ],
+      platform: process.platform,
     },
     extension: {
       id: "Cloudsmith.cloudsmith-vsc",
@@ -1672,6 +1684,9 @@ suite("authenticated CI SecretStorage bootstrap", () => {
       name: "cloudsmith-vsc",
       version: "2.3.0",
     }));
+    for (const filename of [".node-version", ".npm-version", ".npm-integrity"]) {
+      fs.copyFileSync(path.join(ROOT, filename), path.join(fixtureRoot, filename));
+    }
     const receiptBase = { ...candidate.receipt };
     delete receiptBase.fingerprint;
     receiptBase.artifact = {
