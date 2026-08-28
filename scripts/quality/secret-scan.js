@@ -102,6 +102,7 @@ const MAX_UI_CANDIDATE_VSIX_BYTES = 12 * 1024 * 1024;
 const MAX_UI_RESULT_BYTES = 2 * 1024 * 1024;
 const MAX_SIGNED_OUT_EVIDENCE_BYTES = 2 * 1024 * 1024;
 const MAX_SAFE_REPORT_BYTES = 2 * 1024 * 1024;
+const SCANNER_PROCESS_TIMEOUT_MS = 60 * 1000;
 const TRACKED_FINDING_KEYS = Object.freeze([
   "commit",
   "endLine",
@@ -208,6 +209,13 @@ function privateScannerEnvironment(environment, scannerHome) {
 }
 
 function run(executable, args, options = {}) {
+  const timeout = options.timeoutMilliseconds === undefined
+    ? SCANNER_PROCESS_TIMEOUT_MS
+    : options.timeoutMilliseconds;
+  if (!Number.isSafeInteger(timeout) || timeout <= 0
+    || timeout > SCANNER_PROCESS_TIMEOUT_MS) {
+    throw new Error("Secret scanner process timeout is invalid.");
+  }
   const result = spawnSync(executable, args, {
     cwd: options.cwd || ROOT,
     encoding: "utf8",
@@ -215,6 +223,8 @@ function run(executable, args, options = {}) {
     input: options.input,
     maxBuffer: 2 * 1024 * 1024,
     stdio: "pipe",
+    timeout,
+    killSignal: "SIGKILL",
   });
   return result;
 }
@@ -2732,6 +2742,7 @@ module.exports = {
   GITLEAKS_VERSION,
   MAX_GENERATED_FILE_BYTES,
   MAX_TRACKED_FILE_BYTES,
+  SCANNER_PROCESS_TIMEOUT_MS,
   REPORT_TEMPLATE,
   SAFE_REPORT_KEYS,
   SIGNED_OUT_BUNDLE_DIRECTORY,
@@ -2761,6 +2772,7 @@ module.exports = {
   scannerEnvironment,
   privateScannerEnvironment,
   removePrivateSnapshotRoot,
+  runScannerProcess: run,
   trackedFiles,
   validateArchiveEntryPath,
   walkGeneratedFiles,

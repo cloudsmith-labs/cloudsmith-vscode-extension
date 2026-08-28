@@ -19,6 +19,7 @@ const {
   FORBIDDEN_REPORT_FIELDS,
   GITLEAKS_VERSION,
   MAX_TRACKED_FILE_BYTES,
+  SCANNER_PROCESS_TIMEOUT_MS,
   REPORT_TEMPLATE,
   SIGNED_OUT_BUNDLE_DIRECTORY,
   SIGNED_OUT_BUNDLE_NAMES,
@@ -29,6 +30,7 @@ const {
   parseSafeReport,
   resultDocument,
   removePrivateSnapshotRoot,
+  runScannerProcess,
   scanGeneratedEvidence,
   scanTracked,
   scanVsix,
@@ -590,6 +592,29 @@ suite("secret exposure gate", () => {
     });
     assert.deepStrictEqual(findings, []);
     assert.strictEqual(fs.existsSync(scannerHome), false);
+  });
+
+  test("scanner subprocesses have a host-enforced kill deadline", () => {
+    const started = Date.now();
+    const result = runScannerProcess(process.execPath, [
+      "-e",
+      "setInterval(() => {}, 1000)",
+    ], {
+      cwd: scratch,
+      env: { PATH: process.env.PATH || "" },
+      timeoutMilliseconds: 50,
+    });
+    assert.strictEqual(result.status, null);
+    assert.strictEqual(result.signal, "SIGKILL");
+    assert.strictEqual(result.error?.code, "ETIMEDOUT");
+    assert.ok(Date.now() - started < 5_000);
+    assert.strictEqual(SCANNER_PROCESS_TIMEOUT_MS, 60_000);
+    assert.throws(
+      () => runScannerProcess(process.execPath, ["--version"], {
+        timeoutMilliseconds: SCANNER_PROCESS_TIMEOUT_MS + 1,
+      }),
+      /process timeout is invalid/u,
+    );
   });
 
   test("fails closed when scanner exit status and safe report disagree", () => {
