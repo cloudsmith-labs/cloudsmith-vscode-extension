@@ -1449,6 +1449,66 @@ async function scanSnapshotEntryDescriptor(
   return findings;
 }
 
+function scanSnapshotEntryDescriptorSync(
+  scan,
+  snapshotRoot,
+  entry,
+  options,
+  errorMessage,
+) {
+  const target = path.join(snapshotRoot, ...entry.manifest.path.split("/"));
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  let descriptor;
+  let completed = false;
+  let findings;
+  try {
+    descriptor = fs.openSync(target, flags);
+    if (!stableSnapshotDescriptorState(target, descriptor, entry.snapshot.identity)) {
+      throw new Error(errorMessage);
+    }
+    const descriptorPath = inheritedDescriptorScanPath();
+    const scanTarget = descriptorPath || target;
+    const result = scan("dir", scanTarget, {
+      ...options,
+      descriptorSourcePath: target,
+      scanRoot: descriptorPath ? path.dirname(descriptorPath) : snapshotRoot,
+      ...(descriptorPath ? { extraFileDescriptor: descriptor } : {}),
+    });
+    if (result && typeof result.then === "function") throw new Error(errorMessage);
+    if (!stableSnapshotDescriptorState(target, descriptor, entry.snapshot.identity)) {
+      throw new Error(errorMessage);
+    }
+    const reportedPath = descriptorPath
+      ? path.basename(descriptorPath)
+      : entry.manifest.path;
+    const normalized = normalizeTrackedFindings(result, reportedPath);
+    const logicalPath = options.label
+      ? `${options.label}/${entry.manifest.path}`
+      : entry.manifest.path;
+    assertRepositoryRelativePath(logicalPath);
+    findings = [];
+    for (let index = 0; index < normalized.length; index += 1) {
+      findings[index] = INTRINSIC_OBJECT_FREEZE({
+        ...normalized[index],
+        path: logicalPath,
+      });
+    }
+    findings = INTRINSIC_OBJECT_FREEZE(findings);
+    completed = true;
+  } catch {
+    completed = false;
+  }
+  if (descriptor !== undefined) {
+    try {
+      fs.closeSync(descriptor);
+    } catch {
+      completed = false;
+    }
+  }
+  if (!completed) throw new Error(errorMessage);
+  return findings;
+}
+
 function scanSnapshotEntriesSync(
   snapshotRoot,
   entries,
@@ -1459,6 +1519,16 @@ function scanSnapshotEntriesSync(
 ) {
   const findings = [];
   for (const entry of entries) {
+    if (path.extname(entry.manifest.path).toLowerCase() === ".vsix") {
+      findings.push(...scanSnapshotEntryDescriptorSync(
+        scan,
+        snapshotRoot,
+        entry,
+        options,
+        errorMessage,
+      ));
+      continue;
+    }
     let provenBytes;
     let scannerBytes;
     try {

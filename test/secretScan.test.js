@@ -1194,6 +1194,25 @@ suite("secret exposure gate", () => {
     );
   });
 
+  test("keeps a clean scanner report fail-closed when stdin transport breaks", () => {
+    assert.throws(
+      () => scanWithGitleaks("stdin", "quality/large-proof.vsix", {
+        root: path.resolve(__dirname, ".."),
+        input: Buffer.alloc(1024 * 1024, 0x5a),
+        execute() {
+          return {
+            status: 0,
+            signal: null,
+            error: Object.assign(new Error("synthetic transport break"), { code: "EPIPE" }),
+            stdout: "[]\n",
+            stderr: "",
+          };
+        },
+      }),
+      /failed closed before producing a trustworthy result/u,
+    );
+  });
+
   test("rejects missing, oversized, and unexpected scanner stdout without reflecting it", () => {
     const target = path.join(scratch, "stdout-target");
     fs.mkdirSync(target);
@@ -3028,6 +3047,84 @@ suite("secret exposure gate", () => {
       identity: originalIdentity,
       sha256: crypto.createHash("sha256").update(originalBytes).digest("hex"),
     }]);
+  });
+
+  test("generated VSIX evidence uses descriptor transport while adjacent text uses stdin", () => {
+    const caseRoot = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "generated-vsix-")));
+    const archivePath = ".quality/qualification/live-candidate.vsix";
+    const textPath = ".quality/qualification/proof.json";
+    const archiveBytes = Buffer.alloc(1_067_417, 0x5a);
+    const textBytes = Buffer.from("{\"status\":\"synthetic\"}\n");
+    fs.mkdirSync(path.join(caseRoot, ".quality", "qualification"), { recursive: true });
+    fs.writeFileSync(path.join(caseRoot, ...archivePath.split("/")), archiveBytes);
+    fs.writeFileSync(path.join(caseRoot, ...textPath.split("/")), textBytes);
+
+    const transports = [];
+    const component = scanGeneratedEvidence(caseRoot, ".quality", {
+      scanWithGitleaks(kind, logicalPath, options) {
+        if (kind === "stdin") {
+          transports.push({ kind, path: logicalPath });
+          assert.strictEqual(logicalPath, textPath);
+          assert.deepStrictEqual(options.input, textBytes);
+          return [];
+        }
+        assert.strictEqual(kind, "dir");
+        assert.strictEqual(options.input, undefined);
+        transports.push({ kind, path: archivePath });
+        const scannedBytes = Number.isSafeInteger(options.extraFileDescriptor)
+          ? fs.readFileSync(options.extraFileDescriptor)
+          : fs.readFileSync(logicalPath);
+        assert.deepStrictEqual(scannedBytes, archiveBytes);
+        return [{
+          commit: null,
+          ruleId: "synthetic-descriptor-rule",
+          path: Number.isSafeInteger(options.extraFileDescriptor)
+            ? path.basename(logicalPath)
+            : archivePath,
+          startLine: 1,
+          endLine: 1,
+        }];
+      },
+    });
+
+    assert.deepStrictEqual(transports, [
+      { kind: "dir", path: archivePath },
+      { kind: "stdin", path: textPath },
+    ]);
+    assert.deepStrictEqual(component.findings, [{
+      commit: null,
+      ruleId: "synthetic-descriptor-rule",
+      path: archivePath,
+      startLine: 1,
+      endLine: 1,
+    }]);
+    assert.deepStrictEqual(
+      component.snapshotManifest.map(entry => entry.path),
+      [archivePath, textPath],
+    );
+  });
+
+  test("generated VSIX descriptor transport rejects async output and path replacement", () => {
+    for (const mutation of ["async-output", "path-replacement"]) {
+      const caseRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+        scratch,
+        `generated-vsix-${mutation}-`,
+      )));
+      const archivePath = ".quality/qualification/live-candidate.vsix";
+      const target = path.join(caseRoot, ...archivePath.split("/"));
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, Buffer.alloc(128, 0x5a));
+
+      assert.throws(() => scanGeneratedEvidence(caseRoot, ".quality", {
+        scanWithGitleaks(kind, _logicalPath, options) {
+          assert.strictEqual(kind, "dir");
+          if (mutation === "async-output") return Promise.resolve([]);
+          fs.renameSync(options.descriptorSourcePath, `${options.descriptorSourcePath}.original`);
+          fs.writeFileSync(options.descriptorSourcePath, Buffer.alloc(128, 0x59));
+          return [];
+        },
+      }), /must complete synchronously on exact snapshot bytes/u, mutation);
+    }
   });
 
   test("VSIX raw and expanded scans use one private snapshot and report its exact digest", async () => {
