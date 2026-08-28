@@ -14,6 +14,7 @@ const {
   withCanonicalNpmLauncher,
 } = require("../scripts/quality/canonical-node-runtime");
 const {
+  authenticatePackageNpmRuntime,
   canonicalVscePackageInvocation,
   packageBuildDirectoryIdentity,
   removePackageBuildDirectory,
@@ -616,6 +617,47 @@ suite("M9 release gate helpers", () => {
       assert.strictEqual(npm.version, fixture.version);
       assert.deepStrictEqual(npm.installation, fixture.installation);
       assert.strictEqual(Object.isFrozen(npm.identities), true);
+    });
+  });
+
+  test("package lifecycle ignores npm snapshot bookkeeping and authenticates the install", () => {
+    withNodeVersionPin("22.23.2\n", fixtureRoot => {
+      const fixture = createCanonicalNpmFixture(fixtureRoot);
+      const installed = assertCanonicalNpmRuntime(fixtureRoot, fixture.cliPath, {
+        nodeExecutable: fixture.nodeExecutable,
+        platform: fixture.platform,
+      });
+      withCanonicalNpmLauncher({
+        nodeExecutable: fixture.nodeExecutable,
+        npm: installed,
+        platform: fixture.platform,
+        temporaryParent: fixtureRoot,
+      }, launcher => {
+        assert.notStrictEqual(launcher.npmCliPath, fixture.cliPath);
+        assert.throws(
+          () => assertCanonicalNpmRuntime(fixtureRoot, launcher.npmCliPath, {
+            nodeExecutable: fixture.nodeExecutable,
+            platform: fixture.platform,
+          }),
+          /Canonical npm runtime is unsafe or invalid/u,
+        );
+        let claimedPath = "not-called";
+        const authenticated = authenticatePackageNpmRuntime(
+          fixtureRoot,
+          fixture.nodeExecutable,
+          (repositoryRoot, npmExecPath, options) => {
+            claimedPath = npmExecPath;
+            return assertCanonicalNpmRuntime(repositoryRoot, npmExecPath, {
+              ...options,
+              platform: fixture.platform,
+            });
+          },
+        );
+        assert.strictEqual(claimedPath, undefined);
+        assert.strictEqual(authenticated.cliPath, fixture.cliPath);
+        assert.strictEqual(authenticated.version, installed.version);
+        assert.strictEqual(authenticated.installation.sha256, installed.installation.sha256);
+      });
     });
   });
 

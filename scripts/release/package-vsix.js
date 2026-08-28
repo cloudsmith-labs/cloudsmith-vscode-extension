@@ -157,11 +157,22 @@ function removePackageBuildDirectory(directory, identity, expectedRootEntries = 
   return !fs.existsSync(directory);
 }
 
+function authenticatePackageNpmRuntime(
+  repositoryRoot,
+  nodeExecutable,
+  authenticate = assertCanonicalNpmRuntime,
+) {
+  // npm rewrites npm_execpath when an npm lifecycle runs through our private
+  // snapshot. That ambient bookkeeping field is not an authority claim: bind
+  // the complete canonical installation beside the already exact Node binary.
+  return authenticate(repositoryRoot, undefined, { nodeExecutable });
+}
+
 async function main() {
   assertCanonicalNodeRuntime(root, process.version);
   const nodeExecutable = assertExactNodeExecutable(process.execPath);
   canonicalToolchainEnvironment(process.env, { nodeExecutable });
-  const npm = assertCanonicalNpmRuntime(root, process.env.npm_execpath, { nodeExecutable });
+  const npm = authenticatePackageNpmRuntime(root, nodeExecutable);
   assertNoNpmToolchainShadowing(root);
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
   const lockfile = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "utf8"));
@@ -299,6 +310,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  authenticatePackageNpmRuntime,
   canonicalVscePackageInvocation,
   packageBuildDirectoryIdentity,
   removePackageBuildDirectory,
