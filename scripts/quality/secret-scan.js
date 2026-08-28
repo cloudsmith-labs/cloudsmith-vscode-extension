@@ -141,9 +141,9 @@ const EXACT_FILE_IDENTITY_KEYS = Object.freeze([
 ]);
 const REVIEWED_SYNTHETIC_FIXTURE_PATH = "test/qualityHarness.test.js";
 const REVIEWED_SYNTHETIC_FIXTURE_RULE = "generic-api-key";
-const REVIEWED_SYNTHETIC_FIXTURE_POLICY = "qh-synthetic-cloudsmith-api-key-v1";
-const REVIEWED_SYNTHETIC_FIXTURE_FIRST_LINE = 1731;
-const REVIEWED_SYNTHETIC_FIXTURE_SECOND_LINE = 3567;
+const REVIEWED_SYNTHETIC_FIXTURE_POLICY = "qh-synthetic-cloudsmith-api-key-v2";
+const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_FIRST_LINE = 1731;
+const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_SECOND_LINE = 3567;
 const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_COMMIT =
   "8e54acd0430a7c1e9f6598d982e245afc5ef94a4";
 const REVIEWED_SYNTHETIC_FIXTURE_PREFIX = Object.freeze(
@@ -1315,8 +1315,6 @@ function isReviewedSyntheticTrackedFinding(finding, sourceBytes) {
     && finding.ruleId === REVIEWED_SYNTHETIC_FIXTURE_RULE
     && finding.commit === null
     && finding.startLine === finding.endLine
-    && (finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_FIRST_LINE
-      || finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_SECOND_LINE)
     && reviewedSyntheticFixtureLine(sourceBytes, finding.startLine);
 }
 
@@ -1325,35 +1323,35 @@ function isReviewedSyntheticHistoryFinding(finding) {
     && finding.ruleId === REVIEWED_SYNTHETIC_FIXTURE_RULE
     && finding.commit === REVIEWED_SYNTHETIC_FIXTURE_HISTORY_COMMIT
     && finding.startLine === finding.endLine
-    && (finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_FIRST_LINE
-      || finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_SECOND_LINE);
+    && (finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_HISTORY_FIRST_LINE
+      || finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_HISTORY_SECOND_LINE);
 }
 
 function classifyTrackedFindings(value, entry) {
   const normalized = normalizeTrackedFindings(value, entry.path);
   const findings = [];
   let reviewedFixtureFindingCount = 0;
-  let reviewedFirstSlot = false;
-  let reviewedSecondSlot = false;
+  let reviewedFirstLine = null;
+  let reviewedSecondLine = null;
   for (let index = 0; index < normalized.length; index += 1) {
     if (isReviewedSyntheticTrackedFinding(normalized[index], entry.bytes)) {
-      if (normalized[index].startLine === REVIEWED_SYNTHETIC_FIXTURE_FIRST_LINE) {
-        if (reviewedFirstSlot) {
-          throw new Error("Reviewed synthetic tracked-finding policy is ambiguous.");
-        }
-        reviewedFirstSlot = true;
+      const line = normalized[index].startLine;
+      if (reviewedFirstLine === null) {
+        reviewedFirstLine = line;
+      } else if (line === reviewedFirstLine || line === reviewedSecondLine) {
+        throw new Error("Reviewed synthetic tracked-finding policy is ambiguous.");
+      } else if (reviewedSecondLine === null) {
+        reviewedSecondLine = line;
       } else {
-        if (reviewedSecondSlot) {
-          throw new Error("Reviewed synthetic tracked-finding policy is ambiguous.");
-        }
-        reviewedSecondSlot = true;
+        throw new Error("Reviewed synthetic tracked-finding policy is ambiguous.");
       }
       reviewedFixtureFindingCount += 1;
     } else {
       findings[findings.length] = normalized[index];
     }
   }
-  if (reviewedFirstSlot !== reviewedSecondSlot || reviewedFixtureFindingCount > 2) {
+  if ((reviewedFirstLine === null) !== (reviewedSecondLine === null)
+    || reviewedFixtureFindingCount > 2) {
     throw new Error("Reviewed synthetic tracked-finding policy is incomplete.");
   }
   return Object.freeze({
@@ -2884,7 +2882,7 @@ function scanHistory(root, options = {}) {
       findings[findings.length] = finding;
       continue;
     }
-    if (finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_FIRST_LINE) {
+    if (finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_HISTORY_FIRST_LINE) {
       if (reviewedFirstSlot) {
         throw new Error("Reviewed synthetic history-finding policy is ambiguous.");
       }

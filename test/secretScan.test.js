@@ -760,7 +760,7 @@ suite("secret exposure gate", () => {
     assert.strictEqual(component.reviewedFixtureFindingCount, 2);
     assert.strictEqual(
       component.reviewedFixturePolicyId,
-      "qh-synthetic-cloudsmith-api-key-v1",
+      "qh-synthetic-cloudsmith-api-key-v2",
     );
 
     assert.throws(() => scanTracked(scratch, {
@@ -773,6 +773,27 @@ suite("secret exposure gate", () => {
       files: Object.freeze([relativePath]),
       scanWithGitleaks() {
         return [safeFinding(1731), safeFinding(1731), safeFinding(3567)];
+      },
+    }), /reviewed synthetic tracked-finding policy is ambiguous/iu);
+
+    fs.writeFileSync(source, `// shifted\n// shifted\n${lines.join("\n")}\n`);
+    const shifted = scanTracked(scratch, {
+      files: Object.freeze([relativePath]),
+      scanWithGitleaks() {
+        return [safeFinding(1733), safeFinding(3569)];
+      },
+    });
+    assert.deepStrictEqual(shifted.findings, []);
+    assert.strictEqual(shifted.reviewedFixtureFindingCount, 2);
+
+    fs.writeFileSync(
+      source,
+      `// shifted\n// shifted\n${lines.join("\n")}\n${lines[1730]}\n`,
+    );
+    assert.throws(() => scanTracked(scratch, {
+      files: Object.freeze([relativePath]),
+      scanWithGitleaks() {
+        return [safeFinding(1733), safeFinding(3569), safeFinding(3570)];
       },
     }), /reviewed synthetic tracked-finding policy is ambiguous/iu);
   });
@@ -817,7 +838,7 @@ suite("secret exposure gate", () => {
     assert.strictEqual(result.components[0].reviewedFixtureFindingCount, 2);
     assert.strictEqual(
       result.components[0].reviewedFixturePolicyId,
-      "qh-synthetic-cloudsmith-api-key-v1",
+      "qh-synthetic-cloudsmith-api-key-v2",
     );
     assert.strictEqual(result.findings[0].path, "extension.js");
   });
@@ -2007,7 +2028,7 @@ suite("secret exposure gate", () => {
         commit: "a".repeat(40),
       }],
       reviewedFixtureFindingCount: 2,
-      reviewedFixturePolicyId: "qh-synthetic-cloudsmith-api-key-v1",
+      reviewedFixturePolicyId: "qh-synthetic-cloudsmith-api-key-v2",
     }], new Date("2026-08-27T00:00:00.000Z"));
     assert.strictEqual(document.status, "failed");
     assert.strictEqual(document.findingCount, 1);
@@ -2015,7 +2036,7 @@ suite("secret exposure gate", () => {
     assert.strictEqual(document.components[0].reviewedFixtureFindingCount, 2);
     assert.strictEqual(
       document.components[0].reviewedFixturePolicyId,
-      "qh-synthetic-cloudsmith-api-key-v1",
+      "qh-synthetic-cloudsmith-api-key-v2",
     );
     assert.doesNotMatch(JSON.stringify(document), /(?:secretHash|fingerprint|match|entropy|author|email|message)/iu);
   });
