@@ -481,8 +481,12 @@ suite("qualification candidate isolation", () => {
     fs.writeFileSync(path.join(profile.userDataDir, "User", "probe"), "probe");
     const installed = path.join(profile.extensionsDir, "candidate");
     fs.writeFileSync(installed, "installed");
+    const settingsIdentity = fs.lstatSync(profile.userDataDir);
     assert.strictEqual(resetCiQualificationUserData(profile), profile.userDataDir);
     assert.deepStrictEqual(fs.readdirSync(profile.userDataDir), []);
+    const currentSettings = fs.lstatSync(profile.userDataDir);
+    assert.strictEqual(currentSettings.dev, settingsIdentity.dev);
+    assert.strictEqual(currentSettings.ino, settingsIdentity.ino);
     assert.strictEqual(fs.readFileSync(installed, "utf8"), "installed");
     if (process.platform !== "win32") {
       assert.strictEqual(fs.lstatSync(profile.userDataDir).mode & 0o077, 0);
@@ -494,12 +498,40 @@ suite("qualification candidate isolation", () => {
     cleanupCiQualificationProfile(profile);
   });
 
+  test("CI user-data reset never adopts replaced creator-owned siblings", () => {
+    for (const name of ["home", "extensions", PROFILE_MARKER]) {
+      const parent = temporaryRoot(`cloudsmith-ci-reset-${name}-swap-`);
+      const profile = createCiQualificationProfile({ temporaryParent: parent });
+      const target = path.join(profile.root, name);
+      const displaced = path.join(parent, `displaced-${name}`);
+      const settingsIdentity = fs.lstatSync(profile.userDataDir);
+      fs.renameSync(target, displaced);
+      if (name === PROFILE_MARKER) {
+        fs.copyFileSync(displaced, target);
+        if (process.platform !== "win32") fs.chmodSync(target, 0o600);
+      } else {
+        fs.mkdirSync(target, { mode: 0o700 });
+      }
+
+      assert.throws(
+        () => resetCiQualificationUserData(profile),
+        /refuses a changed profile entry/u,
+      );
+      const currentSettings = fs.lstatSync(profile.userDataDir);
+      assert.strictEqual(currentSettings.dev, settingsIdentity.dev);
+      assert.strictEqual(currentSettings.ino, settingsIdentity.ino);
+      assert.strictEqual(fs.existsSync(displaced), true);
+      assert.strictEqual(fs.existsSync(target), true);
+    }
+  });
+
   test("CI probe user-data reset fails closed on final settings substitution", () => {
     const parent = temporaryRoot("cloudsmith-ci-settings-reset-swap-");
     const profile = createCiQualificationProfile({ temporaryParent: parent });
     fs.mkdirSync(path.join(profile.userDataDir, "nested"));
+    const owned = path.join(profile.userDataDir, "nested", "owned.txt");
     fs.writeFileSync(
-      path.join(profile.userDataDir, "nested", "owned.txt"),
+      owned,
       "synthetic owned settings bytes\n",
     );
     const victim = path.join(parent, "synthetic-settings-victim");
@@ -507,23 +539,23 @@ suite("qualification candidate isolation", () => {
     fs.writeFileSync(path.join(victim, "preserve.txt"), "synthetic victim survives\n");
     const displaced = path.join(parent, "owned-settings-displaced");
     const originalRename = fs.renameSync;
-    const originalRmdir = fs.rmdirSync;
+    const originalUnlink = fs.unlinkSync;
     let substituted = false;
     try {
-      fs.rmdirSync = function interceptFinalSettingsRemoval(target, options) {
-        if (!substituted && target === profile.userDataDir) {
-          originalRename.call(fs, target, displaced);
-          originalRename.call(fs, victim, target);
+      fs.unlinkSync = function interceptSettingsChildRemoval(target) {
+        if (!substituted && target === owned) {
+          originalRename.call(fs, profile.userDataDir, displaced);
+          originalRename.call(fs, victim, profile.userDataDir);
           substituted = true;
         }
-        return originalRmdir.call(fs, target, options);
+        return originalUnlink.call(fs, target);
       };
       assert.throws(
         () => resetCiQualificationUserData(profile),
         /unsafe or changed user-data tree/u,
       );
     } finally {
-      fs.rmdirSync = originalRmdir;
+      fs.unlinkSync = originalUnlink;
     }
     assert.strictEqual(substituted, true);
     assert.strictEqual(fs.existsSync(displaced), true);

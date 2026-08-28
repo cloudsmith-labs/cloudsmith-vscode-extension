@@ -243,6 +243,7 @@ function cleanupEntryKind(stat, errorMessage) {
   if (stat.isDirectory()) return "directory";
   if (stat.isSymbolicLink() && stat.nlink >= 1n) return "link";
   if (stat.isFile() && stat.nlink >= 1n) return "file";
+  if (process.platform !== "win32" && stat.isSocket() && stat.nlink === 1n) return "socket";
   return exactCleanupError(errorMessage);
 }
 
@@ -364,6 +365,9 @@ function snapshotCleanupEntry(
   state.entries += 1;
   const stat = fs.lstatSync(target, { bigint: true });
   const kind = cleanupEntryKind(stat, errorMessage);
+  if (kind === "socket" && state.allowSingleLinkUnixSockets !== true) {
+    return exactCleanupError(errorMessage);
+  }
   if (expected && !matchesExpectedCleanupEntry(stat, kind, expected)) {
     return exactCleanupError(errorMessage);
   }
@@ -430,14 +434,7 @@ function assertCleanupEntryAbsent(target, errorMessage) {
   exactCleanupError(errorMessage);
 }
 
-function removeCleanupSnapshot(node, errorMessage) {
-  if (node.kind !== "directory") {
-    assertCleanupEntry(node, errorMessage);
-    fs.unlinkSync(node.target);
-    assertCleanupEntryAbsent(node.target, errorMessage);
-    return;
-  }
-
+function removeCleanupDirectoryChildren(node, errorMessage) {
   const names = node.children.map(child => path.basename(child.target)).sort();
   assertCleanupDirectory(node, names, errorMessage);
   for (const child of node.children) {
@@ -446,37 +443,68 @@ function removeCleanupSnapshot(node, errorMessage) {
     assertCleanupEntry(node, errorMessage);
   }
   assertCleanupDirectory(node, [], errorMessage);
+}
+
+function removeCleanupSnapshot(node, errorMessage) {
+  if (node.kind !== "directory") {
+    assertCleanupEntry(node, errorMessage);
+    fs.unlinkSync(node.target);
+    assertCleanupEntryAbsent(node.target, errorMessage);
+    return;
+  }
+
+  removeCleanupDirectoryChildren(node, errorMessage);
   // This must stay nonrecursive: a replacement after the final identity check
   // can make rmdir fail, but can never redirect cleanup into a nonempty tree.
   fs.rmdirSync(node.target);
   assertCleanupEntryAbsent(node.target, errorMessage);
 }
 
+function snapshotExactOwnedTree(root, options, errorMessage) {
+  if (typeof root !== "string" || !path.isAbsolute(root)
+    || path.normalize(root) !== root || path.resolve(root) !== root
+    || root.includes("\u0000")) {
+    return exactCleanupError(errorMessage);
+  }
+  const expectedEntries = expectedRootCleanupEntries(
+    options.expectedRootEntries,
+    errorMessage,
+  );
+  const expectedRoot = options.expectedRootIdentity
+    ? { kind: "directory", identity: options.expectedRootIdentity }
+    : null;
+  const snapshot = snapshotCleanupEntry(
+    root,
+    0,
+    {
+      allowSingleLinkUnixSockets: options.allowSingleLinkUnixSockets === true,
+      entries: 0,
+    },
+    expectedRoot,
+    expectedEntries,
+    options.allowAdditionalRootEntries === true,
+    errorMessage,
+  );
+  if (!sameFilesystemPath(fs.realpathSync(root), root)) exactCleanupError(errorMessage);
+  return snapshot;
+}
+
+function emptyExactOwnedDirectory(root, options = {}) {
+  const errorMessage = options.errorMessage || "Exact cleanup refused an unsafe or changed tree.";
+  try {
+    const snapshot = snapshotExactOwnedTree(root, options, errorMessage);
+    if (snapshot.kind !== "directory") exactCleanupError(errorMessage);
+    removeCleanupDirectoryChildren(snapshot, errorMessage);
+    return true;
+  } catch {
+    throw new Error(errorMessage);
+  }
+}
+
 function removeExactOwnedDirectoryTree(root, options = {}) {
   const errorMessage = options.errorMessage || "Exact cleanup refused an unsafe or changed tree.";
   try {
-    if (typeof root !== "string" || !path.isAbsolute(root)
-      || path.normalize(root) !== root || path.resolve(root) !== root
-      || root.includes("\u0000")) {
-      return exactCleanupError(errorMessage);
-    }
-    const expectedEntries = expectedRootCleanupEntries(
-      options.expectedRootEntries,
-      errorMessage,
-    );
-    const expectedRoot = options.expectedRootIdentity
-      ? { kind: "directory", identity: options.expectedRootIdentity }
-      : null;
-    const snapshot = snapshotCleanupEntry(
-      root,
-      0,
-      { entries: 0 },
-      expectedRoot,
-      expectedEntries,
-      options.allowAdditionalRootEntries === true,
-      errorMessage,
-    );
-    if (!sameFilesystemPath(fs.realpathSync(root), root)) exactCleanupError(errorMessage);
+    const snapshot = snapshotExactOwnedTree(root, options, errorMessage);
     removeCleanupSnapshot(snapshot, errorMessage);
     return true;
   } catch {
@@ -544,7 +572,7 @@ function assertActiveNonAuthQualityBoundary(boundary, environment = boundary?.en
   return boundary;
 }
 
-function removeCreatedBoundary(root, identity, expectedRootEntries = undefined) {
+function removeCreatedBoundary(root, identity, expectedRootEntries = undefined, options = {}) {
   if (!root || !identity) return Object.freeze({ reoccupied: false });
   privateDirectory(root, "Non-auth quality boundary", identity);
   const quarantine = path.join(
@@ -557,6 +585,7 @@ function removeCreatedBoundary(root, identity, expectedRootEntries = undefined) 
   fs.renameSync(root, quarantine);
   privateDirectory(quarantine, "Quarantined non-auth quality boundary", identity);
   removeExactOwnedDirectoryTree(quarantine, {
+    allowSingleLinkUnixSockets: options.allowSingleLinkUnixSockets === true,
     errorMessage: "Non-auth quality boundary cleanup refused an unsafe or changed tree.",
     expectedRootEntries,
     expectedRootIdentity: identity,
@@ -702,6 +731,7 @@ function cleanupNonAuthQualityEnvironment(boundary) {
     boundary.root,
     identity.rootIdentity,
     nonAuthBoundaryCleanupEntries(identity),
+    { allowSingleLinkUnixSockets: true },
   );
   activeBoundaries.delete(boundary.root);
   if (removal.reoccupied) {
@@ -736,6 +766,7 @@ module.exports = {
   buildNonAuthQualityEnvironment,
   cleanupNonAuthQualityEnvironment,
   createNonAuthQualityEnvironment,
+  emptyExactOwnedDirectory,
   removeExactOwnedDirectoryTree,
   withNonAuthQualityEnvironment,
 };

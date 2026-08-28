@@ -5,7 +5,10 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
-const { removeExactOwnedDirectoryTree } = require("./non-auth-environment");
+const {
+  emptyExactOwnedDirectory,
+  removeExactOwnedDirectoryTree,
+} = require("./non-auth-environment");
 
 const LOCAL_PROFILE_BASENAME = ".cloudsmith-vscode-qualification";
 const CI_PROFILE_PREFIX = "csvq-";
@@ -282,6 +285,44 @@ function ciProfileCleanupEntries(root) {
   ]);
 }
 
+function matchesCiProfileEntry(stat, entry) {
+  if (!entry?.identity || stat.isSymbolicLink()
+    || (entry.kind === "directory" ? !stat.isDirectory() : !stat.isFile())
+    || String(stat.dev) !== String(entry.identity.dev)
+    || String(stat.ino) !== String(entry.identity.ino)) {
+    return false;
+  }
+  if (entry.kind === "directory") return true;
+  return ["mode", "nlink", "size"].every(key => (
+    entry.identity[key] === undefined
+      || String(stat[key]) === String(entry.identity[key])
+  ));
+}
+
+function assertCiProfileResetSiblings(root, identity) {
+  for (const entry of identity.entries) {
+    if (entry.name === "settings") continue;
+    let stat;
+    try {
+      stat = fs.lstatSync(path.join(root, entry.name));
+    } catch {
+      throw new Error("Qualification reset refuses a changed profile entry.");
+    }
+    if (!matchesCiProfileEntry(stat, entry)) {
+      throw new Error("Qualification reset refuses a changed profile entry.");
+    }
+  }
+  let marker;
+  try {
+    marker = readMarker(root);
+  } catch {
+    throw new Error("Qualification reset refuses a changed profile entry.");
+  }
+  if (marker.mode !== "ci" || marker.proof !== identity.proof) {
+    throw new Error("Qualification reset refuses a changed profile entry.");
+  }
+}
+
 function localProfileCleanupEntries(root) {
   return Object.freeze([
     Object.freeze({
@@ -488,7 +529,8 @@ function resetCiQualificationUserData(profile) {
   if (!userDataIdentity || userDataIdentity.kind !== "directory") {
     throw new Error("Qualification reset refuses an unknown user-data directory.");
   }
-  removeExactOwnedDirectoryTree(userDataDir, {
+  assertCiProfileResetSiblings(root, identity);
+  emptyExactOwnedDirectory(userDataDir, {
     allowAdditionalRootEntries: true,
     errorMessage: "Qualification reset refuses an unsafe or changed user-data tree.",
     expectedRootEntries: [],
@@ -499,15 +541,14 @@ function resetCiQualificationUserData(profile) {
     || currentRoot.dev !== identity.device || currentRoot.ino !== identity.inode) {
     throw new Error("Qualification profile root changed during user-data reset.");
   }
-  createPrivateDirectory(userDataDir);
-  const resetStat = fs.lstatSync(userDataDir);
-  if (resetStat.dev !== identity.device) {
-    throw new Error("Reset qualification user-data must remain on the owned filesystem.");
+  const resetStat = assertPrivateRealDirectory(
+    userDataDir,
+    "Reset qualification user-data",
+  );
+  if (!matchesCiProfileEntry(resetStat, userDataIdentity)) {
+    throw new Error("Qualification reset refuses a changed user-data directory.");
   }
-  activeCiProfiles.set(root, Object.freeze({
-    ...identity,
-    entries: ciProfileCleanupEntries(root),
-  }));
+  assertCiProfileResetSiblings(root, identity);
   return userDataDir;
 }
 

@@ -3644,6 +3644,184 @@ suite("Quality gate runner", () => {
     }
   });
 
+  test("non-auth cleanup narrowly admits single-link Unix sockets and still rejects FIFOs", function () {
+    if (process.platform === "win32") this.skip();
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      process.platform === "darwin" ? fs.realpathSync("/tmp") : os.tmpdir(),
+      "qh199-a-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    try {
+    const boundary = createNonAuthQualityEnvironment({
+      environment: { PATH: "/fixture/bin" },
+      temporaryParent: scratch,
+    });
+    const socketRoot = path.join(boundary.paths.temporary, "s");
+    const socket = path.join(socketRoot, "g.sock");
+    fs.mkdirSync(socketRoot, { mode: 0o700 });
+    if (process.platform === "darwin") {
+      assert.ok(Buffer.byteLength(socket, "utf8") <= 103);
+    }
+    const socketProcess = spawnSync(process.execPath, [
+      "-e",
+      "const net=require('net');const server=net.createServer();"
+        + "server.listen(process.argv[1],()=>process.kill(process.pid,'SIGKILL'));",
+      socket,
+    ], { encoding: "utf8", env: {}, timeout: 5_000 });
+    assert.strictEqual(socketProcess.status, null, socketProcess.stderr);
+    assert.strictEqual(socketProcess.signal, "SIGKILL", socketProcess.stderr);
+    const socketStat = fs.lstatSync(socket);
+    assert.strictEqual(socketStat.isSocket(), true);
+    assert.strictEqual(socketStat.nlink, 1);
+      assert.throws(
+        () => removeExactOwnedDirectoryTree(socketRoot, {
+          allowAdditionalRootEntries: true,
+          errorMessage: "Synthetic generic cleanup rejected an unscoped Unix socket.",
+          expectedRootEntries: [],
+          expectedRootIdentity: fs.lstatSync(socketRoot),
+        }),
+        /rejected an unscoped Unix socket/u,
+      );
+      assert.strictEqual(cleanupNonAuthQualityEnvironment(boundary), true);
+      assert.strictEqual(fs.existsSync(boundary.root), false);
+
+      const fifoRoot = path.join(scratch, "f");
+      const fifo = path.join(fifoRoot, "x.fifo");
+      fs.mkdirSync(fifoRoot, { mode: 0o700 });
+      assert.strictEqual(spawnSync("mkfifo", [fifo], { encoding: "utf8" }).status, 0);
+      assert.throws(
+        () => removeExactOwnedDirectoryTree(fifoRoot, {
+          allowAdditionalRootEntries: true,
+          allowSingleLinkUnixSockets: true,
+          errorMessage: "Synthetic socket-enabled cleanup rejected an unsafe entry type.",
+          expectedRootEntries: [],
+          expectedRootIdentity: fs.lstatSync(fifoRoot),
+        }),
+        /rejected an unsafe entry type/u,
+      );
+      assert.strictEqual(fs.lstatSync(fifo).isFIFO(), true);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("socket-enabled cleanup rejects an identity replacement before unlink", function () {
+    if (process.platform === "win32") this.skip();
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      process.platform === "darwin" ? fs.realpathSync("/tmp") : os.tmpdir(),
+      "qh199-b-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    try {
+    const root = path.join(scratch, "r");
+    const socket = path.join(root, "a.sock");
+    const replacement = path.join(scratch, "b.sock");
+    const displaced = path.join(scratch, "c.sock");
+    fs.mkdirSync(root, { mode: 0o700 });
+    for (const target of [socket, replacement]) {
+      if (process.platform === "darwin") {
+        assert.ok(Buffer.byteLength(target, "utf8") <= 103);
+      }
+      const socketProcess = spawnSync(process.execPath, [
+        "-e",
+        "const net=require('net');const server=net.createServer();"
+          + "server.listen(process.argv[1],()=>process.kill(process.pid,'SIGKILL'));",
+        target,
+      ], { encoding: "utf8", env: {}, timeout: 5_000 });
+      assert.strictEqual(socketProcess.status, null, socketProcess.stderr);
+      assert.strictEqual(socketProcess.signal, "SIGKILL", socketProcess.stderr);
+    }
+    const originalLstat = fs.lstatSync;
+    let socketObservations = 0;
+    let substituted = false;
+    try {
+      fs.lstatSync = function replaceSocketBeforeFinalIdentityCheck(target, options) {
+        if (target === socket && ++socketObservations === 2) {
+          fs.renameSync(socket, displaced);
+          fs.renameSync(replacement, socket);
+          substituted = true;
+        }
+        return originalLstat.call(fs, target, options);
+      };
+      assert.throws(
+        () => removeExactOwnedDirectoryTree(root, {
+          allowAdditionalRootEntries: true,
+          allowSingleLinkUnixSockets: true,
+          errorMessage: "Synthetic exact cleanup rejected socket identity drift.",
+          expectedRootEntries: [],
+          expectedRootIdentity: originalLstat.call(fs, root),
+        }),
+        /rejected socket identity drift/u,
+      );
+    } finally {
+      fs.lstatSync = originalLstat;
+    }
+      assert.strictEqual(substituted, true);
+      assert.strictEqual(fs.lstatSync(socket).isSocket(), true);
+      assert.strictEqual(fs.lstatSync(displaced).isSocket(), true);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("socket unlink substitution cannot follow a link outside the owned tree", function () {
+    if (process.platform === "win32") this.skip();
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      process.platform === "darwin" ? fs.realpathSync("/tmp") : os.tmpdir(),
+      "qh199-c-",
+    )));
+    if (process.platform !== "win32") fs.chmodSync(scratch, 0o700);
+    try {
+    const root = path.join(scratch, "r");
+    const socket = path.join(root, "a.sock");
+    const displaced = path.join(scratch, "b.sock");
+    const outside = path.join(scratch, "o.txt");
+    fs.mkdirSync(root, { mode: 0o700 });
+    fs.writeFileSync(outside, "synthetic outside bytes survive\n");
+    if (process.platform === "darwin") {
+      assert.ok(Buffer.byteLength(socket, "utf8") <= 103);
+    }
+    const socketProcess = spawnSync(process.execPath, [
+      "-e",
+      "const net=require('net');const server=net.createServer();"
+        + "server.listen(process.argv[1],()=>process.kill(process.pid,'SIGKILL'));",
+      socket,
+    ], { encoding: "utf8", env: {}, timeout: 5_000 });
+    assert.strictEqual(socketProcess.status, null, socketProcess.stderr);
+    assert.strictEqual(socketProcess.signal, "SIGKILL", socketProcess.stderr);
+    const originalUnlink = fs.unlinkSync;
+    let substituted = false;
+    try {
+      fs.unlinkSync = function replaceSocketAtUnlink(target) {
+        if (!substituted && target === socket) {
+          fs.renameSync(socket, displaced);
+          fs.symlinkSync(outside, socket);
+          substituted = true;
+        }
+        return originalUnlink.call(fs, target);
+      };
+      assert.strictEqual(removeExactOwnedDirectoryTree(root, {
+        allowAdditionalRootEntries: true,
+        allowSingleLinkUnixSockets: true,
+        errorMessage: "Synthetic socket cleanup refused its exact tree.",
+        expectedRootEntries: [],
+        expectedRootIdentity: fs.lstatSync(root),
+      }), true);
+    } finally {
+      fs.unlinkSync = originalUnlink;
+    }
+      assert.strictEqual(substituted, true);
+      assert.strictEqual(fs.existsSync(root), false);
+      assert.strictEqual(
+        fs.readFileSync(outside, "utf8"),
+        "synthetic outside bytes survive\n",
+      );
+      assert.strictEqual(fs.lstatSync(displaced).isSocket(), true);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   test("binds exact report JSON and Markdown bytes for handoff verification", () => {
     const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-report-bundle-"));
     const plan = getGatePlan("full");

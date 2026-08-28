@@ -10,6 +10,9 @@ const {
   NON_AUTH_AMBIENT_CAPABILITY_NAMES,
 } = require("../scripts/quality/non-auth-environment");
 const {
+  resetCiQualificationUserData,
+} = require("../scripts/quality/qualification-profile");
+const {
   DECLARED_TESTS,
   PROBE_TEST,
   SUITE_TESTS,
@@ -81,7 +84,10 @@ suite("signed-out black-box UI runner contract", function () {
     });
     assert.strictEqual(harness.cleanupCalls(), 1);
     assert.strictEqual(fs.existsSync(harness.profileRoot), false);
-    assert.deepStrictEqual(harness.phases(), ["driver", "probe", "reset", "suite"]);
+    assert.deepStrictEqual(
+      harness.phases(),
+      ["driver", "reset", "probe", "reset", "suite"],
+    );
     const candidateEnvironment = harness.candidateEnvironment();
     const nonAuthBoundaryRoot = path.dirname(candidateEnvironment.HOME);
     assert.strictEqual(fs.existsSync(nonAuthBoundaryRoot), false);
@@ -152,7 +158,16 @@ suite("signed-out black-box UI runner contract", function () {
   test("rejects a probe that unexpectedly passes and never starts the real suite", async () => {
     const harness = createHarness(repositories, { probeStatus: 0 });
     await assertSafeRejection(harness.run, "UI_PROBE_INVALID");
-    assert.deepStrictEqual(harness.phases(), ["driver", "probe"]);
+    assert.deepStrictEqual(harness.phases(), ["driver", "reset", "probe"]);
+    assert.strictEqual(harness.cleanupCalls(), 1);
+    assert.strictEqual(fs.existsSync(harness.resultPath), false);
+    assert.strictEqual(fs.existsSync(harness.nonAuthBoundaryRoot()), false);
+  });
+
+  test("fails closed before probe launch when the preflight profile reset is rejected", async () => {
+    const harness = createHarness(repositories, { resetFailureCall: 1 });
+    await assertSafeRejection(harness.run, "UI_PROFILE_RESET_FAILED");
+    assert.deepStrictEqual(harness.phases(), ["driver", "reset"]);
     assert.strictEqual(harness.cleanupCalls(), 1);
     assert.strictEqual(fs.existsSync(harness.resultPath), false);
     assert.strictEqual(fs.existsSync(harness.nonAuthBoundaryRoot()), false);
@@ -182,7 +197,11 @@ suite("signed-out black-box UI runner contract", function () {
     const result = await harness.run();
 
     assert.strictEqual(result.status, "passed");
-    assert.deepStrictEqual(harness.phases(), ["driver", "probe", "suite"]);
+    assert.deepStrictEqual(
+      harness.phases(),
+      ["driver", "reset", "probe", "reset", "suite"],
+    );
+    assert.strictEqual(harness.settingsReplacements(), 0);
     assert.ok(harness.boundaryRoot());
     assert.strictEqual(fs.existsSync(harness.boundaryRoot()), false);
     for (const target of harness.nestedTemporaryPaths()) {
@@ -216,7 +235,7 @@ suite("signed-out black-box UI runner contract", function () {
   test("rejects forged probe semantics even when the process exits one", async () => {
     const harness = createHarness(repositories, { probeErrorKind: "unexpected-test-failure" });
     await assertSafeRejection(harness.run, "UI_PROBE_INVALID");
-    assert.deepStrictEqual(harness.phases(), ["driver", "probe"]);
+    assert.deepStrictEqual(harness.phases(), ["driver", "reset", "probe"]);
     assert.strictEqual(harness.cleanupCalls(), 1);
     assert.strictEqual(fs.existsSync(harness.resultPath), false);
   });
@@ -238,7 +257,10 @@ suite("signed-out black-box UI runner contract", function () {
     ]) {
       const harness = createHarness(repositories, { suiteRecords });
       await assertSafeRejection(harness.run, "UI_SUITE_INVALID");
-      assert.deepStrictEqual(harness.phases(), ["driver", "probe", "reset", "suite"]);
+      assert.deepStrictEqual(
+        harness.phases(),
+        ["driver", "reset", "probe", "reset", "suite"],
+      );
       assert.strictEqual(harness.cleanupCalls(), 1);
       assert.strictEqual(fs.existsSync(harness.resultPath), false);
     }
@@ -380,6 +402,7 @@ function createHarness(repositories, options = {}) {
   };
   const receipt = { ...receiptBase, fingerprint: fingerprint(receiptBase) };
   let cleanupCalls = 0;
+  let resetCalls = 0;
   let candidateEnvironment = null;
   const candidate = {
     receipt,
@@ -490,6 +513,10 @@ function createHarness(repositories, options = {}) {
       },
       resetCiQualificationUserData: value => {
         phases.push("reset");
+        resetCalls += 1;
+        if (options.resetFailureCall === resetCalls) {
+          throw new Error("synthetic exact reset rejection");
+        }
         assert.strictEqual(value, profile);
         fs.rmSync(value.userDataDir, { recursive: true, force: true });
         fs.mkdirSync(value.userDataDir, { mode: 0o700 });
@@ -533,6 +560,7 @@ function createRealNestedCandidateHarness(repositories) {
   let observedEmptyEveryTime = true;
   const candidateEnvironments = [];
   const phases = [];
+  let settingsReplacements = 0;
   let randomIndex = 0;
 
   function observeCandidateEnvironment(environment) {
@@ -616,6 +644,7 @@ function createRealNestedCandidateHarness(repositories) {
       `${path.join(activeBoundaryRoot, "tmp")}${path.sep}`
     ), true);
     assert.deepStrictEqual(fs.readFileSync(installArtifact), artifactBytes);
+    fs.mkdirSync(path.join(profileRoot, "settings", "User"), { recursive: true });
     return processResultWithOutput(0, "installed\n");
   };
 
@@ -630,6 +659,14 @@ function createRealNestedCandidateHarness(repositories) {
     }
     const phase = spawnOptions.env.CLOUDSMITH_UI_EVIDENCE_PHASE;
     phases.push(phase);
+    const settings = path.join(profileRoot, "settings");
+    const userSettings = path.join(settings, "User");
+    if (fs.existsSync(userSettings)) {
+      fs.rmSync(settings, { recursive: true, force: true });
+      fs.mkdirSync(settings, { mode: 0o755 });
+      settingsReplacements += 1;
+    }
+    fs.mkdirSync(path.join(userSettings, "globalStorage"), { recursive: true });
     if (phase === "probe") {
       fs.writeFileSync(path.join(profileRoot, "settings", "probe-state"), "reset me\n");
       writeEvidence(spawnOptions.env, [{
@@ -654,6 +691,7 @@ function createRealNestedCandidateHarness(repositories) {
     candidateEnvironments: () => candidateEnvironments.map(value => ({ ...value })),
     nestedTemporaryPaths: () => [profileRoot, packageScratch, installScratch],
     phases: () => [...phases],
+    settingsReplacements: () => settingsReplacements,
     toolConfigObservations: () => ({ ...configPaths, observedEmptyEveryTime }),
     run: () => runUiSmoke({
       root: repositoryRoot,
@@ -678,6 +716,10 @@ function createRealNestedCandidateHarness(repositories) {
       nodeVersion: "22.23.2",
       extestCli: path.join(repositoryRoot, "fixture-extest.js"),
       spawnSync: uiSpawn,
+      resetCiQualificationUserData: profile => {
+        phases.push("reset");
+        return resetCiQualificationUserData(profile);
+      },
       sourceIdentity: () => SOURCE,
       randomBytes: size => Buffer.alloc(size, ++randomIndex),
       prepareCode: ({ profile, environment }) => {

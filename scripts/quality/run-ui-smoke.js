@@ -65,7 +65,7 @@ const SAFE_FAILURE_MESSAGES = Object.freeze({
   UI_DRIVER_INVALID: "The black-box UI driver setup failed closed before launch.",
   UI_INVENTORY_INVALID: "The black-box UI declared inventory is invalid.",
   UI_PROFILE_CLEANUP_FAILED: "The black-box UI profile cleanup failed closed.",
-  UI_PROFILE_RESET_FAILED: "The black-box UI profile reset failed closed between phases.",
+  UI_PROFILE_RESET_FAILED: "The black-box UI profile reset failed closed before or between phases.",
   UI_PROBE_INVALID: "The black-box UI false-green probe did not fail in the exact expected way.",
   UI_SMOKE_FAILED: "The black-box UI smoke did not produce authoritative passed evidence.",
   UI_SOURCE_DRIFT: "The black-box UI source changed during qualification.",
@@ -153,6 +153,14 @@ async function runUiSmoke(options = {}) {
       extestCli,
       timeout: options.driverTimeout || 300_000,
     });
+
+    // The VS Code CLI install can create settings/User. ExTester removes and
+    // recreates the complete settings directory when that child exists, which
+    // would invalidate the creator-bound directory identity. Reset the exact
+    // owned tree first so ExTester only creates descendants inside that root.
+    safeStageCode = "UI_PROFILE_RESET_FAILED";
+    await resetUserData(candidate.profile);
+    assertRealDirectoryInside(candidate.profile.userDataDir, candidate.profile.root);
 
     safeStageCode = "UI_PROBE_INVALID";
     const probe = runTestPhase({
