@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawnSync } = require("child_process");
+const { spawn: spawnProcess, spawnSync } = require("child_process");
 const { TextDecoder } = require("util");
 const {
   ROOT,
@@ -158,6 +158,33 @@ function qualificationEnvironment(environment, profile, nonAuthBoundary = null) 
     XDG_STATE_HOME: path.join(profile.homeDir, ".local", "state"),
     APPDATA: path.join(profile.homeDir, "AppData", "Roaming"),
     LOCALAPPDATA: path.join(profile.homeDir, "AppData", "Local"),
+  });
+}
+
+function qualificationLaunchEnvironment(environment, profile, hostHomeDirectory) {
+  if (!environment || typeof environment !== "object" || Array.isArray(environment)) {
+    throw new Error("Qualification launch environment must be an object.");
+  }
+  if (profile?.mode !== "local") return environment;
+  if (typeof hostHomeDirectory !== "string"
+    || !path.isAbsolute(hostHomeDirectory)
+    || path.resolve(hostHomeDirectory) !== hostHomeDirectory
+    || path.normalize(hostHomeDirectory) !== hostHomeDirectory) {
+    throw new Error("Local qualification host home must be an absolute normalized path.");
+  }
+  const hostHome = fs.realpathSync(hostHomeDirectory);
+  const stat = fs.lstatSync(hostHome);
+  if (hostHome !== hostHomeDirectory || stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error("Local qualification host home must be an exact real directory.");
+  }
+  const profileRoot = fs.realpathSync(profile.root);
+  if (hostHome === profileRoot || hostHome.startsWith(`${profileRoot}${path.sep}`)) {
+    throw new Error("Local qualification host home must remain outside the synthetic profile.");
+  }
+  return Object.freeze({
+    ...environment,
+    HOME: hostHome,
+    USERPROFILE: hostHome,
   });
 }
 
@@ -734,6 +761,69 @@ function qualificationLaunchArguments(candidateOrProfile, options = {}) {
   return Object.freeze(arguments_);
 }
 
+function waitForColdQualificationLaunch(child, stabilizationMs = 2000) {
+  if (!child || typeof child.once !== "function" || typeof child.removeListener !== "function"
+    || typeof child.unref !== "function"
+    || !Number.isSafeInteger(stabilizationMs) || stabilizationMs < 0 || stabilizationMs > 10000) {
+    return Promise.reject(new Error("Qualification cold launch returned an invalid process."));
+  }
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.reject(new Error(
+      "Qualification cold launch exited before owning the dedicated profile. Close the existing qualification instance and retry."
+    ));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    const finish = error => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      child.removeListener("error", onError);
+      child.removeListener("exit", onExit);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onError = () => finish(new Error("Qualification cold launch could not start."));
+    const onExit = () => finish(new Error(
+      "Qualification cold launch exited before owning the dedicated profile. Close the existing qualification instance and retry."
+    ));
+    child.once("error", onError);
+    child.once("exit", onExit);
+    timer = setTimeout(() => {
+      if (child.exitCode !== null || child.signalCode !== null) onExit();
+      else finish(null);
+    }, stabilizationMs);
+  });
+}
+
+async function launchPreparedQualificationCandidate(options) {
+  const launchEnvironment = qualificationLaunchEnvironment(
+    options.environment,
+    options.profile,
+    options.hostHomeDirectory,
+  );
+  let child;
+  try {
+    child = options.spawn(
+      options.code.executable,
+      qualificationLaunchArguments(options.profile, { workspacePath: options.workspacePath }),
+      {
+        cwd: options.root,
+        env: launchEnvironment,
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
+  } catch {
+    throw new Error("Qualification cold launch could not start.");
+  }
+  await options.waitForColdLaunch(child, options.launchStabilizationMs);
+  child.unref();
+  return "command-accepted";
+}
+
 async function prepareCodePaths(options) {
   if (options.vscodeExecutable) {
     return Object.freeze({
@@ -791,6 +881,9 @@ async function prepareQualificationCandidate(options = {}) {
   const root = options.root || ROOT;
   const adapters = options.adapters || {};
   const spawn = adapters.spawnSync || spawnSync;
+  const spawnDetached = adapters.spawn || spawnProcess;
+  const userInfo = adapters.userInfo || os.userInfo;
+  const waitForColdLaunch = adapters.waitForColdLaunch || waitForColdQualificationLaunch;
   const identifySource = adapters.sourceIdentity || sourceIdentity;
   const verifyArtifact = adapters.verifyVsix || verifyVsix;
   const verifySidecars = adapters.validateSidecars || validateSidecars;
@@ -968,17 +1061,6 @@ async function prepareQualificationCandidate(options = {}) {
     } finally {
       privateArtifact.cleanup();
     }
-    let launchStatus = "not-requested";
-    if (options.launch) {
-      runChecked(
-        spawn,
-        code.cli,
-        qualificationLaunchArguments(profile, { workspacePath: options.workspacePath }),
-        { cwd: root, env: environment },
-        "Qualification candidate launch",
-      );
-      launchStatus = "command-accepted";
-    }
     const finalVerification = await verifyQualificationArtifact(packageOutput.absoluteVsixPath, {
       sourceSha: provenance.sourceClean ? sourceBefore.sha : null,
     }, verifyArtifact);
@@ -1003,6 +1085,33 @@ async function prepareQualificationCandidate(options = {}) {
     );
     if (nonAuthBoundary) {
       assertActiveNonAuthQualityBoundary(nonAuthBoundary, suppliedEnvironment);
+    }
+
+    let launchStatus = "not-requested";
+    if (options.launch) {
+      let hostHomeDirectory;
+      if (profile.mode === "local") {
+        const account = userInfo();
+        const hostHomeDescriptor = account && typeof account === "object"
+          ? Object.getOwnPropertyDescriptor(account, "homedir")
+          : null;
+        if (!hostHomeDescriptor || !("value" in hostHomeDescriptor)
+          || typeof hostHomeDescriptor.value !== "string") {
+          throw new Error("Could not resolve the exact OS account home for qualification launch.");
+        }
+        hostHomeDirectory = hostHomeDescriptor.value;
+      }
+      launchStatus = await launchPreparedQualificationCandidate({
+        root,
+        spawn: spawnDetached,
+        environment,
+        profile,
+        code,
+        workspacePath: options.workspacePath,
+        hostHomeDirectory,
+        waitForColdLaunch,
+        launchStabilizationMs: adapters.launchStabilizationMs,
+      });
     }
 
     const receiptBase = {

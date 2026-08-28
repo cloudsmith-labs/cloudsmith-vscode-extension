@@ -44,6 +44,16 @@ both required. Passing one never implies that the other ran.
       SecretStorage/Keychain value.
 - [ ] Production extension used its normal authentication and SecretStorage
       path; no production test bypass was added.
+- [ ] The local interactive launch preserved the real OS account home identity
+      for the OS-backed keyring while user-data, extensions, XDG, and
+      application-data remained qualification-owned; no insecure basic
+      password-store fallback was enabled.
+- [ ] The canonical launcher started the exact app executable as a cold process
+      and rejected forwarded reuse of an existing qualification process; the
+      explicit CLI credential-import action was not used.
+- [ ] The connected state survived the required reload protocol; a
+      same-process SecretStorage reread was not treated as persistence proof,
+      and a full cold restart restored the connected state.
 - [ ] `npm run quality:secrets` passed for Git-visible current content.
 - [ ] `npm run quality:secrets:artifacts` passed for generated evidence and
       raw/expanded VSIX contents.

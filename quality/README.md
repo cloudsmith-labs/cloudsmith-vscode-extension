@@ -119,6 +119,21 @@ the current process did not create. Use `npm run quality:qualification:reset`
 only to remove the validated dedicated local profile when an intentional clean
 reauthentication is needed.
 
+Preparation, packaging, installation, and signed-out/CI execution keep their
+private synthetic home. The interactive local launch starts the exact app
+executable as a cold process and restores only the canonical OS account
+`HOME`/`USERPROFILE` identity so VS Code can use its normal OS-backed
+SecretStorage keyring; explicit user-data, extension, XDG, `APPDATA`, and
+`LOCALAPPDATA` paths remain qualification-owned. A launch that exits during its
+bounded ownership probe fails closed instead of forwarding to an already
+running qualification process. The harness never selects the insecure `basic`
+password store and never reads the keyring or qualification-profile contents.
+Do not invoke the product's explicit Cloudsmith CLI credential-import action in
+this profile because restoring the account home also restores its normal CLI
+lookup locations. A same-process SecretStorage write/read is intermediate
+evidence; the authenticated lane must still prove persistence through window
+reload and a full cold restart.
+
 `quality:qualification:prepare` owns the complete candidate lifecycle:
 
 1. invalidate stale candidate evidence;

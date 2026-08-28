@@ -1,6 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const assert = require("assert");
 const crypto = require("crypto");
+const { EventEmitter } = require("events");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -652,6 +653,188 @@ suite("qualification candidate isolation", () => {
     assert.strictEqual(arguments_.some(value => value.includes("extensionDevelopmentPath")), false);
   });
 
+  test("actual local preparation cold-launches with host identity only at the final boundary", async () => {
+    const root = temporaryRoot();
+    writeCandidateRepository(root);
+    const profileOwnerHome = temporaryRoot("cloudsmith-profile-owner-");
+    const hostHome = temporaryRoot("cloudsmith-os-account-home-");
+    const profileRoot = path.join(profileOwnerHome, LOCAL_PROFILE_BASENAME);
+    const syntheticHome = path.join(profileRoot, "home");
+    const executable = makeExecutable(path.join(
+      root, "Visual Studio Code.app", "Contents", "MacOS", "Code"
+    ));
+    const cli = makeExecutable(path.join(
+      root, "Visual Studio Code.app", "Contents", "Resources", "app", "bin", "code"
+    ));
+    const artifactRelative = "out/development/cloudsmith-vsc-2.3.0.vsix";
+    const artifact = path.join(root, artifactRelative);
+    const verifiedBytes = Buffer.from("verified-local-vsix");
+    const verifiedSha = crypto.createHash("sha256").update(verifiedBytes).digest("hex");
+    const source = { sha: "a".repeat(40), fingerprint: "b".repeat(64) };
+    let polishPassed = false;
+    let artifactVerificationCount = 0;
+    const prelaunchEnvironments = [];
+    const spawnSyncFixture = (command, arguments_, options) => {
+      prelaunchEnvironments.push(options.env);
+      assert.strictEqual(options.env.HOME, syntheticHome);
+      assert.strictEqual(options.env.USERPROFILE, syntheticHome);
+      assert.strictEqual(options.env.CLOUDSMITH_API_KEY, undefined);
+      if (command === "git") {
+        if (arguments_[0] === "branch") {
+          return {
+            status: 0,
+            signal: null,
+            stdout: "test/release-quality-harness\n",
+            stderr: "",
+          };
+        }
+        if (arguments_[0] === "status") {
+          return { status: 0, signal: null, stdout: " M bounded-fixture.js\n", stderr: "" };
+        }
+        return { status: 0, signal: null, stdout: "", stderr: "" };
+      }
+      if (new Set(["npm", "npm.cmd"]).has(path.basename(command))) {
+        if (JSON.stringify(arguments_) === JSON.stringify(["run", "verify:polish"])) {
+          polishPassed = true;
+          return { status: 0, signal: null, stdout: "polish passed\n", stderr: "" };
+        }
+        assert.strictEqual(polishPassed, true);
+        fs.mkdirSync(path.dirname(artifact), { recursive: true });
+        fs.writeFileSync(artifact, verifiedBytes);
+        fs.writeFileSync(`${artifact}.sha256`, "verified-sidecar");
+        fs.writeFileSync(`${artifact}.provenance.json`, JSON.stringify({
+          sourceClean: false,
+          sourceSha: source.sha,
+        }));
+        fs.appendFileSync(
+          arguments_[4],
+          `vsix_path=${artifactRelative}\nchecksum_path=${artifactRelative}.sha256\n`
+            + `provenance_path=${artifactRelative}.provenance.json\n`,
+        );
+        return { status: 0, signal: null, stdout: "packaged\n", stderr: "" };
+      }
+      assert.strictEqual(command, cli);
+      if (arguments_.includes("--version")) {
+        return { status: 0, signal: null, stdout: "1.134.0\nfixture\narm64\n", stderr: "" };
+      }
+      if (arguments_.includes("--list-extensions")) {
+        return {
+          status: 0,
+          signal: null,
+          stdout: "cloudsmith.cloudsmith-vsc@2.3.0\n",
+          stderr: "",
+        };
+      }
+      assert.ok(arguments_.includes("--force"));
+      assert.ok(arguments_.includes("--install-extension"));
+      return { status: 0, signal: null, stdout: "installed\n", stderr: "" };
+    };
+    const launchedChild = new EventEmitter();
+    launchedChild.exitCode = null;
+    launchedChild.signalCode = null;
+    launchedChild.unrefCalled = false;
+    launchedChild.unref = () => { launchedChild.unrefCalled = true; };
+    const forwardedChild = new EventEmitter();
+    forwardedChild.exitCode = null;
+    forwardedChild.signalCode = null;
+    forwardedChild.unrefCalled = false;
+    forwardedChild.unref = () => { forwardedChild.unrefCalled = true; };
+    let launchCall = null;
+    let launchAttempts = 0;
+    const candidateOptions = {
+      root,
+      mode: "local",
+      launch: true,
+      homeDirectory: profileOwnerHome,
+      vscodeExecutable: executable,
+      vscodeCli: cli,
+      platform: "darwin",
+      environment: {
+        PATH: process.env.PATH || "",
+        HOME: "/ambient/home/must-not-own-keyring",
+        CLOUDSMITH_API_KEY: "must-not-pass",
+      },
+      adapters: {
+        spawnSync: spawnSyncFixture,
+        spawn(command, arguments_, options) {
+          assert.strictEqual(artifactVerificationCount, (launchAttempts + 1) * 2);
+          launchCall = { command, arguments_, options, environment: options.env };
+          launchAttempts += 1;
+          if (launchAttempts === 1) {
+            queueMicrotask(() => {
+              forwardedChild.exitCode = 0;
+              forwardedChild.emit("exit", 0, null);
+            });
+            return forwardedChild;
+          }
+          return launchedChild;
+        },
+        userInfo: () => ({ homedir: hostHome }),
+        launchStabilizationMs: 0,
+        sourceIdentity: () => source,
+        now: () => new Date("2026-08-28T00:00:00.000Z"),
+        verifyVsix: async file => {
+          artifactVerificationCount += 1;
+          return {
+            buffer: verifiedBytes,
+            sha256: verifiedSha,
+            archiveBytes: verifiedBytes.length,
+            artifactIdentity: exactFileIdentity(fs.lstatSync(file, { bigint: true })),
+            entryCount: 7,
+            manifest: { name: "cloudsmith-vsc", publisher: "Cloudsmith", version: "2.3.0" },
+          };
+        },
+        validateSidecars: (file, verification) => ({
+          artifactIdentity: verification.artifactIdentity,
+          checksumIdentity: exactFileIdentity(fs.lstatSync(`${file}.sha256`, { bigint: true })),
+          provenance: {},
+          provenanceIdentity: exactFileIdentity(
+            fs.lstatSync(`${file}.provenance.json`, { bigint: true }),
+          ),
+        }),
+      },
+    };
+
+    await assert.rejects(
+      prepareQualificationCandidate(candidateOptions),
+      /cold launch exited before owning the dedicated profile/,
+    );
+    assert.strictEqual(forwardedChild.unrefCalled, false);
+    assert.strictEqual(fs.existsSync(path.join(
+      root, ".quality", "qualification", "candidate.json"
+    )), false);
+
+    const result = await prepareQualificationCandidate(candidateOptions);
+
+    assert.ok(prelaunchEnvironments.length > 0);
+    assert.strictEqual(launchCall.command, executable);
+    assert.strictEqual(launchCall.environment.HOME, hostHome);
+    assert.strictEqual(launchCall.environment.USERPROFILE, hostHome);
+    assert.strictEqual(launchCall.environment.CLOUDSMITH_API_KEY, undefined);
+    assert.strictEqual(launchCall.options.cwd, root);
+    assert.strictEqual(launchCall.options.detached, true);
+    assert.strictEqual(launchCall.options.stdio, "ignore");
+    assert.strictEqual(launchCall.options.windowsHide, true);
+    for (const [name, expected] of Object.entries({
+      XDG_CONFIG_HOME: path.join(syntheticHome, ".config"),
+      XDG_CACHE_HOME: path.join(syntheticHome, ".cache"),
+      XDG_DATA_HOME: path.join(syntheticHome, ".local", "share"),
+      XDG_STATE_HOME: path.join(syntheticHome, ".local", "state"),
+      APPDATA: path.join(syntheticHome, "AppData", "Roaming"),
+      LOCALAPPDATA: path.join(syntheticHome, "AppData", "Local"),
+    })) {
+      assert.strictEqual(launchCall.environment[name], expected);
+    }
+    assert.deepStrictEqual(launchCall.arguments_, [...qualificationLaunchArguments(result.profile)]);
+    assert.strictEqual(launchCall.arguments_.some(value => value.includes("password-store")), false);
+    assert.strictEqual(launchedChild.unrefCalled, true);
+    assert.strictEqual(launchAttempts, 2);
+    assert.deepStrictEqual(result.receipt.launch, {
+      status: "command-accepted",
+      developmentPath: false,
+    });
+  });
+
   test("candidate source handoff rejects commit and working-tree drift", () => {
     const initial = { sha: "a".repeat(40), fingerprint: "b".repeat(64) };
     assert.strictEqual(assertStableSource(initial, { ...initial }), initial);
@@ -1091,6 +1274,11 @@ suite("qualification candidate isolation", () => {
     const verifiedBytes = Buffer.from("verified-vsix");
     const verifiedSha = crypto.createHash("sha256").update(verifiedBytes).digest("hex");
     let polishPassed = false;
+    const ciLaunchedChild = new EventEmitter();
+    ciLaunchedChild.exitCode = null;
+    ciLaunchedChild.signalCode = null;
+    ciLaunchedChild.unref = () => {};
+    let ciLaunchCall = null;
     const spawn = (command, arguments_, options) => {
       assert.strictEqual(options.env?.CLOUDSMITH_API_KEY, undefined);
       if (command === "git") {
@@ -1142,6 +1330,7 @@ suite("qualification candidate isolation", () => {
     const result = await prepareQualificationCandidate({
       root,
       mode: "ci",
+      launch: true,
       temporaryParent,
       platform: "darwin",
       prepareCode({ profile, vscodeVersion, environment }) {
@@ -1155,6 +1344,12 @@ suite("qualification candidate isolation", () => {
       environment: { PATH: process.env.PATH || "", CLOUDSMITH_API_KEY: "must-not-pass" },
       adapters: {
         spawnSync: spawn,
+        spawn(command, arguments_, options) {
+          ciLaunchCall = { command, arguments_, environment: options.env };
+          return ciLaunchedChild;
+        },
+        userInfo: () => { throw new Error("CI launch must not query OS account identity"); },
+        launchStabilizationMs: 0,
         sourceIdentity: () => {
           assert.strictEqual(polishPassed, true, "polish must pass before source capture");
           return source;
@@ -1200,7 +1395,10 @@ suite("qualification candidate isolation", () => {
     assert.strictEqual(persisted.artifact.sourceFingerprint, source.fingerprint);
     assert.strictEqual(persisted.extension.id, "Cloudsmith.cloudsmith-vsc");
     assert.strictEqual(persisted.installation.version, "2.3.0");
-    assert.deepStrictEqual(persisted.launch, { status: "not-requested", developmentPath: false });
+    assert.deepStrictEqual(persisted.launch, {
+      status: "command-accepted",
+      developmentPath: false,
+    });
     assert.strictEqual(persisted.profile.mode, "ci");
     assert.strictEqual(persisted.profile.persistent, false);
     assert.strictEqual(persisted.profile.testResourcesDir, persisted.profile.root);
@@ -1212,6 +1410,17 @@ suite("qualification candidate isolation", () => {
     assert.strictEqual(result.profile.executable, executable);
     assert.strictEqual(result.profile.cli, cli);
     assert.strictEqual(result.profile.vscodeVersion, "1.131.0");
+    assert.strictEqual(ciLaunchCall.command, executable);
+    assert.strictEqual(ciLaunchCall.environment.HOME, path.join(result.profile.root, "home"));
+    assert.strictEqual(
+      ciLaunchCall.environment.USERPROFILE,
+      path.join(result.profile.root, "home"),
+    );
+    assert.deepStrictEqual(ciLaunchCall.arguments_, [
+      "--user-data-dir", result.profile.userDataDir,
+      "--extensions-dir", result.profile.extensionsDir,
+      "--disable-updates", "--skip-welcome", "--skip-release-notes", "--new-window",
+    ]);
     assert.strictEqual(result.cleanup(), true);
     assert.strictEqual(fs.existsSync(result.profile.root), false);
   });
