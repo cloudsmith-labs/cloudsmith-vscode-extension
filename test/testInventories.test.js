@@ -297,7 +297,10 @@ suite("test runner inventories", () => {
   test("qualification host roots preserve the macOS IPC socket length budget", () => {
     const runRoot = createIsolatedQualificationRoot("smoke", os.tmpdir());
     try {
-      assert.ok(path.join(runRoot, "user-data", "1.13-main.sock").length <= 103);
+      assert.ok(Buffer.byteLength(
+        path.join(runRoot, "user-data", "1.13-main.sock"),
+        "utf8"
+      ) <= 103);
     } finally {
       removeIsolatedQualificationRoot(runRoot);
     }

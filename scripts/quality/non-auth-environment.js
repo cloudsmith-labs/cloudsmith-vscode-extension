@@ -598,7 +598,7 @@ function createNonAuthQualityEnvironment(options = {}) {
     platform: options.platform,
   });
   const temporaryParent = options.temporaryParent === undefined
-    ? os.tmpdir()
+    ? (process.platform === "darwin" ? "/tmp" : os.tmpdir())
     : options.temporaryParent;
   const parent = canonicalTemporaryParent(temporaryParent);
   let root = null;
