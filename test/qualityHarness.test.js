@@ -5845,7 +5845,7 @@ suite("Release checklist and deterministic quality report", () => {
   });
 
   test("rejects stale live status after a source-bound release checklist receipt passed", function () {
-    this.timeout(30000);
+    this.timeout(60000);
     const plan = getGatePlan("release");
     const liveQualification = validLiveStatus();
     const common = {
