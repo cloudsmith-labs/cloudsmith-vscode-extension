@@ -2,6 +2,7 @@
 
 const crypto = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const {
   isPlainObject,
@@ -63,6 +64,17 @@ const IMMUTABLE_EXTENSION_ARTIFACT_KEYS = Object.freeze(
 function hasExactKeys(value, keys) {
   return isPlainObject(value)
     && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
+}
+
+function operatingSystemAccountHome() {
+  const account = os.userInfo();
+  const descriptor = account && typeof account === "object"
+    ? Object.getOwnPropertyDescriptor(account, "homedir")
+    : null;
+  if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string") {
+    throw new Error("Qualification OS account home is unavailable.");
+  }
+  return descriptor.value;
 }
 
 function exactSource(value) {
@@ -427,7 +439,10 @@ function candidateBindingFromReceipt(receipt, options = {}) {
   if (profile.mode === "local") {
     let expectedLocalRoot;
     try {
-      expectedLocalRoot = canonicalLocalProfileRoot(options.homeDirectory);
+      const homeDirectory = options.homeDirectory === undefined
+        ? operatingSystemAccountHome()
+        : options.homeDirectory;
+      expectedLocalRoot = canonicalLocalProfileRoot(homeDirectory);
     } catch {
       throw new Error("Qualification candidate local profile root is not canonical.");
     }

@@ -22,6 +22,7 @@ const {
   validateEquivalentExtensionArtifact,
 } = require("../scripts/quality/candidate-binding");
 const { fingerprint } = require("../scripts/quality/evidence");
+const { executeCommand } = require("../scripts/quality/gate");
 const {
   writeAuthenticatedCandidateProof,
   writeLiveCandidateProof,
@@ -582,6 +583,62 @@ suite("live qualification candidate binding", () => {
         homeDirectory: path.join(fixture.root, "not-a-home"),
       }).profileMode,
       "ci",
+    );
+  });
+
+  test("validates the local profile against OS account identity inside an isolated HOME", () => {
+    const fixture = candidateFixture(roots);
+    const account = os.userInfo();
+    const homeDescriptor = account && typeof account === "object"
+      ? Object.getOwnPropertyDescriptor(account, "homedir")
+      : null;
+    assert.ok(homeDescriptor && "value" in homeDescriptor);
+    const accountHome = homeDescriptor.value;
+    const localRoot = path.join(accountHome, ".cloudsmith-vscode-qualification");
+    const localBase = {
+      ...fixture.receipt,
+      profile: {
+        mode: "local",
+        persistent: true,
+        root: localRoot,
+        testResourcesDir: localRoot,
+        userDataDir: path.join(localRoot, "user-data"),
+        extensionsDir: path.join(localRoot, "extensions"),
+      },
+    };
+    delete localBase.fingerprint;
+    const localReceipt = { ...localBase, fingerprint: fingerprint(localBase) };
+    const candidateBindingPath = path.join(__dirname, "../scripts/quality/candidate-binding.js");
+    const execution = executeCommand({
+      id: "local-candidate-in-private-home",
+      category: "live-qualification",
+      executable: "node",
+      args: ["-e", `
+        const os = require("os");
+        const { candidateBindingFromReceipt } = require(${JSON.stringify(candidateBindingPath)});
+        const binding = candidateBindingFromReceipt(
+          ${JSON.stringify(localReceipt)},
+          { source: ${JSON.stringify(SOURCE)} },
+        );
+        if (os.homedir() === os.userInfo().homedir || binding.profileMode !== "local") {
+          process.exitCode = 1;
+        }
+      `],
+      command: "node local-candidate-in-private-home",
+      blockedExitCodes: [],
+      sequence: 1,
+    }, {
+      environment: { PATH: process.env.PATH || "/usr/bin:/bin" },
+      root: fixture.root,
+      runtimeExecutable: process.execPath,
+      source: SOURCE,
+      temporaryParent: fixture.root,
+    });
+    assert.strictEqual(execution.status, 0, execution.stderr);
+    assert.strictEqual(execution.stdout, "");
+    assert.strictEqual(
+      fs.readdirSync(fixture.root).some(name => name.startsWith("cloudsmith-non-auth-")),
+      false,
     );
   });
 
