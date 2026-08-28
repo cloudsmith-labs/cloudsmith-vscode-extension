@@ -11,6 +11,7 @@ const { writeJson } = require("../scripts/quality/common");
 const { fingerprint } = require("../scripts/quality/evidence");
 const { getGatePlan } = require("../scripts/quality/gate");
 const {
+  LIVE_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_RECEIPT,
   exactFileIdentity,
@@ -26,6 +27,8 @@ const {
   SIGNED_OUT_UI_SCAN_EXCLUSIONS,
   UI_CANDIDATE_SCAN_EXCLUSIONS,
   executeScan,
+  isReviewedSyntheticHistoryFinding,
+  isReviewedSyntheticTrackedFinding,
   parseArguments,
   parseSafeReport,
   resultDocument,
@@ -79,6 +82,21 @@ function syntheticGeneratedEvidence(count = 1) {
         modifiedNanoseconds: String(index + 1),
         size: "1",
       },
+    })),
+  };
+}
+
+function syntheticGeneratedScanResult(options) {
+  const inventory = options.expectedInventory || [];
+  return {
+    id: options.id,
+    status: inventory.length === 0 ? "not-present" : "scanned",
+    fileCount: inventory.length,
+    findings: [],
+    snapshotManifest: inventory.map(entry => ({
+      path: entry.path,
+      identity: entry.identity,
+      sha256: "c".repeat(64),
     })),
   };
 }
@@ -543,7 +561,7 @@ suite("secret exposure gate", () => {
           error: null,
           stdout: JSON.stringify([{
             ruleId: "synthetic-rule",
-            file: "stdin",
+            file: "",
             startLine: 2,
             endLine: 2,
             commit: "",
@@ -559,6 +577,138 @@ suite("secret exposure gate", () => {
       endLine: 2,
       commit: null,
     }]);
+  });
+
+  test("classifies only the exact reviewed synthetic credential fixture", () => {
+    const fixtureLine = "      CLOUDSMITH_API_KEY: \"synthetic-nonsecret-sentinel\",";
+    const sourceAtFirstSlot = line => Buffer.from(`${"\n".repeat(1730)}${line}\n`);
+    const sourceBytes = sourceAtFirstSlot(fixtureLine);
+    const finding = {
+      ruleId: "generic-api-key",
+      path: "test/qualityHarness.test.js",
+      startLine: 1731,
+      endLine: 1731,
+      commit: null,
+    };
+    assert.strictEqual(isReviewedSyntheticTrackedFinding(finding, sourceBytes), true);
+    for (const candidate of [
+      { ...finding, ruleId: "cloudsmith-api-key" },
+      { ...finding, path: "test/another.test.js" },
+      { ...finding, startLine: 1732, endLine: 1732 },
+      { ...finding, endLine: 3567 },
+      { ...finding, commit: "a".repeat(40) },
+    ]) {
+      assert.strictEqual(isReviewedSyntheticTrackedFinding(candidate, sourceBytes), false);
+    }
+    for (const line of [
+      "      OTHER_API_KEY: \"synthetic-nonsecret-sentinel\",",
+      "      CLOUDSMITH_API_KEY: \"ordinary-placeholder\",",
+      "      CLOUDSMITH_API_KEY: 'synthetic-nonsecret-sentinel',",
+      "      CLOUDSMITH_API_KEY: \"synthetic-nonsecret-sentinel\"",
+      "      CLOUDSMITH_API_KEY: \"synthetic-sentinel\\\"escaped\",",
+      "      CLOUDSMITH_API_KEY: \"ordinary-placeholder\", // synthetic-sentinel",
+    ]) {
+      const changedBytes = sourceAtFirstSlot(line);
+      assert.strictEqual(isReviewedSyntheticTrackedFinding(finding, changedBytes), false);
+      changedBytes.fill(0);
+    }
+    const originalEvery = Array.prototype.every;
+    try {
+      Array.prototype.every = function rejectDynamicEvery() {
+        assert.fail("Reviewed fixture classification must not call a mutable Array method.");
+      };
+      assert.strictEqual(isReviewedSyntheticTrackedFinding(finding, sourceBytes), true);
+    } finally {
+      Array.prototype.every = originalEvery;
+    }
+    sourceBytes.fill(0);
+  });
+
+  test("tracked scanner classifies exactly two reviewed fixture slots and reports policy metadata", () => {
+    const relativePath = "test/qualityHarness.test.js";
+    const source = path.join(scratch, relativePath);
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    const lines = Array.from({ length: 3567 }, () => "// bounded filler");
+    lines[1730] = "      CLOUDSMITH_API_KEY: \"synthetic-first-sentinel\",";
+    lines[3566] = "      CLOUDSMITH_API_KEY: \"synthetic-second-sentinel\",";
+    fs.writeFileSync(source, `${lines.join("\n")}\n`);
+    const safeFinding = line => ({
+      ruleId: "generic-api-key",
+      path: relativePath,
+      startLine: line,
+      endLine: line,
+      commit: null,
+    });
+    const component = scanTracked(scratch, {
+      files: Object.freeze([relativePath]),
+      scanWithGitleaks() {
+        return [safeFinding(1731), safeFinding(3567)];
+      },
+    });
+    assert.deepStrictEqual(component.findings, []);
+    assert.strictEqual(component.reviewedFixtureFindingCount, 2);
+    assert.strictEqual(
+      component.reviewedFixturePolicyId,
+      "qh-synthetic-cloudsmith-api-key-v1",
+    );
+
+    assert.throws(() => scanTracked(scratch, {
+      files: Object.freeze([relativePath]),
+      scanWithGitleaks() {
+        return [safeFinding(1731)];
+      },
+    }), /reviewed synthetic tracked-finding policy is incomplete/iu);
+    assert.throws(() => scanTracked(scratch, {
+      files: Object.freeze([relativePath]),
+      scanWithGitleaks() {
+        return [safeFinding(1731), safeFinding(1731), safeFinding(3567)];
+      },
+    }), /reviewed synthetic tracked-finding policy is ambiguous/iu);
+  });
+
+  test("history classification removes only both immutable reviewed fixture slots", async () => {
+    const reviewed = line => ({
+      ruleId: "generic-api-key",
+      file: "test/qualityHarness.test.js",
+      startLine: line,
+      endLine: line,
+      commit: "8e54acd0430a7c1e9f6598d982e245afc5ef94a4",
+    });
+    const retained = {
+      ruleId: "fixture-rule",
+      file: "extension.js",
+      startLine: 3,
+      endLine: 3,
+      commit: "5".repeat(40),
+    };
+    assert.strictEqual(isReviewedSyntheticHistoryFinding({
+      ...reviewed(1731),
+      path: reviewed(1731).file,
+    }), true);
+    const result = await executeScan({
+      root: path.resolve(__dirname, ".."),
+      mode: "history",
+      assertScannerVersion() {},
+      currentHead() {
+        return "a".repeat(40);
+      },
+      execute() {
+        return {
+          status: 1,
+          signal: null,
+          error: null,
+          stdout: JSON.stringify([reviewed(1731), reviewed(3567), retained]),
+          stderr: "",
+        };
+      },
+    });
+    assert.strictEqual(result.findingCount, 1);
+    assert.strictEqual(result.components[0].reviewedFixtureFindingCount, 2);
+    assert.strictEqual(
+      result.components[0].reviewedFixturePolicyId,
+      "qh-synthetic-cloudsmith-api-key-v1",
+    );
+    assert.strictEqual(result.findings[0].path, "extension.js");
   });
 
   test("runs the scanner with a separate private HOME and XDG boundary", () => {
@@ -615,6 +765,223 @@ suite("secret exposure gate", () => {
       }),
       /process timeout is invalid/u,
     );
+    assert.throws(
+      () => runScannerProcess(process.execPath, ["--version"], {
+        extraFileDescriptor: -1,
+      }),
+      /inherited descriptor is invalid/u,
+    );
+    assert.throws(
+      () => runScannerProcess(process.execPath, ["--version"], {
+        extraFileDescriptor: 0,
+        input: Buffer.alloc(0),
+      }),
+      /inherited descriptor is invalid/u,
+    );
+    const descriptorTarget = path.join(scratch, "inherited-descriptor.txt");
+    fs.writeFileSync(descriptorTarget, "bounded descriptor fixture\n");
+    const descriptor = fs.openSync(descriptorTarget, fs.constants.O_RDONLY);
+    try {
+      const inherited = runScannerProcess(process.execPath, [
+        "-e",
+        "const fs=require('fs');process.stdout.write(fs.fstatSync(3).isFile()?'file':'other')",
+      ], {
+        cwd: scratch,
+        env: { PATH: process.env.PATH || "" },
+        extraFileDescriptor: descriptor,
+      });
+      assert.strictEqual(inherited.status, 0);
+      assert.strictEqual(inherited.signal, null);
+      assert.strictEqual(inherited.error, undefined);
+      assert.strictEqual(inherited.stdout, "file");
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  });
+
+  test("current mode scans every generated VSIX through the archive boundary", async () => {
+    const caseRoot = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "current-vsix-")));
+    const trackedPath = "tracked-proof.txt";
+    fs.writeFileSync(path.join(caseRoot, trackedPath), "bounded tracked fixture\n");
+    const qualification = path.join(caseRoot, ".quality", "qualification");
+    fs.mkdirSync(qualification, { recursive: true });
+    fs.writeFileSync(
+      path.join(qualification, "live-candidate.json"),
+      "{\"status\":\"synthetic\"}\n",
+    );
+    const secretReceipts = path.join(caseRoot, ".quality", "secrets");
+    fs.mkdirSync(secretReceipts, { recursive: true });
+    fs.writeFileSync(path.join(secretReceipts, "current.json"), "{\"owned\":true}\n");
+    fs.writeFileSync(path.join(secretReceipts, "rogue.json"), "{\"owned\":false}\n");
+    const vsixPaths = [
+      ".quality/qualification/authenticated-candidate.vsix",
+      ".quality/qualification/live-candidate.VSIX",
+      ".quality/qualification/ui-candidate.vsix",
+    ];
+    for (const relativePath of vsixPaths) {
+      fs.writeFileSync(
+        path.join(caseRoot, ...relativePath.split("/")),
+        "bounded archive fixture\n",
+      );
+    }
+    const stdinTargets = [];
+    const archiveTargets = [];
+    let persisted;
+    const result = await executeScan({
+      root: caseRoot,
+      mode: "current",
+      files: Object.freeze([trackedPath]),
+      excludedFiles: [".quality/qualification/live-candidate.json"],
+      excludedPrefixes: [".quality"],
+      assertScannerVersion() {},
+      currentHead: () => "a".repeat(40),
+      scanWithGitleaks(kind, logicalPath) {
+        assert.strictEqual(kind, "stdin");
+        assert.strictEqual(logicalPath.toLowerCase().endsWith(".vsix"), false);
+        stdinTargets.push(logicalPath);
+        return [];
+      },
+      async scanVsix(_root, relativePath, options) {
+        archiveTargets.push(relativePath);
+        const target = path.join(caseRoot, ...relativePath.split("/"));
+        const identity = exactFileIdentity(fs.lstatSync(target, { bigint: true }));
+        assert.deepStrictEqual(options.expectedVsixIdentity, identity);
+        return {
+          id: `vsix:${relativePath}`,
+          status: "scanned",
+          fileCount: 1,
+          findings: [],
+          snapshot: {
+            path: relativePath,
+            identity,
+            sha256: "b".repeat(64),
+          },
+        };
+      },
+      writeReceipt(value) { persisted = value; },
+    });
+
+    assert.deepStrictEqual(archiveTargets, [...vsixPaths].sort());
+    assert.deepStrictEqual(stdinTargets.sort(), [
+      ".quality/qualification/live-candidate.json",
+      ".quality/secrets/rogue.json",
+      trackedPath,
+    ]);
+    assert.strictEqual(result.status, "passed");
+    assert.strictEqual(persisted, result);
+  });
+
+  test("current mode rejects a generated candidate appearing during receipt persistence", async () => {
+    const caseRoot = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "current-drift-")));
+    const trackedPath = "tracked-proof.txt";
+    fs.writeFileSync(path.join(caseRoot, trackedPath), "bounded tracked fixture\n");
+    const qualification = path.join(caseRoot, ".quality", "qualification");
+    fs.mkdirSync(qualification, { recursive: true });
+    const relativePath = ".quality/qualification/live-candidate.vsix";
+    fs.writeFileSync(
+      path.join(caseRoot, ...relativePath.split("/")),
+      "bounded archive fixture\n",
+    );
+    let writeCalls = 0;
+    await assert.rejects(executeScan({
+      root: caseRoot,
+      mode: "current",
+      files: Object.freeze([trackedPath]),
+      assertScannerVersion() {},
+      currentHead: () => "a".repeat(40),
+      scanWithGitleaks() { return []; },
+      async scanVsix(_root, scannedPath) {
+        const target = path.join(caseRoot, ...scannedPath.split("/"));
+        return {
+          id: `vsix:${scannedPath}`,
+          status: "scanned",
+          fileCount: 1,
+          findings: [],
+          snapshot: {
+            path: scannedPath,
+            identity: exactFileIdentity(fs.lstatSync(target, { bigint: true })),
+            sha256: "b".repeat(64),
+          },
+        };
+      },
+      writeReceipt() {
+        writeCalls += 1;
+        fs.writeFileSync(
+          path.join(qualification, "appeared-candidate.vsix"),
+          "late archive fixture\n",
+        );
+      },
+    }), /generated qualification inventory changed/iu);
+    assert.strictEqual(writeCalls, 1);
+  });
+
+  test("current mode rejects forged generated and VSIX adapter coverage", async () => {
+    for (const mutation of ["generated-count", "vsix-identity", "vsix-count"]) {
+      const caseRoot = fs.realpathSync(fs.mkdtempSync(path.join(scratch, `adapter-${mutation}-`)));
+      const trackedPath = "tracked-proof.txt";
+      fs.writeFileSync(path.join(caseRoot, trackedPath), "bounded tracked fixture\n");
+      const qualification = path.join(caseRoot, ".quality", "qualification");
+      fs.mkdirSync(qualification, { recursive: true });
+      fs.writeFileSync(path.join(qualification, "proof.json"), "{\"status\":\"bounded\"}\n");
+      const relativePath = ".quality/qualification/live-candidate.vsix";
+      const candidatePath = path.join(caseRoot, ...relativePath.split("/"));
+      fs.writeFileSync(candidatePath, "bounded archive fixture\n");
+      await assert.rejects(executeScan({
+        root: caseRoot,
+        mode: "current",
+        files: Object.freeze([trackedPath]),
+        assertScannerVersion() {},
+        currentHead: () => "a".repeat(40),
+        scanWithGitleaks() { return []; },
+        scanGeneratedEvidence(_root, _relativeDirectory, options) {
+          const result = syntheticGeneratedScanResult(options);
+          return mutation === "generated-count"
+            ? { ...result, fileCount: result.fileCount + 1 }
+            : result;
+        },
+        async scanVsix(_root, scannedPath) {
+          const identity = exactFileIdentity(fs.lstatSync(candidatePath, { bigint: true }));
+          return {
+            id: `vsix:${scannedPath}`,
+            status: "scanned",
+            fileCount: mutation === "vsix-count" ? 10002 : 1,
+            findings: [],
+            snapshot: {
+              path: scannedPath,
+              identity: mutation === "vsix-identity"
+                ? { ...identity, inode: `${identity.inode}-crossed` }
+                : identity,
+              sha256: "b".repeat(64),
+            },
+          };
+        },
+      }), /generated qualification scanner returned invalid findings/iu, mutation);
+    }
+  });
+
+  test("current mode bounds the aggregate generated VSIX inventory", async () => {
+    const caseRoot = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "vsix-bound-")));
+    const trackedPath = "tracked-proof.txt";
+    fs.writeFileSync(path.join(caseRoot, trackedPath), "bounded tracked fixture\n");
+    const qualification = path.join(caseRoot, ".quality", "qualification");
+    fs.mkdirSync(qualification, { recursive: true });
+    for (let index = 0; index < 65; index += 1) {
+      fs.writeFileSync(
+        path.join(qualification, `candidate-${String(index).padStart(2, "0")}.vsix`),
+        "bounded archive fixture\n",
+      );
+    }
+    let candidateReached = false;
+    await assert.rejects(executeScan({
+      root: caseRoot,
+      mode: "current",
+      files: Object.freeze([trackedPath]),
+      assertScannerVersion() {},
+      currentHead: () => "a".repeat(40),
+      scanWithGitleaks() { return []; },
+      async scanVsix() { candidateReached = true; return null; },
+    }), /VSIX inventory exceeds its safety bound/u);
+    assert.strictEqual(candidateReached, false);
   });
 
   test("fails closed when scanner exit status and safe report disagree", () => {
@@ -1014,7 +1381,10 @@ suite("secret exposure gate", () => {
 
   test("upload-eligible UI evidence binds one exact receipt/proof snapshot through persistence", async () => {
     const fixture = await createUiCandidateScanFixture(scratch);
+    const liveCandidatePath = path.join(scratch, ...LIVE_CANDIDATE_ARTIFACT.split("/"));
+    fs.writeFileSync(liveCandidatePath, "bounded auxiliary archive fixture\n");
     const scannedTargets = [];
+    const auxiliaryTargets = [];
     const scanRoots = new Set();
     let persisted;
     const result = await executeScan({
@@ -1024,18 +1394,36 @@ suite("secret exposure gate", () => {
       currentHead: () => fixture.source.sha,
       scanGeneratedEvidence(_root, relativeDirectory, options) {
         assert.strictEqual(relativeDirectory, ".quality");
+        assert.deepStrictEqual([...options.excludedPrefixes], []);
         assert.deepStrictEqual(
-          [...options.excludedPrefixes],
-          [...UI_CANDIDATE_SCAN_EXCLUSIONS],
+          [...options.excludedFiles].sort(),
+          [
+            ...UI_CANDIDATE_SCAN_EXCLUSIONS,
+            ".quality/secrets/evidence.json",
+            LIVE_CANDIDATE_ARTIFACT,
+          ].sort(),
         );
-        return {
-          id: options.id,
-          status: "scanned",
-          fileCount: 1,
-          findings: [],
-        };
+        return syntheticGeneratedScanResult(options);
       },
       scanWithGitleaks(_kind, target, options) {
+        if (_kind === "dir") {
+          const artifactName = path.basename(UI_CANDIDATE_ARTIFACT);
+          scannedTargets.push(artifactName);
+          assert.strictEqual(path.basename(options.descriptorSourcePath), artifactName);
+          scanRoots.add(path.dirname(options.descriptorSourcePath));
+          assert.strictEqual(options.input, undefined);
+          if (process.platform === "win32") {
+            assert.strictEqual(target, options.descriptorSourcePath);
+            assert.strictEqual(options.extraFileDescriptor, undefined);
+          } else {
+            assert.strictEqual(
+              target,
+              process.platform === "linux" ? "/proc/self/fd/3" : "/dev/fd/3",
+            );
+            assert.strictEqual(Number.isSafeInteger(options.extraFileDescriptor), true);
+          }
+          return [];
+        }
         scannedTargets.push(target);
         scanRoots.add(options.scanRoot);
         assert.strictEqual(_kind, "stdin");
@@ -1048,6 +1436,23 @@ suite("secret exposure gate", () => {
         assert.ok(expected, target);
         assert.deepStrictEqual(options.input, expected);
         return [];
+      },
+      async scanVsix(_root, relativePath, options) {
+        auxiliaryTargets.push(relativePath);
+        const identity = exactFileIdentity(fs.lstatSync(liveCandidatePath, { bigint: true }));
+        assert.strictEqual(relativePath, LIVE_CANDIDATE_ARTIFACT);
+        assert.deepStrictEqual(options.expectedVsixIdentity, identity);
+        return {
+          id: `vsix:${relativePath}`,
+          status: "scanned",
+          fileCount: 1,
+          findings: [],
+          snapshot: {
+            path: relativePath,
+            identity,
+            sha256: "b".repeat(64),
+          },
+        };
       },
       writeReceipt(value) { persisted = value; },
       now: new Date("2026-08-27T12:05:00.000Z"),
@@ -1063,6 +1468,7 @@ suite("secret exposure gate", () => {
       "generated-quality-evidence",
       `vsix:${UI_CANDIDATE_ARTIFACT}`,
     ]);
+    assert.deepStrictEqual(auxiliaryTargets, [LIVE_CANDIDATE_ARTIFACT]);
     assert.deepStrictEqual(result.candidate, {
       receiptFingerprint: fixture.receipt.fingerprint,
       receiptSha256: crypto.createHash("sha256").update(fixture.receiptBytes).digest("hex"),
@@ -1091,20 +1497,19 @@ suite("secret exposure gate", () => {
         assertScannerVersion() {},
         currentHead: () => fixture.source.sha,
         scanGeneratedEvidence(_root, _relativeDirectory, options) {
+          assert.deepStrictEqual([...options.excludedPrefixes], []);
           assert.deepStrictEqual(
-            [...options.excludedPrefixes],
-            [...UI_CANDIDATE_SCAN_EXCLUSIONS],
+            [...options.excludedFiles].sort(),
+            [
+              ...UI_CANDIDATE_SCAN_EXCLUSIONS,
+              ".quality/secrets/evidence.json",
+            ].sort(),
           );
           if (mutation === "add") {
             fs.writeFileSync(fixture.receiptPath, fixture.receiptBytes, { mode: 0o600 });
             fs.writeFileSync(fixture.artifactPath, fixture.artifactBytes, { mode: 0o600 });
           }
-          return {
-            id: options.id,
-            status: "scanned",
-            fileCount: 1,
-            findings: [],
-          };
+          return syntheticGeneratedScanResult(options);
         },
         scanWithGitleaks(_kind, _target, options) {
           scanCalls += 1;
@@ -1188,18 +1593,37 @@ suite("secret exposure gate", () => {
       currentHead: () => fixture.source.sha,
       scanGeneratedEvidence(_root, relativeDirectory, options) {
         assert.strictEqual(relativeDirectory, ".quality");
+        assert.deepStrictEqual([...options.excludedPrefixes], []);
         assert.deepStrictEqual(
-          [...options.excludedPrefixes],
-          [...SIGNED_OUT_UI_SCAN_EXCLUSIONS],
+          [...options.excludedFiles].sort(),
+          [
+            ...SIGNED_OUT_UI_SCAN_EXCLUSIONS,
+            ".quality/secrets/evidence.json",
+            ...SIGNED_OUT_BUNDLE_NAMES.map(name => (
+              `${SIGNED_OUT_BUNDLE_DIRECTORY}/${name}`
+            )),
+          ].sort(),
         );
-        return {
-          id: options.id,
-          status: "scanned",
-          fileCount: 1,
-          findings: [],
-        };
+        return syntheticGeneratedScanResult(options);
       },
       scanWithGitleaks(_kind, target, options) {
+        if (_kind === "dir") {
+          const artifactName = path.basename(UI_CANDIDATE_ARTIFACT);
+          scannedTargets.push(artifactName);
+          assert.strictEqual(path.basename(options.descriptorSourcePath), artifactName);
+          assert.strictEqual(options.input, undefined);
+          if (process.platform === "win32") {
+            assert.strictEqual(target, options.descriptorSourcePath);
+            assert.strictEqual(options.extraFileDescriptor, undefined);
+          } else {
+            assert.strictEqual(
+              target,
+              process.platform === "linux" ? "/proc/self/fd/3" : "/dev/fd/3",
+            );
+            assert.strictEqual(Number.isSafeInteger(options.extraFileDescriptor), true);
+          }
+          return [];
+        }
         scannedTargets.push(target);
         assert.strictEqual(_kind, "stdin");
         const expected = {
@@ -1254,10 +1678,17 @@ suite("secret exposure gate", () => {
   });
 
   test("signed-out staging cleans source, add, change, delete, and same-byte replacement drift", async () => {
-    for (const mutation of ["source", "add", "change", "delete", "same"]) {
+    for (const mutation of ["source", "add", "change", "delete", "same", "generated"]) {
       const caseRoot = fs.realpathSync(fs.mkdtempSync(path.join(scratch, `stage-${mutation}-`)));
       const fixture = await createSignedOutBundleFixture(caseRoot);
       const outputPath = ".quality/secrets/evidence.json";
+      const generatedProof = path.join(
+        caseRoot,
+        ".quality",
+        "qualification",
+        "auxiliary.json",
+      );
+      fs.writeFileSync(generatedProof, "{\"status\":\"bounded\"}\n");
       let sourceDrift = false;
       await assert.rejects(executeScan({
         root: caseRoot,
@@ -1269,9 +1700,6 @@ suite("secret exposure gate", () => {
           : fixture.source,
         assertScannerVersion() {},
         currentHead: () => fixture.source.sha,
-        scanGeneratedEvidence(_root, _relativeDirectory, options) {
-          return { id: options.id, status: "scanned", fileCount: 1, findings: [] };
-        },
         scanWithGitleaks() { return []; },
         afterSignedOutBundleStage(stage) {
           if (process.platform !== "win32") fs.chmodSync(stage, 0o700);
@@ -1285,14 +1713,16 @@ suite("secret exposure gate", () => {
             fs.writeFileSync(resultPath, `${JSON.stringify({ changed: true })}\n`);
           } else if (mutation === "delete") {
             fs.unlinkSync(resultPath);
-          } else {
+          } else if (mutation === "same") {
             const replacement = path.join(stage, "replacement.json");
             fs.writeFileSync(replacement, fixture.uiBytes, { mode: 0o400 });
             fs.renameSync(replacement, resultPath);
+          } else {
+            fs.writeFileSync(generatedProof, "{\"status\":\"changed\"}\n");
           }
           if (process.platform !== "win32") fs.chmodSync(stage, 0o500);
         },
-      }), /signed-out UI|staged signed-out/iu, mutation);
+      }), /signed-out UI|staged signed-out|generated qualification inventory/iu, mutation);
       assert.strictEqual(fs.existsSync(path.join(caseRoot, outputPath)), false, mutation);
       assert.strictEqual(fs.existsSync(path.join(
         caseRoot,
@@ -1312,7 +1742,7 @@ suite("secret exposure gate", () => {
       assertScannerVersion() {},
       currentHead: () => fixture.source.sha,
       scanGeneratedEvidence(_root, _relativeDirectory, options) {
-        return { id: options.id, status: "scanned", fileCount: 1, findings: [] };
+        return syntheticGeneratedScanResult(options);
       },
       scanWithGitleaks() { return []; },
     });
@@ -1414,10 +1844,17 @@ suite("secret exposure gate", () => {
         endLine: 2,
         commit: "a".repeat(40),
       }],
+      reviewedFixtureFindingCount: 2,
+      reviewedFixturePolicyId: "qh-synthetic-cloudsmith-api-key-v1",
     }], new Date("2026-08-27T00:00:00.000Z"));
     assert.strictEqual(document.status, "failed");
     assert.strictEqual(document.findingCount, 1);
     assert.strictEqual(document.scanner.version, GITLEAKS_VERSION);
+    assert.strictEqual(document.components[0].reviewedFixtureFindingCount, 2);
+    assert.strictEqual(
+      document.components[0].reviewedFixturePolicyId,
+      "qh-synthetic-cloudsmith-api-key-v1",
+    );
     assert.doesNotMatch(JSON.stringify(document), /(?:secretHash|fingerprint|match|entropy|author|email|message)/iu);
   });
 
@@ -2359,15 +2796,31 @@ suite("secret exposure gate", () => {
     const scannedTargets = [];
     const component = await scanVsix(caseRoot, relativePath, {
       scanWithGitleaks(kind, logicalPath, options) {
-        assert.strictEqual(kind, "stdin");
-        scannedTargets.push(logicalPath);
-        if (logicalPath === "candidate.vsix") {
-          assert.deepStrictEqual(options.input, candidateBytes);
+        if (kind === "dir") {
+          scannedTargets.push("candidate.vsix");
+          if (Number.isSafeInteger(options.extraFileDescriptor)) {
+            assert.match(logicalPath, /(?:\/dev\/fd|\/proc\/self\/fd)\/3$/u);
+            assert.deepStrictEqual(fs.readFileSync(options.extraFileDescriptor), candidateBytes);
+          } else {
+            assert.strictEqual(process.platform, "win32");
+            assert.deepStrictEqual(fs.readFileSync(logicalPath), candidateBytes);
+          }
+          return [{
+            commit: null,
+            ruleId: "synthetic-descriptor-rule",
+            path: Number.isSafeInteger(options.extraFileDescriptor)
+              ? path.basename(logicalPath)
+              : "candidate.vsix",
+            startLine: 1,
+            endLine: 1,
+          }];
         } else {
+          assert.strictEqual(kind, "stdin");
+          scannedTargets.push(logicalPath);
           assert.strictEqual(logicalPath, "extension/safe.txt");
           assert.deepStrictEqual(options.input, Buffer.from("authorized archive bytes\n"));
+          return [];
         }
-        return [];
       },
     });
 
@@ -2377,6 +2830,13 @@ suite("secret exposure gate", () => {
       identity: sourceIdentity,
       sha256: crypto.createHash("sha256").update(candidateBytes).digest("hex"),
     });
+    assert.deepStrictEqual(component.findings, [{
+      commit: null,
+      ruleId: "synthetic-descriptor-rule",
+      path: `${relativePath}::archive/candidate.vsix`,
+      startLine: 1,
+      endLine: 1,
+    }]);
   });
 
   test("raw and expanded VSIX scans never follow swapped-and-restored snapshot paths", async () => {
@@ -2393,19 +2853,34 @@ suite("secret exposure gate", () => {
 
     const component = await scanVsix(caseRoot, relativePath, {
       scanWithGitleaks(kind, logicalPath, options) {
-        assert.strictEqual(kind, "stdin");
-        const scanRoot = options.scanRoot;
+        const raw = kind === "dir";
+        if (!raw) assert.strictEqual(kind, "stdin");
+        const descriptor = options.extraFileDescriptor;
+        const scanRoot = raw && Number.isSafeInteger(descriptor)
+          ? path.dirname(options.descriptorSourcePath)
+          : raw
+            ? path.dirname(logicalPath)
+          : options.scanRoot;
+        const windowsRawBytes = raw && !Number.isSafeInteger(descriptor)
+          ? fs.readFileSync(logicalPath)
+          : null;
         const displaced = `${scanRoot}-displaced`;
-        const replacementBytes = logicalPath === "candidate.vsix"
+        const observedPath = raw ? "candidate.vsix" : logicalPath;
+        const replacementBytes = raw
           ? rawReplacement
           : expandedReplacement;
         fs.renameSync(scanRoot, displaced);
         try {
-          const replacementTarget = path.join(scanRoot, ...logicalPath.split("/"));
+          const replacementTarget = path.join(scanRoot, ...observedPath.split("/"));
           fs.mkdirSync(path.dirname(replacementTarget), { recursive: true });
           fs.writeFileSync(replacementTarget, replacementBytes);
           assert.deepStrictEqual(fs.readFileSync(replacementTarget), replacementBytes);
-          observed.push({ logicalPath, bytes: Buffer.from(options.input) });
+          observed.push({
+            logicalPath: observedPath,
+            bytes: raw && Number.isSafeInteger(descriptor)
+              ? fs.readFileSync(descriptor)
+              : raw ? windowsRawBytes : Buffer.from(options.input),
+          });
         } finally {
           fs.rmSync(scanRoot, { recursive: true, force: true });
           fs.renameSync(displaced, scanRoot);
@@ -2443,8 +2918,11 @@ suite("secret exposure gate", () => {
       scanWithGitleaks(_kind, logicalPath, options) {
         scanNumber += 1;
         if (scanNumber === 1) {
-          assert.strictEqual(logicalPath, "candidate.vsix");
-          assert.match(options.input.toString("hex"), /^[a-f0-9]+$/u);
+          if (Number.isSafeInteger(options.extraFileDescriptor)) {
+            assert.match(logicalPath, /(?:\/dev\/fd|\/proc\/self\/fd)\/3$/u);
+          } else {
+            assert.strictEqual(process.platform, "win32");
+          }
           fs.renameSync(qualification, displaced);
           fs.renameSync(replacement, qualification);
         } else {

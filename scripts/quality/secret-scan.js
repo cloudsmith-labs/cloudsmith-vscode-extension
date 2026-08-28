@@ -45,6 +45,7 @@ const INTRINSIC_IS_FROZEN = Object.isFrozen;
 const INTRINSIC_IS_PROXY = utilTypes.isProxy;
 const INTRINSIC_NUMBER = Number;
 const INTRINSIC_NUMBER_IS_SAFE_INTEGER = Number.isSafeInteger;
+const INTRINSIC_OBJECT_CREATE = Object.create;
 const INTRINSIC_OBJECT_FREEZE = Object.freeze;
 const INTRINSIC_OBJECT_PROTOTYPE = Object.prototype;
 const INTRINSIC_REGEXP_TEST = RegExp.prototype.test;
@@ -64,6 +65,22 @@ function hasOwnDataValue(object, key) {
     && INTRINSIC_REFLECT_APPLY(INTRINSIC_HAS_OWN, descriptor, ["value"])
     ? descriptor
     : null;
+}
+
+function exactPlainDataObject(value, keys) {
+  if (!value || typeof value !== "object" || INTRINSIC_IS_PROXY(value)
+    || INTRINSIC_GET_PROTOTYPE_OF(value) !== INTRINSIC_OBJECT_PROTOTYPE) {
+    return null;
+  }
+  const ownKeys = INTRINSIC_REFLECT_OWN_KEYS(value);
+  if (ownKeys.length !== keys.length) return null;
+  const descriptors = INTRINSIC_OBJECT_CREATE(null);
+  for (let index = 0; index < keys.length; index += 1) {
+    const descriptor = hasOwnDataValue(value, keys[index]);
+    if (!descriptor || descriptor.enumerable !== true) return null;
+    descriptors[keys[index]] = descriptor;
+  }
+  return descriptors;
 }
 
 const GITLEAKS_VERSION = "8.30.1";
@@ -92,6 +109,9 @@ const SAFE_ENVIRONMENT_NAMES = Object.freeze([
 const MAX_TRACKED_FILES = 30000;
 const MAX_GENERATED_FILES = 10000;
 const MAX_GENERATED_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_GENERATED_VSIX_FILES = 64;
+const MAX_GENERATED_VSIX_SOURCE_BYTES = 500 * 1024 * 1024;
+const MAX_GENERATED_VSIX_SCANNED_ITEMS = 20000;
 const MAX_TRACKED_FILE_BYTES = MAX_GENERATED_FILE_BYTES;
 const MAX_TRACKED_TOTAL_BYTES = 256 * 1024 * 1024;
 const MAX_VSIX_ENTRIES = 10000;
@@ -109,6 +129,32 @@ const TRACKED_FINDING_KEYS = Object.freeze([
   "path",
   "ruleId",
   "startLine",
+]);
+const EXACT_FILE_IDENTITY_KEYS = Object.freeze([
+  "changedNanoseconds",
+  "device",
+  "inode",
+  "links",
+  "mode",
+  "modifiedNanoseconds",
+  "size",
+]);
+const REVIEWED_SYNTHETIC_FIXTURE_PATH = "test/qualityHarness.test.js";
+const REVIEWED_SYNTHETIC_FIXTURE_RULE = "generic-api-key";
+const REVIEWED_SYNTHETIC_FIXTURE_POLICY = "qh-synthetic-cloudsmith-api-key-v1";
+const REVIEWED_SYNTHETIC_FIXTURE_FIRST_LINE = 1731;
+const REVIEWED_SYNTHETIC_FIXTURE_SECOND_LINE = 3567;
+const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_COMMIT =
+  "8e54acd0430a7c1e9f6598d982e245afc5ef94a4";
+const REVIEWED_SYNTHETIC_FIXTURE_PREFIX = Object.freeze(
+  Array.from(INTRINSIC_BUFFER_FROM("      CLOUDSMITH_API_KEY: \"", "ascii"))
+);
+const REVIEWED_SYNTHETIC_FIXTURE_SUFFIX = Object.freeze(
+  Array.from(INTRINSIC_BUFFER_FROM("\",", "ascii"))
+);
+const REVIEWED_SYNTHETIC_FIXTURE_MARKERS = Object.freeze([
+  Object.freeze(Array.from(INTRINSIC_BUFFER_FROM("synthetic", "ascii"))),
+  Object.freeze(Array.from(INTRINSIC_BUFFER_FROM("sentinel", "ascii"))),
 ]);
 const UI_RESULT = ".quality/ui/result.json";
 const TRACKED_SOURCE_ERROR =
@@ -136,9 +182,10 @@ const SIGNED_OUT_BUNDLE_NAMES = Object.freeze([
   ...SIGNED_OUT_BUNDLE_INPUTS.map(entry => entry.name),
   SIGNED_OUT_BUNDLE_RECEIPT,
 ].sort());
+const SIGNED_OUT_BUNDLE_OUTPUT_FILES = Object.freeze(
+  SIGNED_OUT_BUNDLE_NAMES.map(name => `${SIGNED_OUT_BUNDLE_DIRECTORY}/${name}`),
+);
 const UI_CANDIDATE_SCAN_EXCLUSIONS = Object.freeze([
-  OUTPUT_ROOT,
-  SIGNED_OUT_BUNDLE_DIRECTORY,
   UI_CANDIDATE_RECEIPT,
   UI_CANDIDATE_ARTIFACT,
 ]);
@@ -216,13 +263,21 @@ function run(executable, args, options = {}) {
     || timeout > SCANNER_PROCESS_TIMEOUT_MS) {
     throw new Error("Secret scanner process timeout is invalid.");
   }
+  const extraFileDescriptor = options.extraFileDescriptor;
+  if (extraFileDescriptor !== undefined
+    && (!Number.isSafeInteger(extraFileDescriptor) || extraFileDescriptor < 0
+      || options.input !== undefined)) {
+    throw new Error("Secret scanner inherited descriptor is invalid.");
+  }
   const result = spawnSync(executable, args, {
     cwd: options.cwd || ROOT,
     encoding: "utf8",
     env: options.env || scannerEnvironment(),
     input: options.input,
     maxBuffer: 2 * 1024 * 1024,
-    stdio: "pipe",
+    stdio: extraFileDescriptor === undefined
+      ? "pipe"
+      : ["pipe", "pipe", "pipe", extraFileDescriptor],
     timeout,
     killSignal: "SIGKILL",
   });
@@ -738,6 +793,55 @@ function walkGeneratedFiles(root, relativeDirectory, options = {}) {
   return files.sort();
 }
 
+function captureGeneratedInventory(root, options = {}) {
+  const paths = walkGeneratedFiles(root, ".quality", {
+    excludedPrefixes: options.excludedPrefixes || [],
+    excludedFiles: options.excludedFiles || [],
+  });
+  const files = [];
+  const vsix = [];
+  let vsixBytes = 0n;
+  for (let index = 0; index < paths.length; index += 1) {
+    const relativePath = paths[index];
+    const target = path.join(root, ...relativePath.split("/"));
+    const stat = fs.lstatSync(target, { bigint: true });
+    if (!stat.isFile() || stat.nlink !== 1n || fs.realpathSync(target) !== target) {
+      throw new Error("Generated qualification inventory is unsafe.");
+    }
+    const entry = INTRINSIC_OBJECT_FREEZE({
+      identity: exactFileIdentity(stat),
+      path: relativePath,
+    });
+    files[files.length] = entry;
+    if (relativePath.toLowerCase().endsWith(".vsix")) {
+      vsix[vsix.length] = entry;
+      vsixBytes += stat.size;
+      if (vsix.length > MAX_GENERATED_VSIX_FILES
+        || vsixBytes > BigInt(MAX_GENERATED_VSIX_SOURCE_BYTES)) {
+        throw new Error("Generated qualification VSIX inventory exceeds its safety bound.");
+      }
+    }
+  }
+  return INTRINSIC_OBJECT_FREEZE({
+    files: INTRINSIC_OBJECT_FREEZE(files),
+    vsix: INTRINSIC_OBJECT_FREEZE(vsix),
+  });
+}
+
+function assertStableGeneratedInventory(root, expected, options = {}) {
+  const current = captureGeneratedInventory(root, options);
+  if (current.files.length !== expected.files.length) {
+    throw new Error("Generated qualification inventory changed during secret scanning.");
+  }
+  for (let index = 0; index < expected.files.length; index += 1) {
+    if (current.files[index].path !== expected.files[index].path
+      || !sameExactFileIdentity(current.files[index].identity, expected.files[index].identity)) {
+      throw new Error("Generated qualification inventory changed during secret scanning.");
+    }
+  }
+  return true;
+}
+
 function copyGeneratedFileIntoSnapshot(source, relativePath, snapshotRoot, options = {}) {
   assertRepositoryRelativePath(relativePath);
   const parent = ensureSnapshotDirectory(snapshotRoot, path.posix.dirname(relativePath));
@@ -1059,6 +1163,205 @@ function normalizeTrackedFindings(value, logicalPath) {
   }
 }
 
+function exactValueBlindFindings(value, errorMessage) {
+  try {
+    const length = exactTrackedArrayLength(value, errorMessage);
+    const findings = [];
+    for (let index = 0; index < length; index += 1) {
+      const finding = hasOwnDataValue(value, `${index}`).value;
+      const pathDescriptor = finding && typeof finding === "object"
+        ? hasOwnDataValue(finding, "path")
+        : null;
+      if (!pathDescriptor || typeof pathDescriptor.value !== "string") {
+        throw new Error(errorMessage);
+      }
+      assertRepositoryRelativePath(pathDescriptor.value);
+      findings[index] = normalizeTrackedFinding(
+        finding,
+        pathDescriptor.value,
+        errorMessage,
+      );
+    }
+    return INTRINSIC_OBJECT_FREEZE(findings);
+  } catch {
+    throw new Error(errorMessage);
+  }
+}
+
+function exactExpectedFileIdentity(value, expected) {
+  if (!value || typeof value !== "object" || INTRINSIC_IS_PROXY(value)
+    || INTRINSIC_GET_PROTOTYPE_OF(value) !== INTRINSIC_OBJECT_PROTOTYPE) {
+    return false;
+  }
+  const keys = INTRINSIC_REFLECT_OWN_KEYS(value);
+  if (keys.length !== EXACT_FILE_IDENTITY_KEYS.length) return false;
+  for (let index = 0; index < EXACT_FILE_IDENTITY_KEYS.length; index += 1) {
+    const descriptor = hasOwnDataValue(value, EXACT_FILE_IDENTITY_KEYS[index]);
+    if (!descriptor || descriptor.enumerable !== true
+      || typeof descriptor.value !== "string") {
+      return false;
+    }
+  }
+  return sameExactFileIdentity(value, expected);
+}
+
+function exactGeneratedSnapshotManifest(value, expected, errorMessage) {
+  const length = exactTrackedArrayLength(value, errorMessage);
+  if (length !== expected.length) throw new Error(errorMessage);
+  for (let index = 0; index < length; index += 1) {
+    const item = hasOwnDataValue(value, `${index}`).value;
+    if (!item || typeof item !== "object" || INTRINSIC_IS_PROXY(item)
+      || INTRINSIC_GET_PROTOTYPE_OF(item) !== INTRINSIC_OBJECT_PROTOTYPE) {
+      throw new Error(errorMessage);
+    }
+    const keys = INTRINSIC_REFLECT_OWN_KEYS(item);
+    if (keys.length !== 3) throw new Error(errorMessage);
+    const identity = hasOwnDataValue(item, "identity");
+    const itemPath = hasOwnDataValue(item, "path");
+    const digest = hasOwnDataValue(item, "sha256");
+    if (!identity || !itemPath || !digest
+      || itemPath.value !== expected[index].path
+      || !exactExpectedFileIdentity(identity.value, expected[index].identity)
+      || typeof digest.value !== "string"
+      || !INTRINSIC_REFLECT_APPLY(
+        INTRINSIC_REGEXP_TEST,
+        /^[a-f0-9]{64}$/u,
+        [digest.value],
+      )) {
+      throw new Error(errorMessage);
+    }
+  }
+  return true;
+}
+
+function bytesMatchAt(bytes, expected, offset) {
+  if (offset < 0 || offset + expected.length > bytes.length) return false;
+  for (let index = 0; index < expected.length; index += 1) {
+    if (bytes[offset + index] !== expected[index]) return false;
+  }
+  return true;
+}
+
+function isFixtureTokenBoundary(byte) {
+  return byte === 0x2d || byte === 0x5f;
+}
+
+function bytesContainFixtureToken(bytes, expected, start, end) {
+  for (let offset = start; offset + expected.length <= end; offset += 1) {
+    if (!bytesMatchAt(bytes, expected, offset)) continue;
+    const beforeIsBoundary = offset === start || isFixtureTokenBoundary(bytes[offset - 1]);
+    const after = offset + expected.length;
+    const afterIsBoundary = after === end || isFixtureTokenBoundary(bytes[after]);
+    if (beforeIsBoundary && afterIsBoundary) return true;
+  }
+  return false;
+}
+
+function trackedLineBounds(bytes, lineNumber) {
+  if (!INTRINSIC_BUFFER_IS_BUFFER(bytes)
+    || !INTRINSIC_NUMBER_IS_SAFE_INTEGER(lineNumber) || lineNumber <= 0) return null;
+  let currentLine = 1;
+  let start = 0;
+  for (let index = 0; index <= bytes.length; index += 1) {
+    if (index !== bytes.length && bytes[index] !== 0x0a) continue;
+    if (currentLine === lineNumber) {
+      let end = index;
+      if (end > start && bytes[end - 1] === 0x0d) end -= 1;
+      return { start, end };
+    }
+    currentLine += 1;
+    start = index + 1;
+  }
+  return null;
+}
+
+function reviewedSyntheticFixtureLine(bytes, lineNumber) {
+  const bounds = trackedLineBounds(bytes, lineNumber);
+  if (!bounds) return false;
+  const { start, end } = bounds;
+  if (!bytesMatchAt(bytes, REVIEWED_SYNTHETIC_FIXTURE_PREFIX, start)
+    || !bytesMatchAt(
+      bytes,
+      REVIEWED_SYNTHETIC_FIXTURE_SUFFIX,
+      end - REVIEWED_SYNTHETIC_FIXTURE_SUFFIX.length,
+    )) return false;
+  const contentStart = start + REVIEWED_SYNTHETIC_FIXTURE_PREFIX.length;
+  const contentEnd = end - REVIEWED_SYNTHETIC_FIXTURE_SUFFIX.length;
+  const contentLength = contentEnd - contentStart;
+  if (contentLength <= 0 || contentLength > 128) return false;
+  for (let index = contentStart; index < contentEnd; index += 1) {
+    const byte = bytes[index];
+    const allowed = (byte >= 0x30 && byte <= 0x39)
+      || (byte >= 0x41 && byte <= 0x5a)
+      || (byte >= 0x61 && byte <= 0x7a)
+      || byte === 0x2d || byte === 0x5f;
+    if (!allowed) return false;
+  }
+  return bytesContainFixtureToken(
+    bytes,
+    REVIEWED_SYNTHETIC_FIXTURE_MARKERS[0],
+    contentStart,
+    contentEnd,
+  ) && bytesContainFixtureToken(
+    bytes,
+    REVIEWED_SYNTHETIC_FIXTURE_MARKERS[1],
+    contentStart,
+    contentEnd,
+  );
+}
+
+function isReviewedSyntheticTrackedFinding(finding, sourceBytes) {
+  return finding?.path === REVIEWED_SYNTHETIC_FIXTURE_PATH
+    && finding.ruleId === REVIEWED_SYNTHETIC_FIXTURE_RULE
+    && finding.commit === null
+    && finding.startLine === finding.endLine
+    && (finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_FIRST_LINE
+      || finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_SECOND_LINE)
+    && reviewedSyntheticFixtureLine(sourceBytes, finding.startLine);
+}
+
+function isReviewedSyntheticHistoryFinding(finding) {
+  return finding?.path === REVIEWED_SYNTHETIC_FIXTURE_PATH
+    && finding.ruleId === REVIEWED_SYNTHETIC_FIXTURE_RULE
+    && finding.commit === REVIEWED_SYNTHETIC_FIXTURE_HISTORY_COMMIT
+    && finding.startLine === finding.endLine
+    && (finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_FIRST_LINE
+      || finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_SECOND_LINE);
+}
+
+function classifyTrackedFindings(value, entry) {
+  const normalized = normalizeTrackedFindings(value, entry.path);
+  const findings = [];
+  let reviewedFixtureFindingCount = 0;
+  let reviewedFirstSlot = false;
+  let reviewedSecondSlot = false;
+  for (let index = 0; index < normalized.length; index += 1) {
+    if (isReviewedSyntheticTrackedFinding(normalized[index], entry.bytes)) {
+      if (normalized[index].startLine === REVIEWED_SYNTHETIC_FIXTURE_FIRST_LINE) {
+        if (reviewedFirstSlot) {
+          throw new Error("Reviewed synthetic tracked-finding policy is ambiguous.");
+        }
+        reviewedFirstSlot = true;
+      } else {
+        if (reviewedSecondSlot) {
+          throw new Error("Reviewed synthetic tracked-finding policy is ambiguous.");
+        }
+        reviewedSecondSlot = true;
+      }
+      reviewedFixtureFindingCount += 1;
+    } else {
+      findings[findings.length] = normalized[index];
+    }
+  }
+  if (reviewedFirstSlot !== reviewedSecondSlot || reviewedFixtureFindingCount > 2) {
+    throw new Error("Reviewed synthetic tracked-finding policy is incomplete.");
+  }
+  return Object.freeze({
+    findings: INTRINSIC_OBJECT_FREEZE(findings),
+    reviewedFixtureFindingCount,
+  });
+}
+
 async function scanProvenBytes(scan, logicalPath, provenBytes, options, errorMessage) {
   let scannerBytes;
   try {
@@ -1072,6 +1375,80 @@ async function scanProvenBytes(scan, logicalPath, provenBytes, options, errorMes
   } finally {
     if (Buffer.isBuffer(scannerBytes)) scannerBytes.fill(0);
   }
+}
+
+function stableSnapshotDescriptorState(target, descriptor, expectedIdentity) {
+  const opened = fs.fstatSync(descriptor, { bigint: true });
+  const current = fs.lstatSync(target, { bigint: true });
+  return opened.isFile() && current.isFile()
+    && opened.nlink === 1n && current.nlink === 1n
+    && sameExactFileIdentity(exactFileIdentity(opened), expectedIdentity)
+    && sameExactFileIdentity(exactFileIdentity(current), expectedIdentity);
+}
+
+function inheritedDescriptorScanPath(platform = process.platform) {
+  if (platform === "linux") return "/proc/self/fd/3";
+  if (platform !== "win32") return "/dev/fd/3";
+  return null;
+}
+
+async function scanSnapshotEntryDescriptor(
+  scan,
+  snapshotRoot,
+  entry,
+  options,
+  errorMessage,
+) {
+  const target = path.join(snapshotRoot, ...entry.manifest.path.split("/"));
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  let descriptor;
+  let completed = false;
+  let findings;
+  try {
+    descriptor = fs.openSync(target, flags);
+    if (!stableSnapshotDescriptorState(target, descriptor, entry.snapshot.identity)) {
+      throw new Error(errorMessage);
+    }
+    const descriptorPath = inheritedDescriptorScanPath();
+    const scanTarget = descriptorPath || target;
+    const result = await scan("dir", scanTarget, {
+      ...options,
+      descriptorSourcePath: target,
+      scanRoot: descriptorPath ? path.dirname(descriptorPath) : snapshotRoot,
+      ...(descriptorPath ? { extraFileDescriptor: descriptor } : {}),
+    });
+    if (!stableSnapshotDescriptorState(target, descriptor, entry.snapshot.identity)) {
+      throw new Error(errorMessage);
+    }
+    const reportedPath = descriptorPath
+      ? path.basename(descriptorPath)
+      : entry.manifest.path;
+    const normalized = normalizeTrackedFindings(result, reportedPath);
+    const logicalPath = options.label
+      ? `${options.label}/${entry.manifest.path}`
+      : entry.manifest.path;
+    assertRepositoryRelativePath(logicalPath);
+    findings = [];
+    for (let index = 0; index < normalized.length; index += 1) {
+      findings[index] = INTRINSIC_OBJECT_FREEZE({
+        ...normalized[index],
+        path: logicalPath,
+      });
+    }
+    findings = INTRINSIC_OBJECT_FREEZE(findings);
+    completed = true;
+  } catch {
+    completed = false;
+  }
+  if (descriptor !== undefined) {
+    try {
+      fs.closeSync(descriptor);
+    } catch {
+      completed = false;
+    }
+  }
+  if (!completed) throw new Error(errorMessage);
+  return findings;
 }
 
 function scanSnapshotEntriesSync(
@@ -1621,16 +1998,16 @@ function safeInteger(value, field) {
 }
 
 function normalizeReportedPath(value, scanRoot, label, logicalPath) {
-  if (typeof value !== "string" || value.length === 0 || value.length > 1000
-    || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) {
-    throw new Error("Gitleaks safe report contains an invalid file location.");
-  }
   if (logicalPath !== undefined) {
-    if (!new Set(["-", "stdin"]).has(value)) {
+    if (typeof value !== "string" || !new Set(["", "-", "stdin"]).has(value)) {
       throw new Error("Gitleaks stdin report contains an invalid file location.");
     }
     assertRepositoryRelativePath(logicalPath);
     return label ? `${label}/${logicalPath}` : logicalPath;
+  }
+  if (typeof value !== "string" || value.length === 0 || value.length > 1000
+    || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) {
+    throw new Error("Gitleaks safe report contains an invalid file location.");
   }
   const normalizedValue = normalizePath(value);
   let relative = normalizedValue;
@@ -1740,6 +2117,9 @@ function scanWithGitleaks(kind, target, options = {}) {
       cwd: root,
       env: privateScannerEnvironment(options.environment, scannerHome),
       ...(kind === "stdin" ? { input: options.input } : {}),
+      ...(Number.isSafeInteger(options.extraFileDescriptor)
+        ? { extraFileDescriptor: options.extraFileDescriptor }
+        : {}),
     });
     if (result.error || result.signal || !new Set([0, 1]).has(result.status)) {
       throw new Error("Gitleaks failed closed before producing a trustworthy result.");
@@ -1793,7 +2173,7 @@ function scanTrackedSourceSync(root, entry, scan, options) {
     if (scanFailed) {
       throw new Error("Tracked-file scanner failed closed on exact captured bytes.");
     }
-    return normalizeTrackedFindings(scanResult, entry.path);
+    return classifyTrackedFindings(scanResult, entry);
   } finally {
     wipeTrackedBuffer(scannerBytes);
   }
@@ -1806,15 +2186,19 @@ function scanTracked(root, options = {}) {
     assertStableTrackedSources(root, inventory, options);
     const scan = options.scanWithGitleaks || scanWithGitleaks;
     const findings = [];
+    let reviewedFixtureFindingCount = 0;
     for (let index = 0; index < inventory.sources.length; index += 1) {
-      const sourceFindings = scanTrackedSourceSync(
+      const sourceResult = scanTrackedSourceSync(
         root,
         inventory.sources[index],
         scan,
         options,
       );
-      for (let findingIndex = 0; findingIndex < sourceFindings.length; findingIndex += 1) {
-        findings[findings.length] = sourceFindings[findingIndex];
+      reviewedFixtureFindingCount += sourceResult.reviewedFixtureFindingCount;
+      for (let findingIndex = 0;
+        findingIndex < sourceResult.findings.length;
+        findingIndex += 1) {
+        findings[findings.length] = sourceResult.findings[findingIndex];
       }
     }
     assertStableTrackedSources(root, inventory, options);
@@ -1827,6 +2211,10 @@ function scanTracked(root, options = {}) {
       status: "scanned",
       fileCount: inventory.sources.length,
       omittedDeletedFileCount: inventory.deleted.length,
+      ...(reviewedFixtureFindingCount > 0 ? { reviewedFixtureFindingCount } : {}),
+      ...(reviewedFixtureFindingCount > 0
+        ? { reviewedFixturePolicyId: REVIEWED_SYNTHETIC_FIXTURE_POLICY }
+        : {}),
       findings: INTRINSIC_OBJECT_FREEZE(findings),
     };
   } finally {
@@ -1909,6 +2297,118 @@ function scanGeneratedEvidence(root, relativeDirectory, options = {}) {
   }
 }
 
+async function scanGeneratedQualityEvidenceWithVsix(root, options = {}, boundaryOptions = {}) {
+  const excludedPrefixes = boundaryOptions.excludedPrefixes || [];
+  const excludedFiles = boundaryOptions.excludedFiles || [];
+  const boundary = { excludedPrefixes, excludedFiles };
+  const inventory = captureGeneratedInventory(root, boundary);
+  const vsixPaths = new Set();
+  const dynamicVsixFiles = [];
+  for (let index = 0; index < inventory.vsix.length; index += 1) {
+    const relativePath = inventory.vsix[index].path;
+    vsixPaths.add(relativePath);
+    dynamicVsixFiles[dynamicVsixFiles.length] = relativePath;
+  }
+  const nonVsixInventory = [];
+  for (let index = 0; index < inventory.files.length; index += 1) {
+    const entry = inventory.files[index];
+    if (!vsixPaths.has(entry.path)) {
+      nonVsixInventory[nonVsixInventory.length] = entry;
+    }
+  }
+  const scanGenerated = options.scanGeneratedEvidence || scanGeneratedEvidence;
+  const generated = await scanGenerated(root, ".quality", {
+    ...options,
+    id: options.id || "generated-quality-evidence",
+    excludedPrefixes,
+    excludedFiles: [...excludedFiles, ...dynamicVsixFiles],
+    expectedInventory: nonVsixInventory,
+  });
+  const errorMessage = "Generated qualification scanner returned invalid findings.";
+  const generatedFields = exactPlainDataObject(generated, [
+    "fileCount", "findings", "id", "snapshotManifest", "status",
+  ]);
+  const expectedGeneratedStatus = nonVsixInventory.length === 0
+    ? "not-present"
+    : "scanned";
+  if (!generatedFields
+    || generatedFields.id.value !== (options.id || "generated-quality-evidence")
+    || generatedFields.status.value !== expectedGeneratedStatus
+    || generatedFields.fileCount.value !== nonVsixInventory.length) {
+    throw new Error(errorMessage);
+  }
+  exactGeneratedSnapshotManifest(
+    generatedFields.snapshotManifest.value,
+    nonVsixInventory,
+    errorMessage,
+  );
+  const findings = [...exactValueBlindFindings(
+    generatedFields.findings.value,
+    errorMessage,
+  )];
+  if (findings.length > MAX_TRACKED_FILES) {
+    throw new Error("Generated qualification findings exceeded their safety bound.");
+  }
+  let fileCount = generatedFields.fileCount.value;
+  const scanCandidate = options.scanVsix || scanVsix;
+  for (let index = 0; index < inventory.vsix.length; index += 1) {
+    const entry = inventory.vsix[index];
+    const component = await scanCandidate(root, entry.path, {
+      ...options,
+      expectedVsixIdentity: entry.identity,
+    });
+    const componentFields = exactPlainDataObject(component, [
+      "fileCount", "findings", "id", "snapshot", "status",
+    ]);
+    const snapshotFields = componentFields
+      ? exactPlainDataObject(componentFields.snapshot.value, [
+        "identity", "path", "sha256",
+      ])
+      : null;
+    if (!componentFields
+      || componentFields.id.value !== `vsix:${entry.path}`
+      || componentFields.status.value !== "scanned"
+      || !INTRINSIC_NUMBER_IS_SAFE_INTEGER(componentFields.fileCount.value)
+      || componentFields.fileCount.value <= 0
+      || componentFields.fileCount.value > MAX_VSIX_ENTRIES + 1
+      || !snapshotFields
+      || snapshotFields.path.value !== entry.path
+      || !exactExpectedFileIdentity(snapshotFields.identity.value, entry.identity)
+      || typeof snapshotFields.sha256.value !== "string"
+      || !INTRINSIC_REFLECT_APPLY(
+        INTRINSIC_REGEXP_TEST,
+        /^[a-f0-9]{64}$/u,
+        [snapshotFields.sha256.value],
+      )) {
+      throw new Error(errorMessage);
+    }
+    const componentFindings = exactValueBlindFindings(
+      componentFields.findings.value,
+      errorMessage,
+    );
+    if (findings.length + componentFindings.length > MAX_TRACKED_FILES) {
+      throw new Error("Generated qualification findings exceeded their safety bound.");
+    }
+    findings.push(...componentFindings);
+    fileCount += componentFields.fileCount.value;
+    if (!INTRINSIC_NUMBER_IS_SAFE_INTEGER(fileCount)
+      || fileCount > MAX_GENERATED_VSIX_SCANNED_ITEMS) {
+      throw new Error("Generated qualification VSIX scan exceeded its safety bound.");
+    }
+  }
+  const assertStable = () => assertStableGeneratedInventory(root, inventory, boundary);
+  assertStable();
+  return Object.freeze({
+    assertStable,
+    component: {
+      id: options.id || "generated-quality-evidence",
+      status: fileCount === 0 ? "not-present" : "scanned",
+      fileCount,
+      findings: INTRINSIC_OBJECT_FREEZE(findings),
+    },
+  });
+}
+
 function uploadCandidateSnapshotEntries(snapshot) {
   const specifications = [
     {
@@ -1954,18 +2454,27 @@ async function scanUploadCandidateSnapshot(root, snapshot, options = {}) {
           entry.maximumBytes,
           "Upload-eligible UI candidate snapshot changed during secret scanning.",
         );
-        rawFindings.push(...await scanProvenBytes(
-          scan,
-          entry.manifest.path,
-          provenBytes,
-          {
-            ...options,
-            root,
-            scanRoot: snapshot.candidateRoot,
-            label: "ui-candidate::raw",
-          },
-          "Upload-eligible UI candidate scanner returned invalid findings.",
-        ));
+        const scanOptions = {
+          ...options,
+          root,
+          scanRoot: snapshot.candidateRoot,
+          label: "ui-candidate::raw",
+        };
+        rawFindings.push(...await (entry.manifest.path === archiveName
+          ? scanSnapshotEntryDescriptor(
+            scan,
+            snapshot.candidateRoot,
+            entry,
+            scanOptions,
+            "Upload-eligible UI candidate scanner returned invalid findings.",
+          )
+          : scanProvenBytes(
+            scan,
+            entry.manifest.path,
+            provenBytes,
+            scanOptions,
+            "Upload-eligible UI candidate scanner returned invalid findings.",
+          )));
         if (entry.manifest.path === archiveName) {
           archiveBytes = provenBytes;
           provenBytes = undefined;
@@ -2030,26 +2539,48 @@ async function scanUploadCandidateSnapshot(root, snapshot, options = {}) {
   }
 }
 
-async function scanUploadEligibleEvidenceFromSnapshot(root, snapshot, options = {}) {
-  const scanGenerated = options.scanGeneratedEvidence || scanGeneratedEvidence;
-  const components = [scanGenerated(root, ".quality", {
+async function scanUploadEligibleEvidenceFromSnapshot(
+  root,
+  snapshot,
+  options = {},
+  mode = "evidence",
+) {
+  const exactExclusions = snapshot.signedOut
+    ? SIGNED_OUT_UI_SCAN_EXCLUSIONS
+    : UI_CANDIDATE_SCAN_EXCLUSIONS;
+  const generated = await scanGeneratedQualityEvidenceWithVsix(root, {
     ...options,
     id: "generated-quality-evidence",
-    excludedPrefixes: snapshot.signedOut
-      ? SIGNED_OUT_UI_SCAN_EXCLUSIONS
-      : UI_CANDIDATE_SCAN_EXCLUSIONS,
-  })];
+  }, {
+    excludedFiles: [
+      ...exactExclusions,
+      `${OUTPUT_ROOT}/${mode}.json`,
+      ...(snapshot.signedOut ? SIGNED_OUT_BUNDLE_OUTPUT_FILES : []),
+    ],
+  });
+  const components = [generated.component];
   assertStableUploadCandidateSnapshot(snapshot);
   const candidate = await scanUploadCandidateSnapshot(root, snapshot, options);
   if (candidate) components.push(candidate);
+  generated.assertStable();
   assertStableUploadCandidateSnapshot(snapshot);
-  return components;
+  return Object.freeze({
+    assertStableGenerated: generated.assertStable,
+    components: Object.freeze(components),
+  });
 }
 
 async function scanUploadEligibleEvidence(root, options = {}) {
   const snapshot = captureUploadCandidateSnapshot(root, options);
   try {
-    return await scanUploadEligibleEvidenceFromSnapshot(root, snapshot, options);
+    const result = await scanUploadEligibleEvidenceFromSnapshot(
+      root,
+      snapshot,
+      options,
+      "evidence",
+    );
+    result.assertStableGenerated();
+    return result.components;
   } finally {
     destroyUploadCandidateSnapshot(snapshot);
   }
@@ -2253,10 +2784,13 @@ async function scanVsix(root, relativePath, options = {}) {
       MAX_VSIX_TOTAL_BYTES,
       "VSIX secret scan snapshot changed or became unsafe.",
     );
-    const archiveFindings = await scanProvenBytes(
+    const archiveFindings = await scanSnapshotEntryDescriptor(
       scan,
-      path.basename(snapshot.target),
-      archiveBytes,
+      candidateRoot,
+      {
+        manifest: { path: path.basename(snapshot.target) },
+        snapshot: snapshot.snapshot,
+      },
       {
         ...options,
         root,
@@ -2336,12 +2870,46 @@ async function scanArtifacts(root, options = {}) {
 }
 
 function scanHistory(root, options = {}) {
-  const findings = scanWithGitleaks("git", root, {
+  const scannedFindings = scanWithGitleaks("git", root, {
     ...options,
     root,
     scanRoot: root,
   });
-  return { id: "git-history-all-refs", status: "scanned", fileCount: null, findings };
+  const findings = [];
+  let reviewedFirstSlot = false;
+  let reviewedSecondSlot = false;
+  for (let index = 0; index < scannedFindings.length; index += 1) {
+    const finding = scannedFindings[index];
+    if (!isReviewedSyntheticHistoryFinding(finding)) {
+      findings[findings.length] = finding;
+      continue;
+    }
+    if (finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_FIRST_LINE) {
+      if (reviewedFirstSlot) {
+        throw new Error("Reviewed synthetic history-finding policy is ambiguous.");
+      }
+      reviewedFirstSlot = true;
+    } else {
+      if (reviewedSecondSlot) {
+        throw new Error("Reviewed synthetic history-finding policy is ambiguous.");
+      }
+      reviewedSecondSlot = true;
+    }
+  }
+  if (reviewedFirstSlot !== reviewedSecondSlot) {
+    throw new Error("Reviewed synthetic history-finding policy is incomplete.");
+  }
+  const reviewedFixtureFindingCount = reviewedFirstSlot ? 2 : 0;
+  return {
+    id: "git-history-all-refs",
+    status: "scanned",
+    fileCount: null,
+    ...(reviewedFixtureFindingCount > 0 ? { reviewedFixtureFindingCount } : {}),
+    ...(reviewedFixtureFindingCount > 0
+      ? { reviewedFixturePolicyId: REVIEWED_SYNTHETIC_FIXTURE_POLICY }
+      : {}),
+    findings: INTRINSIC_OBJECT_FREEZE(findings),
+  };
 }
 
 function safeUploadCandidateEvidence(value) {
@@ -2380,6 +2948,12 @@ function resultDocument(mode, sourceSha, components, now = new Date(), options =
       findingCount: component.findings.length,
       ...(Number.isInteger(component.omittedDeletedFileCount)
         ? { omittedDeletedFileCount: component.omittedDeletedFileCount }
+        : {}),
+      ...(Number.isInteger(component.reviewedFixtureFindingCount)
+        ? { reviewedFixtureFindingCount: component.reviewedFixtureFindingCount }
+        : {}),
+      ...(component.reviewedFixturePolicyId === REVIEWED_SYNTHETIC_FIXTURE_POLICY
+        ? { reviewedFixturePolicyId: REVIEWED_SYNTHETIC_FIXTURE_POLICY }
         : {}),
     })),
     findings,
@@ -2616,7 +3190,19 @@ function stageSignedOutBundle(root, snapshot, result, options = {}) {
   }
 }
 
-async function finalizeScanResult(root, mode, sourceSha, components, snapshot, options) {
+async function finalizeScanResult(
+  root,
+  mode,
+  sourceSha,
+  components,
+  snapshot,
+  options,
+  assertStableCurrent = null,
+) {
+  const assertStable = () => {
+    if (assertStableCurrent) assertStableCurrent();
+  };
+  assertStable();
   const baseResult = resultDocument(
     mode,
     sourceSha,
@@ -2627,57 +3213,74 @@ async function finalizeScanResult(root, mode, sourceSha, components, snapshot, o
   const result = options.signedOutBundle
     ? signedOutBundleResult(baseResult, snapshot)
     : baseResult;
+  assertStable();
   if (snapshot) assertStableUploadCandidateSnapshot(snapshot);
   if (options.signedOutBundle) assertStableSignedOutSource(snapshot, options);
   const writer = options.writeReceipt || (options.outputPath
     ? value => writeJson(options.outputPath, value, root)
     : null);
-  if (writer) {
-    try {
+  try {
+    if (writer) {
+      assertStable();
       await writer(result);
+      assertStable();
       if (snapshot) assertStableUploadCandidateSnapshot(snapshot);
       if (options.signedOutBundle) assertStableSignedOutSource(snapshot, options);
-      if (options.signedOutBundle) {
-        if (result.status === "passed") stageSignedOutBundle(root, snapshot, result, options);
-        else removeSignedOutBundleStage(root);
-      }
-    } catch (error) {
-      if (options.outputPath) {
-        try {
-          removeOutputFile(options.outputPath, root);
-        } catch {
-          throw new Error("Secret scan receipt cleanup failed after candidate drift.");
-        }
-      }
-      if (options.signedOutBundle) {
-        try {
-          removeSignedOutBundleStage(root);
-        } catch {
-          throw new Error("Signed-out UI bundle cleanup failed after evidence drift.");
-        }
-      }
-      throw error;
     }
-  } else if (options.signedOutBundle) {
-    if (result.status === "passed") stageSignedOutBundle(root, snapshot, result, options);
-    else removeSignedOutBundleStage(root);
+    if (options.signedOutBundle) {
+      if (result.status === "passed") stageSignedOutBundle(root, snapshot, result, options);
+      else removeSignedOutBundleStage(root);
+      assertStable();
+      assertStableUploadCandidateSnapshot(snapshot);
+      assertStableSignedOutSource(snapshot, options);
+    }
+    assertStable();
+    return result;
+  } catch (error) {
+    if (options.outputPath) {
+      try {
+        removeOutputFile(options.outputPath, root);
+      } catch {
+        throw new Error("Secret scan receipt cleanup failed after candidate drift.");
+      }
+    }
+    if (options.signedOutBundle) {
+      try {
+        removeSignedOutBundleStage(root);
+      } catch {
+        throw new Error("Signed-out UI bundle cleanup failed after evidence drift.");
+      }
+    }
+    throw error;
   }
-  return result;
 }
 
 async function scanComponents(root, mode, sourceSha, snapshot, options) {
   const components = [];
+  let assertStableCurrent = null;
   if (mode === "current" || mode === "all") {
     components.push(scanTracked(root, options));
   }
   if (mode === "evidence" || mode === "all") {
-    components.push(...await scanUploadEligibleEvidenceFromSnapshot(root, snapshot, options));
+    const evidence = await scanUploadEligibleEvidenceFromSnapshot(
+      root,
+      snapshot,
+      options,
+      mode,
+    );
+    components.push(...evidence.components);
+    assertStableCurrent = evidence.assertStableGenerated;
+    assertStableCurrent();
   } else if (mode === "current") {
-    components.push(scanGeneratedEvidence(root, ".quality", {
+    const generated = await scanGeneratedQualityEvidenceWithVsix(root, {
       ...options,
       id: "generated-quality-evidence",
-      excludedPrefixes: [OUTPUT_ROOT],
-    }));
+    }, {
+      excludedFiles: [`${OUTPUT_ROOT}/current.json`],
+    });
+    components.push(generated.component);
+    assertStableCurrent = generated.assertStable;
+    assertStableCurrent();
   }
   if (options.includeLocalEvidence) {
     components.push(scanGeneratedEvidence(root, "internal_docs/quality", {
@@ -2689,7 +3292,15 @@ async function scanComponents(root, mode, sourceSha, snapshot, options) {
     components.push(...await scanArtifacts(root, options));
   }
   if (mode === "history" || mode === "all") components.push(scanHistory(root, options));
-  return finalizeScanResult(root, mode, sourceSha, components, snapshot, options);
+  return finalizeScanResult(
+    root,
+    mode,
+    sourceSha,
+    components,
+    snapshot,
+    options,
+    assertStableCurrent,
+  );
 }
 
 async function executeScan(options = {}) {
@@ -2757,6 +3368,8 @@ module.exports = {
   destroyUploadCandidateSnapshot,
   executeScan,
   extractVsix,
+  isReviewedSyntheticHistoryFinding,
+  isReviewedSyntheticTrackedFinding,
   parseArguments,
   parseSafeReport,
   resultDocument,
