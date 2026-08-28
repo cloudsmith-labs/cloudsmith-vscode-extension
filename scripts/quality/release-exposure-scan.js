@@ -95,6 +95,10 @@ const PRESERVED_GATE_EXPECTED_PATHS = Object.freeze(PRESERVED_GATE_PROFILES.flat
   ...PRESERVED_GATE_RECEIPT_PATHS[profile],
 ]));
 const INTENTIONALLY_VARIANT_SUPERSEDED_ARTIFACT_STEPS = new Set([
+  // Stryker emits concurrently completed mutant results in run-dependent order.
+  // The summary intentionally binds those exact raw report bytes, so repeated
+  // valid runs can differ while the latest owner remains exact-byte validated.
+  "changed-mutation",
   "quality-report",
   "secret-artifacts",
   "secret-current",

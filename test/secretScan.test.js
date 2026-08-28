@@ -8,9 +8,10 @@ const os = require("os");
 const path = require("path");
 const yazl = require("yazl");
 const { writeJson } = require("../scripts/quality/common");
-const { fingerprint } = require("../scripts/quality/evidence");
+const { aggregateStatuses, fingerprint } = require("../scripts/quality/evidence");
 const {
   artifactFingerprintForStep,
+  gatePlanFingerprint,
   getGatePlan,
   receiptPath,
 } = require("../scripts/quality/gate");
@@ -58,6 +59,7 @@ const {
   RELEASE_COMPONENT_IDS,
   RELEASE_GATE_CIRCULAR_PATHS,
   RELEASE_GATE_EXPECTED_PATHS,
+  assertExactReleaseGateTree,
   buildReleaseExposureResult,
   captureGeneratedEvidenceManifest,
   executeReleaseExposureScan,
@@ -513,6 +515,66 @@ function writeReleaseProgressAtSecretScan(root, source) {
     });
   }
   return plan;
+}
+
+function writePreservedFullGateFromRelease(root, source) {
+  const releasePlan = getGatePlan("release");
+  const releaseReceipts = new Map(releasePlan.map(step => {
+    const relativePath = receiptPath({
+      profile: "release",
+      sequence: step.sequence,
+      stepId: step.id,
+    });
+    return [
+      step.id,
+      JSON.parse(fs.readFileSync(path.join(root, ...relativePath.split("/")), "utf8")),
+    ];
+  }));
+  const plan = getGatePlan("full");
+  const receipts = plan.map(step => {
+    const releaseReceipt = releaseReceipts.get(step.id);
+    const completion = releaseReceipt.status === "not-run" ? {
+      status: "passed",
+      exitCode: 0,
+      reason: null,
+      outputFingerprint: crypto.createHash("sha256").update(step.id).digest("hex"),
+      testEvidence: null,
+      testEvidenceFingerprint: null,
+      artifactFingerprint: step.artifactPath || step.artifactPaths
+        ? crypto.createHash("sha256").update(`${step.id}-artifact`).digest("hex")
+        : null,
+    } : {};
+    return {
+      ...releaseReceipt,
+      ...completion,
+      profile: "full",
+      sequence: step.sequence,
+      stepId: step.id,
+      category: step.category,
+      command: step.command,
+    };
+  });
+  for (const receipt of receipts) {
+    writeJson(receiptPath(receipt), receipt, root, {
+      subtree: ".quality/gates/full",
+    });
+  }
+  const summary = {
+    schemaVersion: 1,
+    profile: "full",
+    source,
+    status: aggregateStatuses(receipts.map(receipt => receipt.status)),
+    planFingerprint: gatePlanFingerprint(plan),
+    steps: receipts,
+  };
+  summary.key = {
+    sha: source.sha,
+    fingerprint: fingerprint(summary),
+  };
+  writeJson(".quality/gates/full.json", summary, root, {
+    subtree: ".quality/gates",
+  });
+  return { plan, receipts };
 }
 
 function makeTreeRemovable(root) {
@@ -3353,6 +3415,59 @@ suite("secret exposure gate", () => {
       () => generatedEvidenceInventory(scratch, { source: fixture.source }),
       /unexpected, stale, or unsafe entry/u,
     );
+  });
+
+  test("preserved mutation reruns may vary without relaxing current or stable artifact binding", () => {
+    for (const testCase of [
+      { stepId: "changed-mutation", accepted: true },
+      { stepId: "change-impact", accepted: false },
+    ]) {
+      const caseRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+        scratch,
+        `${testCase.stepId}-variant-`,
+      )));
+      const fixture = createReleaseExposureFixture(caseRoot);
+      const releasePlan = writeReleaseProgressAtSecretScan(caseRoot, fixture.source);
+      const preserved = writePreservedFullGateFromRelease(caseRoot, fixture.source);
+      const step = releasePlan.find(item => item.id === testCase.stepId);
+      const preservedReceipt = preserved.receipts.find(item => item.stepId === testCase.stepId);
+      const artifactTarget = path.join(caseRoot, ...step.artifactPath.split("/"));
+      fs.writeFileSync(
+        artifactTarget,
+        `synthetic ${testCase.stepId} artifact from a distinct owner-bound rerun\n`,
+      );
+      const releaseReceiptPath = receiptPath({
+        profile: "release",
+        sequence: step.sequence,
+        stepId: step.id,
+      });
+      const releaseReceipt = JSON.parse(fs.readFileSync(
+        path.join(caseRoot, ...releaseReceiptPath.split("/")),
+        "utf8",
+      ));
+      releaseReceipt.artifactFingerprint = artifactFingerprintForStep(step, caseRoot);
+      writeJson(releaseReceiptPath, releaseReceipt, caseRoot, {
+        subtree: ".quality/gates/release",
+      });
+      assert.strictEqual(preservedReceipt.status, "passed");
+      assert.strictEqual(releaseReceipt.status, "passed");
+      assert.notStrictEqual(
+        preservedReceipt.artifactFingerprint,
+        releaseReceipt.artifactFingerprint,
+      );
+
+      if (testCase.accepted) {
+        assert.strictEqual(assertExactReleaseGateTree(
+          caseRoot,
+          { source: fixture.source },
+        ), true);
+        fs.writeFileSync(artifactTarget, "synthetic post-receipt owner tamper\n");
+      }
+      assert.throws(
+        () => assertExactReleaseGateTree(caseRoot, { source: fixture.source }),
+        /unexpected, stale, or unsafe entry/u,
+      );
+    }
   });
 
   test("exact circular report outputs cannot hide rogue descendants", () => {
