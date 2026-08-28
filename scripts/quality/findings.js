@@ -81,9 +81,22 @@ function deriveReleaseBlocking(finding, workflow = null) {
   return false;
 }
 
-function validateFindings(findings, schema, taxonomy, root = ROOT) {
+function validateFindings(
+  findings,
+  schema,
+  taxonomy,
+  root = ROOT,
+  ancestorValidator = isAncestorCommit
+) {
   const errors = [];
   const ids = new Set();
+  const ancestryResults = new Map();
+  const validateAncestor = (candidateRoot, sha) => {
+    if (!ancestryResults.has(sha)) {
+      ancestryResults.set(sha, ancestorValidator(candidateRoot, sha));
+    }
+    return ancestryResults.get(sha);
+  };
   let workflows = null;
   try {
     workflows = readJson("quality/critical-workflows.json", root);
@@ -97,7 +110,8 @@ function validateFindings(findings, schema, taxonomy, root = ROOT) {
       taxonomy,
       index + 1,
       root,
-      workflows
+      workflows,
+      validateAncestor
     ));
     if (!requireNonEmptyString(finding?.id)) return;
     if (ids.has(finding.id)) errors.push(`Duplicate finding ID: ${finding.id}.`);
@@ -112,7 +126,8 @@ function validateFindingRecord(
   taxonomy,
   line = 1,
   root = ROOT,
-  workflowsDocument = null
+  workflowsDocument = null,
+  validateAncestor = isAncestorCommit
 ) {
   const errors = [];
   const label = requireNonEmptyString(finding?.id) ? finding.id : `line ${line}`;
@@ -210,7 +225,7 @@ function validateFindingRecord(
     }
     if (!/^[a-f0-9]{7,40}$/u.test(finding.fixedSha || "")) {
       errors.push(`Finding ${label} deterministic fix requires a fixed SHA.`);
-    } else if (!isAncestorCommit(root, finding.fixedSha)) {
+    } else if (!validateAncestor(root, finding.fixedSha)) {
       errors.push(`Finding ${label} fixed SHA is not an ancestor of the current candidate.`);
     }
     if (!["mutation-killed", "not-applicable"].includes(finding.mutationProof?.status)) {

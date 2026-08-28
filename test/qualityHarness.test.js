@@ -5845,7 +5845,7 @@ suite("Release checklist and deterministic quality report", () => {
   });
 
   test("rejects stale live status after a source-bound release checklist receipt passed", function () {
-    this.timeout(60000);
+    this.timeout(30000);
     const plan = getGatePlan("release");
     const liveQualification = validLiveStatus();
     const common = {
@@ -6268,6 +6268,44 @@ suite("Release checklist and deterministic quality report", () => {
     assert.ok(unprovenNonIssue.some(error => /protecting regression test/u.test(error)));
     assert.ok(unprovenNonIssue.some(error => /completed mutation disposition/u.test(error)));
     assert.ok(unprovenNonIssue.some(error => /completed live disposition/u.test(error)));
+  });
+
+  test("checks each unique fixed finding SHA once per ledger validation", () => {
+    const schema = require("../quality/finding.schema.json");
+    const taxonomy = require("../quality/defect-taxonomy.json");
+    const fixedSha = "a".repeat(40);
+    const fixed = {
+      severity: "P2",
+      domain: "test-harness",
+      status: "closed",
+      deterministicStatus: "fixed",
+      liveStatus: "not-required",
+      rootCauseStatus: "proven",
+      rootCause: "Repeated findings referenced one already validated commit.",
+      regressionTest: "checks each unique fixed finding SHA once per ledger validation",
+      mutationProof: { status: "not-applicable", summary: "Not applicable." },
+      fixedSha,
+      releaseBlocking: false,
+    };
+    let ancestryChecks = 0;
+    const errors = validateFindings(
+      [
+        validFinding({ ...fixed, id: "QH-901" }),
+        validFinding({ ...fixed, id: "QH-902" }),
+      ],
+      schema,
+      taxonomy,
+      root,
+      (candidateRoot, candidateSha) => {
+        ancestryChecks += 1;
+        assert.strictEqual(candidateRoot, root);
+        assert.strictEqual(candidateSha, fixedSha);
+        return true;
+      }
+    );
+
+    assert.deepStrictEqual(errors, []);
+    assert.strictEqual(ancestryChecks, 1);
   });
 
   test("resolves finding evidence through the repository path boundary", function () {
