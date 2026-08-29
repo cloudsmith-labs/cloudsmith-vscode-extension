@@ -906,6 +906,90 @@ suite("secret exposure gate", () => {
     assert.strictEqual(result.findings[0].path, "extension.js");
   });
 
+  test("history classification recognizes only the exact reviewed legacy location set", async () => {
+    const synthetic = line => ({
+      ruleId: "generic-api-key",
+      file: "test/qualityHarness.test.js",
+      startLine: line,
+      endLine: line,
+      commit: "8e54acd0430a7c1e9f6598d982e245afc5ef94a4",
+    });
+    const legacy = [
+      {
+        ruleId: "generic-api-key",
+        file: "extension.js",
+        startLine: 3,
+        endLine: 3,
+        commit: "53877432410e6b2d0264ff8bc524d04841efe2f9",
+      },
+      {
+        ruleId: "generic-api-key",
+        file: "extension.js",
+        startLine: 12,
+        endLine: 12,
+        commit: "7095cd8f31202971b3743cdf4ac7ee8db7915958",
+      },
+      {
+        ruleId: "generic-api-key",
+        file: "functions/cloudsmith_apis.js",
+        startLine: 1,
+        endLine: 1,
+        commit: "961205b2351ce166d54bcc11941e29a906ae2a0d",
+      },
+    ];
+    const run = findings => executeScan({
+      root: path.resolve(__dirname, ".."),
+      mode: "history",
+      assertScannerVersion() {},
+      currentHead() {
+        return "a".repeat(40);
+      },
+      execute() {
+        return {
+          status: 1,
+          signal: null,
+          error: null,
+          stdout: JSON.stringify([synthetic(1731), synthetic(3567), ...findings]),
+          stderr: "",
+        };
+      },
+    });
+    const result = await run(legacy);
+    assert.strictEqual(result.status, "passed");
+    assert.strictEqual(result.findingCount, 0);
+    assert.strictEqual(result.components[0].reviewedLegacyHistoryFindingCount, 3);
+    assert.strictEqual(
+      result.components[0].reviewedLegacyHistoryPolicyId,
+      "reviewed-disposable-credential-history-v1",
+    );
+    await assert.rejects(
+      () => run(legacy.slice(0, 2)),
+      /reviewed legacy history-finding policy is incomplete/iu,
+    );
+    const shifted = legacy.map(item => ({ ...item }));
+    shifted[2].startLine = 2;
+    shifted[2].endLine = 2;
+    await assert.rejects(
+      () => run(shifted),
+      /reviewed legacy history-finding policy is incomplete/iu,
+    );
+    await assert.rejects(
+      () => run([...legacy, { ...legacy[0] }]),
+      /reviewed legacy history-finding policy is ambiguous/iu,
+    );
+    const additional = {
+      ruleId: "generic-api-key",
+      file: "commands/packages.js",
+      startLine: 50,
+      endLine: 50,
+      commit: "b".repeat(40),
+    };
+    const retained = await run([...legacy, additional]);
+    assert.strictEqual(retained.status, "failed");
+    assert.strictEqual(retained.findingCount, 1);
+    assert.strictEqual(retained.findings[0].path, additional.file);
+  });
+
   test("runs the scanner with a separate private HOME and XDG boundary", () => {
     const target = path.join(scratch, "target-private-home");
     fs.mkdirSync(target);

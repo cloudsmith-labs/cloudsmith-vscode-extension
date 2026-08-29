@@ -15,6 +15,7 @@ const {
   removeIsolatedQualificationRoot,
   sanitizeQualificationEnvironment,
 } = require("./testInventories");
+const { testPlan } = require("../scripts/run-tests");
 
 const root = path.resolve(__dirname, "..");
 const MAX_TEST_TRAVERSAL_DEPTH = 8;
@@ -72,6 +73,37 @@ suite("test runner inventories", () => {
     assert.match(nodeRunner, /STANDALONE_NODE_TESTS/);
     const combinedRunner = fs.readFileSync(path.join(root, "scripts", "run-tests.js"), "utf8");
     assert.match(combinedRunner, /CREDENTIAL_BOUNDARY_SKIP_REASON/);
+    const plan = (label, zeroProbe, runNodeTests) => testPlan({
+      label,
+      zeroProbe,
+      runNodeTests,
+    }).map(step => [step.script, [...step.args]]);
+    assert.deepStrictEqual(plan("core", false, true), [
+      ["run-node-tests.js", []],
+      ["run-vscode-tests.js", ["--label", "core"]],
+    ]);
+    assert.deepStrictEqual(plan("smoke", false, false), [
+      ["run-vscode-tests.js", ["--label", "smoke"]],
+    ]);
+    assert.deepStrictEqual(plan("smoke", false, true), [
+      ["run-node-tests.js", []],
+      ["run-vscode-tests.js", ["--label", "smoke"]],
+    ]);
+    assert.deepStrictEqual(plan("core", true, true), [
+      ["run-node-tests.js", ["--zero-probe"]],
+      ["run-vscode-tests.js", ["--label", "core", "--zero-probe"]],
+    ]);
+    assert.deepStrictEqual(plan("smoke", true, false), [
+      ["run-vscode-tests.js", ["--label", "smoke", "--zero-probe"]],
+    ]);
+    assert.deepStrictEqual(plan("smoke", true, true), [
+      ["run-node-tests.js", ["--zero-probe"]],
+      ["run-vscode-tests.js", ["--label", "smoke", "--zero-probe"]],
+    ]);
+    assert.throws(
+      () => testPlan({ label: "smoke", runNodeTests: "true" }),
+      /runNodeTests must be an exact boolean/u,
+    );
     const vscodeRunner = fs.readFileSync(path.join(root, "scripts", "run-vscode-tests.js"), "utf8");
     assert.match(vscodeRunner, /process\.execve/);
     assert.match(vscodeRunner, /exportIsolatedQualificationRoot/);

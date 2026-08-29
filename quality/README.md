@@ -279,7 +279,10 @@ value-blind authentication/exposure receipts may be uploaded; no CI profile,
 runtime-log directory, credential handoff, matched secret, or secret-derived
 digest is retained. QH-010 remains open until credential rotation or revocation
 is separately confirmed, even when every non-destructive qualification check
-passes.
+passes. The history gate recognizes only the exact immutable, value-blind
+metadata locations from the reviewed disposable-credential incident; a partially
+observed, shifted, duplicated, or additional finding still fails closed. That scanner
+classification prevents a CI sequencing deadlock and does not close QH-010.
 
 The ephemeral CI candidate proof is distinct from the persistent local
 `live-candidate` proof used for final Computer Use qualification. Release

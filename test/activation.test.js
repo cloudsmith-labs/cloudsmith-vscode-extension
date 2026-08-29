@@ -57,9 +57,18 @@ function assertCredentialAndAiInactivity(options = {}) {
 }
 
 function isWithin(candidatePath, rootPath) {
+  const canonicalCandidate = (() => {
+    try {
+      return fs.realpathSync(candidatePath);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const parent = fs.realpathSync(path.dirname(candidatePath));
+      return path.join(parent, path.basename(candidatePath));
+    }
+  })();
   const relative = path.relative(
     fs.realpathSync(rootPath),
-    fs.realpathSync(candidatePath)
+    canonicalCandidate
   );
   return relative === ""
     || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));

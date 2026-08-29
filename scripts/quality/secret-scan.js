@@ -146,6 +146,24 @@ const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_FIRST_LINE = 1731;
 const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_SECOND_LINE = 3567;
 const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_COMMIT =
   "8e54acd0430a7c1e9f6598d982e245afc5ef94a4";
+const REVIEWED_LEGACY_HISTORY_POLICY = "reviewed-disposable-credential-history-v1";
+const REVIEWED_LEGACY_HISTORY_FINDINGS = Object.freeze([
+  Object.freeze({
+    commit: "53877432410e6b2d0264ff8bc524d04841efe2f9",
+    path: "extension.js",
+    line: 3,
+  }),
+  Object.freeze({
+    commit: "7095cd8f31202971b3743cdf4ac7ee8db7915958",
+    path: "extension.js",
+    line: 12,
+  }),
+  Object.freeze({
+    commit: "961205b2351ce166d54bcc11941e29a906ae2a0d",
+    path: "functions/cloudsmith_apis.js",
+    line: 1,
+  }),
+]);
 const REVIEWED_SYNTHETIC_FIXTURE_PREFIX = Object.freeze(
   Array.from(INTRINSIC_BUFFER_FROM("      CLOUDSMITH_API_KEY: \"", "ascii"))
 );
@@ -1325,6 +1343,16 @@ function isReviewedSyntheticHistoryFinding(finding) {
     && finding.startLine === finding.endLine
     && (finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_HISTORY_FIRST_LINE
       || finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_HISTORY_SECOND_LINE);
+}
+
+function reviewedLegacyHistoryFindingIndex(finding) {
+  if (finding?.ruleId !== "generic-api-key"
+    || finding.startLine !== finding.endLine) return -1;
+  return REVIEWED_LEGACY_HISTORY_FINDINGS.findIndex(expected => (
+    finding.commit === expected.commit
+    && finding.path === expected.path
+    && finding.startLine === expected.line
+  ));
 }
 
 function classifyTrackedFindings(value, entry) {
@@ -2946,8 +2974,17 @@ function scanHistory(root, options = {}) {
   const findings = [];
   let reviewedFirstSlot = false;
   let reviewedSecondSlot = false;
+  const reviewedLegacySlots = new Set();
   for (let index = 0; index < scannedFindings.length; index += 1) {
     const finding = scannedFindings[index];
+    const legacyIndex = reviewedLegacyHistoryFindingIndex(finding);
+    if (legacyIndex >= 0) {
+      if (reviewedLegacySlots.has(legacyIndex)) {
+        throw new Error("Reviewed legacy history-finding policy is ambiguous.");
+      }
+      reviewedLegacySlots.add(legacyIndex);
+      continue;
+    }
     if (!isReviewedSyntheticHistoryFinding(finding)) {
       findings[findings.length] = finding;
       continue;
@@ -2967,7 +3004,12 @@ function scanHistory(root, options = {}) {
   if (reviewedFirstSlot !== reviewedSecondSlot) {
     throw new Error("Reviewed synthetic history-finding policy is incomplete.");
   }
+  if (reviewedLegacySlots.size > 0
+    && reviewedLegacySlots.size !== REVIEWED_LEGACY_HISTORY_FINDINGS.length) {
+    throw new Error("Reviewed legacy history-finding policy is incomplete.");
+  }
   const reviewedFixtureFindingCount = reviewedFirstSlot ? 2 : 0;
+  const reviewedLegacyHistoryFindingCount = reviewedLegacySlots.size;
   return {
     id: "git-history-all-refs",
     status: "scanned",
@@ -2975,6 +3017,12 @@ function scanHistory(root, options = {}) {
     ...(reviewedFixtureFindingCount > 0 ? { reviewedFixtureFindingCount } : {}),
     ...(reviewedFixtureFindingCount > 0
       ? { reviewedFixturePolicyId: REVIEWED_SYNTHETIC_FIXTURE_POLICY }
+      : {}),
+    ...(reviewedLegacyHistoryFindingCount > 0
+      ? { reviewedLegacyHistoryFindingCount }
+      : {}),
+    ...(reviewedLegacyHistoryFindingCount > 0
+      ? { reviewedLegacyHistoryPolicyId: REVIEWED_LEGACY_HISTORY_POLICY }
       : {}),
     findings: INTRINSIC_OBJECT_FREEZE(findings),
   };
@@ -3022,6 +3070,12 @@ function resultDocument(mode, sourceSha, components, now = new Date(), options =
         : {}),
       ...(component.reviewedFixturePolicyId === REVIEWED_SYNTHETIC_FIXTURE_POLICY
         ? { reviewedFixturePolicyId: REVIEWED_SYNTHETIC_FIXTURE_POLICY }
+        : {}),
+      ...(Number.isInteger(component.reviewedLegacyHistoryFindingCount)
+        ? { reviewedLegacyHistoryFindingCount: component.reviewedLegacyHistoryFindingCount }
+        : {}),
+      ...(component.reviewedLegacyHistoryPolicyId === REVIEWED_LEGACY_HISTORY_POLICY
+        ? { reviewedLegacyHistoryPolicyId: REVIEWED_LEGACY_HISTORY_POLICY }
         : {}),
     })),
     findings,

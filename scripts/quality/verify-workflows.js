@@ -496,17 +496,18 @@ function expectedExtensionTestsJob() {
       "fail-fast": false,
       matrix: {
         include: [
-          { os: "ubuntu-24.04", vscode: "1.99.0", label: "core" },
-          { os: "ubuntu-24.04", vscode: "1.99.0", label: "smoke" },
-          { os: "ubuntu-24.04", vscode: "1.134.0", label: "core" },
-          { os: "windows-2025", vscode: "1.134.0", label: "smoke" },
-          { os: "macos-15", vscode: "1.134.0", label: "smoke" },
+          { os: "ubuntu-24.04", vscode: "1.99.0", label: "core", "node-tests": "true" },
+          { os: "ubuntu-24.04", vscode: "1.99.0", label: "smoke", "node-tests": "false" },
+          { os: "ubuntu-24.04", vscode: "1.134.0", label: "core", "node-tests": "true" },
+          { os: "windows-2025", vscode: "1.134.0", label: "smoke", "node-tests": "true" },
+          { os: "macos-15", vscode: "1.134.0", label: "smoke", "node-tests": "true" },
         ],
       },
     },
     env: {
       VSCODE_TEST_VERSION: "${{ matrix.vscode }}",
       VSCODE_TEST_LABEL: "${{ matrix.label }}",
+      CLOUDSMITH_RUN_NODE_TESTS: "${{ matrix.node-tests }}",
     },
     steps: [
       checkoutStep("Checkout exact source", true),
@@ -521,10 +522,13 @@ function expectedExtensionTestsJob() {
         if: "runner.os == 'Windows'",
         run: "npm run package",
       },
-      { name: "Run deterministic extension suite", run: "npm test" },
+      {
+        name: "Run deterministic extension suite",
+        run: "npm test -- --extension-matrix",
+      },
       {
         name: "Prove the real test entrypoint rejects zero tests",
-        run: "npm run test:zero-guard",
+        run: "npm run test:zero-guard -- --extension-matrix",
       },
     ],
   };

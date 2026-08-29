@@ -5,6 +5,7 @@ const path = require("path");
 const {
   digestStableSingleLinkFile,
   exactFileIdentity,
+  sameExactFileIdentity,
   withStableSingleLinkFile,
 } = require("./candidate-binding");
 const {
@@ -73,16 +74,27 @@ function assertExactNodeExecutable(executable = process.execPath, options = {}) 
   try {
     const claimedTarget = exactAbsolutePath(executable, errorMessage);
     const claimedStat = fileSystem.lstatSync(claimedTarget, { bigint: true });
-    if (claimedStat.isSymbolicLink() || !claimedStat.isFile()) {
+    const claimedIsLink = claimedStat.isSymbolicLink();
+    if (!claimedIsLink && !claimedStat.isFile()) {
       throw new Error(errorMessage);
     }
+    const claimedIdentity = exactFileIdentity(claimedStat);
+    const claimedLink = claimedIsLink ? fileSystem.readlinkSync(claimedTarget) : null;
     const target = exactAbsolutePath(fileSystem.realpathSync(claimedTarget), errorMessage);
     const stat = fileSystem.lstatSync(target, { bigint: true });
+    const targetIdentity = exactFileIdentity(stat);
+    const afterClaimedStat = fileSystem.lstatSync(claimedTarget, { bigint: true });
     if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink < 1n || stat.size <= 0n
       || (process.platform !== "win32" && (stat.mode & 0o022n) !== 0n)
       || !sameFilesystemPath(fileSystem.realpathSync(target), target, platform)
-      || JSON.stringify(exactFileIdentity(claimedStat))
-        !== JSON.stringify(exactFileIdentity(stat))) {
+      || !sameExactFileIdentity(claimedIdentity, exactFileIdentity(afterClaimedStat))
+      || (claimedIsLink
+        ? fileSystem.readlinkSync(claimedTarget) !== claimedLink
+        : !sameExactFileIdentity(claimedIdentity, exactFileIdentity(stat)))) {
+      throw new Error(errorMessage);
+    }
+    const finalTargetStat = fileSystem.lstatSync(target, { bigint: true });
+    if (!sameExactFileIdentity(targetIdentity, exactFileIdentity(finalTargetStat))) {
       throw new Error(errorMessage);
     }
     return target;

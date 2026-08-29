@@ -622,7 +622,7 @@ suite("M9 release gate helpers", () => {
     });
   });
 
-  test("canonical Node binding resolves a safe ancestor link and rejects a final link", function () {
+  test("canonical Node binding resolves stable ancestor and final links but rejects replacement", function () {
     if (process.platform === "win32") this.skip();
     const realParent = fs.realpathSync(fs.mkdtempSync(path.join(
       os.tmpdir(),
@@ -640,10 +640,49 @@ suite("M9 release gate helpers", () => {
       );
       const finalLink = path.join(realParent, "bin", "node-link");
       fs.symlinkSync(executable, finalLink, "file");
+      assert.strictEqual(assertExactNodeExecutable(finalLink), executable);
+      const replacement = path.join(realParent, "bin", "replacement-node");
+      fs.writeFileSync(replacement, "synthetic replacement node runtime\n", { mode: 0o700 });
+      let replaced = false;
       assert.throws(
-        () => assertExactNodeExecutable(finalLink),
+        () => assertExactNodeExecutable(finalLink, {
+          fileSystem: {
+            ...fs,
+            realpathSync(target) {
+              const resolved = fs.realpathSync(target);
+              if (target === finalLink && !replaced) {
+                fs.unlinkSync(finalLink);
+                fs.symlinkSync(replacement, finalLink, "file");
+                replaced = true;
+              }
+              return resolved;
+            },
+          },
+        }),
         /Canonical Node\.js executable is unsafe or invalid/u,
       );
+      fs.unlinkSync(finalLink);
+      fs.symlinkSync(executable, finalLink, "file");
+      let targetReplaced = false;
+      assert.throws(
+        () => assertExactNodeExecutable(finalLink, {
+          fileSystem: {
+            ...fs,
+            realpathSync(target) {
+              const resolved = fs.realpathSync(target);
+              if (target === executable && !targetReplaced) {
+                const displaced = `${executable}.displaced`;
+                fs.renameSync(executable, displaced);
+                fs.writeFileSync(executable, "synthetic target-only replacement\n", { mode: 0o700 });
+                targetReplaced = true;
+              }
+              return resolved;
+            },
+          },
+        }),
+        /Canonical Node\.js executable is unsafe or invalid/u,
+      );
+      assert.strictEqual(targetReplaced, true);
     } finally {
       fs.rmSync(linkedParent, { force: true });
       fs.rmSync(realParent, { recursive: true, force: true });
