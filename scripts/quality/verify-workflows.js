@@ -53,6 +53,7 @@ const EXPECTED_QUALITY_SCRIPT_ENTRYPOINTS = Object.freeze({
   pretest: "npm run lint",
   "quality:fast": "node scripts/quality/gate.js fast",
   "quality:full": "node scripts/quality/gate.js full",
+  "quality:remote-ci:collect": "node scripts/quality/collect-remote-ci.js",
   "quality:qualification:launch": "node scripts/quality/prepare-qualification.js --launch",
   "quality:qualification:prepare": "node scripts/quality/prepare-qualification.js",
   "quality:qualification:prepare-authenticated-ci":
@@ -155,10 +156,13 @@ function verifyEvidenceHandoffContract(
   const gitleaksActionPath = ".github/actions/setup-gitleaks/action.yml";
   const deepWorkflowPath = ".github/workflows/deep-quality.yml";
   const workflowPath = ".github/workflows/main.yml";
+  const remoteCiSchemaPath = "quality/remote-ci.schema.json";
+  const remoteCiCollectorPath = "scripts/quality/collect-remote-ci.js";
   verifyQualityManifestEntrypoints(manifest, errors);
   let deepWorkflowTarget;
   let gitleaksActionTarget;
   let workflowTarget;
+  let remoteCiSchemaTarget;
   try {
     resolveGitVisibleRegularFile(verifierPath, repositoryFiles, root);
     resolveGitVisibleRegularFile(mutationVerifierPath, repositoryFiles, root);
@@ -173,6 +177,12 @@ function verifyEvidenceHandoffContract(
     );
     deepWorkflowTarget = resolveGitVisibleRegularFile(deepWorkflowPath, repositoryFiles, root);
     workflowTarget = resolveGitVisibleRegularFile(workflowPath, repositoryFiles, root);
+    remoteCiSchemaTarget = resolveGitVisibleRegularFile(
+      remoteCiSchemaPath,
+      repositoryFiles,
+      root,
+    );
+    resolveGitVisibleRegularFile(remoteCiCollectorPath, repositoryFiles, root);
   } catch {
     errors.push(
       "Quality evidence handoff, pinned scanner setup, and CI workflow sources must be Git-visible regular files."
@@ -186,9 +196,17 @@ function verifyEvidenceHandoffContract(
   );
   const deepWorkflow = verifiedSource(deepWorkflowPath, deepWorkflowTarget, sourceOverrides);
   const workflow = verifiedSource(workflowPath, workflowTarget, sourceOverrides);
+  const remoteCiSchema = parseCiWorkflow(verifiedSource(
+    remoteCiSchemaPath,
+    remoteCiSchemaTarget,
+    sourceOverrides,
+  ));
   const gitleaksActionDocument = parseCiWorkflow(gitleaksAction);
   const workflowDocument = parseCiWorkflow(workflow);
   const deepWorkflowDocument = parseCiWorkflow(deepWorkflow);
+  if (!validRemoteCiSchema(remoteCiSchema)) {
+    errors.push("Final-head remote CI schema must match the reviewed GitHub API evidence contract.");
+  }
   if (!isDeepStrictEqual(gitleaksActionDocument, expectedPinnedGitleaksAction())) {
     errors.push("CI secret scanning must use the exact reviewed Gitleaks release and archive digest.");
   }
@@ -267,6 +285,31 @@ function verifyEvidenceHandoffContract(
   }
 }
 
+function validRemoteCiSchema(document) {
+  return isPlainObject(document)
+    && document.$id === "https://cloudsmith.com/schemas/vscode-extension-remote-ci-receipt-v2.json"
+    && document.properties?.schemaVersion?.const === 2
+    && document.properties?.repository?.const
+      === "cloudsmith-labs/cloudsmith-vscode-extension"
+    && document.properties?.evidence?.properties?.path?.const
+      === "internal_docs/quality/remote-ci-api.json"
+    && isDeepStrictEqual(document.required, [
+      "schemaVersion", "repository", "branch", "sourceSha", "sourceFingerprint", "capturedAt",
+      "pullRequest", "runs", "evidence",
+    ])
+    && isDeepStrictEqual(document.properties?.pullRequest?.required, [
+      "number", "draft", "state", "baseRef", "headRef", "headSha", "url",
+    ])
+    && isDeepStrictEqual(document.properties?.runs?.items?.required, [
+      "workflowFile", "workflowName", "event", "runId", "runAttempt",
+      "pullRequestNumber", "headSha", "status", "conclusion", "createdAt",
+      "completedAt", "url", "jobs",
+    ])
+    && isDeepStrictEqual(document.properties?.runs?.items?.properties?.jobs?.items?.required, [
+      "id", "name", "databaseId", "status", "conclusion", "startedAt", "completedAt",
+    ]);
+}
+
 function verifyQualityManifestEntrypoints(manifest, errors) {
   for (const [name, expected] of Object.entries(EXPECTED_QUALITY_SCRIPT_ENTRYPOINTS)) {
     if (manifest?.scripts?.[name] !== expected) {
@@ -279,6 +322,7 @@ const CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90
 const SETUP_NODE_ACTION = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020";
 const UPLOAD_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 const QUALITY_BASE = "${{ github.event_name == 'push' && github.event.before || 'origin/main' }}";
+const CANDIDATE_SHA = "${{ env.CANDIDATE_SHA }}";
 
 function parseCiWorkflow(source) {
   try {
@@ -297,7 +341,10 @@ function validMainWorkflowEnvelope(document) {
       pull_request: { branches: ["main"] },
     })
     && isDeepStrictEqual(document.permissions, { contents: "read" })
-    && isDeepStrictEqual(document.env, { NODE_VERSION: "22.23.2" })
+    && isDeepStrictEqual(document.env, {
+      NODE_VERSION: "22.23.2",
+      CANDIDATE_SHA: "${{ github.event.pull_request.head.sha || github.sha }}",
+    })
     && isDeepStrictEqual(Object.keys(document.jobs || {}).sort(), [
       "build-candidate",
       "extension-tests",
@@ -312,7 +359,10 @@ function validDeepWorkflowEnvelope(document) {
     && isDeepStrictEqual(Object.keys(document).sort(), ["env", "jobs", "name", "on", "permissions"])
     && isDeepStrictEqual(document.on, { workflow_dispatch: null })
     && isDeepStrictEqual(document.permissions, { contents: "read" })
-    && isDeepStrictEqual(document.env, { NODE_VERSION: "22.23.2" })
+    && isDeepStrictEqual(document.env, {
+      NODE_VERSION: "22.23.2",
+      CANDIDATE_SHA: "${{ github.sha }}",
+    })
     && isDeepStrictEqual(Object.keys(document.jobs || {}).sort(), [
       "authenticated-production-ui",
       "core-mutation",
@@ -362,7 +412,7 @@ function expectedQualityJob() {
         if: "${{ always() && steps.quality_evidence_handoff.outcome == 'success' && steps.quality_evidence_secret_scan.outcome == 'success' }}",
         uses: UPLOAD_ACTION,
         with: {
-          name: "quality-evidence-${{ github.sha }}-${{ github.run_attempt }}",
+          name: "quality-evidence-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}",
           path: ".quality/impact.json\n.quality/gates/fast.json\n.quality/gates/fast/*.json\n.quality/report.json\n.quality/report.md\n.quality/secrets/current.json\n.quality/secrets/evidence.json\n",
           "if-no-files-found": "error",
           "include-hidden-files": true,
@@ -396,7 +446,7 @@ function expectedChangedMutationJob() {
           QUALITY_BASE,
           EXPECTED_MUTATION_EXIT_CODE: "${{ steps.mutation_run.outputs.exit_code }}",
           EXPECTED_MUTATION_OUTCOME: "${{ steps.mutation_run.outcome }}",
-          EXPECTED_SOURCE_SHA: "${{ github.sha }}",
+          EXPECTED_SOURCE_SHA: CANDIDATE_SHA,
         },
         run: "npm run quality:verify-mutation-evidence -- --base \"$QUALITY_BASE\" --expected-exit-code \"$EXPECTED_MUTATION_EXIT_CODE\" --expected-run-outcome \"$EXPECTED_MUTATION_OUTCOME\" --expected-source-sha \"$EXPECTED_SOURCE_SHA\"",
       },
@@ -405,7 +455,7 @@ function expectedChangedMutationJob() {
         if: "${{ always() && steps.mutation_evidence_handoff.outcome == 'success' }}",
         uses: UPLOAD_ACTION,
         with: {
-          name: "mutation-evidence-${{ github.sha }}-${{ github.run_attempt }}",
+          name: "mutation-evidence-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}",
           path: ".quality/mutation/summary-changed.json\n.quality/mutation/mutation.json\n",
           "if-no-files-found": "error",
           "include-hidden-files": true,
@@ -478,14 +528,14 @@ function expectedPackageJob() {
         id: "package",
         env: {
           M9_REQUIRE_CLEAN: 1,
-          M9_SOURCE_SHA: "${{ github.sha }}",
+          M9_SOURCE_SHA: CANDIDATE_SHA,
         },
         run: "npm run package -- --github-output \"$GITHUB_OUTPUT\"",
       },
       {
         name: "Re-verify artifact and sidecars before handoff",
         env: {
-          EXPECTED_SOURCE_SHA: "${{ github.sha }}",
+          EXPECTED_SOURCE_SHA: CANDIDATE_SHA,
           VSIX_PATH: "${{ steps.package.outputs.vsix_path }}",
         },
         run: "npm run package:verify -- --expected-source-sha \"$EXPECTED_SOURCE_SHA\" --require-publishable \"$VSIX_PATH\"",
@@ -498,7 +548,7 @@ function expectedPackageJob() {
         name: "Upload exact verified release inputs",
         uses: UPLOAD_ACTION,
         with: {
-          name: "vsix-${{ github.sha }}",
+          name: "vsix-${{ env.CANDIDATE_SHA }}",
           path: "${{ steps.package.outputs.vsix_path }}\n${{ steps.package.outputs.checksum_path }}\n${{ steps.package.outputs.provenance_path }}\n.quality/secrets/artifacts.json\n",
           "if-no-files-found": "error",
           "retention-days": 90,
@@ -551,7 +601,7 @@ function expectedCoreMutationJob() {
         env: {
           EXPECTED_MUTATION_EXIT_CODE: "${{ steps.mutation_run.outputs.exit_code }}",
           EXPECTED_MUTATION_OUTCOME: "${{ steps.mutation_run.outcome }}",
-          EXPECTED_SOURCE_SHA: "${{ github.sha }}",
+          EXPECTED_SOURCE_SHA: CANDIDATE_SHA,
         },
         run: "npm run quality:verify-mutation-evidence -- --mode core --expected-exit-code \"$EXPECTED_MUTATION_EXIT_CODE\" --expected-run-outcome \"$EXPECTED_MUTATION_OUTCOME\" --expected-source-sha \"$EXPECTED_SOURCE_SHA\"",
       },
@@ -560,7 +610,7 @@ function expectedCoreMutationJob() {
         if: "${{ always() && steps.mutation_evidence_handoff.outcome == 'success' }}",
         uses: UPLOAD_ACTION,
         with: {
-          name: "core-mutation-evidence-${{ github.sha }}-${{ github.run_attempt }}",
+          name: "core-mutation-evidence-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}",
           path: ".quality/mutation/summary-core.json\n.quality/mutation/mutation.json\n",
           "if-no-files-found": "error",
           "include-hidden-files": true,
@@ -583,7 +633,7 @@ function expectedCoreMutationJob() {
         if: "${{ always() }}",
         uses: UPLOAD_ACTION,
         with: {
-          name: "history-secret-receipt-${{ github.sha }}-${{ github.run_attempt }}",
+          name: "history-secret-receipt-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}",
           path: ".quality/secrets/history.json",
           "if-no-files-found": "error",
           "include-hidden-files": true,
@@ -628,7 +678,7 @@ function expectedSignedOutUiJob() {
         name: "Verify detached staged signed-out UI evidence",
         id: "ui_evidence_bundle",
         if: "${{ always() }}",
-        env: { EXPECTED_SOURCE_SHA: "${{ github.sha }}" },
+        env: { EXPECTED_SOURCE_SHA: CANDIDATE_SHA },
         run: "node scripts/quality/verify-ui-evidence.js --bundle .quality/upload/signed-out-ui",
       },
       {
@@ -636,7 +686,7 @@ function expectedSignedOutUiJob() {
         if: "${{ always() && steps.ui_evidence_handoff.outcome == 'success' && steps.ui_evidence_secret_scan.outcome == 'success' && steps.ui_evidence_bundle.outcome == 'success' }}",
         uses: UPLOAD_ACTION,
         with: {
-          name: "signed-out-ui-evidence-${{ github.sha }}-${{ github.run_attempt }}",
+          name: "signed-out-ui-evidence-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}",
           path: [
             ".quality/upload/signed-out-ui/evidence.json",
             ".quality/upload/signed-out-ui/result.json",
@@ -690,7 +740,7 @@ function expectedAuthenticatedUiJob() {
         name: "Verify exact authenticated evidence binding",
         id: "authenticated_evidence_handoff",
         if: "${{ always() }}",
-        env: { EXPECTED_SOURCE_SHA: "${{ github.sha }}" },
+        env: { EXPECTED_SOURCE_SHA: CANDIDATE_SHA },
         run: "npm run quality:verify-authenticated-evidence",
       },
       {
@@ -704,7 +754,7 @@ function expectedAuthenticatedUiJob() {
         if: "${{ always() && steps.authenticated_evidence_handoff.outcome == 'success' && steps.authenticated_evidence_secret_scan.outcome == 'success' }}",
         uses: UPLOAD_ACTION,
         with: {
-          name: "authenticated-ui-evidence-${{ github.sha }}-${{ github.run_attempt }}",
+          name: "authenticated-ui-evidence-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}",
           path: ".quality/qualification/authenticated-candidate.json\n.quality/qualification/authenticated-candidate.vsix\n.quality/qualification/authenticated-ci.json\n.quality/secrets/authenticated-ci.json\n.quality/secrets/evidence.json\n",
           "if-no-files-found": "error",
           "include-hidden-files": true,
@@ -750,7 +800,7 @@ function expectedPinnedGitleaksAction() {
 }
 
 function checkoutStep(name, history) {
-  const withOptions = { "persist-credentials": false };
+  const withOptions = { "persist-credentials": false, ref: CANDIDATE_SHA };
   if (history) withOptions["fetch-depth"] = 0;
   return { name, uses: CHECKOUT_ACTION, with: withOptions };
 }
@@ -840,6 +890,44 @@ function verifyTaxonomy(taxonomy, findingSchema, errors) {
   }
   if (findingSchema.properties?.releaseBlocking?.type !== "boolean") {
     errors.push("Finding schema releaseBlocking must be a boolean policy assertion.");
+  }
+  const evidenceLayers = new Set(taxonomy.evidenceLayers || []);
+  const policy = taxonomy.requiredEvidencePolicy;
+  if (!isPlainObject(policy)
+    || policy.derivationField !== "testLayerThatShouldHaveCaughtIt") {
+    errors.push("Defect taxonomy must derive required evidence from the escaped layer.");
+    return;
+  }
+  for (const testLayer of taxonomy.testLayers || []) {
+    const derived = policy.defaultByEscapedLayer?.[testLayer];
+    if (!Array.isArray(derived) || derived.length !== 1 || derived[0] !== testLayer) {
+      errors.push(`Defect taxonomy must default ${testLayer} to its exact finding evidence layer.`);
+    }
+  }
+  for (const layer of [
+    ...(policy.liveStatusLayers || []),
+    ...(policy.externalSecurityOverride?.requiredLayers || []),
+  ]) {
+    if (!evidenceLayers.has(layer)) {
+      errors.push(`Defect taxonomy required evidence references unknown layer ${String(layer)}.`);
+    }
+  }
+  const override = policy.externalSecurityOverride;
+  if (!isPlainObject(override)
+    || override.domain !== "security-environment"
+    || override.severity !== "P0"
+    || override.deterministicStatus !== "not-applicable"
+    || JSON.stringify(uniqueSorted(override.requiredLayers || []))
+      !== JSON.stringify(["durable-security-scan", "external-confirmation"])) {
+    errors.push("Defect taxonomy external security evidence override is invalid.");
+  }
+  if (!isPlainObject(policy.findingOverrides)
+    || JSON.stringify(policy.findingOverrides) !== JSON.stringify({
+      "QH-011": ["contract"],
+      "QH-012": ["contract"],
+      "QH-026": ["contract"],
+    })) {
+    errors.push("Defect taxonomy reviewed finding evidence overrides are invalid.");
   }
 }
 

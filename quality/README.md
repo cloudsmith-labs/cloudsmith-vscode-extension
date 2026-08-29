@@ -53,8 +53,9 @@ session is absent or expired. Automation resumes after the user confirms
 completion; it never observes password, API-key, or MFA entry.
 
 Passing deterministic gates does not attest the authenticated lane. Team-test
-readiness requires both lanes and a fresh, source-bound live attestation for
-every workflow whose `liveFixture.required` value is `true`.
+readiness uses a fresh, source-bound live attestation for every workflow whose
+`liveFixture.required` value is `true`, while finding closure separately uses
+the lowest evidence layer that authoritatively proves the escaped contract.
 
 ## Everyday and release commands
 
@@ -329,9 +330,31 @@ callers may not override it. Reports publish separate counts by domain,
 severity, deterministic state, and live state so harness/evidence defects are
 not mislabeled as product bugs.
 
+Every finding declares reviewed `requiredEvidenceLayers`. This finding-level
+contract is independent of the broader workflow matrix:
+
+> A finding is closed by the lowest evidence layer that authoritatively proves
+> the escaped contract. Live Cloudsmith evidence is required only when
+> correctness materially depends on real Cloudsmith, service, registry, or
+> format-native protocol behavior.
+
+Controlled platform and scheduling cases such as `openExternal(false)`,
+malformed or adversarial URLs, HTTPS/host confirmation, stale-generation
+rejection, refresh-failure projection, omitted/default arguments, invalid
+producer provenance, and injected platform API failures are closed by their
+declared unit, contract, Extension Host, or rendered black-box layer. They must
+not remain blocked waiting for a naturally occurring service failure.
+
+Real API shape and pagination, native registry/package-manager behavior,
+persisted authentication, pull-through outcomes, mutations, and format-native
+protocol semantics still require `live-protocol` evidence where declared. A
+P0 external credential incident uses the taxonomy-enforced
+`durable-security-scan` plus `external-confirmation` requirement.
+
 A deterministic fix with pending or blocked required live verification remains
-unverified. Schema-v5 live attestations and schema-v3 derived status bind each
-live PASS to the exact local qualification receipt fingerprint, stable VSIX
+unverified. Schema-v6 live attestations and schema-v4 derived status bind each
+candidate-observed workflow, regardless of PASS/PARTIAL/BLOCKED/FAIL outcome,
+to the exact local qualification receipt fingerprint, stable VSIX
 SHA-256, extension and installed ID/version, source SHA/fingerprint, VS Code
 version, and a one-way identity of the non-secret profile `{mode, root}`
 metadata. The authenticated-CI receipt separately binds its own ephemeral CI
@@ -341,8 +364,47 @@ succeeds. Local and CI proof must agree on immutable product identity, without
 falsely equating their receipt or profile identities. Missing, crossed, stale,
 or mismatched candidate proof fails closed.
 Every required workflow has exactly one `PASS`, `FAIL`, `PARTIAL`, or `BLOCKED`
-matrix row; blank rows are invalid. No credential or profile content enters
-these receipts.
+matrix row. `candidateProvenance` is `verified` only when that row binds the
+exact receipt and is `not-observed` only with a null receipt. Outcome
+disposition separately distinguishes complete, failed, partial evidence,
+defect-blocked, not-authorized, external-precondition, and not-executed cases.
+Blank rows are invalid. No credential or profile content enters these receipts.
+
+## Push, CI, and final qualification lifecycle
+
+Final TEAM-TEST readiness is not a precondition for pushing a validated task
+branch. The permanent sequence is:
+
+```text
+local deterministic/security gates green
++ no unresolved code-security blocker
++ reviewed branch diff
+        ↓
+push the task branch
+        ↓
+open or update a draft pull request
+        ↓
+authoritative remote CI on the pushed SHA
+        ↓
+targeted authenticated/live qualification on the final candidate
+        ↓
+final readiness calculation
+```
+
+A draft pull request is neither a merge nor a release. Do not change branch
+protection or required-status governance to complete this lifecycle.
+
+Final readiness loads the ignored schema-v2
+`internal_docs/quality/remote-ci.json` receipt. It must bind the repository,
+draft PR, task branch, exact pushed source SHA, workflow run identities, and the
+complete successful job inventories for both the deterministic PR workflow and
+the manually dispatched deep-quality workflow. The reviewed collector preserves
+the bounded GitHub API responses in `remote-ci-api.json`; the receipt binds those
+exact bytes, and report validation independently reconciles PR, branch, SHA,
+latest run attempt, timestamps, and terminal job results against that capture.
+Missing, stale, crossed, superseded, failed, cancelled, skipped, or incomplete
+remote CI blocks readiness. A ready live attestation must be completed after the
+last authoritative remote run completes.
 
 ## Permanent change flow
 

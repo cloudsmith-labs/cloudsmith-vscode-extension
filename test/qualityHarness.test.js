@@ -336,7 +336,7 @@ function validLiveStatus(overrides = {}) {
     },
   });
   const value = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     source: SOURCE_IDENTITY,
     candidate: candidateBindingFromReceipt(localCandidateReceipt, {
       source: SOURCE_IDENTITY,
@@ -366,6 +366,8 @@ function validLiveStatus(overrides = {}) {
     value.workflowMatrix = value.requiredWorkflowIds.map(id => ({
       id,
       status: passed.has(id) ? "PASS" : "BLOCKED",
+      outcomeDisposition: passed.has(id) ? "complete" : "not-executed",
+      candidateProvenance: passed.has(id) ? "verified" : "not-observed",
     }));
   }
   return value;
@@ -589,7 +591,8 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
       firstKnownBadSha: null,
       evidence: [{ kind: "protocol", location: "fixture", summary: "Synthetic fixture." }],
       rootCauseStatus: "suspected",
-      testLayerThatShouldHaveCaughtIt: "live-protocol",
+      requiredEvidenceLayers: ["documentation"],
+      testLayerThatShouldHaveCaughtIt: "documentation",
       whyItEscaped: "This is a schema-valid trust fixture.",
       regressionTest: null,
       mutationProof: { status: "not-applicable", summary: "Not applicable to the fixture." },
@@ -782,7 +785,7 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
     `${JSON.stringify(authenticatedExposureReceipt, null, 2)}\n`,
   );
   const document = {
-    schemaVersion: 5,
+    schemaVersion: 6,
     source,
     candidate,
     status: "passed",
@@ -791,7 +794,7 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
     operatorId: "fixture-qualification-operator",
     completedAt,
     summary: null,
-    verdict: "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS",
+    verdict: "TEAM-TEST READY WITH RISKS",
     evidence: [qualificationEvidence, findingsEvidence],
     findingsFingerprint: findingsEvidence.sha256,
     openReleaseBlockerCount: 0,
@@ -799,7 +802,9 @@ function passedLiveAttestation(source = SOURCE_IDENTITY, now = LIVE_FIXTURE_NOW)
       id,
       status: "PASS",
       authoritativeOutcomeObserved: true,
+      candidateProvenance: "verified",
       candidateReceiptFingerprint: candidate.receiptFingerprint,
+      outcomeDisposition: "complete",
       evidence: [qualificationEvidence],
     })),
     visibleEnabledActions: {
@@ -1357,6 +1362,7 @@ function validFinding(overrides = {}) {
       summary: "The authoritative assertion failed.",
     }],
     rootCauseStatus: "unknown",
+    requiredEvidenceLayers: ["live-protocol"],
     testLayerThatShouldHaveCaughtIt: "extension-host",
     whyItEscaped: "The old test stopped at dispatch.",
     regressionTest: null,
@@ -1376,7 +1382,11 @@ function createEvidenceHandoffFixture(options = {}) {
   fs.mkdirSync(path.join(fixtureRoot, "quality"), { recursive: true });
   fs.mkdirSync(path.join(fixtureRoot, "test"), { recursive: true });
   fs.copyFileSync(path.join(root, "package.json"), path.join(fixtureRoot, "package.json"));
-  for (const filename of ["critical-workflows.json", "mutation-baseline.json"]) {
+  for (const filename of [
+    "critical-workflows.json",
+    "defect-taxonomy.json",
+    "mutation-baseline.json",
+  ]) {
     fs.copyFileSync(
       path.join(root, "quality", filename),
       path.join(fixtureRoot, "quality", filename)
@@ -6420,7 +6430,7 @@ suite("Release checklist and deterministic quality report", () => {
         staleResult.passedWorkflowIds,
         requiredLiveWorkflowIds(workflows)
       );
-      assert.strictEqual(passed.status, "passed");
+      assert.strictEqual(passed.status, "passed", JSON.stringify(passed.errors));
       assert.strictEqual(passed.authenticatedAcceptance, "recorded");
       assert.deepStrictEqual(passed.missingWorkflowIds, []);
     } finally {
@@ -6921,7 +6931,11 @@ suite("Release checklist and deterministic quality report", () => {
       };
 
       const intact = generateReport(common);
-      assert.strictEqual(intact.liveQualification.status, "passed");
+      assert.strictEqual(
+        intact.liveQualification.status,
+        "passed",
+        JSON.stringify(intact.liveQualification.errors),
+      );
       assert.strictEqual(intact.liveQualification.verdict, status.verdict);
       const rendered = renderMarkdown(intact);
       assert.match(rendered, new RegExp(status.candidate.receiptFingerprint, "u"));
@@ -7226,6 +7240,7 @@ suite("Release checklist and deterministic quality report", () => {
       status: "closed",
       deterministicStatus: "fixed",
       liveStatus: "not-required",
+      requiredEvidenceLayers: ["extension-host"],
       rootCauseStatus: "proven",
       rootCause: "Repeated findings referenced one already validated commit.",
       regressionTest: "checks each unique fixed finding SHA once per ledger validation",
@@ -7352,6 +7367,7 @@ suite("Release checklist and deterministic quality report", () => {
       status: "closed",
       deterministicStatus: "not-applicable",
       liveStatus: "verified",
+      requiredEvidenceLayers: ["durable-security-scan", "external-confirmation"],
       rootCauseStatus: "proven",
       rootCause: "The external security disposition is independently evidenced.",
       regressionTest: null,
@@ -7525,6 +7541,33 @@ suite("Quality contract verifier fixtures", function () {
     ));
   });
 
+  test("rejects PR merge-ref checkout and direct github.sha candidate provenance", () => {
+    const workflowPath = ".github/workflows/main.yml";
+    const workflow = fs.readFileSync(path.join(root, workflowPath), "utf8");
+    const mutations = [
+      workflow.replaceAll("          ref: ${{ env.CANDIDATE_SHA }}\n", ""),
+      workflow.replace(
+        "CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}",
+        "CANDIDATE_SHA: ${{ github.sha }}"
+      ),
+      workflow.replace(
+        "EXPECTED_SOURCE_SHA: ${{ env.CANDIDATE_SHA }}",
+        "EXPECTED_SOURCE_SHA: ${{ github.sha }}"
+      ),
+    ];
+
+    for (const changed of mutations) {
+      const result = verifyQualityContracts({
+        root,
+        sourceOverrides: { [workflowPath]: changed },
+      });
+      assert.ok(
+        result.errors.some(error => /CI must (?:verify|execute|build)/u.test(error)),
+        `PR merge-ref or direct github.sha provenance was accepted: ${result.errors.join("\n")}`
+      );
+    }
+  });
+
   test("rejects bypasses around changed and core mutation evidence handoffs", () => {
     const workflowPath = ".github/workflows/main.yml";
     const deepWorkflowPath = ".github/workflows/deep-quality.yml";
@@ -7627,7 +7670,7 @@ suite("Quality contract verifier fixtures", function () {
         "run: node scripts/quality/verify-ui-evidence.js"
       ),
       deepWorkflow.replace(
-        "        env:\n          EXPECTED_SOURCE_SHA: ${{ github.sha }}\n        run: node scripts/quality/verify-ui-evidence.js --bundle .quality/upload/signed-out-ui",
+        "        env:\n          EXPECTED_SOURCE_SHA: ${{ env.CANDIDATE_SHA }}\n        run: node scripts/quality/verify-ui-evidence.js --bundle .quality/upload/signed-out-ui",
         "        env:\n          EXPECTED_SOURCE_SHA: invented\n        run: node scripts/quality/verify-ui-evidence.js --bundle .quality/upload/signed-out-ui"
       ),
       deepWorkflow.replace(
@@ -7641,8 +7684,8 @@ suite("Quality contract verifier fixtures", function () {
         `${exactUiUploadPaths}\n            .quality/upload/signed-out-ui/unexpected.txt`,
       ),
       deepWorkflow.replace(
-        "  signed-out-black-box-ui:\n    name: Signed-out packaged black-box UI\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    steps:\n      - name: Checkout exact source\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          fetch-depth: 0\n          persist-credentials: false",
-        "  signed-out-black-box-ui:\n    name: Signed-out packaged black-box UI\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    steps:\n      - name: Checkout exact source\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          persist-credentials: false"
+        "  signed-out-black-box-ui:\n    name: Signed-out packaged black-box UI\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    steps:\n      - name: Checkout exact source\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          ref: ${{ env.CANDIDATE_SHA }}\n          fetch-depth: 0\n          persist-credentials: false",
+        "  signed-out-black-box-ui:\n    name: Signed-out packaged black-box UI\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    steps:\n      - name: Checkout exact source\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          ref: ${{ env.CANDIDATE_SHA }}\n          persist-credentials: false"
       ),
     ];
     for (const [index, changed] of mutations.entries()) {

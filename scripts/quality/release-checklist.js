@@ -52,10 +52,20 @@ const RELEASE_EXPOSURE_RESULT = ".quality/secrets/release.json";
 const UI_RESULT = ".quality/ui/result.json";
 const READY_VERDICTS = new Set([
   "TEAM-TEST READY",
-  "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS",
+  "TEAM-TEST READY WITH RISKS",
 ]);
 const DECLARED_STATUSES = new Set(["passed", "failed", "partial", "blocked", "not-run"]);
 const WORKFLOW_RESULT_STATUSES = new Set(["PASS", "FAIL", "PARTIAL", "BLOCKED"]);
+const CANDIDATE_PROVENANCE_STATUSES = new Set(["verified", "not-observed"]);
+const OUTCOME_DISPOSITIONS = new Set([
+  "complete",
+  "failed",
+  "partial-evidence",
+  "blocked-by-defect",
+  "not-authorized",
+  "external-precondition",
+  "not-executed",
+]);
 const EVIDENCE_PATH_PATTERN = /^internal_docs\/quality\/[A-Za-z0-9][A-Za-z0-9._-]*\.(?:json|jsonl|md|png|txt|webp)$/u;
 const EVIDENCE_MAX_BYTES = 16 * 1024 * 1024;
 const MAX_QUALIFICATION_AGE_MS = 24 * 60 * 60 * 1000;
@@ -262,19 +272,24 @@ function validateNonPassingAttestation(
     completedAt,
     evidenceNotBefore,
     evidencePaths,
-    { requirePass: false }
+    { candidateCapturedAt: candidateValidation.capturedAt, requirePass: false }
   );
   for (const [label, references] of [
     ["Visible enabled action qualification", document.visibleEnabledActions?.evidence],
     ["Independent release review", document.independentReview?.evidence],
   ]) {
     if (references === undefined) continue;
+    const candidateBoundNotBefore = label === "Visible enabled action qualification"
+      && document.visibleEnabledActions?.status === "passed"
+      && Number.isFinite(candidateValidation.capturedAt)
+      ? Math.max(evidenceNotBefore || 0, candidateValidation.capturedAt)
+      : evidenceNotBefore;
     const optionalPaths = validateEvidenceReferences(
       references,
       label,
       errors,
       context,
-      { notAfter: context.nowMs, notBefore: evidenceNotBefore }
+      { notAfter: context.nowMs, notBefore: candidateBoundNotBefore }
     );
     for (const evidencePath of optionalPaths) evidencePaths.add(evidencePath);
   }
@@ -297,21 +312,26 @@ function validateAttestationCandidate(document, source, context) {
   const passResults = Array.isArray(document?.workflowResults)
     ? document.workflowResults.filter(result => result?.status === "PASS")
     : [];
+  const candidateObservedResults = Array.isArray(document?.workflowResults)
+    ? document.workflowResults.filter(result => result?.candidateProvenance === "verified")
+    : [];
   const candidateRequired = document?.status === "passed"
     || document?.authenticatedAcceptance === true
     || passResults.length > 0
+    || candidateObservedResults.length > 0
     || document?.visibleEnabledActions?.status === "passed"
     || document?.independentReview?.status === "passed";
   if (document?.candidate === null || document?.candidate === undefined) {
     if (candidateRequired) {
       errors.push("Every live PASS must bind the exact qualification candidate.");
     }
-    for (const result of passResults) {
-      if (result?.candidateReceiptFingerprint !== null) {
-        errors.push(`Live workflow ${String(result?.id)} has an unbound candidate receipt.`);
+    for (const result of document?.workflowResults || []) {
+      if (result?.candidateProvenance === "verified"
+        || result?.candidateReceiptFingerprint !== null) {
+        errors.push(`Live workflow ${String(result?.id)} has candidate provenance without a candidate.`);
       }
     }
-    return { binding: null, errors: uniqueSorted(errors) };
+    return { binding: null, capturedAt: null, errors: uniqueSorted(errors) };
   }
 
   let binding = null;
@@ -389,9 +409,13 @@ function validateAttestationCandidate(document, source, context) {
 
   const receiptFingerprint = document.candidate?.receiptFingerprint;
   for (const result of document.workflowResults || []) {
-    if (result?.status === "PASS"
+    if (result?.candidateProvenance === "verified"
       && result.candidateReceiptFingerprint !== receiptFingerprint) {
       errors.push(`Live workflow ${String(result?.id)} does not bind the exact candidate receipt.`);
+    }
+    if (result?.candidateProvenance === "not-observed"
+      && result.candidateReceiptFingerprint !== null) {
+      errors.push(`Live workflow ${String(result?.id)} claims provenance for an unobserved candidate.`);
     }
   }
   for (const [label, value] of [
@@ -403,7 +427,12 @@ function validateAttestationCandidate(document, source, context) {
       errors.push(`${label} does not bind the exact candidate receipt.`);
     }
   }
-  return { binding, errors: uniqueSorted(errors) };
+  const capturedAt = binding ? Date.parse(context.liveCandidateReceipt?.capturedAt) : null;
+  return {
+    binding,
+    capturedAt: Number.isFinite(capturedAt) ? capturedAt : null,
+    errors: uniqueSorted(errors),
+  };
 }
 
 function validateCandidateCaptureWindow(receipt, document) {
@@ -427,9 +456,9 @@ function validateAttestationEnvelope(document, source, errors, context) {
   ];
   if (!isPlainObject(document)
     || JSON.stringify(Object.keys(document).sort()) !== JSON.stringify(exactKeys)) {
-    errors.push("Live qualification fields do not match schemaVersion 5.");
+    errors.push("Live qualification fields do not match schemaVersion 6.");
   }
-  if (document.schemaVersion !== 5) errors.push("Live qualification schemaVersion must be 5.");
+  if (document.schemaVersion !== 6) errors.push("Live qualification schemaVersion must be 6.");
   if (!isPlainObject(document.source)
     || JSON.stringify(Object.keys(document.source).sort())
       !== JSON.stringify(["fingerprint", "sha"])) {
@@ -572,7 +601,7 @@ function validatePassedAttestation(
   }
   if (Number.isInteger(context.findingsState.openNonBlockingRiskCount)) {
     const expectedVerdict = context.findingsState.openNonBlockingRiskCount > 0
-      ? "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS"
+      ? "TEAM-TEST READY WITH RISKS"
       : "TEAM-TEST READY";
     if (document.verdict !== expectedVerdict) {
       errors.push(
@@ -609,7 +638,7 @@ function validatePassedAttestation(
     completedAt,
     evidenceNotBefore,
     evidencePaths,
-    { requirePass: true },
+    { candidateCapturedAt: candidateValidation.capturedAt, requirePass: true },
   );
   validateVisibleActions(
     document.visibleEnabledActions,
@@ -618,6 +647,7 @@ function validatePassedAttestation(
     completedAt,
     evidenceNotBefore,
     evidencePaths,
+    candidateValidation.capturedAt,
   );
   validateIndependentReview(
     document.independentReview,
@@ -658,7 +688,7 @@ function validateWorkflowResults(
     seen.add(result?.id);
     if (!isPlainObject(result)
       || Object.keys(result).sort().join(",")
-        !== "authoritativeOutcomeObserved,candidateReceiptFingerprint,evidence,id,status") {
+        !== "authoritativeOutcomeObserved,candidateProvenance,candidateReceiptFingerprint,evidence,id,outcomeDisposition,status") {
       errors.push(`Live workflow ${String(result?.id)} fields do not match the workflow-result schema.`);
     }
     if (!WORKFLOW_RESULT_STATUSES.has(result?.status)) {
@@ -667,8 +697,13 @@ function validateWorkflowResults(
     if (options.requirePass && result?.status !== "PASS") {
       errors.push(`Live workflow ${String(result?.id)} is not PASS.`);
     }
-    if (result?.status === "PASS" && result?.authoritativeOutcomeObserved !== true) {
-      errors.push(`Live workflow ${String(result?.id)} lacks an authoritative-outcome attestation.`);
+    if (["PASS", "FAIL"].includes(result?.status)
+      && result?.authoritativeOutcomeObserved !== true) {
+      errors.push(`Live workflow ${String(result?.id)} lacks an authoritative terminal attestation.`);
+    }
+    if (["PARTIAL", "BLOCKED"].includes(result?.status)
+      && result?.authoritativeOutcomeObserved !== false) {
+      errors.push(`Live workflow ${String(result?.id)} overstates an incomplete authoritative outcome.`);
     }
     if (typeof result?.authoritativeOutcomeObserved !== "boolean") {
       errors.push(`Live workflow ${String(result?.id)} must record authoritativeOutcomeObserved.`);
@@ -677,12 +712,59 @@ function validateWorkflowResults(
       || /^[a-f0-9]{64}$/u.test(result?.candidateReceiptFingerprint || ""))) {
       errors.push(`Live workflow ${String(result?.id)} has an invalid candidate receipt fingerprint.`);
     }
+    if (!CANDIDATE_PROVENANCE_STATUSES.has(result?.candidateProvenance)) {
+      errors.push(`Live workflow ${String(result?.id)} has invalid candidate provenance.`);
+    }
+    if (result?.candidateProvenance === "verified"
+      && !/^[a-f0-9]{64}$/u.test(result?.candidateReceiptFingerprint || "")) {
+      errors.push(`Live workflow ${String(result?.id)} verified provenance without a receipt.`);
+    }
+    if (result?.candidateProvenance === "not-observed"
+      && result?.candidateReceiptFingerprint !== null) {
+      errors.push(`Live workflow ${String(result?.id)} unobserved provenance must have a null receipt.`);
+    }
+    if (!OUTCOME_DISPOSITIONS.has(result?.outcomeDisposition)) {
+      errors.push(`Live workflow ${String(result?.id)} has an invalid outcome disposition.`);
+    }
+    const validDisposition = (
+      (result?.status === "PASS" && result?.outcomeDisposition === "complete")
+      || (result?.status === "FAIL" && result?.outcomeDisposition === "failed")
+      || (result?.status === "PARTIAL" && result?.outcomeDisposition === "partial-evidence")
+      || (result?.status === "BLOCKED" && [
+        "blocked-by-defect",
+        "not-authorized",
+        "external-precondition",
+        "not-executed",
+      ].includes(result?.outcomeDisposition))
+    );
+    if (!validDisposition) {
+      errors.push(`Live workflow ${String(result?.id)} status and outcome disposition disagree.`);
+    }
+    if (["PASS", "FAIL"].includes(result?.status)
+      && result?.candidateProvenance !== "verified") {
+      errors.push(`Live workflow ${String(result?.id)} terminal outcome lacks verified candidate provenance.`);
+    }
+    if (result?.outcomeDisposition === "not-executed"
+      && result?.candidateProvenance !== "not-observed") {
+      errors.push(`Live workflow ${String(result?.id)} not-executed outcome claims candidate observation.`);
+    }
+    if (result?.status === "PARTIAL" && result?.candidateProvenance !== "verified") {
+      errors.push(`Live workflow ${String(result?.id)} partial evidence lacks candidate provenance.`);
+    }
+    if (result?.outcomeDisposition === "not-authorized"
+      && result?.candidateProvenance !== "verified") {
+      errors.push(`Live workflow ${String(result?.id)} not-authorized preflight lacks candidate provenance.`);
+    }
+    const resultEvidenceNotBefore = result?.candidateProvenance === "verified"
+      && Number.isFinite(options.candidateCapturedAt)
+      ? Math.max(evidenceNotBefore || 0, options.candidateCapturedAt)
+      : evidenceNotBefore;
     const resultPaths = validateEvidenceReferences(
       result?.evidence,
       `Live workflow ${String(result?.id)}`,
       errors,
       context,
-      { notAfter: completedAt, notBefore: evidenceNotBefore },
+      { notAfter: completedAt, notBefore: resultEvidenceNotBefore },
     );
     for (const evidencePath of resultPaths) evidencePaths.add(evidencePath);
   }
@@ -696,12 +778,14 @@ function normalizedWorkflowMatrix(results, requiredIds) {
   if (Array.isArray(results)) {
     for (const result of results) {
       if (!requiredIds.includes(result?.id) || byId.has(result.id)) continue;
-      byId.set(result.id, WORKFLOW_RESULT_STATUSES.has(result.status) ? result.status : "BLOCKED");
+      byId.set(result.id, WORKFLOW_RESULT_STATUSES.has(result.status) ? result : null);
     }
   }
   return requiredIds.map(id => Object.freeze({
     id,
-    status: byId.get(id) || "BLOCKED",
+    status: byId.get(id)?.status || "BLOCKED",
+    outcomeDisposition: byId.get(id)?.outcomeDisposition || "not-executed",
+    candidateProvenance: byId.get(id)?.candidateProvenance || "not-observed",
   }));
 }
 
@@ -720,6 +804,7 @@ function validateVisibleActions(
   completedAt,
   evidenceNotBefore,
   evidencePaths,
+  candidateCapturedAt,
 ) {
   if (!isPlainObject(value)
     || Object.keys(value).sort().join(",")
@@ -740,7 +825,12 @@ function validateVisibleActions(
     "Visible enabled action qualification",
     errors,
     context,
-    { notAfter: completedAt, notBefore: evidenceNotBefore },
+    {
+      notAfter: completedAt,
+      notBefore: Number.isFinite(candidateCapturedAt)
+        ? Math.max(evidenceNotBefore || 0, candidateCapturedAt)
+        : evidenceNotBefore,
+    },
   );
   for (const evidencePath of actionPaths) evidencePaths.add(evidencePath);
 }
@@ -803,7 +893,7 @@ function statusDocument(values) {
     .filter(result => result.status === "PASS")
     .map(result => result.id);
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     source: values.source,
     candidate: values.candidate || null,
     inputPath: values.inputPath,
@@ -926,10 +1016,11 @@ function readFindingsState(root = ROOT, findingsPath = DEFAULT_FINDINGS) {
   try {
     const records = parseFindingsJsonl(decodeFindingsBytes(bytes));
     if (records.length === 0) throw new Error("The ignored findings ledger is empty.");
+    const taxonomy = readJson("quality/defect-taxonomy.json", root);
     const validationErrors = validateFindings(
       records,
       readJson("quality/finding.schema.json", root),
-      readJson("quality/defect-taxonomy.json", root),
+      taxonomy,
       root
     );
     if (validationErrors.length > 0) {
@@ -949,10 +1040,10 @@ function readFindingsState(root = ROOT, findingsPath = DEFAULT_FINDINGS) {
     return {
       fingerprint,
       openReleaseBlockerCount: openRecords.filter(record => (
-        deriveReleaseBlocking(record, workflowById.get(record.workflowContract))
+        deriveReleaseBlocking(record, workflowById.get(record.workflowContract), taxonomy)
       )).length,
       openNonBlockingRiskCount: openRecords.filter(record => (
-        !deriveReleaseBlocking(record, workflowById.get(record.workflowContract))
+        !deriveReleaseBlocking(record, workflowById.get(record.workflowContract), taxonomy)
       )).length,
       errors: [],
     };

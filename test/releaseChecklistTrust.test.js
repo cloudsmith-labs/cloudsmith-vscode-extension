@@ -139,6 +139,7 @@ function createFixture() {
       firstKnownBadSha: null,
       evidence: [{ kind: "protocol", location: "fixture", summary: "Synthetic fixture." }],
       rootCauseStatus: "suspected",
+      requiredEvidenceLayers: ["live-protocol"],
       testLayerThatShouldHaveCaughtIt: "live-protocol",
       whyItEscaped: "This is a schema-valid trust fixture.",
       regressionTest: null,
@@ -343,7 +344,7 @@ function createFixture() {
     `${JSON.stringify(authenticatedExposureReceipt, null, 2)}\n`,
   );
   const document = {
-    schemaVersion: 5,
+    schemaVersion: 6,
     source: SOURCE,
     candidate,
     status: "passed",
@@ -352,7 +353,7 @@ function createFixture() {
     checklistConfirmed: true,
     operatorId: "qualification-operator",
     completedAt: COMPLETED_AT,
-    verdict: "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS",
+    verdict: "TEAM-TEST READY WITH RISKS",
     evidence: [qualificationEvidence, findingsEvidence],
     findingsFingerprint: findingsEvidence.sha256,
     openReleaseBlockerCount: 0,
@@ -360,7 +361,9 @@ function createFixture() {
       id: "WF-AUTH-STATE",
       status: "PASS",
       authoritativeOutcomeObserved: true,
+      candidateProvenance: "verified",
       candidateReceiptFingerprint: candidate.receiptFingerprint,
+      outcomeDisposition: "complete",
       evidence: [qualificationEvidence],
     }],
     visibleEnabledActions: {
@@ -825,6 +828,7 @@ suite("Release checklist trust receipts", () => {
     partial.verdict = null;
     partial.workflowResults[0].status = "PARTIAL";
     partial.workflowResults[0].authoritativeOutcomeObserved = false;
+    partial.workflowResults[0].outcomeDisposition = "partial-evidence";
 
     const result = evaluate(fixture, partial);
 
@@ -834,11 +838,13 @@ suite("Release checklist trust receipts", () => {
     assert.deepStrictEqual(result.workflowMatrix, [{
       id: "WF-AUTH-STATE",
       status: "PARTIAL",
+      outcomeDisposition: "partial-evidence",
+      candidateProvenance: "verified",
     }]);
     assert.deepStrictEqual(result.missingWorkflowIds, ["WF-AUTH-STATE"]);
   });
 
-  test("retains exact local PASS evidence in non-passing attestations without CI proof", () => {
+  test("retains exact candidate provenance for PARTIAL and precondition-confirmed BLOCKED rows", () => {
     const workflows = {
       workflows: [
         ...WORKFLOWS.workflows,
@@ -864,7 +870,9 @@ suite("Release checklist trust receipts", () => {
         id: "WF-SECOND-LIVE",
         status: rowStatus,
         authoritativeOutcomeObserved: false,
-        candidateReceiptFingerprint: null,
+        candidateProvenance: "verified",
+        candidateReceiptFingerprint: fixture.candidateReceipt.fingerprint,
+        outcomeDisposition: rowStatus === "PARTIAL" ? "partial-evidence" : "not-authorized",
         evidence: [fixture.qualificationEvidence],
       });
 
@@ -879,8 +887,172 @@ suite("Release checklist trust receipts", () => {
       assert.deepStrictEqual(result.candidate, fixture.document.candidate);
       assert.deepStrictEqual(result.passedWorkflowIds, ["WF-AUTH-STATE"]);
       assert.deepStrictEqual(result.missingWorkflowIds, ["WF-SECOND-LIVE"]);
+      const second = result.workflowMatrix.find(row => row.id === "WF-SECOND-LIVE");
+      assert.strictEqual(second.candidateProvenance, "verified");
+      assert.strictEqual(
+        second.outcomeDisposition,
+        rowStatus === "PARTIAL" ? "partial-evidence" : "not-authorized"
+      );
       assert.deepStrictEqual(result.errors, []);
     }
+  });
+
+  test("rejects a wrong candidate receipt for PARTIAL and candidate-bound BLOCKED rows", () => {
+    for (const [declaredStatus, rowStatus, outcomeDisposition] of [
+      ["partial", "PARTIAL", "partial-evidence"],
+      ["blocked", "BLOCKED", "not-authorized"],
+    ]) {
+      const document = clone(fixture.document);
+      document.status = declaredStatus;
+      document.summary = `The candidate-bound ${rowStatus.toLowerCase()} row has crossed provenance.`;
+      document.authenticatedAcceptance = false;
+      document.checklistConfirmed = false;
+      document.verdict = null;
+      document.workflowResults[0] = {
+        ...document.workflowResults[0],
+        status: rowStatus,
+        authoritativeOutcomeObserved: false,
+        candidateProvenance: "verified",
+        candidateReceiptFingerprint: "f".repeat(64),
+        outcomeDisposition,
+      };
+
+      const result = evaluate(fixture, document);
+
+      assert.strictEqual(result.status, "failed");
+      assert.ok(result.errors.some(error => (
+        /does not bind the exact candidate receipt/u.test(error)
+      )));
+    }
+  });
+
+  test("rejects candidate-bound workflow evidence captured before the candidate receipt", () => {
+    const document = clone(fixture.document);
+    document.workflowResults[0].evidence[0].capturedAt = timestampBeforeNow(4 * 60 * 1000);
+
+    const result = evaluate(fixture, document);
+
+    assert.strictEqual(result.status, "failed");
+    assert.ok(result.errors.some(error => /timestamp predates the required event/u.test(error)));
+  });
+
+  test("rejects candidate-bound visible-action evidence captured before the candidate receipt", () => {
+    const document = clone(fixture.document);
+    document.visibleEnabledActions.evidence[0].capturedAt = timestampBeforeNow(4 * 60 * 1000);
+
+    const result = evaluate(fixture, document);
+
+    assert.strictEqual(result.status, "failed");
+    assert.ok(result.errors.some(error => /timestamp predates the required event/u.test(error)));
+  });
+
+  test("retains null provenance only for a workflow that was not executed", () => {
+    const workflows = {
+      workflows: [
+        ...WORKFLOWS.workflows,
+        {
+          id: "WF-SECOND-LIVE",
+          requiredLayers: ["live-protocol"],
+          liveFixture: { required: true },
+        },
+      ],
+    };
+    const document = clone(fixture.document);
+    document.status = "blocked";
+    document.summary = "The second workflow was not executed.";
+    document.authenticatedAcceptance = false;
+    document.checklistConfirmed = false;
+    document.verdict = null;
+    document.workflowResults.push({
+      id: "WF-SECOND-LIVE",
+      status: "BLOCKED",
+      authoritativeOutcomeObserved: false,
+      candidateProvenance: "not-observed",
+      candidateReceiptFingerprint: null,
+      outcomeDisposition: "not-executed",
+      evidence: [fixture.qualificationEvidence],
+    });
+
+    const result = evaluate(fixture, document, {
+      authenticatedReceipt: null,
+      authenticatedCandidateReceipt: null,
+      authenticatedCandidateArtifactPath: null,
+      workflows,
+    });
+
+    assert.strictEqual(result.status, "blocked");
+    assert.deepStrictEqual(result.workflowMatrix.find(row => (
+      row.id === "WF-SECOND-LIVE"
+    )), {
+      id: "WF-SECOND-LIVE",
+      status: "BLOCKED",
+      outcomeDisposition: "not-executed",
+      candidateProvenance: "not-observed",
+    });
+    assert.deepStrictEqual(result.errors, []);
+  });
+
+  test("rejects null, wrong, and contradictory provenance independently of outcome", () => {
+    for (const mutate of [
+      document => {
+        document.workflowResults[0].candidateReceiptFingerprint = null;
+      },
+      document => {
+        document.workflowResults[0].candidateReceiptFingerprint = "f".repeat(64);
+      },
+      document => {
+        document.workflowResults[0].candidateProvenance = "not-observed";
+      },
+      document => {
+        document.workflowResults[0].candidateProvenance = "not-observed";
+        document.workflowResults[0].candidateReceiptFingerprint = null;
+      },
+    ]) {
+      const document = clone(fixture.document);
+      document.status = "partial";
+      document.summary = "Candidate provenance regression fixture.";
+      document.authenticatedAcceptance = false;
+      document.checklistConfirmed = false;
+      document.verdict = null;
+      document.workflowResults[0].status = "PARTIAL";
+      document.workflowResults[0].authoritativeOutcomeObserved = false;
+      document.workflowResults[0].outcomeDisposition = "partial-evidence";
+      mutate(document);
+
+      const result = evaluate(fixture, document, {
+        authenticatedReceipt: null,
+        authenticatedCandidateReceipt: null,
+        authenticatedCandidateArtifactPath: null,
+      });
+      assert.strictEqual(result.status, "failed");
+      assert.ok(result.errors.some(error => /provenance|receipt|exact candidate/u.test(error)));
+    }
+  });
+
+  test("rejects unobserved provenance for a not-authorized candidate preflight", () => {
+    const document = clone(fixture.document);
+    document.status = "blocked";
+    document.summary = "The write was not authorized after candidate preflight.";
+    document.authenticatedAcceptance = false;
+    document.checklistConfirmed = false;
+    document.verdict = null;
+    document.workflowResults[0] = {
+      ...document.workflowResults[0],
+      status: "BLOCKED",
+      authoritativeOutcomeObserved: false,
+      candidateProvenance: "not-observed",
+      candidateReceiptFingerprint: null,
+      outcomeDisposition: "not-authorized",
+    };
+
+    const result = evaluate(fixture, document, {
+      authenticatedReceipt: null,
+      authenticatedCandidateReceipt: null,
+      authenticatedCandidateArtifactPath: null,
+    });
+
+    assert.strictEqual(result.status, "failed");
+    assert.ok(result.errors.some(error => /not-authorized preflight lacks candidate provenance/u.test(error)));
   });
 
   test("keeps local PASS binding fail-closed without weakening passed CI acceptance", () => {
@@ -905,7 +1077,9 @@ suite("Release checklist trust receipts", () => {
       id: "WF-SECOND-LIVE",
       status: "PARTIAL",
       authoritativeOutcomeObserved: false,
-      candidateReceiptFingerprint: null,
+      candidateProvenance: "verified",
+      candidateReceiptFingerprint: fixture.candidateReceipt.fingerprint,
+      outcomeDisposition: "partial-evidence",
       evidence: [fixture.qualificationEvidence],
     });
     const crossed = evaluate(fixture, partial, {
@@ -957,7 +1131,12 @@ suite("Release checklist trust receipts", () => {
     assert.strictEqual(result.status, "blocked");
     assert.strictEqual(result.authenticatedAcceptance, "not-recorded");
     assert.strictEqual(result.verdict, null);
-    assert.deepStrictEqual(result.workflowMatrix, [{ id: "WF-AUTH-STATE", status: "PASS" }]);
+    assert.deepStrictEqual(result.workflowMatrix, [{
+      id: "WF-AUTH-STATE",
+      status: "PASS",
+      outcomeDisposition: "complete",
+      candidateProvenance: "verified",
+    }]);
     assert.deepStrictEqual(result.passedWorkflowIds, ["WF-AUTH-STATE"]);
   });
 
@@ -1306,6 +1485,7 @@ suite("Release checklist trust receipts", () => {
     partial.verdict = null;
     partial.workflowResults[0].status = "PARTIAL";
     partial.workflowResults[0].authoritativeOutcomeObserved = false;
+    partial.workflowResults[0].outcomeDisposition = "partial-evidence";
     fs.writeFileSync(path.join(fixture.root, inputPath), `${JSON.stringify(partial, null, 2)}\n`);
     writeReleaseExposureFixture(fixture, partial, inputPath);
     fs.mkdirSync(path.join(fixture.root, ".quality", "gates"), { recursive: true });
@@ -1345,6 +1525,7 @@ suite("Release checklist trust receipts", () => {
     partial.verdict = null;
     partial.workflowResults[0].status = "PARTIAL";
     partial.workflowResults[0].authoritativeOutcomeObserved = false;
+    partial.workflowResults[0].outcomeDisposition = "partial-evidence";
     fs.writeFileSync(path.join(fixture.root, inputPath), `${JSON.stringify(partial, null, 2)}\n`);
     fs.writeFileSync(
       path.join(fixture.root, AUTHENTICATED_CANDIDATE_RECEIPT),
@@ -1456,6 +1637,8 @@ suite("Release checklist trust receipts", () => {
     assert.deepStrictEqual(wrongHashResult.workflowMatrix, [{
       id: "WF-AUTH-STATE",
       status: "PASS",
+      outcomeDisposition: "complete",
+      candidateProvenance: "verified",
     }]);
 
     const traversal = clone(fixture.document);

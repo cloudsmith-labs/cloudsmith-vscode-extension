@@ -53,6 +53,7 @@ const DEFAULT_FINDINGS = "internal_docs/quality/findings.jsonl";
 const DEFAULT_LIVE_STATUS = ".quality/gates/live-qualification-status.json";
 const DEFAULT_UI_RESULT = ".quality/ui/result.json";
 const DEFAULT_CANDIDATE_RECEIPT = ".quality/qualification/candidate.json";
+const DEFAULT_REMOTE_CI = "internal_docs/quality/remote-ci.json";
 const MAX_REPORT_INPUT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_EXTENSION_VERSION = require("../../package.json").version;
 const UI_BLOCKED_REASON = "Black-box UI qualification is blocked by the current host environment.";
@@ -64,6 +65,34 @@ const FINDING_SEVERITIES = Object.freeze(["P0", "P1", "P2", "P3"]);
 const DETERMINISTIC_FINDING_STATUSES = Object.freeze(["failing", "fixed", "not-applicable"]);
 const LIVE_FINDING_STATUSES = Object.freeze([
   "not-required", "pending", "blocked", "verified", "failed",
+]);
+const REQUIRED_REMOTE_CI_RUNS = Object.freeze([
+  Object.freeze({
+    workflowFile: ".github/workflows/main.yml",
+    workflowName: "Deterministic build candidate",
+    event: "pull_request",
+    jobs: Object.freeze([
+      ["quality", "Quality"],
+      ["mutation", "Changed high-risk mutation gate"],
+      ["extension-tests:ubuntu-24.04:1.99.0:core", "Extension tests (ubuntu-24.04, VS Code 1.99.0, core)"],
+      ["extension-tests:ubuntu-24.04:1.99.0:smoke", "Extension tests (ubuntu-24.04, VS Code 1.99.0, smoke)"],
+      ["extension-tests:ubuntu-24.04:1.134.0:core", "Extension tests (ubuntu-24.04, VS Code 1.134.0, core)"],
+      ["extension-tests:windows-2025:1.134.0:smoke", "Extension tests (windows-2025, VS Code 1.134.0, smoke)"],
+      ["extension-tests:macos-15:1.134.0:smoke", "Extension tests (macos-15, VS Code 1.134.0, smoke)"],
+      ["package", "Reproducible VSIX"],
+      ["build-candidate", "Deterministic build candidate"],
+    ]),
+  }),
+  Object.freeze({
+    workflowFile: ".github/workflows/deep-quality.yml",
+    workflowName: "Manual deep quality",
+    event: "workflow_dispatch",
+    jobs: Object.freeze([
+      ["core-mutation", "Core mutation"],
+      ["signed-out-black-box-ui", "Signed-out packaged black-box UI"],
+      ["authenticated-production-ui", "Authenticated packaged production UI"],
+    ]),
+  }),
 ]);
 
 function generateReport(options = {}) {
@@ -111,7 +140,8 @@ function generateReport(options = {}) {
     options.findings || [],
     options.findingsStatus || "passed",
     options.findingsErrors || [],
-    options.workflows
+    options.workflows,
+    options.taxonomy
   );
   const findingsState = {
     fingerprint: options.findingsFingerprint || fingerprint(options.findings || []),
@@ -147,6 +177,13 @@ function generateReport(options = {}) {
     workflowCoverage
   );
   const categories = summarizeCategories(receiptById, mutation);
+  const remoteCi = summarizeRemoteCi(
+    options.remoteCi,
+    source,
+    options.remoteCiArtifactFingerprint,
+    options.nowMs,
+    { root: options.root || ROOT, fileSystem: options.fileSystem },
+  );
   const releaseReadiness = releaseReadinessStatus({
     deterministicStatus,
     impact,
@@ -155,10 +192,11 @@ function generateReport(options = {}) {
     liveQualification,
     findings,
     workflowCoverage,
+    remoteCi,
     profile,
   });
   const report = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     source,
     gateProfile: profile,
     status: releaseReadiness.status,
@@ -172,6 +210,7 @@ function generateReport(options = {}) {
     mutation,
     blackBoxUi,
     liveQualification,
+    remoteCi,
     categories,
     workflowCoverage,
     webviewInteractionEvidence,
@@ -187,18 +226,29 @@ function generateReport(options = {}) {
 
 function revalidateLiveQualificationForReport(options, source) {
   try {
+    const root = options.root || ROOT;
+    const inputPath = options.liveQualification?.inputPath;
+    const attestation = readOptionalRepositoryJson(
+      inputPath,
+      root,
+      "internal_docs/quality",
+      options,
+    );
     return {
       status: evaluateDiskLiveQualification({
-        root: options.root || ROOT,
+        root,
         source,
         workflows: options.workflows,
-        inputPath: options.liveQualification?.inputPath,
+        inputPath,
         qualificationHomeDirectory: options.qualificationHomeDirectory,
       }),
+      completedAt: typeof attestation?.completedAt === "string"
+        ? attestation.completedAt
+        : null,
       error: null,
     };
   } catch (error) {
-    return { status: null, error: error.message };
+    return { status: null, completedAt: null, error: error.message };
   }
 }
 
@@ -683,6 +733,7 @@ function summarizeLiveQualification(value, source, options = {}) {
     const requiredWorkflowIds = uniqueSorted(value.requiredWorkflowIds || []);
     summary = {
       status,
+      completedAt: null,
       candidate: safeLiveCandidate(value.candidate),
       authenticatedAcceptance: status === "passed"
         ? value.authenticatedAcceptance
@@ -717,7 +768,7 @@ function summarizeLiveQualification(value, source, options = {}) {
     const revalidation = options.revalidation;
     if (!isPlainObject(revalidation)
       || JSON.stringify(Object.keys(revalidation).sort())
-        !== JSON.stringify(["error", "status"])) {
+        !== JSON.stringify(["completedAt", "error", "status"])) {
       summary = rejectUnboundLiveQualification(
         summary,
         "failed",
@@ -735,6 +786,8 @@ function summarizeLiveQualification(value, source, options = {}) {
         "failed",
         "Live qualification status does not match a fresh evaluation of its disk attestation."
       );
+    } else {
+      summary.completedAt = revalidation.completedAt;
     }
   }
   return bindLiveQualificationToChecklist(
@@ -754,9 +807,9 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
   ];
   if (!isPlainObject(value)) return ["Live status artifact must be an object."];
   if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(exactKeys)) {
-    errors.push("Live status artifact fields do not match schemaVersion 3.");
+    errors.push("Live status artifact fields do not match schemaVersion 4.");
   }
-  if (value.schemaVersion !== 3) errors.push("Live status artifact schemaVersion must be 3.");
+  if (value.schemaVersion !== 4) errors.push("Live status artifact schemaVersion must be 4.");
   if (!isPlainObject(value.source)
     || JSON.stringify(Object.keys(value.source).sort()) !== JSON.stringify(["fingerprint", "sha"])
     || !/^[a-f0-9]{40,64}$/u.test(value.source?.sha || "")
@@ -833,11 +886,42 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
     const matrixPassed = [];
     for (const row of value.workflowMatrix) {
       if (!isPlainObject(row)
-        || JSON.stringify(Object.keys(row).sort()) !== JSON.stringify(["id", "status"])
+        || JSON.stringify(Object.keys(row).sort())
+          !== JSON.stringify(["candidateProvenance", "id", "outcomeDisposition", "status"])
         || !/^WF-[A-Z0-9-]+$/u.test(row.id || "")
-        || !["PASS", "FAIL", "PARTIAL", "BLOCKED"].includes(row.status)) {
+        || !["PASS", "FAIL", "PARTIAL", "BLOCKED"].includes(row.status)
+        || !["verified", "not-observed"].includes(row.candidateProvenance)
+        || ![
+          "complete",
+          "failed",
+          "partial-evidence",
+          "blocked-by-defect",
+          "not-authorized",
+          "external-precondition",
+          "not-executed",
+        ].includes(row.outcomeDisposition)) {
         errors.push("Live status artifact has an invalid workflow-matrix row.");
         continue;
+      }
+      const dispositionMatches = (
+        (row.status === "PASS" && row.outcomeDisposition === "complete")
+        || (row.status === "FAIL" && row.outcomeDisposition === "failed")
+        || (row.status === "PARTIAL" && row.outcomeDisposition === "partial-evidence")
+        || (row.status === "BLOCKED" && [
+          "blocked-by-defect",
+          "not-authorized",
+          "external-precondition",
+          "not-executed",
+        ].includes(row.outcomeDisposition))
+      );
+      if (!dispositionMatches
+        || (["PASS", "FAIL"].includes(row.status) && row.candidateProvenance !== "verified")
+        || (row.status === "PARTIAL" && row.candidateProvenance !== "verified")
+        || (row.outcomeDisposition === "not-authorized"
+          && row.candidateProvenance !== "verified")
+        || (row.outcomeDisposition === "not-executed"
+          && row.candidateProvenance !== "not-observed")) {
+        errors.push("Live status artifact workflow outcome semantics are inconsistent.");
       }
       matrixIds.push(row.id);
       if (row.status === "PASS") matrixPassed.push(row.id);
@@ -845,6 +929,10 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
     if (JSON.stringify(matrixIds) !== JSON.stringify(requiredWorkflowIds)
       || JSON.stringify(matrixPassed) !== JSON.stringify(value.passedWorkflowIds)) {
       errors.push("Live status artifact workflow matrix does not reconcile with its inventories.");
+    }
+    if (value.candidate === null
+      && value.workflowMatrix.some(row => row.candidateProvenance === "verified")) {
+      errors.push("Live status artifact candidate-observed rows lack a candidate binding.");
     }
   }
   if (!isPlainObject(value.visibleEnabledActions)
@@ -867,7 +955,7 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
     if (value.authenticatedAcceptance !== "recorded"
       || !new Set([
         "TEAM-TEST READY",
-        "TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS",
+        "TEAM-TEST READY WITH RISKS",
       ]).has(value.verdict)
       || JSON.stringify(value.passedWorkflowIds) !== JSON.stringify(value.requiredWorkflowIds)
       || (value.workflowMatrix || []).some(row => row.status !== "PASS")
@@ -921,13 +1009,19 @@ function emptyLiveQualification(status, findingsState = {}, requiredWorkflowIds 
   const required = uniqueSorted(requiredWorkflowIds);
   return {
     status,
+    completedAt: null,
     candidate: null,
     authenticatedAcceptance: "not-recorded",
     verdict: null,
     requiredWorkflowIds: required,
     passedWorkflowIds: [],
     missingWorkflowIds: required,
-    workflowMatrix: required.map(id => ({ id, status: "BLOCKED" })),
+    workflowMatrix: required.map(id => ({
+      id,
+      status: "BLOCKED",
+      outcomeDisposition: "not-executed",
+      candidateProvenance: "not-observed",
+    })),
     attestationFingerprint: null,
     evidenceManifest: [],
     findingsFingerprint: findingsState?.fingerprint || null,
@@ -979,7 +1073,7 @@ function rejectUnboundLiveQualification(summary, status, error) {
   };
 }
 
-function summarizeFindings(findings, inputStatus, errors = [], workflows = {}) {
+function summarizeFindings(findings, inputStatus, errors = [], workflows = {}, taxonomy = {}) {
   const workflowById = new Map((workflows?.workflows || []).map(workflow => [
     workflow.id,
     workflow,
@@ -988,7 +1082,8 @@ function summarizeFindings(findings, inputStatus, errors = [], workflows = {}) {
   const normalized = findings.map(finding => {
     const releaseBlocking = deriveReleaseBlocking(
       finding,
-      workflowById.get(finding.workflowContract)
+      workflowById.get(finding.workflowContract),
+      taxonomy
     );
     if (typeof finding.releaseBlocking !== "boolean"
       || finding.releaseBlocking !== releaseBlocking) {
@@ -1226,6 +1321,279 @@ function receiptStatus(receiptById, ids) {
   return aggregateStatuses(ids.map(id => receiptById.get(id)?.status || "not-run"));
 }
 
+function summarizeRemoteCi(
+  value,
+  source,
+  artifactFingerprint = null,
+  now = Date.now(),
+  options = {},
+) {
+  const base = {
+    status: "not-run",
+    repository: null,
+    branch: null,
+    sourceSha: null,
+    sourceFingerprint: null,
+    capturedAt: null,
+    completedAt: null,
+    pullRequest: null,
+    runs: [],
+    receiptFingerprint: artifactFingerprint,
+    errors: [],
+  };
+  if (value === null || value === undefined) return base;
+  const errors = [];
+  const rootKeys = [
+    "branch", "capturedAt", "evidence", "pullRequest", "repository", "runs",
+    "schemaVersion", "sourceFingerprint", "sourceSha",
+  ];
+  if (!isPlainObject(value)
+    || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(rootKeys)) {
+    errors.push("Remote CI receipt fields do not match schemaVersion 2.");
+  }
+  if (value?.schemaVersion !== 2) errors.push("Remote CI receipt schemaVersion must be 2.");
+  if (value?.repository !== "cloudsmith-labs/cloudsmith-vscode-extension") {
+    errors.push("Remote CI receipt repository is invalid.");
+  }
+  if (typeof value?.branch !== "string" || value.branch.length === 0
+    || value.branch.length > 255 || /[\u0000-\u001f\u007f]/u.test(value.branch)) {
+    errors.push("Remote CI receipt branch is invalid.");
+  }
+  if (value?.sourceSha !== source?.sha) {
+    errors.push("Remote CI receipt does not bind the current source SHA.");
+  }
+  if (value?.sourceFingerprint !== source?.fingerprint) {
+    errors.push("Remote CI receipt does not bind the current clean source fingerprint.");
+  }
+  const capturedAt = Date.parse(value?.capturedAt);
+  if (!Number.isFinite(capturedAt)
+    || new Date(capturedAt).toISOString() !== value.capturedAt
+    || capturedAt > now || now - capturedAt > 24 * 60 * 60 * 1000) {
+    errors.push("Remote CI receipt capture time is invalid or stale.");
+  }
+  const pullRequest = value?.pullRequest;
+  if (!isPlainObject(pullRequest)
+    || JSON.stringify(Object.keys(pullRequest).sort())
+      !== JSON.stringify(["baseRef", "draft", "headRef", "headSha", "number", "state", "url"])
+    || !Number.isInteger(pullRequest?.number) || pullRequest.number < 1
+    || pullRequest?.draft !== true
+    || pullRequest?.state !== "open"
+    || pullRequest?.baseRef !== "main"
+    || pullRequest?.headRef !== value?.branch
+    || pullRequest?.headSha !== source?.sha
+    || pullRequest?.url !== `https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/pull/${String(pullRequest?.number)}`) {
+    errors.push("Remote CI receipt does not bind an exact draft pull request.");
+  }
+  if (!Array.isArray(value?.runs) || value.runs.length !== REQUIRED_REMOTE_CI_RUNS.length) {
+    errors.push("Remote CI receipt does not contain the authoritative workflow inventory.");
+  } else {
+    for (let index = 0; index < REQUIRED_REMOTE_CI_RUNS.length; index += 1) {
+      const expected = REQUIRED_REMOTE_CI_RUNS[index];
+      const run = value.runs[index];
+      const runKeys = [
+        "completedAt", "conclusion", "createdAt", "event", "headSha", "jobs",
+        "pullRequestNumber", "runAttempt", "runId", "status", "url", "workflowFile",
+        "workflowName",
+      ];
+      if (!isPlainObject(run)
+        || JSON.stringify(Object.keys(run).sort()) !== JSON.stringify(runKeys)
+        || run.workflowFile !== expected.workflowFile
+        || run.workflowName !== expected.workflowName
+        || run.event !== expected.event
+        || !Number.isInteger(run.runId) || run.runId < 1
+        || !Number.isInteger(run.runAttempt) || run.runAttempt < 1
+        || run.headSha !== source?.sha
+        || run.status !== "completed"
+        || run.conclusion !== "success"
+        || (index === 0 && run.pullRequestNumber !== pullRequest?.number)
+        || (index === 1 && run.pullRequestNumber !== null)
+        || !validOrderedRemoteTimestamps(run.createdAt, run.completedAt, capturedAt)
+        || run.url !== `https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/actions/runs/${String(run?.runId)}`) {
+        errors.push(`Remote CI workflow ${expected.workflowFile} is invalid or not successful.`);
+        continue;
+      }
+      const expectedJobs = expected.jobs.map(([id, name]) => ({
+        id,
+        name,
+        databaseId: null,
+        status: "completed",
+        conclusion: "success",
+        startedAt: null,
+        completedAt: null,
+      }));
+      if (!Array.isArray(run.jobs)
+        || run.jobs.some(job => !isPlainObject(job)
+          || JSON.stringify(Object.keys(job).sort())
+            !== JSON.stringify([
+              "completedAt", "conclusion", "databaseId", "id", "name", "startedAt", "status",
+            ])
+          || !Number.isInteger(job.databaseId) || job.databaseId < 1
+          || job.status !== "completed"
+          || job.conclusion !== "success"
+          || !validOrderedRemoteTimestamps(job.startedAt, job.completedAt, capturedAt))
+        || !isDeepStrictEqual(
+          run.jobs.map(job => ({ ...job, databaseId: null, startedAt: null, completedAt: null })),
+          expectedJobs,
+        )) {
+        errors.push(`Remote CI workflow ${expected.workflowFile} has incomplete or failed jobs.`);
+      }
+    }
+  }
+  const apiEvidence = validateRemoteCiApiEvidence(value, source, errors, options);
+  const completedAtValues = Array.isArray(value?.runs)
+    ? value.runs.map(run => Date.parse(run?.completedAt)).filter(Number.isFinite)
+    : [];
+  const completedAt = completedAtValues.length === REQUIRED_REMOTE_CI_RUNS.length
+    ? Math.max(...completedAtValues)
+    : null;
+  return {
+    ...base,
+    status: errors.length === 0 ? "passed" : "failed",
+    repository: typeof value?.repository === "string" ? value.repository : null,
+    branch: typeof value?.branch === "string" ? value.branch : null,
+    sourceSha: typeof value?.sourceSha === "string" ? value.sourceSha : null,
+    sourceFingerprint: typeof value?.sourceFingerprint === "string"
+      ? value.sourceFingerprint
+      : null,
+    capturedAt: typeof value?.capturedAt === "string" ? value.capturedAt : null,
+    completedAt: Number.isFinite(completedAt) ? new Date(completedAt).toISOString() : null,
+    pullRequest: isPlainObject(pullRequest) ? { ...pullRequest } : null,
+    runs: Array.isArray(value?.runs) ? value.runs.map(run => ({
+      workflowFile: run?.workflowFile || null,
+      workflowName: run?.workflowName || null,
+      runId: Number.isInteger(run?.runId) ? run.runId : null,
+      runAttempt: Number.isInteger(run?.runAttempt) ? run.runAttempt : null,
+      headSha: run?.headSha || null,
+      completedAt: run?.completedAt || null,
+      conclusion: run?.conclusion || null,
+      url: run?.url || null,
+      jobs: Array.isArray(run?.jobs) ? run.jobs.map(job => ({ ...job })) : [],
+    })) : [],
+    evidence: apiEvidence,
+    errors: uniqueSorted(errors),
+  };
+}
+
+function validOrderedRemoteTimestamps(startedAt, completedAt, capturedAt) {
+  const start = Date.parse(startedAt);
+  const completed = Date.parse(completedAt);
+  return Number.isFinite(start)
+    && Number.isFinite(completed)
+    && new Date(start).toISOString() === startedAt
+    && new Date(completed).toISOString() === completedAt
+    && start <= completed
+    && completed <= capturedAt;
+}
+
+function validateRemoteCiApiEvidence(receipt, source, errors, options = {}) {
+  const reference = receipt?.evidence;
+  if (!isPlainObject(reference)
+    || JSON.stringify(Object.keys(reference).sort()) !== JSON.stringify(["path", "sha256"])
+    || reference.path !== "internal_docs/quality/remote-ci-api.json"
+    || !/^[a-f0-9]{64}$/u.test(reference.sha256 || "")) {
+    errors.push("Remote CI receipt does not bind the reviewed GitHub API capture.");
+    return null;
+  }
+  let artifact = options.apiEvidence || null;
+  try {
+    artifact ||= readOptionalRepositoryJsonArtifact(
+      reference.path,
+      options.root || ROOT,
+      "internal_docs/quality",
+      options,
+    );
+  } catch (error) {
+    errors.push(`Remote CI GitHub API capture is untrusted: ${error.message}`);
+    return { ...reference };
+  }
+  if (!artifact || artifact.fingerprint !== reference.sha256) {
+    errors.push("Remote CI receipt does not bind the exact GitHub API capture bytes.");
+    return { ...reference };
+  }
+  const snapshot = artifact.value;
+  if (!isPlainObject(snapshot)
+    || snapshot.schemaVersion !== 1
+    || snapshot.repository !== receipt.repository
+    || snapshot.capturedAt !== receipt.capturedAt
+    || !isPlainObject(snapshot.pullRequest)
+    || !Array.isArray(snapshot.runs)
+    || !isPlainObject(snapshot.jobsByRunId)
+    || !isPlainObject(snapshot.runListsByWorkflow)) {
+    errors.push("Remote CI GitHub API capture envelope is invalid.");
+    return { ...reference };
+  }
+  const pull = snapshot.pullRequest;
+  if (pull.number !== receipt.pullRequest?.number
+    || pull.draft !== true
+    || pull.state !== "open"
+    || pull.html_url !== receipt.pullRequest?.url
+    || pull.base?.ref !== receipt.pullRequest?.baseRef
+    || pull.head?.ref !== receipt.pullRequest?.headRef
+    || pull.head?.sha !== source?.sha) {
+    errors.push("Remote CI draft pull-request receipt disagrees with GitHub API evidence.");
+  }
+  if (pull.head?.repo?.full_name !== receipt.repository
+    || pull.base?.repo?.full_name !== receipt.repository) {
+    errors.push("Remote CI pull-request repositories disagree with configured origin.");
+  }
+  for (const run of receipt.runs || []) {
+    const rawRun = snapshot.runs.find(item => item?.id === run.runId);
+    const rawJobs = snapshot.jobsByRunId[String(run.runId)]?.jobs;
+    const matchingRuns = (snapshot.runListsByWorkflow[run.workflowFile]?.workflow_runs || [])
+      .filter(item => normalizedWorkflowRunPath(item?.path) === run.workflowFile
+        && item?.event === run.event
+        && item?.head_sha === source?.sha
+        && item?.head_branch === receipt.branch
+        && item?.head_repository?.full_name === receipt.repository);
+    const authoritativeRun = matchingRuns.sort((left, right) => (
+      (Date.parse(right.updated_at) - Date.parse(left.updated_at))
+      || (Date.parse(right.created_at) - Date.parse(left.created_at))
+      || (right.id - left.id)
+      || (right.run_attempt - left.run_attempt)
+    ))[0];
+    if (!rawRun
+      || authoritativeRun?.id !== run.runId
+      || authoritativeRun?.run_attempt !== run.runAttempt
+      || rawRun.run_attempt !== run.runAttempt
+      || normalizedWorkflowRunPath(rawRun.path) !== run.workflowFile
+      || rawRun.name !== run.workflowName
+      || rawRun.event !== run.event
+      || rawRun.head_sha !== run.headSha
+      || rawRun.head_branch !== receipt.branch
+      || rawRun.head_repository?.full_name !== receipt.repository
+      || rawRun.status !== run.status
+      || rawRun.conclusion !== run.conclusion
+      || rawRun.html_url !== run.url
+      || rawRun.created_at !== run.createdAt
+      || rawRun.updated_at !== run.completedAt
+      || (run.pullRequestNumber === null
+        ? (rawRun.pull_requests || []).length !== 0
+        : !(rawRun.pull_requests || []).some(item => item?.number === run.pullRequestNumber))
+      || !Array.isArray(rawJobs)) {
+      errors.push(`Remote CI workflow ${run.workflowFile} disagrees with GitHub API evidence.`);
+      continue;
+    }
+    for (const job of run.jobs || []) {
+      const rawJob = rawJobs.find(item => item?.id === job.databaseId);
+      if (!rawJob
+        || rawJob.name !== job.name
+        || rawJob.status !== job.status
+        || rawJob.conclusion !== job.conclusion
+        || rawJob.started_at !== job.startedAt
+        || rawJob.completed_at !== job.completedAt) {
+        errors.push(`Remote CI job ${job.id} disagrees with GitHub API evidence.`);
+      }
+    }
+  }
+  return { ...reference };
+}
+
+function normalizedWorkflowRunPath(value) {
+  if (typeof value !== "string" || value.length > 512) return null;
+  const match = /^(\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml)(?:@[^\s@\u0000-\u001f\u007f]{1,255})?$/u.exec(value);
+  return match?.[1] || null;
+}
+
 function releaseReadinessStatus(values) {
   const reasons = [];
   const workflowStatus = aggregateStatuses(values.workflowCoverage
@@ -1246,6 +1614,15 @@ function releaseReadinessStatus(values) {
   }
   if (values.profile === "release" && values.blackBoxUi.status !== "passed") {
     reasons.push(`black-box UI: ${values.blackBoxUi.status}`);
+  }
+  if (values.profile === "release" && values.remoteCi.status !== "passed") {
+    reasons.push(`final-head remote CI: ${values.remoteCi.status}`);
+  }
+  if (values.profile === "release"
+    && values.remoteCi.status === "passed"
+    && values.liveQualification.status === "passed"
+    && (!(Date.parse(values.liveQualification.completedAt) >= Date.parse(values.remoteCi.completedAt)))) {
+    reasons.push("authenticated live qualification predates final-head remote CI");
   }
   if (values.liveQualification.status !== "passed" || !allAuthenticatedPassed) {
     reasons.push(`authenticated live qualification: ${values.liveQualification.status}`);
@@ -1277,6 +1654,9 @@ function releaseReadinessStatus(values) {
     values.mutation.status,
     values.profile === "fast" ? "not-applicable" : workflowStatus,
     values.profile === "release" ? values.blackBoxUi.status : "not-applicable",
+    values.profile === "release" && values.remoteCi.status === "failed"
+      ? "failed"
+      : "not-applicable",
     values.liveQualification.status === "failed" ? "failed" : "not-applicable",
     values.findings.status,
     values.findings.deterministicReleaseBlocking > 0 ? "failed" : "not-applicable",
@@ -1415,6 +1795,14 @@ function loadReportInputs(options = {}) {
       options,
     )
     : null;
+  const remoteCiArtifact = profile === "release"
+    ? readOptionalRepositoryJsonArtifact(
+      DEFAULT_REMOTE_CI,
+      root,
+      "internal_docs/quality",
+      options,
+    )
+    : null;
   const impactArtifact = readOptionalRepositoryJsonArtifact(
     ".quality/impact.json",
     root,
@@ -1440,11 +1828,14 @@ function loadReportInputs(options = {}) {
     extensionVersion: manifest.version,
     liveQualification: liveArtifact?.value || null,
     liveQualificationArtifactFingerprint: liveArtifact?.fingerprint || null,
+    remoteCi: remoteCiArtifact?.value || null,
+    remoteCiArtifactFingerprint: remoteCiArtifact?.fingerprint || null,
     findings,
     findingsFingerprint,
     findingsStatus,
     findingsErrors,
     workflows,
+    taxonomy: readJson("quality/defect-taxonomy.json", root),
     inventories: require(path.join(root, "test", "testInventories.js")),
   };
 }
@@ -1511,6 +1902,19 @@ function renderMarkdown(report) {
     lines.push(...report.releaseReadiness.reasons.map(reason => `- ${reason}`), "");
   }
   lines.push(
+    "## Final-head remote CI",
+    "",
+    `Status: **${report.remoteCi.status.toUpperCase()}**  `,
+    `Branch: ${report.remoteCi.branch || "not recorded"}  `,
+    `Pushed SHA: ${report.remoteCi.sourceSha || "not recorded"}  `,
+    `Draft PR: ${report.remoteCi.pullRequest?.url || "not recorded"}`,
+    "",
+    "| Workflow | Run | Conclusion |",
+    "| --- | --- | --- |",
+    ...report.remoteCi.runs.map(run => (
+      `| ${run.workflowName || run.workflowFile} | ${run.url || "not recorded"} | ${run.conclusion || "not recorded"} |`
+    )),
+    "",
     "## Impact",
     "",
     `Status: **${report.impact.status.toUpperCase()}**`,
@@ -1576,9 +1980,11 @@ function renderMarkdown(report) {
     "",
     "## Authenticated live workflow matrix",
     "",
-    "| Workflow | Status |",
-    "| --- | --- |",
-    ...report.liveQualification.workflowMatrix.map(row => `| ${row.id} | ${row.status} |`),
+    "| Workflow | Status | Disposition | Candidate provenance |",
+    "| --- | --- | --- | --- |",
+    ...report.liveQualification.workflowMatrix.map(row => (
+      `| ${row.id} | ${row.status} | ${row.outcomeDisposition} | ${row.candidateProvenance} |`
+    )),
     "",
     "## Findings",
     "",
@@ -1663,6 +2069,7 @@ module.exports = {
   DEFAULT_FINDINGS,
   DEFAULT_JSON_OUTPUT,
   DEFAULT_MARKDOWN_OUTPUT,
+  DEFAULT_REMOTE_CI,
   UI_BLOCKED_REASON,
   discoverUiArtifacts,
   expectedBlackBoxUiTests,
@@ -1672,8 +2079,11 @@ module.exports = {
   normalizeGateReceipt,
   parseArguments,
   parseFindingsJsonl,
+  releaseReadinessStatus,
   renderMarkdown,
+  summarizeRemoteCi,
   summarizeFindings,
+  validateDerivedLiveStatus,
   validateUiResult,
   validateImpactArtifact,
   validateFindingRecord,

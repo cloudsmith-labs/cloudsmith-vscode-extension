@@ -21,6 +21,7 @@
     "firstKnownBadSha",
     "evidence",
     "rootCauseStatus",
+    "requiredEvidenceLayers",
     "testLayerThatShouldHaveCaughtIt",
     "whyItEscaped",
     "regressionTest",
@@ -110,7 +111,26 @@
     },
     "rootCauseStatus": { "enum": ["unknown", "suspected", "proven"] },
     "rootCause": { "type": ["string", "null"] },
+    "requiredEvidenceLayers": {
+      "description": "The lowest reviewed evidence layer or layers that authoritatively prove the escaped finding contract. This is independent of broader workflow qualification depth.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "unit",
+          "contract",
+          "extension-host",
+          "live-protocol",
+          "black-box-ui",
+          "documentation",
+          "durable-security-scan",
+          "external-confirmation"
+        ]
+      }
+    },
     "testLayerThatShouldHaveCaughtIt": {
+      "description": "Records the layer where the defect escaped. The separately reviewed requiredEvidenceLayers field records the lowest authoritative closure layer; workflow-wide qualification depth does not override it.",
       "enum": ["unit", "contract", "extension-host", "live-protocol", "black-box-ui", "documentation"]
     },
     "whyItEscaped": { "type": "string", "minLength": 1 },

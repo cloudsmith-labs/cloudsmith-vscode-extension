@@ -54,15 +54,36 @@ function isClosedFinding(finding) {
   return CLOSED_FINDING_STATUSES.has(finding?.status);
 }
 
-function findingRequiresLiveVerification(finding) {
-  if (!isPlainObject(finding)) return false;
-  if (finding.liveStatus !== "not-required") return true;
-  if (finding.domain === "security-environment" && finding.severity === "P0") return true;
-  return finding.domain === "product"
-    && ["live-protocol", "black-box-ui"].includes(finding.testLayerThatShouldHaveCaughtIt);
+function deriveRequiredEvidenceLayers(finding, taxonomy = null) {
+  if (!isPlainObject(finding) || !isPlainObject(taxonomy?.requiredEvidencePolicy)) {
+    return Object.freeze([]);
+  }
+  const policy = taxonomy.requiredEvidencePolicy;
+  const externalOverride = policy.externalSecurityOverride;
+  if (isPlainObject(externalOverride)
+    && finding.domain === externalOverride.domain
+    && finding.severity === externalOverride.severity
+    && finding.deterministicStatus === externalOverride.deterministicStatus) {
+    return Object.freeze(uniqueSorted(externalOverride.requiredLayers || []));
+  }
+  const findingOverride = policy.findingOverrides?.[finding.id];
+  if (Array.isArray(findingOverride)) {
+    return Object.freeze(uniqueSorted(findingOverride));
+  }
+  return Object.freeze(uniqueSorted(
+    policy.defaultByEscapedLayer?.[finding.testLayerThatShouldHaveCaughtIt] || []
+  ));
 }
 
-function deriveReleaseBlocking(finding, workflow = null) {
+function findingRequiresLiveVerification(finding, taxonomy = null) {
+  const requiredLayers = deriveRequiredEvidenceLayers(finding, taxonomy);
+  const liveStatusLayers = new Set(
+    taxonomy?.requiredEvidencePolicy?.liveStatusLayers || []
+  );
+  return requiredLayers.some(layer => liveStatusLayers.has(layer));
+}
+
+function deriveReleaseBlocking(finding, workflow = null, taxonomy = null) {
   if (!isPlainObject(finding)) return true;
   if (isClosedFinding(finding)) return false;
   if (finding.severity === "P3") return false;
@@ -70,7 +91,7 @@ function deriveReleaseBlocking(finding, workflow = null) {
   if (finding.severity === "P1") return true;
 
   const deterministicUnresolved = finding.deterministicStatus !== "fixed";
-  const liveUnresolved = findingRequiresLiveVerification(finding)
+  const liveUnresolved = findingRequiresLiveVerification(finding, taxonomy)
     && finding.liveStatus !== "verified";
   if (finding.domain === "product") {
     const releaseCritical = workflow == null || workflow.criticality === "release-critical";
@@ -201,7 +222,7 @@ function validateFindingRecord(
   if (typeof finding.releaseBlocking !== "boolean") {
     errors.push(`Finding ${label} must declare boolean releaseBlocking.`);
   }
-  const derivedReleaseBlocking = deriveReleaseBlocking(finding, workflow);
+  const derivedReleaseBlocking = deriveReleaseBlocking(finding, workflow, taxonomy);
   if (typeof finding.releaseBlocking === "boolean"
     && finding.releaseBlocking !== derivedReleaseBlocking) {
     errors.push(
@@ -264,9 +285,24 @@ function validateFindingRecord(
       );
     }
   }
-  if (findingRequiresLiveVerification(finding)
+  const requiredEvidenceLayers = deriveRequiredEvidenceLayers(finding, taxonomy);
+  if (requiredEvidenceLayers.length === 0) {
+    errors.push(`Finding ${label} has no policy-derived required evidence layer.`);
+  }
+  if (JSON.stringify(uniqueSorted(finding.requiredEvidenceLayers || []))
+    !== JSON.stringify(requiredEvidenceLayers)) {
+    errors.push(`Finding ${label} required evidence layers do not match taxonomy policy.`);
+  }
+  if (findingRequiresLiveVerification(finding, taxonomy)
     && finding.liveStatus === "not-required") {
     errors.push(`Finding ${label} cannot mark required live verification as not-required.`);
+  }
+  if (!findingRequiresLiveVerification(finding, taxonomy)
+    && !["not-required", "verified"].includes(finding.liveStatus)) {
+    errors.push(
+      `Finding ${label} must mark live verification not-required because its escaped contract `
+      + `is closed by ${requiredEvidenceLayers.join(", ") || "no valid layer"}.`
+    );
   }
   if (finding.rootCauseStatus === "proven" && !requireNonEmptyString(finding.rootCause)) {
     errors.push(`Finding ${label} proven root cause requires a nonempty rootCause.`);
@@ -406,6 +442,7 @@ function validateNestedEvidenceStatus(value, allowedStatuses, field, label, erro
 module.exports = {
   decodeFindingsBytes,
   decodeUtf8Bytes,
+  deriveRequiredEvidenceLayers,
   deriveReleaseBlocking,
   findingRequiresLiveVerification,
   isClosedFinding,

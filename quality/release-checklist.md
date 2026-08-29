@@ -115,7 +115,7 @@ both required. Passing one never implies that the other ran.
 
 ## Authenticated authoritative outcomes
 
-- [ ] Fresh schema-v5 attestation binds the exact local candidate receipt,
+- [ ] Fresh schema-v6 attestation binds the exact local candidate receipt,
       stable VSIX bytes, installed identity/version, source, dedicated local
       profile identity, exact findings bytes, independent review, and all
       required evidence.
@@ -126,9 +126,13 @@ both required. Passing one never implies that the other ran.
 - [ ] Final PASS loaded `.quality/secrets/authenticated-ci.json` and validated
       its exact generated-evidence, candidate-VSIX, runtime-log, and profile-
       metadata-only components against the authenticated candidate receipt.
-- [ ] Every live `PASS` row, visible-action pass, and independent-review pass
-      names the same candidate receipt fingerprint; missing or stale candidate
-      metadata fails closed.
+- [ ] Every candidate-observed workflow row, including `PARTIAL` and `BLOCKED`,
+      names the exact candidate receipt fingerprint independently of outcome;
+      only a genuinely not-executed row uses `candidateProvenance: not-observed`
+      with a null receipt.
+- [ ] Workflow outcome disposition distinguishes partial evidence,
+      defect-blocked, not-authorized, external-precondition, not-executed, and
+      authoritative failure without treating them as interchangeable.
 - [ ] Every manifest workflow with `liveFixture.required: true` has one nonblank
       `PASS`, `FAIL`, `PARTIAL`, or `BLOCKED` row.
 - [ ] Activation/reload and authentication state settle truthfully.
@@ -136,8 +140,11 @@ both required. Passing one never implies that the other ran.
       metadata settles, with explicit empty/partial/failed/cancelled terminals.
 - [ ] Search first page, Load More, exhaustion, duplicate-only continuation,
       retained actions, and supersession settle within bounds.
-- [ ] Every registered resolver family reaches a terminal result and preserves
-      format-native identity and qualifiers.
+- [ ] Every registered resolver family has authoritative deterministic or
+      Extension Host evidence for canonical parsing, identity, provenance, and
+      bounded terminals; live fixtures are required only for resolver claims
+      that materially depend on real registry, package-manager, or Cloudsmith
+      protocol semantics.
 - [ ] Direct/Flat/Tree, filters, cancellation, rescan, coverage/enrichment, and
       supersession do not publish stale or false-complete state.
 - [ ] Dependency, Compliance, Vulnerability, Quarantine, and detail surfaces
@@ -174,16 +181,31 @@ both required. Passing one never implies that the other ran.
 
 ## Final gate and verdict
 
+- [ ] Local deterministic/security gates are green, no unresolved code-security
+      blocker exists, and the branch diff is reviewed before push.
+- [ ] The validated task branch was pushed and a draft PR opened or updated
+      without requiring final TEAM-TEST readiness as a push precondition.
+- [ ] Branch protection, required-status rules, bypass rules, and repository
+      governance were not changed.
 - [ ] `npm run quality:release` completed against the final candidate; a history
       or QH-010 blocker is reported as open rather than bypassed.
 - [ ] The release-profile run preserved any prior fast/full receipt trees and
       accepted them only when complete, canonical, current-source,
       current-plan, and byte-stable; every unsafe or changed gate-tree entry was
       rejected.
-- [ ] Final pushed-head CI and highest-risk live requalification completed before
-      a ready verdict.
+- [ ] Authoritative remote CI completed on the exact pushed SHA, followed by
+      only the highest-risk affected live requalification needed for that final
+      candidate, before a ready verdict.
+- [ ] Fresh schema-v2 `internal_docs/quality/remote-ci.json` binds the draft PR,
+      exact task-branch SHA, both authoritative workflow runs, and every exact
+      required job with a successful terminal conclusion, while its exact
+      `remote-ci-api.json` evidence preserves the reviewed bounded GitHub API
+      responses; missing, stale, crossed, superseded, cancelled, skipped,
+      failed, or incomplete CI blocks readiness.
+- [ ] The final targeted live qualification and independent review postdate the
+      last authoritative remote-CI completion time.
 - [ ] No P0, P1 product, core P2 product, dead enabled action, false
       success/clean/complete, required live failure, deterministic failure,
       evidence-invalidating CI defect, or unresolved security blocker remains.
 - [ ] Verdict is exactly `TEAM-TEST READY`, `NOT TEAM-TEST READY`, or
-      `TEAM-TEST READY WITH KNOWN NON-BLOCKING RISKS`.
+      `TEAM-TEST READY WITH RISKS`.

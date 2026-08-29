@@ -9,6 +9,7 @@ permissions:
 
 env:
   NODE_VERSION: 22.23.2
+  CANDIDATE_SHA: ${{ github.sha }}
 
 jobs:
   core-mutation:
@@ -19,6 +20,7 @@ jobs:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -49,14 +51,14 @@ jobs:
         env:
           EXPECTED_MUTATION_EXIT_CODE: ${{ steps.mutation_run.outputs.exit_code }}
           EXPECTED_MUTATION_OUTCOME: ${{ steps.mutation_run.outcome }}
-          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_SOURCE_SHA: ${{ env.CANDIDATE_SHA }}
         run: npm run quality:verify-mutation-evidence -- --mode core --expected-exit-code "$EXPECTED_MUTATION_EXIT_CODE" --expected-run-outcome "$EXPECTED_MUTATION_OUTCOME" --expected-source-sha "$EXPECTED_SOURCE_SHA"
 
       - name: Upload core mutation evidence
         if: ${{ always() && steps.mutation_evidence_handoff.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: core-mutation-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          name: core-mutation-evidence-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}
           path: |
             .quality/mutation/summary-core.json
             .quality/mutation/mutation.json
@@ -77,7 +79,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: history-secret-receipt-${{ github.sha }}-${{ github.run_attempt }}
+          name: history-secret-receipt-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}
           path: .quality/secrets/history.json
           if-no-files-found: error
           include-hidden-files: true
@@ -91,6 +93,7 @@ jobs:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -124,14 +127,14 @@ jobs:
         id: ui_evidence_bundle
         if: ${{ always() }}
         env:
-          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_SOURCE_SHA: ${{ env.CANDIDATE_SHA }}
         run: node scripts/quality/verify-ui-evidence.js --bundle .quality/upload/signed-out-ui
 
       - name: Upload safe signed-out UI receipts
         if: ${{ always() && steps.ui_evidence_handoff.outcome == 'success' && steps.ui_evidence_secret_scan.outcome == 'success' && steps.ui_evidence_bundle.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: signed-out-ui-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          name: signed-out-ui-evidence-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}
           path: |-
             .quality/upload/signed-out-ui/evidence.json
             .quality/upload/signed-out-ui/result.json
@@ -150,6 +153,7 @@ jobs:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -184,7 +188,7 @@ jobs:
         id: authenticated_evidence_handoff
         if: ${{ always() }}
         env:
-          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_SOURCE_SHA: ${{ env.CANDIDATE_SHA }}
         run: npm run quality:verify-authenticated-evidence
 
       - name: Scan upload-eligible authenticated evidence
@@ -196,7 +200,7 @@ jobs:
         if: ${{ always() && steps.authenticated_evidence_handoff.outcome == 'success' && steps.authenticated_evidence_secret_scan.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: authenticated-ui-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          name: authenticated-ui-evidence-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}
           path: |
             .quality/qualification/authenticated-candidate.json
             .quality/qualification/authenticated-candidate.vsix

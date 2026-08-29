@@ -119,7 +119,7 @@
       "id": "WF-DEPENDENCY-RESOLUTION",
       "criticality": "release-critical",
       "surface": "Dependency health / resolver inventory",
-      "authoritativeOutcome": "Every registered resolver family reaches a bounded terminal result and preserves exact dependency identity, provenance, qualifiers, directness, and resolution completeness without manufacturing registry evidence.",
+      "authoritativeOutcome": "Every registered resolver family reaches a bounded terminal result and preserves exact dependency identity, provenance, qualifiers, directness, and resolution completeness without manufacturing registry evidence; real registry or service behavior is required only for claims that materially depend on it.",
       "riskClasses": ["canonical-identity", "format-native-semantics", "boundedness", "validation/security", "terminal-state"],
       "requiredLayers": ["unit", "contract", "extension-host", "live-protocol"],
       "testFiles": ["test/dependencyAdapterRegistry.test.js", "test/dependencyHealthProvider.test.js", "test/lockfileResolver.test.js"],
@@ -130,7 +130,7 @@
       ],
       "productionAreas": ["views/dependencyHealthProvider.js", "util/dependencyAdapterRegistry.js", "util/dependencyRecord.js", "util/dependencyManifestDiscovery.js", "util/lockfileResolver.js", "util/lockfileParsers/**", "util/manifestParser.js", "models/dependencyHealthNode.js", "models/dependencySourceGroupNode.js"],
       "targetCommands": ["npm run test:node", "npm run test:vscode"],
-      "liveFixture": { "required": true, "kind": "local-project-fixtures", "description": "Established cloudsmith-*-demo projects under the Projects root; connected read-only enrichment.", "destructive": false },
+      "liveFixture": { "required": true, "kind": "local-project-fixtures", "description": "Established cloudsmith-*-demo projects under the Projects root for deterministic/Extension Host parser coverage, plus connected read-only enrichment and only format-native registry/service claims that cannot be proven below live protocol.", "destructive": false },
       "destructive": false,
       "formatContracts": [
         { "format": "npm", "identity": "scope/name, exact version, installed-path occurrence" },
@@ -313,7 +313,7 @@
       ],
       "productionAreas": ["util/installCommandBuilder.js", "commands/packages.js", "commands/support.js", "domain/installGuidanceSupport.js", "domain/packageAdapters.js", "domain/packageActionCapabilities.js", "models/packageNode.js", "models/searchResultNode.js", "models/dependencyHealthNode.js", "package.json"],
       "targetCommands": ["npm run test:node", "npm run test:vscode", "npm run test:mutation:changed"],
-      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "Current InstallCommandBuilder format inventory using existing exact packages; Show, Copy, paste, semantic comparison, and secret scan.", "destructive": false },
+      "liveFixture": { "required": true, "kind": "cloudsmith-read-only", "description": "The complete InstallCommandBuilder inventory is proved by registered Show/Copy producer-consumer and Extension Host evidence; candidate-bound existing packages sample the rendered selected-repository action, with native package-manager or protocol evidence only where real ecosystem semantics are material.", "destructive": false },
       "destructive": false,
       "actionContractIds": ["ACT-EXPLORER-SHOW-INSTALL", "ACT-SEARCH-SHOW-INSTALL", "ACT-DEPENDENCY-SHOW-INSTALL"],
       "formatContracts": [

@@ -11,20 +11,170 @@ const {
 } = require("../scripts/quality/candidate-binding");
 const {
   generateReport,
+  releaseReadinessStatus,
+  summarizeRemoteCi,
   summarizeFindings,
   UI_BLOCKED_REASON,
+  validateDerivedLiveStatus,
   validateUiResult,
 } = require("../scripts/quality/report");
 const { verifyQualityContracts } = require("../scripts/quality/verify-workflows");
 const {
   verifySignedOutUiEvidence,
 } = require("../scripts/quality/verify-ui-evidence");
+const {
+  deriveReleaseBlocking,
+  deriveRequiredEvidenceLayers,
+  findingRequiresLiveVerification,
+} = require("../scripts/quality/findings");
+const TAXONOMY = require("../quality/defect-taxonomy.json");
 
 const SOURCE = Object.freeze({
   sha: "1".repeat(40),
   fingerprint: "2".repeat(64),
 });
 const NPM_INTEGRITY = JSON.parse(fs.readFileSync(path.join(__dirname, "../.npm-integrity"), "utf8"));
+
+function remoteCiReceipt(overrides = {}) {
+  const capturedAt = new Date().toISOString();
+  const createdAt = new Date(Date.parse(capturedAt) - 5 * 60 * 1000).toISOString();
+  const completedAt = new Date(Date.parse(capturedAt) - 4 * 60 * 1000).toISOString();
+  let databaseId = 2000;
+  const mainJobs = [
+    ["quality", "Quality"],
+    ["mutation", "Changed high-risk mutation gate"],
+    ["extension-tests:ubuntu-24.04:1.99.0:core", "Extension tests (ubuntu-24.04, VS Code 1.99.0, core)"],
+    ["extension-tests:ubuntu-24.04:1.99.0:smoke", "Extension tests (ubuntu-24.04, VS Code 1.99.0, smoke)"],
+    ["extension-tests:ubuntu-24.04:1.134.0:core", "Extension tests (ubuntu-24.04, VS Code 1.134.0, core)"],
+    ["extension-tests:windows-2025:1.134.0:smoke", "Extension tests (windows-2025, VS Code 1.134.0, smoke)"],
+    ["extension-tests:macos-15:1.134.0:smoke", "Extension tests (macos-15, VS Code 1.134.0, smoke)"],
+    ["package", "Reproducible VSIX"],
+    ["build-candidate", "Deterministic build candidate"],
+  ].map(([id, name]) => ({
+    id,
+    name,
+    databaseId: ++databaseId,
+    status: "completed",
+    conclusion: "success",
+    startedAt: createdAt,
+    completedAt,
+  }));
+  const deepJobs = [
+    ["core-mutation", "Core mutation"],
+    ["signed-out-black-box-ui", "Signed-out packaged black-box UI"],
+    ["authenticated-production-ui", "Authenticated packaged production UI"],
+  ].map(([id, name]) => ({
+    id,
+    name,
+    databaseId: ++databaseId,
+    status: "completed",
+    conclusion: "success",
+    startedAt: createdAt,
+    completedAt,
+  }));
+  return {
+    schemaVersion: 2,
+    repository: "cloudsmith-labs/cloudsmith-vscode-extension",
+    branch: "test/release-quality-harness",
+    sourceSha: SOURCE.sha,
+    sourceFingerprint: SOURCE.fingerprint,
+    capturedAt,
+    pullRequest: {
+      number: 42,
+      draft: true,
+      state: "open",
+      baseRef: "main",
+      headRef: "test/release-quality-harness",
+      headSha: SOURCE.sha,
+      url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/pull/42",
+    },
+    runs: [{
+      workflowFile: ".github/workflows/main.yml",
+      workflowName: "Deterministic build candidate",
+      event: "pull_request",
+      runId: 1001,
+      runAttempt: 1,
+      pullRequestNumber: 42,
+      headSha: SOURCE.sha,
+      status: "completed",
+      conclusion: "success",
+      createdAt,
+      completedAt,
+      url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/actions/runs/1001",
+      jobs: mainJobs,
+    }, {
+      workflowFile: ".github/workflows/deep-quality.yml",
+      workflowName: "Manual deep quality",
+      event: "workflow_dispatch",
+      runId: 1002,
+      runAttempt: 1,
+      pullRequestNumber: null,
+      headSha: SOURCE.sha,
+      status: "completed",
+      conclusion: "success",
+      createdAt,
+      completedAt,
+      url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/actions/runs/1002",
+      jobs: deepJobs,
+    }],
+    evidence: {
+      path: "internal_docs/quality/remote-ci-api.json",
+      sha256: "a".repeat(64),
+    },
+    ...overrides,
+  };
+}
+
+function remoteCiApiEvidence(receipt) {
+  const rawRun = run => ({
+    id: run.runId,
+    run_attempt: run.runAttempt,
+    path: run.workflowFile,
+    name: run.workflowName,
+    event: run.event,
+    head_sha: run.headSha,
+    head_branch: receipt.branch,
+    head_repository: { full_name: receipt.repository },
+    status: run.status,
+    conclusion: run.conclusion,
+    html_url: run.url,
+    created_at: run.createdAt,
+    updated_at: run.completedAt,
+    pull_requests: run.pullRequestNumber === null ? [] : [{ number: run.pullRequestNumber }],
+  });
+  const value = {
+    schemaVersion: 1,
+    repository: receipt.repository,
+    capturedAt: receipt.capturedAt,
+    pullRequest: {
+      number: receipt.pullRequest.number,
+      draft: receipt.pullRequest.draft,
+      state: receipt.pullRequest.state,
+      html_url: receipt.pullRequest.url,
+      base: { ref: receipt.pullRequest.baseRef, repo: { full_name: receipt.repository } },
+      head: {
+        ref: receipt.pullRequest.headRef,
+        sha: receipt.pullRequest.headSha,
+        repo: { full_name: receipt.repository },
+      },
+    },
+    runs: receipt.runs.map(rawRun),
+    jobsByRunId: Object.fromEntries(receipt.runs.map(run => [String(run.runId), {
+      jobs: run.jobs.map(job => ({
+        id: job.databaseId,
+        name: job.name,
+        status: job.status,
+        conclusion: job.conclusion,
+        started_at: job.startedAt,
+        completed_at: job.completedAt,
+      })),
+    }])),
+    runListsByWorkflow: Object.fromEntries(receipt.runs.map(run => [run.workflowFile, {
+      workflow_runs: [rawRun(run)],
+    }])),
+  };
+  return { value, fingerprint: receipt.evidence.sha256 };
+}
 
 function candidateReceipt(overrides = {}) {
   const base = {
@@ -107,6 +257,235 @@ function validUiResult(receipt) {
 }
 
 suite("two-lane release-readiness model", () => {
+  test("requires exact successful final-head remote CI before readiness", () => {
+    const exact = remoteCiReceipt();
+    const options = { apiEvidence: remoteCiApiEvidence(exact) };
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), options).status, "passed");
+    assert.strictEqual(summarizeRemoteCi(null, SOURCE).status, "not-run");
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE).status, "failed");
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: { ...options.apiEvidence, fingerprint: "b".repeat(64) },
+    }).status, "failed");
+
+    const mutations = [
+      { ...exact, sourceSha: "3".repeat(40) },
+      { ...exact, sourceFingerprint: "3".repeat(64) },
+      { ...exact, capturedAt: new Date(Date.now() - (25 * 60 * 60 * 1000)).toISOString() },
+      { ...exact, pullRequest: { ...exact.pullRequest, draft: false } },
+      { ...exact, branch: "other-branch" },
+      {
+        ...exact,
+        runs: exact.runs.map((run, index) => index === 0
+          ? { ...run, conclusion: "failure" }
+          : run),
+      },
+      {
+        ...exact,
+        runs: exact.runs.map((run, index) => index === 0
+          ? { ...run, jobs: run.jobs.slice(1) }
+          : run),
+      },
+      {
+        ...exact,
+        runs: exact.runs.map((run, index) => index === 0
+          ? { ...run, completedAt: new Date(Date.parse(run.createdAt) - 1).toISOString() }
+          : run),
+      },
+    ];
+    for (const mutation of mutations) {
+      assert.strictEqual(
+        summarizeRemoteCi(mutation, SOURCE, null, Date.now(), options).status,
+        "failed",
+      );
+    }
+    const superseded = remoteCiApiEvidence(exact);
+    superseded.value.runListsByWorkflow[exact.runs[0].workflowFile].workflow_runs.unshift({
+      ...superseded.value.runs[0],
+      id: exact.runs[0].runId + 100,
+      run_attempt: 1,
+      created_at: new Date(Date.parse(exact.runs[0].createdAt) + 1000).toISOString(),
+    });
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: superseded,
+    }).status, "failed");
+    const suffixedPaths = remoteCiApiEvidence(exact);
+    for (const run of suffixedPaths.value.runs) run.path += "@refs/heads/test/release-quality-harness";
+    for (const run of exact.runs) {
+      suffixedPaths.value.runListsByWorkflow[run.workflowFile].workflow_runs[0].path
+        += "@refs/heads/test/release-quality-harness";
+    }
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: suffixedPaths,
+    }).status, "passed");
+    const hostilePath = remoteCiApiEvidence(exact);
+    hostilePath.value.runs[0].path += "@main@hostile";
+    hostilePath.value.runListsByWorkflow[exact.runs[0].workflowFile].workflow_runs[0].path
+      += "@main@hostile";
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: hostilePath,
+    }).status, "failed");
+    const crossedRepository = remoteCiApiEvidence(exact);
+    crossedRepository.value.pullRequest.head.repo.full_name = "fork/repository";
+    crossedRepository.value.runs[1].head_repository.full_name = "fork/repository";
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: crossedRepository,
+    }).status, "failed");
+    const olderHighAttemptReceipt = remoteCiReceipt();
+    olderHighAttemptReceipt.runs[0].runAttempt = 2;
+    const newerFailed = remoteCiApiEvidence(olderHighAttemptReceipt);
+    newerFailed.value.runListsByWorkflow[olderHighAttemptReceipt.runs[0].workflowFile]
+      .workflow_runs.unshift({
+        ...newerFailed.value.runs[0],
+        id: olderHighAttemptReceipt.runs[0].runId + 1,
+        run_attempt: 1,
+        conclusion: "failure",
+        created_at: new Date(
+          Date.parse(olderHighAttemptReceipt.runs[0].createdAt) + 1000
+        ).toISOString(),
+        updated_at: new Date(
+          Date.parse(olderHighAttemptReceipt.runs[0].completedAt) + 1000
+        ).toISOString(),
+      });
+    assert.strictEqual(summarizeRemoteCi(
+      olderHighAttemptReceipt,
+      SOURCE,
+      null,
+      Date.now(),
+      { apiEvidence: newerFailed },
+    ).status, "failed");
+    const olderRetried = remoteCiApiEvidence(exact);
+    olderRetried.value.runListsByWorkflow[exact.runs[0].workflowFile].workflow_runs.push({
+      ...olderRetried.value.runs[0],
+      id: exact.runs[0].runId - 100,
+      run_attempt: exact.runs[0].runAttempt + 1,
+      created_at: new Date(Date.parse(exact.runs[0].createdAt) - 1000).toISOString(),
+    });
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: olderRetried,
+    }).status, "passed");
+  });
+
+  test("remote CI absence and failure block or fail an otherwise ready release", () => {
+    const readyInputs = {
+      profile: "release",
+      deterministicStatus: "passed",
+      impact: { status: "passed" },
+      mutation: { status: "passed" },
+      blackBoxUi: { status: "passed" },
+      liveQualification: {
+        status: "passed",
+        completedAt: "2026-08-29T21:00:00.000Z",
+        authenticatedAcceptance: "recorded",
+        verdict: "TEAM-TEST READY",
+      },
+      findings: {
+        status: "passed",
+        releaseBlocking: 0,
+        deterministicReleaseBlocking: 0,
+        liveReleaseBlocking: 0,
+      },
+      workflowCoverage: [{
+        criticality: "release-critical",
+        deterministicStatus: "passed",
+        authenticatedRequired: true,
+        authenticatedStatus: "PASS",
+      }],
+    };
+
+    assert.strictEqual(releaseReadinessStatus({
+      ...readyInputs,
+      remoteCi: { status: "not-run" },
+    }).status, "blocked");
+    assert.strictEqual(releaseReadinessStatus({
+      ...readyInputs,
+      remoteCi: { status: "failed" },
+    }).status, "failed");
+    assert.strictEqual(releaseReadinessStatus({
+      ...readyInputs,
+      remoteCi: { status: "passed", completedAt: "2026-08-29T20:00:00.000Z" },
+    }).status, "passed");
+    assert.strictEqual(releaseReadinessStatus({
+      ...readyInputs,
+      remoteCi: { status: "passed", completedAt: "2026-08-29T22:00:00.000Z" },
+    }).status, "blocked");
+  });
+
+  test("derived status rejects unobserved PARTIAL and not-authorized rows", () => {
+    const base = {
+      schemaVersion: 4,
+      source: SOURCE,
+      candidate: null,
+      inputPath: "internal_docs/quality/live-qualification.json",
+      status: "partial",
+      authenticatedAcceptance: "not-recorded",
+      verdict: null,
+      requiredWorkflowIds: ["WF-LIVE"],
+      passedWorkflowIds: [],
+      missingWorkflowIds: ["WF-LIVE"],
+      workflowMatrix: [{
+        id: "WF-LIVE",
+        status: "PARTIAL",
+        outcomeDisposition: "partial-evidence",
+        candidateProvenance: "not-observed",
+      }],
+      attestationFingerprint: null,
+      evidenceManifest: [{
+        path: "internal_docs/quality/findings.jsonl",
+        sha256: "4".repeat(64),
+        capturedAt: new Date().toISOString(),
+      }],
+      findingsFingerprint: "4".repeat(64),
+      openReleaseBlockerCount: 1,
+      visibleEnabledActions: { status: "not-run", silentNoOpCount: null },
+      reason: null,
+      errors: [],
+    };
+    const findingsState = { fingerprint: "4".repeat(64), openReleaseBlockerCount: 1 };
+    assert.ok(validateDerivedLiveStatus(base, ["WF-LIVE"], findingsState)
+      .some(error => /outcome semantics/u.test(error)));
+
+    const blocked = {
+      ...base,
+      status: "blocked",
+      workflowMatrix: [{
+        ...base.workflowMatrix[0],
+        status: "BLOCKED",
+        outcomeDisposition: "not-authorized",
+      }],
+    };
+    assert.ok(validateDerivedLiveStatus(blocked, ["WF-LIVE"], findingsState)
+      .some(error => /outcome semantics/u.test(error)));
+  });
+
+  test("derives finding closure layers independently of stale live status", () => {
+    const deterministicFinding = {
+      id: "QH-900",
+      severity: "P2",
+      domain: "product",
+      status: "open",
+      deterministicStatus: "fixed",
+      liveStatus: "blocked",
+      requiredEvidenceLayers: ["contract"],
+      testLayerThatShouldHaveCaughtIt: "contract",
+    };
+    const liveFinding = {
+      ...deterministicFinding,
+      id: "QH-901",
+      requiredEvidenceLayers: ["live-protocol"],
+      testLayerThatShouldHaveCaughtIt: "live-protocol",
+    };
+    const workflow = { criticality: "release-critical" };
+
+    assert.deepStrictEqual(
+      deriveRequiredEvidenceLayers(deterministicFinding, TAXONOMY),
+      ["contract"]
+    );
+    assert.strictEqual(findingRequiresLiveVerification(deterministicFinding, TAXONOMY), false);
+    assert.strictEqual(deriveReleaseBlocking(deterministicFinding, workflow, TAXONOMY), false);
+    assert.strictEqual(findingRequiresLiveVerification(liveFinding, TAXONOMY), true);
+    assert.strictEqual(deriveReleaseBlocking(liveFinding, workflow, TAXONOMY), true);
+  });
+
   test("contract verification enforces taxonomy parity and required authenticated fixtures", () => {
     const root = path.resolve(__dirname, "..");
     const taxonomy = JSON.parse(JSON.stringify(require("../quality/defect-taxonomy.json")));
@@ -121,6 +500,20 @@ suite("two-lane release-readiness model", () => {
     assert.ok(result.errors.some(error => /required, non-destructive authenticated live fixture/u.test(error)));
   });
 
+  test("contract verification binds the remote CI schema to its reviewed API evidence model", () => {
+    const schemaPath = "quality/remote-ci.schema.json";
+    const schema = fs.readFileSync(path.join(__dirname, "..", schemaPath), "utf8");
+    const errors = verifyQualityContracts({
+      sourceOverrides: {
+        [schemaPath]: schema.replace("remote-ci-receipt-v2", "remote-ci-receipt-v1"),
+      },
+    }).errors;
+
+    assert.ok(errors.includes(
+      "Final-head remote CI schema must match the reviewed GitHub API evidence contract."
+    ));
+  });
+
   test("derives finding blockers and emits stable domain, severity, deterministic, and live counts", () => {
     const workflows = {
       workflows: [{ id: "WF-CORE", criticality: "release-critical" }],
@@ -133,6 +526,7 @@ suite("two-lane release-readiness model", () => {
         status: "open",
         deterministicStatus: "fixed",
         liveStatus: "pending",
+        requiredEvidenceLayers: ["live-protocol"],
         workflowContract: "WF-CORE",
         surface: "fixture",
         releaseBlocking: false,
@@ -144,13 +538,14 @@ suite("two-lane release-readiness model", () => {
         status: "open",
         deterministicStatus: "failing",
         liveStatus: "not-required",
+        requiredEvidenceLayers: ["contract"],
         workflowContract: "WF-CORE",
         surface: "fixture",
         releaseBlocking: false,
       },
     ];
 
-    const summary = summarizeFindings(findings, "passed", [], workflows);
+    const summary = summarizeFindings(findings, "passed", [], workflows, TAXONOMY);
 
     assert.strictEqual(summary.status, "failed");
     assert.strictEqual(summary.releaseBlocking, 2);
@@ -212,7 +607,7 @@ suite("two-lane release-readiness model", () => {
       },
     });
     const liveQualification = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       source: SOURCE,
       candidate: candidateBindingFromReceipt(localCandidateReceipt, {
         source: SOURCE,
@@ -226,8 +621,18 @@ suite("two-lane release-readiness model", () => {
       passedWorkflowIds: ["WF-NO-LIVE-LAYER"],
       missingWorkflowIds: ["WF-LIVE-LAYER"],
       workflowMatrix: [
-        { id: "WF-LIVE-LAYER", status: "PARTIAL" },
-        { id: "WF-NO-LIVE-LAYER", status: "PASS" },
+        {
+          id: "WF-LIVE-LAYER",
+          status: "PARTIAL",
+          outcomeDisposition: "partial-evidence",
+          candidateProvenance: "verified",
+        },
+        {
+          id: "WF-NO-LIVE-LAYER",
+          status: "PASS",
+          outcomeDisposition: "complete",
+          candidateProvenance: "verified",
+        },
       ],
       attestationFingerprint: "4".repeat(64),
       evidenceManifest: [{
