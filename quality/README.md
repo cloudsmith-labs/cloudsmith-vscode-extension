@@ -397,14 +397,20 @@ protection or required-status governance to complete this lifecycle.
 Final readiness loads the ignored schema-v2
 `internal_docs/quality/remote-ci.json` receipt. It must bind the repository,
 draft PR, task branch, exact pushed source SHA, workflow run identities, and the
-complete successful job inventories for both the deterministic PR workflow and
-the manually dispatched deep-quality workflow. The reviewed collector preserves
-the bounded GitHub API responses in `remote-ci-api.json`; the receipt binds those
+complete successful job inventory for the PR-triggered production workflow,
+including core mutation and signed-out packaged UI. Authenticated qualification
+remains the targeted post-CI lane and is not pulled ahead of remote CI merely to
+make a branch-only manual workflow dispatchable. The reviewed collector preserves
+the bounded GitHub API response in `remote-ci-api.json`; the receipt binds those
 exact bytes, and report validation independently reconciles PR, branch, SHA,
 latest run attempt, timestamps, and terminal job results against that capture.
 Missing, stale, crossed, superseded, failed, cancelled, skipped, or incomplete
 remote CI blocks readiness. A ready live attestation must be completed after the
 last authoritative remote run completes.
+
+The manual deep-quality workflow remains available once its definition exists on
+the default branch. It is an additional lane, not a prerequisite that can make a
+new workflow impossible to qualify before merge.
 
 ## Permanent change flow
 

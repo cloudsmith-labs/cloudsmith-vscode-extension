@@ -197,8 +197,9 @@ both required. Passing one never implies that the other ran.
       only the highest-risk affected live requalification needed for that final
       candidate, before a ready verdict.
 - [ ] Fresh schema-v2 `internal_docs/quality/remote-ci.json` binds the draft PR,
-      exact task-branch SHA, both authoritative workflow runs, and every exact
-      required job with a successful terminal conclusion, while its exact
+      exact task-branch SHA, the authoritative PR workflow run, and every exact
+      required job—including core mutation and signed-out packaged UI—with a
+      successful terminal conclusion, while its exact
       `remote-ci-api.json` evidence preserves the reviewed bounded GitHub API
       responses; missing, stale, crossed, superseded, cancelled, skipped,
       failed, or incomplete CI blocks readiness.

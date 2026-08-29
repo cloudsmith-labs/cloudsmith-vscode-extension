@@ -25,18 +25,9 @@ const WORKFLOWS = Object.freeze([
       ["extension-tests:windows-2025:1.134.0:smoke", "Extension tests (windows-2025, VS Code 1.134.0, smoke)"],
       ["extension-tests:macos-15:1.134.0:smoke", "Extension tests (macos-15, VS Code 1.134.0, smoke)"],
       ["package", "Reproducible VSIX"],
-      ["build-candidate", "Deterministic build candidate"],
-    ]),
-  }),
-  Object.freeze({
-    argument: "deep-run",
-    path: ".github/workflows/deep-quality.yml",
-    event: "workflow_dispatch",
-    name: "Manual deep quality",
-    jobs: Object.freeze([
       ["core-mutation", "Core mutation"],
       ["signed-out-black-box-ui", "Signed-out packaged black-box UI"],
-      ["authenticated-production-ui", "Authenticated packaged production UI"],
+      ["build-candidate", "Deterministic build candidate"],
     ]),
   }),
 ]);
@@ -46,15 +37,14 @@ function parseArguments(argv) {
   for (let index = 0; index < argv.length; index += 2) {
     const name = argv[index];
     const value = argv[index + 1];
-    if (!/^--(?:pr|main-run|deep-run)$/u.test(name || "") || !/^[1-9][0-9]*$/u.test(value || "")) {
-      throw new Error("Usage: collect-remote-ci.js --pr N --main-run ID --deep-run ID");
+    if (!/^--(?:pr|main-run)$/u.test(name || "") || !/^[1-9][0-9]*$/u.test(value || "")) {
+      throw new Error("Usage: collect-remote-ci.js --pr N --main-run ID");
     }
     values[name.slice(2)] = Number(value);
   }
   if (!Number.isSafeInteger(values.pr)
-    || !Number.isSafeInteger(values["main-run"])
-    || !Number.isSafeInteger(values["deep-run"])) {
-    throw new Error("Usage: collect-remote-ci.js --pr N --main-run ID --deep-run ID");
+    || !Number.isSafeInteger(values["main-run"])) {
+    throw new Error("Usage: collect-remote-ci.js --pr N --main-run ID");
   }
   return values;
 }
@@ -97,7 +87,7 @@ function buildReceipt(snapshot, source, branch, runIds) {
       event: workflow.event,
       runId: raw.id,
       runAttempt: raw.run_attempt,
-      pullRequestNumber: index === 0 ? pull.number : null,
+      pullRequestNumber: pull.number,
       headSha: raw.head_sha,
       status: raw.status,
       conclusion: raw.conclusion,
@@ -176,7 +166,7 @@ function main(argv = process.argv.slice(2)) {
     snapshot,
     source,
     branch,
-    [args["main-run"], args["deep-run"]],
+    [args["main-run"]],
   );
   receipt.evidence = {
     path: API_OUTPUT,

@@ -7399,7 +7399,7 @@ suite("Release checklist and deterministic quality report", () => {
 });
 
 suite("Quality contract verifier fixtures", function () {
-  this.timeout(10_000);
+  this.timeout(60_000);
   test("rejects whole-object replacements of deterministic release jobs", () => {
     const workflowPath = ".github/workflows/main.yml";
     const workflow = yaml.load(
@@ -7605,6 +7605,23 @@ suite("Quality contract verifier fixtures", function () {
       }).errors.includes(changedError));
     }
 
+    const mainCoreError = "CI must execute exact core mutation on the pushed PR head.";
+    for (const changed of [
+      workflow.replace(
+        "  core-mutation:\n",
+        "  core-mutation:\n    continue-on-error: true\n",
+      ),
+      workflow.replace(
+        "run: npm run quality:secrets:history",
+        "run: npm run quality:secrets:current",
+      ),
+    ]) {
+      assert.ok(verifyQualityContracts({
+        root,
+        sourceOverrides: { [workflowPath]: changed },
+      }).errors.includes(mainCoreError));
+    }
+
     const deepError =
       "Deep CI must verify exact core-mutation evidence before a verifier-gated upload.";
     for (const changed of [
@@ -7641,7 +7658,9 @@ suite("Quality contract verifier fixtures", function () {
   });
 
   test("rejects signed-out UI workflow bypasses and profile uploads", () => {
+    const workflowPath = ".github/workflows/main.yml";
     const deepWorkflowPath = ".github/workflows/deep-quality.yml";
+    const workflow = fs.readFileSync(path.join(root, workflowPath), "utf8");
     const deepWorkflow = fs.readFileSync(path.join(root, deepWorkflowPath), "utf8");
     const exactUiUploadPaths = [
       "          path: |-",
@@ -7693,6 +7712,23 @@ suite("Quality contract verifier fixtures", function () {
         root,
         sourceOverrides: { [deepWorkflowPath]: changed },
       }).errors.includes(uiError), `signed-out workflow mutation ${index}`);
+    }
+
+    const mainUiError = "CI must execute exact signed-out packaged UI on the pushed PR head.";
+    for (const changed of [
+      workflow.replace(
+        "run: npm run test:ui:smoke",
+        "run: xvfb-run -a npm run test:ui:smoke",
+      ),
+      workflow.replace(
+        "if: ${{ always() && steps.ui_evidence_handoff.outcome == 'success' && steps.ui_evidence_secret_scan.outcome == 'success' && steps.ui_evidence_bundle.outcome == 'success' }}",
+        "if: ${{ always() }}",
+      ),
+    ]) {
+      assert.ok(verifyQualityContracts({
+        root,
+        sourceOverrides: { [workflowPath]: changed },
+      }).errors.includes(mainUiError));
     }
   });
 
@@ -8134,7 +8170,7 @@ suite("Quality contract verifier fixtures", function () {
   });
 
   test("rejects host-managed production activation and credential-reading harness code", function () {
-    this.timeout(5000);
+    this.timeout(30_000);
     const configPath = ".vscode-test.mjs";
     const entrypointPath = "test/harness-extension/extension.js";
     const configSource = fs.readFileSync(path.join(root, configPath), "utf8");

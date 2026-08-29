@@ -51,6 +51,7 @@ const {
 const {
   AUTHENTICATED_SESSION,
   cleanupPreparedAuthenticatedCandidate,
+  canonicalApprovedTemporaryBase,
   markPreparedAuthenticatedCandidateProcessExit,
   prepareAuthenticatedCandidateSession,
   runAuthenticatedCandidateSessionCommand,
@@ -1946,7 +1947,8 @@ suite("authenticated CI SecretStorage bootstrap", () => {
   });
 
   test("candidate session persists only profile ownership metadata and product identity", () => {
-    const candidate = candidateFixture();
+    const temporaryParent = canonicalApprovedTemporaryBase();
+    const candidate = candidateFixture({ temporaryParent });
     const session = sessionFromCandidate(candidate);
     assert.strictEqual(session.schemaVersion, 2);
     assert.strictEqual(session.status, "prepared");

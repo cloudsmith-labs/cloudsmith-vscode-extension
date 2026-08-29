@@ -10,6 +10,7 @@ const { applyAuditPolicy } = require("../scripts/release/verify-dependency-audit
 const {
   assertCanonicalNpmRuntime,
   assertCanonicalNodeRuntime,
+  assertExactNodeExecutable,
   canonicalToolchainEnvironment,
   npmInstallationFingerprint,
   withCanonicalNpmLauncher,
@@ -235,7 +236,7 @@ suite("M9 release gate helpers", () => {
     assert.match(workflow, /- name: Verify architecture boundaries\s+run: npm run verify:architecture/);
     assert.match(
       workflow,
-      /build-candidate:[\s\S]*needs: \[quality, mutation, extension-tests, package\]/
+      /build-candidate:[\s\S]*needs: \[quality, mutation, extension-tests, package, core-mutation, signed-out-black-box-ui\]/
     );
   });
 
@@ -619,6 +620,45 @@ suite("M9 release gate helpers", () => {
       assert.deepStrictEqual(npm.installation, fixture.installation);
       assert.strictEqual(Object.isFrozen(npm.identities), true);
     });
+  });
+
+  test("canonical Node binding resolves a safe ancestor link and rejects a final link", function () {
+    if (process.platform === "win32") this.skip();
+    const realParent = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-node-real-parent-",
+    )));
+    const linkedParent = `${realParent}-link`;
+    try {
+      const executable = path.join(realParent, "bin", "node");
+      fs.mkdirSync(path.dirname(executable), { recursive: true });
+      fs.writeFileSync(executable, "synthetic exact node runtime\n", { mode: 0o700 });
+      fs.symlinkSync(realParent, linkedParent, "dir");
+      assert.strictEqual(
+        assertExactNodeExecutable(path.join(linkedParent, "bin", "node")),
+        executable,
+      );
+      const finalLink = path.join(realParent, "bin", "node-link");
+      fs.symlinkSync(executable, finalLink, "file");
+      assert.throws(
+        () => assertExactNodeExecutable(finalLink),
+        /Canonical Node\.js executable is unsafe or invalid/u,
+      );
+    } finally {
+      fs.rmSync(linkedParent, { force: true });
+      fs.rmSync(realParent, { recursive: true, force: true });
+    }
+  });
+
+  test("canonical toolchain normalizes safe absolute PATH entries", () => {
+    const entry = `${path.dirname(process.execPath)}${path.sep}`;
+    const environment = canonicalToolchainEnvironment(
+      { PATH: `${entry}${path.delimiter}${path.dirname(process.execPath)}` },
+      { nodeExecutable: process.execPath },
+    );
+    assert.deepStrictEqual(environment.PATH.split(path.delimiter), [
+      path.dirname(assertExactNodeExecutable(process.execPath)),
+    ]);
   });
 
   test("package lifecycle ignores npm snapshot bookkeeping and authenticates the install", () => {

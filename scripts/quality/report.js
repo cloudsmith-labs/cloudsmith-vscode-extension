@@ -80,17 +80,9 @@ const REQUIRED_REMOTE_CI_RUNS = Object.freeze([
       ["extension-tests:windows-2025:1.134.0:smoke", "Extension tests (windows-2025, VS Code 1.134.0, smoke)"],
       ["extension-tests:macos-15:1.134.0:smoke", "Extension tests (macos-15, VS Code 1.134.0, smoke)"],
       ["package", "Reproducible VSIX"],
-      ["build-candidate", "Deterministic build candidate"],
-    ]),
-  }),
-  Object.freeze({
-    workflowFile: ".github/workflows/deep-quality.yml",
-    workflowName: "Manual deep quality",
-    event: "workflow_dispatch",
-    jobs: Object.freeze([
       ["core-mutation", "Core mutation"],
       ["signed-out-black-box-ui", "Signed-out packaged black-box UI"],
-      ["authenticated-production-ui", "Authenticated packaged production UI"],
+      ["build-candidate", "Deterministic build candidate"],
     ]),
   }),
 ]);
@@ -1405,8 +1397,7 @@ function summarizeRemoteCi(
         || run.headSha !== source?.sha
         || run.status !== "completed"
         || run.conclusion !== "success"
-        || (index === 0 && run.pullRequestNumber !== pullRequest?.number)
-        || (index === 1 && run.pullRequestNumber !== null)
+        || run.pullRequestNumber !== pullRequest?.number
         || !validOrderedRemoteTimestamps(run.createdAt, run.completedAt, capturedAt)
         || run.url !== `https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/actions/runs/${String(run?.runId)}`) {
         errors.push(`Remote CI workflow ${expected.workflowFile} is invalid or not successful.`);

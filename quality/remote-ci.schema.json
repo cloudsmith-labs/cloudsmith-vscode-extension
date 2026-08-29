@@ -43,8 +43,8 @@
     },
     "runs": {
       "type": "array",
-      "minItems": 2,
-      "maxItems": 2,
+      "minItems": 1,
+      "maxItems": 1,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -54,14 +54,12 @@
           "completedAt", "url", "jobs"
         ],
         "properties": {
-          "workflowFile": {
-            "enum": [".github/workflows/main.yml", ".github/workflows/deep-quality.yml"]
-          },
+          "workflowFile": { "const": ".github/workflows/main.yml" },
           "workflowName": { "type": "string", "minLength": 1 },
-          "event": { "enum": ["pull_request", "workflow_dispatch"] },
+          "event": { "const": "pull_request" },
           "runId": { "type": "integer", "minimum": 1 },
           "runAttempt": { "type": "integer", "minimum": 1 },
-          "pullRequestNumber": { "type": ["integer", "null"], "minimum": 1 },
+          "pullRequestNumber": { "type": "integer", "minimum": 1 },
           "headSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
           "status": { "const": "completed" },
           "conclusion": { "const": "success" },

@@ -223,6 +223,8 @@ function verifyEvidenceHandoffContract(
       mutation: 1,
       "extension-tests": 0,
       package: 1,
+      "core-mutation": 2,
+      "signed-out-black-box-ui": 1,
       "build-candidate": 0,
     })) {
     errors.push(
@@ -239,6 +241,17 @@ function verifyEvidenceHandoffContract(
   if (!validMainWorkflowEnvelope(workflowDocument)
     || !isDeepStrictEqual(workflowDocument?.jobs?.package, expectedPackageJob())) {
     errors.push("CI must build, verify, scan, and upload the exact reproducible VSIX inputs.");
+  }
+  if (!validMainWorkflowEnvelope(workflowDocument)
+    || !isDeepStrictEqual(workflowDocument?.jobs?.["core-mutation"], expectedCoreMutationJob())) {
+    errors.push("CI must execute exact core mutation on the pushed PR head.");
+  }
+  if (!validMainWorkflowEnvelope(workflowDocument)
+    || !isDeepStrictEqual(
+      workflowDocument?.jobs?.["signed-out-black-box-ui"],
+      expectedSignedOutUiJob(),
+    )) {
+    errors.push("CI must execute exact signed-out packaged UI on the pushed PR head.");
   }
   if (!validMainWorkflowEnvelope(workflowDocument)
     || !isDeepStrictEqual(
@@ -293,6 +306,12 @@ function validRemoteCiSchema(document) {
       === "cloudsmith-labs/cloudsmith-vscode-extension"
     && document.properties?.evidence?.properties?.path?.const
       === "internal_docs/quality/remote-ci-api.json"
+    && document.properties?.runs?.minItems === 1
+    && document.properties?.runs?.maxItems === 1
+    && document.properties?.runs?.items?.properties?.workflowFile?.const
+      === ".github/workflows/main.yml"
+    && document.properties?.runs?.items?.properties?.event?.const === "pull_request"
+    && document.properties?.runs?.items?.properties?.pullRequestNumber?.type === "integer"
     && isDeepStrictEqual(document.required, [
       "schemaVersion", "repository", "branch", "sourceSha", "sourceFingerprint", "capturedAt",
       "pullRequest", "runs", "evidence",
@@ -347,10 +366,12 @@ function validMainWorkflowEnvelope(document) {
     })
     && isDeepStrictEqual(Object.keys(document.jobs || {}).sort(), [
       "build-candidate",
+      "core-mutation",
       "extension-tests",
       "mutation",
       "package",
       "quality",
+      "signed-out-black-box-ui",
     ]);
 }
 
@@ -488,7 +509,7 @@ function expectedExtensionTestsJob() {
       VSCODE_TEST_LABEL: "${{ matrix.label }}",
     },
     steps: [
-      checkoutStep("Checkout exact source", false),
+      checkoutStep("Checkout exact source", true),
       setupNodeStep(),
       installStep(),
       {
@@ -562,7 +583,10 @@ function expectedPackageJob() {
 function expectedBuildCandidateJob() {
   return {
     name: "Deterministic build candidate",
-    needs: ["quality", "mutation", "extension-tests", "package"],
+    needs: [
+      "quality", "mutation", "extension-tests", "package", "core-mutation",
+      "signed-out-black-box-ui",
+    ],
     if: "${{ always() }}",
     "runs-on": "ubuntu-24.04",
     "timeout-minutes": 5,
@@ -573,8 +597,10 @@ function expectedBuildCandidateJob() {
         MUTATION_RESULT: "${{ needs.mutation.result }}",
         TEST_RESULT: "${{ needs.extension-tests.result }}",
         PACKAGE_RESULT: "${{ needs.package.result }}",
+        CORE_MUTATION_RESULT: "${{ needs.core-mutation.result }}",
+        SIGNED_OUT_UI_RESULT: "${{ needs.signed-out-black-box-ui.result }}",
       },
-      run: "if [[ \"$QUALITY_RESULT\" != \"success\" || \"$MUTATION_RESULT\" != \"success\" || \"$TEST_RESULT\" != \"success\" || \"$PACKAGE_RESULT\" != \"success\" ]]; then\n  echo \"A deterministic build-candidate input failed, was canceled, or was skipped.\"\n  exit 1\nfi\necho \"Every deterministic build-candidate input succeeded; production release readiness remains blocked pending separately sourced UI and live qualification.\"\n",
+      run: "if [[ \"$QUALITY_RESULT\" != \"success\" || \"$MUTATION_RESULT\" != \"success\" || \"$TEST_RESULT\" != \"success\" || \"$PACKAGE_RESULT\" != \"success\" || \"$CORE_MUTATION_RESULT\" != \"success\" || \"$SIGNED_OUT_UI_RESULT\" != \"success\" ]]; then\n  echo \"A deterministic build-candidate input failed, was canceled, or was skipped.\"\n  exit 1\nfi\necho \"Every deterministic build-candidate input succeeded; production release readiness remains blocked pending separately sourced UI and live qualification.\"\n",
     }],
   };
 }

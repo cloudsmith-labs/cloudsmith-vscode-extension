@@ -71,11 +71,18 @@ function assertExactNodeExecutable(executable = process.execPath, options = {}) 
   const fileSystem = options.fileSystem || require("fs");
   const platform = options.platform || process.platform;
   try {
-    const target = exactAbsolutePath(executable, errorMessage);
+    const claimedTarget = exactAbsolutePath(executable, errorMessage);
+    const claimedStat = fileSystem.lstatSync(claimedTarget, { bigint: true });
+    if (claimedStat.isSymbolicLink() || !claimedStat.isFile()) {
+      throw new Error(errorMessage);
+    }
+    const target = exactAbsolutePath(fileSystem.realpathSync(claimedTarget), errorMessage);
     const stat = fileSystem.lstatSync(target, { bigint: true });
     if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink < 1n || stat.size <= 0n
       || (process.platform !== "win32" && (stat.mode & 0o022n) !== 0n)
-      || !sameFilesystemPath(fileSystem.realpathSync(target), target, platform)) {
+      || !sameFilesystemPath(fileSystem.realpathSync(target), target, platform)
+      || JSON.stringify(exactFileIdentity(claimedStat))
+        !== JSON.stringify(exactFileIdentity(stat))) {
       throw new Error(errorMessage);
     }
     return target;
@@ -648,14 +655,16 @@ function canonicalToolchainEnvironment(environment, options = {}) {
   }
   prefixes.push(path.dirname(nodeExecutable));
   const sameEntry = (left, right) => sameFilesystemPath(left, right, platform);
-  const remaining = current.value.split(path.delimiter).filter(entry => {
-    if (!entry) return false;
-    if (!path.isAbsolute(entry) || path.normalize(entry) !== entry
-      || /[\u0000-\u001f\u007f]/u.test(entry)) {
+  const remaining = current.value.split(path.delimiter).filter(Boolean).map(entry => {
+    if (!path.isAbsolute(entry) || /[\u0000-\u001f\u007f]/u.test(entry)) {
       throw new Error("Canonical toolchain PATH is unsafe or invalid");
     }
-    return !prefixes.some(prefix => sameEntry(entry, prefix));
-  });
+    const normalized = path.resolve(entry);
+    if (!path.isAbsolute(normalized)) {
+      throw new Error("Canonical toolchain PATH is unsafe or invalid");
+    }
+    return normalized;
+  }).filter(entry => !prefixes.some(prefix => sameEntry(entry, prefix)));
   const anchored = [...prefixes, ...remaining].join(path.delimiter);
   if (anchored.length > 32768 || anchored.includes("\u0000")) {
     throw new Error("Canonical toolchain PATH is unsafe or invalid");

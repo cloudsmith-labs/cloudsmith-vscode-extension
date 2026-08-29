@@ -49,20 +49,9 @@ function remoteCiReceipt(overrides = {}) {
     ["extension-tests:windows-2025:1.134.0:smoke", "Extension tests (windows-2025, VS Code 1.134.0, smoke)"],
     ["extension-tests:macos-15:1.134.0:smoke", "Extension tests (macos-15, VS Code 1.134.0, smoke)"],
     ["package", "Reproducible VSIX"],
-    ["build-candidate", "Deterministic build candidate"],
-  ].map(([id, name]) => ({
-    id,
-    name,
-    databaseId: ++databaseId,
-    status: "completed",
-    conclusion: "success",
-    startedAt: createdAt,
-    completedAt,
-  }));
-  const deepJobs = [
     ["core-mutation", "Core mutation"],
     ["signed-out-black-box-ui", "Signed-out packaged black-box UI"],
-    ["authenticated-production-ui", "Authenticated packaged production UI"],
+    ["build-candidate", "Deterministic build candidate"],
   ].map(([id, name]) => ({
     id,
     name,
@@ -102,20 +91,6 @@ function remoteCiReceipt(overrides = {}) {
       completedAt,
       url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/actions/runs/1001",
       jobs: mainJobs,
-    }, {
-      workflowFile: ".github/workflows/deep-quality.yml",
-      workflowName: "Manual deep quality",
-      event: "workflow_dispatch",
-      runId: 1002,
-      runAttempt: 1,
-      pullRequestNumber: null,
-      headSha: SOURCE.sha,
-      status: "completed",
-      conclusion: "success",
-      createdAt,
-      completedAt,
-      url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/actions/runs/1002",
-      jobs: deepJobs,
     }],
     evidence: {
       path: "internal_docs/quality/remote-ci-api.json",
@@ -326,7 +301,7 @@ suite("two-lane release-readiness model", () => {
     }).status, "failed");
     const crossedRepository = remoteCiApiEvidence(exact);
     crossedRepository.value.pullRequest.head.repo.full_name = "fork/repository";
-    crossedRepository.value.runs[1].head_repository.full_name = "fork/repository";
+    crossedRepository.value.runs[0].head_repository.full_name = "fork/repository";
     assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
       apiEvidence: crossedRepository,
     }).status, "failed");
