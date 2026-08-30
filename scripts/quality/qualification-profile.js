@@ -17,6 +17,9 @@ const PROFILE_OWNER = "cloudsmith-vscode-qualification";
 const LOCAL_PROFILE_SUBDIRECTORIES = Object.freeze(["home", "user-data", "extensions"]);
 const CI_PROFILE_SUBDIRECTORIES = Object.freeze(["home", "settings", "extensions"]);
 const activeCiProfiles = new Map();
+const EXACT_MARKER_READ_FLAGS = fs.constants.O_RDONLY
+  | (fs.constants.O_NOFOLLOW || 0)
+  | (fs.constants.O_NONBLOCK || 0);
 
 function assertAbsoluteNormalizedPath(value, label) {
   if (typeof value !== "string"
@@ -114,18 +117,58 @@ function writeMarker(root, mode, proof) {
 
 function readMarker(root) {
   const target = markerPath(root);
-  const stat = fs.lstatSync(target);
-  if (stat.isSymbolicLink() || !stat.isFile()
-    || (process.platform !== "win32" && (stat.mode & 0o077) !== 0)
-    || stat.size > 1024) {
-    throw new Error("Qualification profile ownership marker is not a private regular file.");
-  }
+  let descriptor;
+  let bytes;
   let marker;
+  let completed = false;
   try {
-    marker = JSON.parse(fs.readFileSync(target, "utf8"));
+    descriptor = fs.openSync(target, EXACT_MARKER_READ_FLAGS);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    const current = fs.lstatSync(target, { bigint: true });
+    const sameIdentity = opened.dev === current.dev
+      && opened.ino === current.ino
+      && opened.mode === current.mode
+      && opened.nlink === current.nlink
+      && opened.size === current.size
+      && opened.mtimeNs === current.mtimeNs
+      && opened.ctimeNs === current.ctimeNs;
+    if (current.isSymbolicLink() || !opened.isFile() || !current.isFile()
+      || opened.nlink !== 1n
+      || (process.platform !== "win32" && (opened.mode & 0o77n) !== 0n)
+      || opened.size > 1024n || !sameIdentity
+      || fs.realpathSync(target) !== target) {
+      throw new Error("Qualification profile ownership marker is not a private regular file.");
+    }
+    bytes = fs.readFileSync(descriptor);
+    const finalOpened = fs.fstatSync(descriptor, { bigint: true });
+    const finalPath = fs.lstatSync(target, { bigint: true });
+    if (bytes.length !== Number(opened.size)
+      || finalPath.isSymbolicLink()
+      || finalOpened.dev !== opened.dev || finalOpened.ino !== opened.ino
+      || finalOpened.mode !== opened.mode || finalOpened.nlink !== opened.nlink
+      || finalOpened.size !== opened.size || finalOpened.mtimeNs !== opened.mtimeNs
+      || finalOpened.ctimeNs !== opened.ctimeNs
+      || finalPath.dev !== opened.dev || finalPath.ino !== opened.ino
+      || finalPath.mode !== opened.mode || finalPath.nlink !== opened.nlink
+      || finalPath.size !== opened.size || finalPath.mtimeNs !== opened.mtimeNs
+      || finalPath.ctimeNs !== opened.ctimeNs) {
+      throw new Error("Qualification profile ownership marker is not a private regular file.");
+    }
+    marker = JSON.parse(bytes.toString("utf8"));
+    completed = true;
   } catch {
     throw new Error("Qualification profile ownership marker is invalid.");
+  } finally {
+    if (Buffer.isBuffer(bytes)) bytes.fill(0);
+    if (descriptor !== undefined) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        completed = false;
+      }
+    }
   }
+  if (!completed) throw new Error("Qualification profile ownership marker is invalid.");
   if (marker?.schemaVersion !== 1
     || marker.owner !== PROFILE_OWNER
     || !new Set(["local", "ci"]).has(marker.mode)

@@ -12,6 +12,11 @@ const {
   writeJson,
 } = require("./common");
 const { sourceIdentity } = require("./evidence");
+const {
+  exactFileIdentity,
+  readStableSingleLinkFile,
+  sameExactFileIdentity,
+} = require("./candidate-binding");
 const { MUTATION_GLOBAL_OWNERS } = require("./run-mutation");
 
 const DEFAULT_BASE = "origin/main";
@@ -42,6 +47,7 @@ const TEST_COMMANDS_BY_LAYER = Object.freeze({
   "black-box-ui": "npm run test:ui:smoke",
   "live-protocol": "npm run test:live",
 });
+const MAX_IMPACT_SOURCE_BYTES = 64 * 1024 * 1024;
 
 class ImpactAnalysisError extends Error {
   constructor(message, report = null) {
@@ -276,8 +282,23 @@ function resolveRelativeTestDependency(root, importer, request) {
 
 function directRelativeTestDependencies(root, file) {
   const target = path.join(root, ...file.split("/"));
-  if (!fs.existsSync(target) || !fs.lstatSync(target).isFile()) return [];
-  const source = fs.readFileSync(target, "utf8");
+  let proof;
+  try {
+    proof = readStableSingleLinkFile(target, {
+      errorMessage: "Impact test dependency source is unsafe or changed.",
+      maximumBytes: MAX_IMPACT_SOURCE_BYTES,
+      minimumBytes: 0,
+    });
+  } catch (error) {
+    try {
+      fs.lstatSync(target);
+    } catch (statError) {
+      if (statError.code === "ENOENT") return [];
+    }
+    throw new ImpactAnalysisError(error.message);
+  }
+  const source = proof.bytes.toString("utf8");
+  proof.bytes.fill(0);
   const requests = [];
   const expression = /\brequire\s*\(\s*["']([^"']+)["']\s*\)|\bfrom\s+["']([^"']+)["']/gu;
   for (const match of source.matchAll(expression)) {
@@ -611,13 +632,33 @@ function highRiskCategories(files, selectedWorkflows, selectedActions) {
 
 function fileState(root, file) {
   const target = path.join(root, file);
-  if (!fs.existsSync(target)) return "missing";
-  const stat = fs.lstatSync(target);
+  let stat;
+  try {
+    stat = fs.lstatSync(target, { bigint: true });
+  } catch (error) {
+    if (error.code === "ENOENT") return "missing";
+    throw error;
+  }
   if (stat.isSymbolicLink()) {
-    return `symlink:${crypto.createHash("sha256").update(fs.readlinkSync(target)).digest("hex")}`;
+    const link = fs.readlinkSync(target);
+    const finalStat = fs.lstatSync(target, { bigint: true });
+    if (!sameExactFileIdentity(exactFileIdentity(stat), exactFileIdentity(finalStat))) {
+      throw new ImpactAnalysisError("Impact source changed while its symlink state was captured.");
+    }
+    return `symlink:${crypto.createHash("sha256").update(link).digest("hex")}`;
   }
   if (!stat.isFile()) return stat.isDirectory() ? "directory" : "other";
-  return `sha256:${crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex")}`;
+  const proof = readStableSingleLinkFile(target, {
+    errorMessage: "Impact source is unsafe or changed.",
+    expectedIdentity: exactFileIdentity(stat),
+    maximumBytes: MAX_IMPACT_SOURCE_BYTES,
+    minimumBytes: 0,
+  });
+  try {
+    return `sha256:${crypto.createHash("sha256").update(proof.bytes).digest("hex")}`;
+  } finally {
+    proof.bytes.fill(0);
+  }
 }
 
 function stableFingerprint(value) {

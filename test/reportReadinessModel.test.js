@@ -319,6 +319,17 @@ suite("two-lane release-readiness model", () => {
         "2026-08-30T04:35:56.000Z",
       ]),
     );
+    receipt.evidence = {
+      path: "internal_docs/quality/remote-ci-api.json",
+      sha256: "a".repeat(64),
+    };
+    assert.strictEqual(summarizeRemoteCi(
+      receipt,
+      SOURCE,
+      null,
+      Date.now(),
+      { apiEvidence: { value: snapshot, fingerprint: "a".repeat(64) } },
+    ).status, "passed");
   });
 
   test("requires exact successful final-head remote CI before readiness", () => {
@@ -456,22 +467,30 @@ suite("two-lane release-readiness model", () => {
       }],
     };
 
-    assert.strictEqual(releaseReadinessStatus({
+    const missingCi = releaseReadinessStatus({
       ...readyInputs,
       remoteCi: { status: "not-run" },
-    }).status, "blocked");
-    assert.strictEqual(releaseReadinessStatus({
+    });
+    assert.strictEqual(missingCi.status, "blocked");
+    assert.strictEqual(missingCi.verdict, "NOT TEAM-TEST READY");
+    const failedCi = releaseReadinessStatus({
       ...readyInputs,
       remoteCi: { status: "failed" },
-    }).status, "failed");
-    assert.strictEqual(releaseReadinessStatus({
+    });
+    assert.strictEqual(failedCi.status, "failed");
+    assert.strictEqual(failedCi.verdict, "NOT TEAM-TEST READY");
+    const passed = releaseReadinessStatus({
       ...readyInputs,
       remoteCi: { status: "passed", completedAt: "2026-08-29T20:00:00.000Z" },
-    }).status, "passed");
-    assert.strictEqual(releaseReadinessStatus({
+    });
+    assert.strictEqual(passed.status, "passed");
+    assert.strictEqual(passed.verdict, "TEAM-TEST READY");
+    const predatesCi = releaseReadinessStatus({
       ...readyInputs,
       remoteCi: { status: "passed", completedAt: "2026-08-29T22:00:00.000Z" },
-    }).status, "blocked");
+    });
+    assert.strictEqual(predatesCi.status, "blocked");
+    assert.strictEqual(predatesCi.verdict, "NOT TEAM-TEST READY");
   });
 
   test("derived status rejects unobserved PARTIAL and not-authorized rows", () => {
@@ -735,7 +754,7 @@ suite("two-lane release-readiness model", () => {
     assert.strictEqual(liveLayer.authenticatedStatus, "PARTIAL");
     assert.strictEqual(liveLayer.layerStatuses["live-protocol"], "blocked");
     assert.deepStrictEqual(report.liveQualification.workflowMatrix, liveQualification.workflowMatrix);
-    assert.strictEqual(report.releaseReadiness.verdict, null);
+    assert.strictEqual(report.releaseReadiness.verdict, "NOT TEAM-TEST READY");
   });
 
   test("accepts UI evidence only when it binds the exact verified packaged candidate", () => {

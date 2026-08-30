@@ -14,6 +14,10 @@ const EVIDENCE_STATUSES = Object.freeze([
   "not-run",
   "not-applicable",
 ]);
+const EXACT_SOURCE_READ_FLAGS = fs.constants.O_RDONLY
+  | (fs.constants.O_NOFOLLOW || 0)
+  | (fs.constants.O_NONBLOCK || 0);
+const MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024;
 
 function canonicalize(value) {
   if (Array.isArray(value)) {
@@ -95,20 +99,81 @@ function runGit(root, spawn, args, encoding, environment) {
 function hashFileState(hash, root, file) {
   const target = path.join(root, file);
   hash.update(`${file}\0`);
-  if (!fs.existsSync(target)) {
-    hash.update("missing\0");
+  let descriptor;
+  try {
+    descriptor = fs.openSync(target, EXACT_SOURCE_READ_FLAGS);
+  } catch (openError) {
+    let stat;
+    try {
+      stat = fs.lstatSync(target, { bigint: true });
+    } catch (statError) {
+      if (openError.code === "ENOENT" && statError.code === "ENOENT") {
+        hash.update("missing\0");
+        return;
+      }
+      throw openError;
+    }
+    if (!stat.isSymbolicLink()) throw openError;
+    const link = fs.readlinkSync(target);
+    const finalStat = fs.lstatSync(target, { bigint: true });
+    if (!finalStat.isSymbolicLink() || !sameFileIdentity(stat, finalStat)) {
+      throw new Error("Source file changed while its symlink state was captured.");
+    }
+    hash.update(`symlink\0${link}\0`);
     return;
   }
-  const stat = fs.lstatSync(target);
-  if (stat.isSymbolicLink()) {
-    hash.update(`symlink\0${fs.readlinkSync(target)}\0`);
-  } else if (stat.isFile()) {
-    hash.update(`file:${stat.mode & 0o111 ? "executable" : "regular"}\0`);
-    hash.update(fs.readFileSync(target));
-    hash.update("\0");
-  } else {
-    hash.update(`other:${stat.mode}\0`);
+
+  let bytes;
+  let completed = false;
+  try {
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    const current = fs.lstatSync(target, { bigint: true });
+    if (current.isSymbolicLink()) {
+      const link = fs.readlinkSync(target);
+      const finalStat = fs.lstatSync(target, { bigint: true });
+      if (!finalStat.isSymbolicLink() || !sameFileIdentity(current, finalStat)) {
+        throw new Error("Source file changed while its symlink state was captured.");
+      }
+      hash.update(`symlink\0${link}\0`);
+    } else {
+      if (!sameFileIdentity(opened, current)) {
+        throw new Error("Source file changed before its fingerprint was captured.");
+      }
+      if (!opened.isFile()) {
+        hash.update(`other:${String(opened.mode)}\0`);
+      } else {
+        if (opened.size > BigInt(MAX_SOURCE_FILE_BYTES)) {
+          throw new Error("Source file exceeds the fingerprint size bound.");
+        }
+        bytes = fs.readFileSync(descriptor);
+        const finalOpened = fs.fstatSync(descriptor, { bigint: true });
+        const finalPath = fs.lstatSync(target, { bigint: true });
+        if (bytes.length !== Number(opened.size)
+          || finalPath.isSymbolicLink()
+          || !sameFileIdentity(opened, finalOpened)
+          || !sameFileIdentity(opened, finalPath)) {
+          throw new Error("Source file changed while its fingerprint was captured.");
+        }
+        hash.update(`file:${(opened.mode & 0o111n) !== 0n ? "executable" : "regular"}\0`);
+        hash.update(bytes);
+        hash.update("\0");
+      }
+    }
+    completed = true;
+  } finally {
+    if (Buffer.isBuffer(bytes)) bytes.fill(0);
+    try {
+      fs.closeSync(descriptor);
+    } catch {
+      completed = false;
+    }
   }
+  if (!completed) throw new Error("Source file descriptor could not be closed safely.");
+}
+
+function sameFileIdentity(left, right) {
+  return ["dev", "ino", "mode", "nlink", "size", "mtimeNs", "ctimeNs"]
+    .every(key => left[key] === right[key]);
 }
 
 function aggregateStatuses(statuses) {

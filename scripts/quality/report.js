@@ -1479,6 +1479,12 @@ function validOrderedRemoteTimestamps(startedAt, completedAt, capturedAt) {
     && completed <= capturedAt;
 }
 
+function canonicalRemoteTimestamp(value) {
+  if (typeof value !== "string") return null;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : null;
+}
+
 function validateRemoteCiApiEvidence(receipt, source, errors, options = {}) {
   const reference = receipt?.evidence;
   if (!isPlainObject(reference)
@@ -1558,8 +1564,8 @@ function validateRemoteCiApiEvidence(receipt, source, errors, options = {}) {
       || rawRun.status !== run.status
       || rawRun.conclusion !== run.conclusion
       || rawRun.html_url !== run.url
-      || rawRun.created_at !== run.createdAt
-      || rawRun.updated_at !== run.completedAt
+      || canonicalRemoteTimestamp(rawRun.created_at) !== run.createdAt
+      || canonicalRemoteTimestamp(rawRun.updated_at) !== run.completedAt
       || (run.pullRequestNumber === null
         ? (rawRun.pull_requests || []).length !== 0
         : !(rawRun.pull_requests || []).some(item => item?.number === run.pullRequestNumber))
@@ -1573,8 +1579,8 @@ function validateRemoteCiApiEvidence(receipt, source, errors, options = {}) {
         || rawJob.name !== job.name
         || rawJob.status !== job.status
         || rawJob.conclusion !== job.conclusion
-        || rawJob.started_at !== job.startedAt
-        || rawJob.completed_at !== job.completedAt) {
+        || canonicalRemoteTimestamp(rawJob.started_at) !== job.startedAt
+        || canonicalRemoteTimestamp(rawJob.completed_at) !== job.completedAt) {
         errors.push(`Remote CI job ${job.id} disagrees with GitHub API evidence.`);
       }
     }
@@ -1690,7 +1696,9 @@ function releaseReadinessStatus(values) {
       allRequiredPassed: allAuthenticatedPassed,
     },
     authenticatedAcceptance: values.liveQualification.authenticatedAcceptance,
-    verdict: status === "passed" ? values.liveQualification.verdict : null,
+    verdict: status === "passed"
+      ? values.liveQualification.verdict
+      : "NOT TEAM-TEST READY",
     reasons: uniqueSorted(reasons),
   };
 }

@@ -6546,7 +6546,7 @@ suite("Quality mutation and UI harness boundaries", () => {
       uiArtifactFingerprint: forgedFingerprint,
     });
     assert.strictEqual(forged.blackBoxUi.status, "failed");
-    assert.strictEqual(forged.releaseReadiness.verdict, null);
+    assert.strictEqual(forged.releaseReadiness.verdict, "NOT TEAM-TEST READY");
     assert.strictEqual(forged.status, "failed");
 
     const tampered = generateReport({
@@ -7041,7 +7041,7 @@ suite("Release checklist and deterministic quality report", () => {
     assert.strictEqual(report.deterministicGates.status, "passed");
     assert.strictEqual(report.liveQualification.status, "failed");
     assert.strictEqual(report.liveQualification.authenticatedAcceptance, "not-recorded");
-    assert.strictEqual(report.releaseReadiness.verdict, null);
+    assert.strictEqual(report.releaseReadiness.verdict, "NOT TEAM-TEST READY");
     assert.strictEqual(report.status, "failed");
     assert.strictEqual(hasDeterministicReportFailure(report), true);
   });
@@ -7103,16 +7103,16 @@ suite("Release checklist and deterministic quality report", () => {
       /fresh evaluation of its disk attestation/u
     );
     assert.strictEqual(mismatchedBytes.liveQualification.status, "failed");
-    assert.strictEqual(mismatchedBytes.releaseReadiness.verdict, null);
+    assert.strictEqual(mismatchedBytes.releaseReadiness.verdict, "NOT TEAM-TEST READY");
     assert.strictEqual(invalidSchema.liveQualification.status, "failed");
-    assert.strictEqual(invalidSchema.releaseReadiness.verdict, null);
+    assert.strictEqual(invalidSchema.releaseReadiness.verdict, "NOT TEAM-TEST READY");
     assert.strictEqual(stale.liveQualification.status, "failed");
     assert.strictEqual(stale.liveQualification.authenticatedAcceptance, "not-recorded");
-    assert.strictEqual(stale.releaseReadiness.verdict, null);
+    assert.strictEqual(stale.releaseReadiness.verdict, "NOT TEAM-TEST READY");
     assert.strictEqual(stale.status, "failed");
     assert.strictEqual(changedFindings.liveQualification.status, "failed");
     assert.match(changedFindings.liveQualification.errors.join("\n"), /current findings ledger/u);
-    assert.strictEqual(changedFindings.releaseReadiness.verdict, null);
+    assert.strictEqual(changedFindings.releaseReadiness.verdict, "NOT TEAM-TEST READY");
     assert.strictEqual(alternateInput.liveQualification.status, "failed");
     assert.match(alternateInput.liveQualification.errors.join("\n"), /exact default attestation/u);
     assert.strictEqual(hasDeterministicReportFailure(stale), true);
@@ -7211,7 +7211,7 @@ suite("Release checklist and deterministic quality report", () => {
         report.liveQualification.errors.join("\n"),
         /fresh evaluation of its disk attestation/u
       );
-      assert.strictEqual(report.releaseReadiness.verdict, null);
+      assert.strictEqual(report.releaseReadiness.verdict, "NOT TEAM-TEST READY");
     } finally {
       fixture.cleanup();
     }
@@ -7268,7 +7268,7 @@ suite("Release checklist and deterministic quality report", () => {
     assert.deepStrictEqual(report.liveQualification.passedWorkflowIds, [actualWorkflowId]);
     assert.match(report.liveQualification.errors.join("\n"), /workflow manifest|subset/u);
     assert.strictEqual(report.workflowCoverage[0].layerStatuses["live-protocol"], "not-run");
-    assert.strictEqual(report.releaseReadiness.verdict, null);
+    assert.strictEqual(report.releaseReadiness.verdict, "NOT TEAM-TEST READY");
     assert.strictEqual(report.status, "failed");
   });
 
