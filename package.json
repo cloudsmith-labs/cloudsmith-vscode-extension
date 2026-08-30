@@ -1057,6 +1057,7 @@
     "quality:full": "node scripts/quality/gate.js full",
     "quality:release": "node scripts/quality/gate.js release",
     "quality:qualification:prepare": "node scripts/quality/prepare-qualification.js",
+    "quality:qualification:prepare-remote": "node scripts/quality/prepare-remote-qualification.js",
     "quality:qualification:launch": "node scripts/quality/prepare-qualification.js --launch",
     "quality:qualification:reset": "node scripts/quality/reset-qualification-profile.js",
     "quality:qualification:authenticated-ci": "node scripts/quality/run-authenticated-ci.js",

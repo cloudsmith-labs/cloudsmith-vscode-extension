@@ -59,6 +59,7 @@ const EXPECTED_QUALITY_SCRIPT_ENTRYPOINTS = Object.freeze({
   "quality:remote-ci:collect": "node scripts/quality/collect-remote-ci.js",
   "quality:qualification:launch": "node scripts/quality/prepare-qualification.js --launch",
   "quality:qualification:prepare": "node scripts/quality/prepare-qualification.js",
+  "quality:qualification:prepare-remote": "node scripts/quality/prepare-remote-qualification.js",
   "quality:qualification:prepare-authenticated-ci":
     "node scripts/quality/authenticated-candidate-session.js prepare",
   "quality:qualification:reset": "node scripts/quality/reset-qualification-profile.js",

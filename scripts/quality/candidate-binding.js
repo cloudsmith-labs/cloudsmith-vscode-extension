@@ -392,6 +392,7 @@ function candidateBindingFromReceipt(receipt, options = {}) {
   const allowedArtifactPaths = new Set([
     `out/development/${artifactFilename}`,
     `out/release/${artifactFilename}`,
+    ".quality/remote-ci/signed-out-ui/ui-candidate.vsix",
   ]);
   if (!hasExactKeys(artifact, [
     "absoluteVsixPath", "archiveBytes", "entryCount", "sha256", "sourceFingerprint",

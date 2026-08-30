@@ -2091,4 +2091,5 @@ module.exports = {
   validateInputPath,
   validateAttestationCandidate,
   validatePassedAttestation,
+  validatedRemoteCiAuthority,
 };

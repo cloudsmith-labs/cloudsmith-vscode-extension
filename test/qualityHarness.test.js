@@ -71,6 +71,13 @@ const {
   withStableSingleLinkFile,
 } = require("../scripts/quality/candidate-binding");
 const {
+  REMOTE_VSIX,
+  assertRemoteCandidateIdentity,
+  assertRemoteCiIdentity,
+  parseCli: parseRemoteQualificationArguments,
+  prepareRemoteAttestedQualificationCandidate,
+} = require("../scripts/quality/prepare-remote-qualification");
+const {
   assertValidMutationBaseline,
   assertMutationTestOwners,
   assertCanonicalMutationRuntime,
@@ -1497,6 +1504,284 @@ function createEvidenceHandoffFixture(options = {}) {
     summary,
   };
 }
+
+suite("Remote-attested local qualification", () => {
+  test("accepts only exact remote qualification CLI paths", () => {
+    assert.deepStrictEqual(
+      parseRemoteQualificationArguments([
+        "--vscode-executable", "/Applications/Visual Studio Code.app/Contents/MacOS/Code",
+        "--vscode-cli", "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+      ]),
+      {
+        vscodeExecutable: "/Applications/Visual Studio Code.app/Contents/MacOS/Code",
+        vscodeCli: "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+      },
+    );
+    assert.throws(
+      () => parseRemoteQualificationArguments(["--artifact", "newest.vsix"]),
+      /Unknown remote qualification argument/u,
+    );
+  });
+
+  test("requires exact successful remote run and artifact identity", () => {
+    const source = { sha: "a".repeat(40), fingerprint: "b".repeat(64) };
+    const remote = {
+      sourceSha: source.sha,
+      sourceFingerprint: source.fingerprint,
+      pullRequest: { headSha: source.sha, state: "open", draft: true },
+      runs: [{
+        workflowFile: ".github/workflows/main.yml",
+        runId: 42,
+        runAttempt: 1,
+        headSha: source.sha,
+        status: "completed",
+        conclusion: "success",
+      }],
+      signedOutUiArtifact: {
+        artifactId: 7,
+        digest: `sha256:${"c".repeat(64)}`,
+        expired: false,
+        headSha: source.sha,
+        runId: 42,
+        runAttempt: 1,
+      },
+    };
+    assert.strictEqual(assertRemoteCiIdentity(remote, source).artifact.artifactId, 7);
+    assert.throws(
+      () => assertRemoteCiIdentity({
+        ...remote,
+        signedOutUiArtifact: { ...remote.signedOutUiArtifact, runId: 43 },
+      }, source),
+      /stale, incomplete, or candidate-mismatched/u,
+    );
+  });
+
+  test("rejects same-version remote bytes with a different digest", () => {
+    const source = { sha: "a".repeat(40), fingerprint: "b".repeat(64) };
+    const extension = {
+      id: "Cloudsmith.cloudsmith-vsc",
+      publisher: "Cloudsmith",
+      name: "cloudsmith-vsc",
+      version: "2.3.0",
+    };
+    const verification = {
+      sha256: "c".repeat(64),
+      manifest: { publisher: "Cloudsmith", name: "cloudsmith-vsc", version: "2.3.0" },
+    };
+    const candidate = {
+      extensionId: extension.id,
+      extensionVersion: extension.version,
+      sourceSha: source.sha,
+      sourceFingerprint: source.fingerprint,
+      vsixSha256: verification.sha256,
+    };
+    assert.strictEqual(
+      assertRemoteCandidateIdentity(candidate, verification, source, extension),
+      true,
+    );
+    assert.throws(
+      () => assertRemoteCandidateIdentity(
+        { ...candidate, vsixSha256: "d".repeat(64) },
+        verification,
+        source,
+        extension,
+      ),
+      /does not match the exact current candidate/u,
+    );
+  });
+
+  test("binds the local receipt to the staged remote VSIX rather than a wrapper", () => {
+    const fixture = passedLiveAttestation();
+    try {
+      const remoteVsix = path.join(fixture.root, REMOTE_VSIX);
+      fs.mkdirSync(path.dirname(remoteVsix), { recursive: true });
+      fs.copyFileSync(fixture.candidateArtifactPath, remoteVsix);
+      const unsigned = clone(fixture.candidateReceipt);
+      delete unsigned.fingerprint;
+      unsigned.artifact.vsixPath = REMOTE_VSIX;
+      unsigned.artifact.absoluteVsixPath = remoteVsix;
+      const receipt = { ...unsigned, fingerprint: fingerprint(unsigned) };
+      const binding = candidateBindingFromReceipt(receipt, {
+        root: fixture.root,
+        source: receipt.source,
+        artifactPath: remoteVsix,
+        homeDirectory: fixture.qualificationHomeDirectory,
+      });
+      assert.strictEqual(binding.vsixSha256, receipt.artifact.sha256);
+
+      const wrapper = path.join(fixture.root, ".quality/remote-ci/signed-out-ui.zip");
+      fs.writeFileSync(wrapper, "not the attested VSIX");
+      assert.throws(
+        () => candidateBindingFromReceipt(receipt, {
+          root: fixture.root,
+          source: receipt.source,
+          artifactPath: wrapper,
+          homeDirectory: fixture.qualificationHomeDirectory,
+        }),
+        /VSIX proof is stale or mismatched/u,
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("verifies remote authority before installing exact bytes without packaging", async () => {
+    const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-remote-qualification-",
+    )));
+    const source = { sha: "a".repeat(40), fingerprint: "b".repeat(64) };
+    const bytes = Buffer.from("remote attested candidate bytes");
+    const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+    const candidate = {
+      extensionId: "Cloudsmith.cloudsmith-vsc",
+      extensionVersion: "2.3.0",
+      sourceSha: source.sha,
+      sourceFingerprint: source.fingerprint,
+      vsixSha256: sha256,
+    };
+    const remote = {
+      sourceSha: source.sha,
+      sourceFingerprint: source.fingerprint,
+      pullRequest: { headSha: source.sha, state: "open", draft: true },
+      runs: [{
+        workflowFile: ".github/workflows/main.yml",
+        runId: 42,
+        runAttempt: 1,
+        headSha: source.sha,
+        status: "completed",
+        conclusion: "success",
+      }],
+      signedOutUiArtifact: {
+        artifactId: 7,
+        digest: `sha256:${"c".repeat(64)}`,
+        expired: false,
+        headSha: source.sha,
+        runId: 42,
+        runAttempt: 1,
+      },
+    };
+    const remoteCiPath = path.join(fixtureRoot, "internal_docs/quality/remote-ci.json");
+    fs.mkdirSync(path.dirname(remoteCiPath), { recursive: true });
+    fs.writeFileSync(remoteCiPath, `${JSON.stringify(remote)}\n`);
+    const profileRoot = path.join(fixtureRoot, ".cloudsmith-vscode-qualification");
+    const profile = {
+      mode: "local",
+      persistent: true,
+      root: profileRoot,
+      testResourcesDir: profileRoot,
+      homeDir: path.join(profileRoot, "home"),
+      userDataDir: path.join(profileRoot, "user-data"),
+      extensionsDir: path.join(profileRoot, "extensions"),
+    };
+    const identity = {
+      changedNanoseconds: "1",
+      device: "1",
+      inode: "1",
+      links: "1",
+      mode: "33152",
+      modifiedNanoseconds: "1",
+      size: String(bytes.length),
+    };
+    const verification = {
+      buffer: bytes,
+      sha256,
+      archiveBytes: bytes.length,
+      entryCount: 1,
+      totalUncompressedBytes: bytes.length,
+      artifactIdentity: identity,
+      manifest: { publisher: "Cloudsmith", name: "cloudsmith-vsc", version: "2.3.0" },
+    };
+    const events = [];
+    const adapters = {
+      qualificationToolchainPreflight: () => ({
+        npm: { version: "10.9.8", installation: { sha256: "d".repeat(64) } },
+      }),
+      prepareLocalQualificationProfile: () => profile,
+      qualificationEnvironment: environment => environment,
+      captureRepositoryState: () => ({
+        branch: "test/release-quality-harness",
+        dirty: false,
+        status: "clean",
+      }),
+      sourceIdentity: () => source,
+      exactVersionState: () => ({
+        id: "Cloudsmith.cloudsmith-vsc",
+        publisher: "Cloudsmith",
+        name: "cloudsmith-vsc",
+        version: "2.3.0",
+        vscodeVersion: "1.134.0",
+      }),
+      validatedRemoteCiAuthority: () => {
+        events.push("authority");
+        return { laneStatuses: { "remote-ci": "passed", codeql: "passed" }, signedOutCandidate: candidate };
+      },
+      verifyStagedBundleMatchesArchive: () => {
+        events.push("archive");
+        return {
+          "evidence.json": "e".repeat(64),
+          "result.json": "f".repeat(64),
+          "ui-candidate.json": "1".repeat(64),
+          "ui-candidate.vsix": sha256,
+        };
+      },
+      verifyDetachedSignedOutUiBundle: () => {
+        events.push("bundle");
+        return { candidate };
+      },
+      verifyQualificationArtifact: async () => {
+        events.push("vsix");
+        return verification;
+      },
+      prepareCodePaths: async () => ({ executable: "/bounded/code", cli: "/bounded/cli" }),
+      resolveCodeInstallation: () => ({
+        executable: "/bounded/code", cli: "/bounded/cli", version: "1.134.0",
+      }),
+      removeOutputFile: relativePath => events.push(`clear:${relativePath}`),
+      createVerifiedInstallArtifact: verified => {
+        assert.strictEqual(verified.buffer, bytes);
+        return { file: "/private/candidate.vsix", cleanup: () => events.push("cleanup") };
+      },
+      installAndVerifyCandidate: options => {
+        events.push("install");
+        assert.strictEqual(options.profile.root, profileRoot);
+        assert.strictEqual(options.profile.userDataDir, path.join(profileRoot, "user-data"));
+        assert.strictEqual(options.profile.extensionsDir, path.join(profileRoot, "extensions"));
+        assert.strictEqual(options.vsixPath, "/private/candidate.vsix");
+        return { status: "passed", id: candidate.extensionId, version: candidate.extensionVersion };
+      },
+      writeJson: (relativePath, receipt) => {
+        events.push(`write:${relativePath}`);
+        assert.strictEqual(receipt.artifact.vsixPath, REMOTE_VSIX);
+        assert.strictEqual(receipt.artifact.sha256, sha256);
+      },
+      writeLiveCandidateProof: (_root, receipt, proofBytes) => {
+        events.push("write-live-proof");
+        assert.strictEqual(receipt.artifact.sha256, sha256);
+        assert.strictEqual(proofBytes, bytes);
+      },
+      now: () => new Date("2026-08-30T18:00:00.000Z"),
+    };
+    try {
+      const result = await prepareRemoteAttestedQualificationCandidate({
+        root: fixtureRoot,
+        homeDirectory: fixtureRoot,
+        environment: {},
+        adapters,
+      });
+      assert.strictEqual(result.receipt.artifact.sha256, sha256);
+      assert.ok(events.indexOf("authority") < events.indexOf("install"));
+      assert.ok(events.indexOf("archive") < events.indexOf("install"));
+      assert.ok(events.indexOf("bundle") < events.indexOf("install"));
+      assert.ok(events.indexOf("clear:.quality/qualification/live-candidate.json")
+        < events.indexOf("install"));
+      assert.ok(events.includes("write-live-proof"));
+      assert.ok(!events.some(event => event.includes("package")));
+    } finally {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+});
 
 suite("Quality change-impact analyzer", () => {
   test("uses the CI comparison SHA only as the default impact base", () => {
