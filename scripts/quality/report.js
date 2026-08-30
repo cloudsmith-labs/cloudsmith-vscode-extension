@@ -46,6 +46,7 @@ const {
   validateCandidateBinding,
   withStableSingleLinkFile,
 } = require("./candidate-binding");
+const { verifyStagedBundleMatchesArchive } = require("./remote-signed-out-artifact");
 
 const DEFAULT_JSON_OUTPUT = ".quality/report.json";
 const DEFAULT_MARKDOWN_OUTPUT = ".quality/report.md";
@@ -54,6 +55,8 @@ const DEFAULT_LIVE_STATUS = ".quality/gates/live-qualification-status.json";
 const DEFAULT_UI_RESULT = ".quality/ui/result.json";
 const DEFAULT_CANDIDATE_RECEIPT = ".quality/qualification/candidate.json";
 const DEFAULT_REMOTE_CI = "internal_docs/quality/remote-ci.json";
+const REMOTE_SIGNED_OUT_ARCHIVE = ".quality/remote-ci/signed-out-ui.zip";
+const REMOTE_SIGNED_OUT_BUNDLE = ".quality/remote-ci/signed-out-ui";
 const MAX_REPORT_INPUT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_EXTENSION_VERSION = require("../../package.json").version;
 const UI_BLOCKED_REASON = "Black-box UI qualification is blocked by the current host environment.";
@@ -83,6 +86,16 @@ const REQUIRED_REMOTE_CI_RUNS = Object.freeze([
       ["core-mutation", "Core mutation"],
       ["signed-out-black-box-ui", "Signed-out packaged black-box UI"],
       ["build-candidate", "Deterministic build candidate"],
+    ]),
+  }),
+  Object.freeze({
+    workflowFiles: Object.freeze([
+      ".github/workflows/codeql-analysis.yml",
+      "dynamic/github-code-scanning/codeql",
+    ]),
+    jobs: Object.freeze([
+      ["analyze-actions", "Analyze (actions)"],
+      ["analyze-javascript-typescript", "Analyze (javascript-typescript)"],
     ]),
   }),
 ]);
@@ -174,7 +187,12 @@ function generateReport(options = {}) {
     source,
     options.remoteCiArtifactFingerprint,
     options.nowMs,
-    { root: options.root || ROOT, fileSystem: options.fileSystem },
+    {
+      root: options.root || ROOT,
+      fileSystem: options.fileSystem,
+      requireSignedOutAuthority: profile === "release",
+      signedOutAuthority: options.remoteSignedOutAuthority || null,
+    },
   );
   const releaseReadiness = releaseReadinessStatus({
     deterministicStatus,
@@ -731,6 +749,8 @@ function summarizeLiveQualification(value, source, options = {}) {
         ? value.authenticatedAcceptance
         : "not-recorded",
       verdict: status === "passed" ? value.verdict : null,
+      readinessTarget: value.readinessTarget,
+      targetPolicyFingerprint: value.targetPolicyFingerprint,
       requiredWorkflowIds,
       passedWorkflowIds,
       missingWorkflowIds: requiredWorkflowIds.filter(id => !passedWorkflowIds.includes(id)),
@@ -794,14 +814,19 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
   const exactKeys = [
     "attestationFingerprint", "authenticatedAcceptance", "candidate", "errors", "evidenceManifest",
     "findingsFingerprint", "inputPath", "missingWorkflowIds", "openReleaseBlockerCount",
-    "passedWorkflowIds", "reason", "requiredWorkflowIds", "schemaVersion", "source",
-    "status", "verdict", "visibleEnabledActions", "workflowMatrix",
+    "passedWorkflowIds", "readinessTarget", "reason", "requiredWorkflowIds", "schemaVersion", "source",
+    "status", "targetPolicyFingerprint", "verdict", "visibleEnabledActions", "workflowMatrix",
   ];
   if (!isPlainObject(value)) return ["Live status artifact must be an object."];
   if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(exactKeys)) {
     errors.push("Live status artifact fields do not match schemaVersion 4.");
   }
   if (value.schemaVersion !== 4) errors.push("Live status artifact schemaVersion must be 4.");
+  if (!(value.readinessTarget === null || ["team-test", "release"].includes(value.readinessTarget))
+    || !(value.targetPolicyFingerprint === null
+      || /^[a-f0-9]{64}$/u.test(value.targetPolicyFingerprint || ""))) {
+    errors.push("Live status artifact has invalid readiness-target provenance.");
+  }
   if (!isPlainObject(value.source)
     || JSON.stringify(Object.keys(value.source).sort()) !== JSON.stringify(["fingerprint", "sha"])
     || !/^[a-f0-9]{40,64}$/u.test(value.source?.sha || "")
@@ -889,6 +914,7 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
           "partial-evidence",
           "blocked-by-defect",
           "not-authorized",
+          "not-observable-with-current-fixtures",
           "external-precondition",
           "not-executed",
         ].includes(row.outcomeDisposition)) {
@@ -898,7 +924,11 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
       const dispositionMatches = (
         (row.status === "PASS" && row.outcomeDisposition === "complete")
         || (row.status === "FAIL" && row.outcomeDisposition === "failed")
-        || (row.status === "PARTIAL" && row.outcomeDisposition === "partial-evidence")
+        || (row.status === "PARTIAL" && [
+          "partial-evidence",
+          "not-authorized",
+          "not-observable-with-current-fixtures",
+        ].includes(row.outcomeDisposition))
         || (row.status === "BLOCKED" && [
           "blocked-by-defect",
           "not-authorized",
@@ -944,14 +974,17 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
     errors.push("Live status artifact has invalid reason or errors.");
   }
   if (value.status === "passed") {
+    const targetBoundAcceptance = value.readinessTarget === "team-test";
     if (value.authenticatedAcceptance !== "recorded"
       || !new Set([
         "TEAM-TEST READY",
         "TEAM-TEST READY WITH RISKS",
       ]).has(value.verdict)
-      || JSON.stringify(value.passedWorkflowIds) !== JSON.stringify(value.requiredWorkflowIds)
-      || (value.workflowMatrix || []).some(row => row.status !== "PASS")
-      || (value.missingWorkflowIds || []).length !== 0
+      || (!targetBoundAcceptance
+        && JSON.stringify(value.passedWorkflowIds) !== JSON.stringify(value.requiredWorkflowIds))
+      || (!targetBoundAcceptance
+        && (value.workflowMatrix || []).some(row => row.status !== "PASS"))
+      || (!targetBoundAcceptance && (value.missingWorkflowIds || []).length !== 0)
       || !/^[a-f0-9]{64}$/u.test(value.attestationFingerprint || "")
       || (value.evidenceManifest || []).length === 0
       || value.openReleaseBlockerCount !== 0
@@ -960,6 +993,11 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
       || value.reason !== null
       || (value.errors || []).length !== 0) {
       errors.push("Passed live status artifact is internally inconsistent.");
+    }
+    if (targetBoundAcceptance
+      && (value.inputPath !== DEFAULT_LIVE_INPUT
+        || !/^[a-f0-9]{64}$/u.test(value.targetPolicyFingerprint || ""))) {
+      errors.push("Passed TEAM-TEST status does not bind the tracked TEAM-TEST policy.");
     }
     if (value.candidate === null) {
       errors.push("Passed live status artifact does not bind a qualification candidate.");
@@ -1002,6 +1040,8 @@ function emptyLiveQualification(status, findingsState = {}, requiredWorkflowIds 
   return {
     status,
     completedAt: null,
+    readinessTarget: null,
+    targetPolicyFingerprint: null,
     candidate: null,
     authenticatedAcceptance: "not-recorded",
     verdict: null,
@@ -1333,14 +1373,16 @@ function summarizeRemoteCi(
     completedAt: null,
     pullRequest: null,
     runs: [],
+    codeqlAggregate: null,
+    signedOutUiArtifact: null,
     receiptFingerprint: artifactFingerprint,
     errors: [],
   };
   if (value === null || value === undefined) return base;
   const errors = [];
   const rootKeys = [
-    "branch", "capturedAt", "evidence", "pullRequest", "repository", "runs",
-    "schemaVersion", "sourceFingerprint", "sourceSha",
+    "branch", "capturedAt", "codeqlAggregate", "evidence", "pullRequest", "repository",
+    "runs", "schemaVersion", "signedOutUiArtifact", "sourceFingerprint", "sourceSha",
   ];
   if (!isPlainObject(value)
     || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(rootKeys)) {
@@ -1384,6 +1426,7 @@ function summarizeRemoteCi(
   } else {
     for (let index = 0; index < REQUIRED_REMOTE_CI_RUNS.length; index += 1) {
       const expected = REQUIRED_REMOTE_CI_RUNS[index];
+      const expectedLabel = expected.workflowFile || "CodeQL";
       const run = value.runs[index];
       const runKeys = [
         "completedAt", "conclusion", "createdAt", "event", "headSha", "jobs",
@@ -1392,9 +1435,7 @@ function summarizeRemoteCi(
       ];
       if (!isPlainObject(run)
         || JSON.stringify(Object.keys(run).sort()) !== JSON.stringify(runKeys)
-        || run.workflowFile !== expected.workflowFile
-        || run.workflowName !== expected.workflowName
-        || run.event !== expected.event
+        || !validExpectedRemoteCiWorkflow(run, expected, pullRequest)
         || !Number.isInteger(run.runId) || run.runId < 1
         || !Number.isInteger(run.runAttempt) || run.runAttempt < 1
         || run.headSha !== source?.sha
@@ -1403,7 +1444,7 @@ function summarizeRemoteCi(
         || run.pullRequestNumber !== pullRequest?.number
         || !validOrderedRemoteTimestamps(run.createdAt, run.completedAt, capturedAt)
         || run.url !== `https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/actions/runs/${String(run?.runId)}`) {
-        errors.push(`Remote CI workflow ${expected.workflowFile} is invalid or not successful.`);
+        errors.push(`Remote CI workflow ${expectedLabel} is invalid or not successful.`);
         continue;
       }
       const expectedJobs = expected.jobs.map(([id, name]) => ({
@@ -1429,7 +1470,29 @@ function summarizeRemoteCi(
           run.jobs.map(job => ({ ...job, databaseId: null, startedAt: null, completedAt: null })),
           expectedJobs,
         )) {
-        errors.push(`Remote CI workflow ${expected.workflowFile} has incomplete or failed jobs.`);
+        errors.push(`Remote CI workflow ${expectedLabel} has incomplete or failed jobs.`);
+      }
+    }
+  }
+  validateCodeqlAggregate(value?.codeqlAggregate, value, capturedAt, errors);
+  validateSignedOutUiArtifact(value?.signedOutUiArtifact, value, capturedAt, errors);
+  if (options.requireSignedOutAuthority === true) {
+    const authority = options.signedOutAuthority;
+    if (!isPlainObject(authority)
+      || authority.status !== "passed"
+      || authority.sourceSha !== source?.sha
+      || authority.artifactDigest !== value?.signedOutUiArtifact?.digest
+      || `sha256:${authority.archiveSha256}` !== authority.artifactDigest) {
+      errors.push("Remote CI signed-out UI artifact bytes are absent, stale, or mismatched.");
+    } else {
+      try {
+        validateCandidateBinding(authority.candidate);
+        if (authority.candidate.sourceSha !== source.sha
+          || authority.candidate.sourceFingerprint !== source.fingerprint) {
+          throw new Error("mismatch");
+        }
+      } catch {
+        errors.push("Remote CI signed-out UI artifact candidate binding is invalid.");
       }
     }
   }
@@ -1437,7 +1500,11 @@ function summarizeRemoteCi(
   const completedAtValues = Array.isArray(value?.runs)
     ? value.runs.map(run => Date.parse(run?.completedAt)).filter(Number.isFinite)
     : [];
-  const completedAt = completedAtValues.length === REQUIRED_REMOTE_CI_RUNS.length
+  const codeqlAggregateCompletedAt = Date.parse(value?.codeqlAggregate?.completedAt);
+  if (Number.isFinite(codeqlAggregateCompletedAt)) {
+    completedAtValues.push(codeqlAggregateCompletedAt);
+  }
+  const completedAt = completedAtValues.length === REQUIRED_REMOTE_CI_RUNS.length + 1
     ? Math.max(...completedAtValues)
     : null;
   return {
@@ -1452,6 +1519,12 @@ function summarizeRemoteCi(
     capturedAt: typeof value?.capturedAt === "string" ? value.capturedAt : null,
     completedAt: Number.isFinite(completedAt) ? new Date(completedAt).toISOString() : null,
     pullRequest: isPlainObject(pullRequest) ? { ...pullRequest } : null,
+    codeqlAggregate: isPlainObject(value?.codeqlAggregate)
+      ? { ...value.codeqlAggregate }
+      : null,
+    signedOutUiArtifact: isPlainObject(value?.signedOutUiArtifact)
+      ? { ...value.signedOutUiArtifact }
+      : null,
     runs: Array.isArray(value?.runs) ? value.runs.map(run => ({
       workflowFile: run?.workflowFile || null,
       workflowName: run?.workflowName || null,
@@ -1466,6 +1539,70 @@ function summarizeRemoteCi(
     evidence: apiEvidence,
     errors: uniqueSorted(errors),
   };
+}
+
+function validExpectedRemoteCiWorkflow(run, expected, pullRequest) {
+  if (expected.workflowFile) {
+    return run.workflowFile === expected.workflowFile
+      && run.workflowName === expected.workflowName
+      && run.event === expected.event;
+  }
+  if (!expected.workflowFiles?.includes(run.workflowFile)) return false;
+  if (run.workflowFile === "dynamic/github-code-scanning/codeql") {
+    return run.event === "dynamic" && run.workflowName === `PR #${String(pullRequest?.number)}`;
+  }
+  return run.event === "pull_request"
+    && typeof run.workflowName === "string"
+    && run.workflowName.length > 0
+    && run.workflowName.length <= 255
+    && !/[\u0000-\u001f\u007f]/u.test(run.workflowName);
+}
+
+function validateCodeqlAggregate(value, receipt, capturedAt, errors) {
+  const keys = [
+    "annotationsCount", "appSlug", "completedAt", "conclusion", "databaseId", "headSha",
+    "name", "startedAt", "status", "title", "url",
+  ];
+  if (!isPlainObject(value)
+    || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(keys)
+    || !Number.isInteger(value.databaseId) || value.databaseId < 1
+    || value.name !== "CodeQL"
+    || value.appSlug !== "github-advanced-security"
+    || value.headSha !== receipt?.sourceSha
+    || value.status !== "completed"
+    || value.conclusion !== "success"
+    || value.annotationsCount !== 0
+    || value.title !== "No new alerts in code changed by this pull request"
+    || !validOrderedRemoteTimestamps(value.startedAt, value.completedAt, capturedAt)
+    || value.url !== `https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/runs/${String(value.databaseId)}`) {
+    errors.push("Remote CI receipt does not bind a successful exact-head CodeQL aggregate check.");
+  }
+}
+
+function validateSignedOutUiArtifact(value, receipt, capturedAt, errors) {
+  const keys = [
+    "artifactId", "branch", "createdAt", "digest", "expired", "headSha", "name",
+    "runAttempt", "runId", "sizeBytes", "updatedAt",
+  ];
+  const mainRun = receipt?.runs?.[0];
+  const uiJob = mainRun?.jobs?.find(job => job?.id === "signed-out-black-box-ui");
+  const expectedName = `signed-out-ui-evidence-${String(receipt?.sourceSha)}-${String(mainRun?.runAttempt)}`;
+  if (!isPlainObject(value)
+    || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(keys)
+    || !Number.isInteger(value.artifactId) || value.artifactId < 1
+    || value.name !== expectedName
+    || !/^sha256:[a-f0-9]{64}$/u.test(value.digest || "")
+    || !Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 1
+    || value.expired !== false
+    || value.runId !== mainRun?.runId
+    || value.runAttempt !== mainRun?.runAttempt
+    || value.headSha !== receipt?.sourceSha
+    || value.branch !== receipt?.branch
+    || !validOrderedRemoteTimestamps(value.createdAt, value.updatedAt, capturedAt)
+    || Date.parse(value.createdAt) < Date.parse(uiJob?.startedAt)
+    || Date.parse(value.updatedAt) > Date.parse(uiJob?.completedAt)) {
+    errors.push("Remote CI receipt does not bind the exact signed-out UI artifact metadata.");
+  }
 }
 
 function validOrderedRemoteTimestamps(startedAt, completedAt, capturedAt) {
@@ -1518,7 +1655,9 @@ function validateRemoteCiApiEvidence(receipt, source, errors, options = {}) {
     || !isPlainObject(snapshot.pullRequest)
     || !Array.isArray(snapshot.runs)
     || !isPlainObject(snapshot.jobsByRunId)
-    || !isPlainObject(snapshot.runListsByWorkflow)) {
+    || !isPlainObject(snapshot.runListsByWorkflow)
+    || !isPlainObject(snapshot.checkRunsForRef)
+    || !isPlainObject(snapshot.artifactsByRunId)) {
     errors.push("Remote CI GitHub API capture envelope is invalid.");
     return { ...reference };
   }
@@ -1537,13 +1676,17 @@ function validateRemoteCiApiEvidence(receipt, source, errors, options = {}) {
     errors.push("Remote CI pull-request repositories disagree with configured origin.");
   }
   for (const run of receipt.runs || []) {
+    const isDynamicCodeql = run.workflowFile === "dynamic/github-code-scanning/codeql";
+    const expectedHeadBranch = isDynamicCodeql
+      ? `refs/pull/${String(receipt.pullRequest?.number)}/head`
+      : receipt.branch;
     const rawRun = snapshot.runs.find(item => item?.id === run.runId);
     const rawJobs = snapshot.jobsByRunId[String(run.runId)]?.jobs;
     const matchingRuns = (snapshot.runListsByWorkflow[run.workflowFile]?.workflow_runs || [])
       .filter(item => normalizedWorkflowRunPath(item?.path) === run.workflowFile
         && item?.event === run.event
         && item?.head_sha === source?.sha
-        && item?.head_branch === receipt.branch
+        && item?.head_branch === expectedHeadBranch
         && item?.head_repository?.full_name === receipt.repository);
     const authoritativeRun = matchingRuns.sort((left, right) => (
       (Date.parse(right.updated_at) - Date.parse(left.updated_at))
@@ -1559,24 +1702,33 @@ function validateRemoteCiApiEvidence(receipt, source, errors, options = {}) {
       || rawRun.name !== run.workflowName
       || rawRun.event !== run.event
       || rawRun.head_sha !== run.headSha
-      || rawRun.head_branch !== receipt.branch
+      || rawRun.head_branch !== expectedHeadBranch
       || rawRun.head_repository?.full_name !== receipt.repository
       || rawRun.status !== run.status
       || rawRun.conclusion !== run.conclusion
       || rawRun.html_url !== run.url
       || canonicalRemoteTimestamp(rawRun.created_at) !== run.createdAt
       || canonicalRemoteTimestamp(rawRun.updated_at) !== run.completedAt
-      || (run.pullRequestNumber === null
+      || (isDynamicCodeql
         ? (rawRun.pull_requests || []).length !== 0
+          || run.pullRequestNumber !== receipt.pullRequest?.number
         : !(rawRun.pull_requests || []).some(item => item?.number === run.pullRequestNumber))
       || !Array.isArray(rawJobs)) {
       errors.push(`Remote CI workflow ${run.workflowFile} disagrees with GitHub API evidence.`);
+      continue;
+    }
+    const expectedRawJobNames = new Set(run.jobs.map(job => job.name));
+    if (rawJobs.length !== run.jobs.length
+      || new Set(rawJobs.map(job => job?.name)).size !== run.jobs.length
+      || rawJobs.some(job => !expectedRawJobNames.has(job?.name))) {
+      errors.push(`Remote CI workflow ${run.workflowFile} has a crossed GitHub job inventory.`);
       continue;
     }
     for (const job of run.jobs || []) {
       const rawJob = rawJobs.find(item => item?.id === job.databaseId);
       if (!rawJob
         || rawJob.name !== job.name
+        || rawJob.run_attempt !== run.runAttempt
         || rawJob.status !== job.status
         || rawJob.conclusion !== job.conclusion
         || canonicalRemoteTimestamp(rawJob.started_at) !== job.startedAt
@@ -1585,11 +1737,70 @@ function validateRemoteCiApiEvidence(receipt, source, errors, options = {}) {
       }
     }
   }
+  validateCodeqlApiEvidence(snapshot, receipt, source, errors);
+  validateSignedOutUiArtifactApiEvidence(snapshot, receipt, source, errors);
   return { ...reference };
+}
+
+function validateCodeqlApiEvidence(snapshot, receipt, source, errors) {
+  const checks = (snapshot.checkRunsForRef?.check_runs || []).filter(check => (
+    check?.name === "CodeQL"
+      && check?.app?.slug === "github-advanced-security"
+      && check?.head_sha === source?.sha
+  )).sort((left, right) => (
+    (Math.max(remoteTimestampRank(right.completed_at), remoteTimestampRank(right.started_at))
+      - Math.max(remoteTimestampRank(left.completed_at), remoteTimestampRank(left.started_at)))
+    || (right.id - left.id)
+  ));
+  const raw = checks[0];
+  const value = receipt.codeqlAggregate;
+  if (!raw
+    || !(raw.pull_requests || []).some(item => item?.number === receipt.pullRequest?.number)
+    || raw.id !== value?.databaseId
+    || raw.name !== value?.name
+    || raw.app?.slug !== value?.appSlug
+    || raw.head_sha !== value?.headSha
+    || raw.status !== value?.status
+    || raw.conclusion !== value?.conclusion
+    || canonicalRemoteTimestamp(raw.started_at) !== value?.startedAt
+    || canonicalRemoteTimestamp(raw.completed_at) !== value?.completedAt
+    || raw.output?.annotations_count !== value?.annotationsCount
+    || raw.output?.title !== value?.title
+    || raw.html_url !== value?.url) {
+    errors.push("Remote CI CodeQL aggregate receipt disagrees with GitHub API evidence.");
+  }
+}
+
+function remoteTimestampRank(value) {
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) ? milliseconds : Number.NEGATIVE_INFINITY;
+}
+
+function validateSignedOutUiArtifactApiEvidence(snapshot, receipt, source, errors) {
+  const value = receipt.signedOutUiArtifact;
+  const rawArtifacts = snapshot.artifactsByRunId?.[String(value?.runId)]?.artifacts || [];
+  const matches = rawArtifacts.filter(artifact => artifact?.name === value?.name);
+  const raw = matches.length === 1 ? matches[0] : null;
+  const pullRepositoryId = snapshot.pullRequest?.head?.repo?.id;
+  if (!raw
+    || raw.id !== value?.artifactId
+    || raw.digest !== value?.digest
+    || raw.size_in_bytes !== value?.sizeBytes
+    || raw.expired !== value?.expired
+    || canonicalRemoteTimestamp(raw.created_at) !== value?.createdAt
+    || canonicalRemoteTimestamp(raw.updated_at) !== value?.updatedAt
+    || raw.workflow_run?.id !== value?.runId
+    || raw.workflow_run?.head_sha !== source?.sha
+    || raw.workflow_run?.head_branch !== receipt.branch
+    || raw.workflow_run?.repository_id !== pullRepositoryId
+    || raw.workflow_run?.head_repository_id !== pullRepositoryId) {
+    errors.push("Remote CI signed-out UI artifact receipt disagrees with GitHub API evidence.");
+  }
 }
 
 function normalizedWorkflowRunPath(value) {
   if (typeof value !== "string" || value.length > 512) return null;
+  if (value === "dynamic/github-code-scanning/codeql") return value;
   const match = /^(\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml)(?:@[^\s@\u0000-\u001f\u007f]{1,255})?$/u.exec(value);
   return match?.[1] || null;
 }
@@ -1604,6 +1815,14 @@ function releaseReadinessStatus(values) {
   ));
   const allAuthenticatedPassed = requiredAuthenticated.length > 0
     && requiredAuthenticated.every(workflow => workflow.authenticatedStatus === "PASS");
+  const targetPolicySatisfied = values.liveQualification.status === "passed"
+    && values.liveQualification.readinessTarget === "team-test"
+    && /^[a-f0-9]{64}$/u.test(values.liveQualification.targetPolicyFingerprint || "");
+  const remoteSignedOutPassed = values.remoteCi.status === "passed"
+    && values.remoteCi.signedOutUiArtifact !== null;
+  const effectiveBlackBoxStatus = values.blackBoxUi.status === "passed" || remoteSignedOutPassed
+    ? "passed"
+    : values.blackBoxUi.status;
   for (const [label, status] of [
     ["deterministic gates", values.deterministicStatus],
     ["impact analysis", values.impact.status],
@@ -1612,8 +1831,8 @@ function releaseReadinessStatus(values) {
   ]) {
     if (!["passed", "not-applicable"].includes(status)) reasons.push(`${label}: ${status}`);
   }
-  if (values.profile === "release" && values.blackBoxUi.status !== "passed") {
-    reasons.push(`black-box UI: ${values.blackBoxUi.status}`);
+  if (values.profile === "release" && effectiveBlackBoxStatus !== "passed") {
+    reasons.push(`black-box UI: ${effectiveBlackBoxStatus}`);
   }
   if (values.profile === "release" && values.remoteCi.status !== "passed") {
     reasons.push(`final-head remote CI: ${values.remoteCi.status}`);
@@ -1624,7 +1843,7 @@ function releaseReadinessStatus(values) {
     && (!(Date.parse(values.liveQualification.completedAt) >= Date.parse(values.remoteCi.completedAt)))) {
     reasons.push("authenticated live qualification predates final-head remote CI");
   }
-  if (values.liveQualification.status !== "passed" || !allAuthenticatedPassed) {
+  if (!targetPolicySatisfied) {
     reasons.push(`authenticated live qualification: ${values.liveQualification.status}`);
   }
   if (values.findings.status === "failed") reasons.push("finding input: failed");
@@ -1653,7 +1872,7 @@ function releaseReadinessStatus(values) {
     values.impact.status,
     values.mutation.status,
     values.profile === "fast" ? "not-applicable" : workflowStatus,
-    values.profile === "release" ? values.blackBoxUi.status : "not-applicable",
+    values.profile === "release" ? effectiveBlackBoxStatus : "not-applicable",
     values.profile === "release" && values.remoteCi.status === "failed"
       ? "failed"
       : "not-applicable",
@@ -1665,8 +1884,7 @@ function releaseReadinessStatus(values) {
   let status = hardStatuses.includes("failed") ? "failed" : "passed";
   if (status === "passed" && (
     reasons.length > 0
-    || values.liveQualification.status !== "passed"
-    || !allAuthenticatedPassed
+    || !targetPolicySatisfied
   )) {
     status = "blocked";
   }
@@ -1684,7 +1902,7 @@ function releaseReadinessStatus(values) {
         values.findings.deterministicReleaseBlocking > 0 ? "failed" : "not-applicable",
       ]),
       signedOutBlackBoxUi: values.profile === "release"
-        ? values.blackBoxUi.status
+        ? effectiveBlackBoxStatus
         : "not-applicable",
     },
     authenticatedLiveLane: {
@@ -1694,6 +1912,7 @@ function releaseReadinessStatus(values) {
         workflow.authenticatedStatus === "PASS"
       )).length,
       allRequiredPassed: allAuthenticatedPassed,
+      targetPolicySatisfied,
     },
     authenticatedAcceptance: values.liveQualification.authenticatedAcceptance,
     verdict: status === "passed"
@@ -1701,6 +1920,48 @@ function releaseReadinessStatus(values) {
       : "NOT TEAM-TEST READY",
     reasons: uniqueSorted(reasons),
   };
+}
+
+function loadRemoteSignedOutAuthority(root, source, remoteCi, options = {}) {
+  if (!remoteCi?.signedOutUiArtifact) return null;
+  try {
+    const archivePath = resolveOptionalRepositoryFile(
+      REMOTE_SIGNED_OUT_ARCHIVE,
+      root,
+      { subtree: ".quality/remote-ci" },
+    );
+    if (!archivePath) return null;
+    const archiveSha256 = withStableSingleLinkFile(archivePath, {
+      errorMessage: "Remote signed-out UI archive is unsafe or changed.",
+      fileSystem: options.fileSystem,
+      maximumBytes: 16 * 1024 * 1024,
+      minimumBytes: 1,
+    }, bytes => crypto.createHash("sha256").update(bytes).digest("hex"));
+    if (`sha256:${archiveSha256}` !== remoteCi.signedOutUiArtifact.digest) return null;
+    const expectedMemberDigests = verifyStagedBundleMatchesArchive({
+      archivePath,
+      bundleRoot: path.join(root, REMOTE_SIGNED_OUT_BUNDLE),
+      expectedDigest: remoteCi.signedOutUiArtifact.digest,
+      fileSystem: options.fileSystem,
+    });
+    const { verifyDetachedSignedOutUiBundle } = require("./verify-ui-evidence");
+    const verified = verifyDetachedSignedOutUiBundle({
+      bundleRoot: path.join(root, REMOTE_SIGNED_OUT_BUNDLE),
+      contractRoot: root,
+      expectedMemberDigests,
+      expectedSourceSha: source.sha,
+    });
+    return {
+      status: "passed",
+      sourceSha: source.sha,
+      artifactDigest: remoteCi.signedOutUiArtifact.digest,
+      archiveSha256,
+      bundleFingerprint: verified.fingerprint,
+      candidate: verified.candidate,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function loadReportInputs(options = {}) {
@@ -1805,6 +2066,14 @@ function loadReportInputs(options = {}) {
       options,
     )
     : null;
+  const remoteSignedOutAuthority = profile === "release"
+    ? loadRemoteSignedOutAuthority(
+      root,
+      source,
+      remoteCiArtifact?.value || null,
+      options,
+    )
+    : null;
   const impactArtifact = readOptionalRepositoryJsonArtifact(
     ".quality/impact.json",
     root,
@@ -1832,6 +2101,7 @@ function loadReportInputs(options = {}) {
     liveQualificationArtifactFingerprint: liveArtifact?.fingerprint || null,
     remoteCi: remoteCiArtifact?.value || null,
     remoteCiArtifactFingerprint: remoteCiArtifact?.fingerprint || null,
+    remoteSignedOutAuthority,
     findings,
     findingsFingerprint,
     findingsStatus,
@@ -1909,7 +2179,11 @@ function renderMarkdown(report) {
     `Status: **${report.remoteCi.status.toUpperCase()}**  `,
     `Branch: ${report.remoteCi.branch || "not recorded"}  `,
     `Pushed SHA: ${report.remoteCi.sourceSha || "not recorded"}  `,
-    `Draft PR: ${report.remoteCi.pullRequest?.url || "not recorded"}`,
+    `Draft PR: ${report.remoteCi.pullRequest?.url || "not recorded"}  `,
+    `CodeQL aggregate: ${report.remoteCi.codeqlAggregate?.url || "not recorded"}  `,
+    `Signed-out UI artifact: ${report.remoteCi.signedOutUiArtifact
+      ? `${report.remoteCi.signedOutUiArtifact.name} (artifact ${String(report.remoteCi.signedOutUiArtifact.artifactId)})`
+      : "not recorded"}`,
     "",
     "| Workflow | Run | Conclusion |",
     "| --- | --- | --- |",

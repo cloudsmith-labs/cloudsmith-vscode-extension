@@ -128,7 +128,7 @@ both required. Passing one never implies that the other ran.
 
 ## Authenticated authoritative outcomes
 
-- [ ] Fresh schema-v6 attestation binds the exact local candidate receipt,
+- [ ] Fresh schema-v7 target-bound acceptance binds the exact local candidate receipt,
       stable VSIX bytes, installed identity/version, source, dedicated local
       profile identity, exact findings bytes, independent review, and all
       required evidence.
@@ -192,6 +192,52 @@ both required. Passing one never implies that the other ran.
 - [ ] Blocking and in-scope Recommended findings resolved and material changes
       re-reviewed.
 
+## Target-bound acceptance
+
+- [ ] Acceptance records `readinessTarget` as exactly `team-test` or `release`
+      and binds the canonical SHA-256 fingerprint of the tracked
+      `quality/readiness-policy.json`; a TEAM-TEST result is never reused as
+      release evidence.
+- [ ] Exact candidate identity, authoritative current remote CI, CodeQL,
+      signed-out packaged UI, local authenticated continuity, and current
+      finding policy pass for both targets.
+- [ ] Independent signed-out and authenticated lane receipts coexist in the
+      content-addressed candidate-lane store. The latest receipt supersedes only
+      its own lane, and every lane binds the same exact source fingerprint and
+      VSIX bytes even when profile/VS Code execution context differs.
+- [ ] Appending an existing candidate-lane store supplies its independently
+      retained prior store fingerprint. A missing anchor, valid older replay,
+      or tampered store is rejected rather than restarting lane attempt history.
+- [ ] Remote signed-out authority includes the downloaded GitHub artifact
+      archive whose bytes match the GitHub SHA-256 digest, plus successful
+      detached validation of the exact receipt/VSIX/result/secret-scan member
+      inventory. Artifact metadata without those bytes does not pass the lane.
+- [ ] `inherited-unchanged` remains disabled in schema v7. The historical-byte
+      bundle validator alone is not delta/impact authority; until a future
+      acceptance boundary independently validates exact delta, workflow
+      ownership, registration, reopening, and volatile-fact inputs, history is
+      reference-only and is never replaced or relabelled.
+- [ ] Authenticated CI is not treated as a TEAM-TEST requirement while the
+      tracked target policy assigns authority to the value-blind local lane; it
+      remains mandatory for release.
+- [ ] A `WF-PULL-THROUGH` `not-authorized` outcome is candidate-bound, retains
+      the exact preflight/final-confirmation proof, claims neither PASS nor
+      live-protocol satisfaction, and is waived only for TEAM-TEST. Release
+      still requires the post-write outcome.
+- [ ] Every `not-observable-with-current-fixtures` outcome is independently
+      accounts exactly once for the complete tracked format inventory. Each
+      format is either bound to current-candidate positive evidence or proved
+      unavailable with successful service access and a bounded fixture
+      inventory; a product UI zero result is not the proof. Authoritative lower
+      layers pass and no product failure is hidden.
+- [ ] Fixture-unavailable and not-authorized outcomes count as incomplete
+      risks, never PASS, layer satisfaction, or product failures. If either
+      tracked TEAM-TEST waiver is used, the verdict is no stronger than
+      `TEAM-TEST READY WITH RISKS`.
+- [ ] Release does not consume either TEAM-TEST waiver. A positive fixture is
+      obtained whenever format-native service/protocol semantics make the
+      live-protocol layer release-required.
+
 ## Final gate and verdict
 
 - [ ] Local deterministic/security gates are green, no unresolved code-security
@@ -216,6 +262,10 @@ both required. Passing one never implies that the other ran.
       `remote-ci-api.json` evidence preserves the reviewed bounded GitHub API
       responses; missing, stale, crossed, superseded, cancelled, skipped,
       failed, or incomplete CI blocks readiness.
+- [ ] The collector downloaded the exact signed-out artifact archive, matched
+      its SHA-256 to the GitHub artifact digest, safely materialized only the
+      reviewed four-file inventory, and revalidated the inner exact-candidate
+      evidence before the signed-out lane was aggregated.
 - [ ] The final targeted live qualification and independent review postdate the
       last authoritative remote-CI completion time.
 - [ ] No P0, P1 product, core P2 product, dead enabled action, false

@@ -20,6 +20,7 @@ const {
   LIVE_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_ARTIFACT,
   UI_CANDIDATE_RECEIPT,
+  candidateBindingFromReceipt,
   digestStableSingleLinkFile,
   exactFileIdentity,
 } = require("../scripts/quality/candidate-binding");
@@ -57,6 +58,7 @@ const {
   GENERATED_EVIDENCE_EXCLUDED_FILES,
   GENERATED_EVIDENCE_EXCLUDED_PREFIXES,
   GENERATED_EVIDENCE_ROOT,
+  LIVE_ATTESTATION,
   RELEASE_COMPONENT_IDS,
   RELEASE_GATE_CIRCULAR_PATHS,
   RELEASE_GATE_EXPECTED_PATHS,
@@ -381,7 +383,7 @@ function createReleaseExposureFixture(root) {
   const evidencePath = "internal_docs/quality/findings.jsonl";
   const evidenceBytes = Buffer.from("synthetic value-blind finding evidence\n");
   fs.writeFileSync(path.join(root, evidencePath), evidenceBytes);
-  const attestationPath = "internal_docs/quality/live-qualification.json";
+  const attestationPath = LIVE_ATTESTATION;
   const attestation = {
     evidence: [{
       path: evidencePath,
@@ -1965,9 +1967,14 @@ suite("secret exposure gate", () => {
       for (const name of SIGNED_OUT_BUNDLE_NAMES) fs.chmodSync(path.join(detached, name), 0o400);
       fs.chmodSync(detached, 0o500);
     }
+    const expectedMemberDigests = Object.fromEntries(SIGNED_OUT_BUNDLE_NAMES.map(name => [
+      name,
+      crypto.createHash("sha256").update(fs.readFileSync(path.join(detached, name))).digest("hex"),
+    ]));
     const verified = verifyDetachedSignedOutUiBundle({
       bundleRoot: detached,
       contractRoot: scratch,
+      expectedMemberDigests,
       expectedSourceSha: fixture.source.sha,
     });
     assert.deepStrictEqual(verified, {
@@ -1975,7 +1982,20 @@ suite("secret exposure gate", () => {
       sourceSha: fixture.source.sha,
       testCount: 1,
       fingerprint: result.fingerprint,
+      candidate: candidateBindingFromReceipt(fixture.receipt, { source: fixture.source }),
     });
+
+    if (process.platform !== "win32") {
+      fs.chmodSync(detached, 0o700);
+      fs.chmodSync(path.join(detached, "result.json"), 0o600);
+    }
+    fs.appendFileSync(path.join(detached, "result.json"), " ");
+    assert.throws(() => verifyDetachedSignedOutUiBundle({
+      bundleRoot: detached,
+      contractRoot: scratch,
+      expectedMemberDigests,
+      expectedSourceSha: fixture.source.sha,
+    }), /does not match the authoritative archive/u);
   });
 
   test("signed-out staging cleans source, add, change, delete, and same-byte replacement drift", async () => {
@@ -2220,7 +2240,7 @@ suite("secret exposure gate", () => {
       candidateReceiptFingerprint: "c".repeat(64),
       vsixSha256: "d".repeat(64),
       uiResultSha256: "e".repeat(64),
-      attestationPath: "internal_docs/quality/live-qualification.json",
+      attestationPath: LIVE_ATTESTATION,
       attestationSha256: "f".repeat(64),
       generatedEvidence: syntheticGeneratedEvidence(8),
       evidenceManifest: [{
@@ -2328,17 +2348,18 @@ suite("secret exposure gate", () => {
       scanAcceptedEvidence: fixture.scanAcceptedEvidence,
       now: new Date("2026-08-27T12:05:00.000Z"),
     });
-    assert.strictEqual(validateReleaseExposureProof(result, {
+    const expectedProof = {
       source: fixture.source,
       candidateReceiptFingerprint: fixture.candidateReceipt.fingerprint,
       vsixSha256: fixture.candidateReceipt.artifact.sha256,
       uiResultSha256: crypto.createHash("sha256").update(fixture.uiBytes).digest("hex"),
-      attestationPath: "internal_docs/quality/live-qualification.json",
+      attestationPath: LIVE_ATTESTATION,
       attestationSha256: crypto.createHash("sha256")
         .update(fixture.attestationBytes)
         .digest("hex"),
       evidenceManifest: fixture.attestation.evidence,
-    }), true);
+    };
+    assert.strictEqual(validateReleaseExposureProof(result, expectedProof), true);
     assert.strictEqual(validateGeneratedEvidenceAcceptance(scratch, result.generatedEvidence), true);
     assert.deepStrictEqual(
       result.generatedEvidence.boundary.excludedFiles,
@@ -2385,7 +2406,7 @@ suite("secret exposure gate", () => {
       vsixSha256: null,
     });
     assert.deepStrictEqual(result.attestation, {
-      path: "internal_docs/quality/live-qualification.json",
+      path: LIVE_ATTESTATION,
       sha256: null,
     });
     assert.deepStrictEqual(result.evidence, []);

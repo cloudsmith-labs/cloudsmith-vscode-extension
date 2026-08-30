@@ -280,6 +280,20 @@ function verifyDetachedSignedOutUiBundle(options = {}) {
       "evidence.json",
       MAX_EVIDENCE_BYTES,
     ));
+    if (options.expectedMemberDigests !== undefined) {
+      const expectedNames = [...SIGNED_OUT_BUNDLE_NAMES].sort();
+      const suppliedNames = options.expectedMemberDigests
+        && typeof options.expectedMemberDigests === "object"
+        && !Array.isArray(options.expectedMemberDigests)
+        ? Object.keys(options.expectedMemberDigests).sort()
+        : [];
+      if (JSON.stringify(suppliedNames) !== JSON.stringify(expectedNames)
+        || expectedNames.some(name => !/^[a-f0-9]{64}$/u.test(
+          options.expectedMemberDigests[name] || "",
+        ) || captured.get(name).sha256 !== options.expectedMemberDigests[name])) {
+        throw new Error("Detached signed-out UI bundle does not match the authoritative archive.");
+      }
+    }
     const receipt = parseCanonicalJson(
       captured.get("evidence.json"),
       "Detached signed-out UI evidence receipt is not canonical JSON.",
@@ -334,6 +348,7 @@ function verifyDetachedSignedOutUiBundle(options = {}) {
       sourceSha: binding.source.sha,
       testCount: ui.results.length,
       fingerprint: receipt.fingerprint,
+      candidate,
     });
   } finally {
     for (const file of captured.values()) file.bytes.fill(0);

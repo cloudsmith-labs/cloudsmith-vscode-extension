@@ -14,6 +14,8 @@ The permanent inputs are:
 - `defect-taxonomy.json` and `finding.schema.json`: finding vocabulary,
   lifecycle, deterministic/live state, evidence, and escape analysis.
 - `mutation-baseline.json`: measured high-risk mutation populations and policy.
+- `readiness-policy.json`: fingerprintable, target-bound TEAM-TEST and release
+  lane requirements, dispositions, and narrowly reviewed waivers.
 - `release-checklist.md`: the human and CI release-qualification contract.
 
 Generated output belongs under ignored `.quality/`. Run-specific findings and
@@ -52,10 +54,65 @@ authentication entry is a one-time manual handoff only when the dedicated local
 session is absent or expired. Automation resumes after the user confirms
 completion; it never observes password, API-key, or MFA entry.
 
-Passing deterministic gates does not attest the authenticated lane. Team-test
-readiness uses a fresh, source-bound live attestation for every workflow whose
-`liveFixture.required` value is `true`, while finding closure separately uses
-the lowest evidence layer that authoritatively proves the escaped contract.
+Passing deterministic gates does not attest the authenticated lane. Readiness
+evaluates each workflow's required layers against current candidate evidence
+and the selected target policy; it does not turn a historical observation or a
+waived incomplete outcome into fresh live evidence. Finding closure separately
+uses the lowest evidence layer that authoritatively proves the escaped
+contract.
+
+## Target-bound readiness policy
+
+`readiness-policy.json` is the tracked authority for the `team-test` and
+`release` targets. Its fingerprint is SHA-256 over canonical JSON with object
+keys sorted recursively. Every acceptance must bind both its target and that
+fingerprint; an attestation or caller cannot supply an untracked waiver, and a
+TEAM-TEST acceptance is not release evidence.
+
+Both targets require exact candidate identity, current authoritative remote CI,
+CodeQL, signed-out packaged UI, local authenticated continuity, and current
+finding policy. Authenticated CI is intentionally a release-only lane until a
+separately reviewed target-policy revision changes that split. Its absence does
+not block TEAM-TEST, but it continues to block release.
+
+Candidate-bound lane authority is content-addressed per lane. Re-preparing the
+authenticated local lane does not stale the signed-out packaged lane when both
+bind the same source fingerprint and VSIX bytes; a later attempt supersedes
+only its own lane. Appending to an existing store requires its independently
+retained prior fingerprint; a missing anchor or replayed valid older store
+fails closed instead of resetting attempt history. The signed-out remote lane is authoritative only after the
+exact GitHub artifact archive digest is verified, its fixed private inventory
+is unpacked safely, and the inner candidate receipt, VSIX, UI result, and secret
+scan receipt all revalidate against the current candidate. GitHub artifact
+metadata alone is not a signed-out PASS.
+
+`inherited-unchanged` is conditional, never caller-attested. Schema v7 keeps it
+disabled: the available content-addressed validator proves original historical
+receipt/artifact/attestation/evidence/policy/review bytes, but does not yet
+provide independent delta, ownership/impact, registration, reopening, or
+volatile-fact authority. Until a future boundary validates all of those inputs,
+history remains reference-only and the workflow requires current evidence; a
+summary of hash strings and booleans cannot enable inheritance.
+
+Two incomplete dispositions have narrowly different target treatment:
+
+- `WF-PULL-THROUGH` may remain `not-authorized` after candidate-bound preflight
+  when post-write mutation was not authorized. Only TEAM-TEST may waive that
+  incomplete outcome; release still requires the authoritative post-write
+  live-protocol outcome.
+- `not-observable-with-current-fixtures` may be a TEAM-TEST risk only when
+  the proof accounts exactly once for every tracked format contract, identifies
+  each format as current-candidate observed or fixture-unavailable, binds both
+  kinds to their exact evidence, and independently proves each unavailable
+  fixture claim,
+  authoritative lower layers pass, and no product failure occurred. A zero
+  result in the product UI alone is never fixture-absence proof. Release still
+  requires a positive fixture whenever its workflow policy explicitly requires
+  that live-protocol layer.
+
+Neither disposition satisfies a required evidence layer, counts as PASS, or
+counts as a product failure. When either waiver is actually used, the strongest
+TEAM-TEST result is `TEAM-TEST READY WITH RISKS`.
 
 ## Everyday and release commands
 
@@ -378,7 +435,8 @@ P0 external credential incident uses the taxonomy-enforced
 `durable-security-scan` plus `external-confirmation` requirement.
 
 A deterministic fix with pending or blocked required live verification remains
-unverified. Schema-v6 live attestations and schema-v4 derived status bind each
+unverified. Historical schema-v6 live attestations remain immutable. Current
+schema-v7 target-bound acceptance and schema-v4 derived status bind each
 candidate-observed workflow, regardless of PASS/PARTIAL/BLOCKED/FAIL outcome,
 to the exact local qualification receipt fingerprint, stable VSIX
 SHA-256, extension and installed ID/version, source SHA/fingerprint, VS Code
@@ -388,13 +446,21 @@ candidate/profile and is written as passed only after the production connected
 workspace verifier and value-blind SecretStorage/profile cleanup lifecycle
 succeeds. Local and CI proof must agree on immutable product identity, without
 falsely equating their receipt or profile identities. Missing, crossed, stale,
-or mismatched candidate proof fails closed.
-Every required workflow has exactly one `PASS`, `FAIL`, `PARTIAL`, or `BLOCKED`
-matrix row. `candidateProvenance` is `verified` only when that row binds the
-exact receipt and is `not-observed` only with a null receipt. Outcome
-disposition separately distinguishes complete, failed, partial evidence,
-defect-blocked, not-authorized, external-precondition, and not-executed cases.
-Blank rows are invalid. No credential or profile content enters these receipts.
+or mismatched candidate proof fails closed. Independent lane receipts may
+coexist for one immutable artifact identity; the latest authoritative attempt
+supersedes only its own lane.
+
+Every required workflow has exactly one matrix row, but readiness derives from
+the row's named layer claims and the bound target policy rather than requiring
+all rows to be current-receipt PASS. `candidateProvenance` is `verified` only
+when a candidate-observed row binds the exact receipt and is `not-observed`
+only with a null receipt. Historical observations remain reference-only unless
+a complete content-addressed inheritance bundle validates the original
+receipt/artifact/attestation/row/evidence/policy/review bytes and every current
+impact gate. Outcome disposition separately distinguishes complete, failed,
+partial evidence, defect-blocked, not-authorized, external-precondition, and
+not-executed cases. Blank rows are invalid. No credential or profile content
+enters these receipts.
 
 ## Push, CI, and final qualification lifecycle
 

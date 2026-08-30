@@ -4,6 +4,7 @@ const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const yazl = require("yazl");
 const { fingerprint } = require("../scripts/quality/evidence");
 const {
   UI_CANDIDATE_ARTIFACT,
@@ -19,8 +20,11 @@ const {
   validateUiResult,
 } = require("../scripts/quality/report");
 const { verifyQualityContracts } = require("../scripts/quality/verify-workflows");
+const { verifyStagedBundleMatchesArchive } = require("../scripts/quality/remote-signed-out-artifact");
 const {
   buildReceipt,
+  exactArtifactDigest,
+  parseArguments: parseRemoteCiArguments,
   writeRemoteCiEvidence,
 } = require("../scripts/quality/collect-remote-ci");
 const {
@@ -39,10 +43,23 @@ const SOURCE = Object.freeze({
 });
 const NPM_INTEGRITY = JSON.parse(fs.readFileSync(path.join(__dirname, "../.npm-integrity"), "utf8"));
 
+function exactSignedOutZip(files) {
+  return new Promise((resolve, reject) => {
+    const zip = new yazl.ZipFile();
+    const chunks = [];
+    zip.outputStream.on("data", chunk => chunks.push(chunk));
+    zip.outputStream.on("error", reject);
+    zip.outputStream.on("end", () => resolve(Buffer.concat(chunks)));
+    for (const [name, bytes] of Object.entries(files)) zip.addBuffer(bytes, name);
+    zip.end();
+  });
+}
+
 function remoteCiReceipt(overrides = {}) {
   const capturedAt = new Date().toISOString();
   const createdAt = new Date(Date.parse(capturedAt) - 5 * 60 * 1000).toISOString();
   const completedAt = new Date(Date.parse(capturedAt) - 4 * 60 * 1000).toISOString();
+  const aggregateCompletedAt = new Date(Date.parse(capturedAt) - 3 * 60 * 1000).toISOString();
   let databaseId = 2000;
   const mainJobs = [
     ["quality", "Quality"],
@@ -56,6 +73,18 @@ function remoteCiReceipt(overrides = {}) {
     ["core-mutation", "Core mutation"],
     ["signed-out-black-box-ui", "Signed-out packaged black-box UI"],
     ["build-candidate", "Deterministic build candidate"],
+  ].map(([id, name]) => ({
+    id,
+    name,
+    databaseId: ++databaseId,
+    status: "completed",
+    conclusion: "success",
+    startedAt: createdAt,
+    completedAt,
+  }));
+  const codeqlJobs = [
+    ["analyze-actions", "Analyze (actions)"],
+    ["analyze-javascript-typescript", "Analyze (javascript-typescript)"],
   ].map(([id, name]) => ({
     id,
     name,
@@ -81,21 +110,64 @@ function remoteCiReceipt(overrides = {}) {
       headSha: SOURCE.sha,
       url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/pull/42",
     },
-    runs: [{
-      workflowFile: ".github/workflows/main.yml",
-      workflowName: "Deterministic build candidate",
-      event: "pull_request",
-      runId: 1001,
-      runAttempt: 1,
-      pullRequestNumber: 42,
+    runs: [
+      {
+        workflowFile: ".github/workflows/main.yml",
+        workflowName: "Deterministic build candidate",
+        event: "pull_request",
+        runId: 1001,
+        runAttempt: 1,
+        pullRequestNumber: 42,
+        headSha: SOURCE.sha,
+        status: "completed",
+        conclusion: "success",
+        createdAt,
+        completedAt,
+        url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/actions/runs/1001",
+        jobs: mainJobs,
+      },
+      {
+        workflowFile: "dynamic/github-code-scanning/codeql",
+        workflowName: "PR #42",
+        event: "dynamic",
+        runId: 1002,
+        runAttempt: 1,
+        pullRequestNumber: 42,
+        headSha: SOURCE.sha,
+        status: "completed",
+        conclusion: "success",
+        createdAt,
+        completedAt,
+        url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/actions/runs/1002",
+        jobs: codeqlJobs,
+      },
+    ],
+    codeqlAggregate: {
+      databaseId: 3001,
+      name: "CodeQL",
+      appSlug: "github-advanced-security",
       headSha: SOURCE.sha,
       status: "completed",
       conclusion: "success",
+      startedAt: createdAt,
+      completedAt: aggregateCompletedAt,
+      annotationsCount: 0,
+      title: "No new alerts in code changed by this pull request",
+      url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/runs/3001",
+    },
+    signedOutUiArtifact: {
+      artifactId: 4001,
+      name: `signed-out-ui-evidence-${SOURCE.sha}-1`,
+      digest: `sha256:${"b".repeat(64)}`,
+      sizeBytes: 1024,
+      expired: false,
       createdAt,
-      completedAt,
-      url: "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/actions/runs/1001",
-      jobs: mainJobs,
-    }],
+      updatedAt: completedAt,
+      runId: 1001,
+      runAttempt: 1,
+      headSha: SOURCE.sha,
+      branch: "test/release-quality-harness",
+    },
     evidence: {
       path: "internal_docs/quality/remote-ci-api.json",
       sha256: "a".repeat(64),
@@ -112,14 +184,18 @@ function remoteCiApiEvidence(receipt) {
     name: run.workflowName,
     event: run.event,
     head_sha: run.headSha,
-    head_branch: receipt.branch,
+    head_branch: run.workflowFile === "dynamic/github-code-scanning/codeql"
+      ? `refs/pull/${String(receipt.pullRequest.number)}/head`
+      : receipt.branch,
     head_repository: { full_name: receipt.repository },
     status: run.status,
     conclusion: run.conclusion,
     html_url: run.url,
     created_at: run.createdAt,
     updated_at: run.completedAt,
-    pull_requests: run.pullRequestNumber === null ? [] : [{ number: run.pullRequestNumber }],
+    pull_requests: run.workflowFile === "dynamic/github-code-scanning/codeql"
+      ? []
+      : [{ number: run.pullRequestNumber }],
   });
   const value = {
     schemaVersion: 1,
@@ -130,11 +206,11 @@ function remoteCiApiEvidence(receipt) {
       draft: receipt.pullRequest.draft,
       state: receipt.pullRequest.state,
       html_url: receipt.pullRequest.url,
-      base: { ref: receipt.pullRequest.baseRef, repo: { full_name: receipt.repository } },
+      base: { ref: receipt.pullRequest.baseRef, repo: { id: 5001, full_name: receipt.repository } },
       head: {
         ref: receipt.pullRequest.headRef,
         sha: receipt.pullRequest.headSha,
-        repo: { full_name: receipt.repository },
+        repo: { id: 5001, full_name: receipt.repository },
       },
     },
     runs: receipt.runs.map(rawRun),
@@ -144,6 +220,7 @@ function remoteCiApiEvidence(receipt) {
         name: job.name,
         status: job.status,
         conclusion: job.conclusion,
+        run_attempt: run.runAttempt,
         started_at: job.startedAt,
         completed_at: job.completedAt,
       })),
@@ -151,6 +228,44 @@ function remoteCiApiEvidence(receipt) {
     runListsByWorkflow: Object.fromEntries(receipt.runs.map(run => [run.workflowFile, {
       workflow_runs: [rawRun(run)],
     }])),
+    checkRunsForRef: {
+      check_runs: [{
+        id: receipt.codeqlAggregate.databaseId,
+        name: receipt.codeqlAggregate.name,
+        app: { slug: receipt.codeqlAggregate.appSlug },
+        head_sha: receipt.codeqlAggregate.headSha,
+        status: receipt.codeqlAggregate.status,
+        conclusion: receipt.codeqlAggregate.conclusion,
+        started_at: receipt.codeqlAggregate.startedAt,
+        completed_at: receipt.codeqlAggregate.completedAt,
+        output: {
+          annotations_count: receipt.codeqlAggregate.annotationsCount,
+          title: receipt.codeqlAggregate.title,
+        },
+        html_url: receipt.codeqlAggregate.url,
+        pull_requests: [{ number: receipt.pullRequest.number }],
+      }],
+    },
+    artifactsByRunId: {
+      [String(receipt.signedOutUiArtifact.runId)]: {
+        artifacts: [{
+          id: receipt.signedOutUiArtifact.artifactId,
+          name: receipt.signedOutUiArtifact.name,
+          digest: receipt.signedOutUiArtifact.digest,
+          size_in_bytes: receipt.signedOutUiArtifact.sizeBytes,
+          expired: receipt.signedOutUiArtifact.expired,
+          created_at: receipt.signedOutUiArtifact.createdAt,
+          updated_at: receipt.signedOutUiArtifact.updatedAt,
+          workflow_run: {
+            id: receipt.signedOutUiArtifact.runId,
+            head_sha: receipt.signedOutUiArtifact.headSha,
+            head_branch: receipt.signedOutUiArtifact.branch,
+            repository_id: 5001,
+            head_repository_id: 5001,
+          },
+        }],
+      },
+    },
   };
   return { value, fingerprint: receipt.evidence.sha256 };
 }
@@ -236,6 +351,59 @@ function validUiResult(receipt) {
 }
 
 suite("two-lane release-readiness model", () => {
+  test("rejects a staged signed-out bundle swapped after the GitHub archive was captured", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "remote-ui-archive-")));
+    const bundle = path.join(root, "bundle");
+    fs.mkdirSync(bundle, { mode: 0o700 });
+    const files = Object.fromEntries([
+      "evidence.json", "result.json", "ui-candidate.json", "ui-candidate.vsix",
+    ].map(name => [name, Buffer.from(`authoritative ${name}`)]));
+    const archiveBytes = await exactSignedOutZip(files);
+    const archive = path.join(root, "artifact.zip");
+    fs.writeFileSync(archive, archiveBytes);
+    const archiveDescriptor = fs.openSync(archive, "r");
+    fs.fsyncSync(archiveDescriptor);
+    fs.closeSync(archiveDescriptor);
+    for (const [name, bytes] of Object.entries(files)) fs.writeFileSync(path.join(bundle, name), bytes);
+    const digest = `sha256:${require("crypto").createHash("sha256").update(archiveBytes).digest("hex")}`;
+    assert.doesNotThrow(() => verifyStagedBundleMatchesArchive({
+      archivePath: archive,
+      bundleRoot: bundle,
+      expectedDigest: digest,
+    }));
+    fs.writeFileSync(path.join(bundle, "result.json"), "different but self-consistent result");
+    assert.throws(() => verifyStagedBundleMatchesArchive({
+      archivePath: archive,
+      bundleRoot: bundle,
+      expectedDigest: digest,
+    }), /staged member (?:is unsafe or changed|does not match the GitHub archive)/u);
+  });
+  test("rejects a downloaded signed-out artifact whose bytes differ from GitHub metadata", () => {
+    const bytes = Buffer.from("exact-artifact");
+    const digest = `sha256:${require("crypto").createHash("sha256").update(bytes).digest("hex")}`;
+    assert.strictEqual(exactArtifactDigest(bytes, digest), digest.slice(7));
+    assert.throws(
+      () => exactArtifactDigest(Buffer.from("swapped-artifact"), digest),
+      /does not match GitHub metadata/u,
+    );
+  });
+  test("remote CI collection requires main and CodeQL run identities", () => {
+    assert.deepStrictEqual(
+      parseRemoteCiArguments([
+        "--pr", "42", "--main-run", "1001", "--codeql-run", "1002",
+      ]),
+      { pr: 42, "main-run": 1001, "codeql-run": 1002 }
+    );
+    for (const invalid of [
+      ["--pr", "42", "--main-run", "1001"],
+      ["--pr", "42", "--codeql-run", "1002"],
+      ["--pr", "42", "--main-run", "1001", "--codeql-run", "0"],
+      ["--pr", "42", "--main-run", "1001", "--main-run", "1002", "--codeql-run", "1003"],
+    ]) {
+      assert.throws(() => parseRemoteCiArguments(invalid), /--codeql-run ID/u);
+    }
+  });
+
   test("remote CI collection writes only its exact ignored evidence targets", () => {
     const calls = [];
     const writer = (...args) => {
@@ -303,12 +471,16 @@ suite("two-lane release-readiness model", () => {
       job.started_at = "2026-08-30T04:19:24Z";
       job.completed_at = "2026-08-30T04:35:56Z";
     }
+    const uiArtifact = snapshot.artifactsByRunId[String(exact.runs[0].runId)].artifacts[0];
+    uiArtifact.created_at = "2026-08-30T04:20:00Z";
+    uiArtifact.updated_at = "2026-08-30T04:35:00Z";
 
     const receipt = buildReceipt(
       snapshot,
       SOURCE,
       exact.branch,
-      [exact.runs[0].runId],
+      exact.pullRequest.number,
+      exact.runs.map(run => run.runId),
     );
     assert.strictEqual(receipt.runs[0].createdAt, "2026-08-30T04:19:21.000Z");
     assert.strictEqual(receipt.runs[0].completedAt, "2026-08-30T04:38:43.000Z");
@@ -323,23 +495,98 @@ suite("two-lane release-readiness model", () => {
       path: "internal_docs/quality/remote-ci-api.json",
       sha256: "a".repeat(64),
     };
-    assert.strictEqual(summarizeRemoteCi(
+    const summary = summarizeRemoteCi(
       receipt,
       SOURCE,
       null,
       Date.now(),
       { apiEvidence: { value: snapshot, fingerprint: "a".repeat(64) } },
-    ).status, "passed");
+    );
+    assert.strictEqual(summary.status, "passed", summary.errors.join("\n"));
+  });
+
+  test("remote CI collection fails closed on crossed or superseded exact-head evidence", () => {
+    const exact = remoteCiReceipt();
+    const runIds = exact.runs.map(run => run.runId);
+    const rejects = (mutate, pattern) => {
+      const snapshot = remoteCiApiEvidence(exact).value;
+      mutate(snapshot);
+      assert.throws(
+        () => buildReceipt(
+          snapshot,
+          SOURCE,
+          exact.branch,
+          exact.pullRequest.number,
+          runIds,
+        ),
+        pattern,
+      );
+    };
+
+    rejects(snapshot => {
+      snapshot.pullRequest.number += 1;
+    }, /exact draft pull request/u);
+    rejects(snapshot => {
+      const codeql = snapshot.runs[1];
+      snapshot.runListsByWorkflow[codeql.path].workflow_runs.unshift({
+        ...codeql,
+        id: codeql.id + 100,
+        created_at: new Date(Date.parse(codeql.created_at) + 1000).toISOString(),
+        updated_at: new Date(Date.parse(codeql.updated_at) + 1000).toISOString(),
+      });
+    }, /latest successful exact-head run/u);
+    rejects(snapshot => {
+      snapshot.jobsByRunId[String(exact.runs[1].runId)].jobs[0].conclusion = "failure";
+    }, /job inventory is not exact and successful/u);
+    rejects(snapshot => {
+      const aggregate = snapshot.checkRunsForRef.check_runs[0];
+      snapshot.checkRunsForRef.check_runs.unshift({
+        ...aggregate,
+        id: aggregate.id + 100,
+        status: "in_progress",
+        conclusion: null,
+        started_at: new Date(Date.parse(aggregate.completed_at) + 1000).toISOString(),
+        completed_at: null,
+        pull_requests: [],
+      });
+    }, /aggregate check is missing or not successful/u);
+    rejects(snapshot => {
+      snapshot.artifactsByRunId[String(exact.runs[0].runId)]
+        .artifacts[0].workflow_run.head_sha = "3".repeat(40);
+    }, /artifact metadata does not bind the exact run attempt/u);
   });
 
   test("requires exact successful final-head remote CI before readiness", () => {
     const exact = remoteCiReceipt();
     const options = { apiEvidence: remoteCiApiEvidence(exact) };
-    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), options).status, "passed");
+    const exactSummary = summarizeRemoteCi(exact, SOURCE, null, Date.now(), options);
+    assert.strictEqual(exactSummary.status, "passed", exactSummary.errors.join("\n"));
+    assert.strictEqual(exactSummary.completedAt, exact.codeqlAggregate.completedAt);
     assert.strictEqual(summarizeRemoteCi(null, SOURCE).status, "not-run");
     assert.strictEqual(summarizeRemoteCi(exact, SOURCE).status, "failed");
     assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
       apiEvidence: { ...options.apiEvidence, fingerprint: "b".repeat(64) },
+    }).status, "failed");
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      ...options,
+      requireSignedOutAuthority: true,
+    }).status, "failed");
+    const signedOutAuthority = {
+      status: "passed",
+      sourceSha: SOURCE.sha,
+      artifactDigest: exact.signedOutUiArtifact.digest,
+      archiveSha256: exact.signedOutUiArtifact.digest.slice(7),
+      candidate: candidateBindingFromReceipt(candidateReceipt(), { source: SOURCE }),
+    };
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      ...options,
+      requireSignedOutAuthority: true,
+      signedOutAuthority,
+    }).status, "passed");
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      ...options,
+      requireSignedOutAuthority: true,
+      signedOutAuthority: { ...signedOutAuthority, archiveSha256: "c".repeat(64) },
     }).status, "failed");
 
     const mutations = [
@@ -353,6 +600,23 @@ suite("two-lane release-readiness model", () => {
         runs: exact.runs.map((run, index) => index === 0
           ? { ...run, conclusion: "failure" }
           : run),
+      },
+      {
+        ...exact,
+        runs: exact.runs.map((run, index) => index === 1
+          ? { ...run, workflowFile: ".github/workflows/hostile.yml" }
+          : run),
+      },
+      {
+        ...exact,
+        codeqlAggregate: { ...exact.codeqlAggregate, annotationsCount: 1 },
+      },
+      {
+        ...exact,
+        signedOutUiArtifact: {
+          ...exact.signedOutUiArtifact,
+          digest: `sha256:${"c".repeat(64)}`,
+        },
       },
       {
         ...exact,
@@ -384,8 +648,10 @@ suite("two-lane release-readiness model", () => {
       apiEvidence: superseded,
     }).status, "failed");
     const suffixedPaths = remoteCiApiEvidence(exact);
-    for (const run of suffixedPaths.value.runs) run.path += "@refs/heads/test/release-quality-harness";
-    for (const run of exact.runs) {
+    for (const run of suffixedPaths.value.runs.filter(item => item.path.startsWith(".github/"))) {
+      run.path += "@refs/heads/test/release-quality-harness";
+    }
+    for (const run of exact.runs.filter(item => item.workflowFile.startsWith(".github/"))) {
       suffixedPaths.value.runListsByWorkflow[run.workflowFile].workflow_runs[0].path
         += "@refs/heads/test/release-quality-harness";
     }
@@ -404,6 +670,86 @@ suite("two-lane release-readiness model", () => {
     crossedRepository.value.runs[0].head_repository.full_name = "fork/repository";
     assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
       apiEvidence: crossedRepository,
+    }).status, "failed");
+    const crossedCodeql = remoteCiApiEvidence(exact);
+    crossedCodeql.value.checkRunsForRef.check_runs[0].head_sha = "3".repeat(40);
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: crossedCodeql,
+    }).status, "failed");
+    const staticCodeql = remoteCiReceipt();
+    staticCodeql.runs[1] = {
+      ...staticCodeql.runs[1],
+      workflowFile: ".github/workflows/codeql-analysis.yml",
+      workflowName: "CodeQL",
+      event: "pull_request",
+    };
+    assert.strictEqual(summarizeRemoteCi(
+      staticCodeql,
+      SOURCE,
+      null,
+      Date.now(),
+      { apiEvidence: remoteCiApiEvidence(staticCodeql) },
+    ).status, "passed");
+    const crossedCodeqlAttempt = remoteCiApiEvidence(exact);
+    crossedCodeqlAttempt.value.jobsByRunId[String(exact.runs[1].runId)]
+      .jobs[0].run_attempt += 1;
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: crossedCodeqlAttempt,
+    }).status, "failed");
+    const extraCodeqlJob = remoteCiApiEvidence(exact);
+    extraCodeqlJob.value.jobsByRunId[String(exact.runs[1].runId)].jobs.push({
+      ...extraCodeqlJob.value.jobsByRunId[String(exact.runs[1].runId)].jobs[0],
+      id: 9999,
+      name: "Unexpected analysis",
+    });
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: extraCodeqlJob,
+    }).status, "failed");
+    const supersededCodeqlAggregate = remoteCiApiEvidence(exact);
+    supersededCodeqlAggregate.value.checkRunsForRef.check_runs.unshift({
+      ...supersededCodeqlAggregate.value.checkRunsForRef.check_runs[0],
+      id: exact.codeqlAggregate.databaseId + 1,
+      completed_at: new Date(Date.parse(exact.codeqlAggregate.completedAt) + 1000).toISOString(),
+    });
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: supersededCodeqlAggregate,
+    }).status, "failed");
+    const newerInProgressCodeqlAggregate = remoteCiApiEvidence(exact);
+    newerInProgressCodeqlAggregate.value.checkRunsForRef.check_runs.unshift({
+      ...newerInProgressCodeqlAggregate.value.checkRunsForRef.check_runs[0],
+      id: exact.codeqlAggregate.databaseId + 2,
+      status: "in_progress",
+      conclusion: null,
+      started_at: new Date(Date.parse(exact.codeqlAggregate.completedAt) + 1000).toISOString(),
+      completed_at: null,
+      pull_requests: [],
+    });
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: newerInProgressCodeqlAggregate,
+    }).status, "failed");
+    const staleCodeqlRun = remoteCiApiEvidence(exact);
+    staleCodeqlRun.value.runListsByWorkflow[exact.runs[1].workflowFile].workflow_runs.unshift({
+      ...staleCodeqlRun.value.runs[1],
+      id: exact.runs[1].runId + 100,
+      updated_at: new Date(Date.parse(exact.runs[1].completedAt) + 1000).toISOString(),
+    });
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: staleCodeqlRun,
+    }).status, "failed");
+    const crossedArtifact = remoteCiApiEvidence(exact);
+    crossedArtifact.value.artifactsByRunId[String(exact.runs[0].runId)]
+      .artifacts[0].workflow_run.head_sha = "3".repeat(40);
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: crossedArtifact,
+    }).status, "failed");
+    const duplicateArtifact = remoteCiApiEvidence(exact);
+    duplicateArtifact.value.artifactsByRunId[String(exact.runs[0].runId)]
+      .artifacts.push({
+        ...duplicateArtifact.value.artifactsByRunId[String(exact.runs[0].runId)].artifacts[0],
+        id: exact.signedOutUiArtifact.artifactId + 1,
+      });
+    assert.strictEqual(summarizeRemoteCi(exact, SOURCE, null, Date.now(), {
+      apiEvidence: duplicateArtifact,
     }).status, "failed");
     const olderHighAttemptReceipt = remoteCiReceipt();
     olderHighAttemptReceipt.runs[0].runAttempt = 2;
@@ -452,6 +798,8 @@ suite("two-lane release-readiness model", () => {
         completedAt: "2026-08-29T21:00:00.000Z",
         authenticatedAcceptance: "recorded",
         verdict: "TEAM-TEST READY",
+        readinessTarget: "team-test",
+        targetPolicyFingerprint: "c".repeat(64),
       },
       findings: {
         status: "passed",
@@ -502,6 +850,10 @@ suite("two-lane release-readiness model", () => {
       status: "partial",
       authenticatedAcceptance: "not-recorded",
       verdict: null,
+      readinessTarget: null,
+      targetPolicyFingerprint: null,
+      readinessTarget: null,
+      targetPolicyFingerprint: null,
       requiredWorkflowIds: ["WF-LIVE"],
       passedWorkflowIds: [],
       missingWorkflowIds: ["WF-LIVE"],

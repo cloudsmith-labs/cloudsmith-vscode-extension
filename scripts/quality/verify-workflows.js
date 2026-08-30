@@ -18,6 +18,9 @@ const {
   uniqueSorted,
 } = require("./common");
 const { validateMutationBaseline } = require("./mutation-baseline");
+const { fingerprint } = require("./evidence");
+
+const READINESS_POLICY_PATH = "quality/readiness-policy.json";
 
 const REQUIRED_FAILURE_CLASSES = [
   "contract-mismatch",
@@ -95,6 +98,8 @@ function verifyQualityContracts(options = {}) {
   const lockfile = options.lockfile || readJson("package-lock.json", root);
   const mutationBaseline = options.mutationBaseline
     || readJson("quality/mutation-baseline.json", root);
+  const readinessPolicy = options.readinessPolicy
+    || readJson(READINESS_POLICY_PATH, root);
   const inventories = options.inventories
     || require(path.join(root, "test", "testInventories.js"));
   const errors = [];
@@ -107,6 +112,13 @@ function verifyQualityContracts(options = {}) {
     repositoryFiles,
   }).errors);
   verifyTaxonomy(taxonomy, findingSchema, errors);
+  verifyReadinessPolicy(
+    readinessPolicy,
+    workflowsDocument,
+    root,
+    repositoryFiles,
+    errors
+  );
   verifyExtensionHostHarness(root, repositoryFiles, sourceOverrides, errors);
   verifyEvidenceHandoffContract(
     root,
@@ -137,7 +149,148 @@ function verifyQualityContracts(options = {}) {
   );
   verifyScriptedWebviews(actionDocument, root, repositoryFiles, sourceOverrides, errors);
 
-  return { errors: uniqueSorted(errors), workflowCount: workflowIds.size };
+  return {
+    errors: uniqueSorted(errors),
+    readinessPolicyFingerprint: fingerprint(readinessPolicy),
+    workflowCount: workflowIds.size,
+  };
+}
+
+function expectedReadinessPolicy() {
+  return {
+    schemaVersion: 1,
+    policyId: "cloudsmith-vscode-readiness-targets-v1",
+    fingerprintAlgorithm: "sha256-canonical-json-v1",
+    targetValues: ["team-test", "release"],
+    laneValues: [
+      "candidate-identity",
+      "remote-ci",
+      "codeql",
+      "signed-out-packaged-ui",
+      "authenticated-local",
+      "authenticated-ci",
+      "finding-policy",
+    ],
+    targets: {
+      "team-test": {
+        requiredLanes: [
+          "candidate-identity",
+          "remote-ci",
+          "codeql",
+          "signed-out-packaged-ui",
+          "authenticated-local",
+          "finding-policy",
+        ],
+        allowedWaiverDispositions: [
+          "not-authorized",
+          "not-observable-with-current-fixtures",
+        ],
+        waiverResult: "ready-with-risks",
+        releaseEligible: false,
+      },
+      release: {
+        requiredLanes: [
+          "candidate-identity",
+          "remote-ci",
+          "codeql",
+          "signed-out-packaged-ui",
+          "authenticated-local",
+          "authenticated-ci",
+          "finding-policy",
+        ],
+        allowedWaiverDispositions: [],
+        waiverResult: null,
+        releaseEligible: true,
+      },
+    },
+    dispositions: {
+      satisfiesNamedLayer: [
+        "observed-current",
+        "verified-deterministic",
+        "verified-extension-host",
+        "verified-black-box",
+        "verified-live",
+      ],
+      conditionalLayerSatisfaction: ["inherited-unchanged"],
+      referenceOnly: ["observed-historical"],
+      notApplicableOnly: ["not-required"],
+      incompleteWaiverOnly: [
+        "not-authorized",
+        "not-observable-with-current-fixtures",
+      ],
+      neverCountsAsPass: [
+        "observed-historical",
+        "not-authorized",
+        "not-observable-with-current-fixtures",
+        "failed",
+        "blocked",
+      ],
+      productFailure: ["failed"],
+      concreteBlockerRequired: ["blocked"],
+    },
+    inheritance: {
+      disposition: "inherited-unchanged",
+      contentAddressedBundleRequired: true,
+      independentIdentityAndPolicyAnchorsRequired: true,
+      callerSummaryAccepted: false,
+      referenceOnlyWhenBundleUnavailable: true,
+    },
+    pullThroughNotAuthorized: {
+      workflowId: "WF-PULL-THROUGH",
+      disposition: "not-authorized",
+      candidateBoundPreflightRequired: true,
+      candidateBoundFinalConfirmationRequired: true,
+      authoritativePostWriteObserved: false,
+      satisfiesLiveProtocolLayer: false,
+      countsAsPass: false,
+      productFailure: false,
+      waiverTargets: ["team-test"],
+    },
+    fixtureUnavailable: {
+      disposition: "not-observable-with-current-fixtures",
+      independentFixtureProofRequired: true,
+      requiredIndependentProof: [
+        "workspace",
+        "repository",
+        "query",
+        "format",
+        "service-access",
+        "bounded-capture-time",
+        "fixture-inventory",
+      ],
+      productUiZeroResultSufficient: false,
+      authoritativeLowerLayerEvidenceRequired: true,
+      claimOrFormatSpecific: true,
+      satisfiesRequiredLayer: false,
+      countsAsPass: false,
+      productFailure: false,
+      waiverTargets: ["team-test"],
+      releasePositiveFixtureRequiredWhenLiveProtocolLayerRequired: true,
+    },
+  };
+}
+
+function verifyReadinessPolicy(policy, workflowsDocument, root, repositoryFiles, errors) {
+  try {
+    resolveGitVisibleRegularFile(READINESS_POLICY_PATH, repositoryFiles, root);
+  } catch {
+    errors.push("Readiness target policy must be a Git-visible regular file.");
+  }
+  if (!isDeepStrictEqual(policy, expectedReadinessPolicy())) {
+    errors.push(
+      "Readiness target policy must match the exact reviewed TEAM-TEST and release contract."
+    );
+  }
+  const pullThrough = (workflowsDocument?.workflows || []).find(workflow => (
+    workflow?.id === policy?.pullThroughNotAuthorized?.workflowId
+  ));
+  if (!pullThrough
+    || pullThrough.destructive !== true
+    || !pullThrough.requiredLayers?.includes("live-protocol")) {
+    errors.push(
+      "Readiness target policy pull-through waiver must remain bound to the destructive live-protocol workflow."
+    );
+  }
 }
 
 function verifyEvidenceHandoffContract(
@@ -308,15 +461,21 @@ function validRemoteCiSchema(document) {
       === "cloudsmith-labs/cloudsmith-vscode-extension"
     && document.properties?.evidence?.properties?.path?.const
       === "internal_docs/quality/remote-ci-api.json"
-    && document.properties?.runs?.minItems === 1
-    && document.properties?.runs?.maxItems === 1
-    && document.properties?.runs?.items?.properties?.workflowFile?.const
-      === ".github/workflows/main.yml"
-    && document.properties?.runs?.items?.properties?.event?.const === "pull_request"
+    && document.properties?.runs?.minItems === 2
+    && document.properties?.runs?.maxItems === 2
+    && isDeepStrictEqual(document.properties?.runs?.items?.properties?.workflowFile?.enum, [
+      ".github/workflows/main.yml",
+      ".github/workflows/codeql-analysis.yml",
+      "dynamic/github-code-scanning/codeql",
+    ])
+    && isDeepStrictEqual(
+      document.properties?.runs?.items?.properties?.event?.enum,
+      ["pull_request", "dynamic"]
+    )
     && document.properties?.runs?.items?.properties?.pullRequestNumber?.type === "integer"
     && isDeepStrictEqual(document.required, [
       "schemaVersion", "repository", "branch", "sourceSha", "sourceFingerprint", "capturedAt",
-      "pullRequest", "runs", "evidence",
+      "pullRequest", "runs", "codeqlAggregate", "signedOutUiArtifact", "evidence",
     ])
     && isDeepStrictEqual(document.properties?.pullRequest?.required, [
       "number", "draft", "state", "baseRef", "headRef", "headSha", "url",
@@ -328,7 +487,13 @@ function validRemoteCiSchema(document) {
     ])
     && isDeepStrictEqual(document.properties?.runs?.items?.properties?.jobs?.items?.required, [
       "id", "name", "databaseId", "status", "conclusion", "startedAt", "completedAt",
-    ]);
+    ])
+    && document.properties?.codeqlAggregate?.properties?.annotationsCount?.const === 0
+    && document.properties?.codeqlAggregate?.properties?.appSlug?.const
+      === "github-advanced-security"
+    && document.properties?.signedOutUiArtifact?.properties?.expired?.const === false
+    && document.properties?.signedOutUiArtifact?.properties?.digest?.pattern
+      === "^sha256:[a-f0-9]{64}$";
 }
 
 function verifyQualityManifestEntrypoints(manifest, errors) {

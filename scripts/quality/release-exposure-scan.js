@@ -51,7 +51,7 @@ const {
 } = require("./verify-handoff");
 
 const RELEASE_EXPOSURE_RESULT = ".quality/secrets/release.json";
-const LIVE_ATTESTATION = "internal_docs/quality/live-qualification.json";
+const LIVE_ATTESTATION = "internal_docs/quality/current-candidate-acceptance.json";
 const OUTPUT_ROOT = ".quality/secrets";
 const GENERATED_EVIDENCE_ROOT = ".quality";
 const GENERATED_EVIDENCE_BOUNDARY = "immutable-pre-acceptance-v1";

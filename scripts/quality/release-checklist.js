@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const { isDeepStrictEqual } = require("util");
 const {
   ROOT,
   readJson,
@@ -43,8 +44,28 @@ const {
   AUTHENTICATED_EXPOSURE_RESULT,
   validateAuthenticatedExposureProof,
 } = require("./authenticated-exposure-scan");
+const {
+  buildTargetPolicy,
+  evaluateAcceptance,
+  policyFingerprint,
+  reconcileWorkflowRow,
+  validLaneCapture,
+} = require("./readiness-acceptance");
+const {
+  artifactIdentityFromCandidateBinding,
+  validateCandidateLaneStore,
+} = require("./candidate-lanes");
+const { buildReceipt: buildRemoteCiReceipt } = require("./collect-remote-ci");
+const { verifyStagedBundleMatchesArchive } = require("./remote-signed-out-artifact");
 
-const DEFAULT_INPUT = "internal_docs/quality/live-qualification.json";
+const DEFAULT_INPUT = "internal_docs/quality/current-candidate-acceptance.json";
+const HISTORICAL_INPUT = "internal_docs/quality/live-qualification.json";
+const READINESS_POLICY_PATH = "quality/readiness-policy.json";
+const CANDIDATE_LANE_STORE_PATH = "internal_docs/quality/current-candidate-lanes.json";
+const REMOTE_CI_PATH = "internal_docs/quality/remote-ci.json";
+const REMOTE_CI_API_PATH = "internal_docs/quality/remote-ci-api.json";
+const REMOTE_SIGNED_OUT_ARCHIVE = ".quality/remote-ci/signed-out-ui.zip";
+const REMOTE_SIGNED_OUT_BUNDLE = ".quality/remote-ci/signed-out-ui";
 const DEFAULT_OUTPUT = ".quality/gates/live-qualification-status.json";
 const DEFAULT_FINDINGS = "internal_docs/quality/findings.jsonl";
 const DEFAULT_AUTHENTICATED_RECEIPT = ".quality/qualification/authenticated-ci.json";
@@ -63,6 +84,7 @@ const OUTCOME_DISPOSITIONS = new Set([
   "partial-evidence",
   "blocked-by-defect",
   "not-authorized",
+  "not-observable-with-current-fixtures",
   "external-precondition",
   "not-executed",
 ]);
@@ -88,6 +110,478 @@ function requiredLiveWorkflowIds(workflowsDocument) {
   return uniqueSorted((workflowsDocument?.workflows || [])
     .filter(workflow => workflow.liveFixture?.required === true)
     .map(workflow => workflow.id));
+}
+
+function validateCandidateLaneStoreBoundary(value, candidate, errors, context) {
+  if (!isPlainObject(value)
+    || Object.keys(value).sort().join(",") !== "fingerprint,heads,path,sha256"
+    || value.path !== CANDIDATE_LANE_STORE_PATH
+    || !/^[a-f0-9]{64}$/u.test(value.sha256 || "")
+    || !/^[a-f0-9]{64}$/u.test(value.fingerprint || "")
+    || !isPlainObject(value.heads)) {
+    errors.push("Target-bound candidate lane store anchor is invalid.");
+    return null;
+  }
+  try {
+    const proof = loadQualificationProof(
+      context.root,
+      value.path,
+      "internal_docs/quality",
+      context,
+    );
+    if (!proof || proof.sha256 !== value.sha256) {
+      throw new Error("Candidate lane store bytes do not match their independent anchor.");
+    }
+    const summary = validateCandidateLaneStore(proof.document, {
+      expectedArtifactIdentity: artifactIdentityFromCandidateBinding(candidate),
+      expectedHeads: value.heads,
+      expectedFingerprint: value.fingerprint,
+    });
+    for (const receipt of Object.values(proof.document.receipts || {})) {
+      for (const reference of receipt?.evidence || []) {
+        const target = resolveExistingRepositoryFile(reference.path, context.root, {
+          subtree: reference.path.startsWith(".quality/") ? ".quality" : "internal_docs/quality",
+        });
+        const actual = digestStableSingleLinkFile(target, {
+          errorMessage: "Candidate lane evidence is unsafe or changed.",
+          fileSystem: context.fileSystem,
+          maximumBytes: EVIDENCE_MAX_BYTES,
+          minimumBytes: 1,
+        }).sha256;
+        if (actual !== reference.sha256) {
+          throw new Error("Candidate lane evidence bytes do not match their receipt.");
+        }
+      }
+    }
+    return summary;
+  } catch (error) {
+    errors.push(`Target-bound candidate lane store is invalid: ${error.message}`);
+    return null;
+  }
+}
+
+function validatedRemoteCiAuthority(root, source, options = {}) {
+  try {
+    const receiptProof = loadQualificationProof(root, REMOTE_CI_PATH, "internal_docs/quality", options);
+    const apiProof = loadQualificationProof(root, REMOTE_CI_API_PATH, "internal_docs/quality", options);
+    const receipt = receiptProof?.document;
+    if (!receipt || !apiProof
+      || receipt.evidence?.path !== REMOTE_CI_API_PATH
+      || receipt.evidence?.sha256 !== apiProof.sha256) {
+      return { laneStatuses: {}, signedOutCandidate: null };
+    }
+    const runIds = (receipt.runs || []).map(run => run?.runId);
+    const rebuilt = buildRemoteCiReceipt(
+      apiProof.document,
+      source,
+      receipt.branch,
+      receipt.pullRequest?.number,
+      runIds,
+    );
+    rebuilt.evidence = receipt.evidence;
+    if (!isDeepStrictEqual(rebuilt, receipt)) {
+      return { laneStatuses: {}, signedOutCandidate: null };
+    }
+    let signedOutCandidate = null;
+    try {
+      const archive = resolveExistingRepositoryFile(REMOTE_SIGNED_OUT_ARCHIVE, root, {
+        subtree: ".quality/remote-ci",
+      });
+      const expectedMemberDigests = verifyStagedBundleMatchesArchive({
+        archivePath: archive,
+        bundleRoot: path.join(root, REMOTE_SIGNED_OUT_BUNDLE),
+        expectedDigest: receipt.signedOutUiArtifact?.digest,
+        fileSystem: options.fileSystem,
+      });
+      const { verifyDetachedSignedOutUiBundle } = require("./verify-ui-evidence");
+      const verified = verifyDetachedSignedOutUiBundle({
+        bundleRoot: path.join(root, REMOTE_SIGNED_OUT_BUNDLE),
+        contractRoot: root,
+        expectedMemberDigests,
+        expectedSourceSha: source.sha,
+      });
+      signedOutCandidate = verified.candidate;
+    } catch {
+      signedOutCandidate = null;
+    }
+    return {
+      laneStatuses: { "remote-ci": "passed", codeql: "passed" },
+      signedOutCandidate,
+    };
+  } catch {
+    return { laneStatuses: {}, signedOutCandidate: null };
+  }
+}
+
+function evaluateTargetBoundAcceptance(options) {
+  const {
+    attestationFingerprint,
+    document,
+    findingsState,
+    inputPath,
+    source,
+    validationContext: context,
+    workflows,
+  } = options;
+  const errors = [];
+  const exactKeys = [
+    "authenticatedAcceptance", "candidate", "candidateLaneStore", "checklistConfirmed", "completedAt", "evidence",
+    "findingsFingerprint", "historicalEvidence", "independentReview", "lanes",
+    "openNonBlockingRiskCount", "openReleaseBlockerCount", "operatorId", "readinessTarget",
+    "schemaVersion", "source", "status", "summary", "targetPolicy", "verdict",
+    "visibleEnabledActions", "workflowResults",
+  ];
+  if (!isPlainObject(document)
+    || JSON.stringify(Object.keys(document).sort()) !== JSON.stringify(exactKeys)) {
+    errors.push("Target-bound acceptance fields do not match schemaVersion 7.");
+  }
+  if (document.schemaVersion !== 7) errors.push("Target-bound acceptance schemaVersion must be 7.");
+  if (document.readinessTarget !== "team-test" && document.readinessTarget !== "release") {
+    errors.push("Target-bound acceptance has an invalid readiness target.");
+  }
+  if (!isPlainObject(document.source)
+    || Object.keys(document.source).sort().join(",") !== "fingerprint,sha"
+    || document.source.sha !== source.sha
+    || document.source.fingerprint !== source.fingerprint) {
+    errors.push("Target-bound acceptance does not bind the current source identity.");
+  }
+  const trackedPolicy = readJson(READINESS_POLICY_PATH, context.root);
+  const trackedPolicyFingerprint = policyFingerprint(trackedPolicy);
+  if (!isPlainObject(document.targetPolicy)
+    || Object.keys(document.targetPolicy).sort().join(",") !== "path,sha256"
+    || document.targetPolicy.path !== READINESS_POLICY_PATH
+    || document.targetPolicy.sha256 !== trackedPolicyFingerprint) {
+    errors.push("Target-bound acceptance does not bind the tracked readiness policy.");
+  }
+  let targetPolicy = null;
+  try {
+    targetPolicy = buildTargetPolicy(trackedPolicy, workflows, document.readinessTarget);
+  } catch (error) {
+    errors.push(error.message);
+  }
+
+  let candidate = null;
+  let candidateCapturedAt = null;
+  try {
+    if (!context.liveCandidateReceipt || !context.liveCandidateArtifactPath) {
+      throw new Error("Dedicated current-candidate receipt or VSIX proof is missing.");
+    }
+    candidate = candidateBindingFromReceipt(context.liveCandidateReceipt, {
+      root: context.root,
+      source,
+      artifactPath: context.liveCandidateArtifactPath,
+      fileSystem: context.fileSystem,
+      repositoryState: context.repositoryState,
+      homeDirectory: context.qualificationHomeDirectory,
+    });
+    if (candidate.profileMode !== "local") {
+      throw new Error("Current-candidate acceptance requires the dedicated local profile.");
+    }
+    validateCandidateBinding(document.candidate, candidate);
+    validateCandidateCaptureWindow(context.liveCandidateReceipt, document);
+    candidateCapturedAt = Date.parse(context.liveCandidateReceipt.capturedAt);
+  } catch (error) {
+    errors.push(`Target-bound candidate proof is invalid: ${error.message}`);
+  }
+  const candidateLaneStore = candidate
+    ? validateCandidateLaneStoreBoundary(document.candidateLaneStore, candidate, errors, context)
+    : null;
+  const candidateLanes = new Map((candidateLaneStore?.lanes || []).map(lane => [lane.lane, lane]));
+
+  const completedAt = validateTimestamp(
+    document.completedAt,
+    "Target-bound acceptance completion",
+    errors,
+    { now: context.nowMs },
+  );
+  if (Number.isFinite(completedAt)
+    && context.nowMs - completedAt > MAX_QUALIFICATION_AGE_MS) {
+    errors.push("Target-bound acceptance is older than the 24-hour readiness window.");
+  }
+  const evidenceNotBefore = Number.isFinite(completedAt)
+    ? completedAt - MAX_QUALIFICATION_AGE_MS
+    : null;
+  const evidencePaths = validateEvidenceReferences(
+    document.evidence,
+    "Target-bound acceptance",
+    errors,
+    context,
+    { notAfter: completedAt, notBefore: evidenceNotBefore },
+  );
+  if (!evidencePaths.has(DEFAULT_FINDINGS)) {
+    errors.push("Target-bound acceptance must include the exact findings ledger.");
+  }
+  for (const error of findingsState.errors) errors.push(error);
+  if (document.findingsFingerprint !== findingsState.fingerprint
+    || document.openReleaseBlockerCount !== findingsState.openReleaseBlockerCount
+    || document.openNonBlockingRiskCount !== findingsState.openNonBlockingRiskCount) {
+    errors.push("Target-bound acceptance does not bind the current finding disposition.");
+  }
+
+  const laneInputs = [];
+  const seenLanes = new Set();
+  if (!Array.isArray(document.lanes)) errors.push("Target-bound lanes must be an array.");
+  for (const lane of Array.isArray(document.lanes) ? document.lanes : []) {
+    if (!isPlainObject(lane)
+      || Object.keys(lane).sort().join(",")
+        !== "candidateReceiptFingerprint,evidence,id,status"
+      || seenLanes.has(lane.id)
+      || !["passed", "failed", "blocked", "not-run"].includes(lane.status)) {
+      errors.push(`Target-bound lane ${String(lane?.id)} is invalid or repeated.`);
+      continue;
+    }
+    seenLanes.add(lane.id);
+    const laneEvidence = validateEvidenceReferences(
+      lane.evidence,
+      `Target-bound lane ${lane.id}`,
+      errors,
+      context,
+      { notAfter: completedAt, notBefore: evidenceNotBefore },
+    );
+    for (const evidencePath of laneEvidence) evidencePaths.add(evidencePath);
+    if (lane.id === "candidate-identity"
+      && lane.candidateReceiptFingerprint !== candidate?.receiptFingerprint) {
+      errors.push(`Target-bound lane ${lane.id} does not bind the current candidate receipt.`);
+    }
+    if (!(lane.candidateReceiptFingerprint === null
+      || /^[a-f0-9]{64}$/u.test(lane.candidateReceiptFingerprint || ""))) {
+      errors.push(`Target-bound lane ${lane.id} has an invalid candidate receipt fingerprint.`);
+    }
+    let validated = false;
+    if (lane.id === "candidate-identity") {
+      validated = candidate !== null && lane.status === "passed";
+    } else if (["authenticated-local", "signed-out-packaged-ui"].includes(lane.id)) {
+      const stored = candidateLanes.get(lane.id);
+      const submittedEvidence = (lane.evidence || []).map(reference => ({
+        path: reference.path,
+        sha256: reference.sha256,
+      })).sort((left, right) => left.path.localeCompare(right.path));
+      validated = Boolean(stored)
+        && stored.status === lane.status
+        && stored.executionContext.candidateReceiptFingerprint
+          === lane.candidateReceiptFingerprint
+        && isDeepStrictEqual(stored.evidence, submittedEvidence)
+        && validLaneCapture(stored.capturedAt, document.completedAt);
+      if (validated && lane.id === "authenticated-local") {
+        validated = validLaneCapture(
+          stored.capturedAt,
+          document.completedAt,
+          context.liveCandidateReceipt?.capturedAt || null,
+        );
+      }
+      if (validated && lane.id === "signed-out-packaged-ui") {
+        try {
+          validated = context.remoteSignedOutCandidate !== null
+            && isDeepStrictEqual(
+              artifactIdentityFromCandidateBinding(context.remoteSignedOutCandidate),
+              artifactIdentityFromCandidateBinding(candidate),
+            )
+            && stored.executionContext.candidateReceiptFingerprint
+              === context.remoteSignedOutCandidate.receiptFingerprint;
+        } catch {
+          validated = false;
+        }
+      }
+    } else if (lane.id === "finding-policy") {
+      validated = findingsState.errors.length === 0
+        && document.findingsFingerprint === findingsState.fingerprint
+        && lane.status === "passed";
+    } else {
+      validated = context.validatedLaneStatuses?.[lane.id] === lane.status;
+    }
+    laneInputs.push({ id: lane.id, status: lane.status, validated });
+  }
+
+  const knownWorkflowIds = new Set((workflows?.workflows || []).map(workflow => workflow.id));
+  const workflowInputs = [];
+  const seenWorkflows = new Set();
+  if (!Array.isArray(document.workflowResults)) {
+    errors.push("Target-bound workflow results must be an array.");
+  }
+  for (const result of Array.isArray(document.workflowResults) ? document.workflowResults : []) {
+    if (!isPlainObject(result)
+      || Object.keys(result).sort().join(",")
+        !== "authoritativeOutcomeObserved,candidateProvenance,candidateReceiptFingerprint,id,layerEvidence,outcomeDisposition,status"
+      || !knownWorkflowIds.has(result.id)
+      || seenWorkflows.has(result.id)) {
+      errors.push(`Target-bound workflow ${String(result?.id)} is invalid or repeated.`);
+      continue;
+    }
+    seenWorkflows.add(result.id);
+    if (!WORKFLOW_RESULT_STATUSES.has(result.status)
+      || !CANDIDATE_PROVENANCE_STATUSES.has(result.candidateProvenance)
+      || !OUTCOME_DISPOSITIONS.has(result.outcomeDisposition)
+      || typeof result.authoritativeOutcomeObserved !== "boolean") {
+      errors.push(`Target-bound workflow ${result.id} has invalid outcome semantics.`);
+    }
+    if (result.candidateProvenance === "verified"
+      && result.candidateReceiptFingerprint !== candidate?.receiptFingerprint) {
+      errors.push(`Target-bound workflow ${result.id} does not bind the current candidate receipt.`);
+    }
+    const layerEvidence = [];
+    if (!Array.isArray(result.layerEvidence)) {
+      errors.push(`Target-bound workflow ${result.id} layer evidence must be an array.`);
+    }
+    for (const claim of Array.isArray(result.layerEvidence) ? result.layerEvidence : []) {
+      if (!isPlainObject(claim)
+        || Object.keys(claim).sort().join(",")
+          !== "authoritativeOutcomeObserved,blocker,candidateReceiptFingerprint,disposition,evidence,inheritance,layer,waiverProof") {
+        errors.push(`Target-bound workflow ${result.id} has an invalid layer claim.`);
+        continue;
+      }
+      const claimEvidence = validateEvidenceReferences(
+        claim.evidence,
+        `Target-bound workflow ${result.id} ${String(claim.layer)}`,
+        errors,
+        context,
+        { notAfter: completedAt, notBefore: evidenceNotBefore },
+      );
+      for (const evidencePath of claimEvidence) evidencePaths.add(evidencePath);
+      if (["observed-current", "verified-black-box", "verified-live"].includes(claim.disposition)
+        && claim.candidateReceiptFingerprint !== candidate?.receiptFingerprint) {
+        errors.push(`Target-bound workflow ${result.id} ${claim.layer} is not current-candidate-bound.`);
+      }
+      if (claim.disposition === "observed-historical"
+        && claim.candidateReceiptFingerprint !== null) {
+        errors.push(`Target-bound workflow ${result.id} relabels historical evidence as current.`);
+      }
+      if (claim.disposition === "inherited-unchanged") {
+        errors.push(`Target-bound workflow ${result.id} requires an independently validated inheritance bundle; schema v7 reference-only history is insufficient.`);
+      }
+      if (claim.disposition === "blocked"
+        && !/^[A-Z][A-Z0-9_]{0,63}$/u.test(claim.blocker || "")) {
+        errors.push(`Target-bound workflow ${result.id} has no concrete blocker code.`);
+      }
+      const claimEvidenceItems = Array.isArray(claim.evidence) ? claim.evidence : [];
+      const claimEvidenceHashes = new Set(claimEvidenceItems.map(reference => reference?.sha256));
+      const claimEvidenceCapturedAt = new Map(claimEvidenceItems.map(reference => [
+        reference?.sha256,
+        reference?.capturedAt,
+      ]));
+      if (claim.disposition === "not-authorized"
+        && (claim.candidateReceiptFingerprint !== candidate?.receiptFingerprint
+          || claim.waiverProof?.candidateReceiptFingerprint !== candidate?.receiptFingerprint
+          || !claimEvidenceHashes.has(claim.waiverProof?.preflightEvidenceSha256)
+          || !claimEvidenceHashes.has(claim.waiverProof?.finalConfirmationEvidenceSha256))) {
+        errors.push(`Target-bound workflow ${result.id} not-authorized proof is not current-candidate-bound.`);
+      }
+      if (claim.disposition === "not-observable-with-current-fixtures"
+        && !(claim.waiverProof?.formats || []).every(format => (
+          format?.disposition === "observed-current"
+            ? claim.candidateReceiptFingerprint === candidate?.receiptFingerprint
+              && format.candidateReceiptFingerprint === candidate?.receiptFingerprint
+              && claimEvidenceHashes.has(format.evidenceSha256)
+              && claimEvidenceCapturedAt.get(format.evidenceSha256) === format.capturedAt
+              && Date.parse(format.capturedAt) >= candidateCapturedAt
+            : format?.disposition === "not-observable-with-current-fixtures"
+              ? claimEvidenceHashes.has(format.fixtureInventorySha256)
+                && claimEvidenceCapturedAt.get(format.fixtureInventorySha256)
+                  === format.boundedCaptureAt
+              : false
+        ))) {
+        errors.push(`Target-bound workflow ${result.id} fixture-unavailable proof is not evidence-bound.`);
+      }
+      layerEvidence.push({
+        layer: claim.layer,
+        disposition: claim.disposition,
+        authoritativeOutcomeObserved: claim.authoritativeOutcomeObserved,
+        currentCandidateReceiptFingerprint: claim.candidateReceiptFingerprint,
+        inheritance: claim.inheritance,
+        waiverProof: claim.waiverProof,
+      });
+    }
+    const workflowInput = { id: result.id, layerEvidence };
+    workflowInputs.push(workflowInput);
+    const rule = targetPolicy?.workflowRules?.[result.id];
+    if (rule) errors.push(...reconcileWorkflowRow(
+      { ...result, layerEvidence },
+      rule,
+      candidate?.receiptFingerprint,
+    ));
+  }
+
+  const historicalPaths = validateEvidenceReferences(
+    document.historicalEvidence,
+    "Historical reference-only evidence",
+    errors,
+    context,
+    { notAfter: completedAt },
+  );
+  for (const evidencePath of historicalPaths) evidencePaths.add(evidencePath);
+  if (!historicalPaths.has(HISTORICAL_INPUT)) {
+    errors.push("Target-bound acceptance must retain the historical attestation as reference-only evidence.");
+  }
+
+  validateVisibleActions(
+    document.visibleEnabledActions,
+    errors,
+    context,
+    completedAt,
+    evidenceNotBefore,
+    evidencePaths,
+    candidateCapturedAt,
+  );
+  validateIndependentReview(
+    document.independentReview,
+    document,
+    source,
+    errors,
+    context,
+    completedAt,
+    evidencePaths,
+  );
+  const derived = targetPolicy ? evaluateAcceptance({
+    target: document.readinessTarget,
+    policy: targetPolicy,
+    candidateCapturedAt: context.liveCandidateReceipt?.capturedAt,
+    completedAt: document.completedAt,
+    lanes: laneInputs,
+    workflows: workflowInputs,
+    openReleaseBlockerCount: document.openReleaseBlockerCount,
+    openNonBlockingRiskCount: document.openNonBlockingRiskCount,
+  }) : { status: "failed", verdict: "NOT TEAM-TEST READY", errors: [], gaps: [] };
+  errors.push(...derived.errors);
+  if (document.status !== derived.status) {
+    errors.push(`Target-bound acceptance status must reconcile to ${derived.status}.`);
+  }
+  if (document.verdict !== derived.verdict) {
+    errors.push(`Target-bound acceptance verdict must reconcile to ${derived.verdict}.`);
+  }
+  if (document.authenticatedAcceptance !== (derived.status === "passed")) {
+    errors.push("Target-bound authenticated acceptance does not match the derived result.");
+  }
+  if (document.checklistConfirmed !== true) {
+    errors.push("Target-bound readiness checklist was not explicitly confirmed.");
+  }
+  if (!validIdentity(document.operatorId)) {
+    errors.push("Target-bound acceptance must identify its operator.");
+  }
+  const finalStatus = errors.length > 0 ? "failed" : derived.status;
+  const normalizedMatrix = normalizedWorkflowMatrix(document.workflowResults, requiredLiveWorkflowIds(workflows));
+  return statusDocument({
+    source,
+    inputPath,
+    status: finalStatus,
+    requiredIds: requiredLiveWorkflowIds(workflows),
+    workflowMatrix: normalizedMatrix,
+    passedIds: normalizedMatrix.filter(row => row.status === "PASS").map(row => row.id),
+    errors: uniqueSorted(errors),
+    verdict: finalStatus === "passed" ? derived.verdict : null,
+    authenticatedAcceptance: finalStatus === "passed" ? "recorded" : "not-recorded",
+    findingsState,
+    attestationFingerprint,
+    evidenceManifest: qualificationEvidenceManifest(document),
+    readinessTarget: document.readinessTarget,
+    targetPolicyFingerprint: trackedPolicyFingerprint,
+    candidate,
+    visibleEnabledActions: {
+      status: document.visibleEnabledActions?.status || "not-run",
+      silentNoOpCount: Number.isInteger(document.visibleEnabledActions?.silentNoOpCount)
+        ? document.visibleEnabledActions.silentNoOpCount
+        : null,
+    },
+    reason: finalStatus === "passed" ? null : uniqueSorted([...derived.gaps, ...errors]).join("; "),
+  });
 }
 
 function evaluateLiveQualification(options = {}) {
@@ -122,6 +616,18 @@ function evaluateLiveQualification(options = {}) {
       evidenceManifest,
       reason: "No ignored authenticated live-qualification attestation was supplied.",
       errors: findingsState.errors,
+    });
+  }
+
+  if (document.schemaVersion === 7) {
+    return evaluateTargetBoundAcceptance({
+      ...options,
+      attestationFingerprint,
+      findingsState,
+      inputPath,
+      source,
+      validationContext,
+      workflows,
     });
   }
 
@@ -916,6 +1422,8 @@ function statusDocument(values) {
     },
     reason: values.reason || null,
     errors: values.errors || [],
+    readinessTarget: values.readinessTarget || null,
+    targetPolicyFingerprint: values.targetPolicyFingerprint || null,
   };
 }
 
@@ -972,6 +1480,10 @@ function createValidationContext(options = {}) {
     workflows: options.workflows || null,
     qualificationHomeDirectory: options.qualificationHomeDirectory,
     repositoryState: options.repositoryState || null,
+    validatedLaneStatuses: isPlainObject(options.validatedLaneStatuses)
+      ? { ...options.validatedLaneStatuses }
+      : {},
+    remoteSignedOutCandidate: options.remoteSignedOutCandidate || null,
     findingsState: options.findingsState || readFindingsState(
       options.root || ROOT,
       options.findingsPath || DEFAULT_FINDINGS
@@ -1205,6 +1717,11 @@ function qualificationEvidenceManifest(document) {
   const references = [
     ...(document?.evidence || []),
     ...(document?.workflowResults || []).flatMap(result => result?.evidence || []),
+    ...(document?.workflowResults || []).flatMap(result => (
+      result?.layerEvidence || []
+    )).flatMap(claim => claim?.evidence || []),
+    ...(document?.lanes || []).flatMap(lane => lane?.evidence || []),
+    ...(document?.historicalEvidence || []),
     ...(document?.visibleEnabledActions?.evidence || []),
     ...(document?.independentReview?.evidence || []),
   ];
@@ -1311,6 +1828,7 @@ function loadQualificationProof(
 
 function evaluateDiskLiveQualification(options = {}) {
   const root = options.root || ROOT;
+  const currentSource = options.source || sourceIdentity(root);
   const inputPath = options.inputPath || DEFAULT_INPUT;
   validateInputPath(inputPath);
   const loaded = loadLiveQualification(root, inputPath, options);
@@ -1372,8 +1890,14 @@ function evaluateDiskLiveQualification(options = {}) {
   const repositoryState = loaded
     ? captureRepositoryState(root, spawnSync, process.env)
     : null;
+  const remoteAuthority = loaded
+    ? validatedRemoteCiAuthority(root, currentSource, options)
+    : { laneStatuses: {}, signedOutCandidate: null };
+  const validatedLaneStatuses = loaded
+    ? { ...remoteAuthority.laneStatuses }
+    : {};
   return evaluateLiveQualification({
-    source: options.source || sourceIdentity(root),
+    source: currentSource,
     workflows: options.workflows || readJson("quality/critical-workflows.json", root),
     document: loaded?.document || null,
     attestationFingerprint: loaded?.fingerprint || null,
@@ -1397,6 +1921,8 @@ function evaluateDiskLiveQualification(options = {}) {
     qualificationHomeDirectory: options.qualificationHomeDirectory,
     releaseChecklistOutputProof: options.releaseChecklistOutputProof,
     repositoryState,
+    validatedLaneStatuses,
+    remoteSignedOutCandidate: remoteAuthority.signedOutCandidate,
   });
 }
 

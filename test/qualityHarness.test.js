@@ -93,6 +93,7 @@ const {
 } = require("../scripts/quality/mutation-baseline");
 const { validateMutationToolchain } = require("../scripts/quality/mutation-toolchain");
 const {
+  DEFAULT_INPUT: DEFAULT_LIVE_INPUT,
   attestationReviewDigest,
   evaluateDiskLiveQualification,
   evaluateLiveQualification,
@@ -350,6 +351,8 @@ function validLiveStatus(overrides = {}) {
     status: "passed",
     authenticatedAcceptance: "recorded",
     verdict: "TEAM-TEST READY",
+    readinessTarget: null,
+    targetPolicyFingerprint: null,
     requiredWorkflowIds: [],
     passedWorkflowIds: [],
     missingWorkflowIds: [],
@@ -7122,7 +7125,7 @@ suite("Release checklist and deterministic quality report", () => {
   test("requires fresh disk revalidation before a release report can trust live acceptance", () => {
     const fixtureNow = new Date();
     const fixture = passedLiveAttestation(SOURCE_IDENTITY, fixtureNow);
-    const inputPath = "internal_docs/quality/live-qualification.json";
+    const inputPath = DEFAULT_LIVE_INPUT;
     const workflows = require("../quality/critical-workflows.json");
     const plan = getGatePlan("release");
     try {
@@ -8229,6 +8232,139 @@ suite("Quality contract verifier fixtures", function () {
       mutationBaseline: validTrackedMutationBaseline(),
       mutationBaselineCommitIsAncestor: () => true,
     }).errors, []);
+  });
+
+  test("fingerprints the exact reviewed readiness target policy", () => {
+    const policy = require("../quality/readiness-policy.json");
+    const first = verifyQualityContracts({ root, readinessPolicy: policy });
+    const second = verifyQualityContracts({ root, readinessPolicy: clone(policy) });
+
+    assert.match(first.readinessPolicyFingerprint, /^[a-f0-9]{64}$/u);
+    assert.strictEqual(first.readinessPolicyFingerprint, second.readinessPolicyFingerprint);
+  });
+
+  test("rejects readiness target policy changes that weaken target separation", () => {
+    const cases = [
+      ["makes authenticated CI a TEAM-TEST requirement", policy => {
+        policy.targets["team-test"].requiredLanes.push("authenticated-ci");
+      }],
+      ["removes authenticated CI from release", policy => {
+        policy.targets.release.requiredLanes = policy.targets.release.requiredLanes
+          .filter(lane => lane !== "authenticated-ci");
+      }],
+      ["allows not-authorized at release", policy => {
+        policy.targets.release.allowedWaiverDispositions.push("not-authorized");
+      }],
+      ["extends pull-through waiver to release", policy => {
+        policy.pullThroughNotAuthorized.waiverTargets.push("release");
+      }],
+      ["drops candidate-bound final confirmation", policy => {
+        policy.pullThroughNotAuthorized.candidateBoundFinalConfirmationRequired = false;
+      }],
+      ["turns not-authorized into live satisfaction", policy => {
+        policy.pullThroughNotAuthorized.satisfiesLiveProtocolLayer = true;
+      }],
+      ["turns not-authorized into PASS", policy => {
+        policy.pullThroughNotAuthorized.countsAsPass = true;
+      }],
+      ["counts an authorization gap as product failure", policy => {
+        policy.pullThroughNotAuthorized.productFailure = true;
+      }],
+    ];
+
+    for (const [label, mutate] of cases) {
+      const policy = clone(require("../quality/readiness-policy.json"));
+      mutate(policy);
+      const result = verifyQualityContracts({ root, readinessPolicy: policy });
+      assert.ok(result.errors.includes(
+        "Readiness target policy must match the exact reviewed TEAM-TEST and release contract."
+      ), `${label} was accepted`);
+    }
+  });
+
+  test("rejects fixture-unavailable laundering", () => {
+    const cases = [
+      ["accepts product UI zero results", policy => {
+        policy.fixtureUnavailable.productUiZeroResultSufficient = true;
+      }],
+      ["drops independent fixture proof", policy => {
+        policy.fixtureUnavailable.independentFixtureProofRequired = false;
+      }],
+      ["drops successful service access from fixture proof", policy => {
+        policy.fixtureUnavailable.requiredIndependentProof = policy.fixtureUnavailable
+          .requiredIndependentProof.filter(field => field !== "service-access");
+      }],
+      ["drops authoritative lower-layer proof", policy => {
+        policy.fixtureUnavailable.authoritativeLowerLayerEvidenceRequired = false;
+      }],
+      ["allows one fixture claim to cover every format", policy => {
+        policy.fixtureUnavailable.claimOrFormatSpecific = false;
+      }],
+      ["claims required-layer satisfaction", policy => {
+        policy.fixtureUnavailable.satisfiesRequiredLayer = true;
+      }],
+      ["turns fixture absence into PASS", policy => {
+        policy.fixtureUnavailable.countsAsPass = true;
+      }],
+      ["counts fixture absence as product failure", policy => {
+        policy.fixtureUnavailable.productFailure = true;
+      }],
+      ["extends the fixture waiver to release", policy => {
+        policy.fixtureUnavailable.waiverTargets.push("release");
+      }],
+      ["waives a release-required positive fixture", policy => {
+        policy.fixtureUnavailable
+          .releasePositiveFixtureRequiredWhenLiveProtocolLayerRequired = false;
+      }],
+    ];
+
+    for (const [label, mutate] of cases) {
+      const policy = clone(require("../quality/readiness-policy.json"));
+      mutate(policy);
+      const result = verifyQualityContracts({ root, readinessPolicy: policy });
+      assert.ok(result.errors.includes(
+        "Readiness target policy must match the exact reviewed TEAM-TEST and release contract."
+      ), `${label} was accepted`);
+    }
+  });
+
+  test("rejects policy disposition changes and changes their fingerprint", () => {
+    const original = require("../quality/readiness-policy.json");
+    const policy = clone(original);
+    policy.dispositions.neverCountsAsPass = policy.dispositions.neverCountsAsPass
+      .filter(disposition => disposition !== "not-authorized");
+
+    const baseline = verifyQualityContracts({ root, readinessPolicy: original });
+    const changed = verifyQualityContracts({ root, readinessPolicy: policy });
+
+    assert.notStrictEqual(
+      baseline.readinessPolicyFingerprint,
+      changed.readinessPolicyFingerprint
+    );
+    assert.ok(changed.errors.includes(
+      "Readiness target policy must match the exact reviewed TEAM-TEST and release contract."
+    ));
+  });
+
+  test("requires the readiness policy to remain Git-visible and bound to pull-through", () => {
+    const policy = require("../quality/readiness-policy.json");
+    const repositoryFiles = gitVisibleFiles(root);
+    const hidden = verifyQualityContracts({
+      root,
+      readinessPolicy: policy,
+      repositoryFiles: repositoryFiles.filter(file => file !== "quality/readiness-policy.json"),
+    });
+    assert.ok(hidden.errors.includes(
+      "Readiness target policy must be a Git-visible regular file."
+    ));
+
+    const workflows = clone(require("../quality/critical-workflows.json"));
+    workflows.workflows.find(workflow => workflow.id === "WF-PULL-THROUGH")
+      .requiredLayers = ["contract", "extension-host"];
+    const unbound = verifyQualityContracts({ root, readinessPolicy: policy, workflows });
+    assert.ok(unbound.errors.includes(
+      "Readiness target policy pull-through waiver must remain bound to the destructive live-protocol workflow."
+    ));
   });
 
   test("rejects workflow evidence whose declared layer contradicts its runner inventory", () => {
