@@ -79,6 +79,15 @@ function isAllowedNonHarnessExtensionPath(candidatePath, expectedExtensionsDir, 
     || isWithin(candidatePath, appRoot);
 }
 
+function sameHostPath(left, right, platform = process.platform) {
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  const normalize = value => {
+    const normalized = pathApi.normalize(value);
+    return platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  return normalize(left) === normalize(right);
+}
+
 function deferred() {
   let resolve;
   const promise = new Promise(res => { resolve = res; });
@@ -174,6 +183,22 @@ function installOwnedHostResourceFakes() {
 }
 
 suite("Extension activation smoke", () => {
+  test("host path comparison follows platform identity semantics", () => {
+    assert.strictEqual(
+      sameHostPath(
+        "D:\\a\\cloudsmith-vscode-extension\\test\\harness-extension",
+        "d:\\a\\cloudsmith-vscode-extension\\test\\harness-extension",
+        "win32"
+      ),
+      true
+    );
+    assert.strictEqual(sameHostPath("/workspace/Harness", "/workspace/harness", "linux"), false);
+    assert.strictEqual(
+      sameHostPath("D:\\a\\harness", "d:\\a\\different", "win32"),
+      false
+    );
+  });
+
   test("manually composes production activation in a real host with an in-memory credential boundary", async () => {
     const expectedVersion = process.env.EXPECTED_VSCODE_VERSION;
     assert.match(expectedVersion || "", /^\d+\.\d+\.\d+$/);
@@ -185,12 +210,18 @@ suite("Extension activation smoke", () => {
     assert.ok(harnessExtension, "The credential-free test harness extension was not loaded");
     assert.strictEqual(harnessExtension.isActive, false, "The inert harness must not autoactivate");
     assert.strictEqual(
-      fs.realpathSync(harnessExtension.extensionPath),
-      fs.realpathSync(TEST_HARNESS_ROOT)
+      sameHostPath(
+        fs.realpathSync(harnessExtension.extensionPath),
+        fs.realpathSync(TEST_HARNESS_ROOT)
+      ),
+      true
     );
-    assert.notStrictEqual(
-      fs.realpathSync(harnessExtension.extensionPath),
-      fs.realpathSync(PRODUCT_ROOT)
+    assert.strictEqual(
+      sameHostPath(
+        fs.realpathSync(harnessExtension.extensionPath),
+        fs.realpathSync(PRODUCT_ROOT)
+      ),
+      false
     );
     assert.strictEqual(
       vscode.extensions.getExtension("Cloudsmith.cloudsmith-vsc"),
