@@ -27,6 +27,21 @@ const root = path.resolve(__dirname, "../..");
 const VSCE_ENTRY_EVAL = "require(process.argv[1])(process.argv);";
 const packageCleanupFailures = new WeakSet();
 const WINDOWS_PACKAGE_CLEANUP_RETRIES = 32;
+const PACKAGE_BUILD_STAGES = new Set([
+  "first-build-command",
+  "first-output-receipt",
+  "first-source-integrity",
+  "first-artifact-verification",
+  "second-build-command",
+  "second-output-receipt",
+  "second-source-integrity",
+  "second-artifact-verification",
+  "reproducibility",
+  "artifact-publication",
+  "published-artifact-verification",
+  "github-output",
+  "completion",
+]);
 
 function exactAbsolutePath(value, errorMessage) {
   if (typeof value !== "string" || !path.isAbsolute(value)
@@ -596,6 +611,94 @@ function authenticatePackageNpmRuntime(
   return authenticate(repositoryRoot, undefined, { nodeExecutable });
 }
 
+function capturePackageBuildOutput(directory, outputPath, options = {}) {
+  const fileSystem = options.fileSystem || fs;
+  const platform = options.platform || process.platform;
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  const errorMessage = "Release package output cleanup receipt is unsafe or invalid.";
+  if (typeof directory !== "string" || typeof outputPath !== "string"
+    || !pathApi.isAbsolute(directory) || !pathApi.isAbsolute(outputPath)
+    || pathApi.normalize(directory) !== directory || pathApi.resolve(directory) !== directory
+    || pathApi.normalize(outputPath) !== outputPath || pathApi.resolve(outputPath) !== outputPath
+    || !samePackagePath(pathApi.dirname(outputPath), directory, platform)) {
+    throw new Error(errorMessage);
+  }
+  let before;
+  try {
+    before = fileSystem.lstatSync(outputPath, { bigint: true });
+  } catch (error) {
+    if (packageCleanupErrorCode(error) === "ENOENT") return null;
+    throw new Error(errorMessage);
+  }
+  try {
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1n
+      || !samePackagePath(fileSystem.realpathSync(outputPath), outputPath, platform)) {
+      throw new Error(errorMessage);
+    }
+    const identity = exactFileIdentity(before);
+    const after = fileSystem.lstatSync(outputPath, { bigint: true });
+    if (!sameExactFileIdentity(identity, exactFileIdentity(after))) {
+      throw new Error(errorMessage);
+    }
+    return Object.freeze({
+      identity,
+      kind: "file",
+      name: pathApi.basename(outputPath),
+    });
+  } catch {
+    throw new Error(errorMessage);
+  }
+}
+
+function capturePackageBuildOutputAfterCommand(
+  directory,
+  outputPath,
+  cleanupEntries,
+  commandError = null,
+  options = {},
+) {
+  let receipt = null;
+  let receiptError = null;
+  try {
+    receipt = capturePackageBuildOutput(directory, outputPath, options);
+  } catch (error) {
+    receiptError = error;
+  }
+  if (receipt) cleanupEntries.push(receipt);
+  if (commandError) throw commandError;
+  if (receiptError) throw receiptError;
+  if (!receipt) throw new Error("VSCE packaging did not create its exact output file");
+  return receipt;
+}
+
+function packageBuildError(stage) {
+  const safeStage = PACKAGE_BUILD_STAGES.has(stage) ? stage : "unexpected";
+  return new Error(`Release package build failed [${safeStage}].`);
+}
+
+function settlePackageBuildDirectory(
+  directory,
+  identity,
+  expectedEntries,
+  primaryError = null,
+  stage = "unexpected",
+  options = {},
+) {
+  const remove = options.removePackageBuildDirectory || removePackageBuildDirectory;
+  try {
+    remove(directory, identity, expectedEntries, options.cleanupOptions || {});
+  } catch (cleanupError) {
+    if (!primaryError) throw cleanupError;
+    const safeStage = PACKAGE_BUILD_STAGES.has(stage) ? stage : "unexpected";
+    throw new Error(
+      `Release package build failed and its temporary tree was preserved `
+      + `[${safeStage}:cleanup-refused].`,
+    );
+  }
+  if (primaryError) throw packageBuildError(stage);
+  return true;
+}
+
 async function main() {
   assertCanonicalNodeRuntime(root, process.version);
   const nodeExecutable = assertExactNodeExecutable(process.execPath);
@@ -631,30 +734,49 @@ async function main() {
     TZ: "UTC",
   };
   const buildResults = [];
-  const expectedBuildEntries = [];
+  const cleanupBuildEntries = [];
+  let buildStage = "first-build-command";
+  let primaryError = null;
 
   try {
     const sourceReference = clean ? sourceSha : null;
-    for (const outputPath of [firstPath, secondPath]) {
+    for (const [index, outputPath] of [firstPath, secondPath].entries()) {
+      const ordinal = index === 0 ? "first" : "second";
+      buildStage = `${ordinal}-build-command`;
       const invocation = canonicalVscePackageInvocation(outputPath);
-      run(invocation.command, invocation.arguments_, {
-        environmentOverrides,
-        nodeExecutable,
-        npm,
-        repositoryRoot: root,
-      });
+      let commandError = null;
+      try {
+        run(invocation.command, invocation.arguments_, {
+          environmentOverrides,
+          nodeExecutable,
+          npm,
+          repositoryRoot: root,
+        });
+      } catch (error) {
+        commandError = error;
+      }
+      buildStage = `${ordinal}-output-receipt`;
+      try {
+        capturePackageBuildOutputAfterCommand(
+          tempDirectory,
+          outputPath,
+          cleanupBuildEntries,
+          commandError,
+        );
+      } catch (error) {
+        if (error === commandError) buildStage = `${ordinal}-build-command`;
+        throw error;
+      }
+      buildStage = `${ordinal}-source-integrity`;
       if (requireClean && gitStatus() !== "") {
         throw new Error("VSCE prepublish changed the clean source checkout");
       }
+      buildStage = `${ordinal}-artifact-verification`;
       const verification = await verifyVsix(outputPath, { sourceSha: sourceReference });
       buildResults.push(verification);
-      expectedBuildEntries.push(Object.freeze({
-        identity: verification.artifactIdentity,
-        kind: "file",
-        name: path.basename(outputPath),
-      }));
     }
 
+    buildStage = "reproducibility";
     const [first, second] = buildResults;
     if (first.sha256 !== second.sha256 || !first.buffer.equals(second.buffer)) {
       throw new Error("Two canonical VSIX builds from the same source were not byte-identical");
@@ -685,16 +807,19 @@ async function main() {
       platform: process.platform,
     };
 
+    buildStage = "artifact-publication";
     writeAtomically(outputPath, first.buffer);
     writeAtomically(checksumPath, `${first.sha256}  ${filename}\n`);
     writeAtomically(provenancePath, `${JSON.stringify(provenance, null, 2)}\n`);
 
+    buildStage = "published-artifact-verification";
     const written = await verifyVsix(outputPath, { sourceSha: sourceReference });
     validateSidecars(outputPath, written, {
       expectedSourceSha: sourceSha,
       requirePublishable: releaseBuild,
     });
 
+    buildStage = "github-output";
     const githubOutputIndex = process.argv.indexOf("--github-output");
     if (githubOutputIndex !== -1) {
       const githubOutput = process.argv[githubOutputIndex + 1];
@@ -712,6 +837,7 @@ async function main() {
       );
     }
 
+    buildStage = "completion";
     console.log(
       `Built reproducible ${outputKind} artifact ${path.relative(root, outputPath)} `
       + `(${first.entryCount} entries, sha256 ${first.sha256}).`,
@@ -721,13 +847,16 @@ async function main() {
     } else if (!releaseBuild) {
       console.log("Release mode was not requested; this development artifact is explicitly non-publishable.");
     }
-  } finally {
-    removePackageBuildDirectory(
-      tempDirectory,
-      tempDirectoryIdentity,
-      Object.freeze([...expectedBuildEntries]),
-    );
+  } catch {
+    primaryError = true;
   }
+  settlePackageBuildDirectory(
+    tempDirectory,
+    tempDirectoryIdentity,
+    Object.freeze([...cleanupBuildEntries]),
+    primaryError,
+    buildStage,
+  );
 }
 
 if (require.main === module) {
@@ -739,10 +868,13 @@ if (require.main === module) {
 
 module.exports = {
   authenticatePackageNpmRuntime,
+  capturePackageBuildOutput,
+  capturePackageBuildOutputAfterCommand,
   canonicalVscePackageInvocation,
   packageBuildDirectoryIdentity,
   removePackageBuildDirectory,
   runPackageCommand: run,
+  settlePackageBuildDirectory,
   resolveOutputPath,
   samePackagePath,
 };

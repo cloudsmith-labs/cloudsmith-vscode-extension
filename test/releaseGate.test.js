@@ -21,12 +21,15 @@ const {
 } = require("../scripts/quality/harden-hosted-node-runtime");
 const {
   authenticatePackageNpmRuntime,
+  capturePackageBuildOutput,
+  capturePackageBuildOutputAfterCommand,
   canonicalVscePackageInvocation,
   packageBuildDirectoryIdentity,
   removePackageBuildDirectory,
   resolveOutputPath,
   runPackageCommand,
   samePackagePath,
+  settlePackageBuildDirectory,
 } = require("../scripts/release/package-vsix");
 const {
   scanAcceptedEvidence,
@@ -1472,6 +1475,208 @@ suite("M9 release gate helpers", () => {
     assert.strictEqual(
       samePackagePath("/tmp/Owned-Build", "/tmp/owned-build", "linux"),
       false,
+    );
+  });
+
+  test("release package output cleanup receipt is independent of candidate acceptance", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-output-receipt-",
+    )));
+    const outputPath = path.join(scratch, "partial-candidate.vsix");
+    try {
+      assert.strictEqual(capturePackageBuildOutput(scratch, outputPath), null);
+      fs.writeFileSync(outputPath, "partial unverified bytes\n");
+      const receipt = capturePackageBuildOutput(scratch, outputPath);
+      assert.deepStrictEqual(Object.keys(receipt).sort(), ["identity", "kind", "name"]);
+      assert.strictEqual(receipt.kind, "file");
+      assert.strictEqual(receipt.name, path.basename(outputPath));
+      assert.strictEqual(Object.isFrozen(receipt), true);
+      assert.strictEqual(
+        removePackageBuildDirectory(
+          scratch,
+          packageBuildDirectoryIdentity(scratch),
+          [receipt],
+        ),
+        true,
+      );
+      assert.strictEqual(fs.existsSync(scratch), false);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package output cleanup receipt rejects unsafe entry kinds and hard links", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-output-receipt-unsafe-",
+    )));
+    const outputPath = path.join(scratch, "candidate.vsix");
+    const linkedPath = path.join(scratch, "linked.vsix");
+    try {
+      fs.mkdirSync(outputPath);
+      assert.throws(
+        () => capturePackageBuildOutput(scratch, outputPath),
+        /cleanup receipt is unsafe or invalid/u,
+      );
+      fs.rmdirSync(outputPath);
+      fs.writeFileSync(outputPath, "unaccepted hard-linked bytes\n");
+      fs.linkSync(outputPath, linkedPath);
+      assert.throws(
+        () => capturePackageBuildOutput(scratch, outputPath),
+        /cleanup receipt is unsafe or invalid/u,
+      );
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package output cleanup receipt rejects capture-time replacement", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-output-receipt-replacement-",
+    )));
+    const outputPath = path.join(scratch, "candidate.vsix");
+    const replacementPath = path.join(scratch, "replacement.vsix");
+    fs.writeFileSync(outputPath, "first unaccepted bytes\n");
+    fs.writeFileSync(replacementPath, "second unaccepted bytes\n");
+    const fileSystem = Object.create(fs);
+    let lstatCalls = 0;
+    fileSystem.lstatSync = (target, options) => {
+      lstatCalls += 1;
+      if (lstatCalls === 2) {
+        fs.unlinkSync(outputPath);
+        fs.renameSync(replacementPath, outputPath);
+      }
+      return fs.lstatSync(target, options);
+    };
+    try {
+      assert.throws(
+        () => capturePackageBuildOutput(scratch, outputPath, { fileSystem }),
+        /cleanup receipt is unsafe or invalid/u,
+      );
+      assert.strictEqual(fs.readFileSync(outputPath, "utf8"), "second unaccepted bytes\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package output cleanup receipt rejects noncanonical path spellings", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-output-receipt-path-",
+    )));
+    const outputPath = path.join(scratch, "candidate.vsix");
+    fs.writeFileSync(outputPath, "unaccepted bytes\n");
+    try {
+      assert.throws(
+        () => capturePackageBuildOutput(`${scratch}${path.sep}.`, outputPath),
+        /cleanup receipt is unsafe or invalid/u,
+      );
+      assert.throws(
+        () => capturePackageBuildOutput(
+          scratch,
+          `${scratch}${path.sep}nested${path.sep}..${path.sep}candidate.vsix`,
+        ),
+        /cleanup receipt is unsafe or invalid/u,
+      );
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("failed package command remains primary when its unsafe output cannot be receipted", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-command-unsafe-output-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const outputPath = path.join(ownedRoot, "candidate.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.mkdirSync(outputPath);
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const commandError = new Error("synthetic untrusted command failure");
+    const cleanupEntries = [];
+    try {
+      assert.throws(
+        () => capturePackageBuildOutputAfterCommand(
+          ownedRoot,
+          outputPath,
+          cleanupEntries,
+          commandError,
+        ),
+        error => error === commandError,
+      );
+      assert.deepStrictEqual(cleanupEntries, []);
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => settlePackageBuildDirectory(
+            ownedRoot,
+            identity,
+            cleanupEntries,
+            true,
+            "first-build-command",
+          ),
+          error => {
+            assert.strictEqual(
+              error.message,
+              "Release package build failed and its temporary tree was preserved "
+                + "[first-build-command:cleanup-refused].",
+            );
+            assert.doesNotMatch(error.message, /untrusted/u);
+            return true;
+          },
+        );
+      });
+      assert.strictEqual(fs.lstatSync(path.join(ownedRoot, "candidate.vsix")).isDirectory(), true);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package settlement preserves the fixed primary stage when cleanup succeeds", () => {
+    const primary = new Error("synthetic untrusted primary detail");
+    assert.throws(
+      () => settlePackageBuildDirectory(
+        "/synthetic/owned-build",
+        Object.freeze({}),
+        Object.freeze([]),
+        primary,
+        "first-build-command",
+        { removePackageBuildDirectory() { return true; } },
+      ),
+      error => {
+        assert.strictEqual(error.message, "Release package build failed [first-build-command].");
+        assert.doesNotMatch(error.message, /untrusted/u);
+        return true;
+      },
+    );
+  });
+
+  test("release package settlement reports a fixed stage when cleanup would mask failure", () => {
+    const primary = new Error("synthetic untrusted primary detail");
+    assert.throws(
+      () => settlePackageBuildDirectory(
+        "/synthetic/owned-build",
+        Object.freeze({}),
+        Object.freeze([]),
+        primary,
+        "first-build-command",
+        {
+          removePackageBuildDirectory() {
+            throw new Error("synthetic untrusted cleanup detail");
+          },
+        },
+      ),
+      error => {
+        assert.strictEqual(
+          error.message,
+          "Release package build failed and its temporary tree was preserved "
+            + "[first-build-command:cleanup-refused].",
+        );
+        assert.doesNotMatch(error.message, /untrusted/u);
+        return true;
+      },
     );
   });
 
