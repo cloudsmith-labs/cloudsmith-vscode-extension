@@ -14,6 +14,7 @@ const NON_AUTH_CLEANUP_TAINT_ENV = "CLOUDSMITH_QUALITY_CLEANUP_TAINT";
 const EXACT_CLEANUP_MAX_ENTRIES = 100_000;
 const EXACT_CLEANUP_MAX_DEPTH = 128;
 const EXACT_CLEANUP_MAX_NAME_BYTES = 1024;
+const WINDOWS_EXACT_CLEANUP_RETRIES = 32;
 const NON_AUTH_BOUNDARY_DIRECTORY_PATHS = Object.freeze([
   "home",
   "xdgConfig",
@@ -454,29 +455,108 @@ function assertCleanupEntryAbsent(target, errorMessage) {
   exactCleanupError(errorMessage);
 }
 
-function removeCleanupDirectoryChildren(node, errorMessage) {
-  const names = node.children.map(child => path.basename(child.target)).sort();
+function exactCleanupErrorCode(cause) {
+  let descriptor = null;
+  try {
+    descriptor = cause && (typeof cause === "object" || typeof cause === "function")
+      ? Object.getOwnPropertyDescriptor(cause, "code")
+      : null;
+  } catch {
+    return null;
+  }
+  return descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value")
+    && typeof descriptor.value === "string" && /^[A-Z][A-Z0-9_]{1,23}$/u.test(descriptor.value)
+    ? descriptor.value
+    : null;
+}
+
+function transientExactCleanupError(error, operation) {
+  const code = exactCleanupErrorCode(error);
+  return code === "EPERM" || code === "EBUSY"
+    || (operation === "rmdir" && code === "ENOTEMPTY");
+}
+
+function boundedExactCleanupRetryDelay(attempt) {
+  const milliseconds = Math.min(25 * (2 ** attempt), 800);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function assertCleanupRetryAuthority(node, operation, parent, names, errorMessage) {
+  if (parent) assertCleanupDirectory(parent, names, errorMessage);
+  if (operation === "rmdir") {
+    assertCleanupDirectory(node, [], errorMessage);
+  } else {
+    assertCleanupEntry(node, errorMessage);
+  }
+}
+
+function runExactCleanupOperation(node, operation, parent, names, options, errorMessage) {
+  const platform = options.platform || process.platform;
+  const maximumRetries = platform === "win32" ? WINDOWS_EXACT_CLEANUP_RETRIES : 0;
+  const retryDelay = options.retryDelay || boundedExactCleanupRetryDelay;
+  const operations = options.operations || fs;
+  const retryState = options.retryState;
+  if (!retryState || !Number.isSafeInteger(retryState.retries)
+    || retryState.retries < 0 || retryState.retries > maximumRetries) {
+    return exactCleanupError(errorMessage);
+  }
+  let attempt = 0;
+  while (true) {
+    assertCleanupRetryAuthority(node, operation, parent, names, errorMessage);
+    try {
+      operations[`${operation}Sync`](node.target);
+      return;
+    } catch (error) {
+      if (attempt >= maximumRetries || retryState.retries >= maximumRetries
+        || !transientExactCleanupError(error, operation)) {
+        return exactCleanupError(errorMessage);
+      }
+      assertCleanupRetryAuthority(node, operation, parent, names, errorMessage);
+      retryState.retries += 1;
+      retryDelay(attempt);
+      assertCleanupRetryAuthority(node, operation, parent, names, errorMessage);
+      attempt += 1;
+    }
+  }
+}
+
+function removeCleanupDirectoryChildren(node, errorMessage, options) {
+  let names = node.children.map(child => path.basename(child.target)).sort();
   assertCleanupDirectory(node, names, errorMessage);
   for (const child of node.children) {
-    assertCleanupEntry(node, errorMessage);
-    removeCleanupSnapshot(child, errorMessage);
-    assertCleanupEntry(node, errorMessage);
+    assertCleanupDirectory(node, names, errorMessage);
+    removeCleanupSnapshot(child, errorMessage, options, node, names);
+    names = names.filter(name => name !== path.basename(child.target));
+    assertCleanupDirectory(node, names, errorMessage);
   }
   assertCleanupDirectory(node, [], errorMessage);
 }
 
-function removeCleanupSnapshot(node, errorMessage) {
+function removeCleanupSnapshot(node, errorMessage, options, parent = null, parentNames = []) {
   if (node.kind !== "directory") {
-    assertCleanupEntry(node, errorMessage);
-    fs.unlinkSync(node.target);
+    runExactCleanupOperation(
+      node,
+      "unlink",
+      parent,
+      parentNames,
+      options,
+      errorMessage,
+    );
     assertCleanupEntryAbsent(node.target, errorMessage);
     return;
   }
 
-  removeCleanupDirectoryChildren(node, errorMessage);
+  removeCleanupDirectoryChildren(node, errorMessage, options);
   // This must stay nonrecursive: a replacement after the final identity check
   // can make rmdir fail, but can never redirect cleanup into a nonempty tree.
-  fs.rmdirSync(node.target);
+  runExactCleanupOperation(
+    node,
+    "rmdir",
+    parent,
+    parentNames,
+    options,
+    errorMessage,
+  );
   assertCleanupEntryAbsent(node.target, errorMessage);
 }
 
@@ -512,9 +592,10 @@ function snapshotExactOwnedTree(root, options, errorMessage) {
 function emptyExactOwnedDirectory(root, options = {}) {
   const errorMessage = options.errorMessage || "Exact cleanup refused an unsafe or changed tree.";
   try {
-    const snapshot = snapshotExactOwnedTree(root, options, errorMessage);
+    const operationOptions = { ...options, retryState: { retries: 0 } };
+    const snapshot = snapshotExactOwnedTree(root, operationOptions, errorMessage);
     if (snapshot.kind !== "directory") exactCleanupError(errorMessage);
-    removeCleanupDirectoryChildren(snapshot, errorMessage);
+    removeCleanupDirectoryChildren(snapshot, errorMessage, operationOptions);
     return true;
   } catch {
     if (typeof root === "string" && path.isAbsolute(root)
@@ -529,8 +610,9 @@ function emptyExactOwnedDirectory(root, options = {}) {
 function removeExactOwnedDirectoryTree(root, options = {}) {
   const errorMessage = options.errorMessage || "Exact cleanup refused an unsafe or changed tree.";
   try {
-    const snapshot = snapshotExactOwnedTree(root, options, errorMessage);
-    removeCleanupSnapshot(snapshot, errorMessage);
+    const operationOptions = { ...options, retryState: { retries: 0 } };
+    const snapshot = snapshotExactOwnedTree(root, operationOptions, errorMessage);
+    removeCleanupSnapshot(snapshot, errorMessage, operationOptions);
     return true;
   } catch {
     if (typeof root === "string" && path.isAbsolute(root)

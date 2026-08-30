@@ -2729,6 +2729,7 @@ suite("Quality gate runner", () => {
     const rootIdentity = fs.lstatSync(root);
     const originalRmdir = fs.rmdirSync;
     let injected = false;
+    let retryDelays = 0;
     try {
       fs.rmdirSync = function injectEntryAtFinalRemoval(target, options) {
         if (!injected && target === root) {
@@ -2743,6 +2744,8 @@ suite("Quality gate runner", () => {
             errorMessage: "Synthetic exact cleanup rejected tree drift.",
             expectedRootEntries: [],
             expectedRootIdentity: rootIdentity,
+            platform: "win32",
+            retryDelay: () => { retryDelays += 1; },
           }),
           /rejected tree drift/u,
         );
@@ -2752,6 +2755,7 @@ suite("Quality gate runner", () => {
     }
     try {
       assert.strictEqual(injected, true);
+      assert.strictEqual(retryDelays, 0);
       assert.strictEqual(
         fs.readFileSync(path.join(root, "late-entry"), "utf8"),
         "synthetic late bytes\n",
@@ -2785,6 +2789,227 @@ suite("Quality gate runner", () => {
       assert.strictEqual(fs.readFileSync(outside, "utf8"), "synthetic hard-link bytes\n");
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("entry-bounded cleanup retries transient Windows file and directory locks", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-exact-cleanup-windows-retry-",
+    )));
+    const root = path.join(scratch, "owned-root");
+    const target = path.join(root, "owned-file");
+    fs.mkdirSync(root, { mode: 0o700 });
+    fs.writeFileSync(target, "synthetic owned bytes\n");
+    const originalUnlink = fs.unlinkSync.bind(fs);
+    const originalRmdir = fs.rmdirSync.bind(fs);
+    let unlinkAttempts = 0;
+    let rmdirAttempts = 0;
+    try {
+      assert.strictEqual(removeExactOwnedDirectoryTree(root, {
+        allowAdditionalRootEntries: true,
+        errorMessage: "Synthetic Windows exact cleanup refused.",
+        expectedRootEntries: [],
+        expectedRootIdentity: fs.lstatSync(root),
+        operations: {
+          unlinkSync(value) {
+            unlinkAttempts += 1;
+            if (unlinkAttempts === 1) {
+              const error = new Error("synthetic transient unlink refusal");
+              error.code = "EBUSY";
+              throw error;
+            }
+            return originalUnlink(value);
+          },
+          rmdirSync(value) {
+            rmdirAttempts += 1;
+            if (rmdirAttempts === 1) {
+              const error = new Error("synthetic transient rmdir refusal");
+              error.code = "ENOTEMPTY";
+              throw error;
+            }
+            return originalRmdir(value);
+          },
+        },
+        platform: "win32",
+        retryDelay: () => {},
+      }), true);
+      assert.strictEqual(unlinkAttempts, 2);
+      assert.strictEqual(rmdirAttempts, 2);
+      assert.strictEqual(fs.existsSync(root), false);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("entry-bounded Windows retry rejects a replaced locked file", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-exact-cleanup-windows-replacement-",
+    )));
+    const root = path.join(scratch, "owned-root");
+    const target = path.join(root, "owned-file");
+    fs.mkdirSync(root, { mode: 0o700 });
+    fs.writeFileSync(target, "original owned bytes\n");
+    let attempts = 0;
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removeExactOwnedDirectoryTree(root, {
+          allowAdditionalRootEntries: true,
+          errorMessage: "Synthetic Windows exact cleanup rejected replacement.",
+          expectedRootEntries: [],
+          expectedRootIdentity: fs.lstatSync(root),
+          operations: {
+            unlinkSync() {
+              attempts += 1;
+              const error = new Error("synthetic transient unlink refusal");
+              error.code = "EBUSY";
+              throw error;
+            },
+            rmdirSync: fs.rmdirSync.bind(fs),
+          },
+          platform: "win32",
+          retryDelay() {
+            fs.unlinkSync(target);
+            fs.writeFileSync(target, "replacement survives\n");
+          },
+        }), /rejected replacement/u);
+      });
+      assert.strictEqual(attempts, 1);
+      assert.strictEqual(fs.readFileSync(target, "utf8"), "replacement survives\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("entry-bounded Windows cleanup exhausts exactly one shared retry budget", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-exact-cleanup-windows-exhaustion-",
+    )));
+    const root = path.join(scratch, "owned-root");
+    const target = path.join(root, "owned-file");
+    fs.mkdirSync(root, { mode: 0o700 });
+    fs.writeFileSync(target, "locked bytes survive\n");
+    let attempts = 0;
+    let delays = 0;
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removeExactOwnedDirectoryTree(root, {
+          allowAdditionalRootEntries: true,
+          errorMessage: "Synthetic Windows exact cleanup exhausted retries.",
+          expectedRootEntries: [],
+          expectedRootIdentity: fs.lstatSync(root),
+          operations: {
+            unlinkSync() {
+              attempts += 1;
+              const error = new Error("synthetic persistent lock");
+              error.code = "EBUSY";
+              throw error;
+            },
+            rmdirSync: fs.rmdirSync.bind(fs),
+          },
+          platform: "win32",
+          retryDelay: () => { delays += 1; },
+        }), /exhausted retries/u);
+      });
+      assert.strictEqual(attempts, 33);
+      assert.strictEqual(delays, 32);
+      assert.strictEqual(fs.readFileSync(target, "utf8"), "locked bytes survive\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("entry-bounded Windows retries share one budget across partial deletion", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "cloudsmith-exact-cleanup-windows-shared-budget-",
+    )));
+    const root = path.join(scratch, "owned-root");
+    const first = path.join(root, "a-first");
+    const second = path.join(root, "b-second");
+    fs.mkdirSync(root, { mode: 0o700 });
+    fs.writeFileSync(first, "first owned bytes\n");
+    fs.writeFileSync(second, "second locked bytes\n");
+    const originalUnlink = fs.unlinkSync.bind(fs);
+    const attempts = new Map([[first, 0], [second, 0]]);
+    let delays = 0;
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removeExactOwnedDirectoryTree(root, {
+          allowAdditionalRootEntries: true,
+          errorMessage: "Synthetic Windows shared cleanup budget exhausted.",
+          expectedRootEntries: [],
+          expectedRootIdentity: fs.lstatSync(root),
+          operations: {
+            unlinkSync(target) {
+              const attempt = attempts.get(target) + 1;
+              attempts.set(target, attempt);
+              if (target === first && attempt > 20) return originalUnlink(target);
+              const error = new Error("synthetic distributed lock");
+              error.code = "EBUSY";
+              throw error;
+            },
+            rmdirSync: fs.rmdirSync.bind(fs),
+          },
+          platform: "win32",
+          retryDelay: () => { delays += 1; },
+        }), /shared cleanup budget exhausted/u);
+      });
+      assert.strictEqual(attempts.get(first), 21);
+      assert.strictEqual(attempts.get(second), 13);
+      assert.strictEqual(delays, 32);
+      assert.strictEqual(fs.existsSync(first), false);
+      assert.strictEqual(fs.readFileSync(second, "utf8"), "second locked bytes\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("entry-bounded cleanup never retries untrusted failures or trusts a no-op", () => {
+    for (const scenario of [
+      { code: "EACCES", platform: "win32" },
+      { code: "EBUSY", platform: "linux" },
+      { code: null, platform: "win32" },
+    ]) {
+      const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+        os.tmpdir(),
+        "cloudsmith-exact-cleanup-no-false-green-",
+      )));
+      const root = path.join(scratch, "owned-root");
+      const target = path.join(root, "owned-file");
+      fs.mkdirSync(root, { mode: 0o700 });
+      fs.writeFileSync(target, "must survive refusal\n");
+      let attempts = 0;
+      let delays = 0;
+      try {
+        withExpectedCleanupTaint(() => {
+          assert.throws(() => removeExactOwnedDirectoryTree(root, {
+            allowAdditionalRootEntries: true,
+            errorMessage: "Synthetic exact cleanup stayed fail closed.",
+            expectedRootEntries: [],
+            expectedRootIdentity: fs.lstatSync(root),
+            operations: {
+              unlinkSync() {
+                attempts += 1;
+                if (scenario.code === null) return;
+                const error = new Error("synthetic refusal");
+                error.code = scenario.code;
+                throw error;
+              },
+              rmdirSync: fs.rmdirSync.bind(fs),
+            },
+            platform: scenario.platform,
+            retryDelay: () => { delays += 1; },
+          }), /stayed fail closed/u);
+        });
+        assert.strictEqual(attempts, 1);
+        assert.strictEqual(delays, 0);
+        assert.strictEqual(fs.readFileSync(target, "utf8"), "must survive refusal\n");
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
     }
   });
 
