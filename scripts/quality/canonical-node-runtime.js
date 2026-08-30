@@ -836,7 +836,7 @@ function withCanonicalNpmLauncher(options, callback) {
   try {
     directory = fs.mkdtempSync(path.join(temporaryParent, "cloudsmith-npm-launcher-"));
     directory = fs.realpathSync(directory);
-    if (path.dirname(directory) !== temporaryParent
+    if (!sameFilesystemPath(path.dirname(directory), temporaryParent, platform)
       || !path.basename(directory).startsWith("cloudsmith-npm-launcher-")) {
       throw new Error(NPM_LAUNCHER_ERROR);
     }
@@ -867,7 +867,7 @@ function withCanonicalNpmLauncher(options, callback) {
       const stat = fs.lstatSync(target, { bigint: true });
       if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1n
         || stat.size !== BigInt(Buffer.byteLength(source))
-        || fs.realpathSync(target) !== target
+        || !sameFilesystemPath(fs.realpathSync(target), target, platform)
         || (typeof process.getuid === "function" && stat.uid !== BigInt(process.getuid()))
         || (process.platform !== "win32" && (stat.mode & 0o077n) !== 0n)) {
         throw new Error(NPM_LAUNCHER_ERROR);
@@ -938,5 +938,6 @@ module.exports = {
   assertNoNpmToolchainShadowing,
   canonicalToolchainEnvironment,
   npmInstallationFingerprint,
+  sameFilesystemPath,
   withCanonicalNpmLauncher,
 };

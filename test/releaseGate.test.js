@@ -13,6 +13,7 @@ const {
   assertExactNodeExecutable,
   canonicalToolchainEnvironment,
   npmInstallationFingerprint,
+  sameFilesystemPath,
   withCanonicalNpmLauncher,
 } = require("../scripts/quality/canonical-node-runtime");
 const {
@@ -1347,6 +1348,21 @@ suite("M9 release gate helpers", () => {
         assert.strictEqual(fs.existsSync(launcherDirectory), false);
       });
     }
+  });
+
+  test("canonical npm launcher path identity follows host filesystem semantics", () => {
+    assert.strictEqual(
+      sameFilesystemPath("D:\\a\\_temp\\Launcher", "d:\\a\\_temp\\launcher", "win32"),
+      true,
+    );
+    assert.strictEqual(
+      sameFilesystemPath("D:\\a\\_temp\\Launcher", "D:\\a\\_temp\\different", "win32"),
+      false,
+    );
+    assert.strictEqual(
+      sameFilesystemPath("/tmp/Launcher", "/tmp/launcher", "linux"),
+      false,
+    );
   });
 
   test("canonical toolchain environment rejects Windows PATH key collisions", () => {
