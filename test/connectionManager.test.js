@@ -11,7 +11,11 @@ const {
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { FakeSecretStorage } = require("./helpers/fakeSecretStorage");
-const { decodeStoredCredential } = require("../util/credentialEnvelope");
+const {
+  createSSOCredential,
+  decodeStoredCredential,
+  serializeCredential,
+} = require("../util/credentialEnvelope");
 
 function assertStoredAPIKey(stored, expected) {
   const decoded = decodeStoredCredential(stored);
@@ -452,6 +456,57 @@ suite("ConnectionManager Test Suite", () => {
     assert.strictEqual(connectivity, "error");
     assert.strictEqual(manager._lastError, undefined);
     assert.strictEqual(JSON.stringify(manager.getState()).includes(secret), false);
+  });
+
+  test("authentication recovery copy is exact and credential-neutral for API key, SSO, and unknown failures", async () => {
+    const ssoCredential = serializeCredential(createSSOCredential(
+      "access-token",
+      "refresh-token",
+      { credentialId: "a".repeat(32) }
+    ));
+    const cases = [
+      {
+        label: "API key",
+        stored: "stored-key",
+        kind: "unauthorized",
+        expected: "Authentication failed. Sign in again or verify the configured credential.",
+      },
+      {
+        label: "SSO",
+        stored: ssoCredential,
+        kind: "unauthorized",
+        expected: "Authentication failed. Sign in again or verify the configured credential.",
+        options: {
+          protocolClient: {
+            async refresh() { return { ok: false, kind: "network_error" }; },
+          },
+        },
+      },
+      {
+        label: "unknown",
+        stored: "stored-key",
+        kind: "future_auth_failure",
+        expected: "Could not validate the credential.",
+      },
+    ];
+
+    for (const scenario of cases) {
+      const { manager } = createHarness(
+        scenario.stored,
+        async () => apiFailure(
+          scenario.kind,
+          { message: "unsafe upstream authentication detail" }
+        ),
+        scenario.options
+      );
+
+      const result = await manager.initialize();
+
+      assert.strictEqual(result.ok, false, scenario.label);
+      assert.strictEqual(result.error.message, scenario.expected, scenario.label);
+      assert.doesNotMatch(result.error.message, /API key/i, scenario.label);
+      await manager.dispose();
+    }
   });
 
   test("an external deletion during an internal store remains authoritative", async () => {

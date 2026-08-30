@@ -73,6 +73,17 @@ function validateLockfile(lockfile) {
   }
 }
 
+function rejectedFixKey(value) {
+  return value && typeof value === "object"
+    ? `${value.name}\0${value.version}\0${String(value.isSemVerMajor)}`
+    : null;
+}
+
+function rejectedFixesFor(exception) {
+  if (Array.isArray(exception.rejectedFixes)) return exception.rejectedFixes;
+  return exception.rejectedFix ? [exception.rejectedFix] : [];
+}
+
 function validateException(exception, advisory, fixAvailable, now) {
   const id = advisoryId(advisory);
   if (exception.package !== advisory.name || exception.severity !== advisory.severity) {
@@ -86,22 +97,31 @@ function validateException(exception, advisory, fixAvailable, now) {
   if (!Number.isFinite(reviewed) || !Number.isFinite(expires) || expires <= now.getTime()) {
     throw new Error(`Audit exception ${id} is invalid or expired`);
   }
+  if (reviewed > now.getTime()) {
+    throw new Error(`Audit exception ${id} has a future review date`);
+  }
   if (expires - reviewed > 90 * 24 * 60 * 60 * 1000) {
     throw new Error(`Audit exception ${id} exceeds the 90-day review limit`);
   }
   if (fixAvailable) {
-    if (fixAvailable === true || !exception.rejectedFix) {
+    if (fixAvailable === true) {
       throw new Error(`Audit exception ${id} has a supported or unreviewed fix path`);
     }
-    for (const field of ["name", "version", "isSemVerMajor"]) {
-      if (exception.rejectedFix[field] !== fixAvailable[field]) {
-        throw new Error(`Audit exception ${id} rejected-fix metadata drifted`);
-      }
+    const key = rejectedFixKey(fixAvailable);
+    const rejectedFix = rejectedFixesFor(exception)
+      .find(candidate => rejectedFixKey(candidate) === key);
+    if (!rejectedFix) {
+      throw new Error(`Audit exception ${id} rejected-fix metadata drifted`);
     }
-    if (!fixAvailable.isSemVerMajor || !exception.rejectedFix.reason) {
+    if (!fixAvailable.isSemVerMajor || !rejectedFix.reason) {
       throw new Error(`Audit exception ${id} may not reject a non-breaking or unexplained fix`);
     }
+    return key;
   }
+  if (rejectedFixesFor(exception).length > 0) {
+    throw new Error(`Audit exception ${id} contains unused rejected-fix metadata`);
+  }
+  return null;
 }
 
 function applyAuditPolicy({ report, lockfile, exceptions, mode, now = new Date() }) {
@@ -167,8 +187,18 @@ function applyAuditPolicy({ report, lockfile, exceptions, mode, now = new Date()
     if (!exception) {
       throw new Error(`Unexcepted development advisory: ${id}`);
     }
-    for (const fixAvailable of leaf.fixPaths.length ? leaf.fixPaths : [false]) {
-      validateException(exception, leaf.advisory, fixAvailable, now);
+    const fixPaths = leaf.fixPaths.length
+      ? [...new Map(leaf.fixPaths.map(fix => [rejectedFixKey(fix), fix])).values()]
+      : [false];
+    const matchedFixes = new Set();
+    for (const fixAvailable of fixPaths) {
+      const matched = validateException(exception, leaf.advisory, fixAvailable, now);
+      if (matched) matchedFixes.add(matched);
+    }
+    const unusedFixes = rejectedFixesFor(exception)
+      .filter(fix => !matchedFixes.has(rejectedFixKey(fix)));
+    if (unusedFixes.length > 0) {
+      throw new Error(`Audit exception ${id} contains unused rejected-fix metadata`);
     }
     used.add(id);
   }
@@ -207,7 +237,7 @@ function runAudit(mode) {
   }
   const lockfile = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "utf8"));
   const policy = JSON.parse(fs.readFileSync(path.join(__dirname, "audit-exceptions.json"), "utf8"));
-  if (policy.schemaVersion !== 1 || !Array.isArray(policy.exceptions)) {
+  if (policy.schemaVersion !== 2 || !Array.isArray(policy.exceptions)) {
     throw new Error("Audit exception policy has an unsupported schema");
   }
   return applyAuditPolicy({ report, lockfile, exceptions: policy.exceptions, mode });

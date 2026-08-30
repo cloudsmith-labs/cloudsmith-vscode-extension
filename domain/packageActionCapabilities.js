@@ -62,6 +62,7 @@ function derivePackageActionCapabilities(input = {}) {
     copyable: strictEvidence(ownDataValue(input, "copyable")),
     exact: strictEvidence(ownDataValue(input, "exact")),
     found: strictEvidence(ownDataValue(input, "found")),
+    installGuidance: strictEvidence(ownDataValue(input, "installGuidance")),
     policyViolation: strictEvidence(ownDataValue(input, "policyViolation")),
     quarantined: strictEvidence(ownDataValue(input, "quarantined")),
     restrictiveLicense: strictEvidence(ownDataValue(input, "restrictiveLicense")),
@@ -74,7 +75,8 @@ function derivePackageActionCapabilities(input = {}) {
 
   const packageSurface = surface === PACKAGE_ACTION_SURFACES.PACKAGE;
   const vulnerabilityActions = packageSurface || evidence.vulnerable;
-  const installable = evidence.copyable && !evidence.quarantined;
+  const safeToDistribute = evidence.copyable && !evidence.quarantined;
+  const installable = safeToDistribute && evidence.installGuidance;
   const actions = Object.freeze({
     [PACKAGE_ACTIONS.INSPECT]: true,
     [PACKAGE_ACTIONS.OPEN]: true,
@@ -82,7 +84,7 @@ function derivePackageActionCapabilities(input = {}) {
     [PACKAGE_ACTIONS.SHOW_VULNERABILITIES]: vulnerabilityActions,
     [PACKAGE_ACTIONS.EXPLAIN_QUARANTINE]: evidence.quarantined,
     [PACKAGE_ACTIONS.INSTALL]: installable,
-    [PACKAGE_ACTIONS.PROMOTE]: packageSurface && installable,
+    [PACKAGE_ACTIONS.PROMOTE]: packageSurface && safeToDistribute,
     [PACKAGE_ACTIONS.SHOW_PROMOTION_STATUS]: packageSurface,
   });
   return Object.freeze({ actions, evidence, surface });

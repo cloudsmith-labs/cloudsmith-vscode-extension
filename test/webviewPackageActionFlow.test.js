@@ -10,6 +10,7 @@ const { VulnerabilityProvider } = require("../views/vulnerabilityProvider");
 const { apiSuccess } = require("./apiResultHelpers");
 const { createWebviewPanelHarness } = require("./helpers/webviewPanelHarness");
 const { captureAccount, isAccountCurrent } = require("../util/accountOperation");
+const { openExternalWithFeedback } = require("../util/externalNavigation");
 
 suite("WebView package action flow", () => {
   test("Quarantine Show vulnerabilities reaches the real target without tree provenance", async () => {
@@ -44,6 +45,58 @@ suite("WebView package action flow", () => {
     assertExactIdentity(flow.resolvedPackages[0], source);
     assert.deepStrictEqual(flow.information, [
       'No compatible safe version for "axios" is available in common-testing. The reported fix is 1.8.2.',
+    ]);
+  });
+
+  test("safe-version package navigation reports refused and rejected external opens", async () => {
+    const outcomes = [false, new Error("platform rejected")];
+    const cleanState = Object.freeze({
+      status: "complete-clean",
+      complete: true,
+      stale: false,
+      refreshing: false,
+      refreshFailure: null,
+      count: 0,
+      maxSeverity: "None",
+      records: Object.freeze([]),
+    });
+    const flow = createFlow({
+      remediationResult: {
+        success: true,
+        absenceProven: false,
+        versions: [{
+          namespace: "dl-technology-consulting",
+          repository: "common-testing",
+          slug_perm: "axios-1-8-2",
+          name: "axios",
+          version: "1.8.2",
+          format: "npm",
+          status_str: "Completed",
+          deny_policy_violated: false,
+        }],
+      },
+      vulnerabilityStateService: {
+        prime() {},
+        peek() { return null; },
+        async resolve(pkg) { return pkg.version === "1.8.2" ? cleanState : vulnerableState(); },
+        async refresh() { return vulnerableState(); },
+      },
+      showQuickPick(items) {
+        return items.find(item => item.id === "open") || items[0];
+      },
+      async openExternal() {
+        const outcome = outcomes.shift();
+        if (outcome instanceof Error) throw outcome;
+        return outcome;
+      },
+    });
+    await flow.quarantineProvider.show(exactPackage());
+
+    await flow.quarantineHarness.send({ command: "findSafeVersion" });
+    await flow.quarantineHarness.send({ command: "findSafeVersion" });
+    assert.deepStrictEqual(flow.warning, [
+      "Could not open this package in Cloudsmith.",
+      "Could not open this package in Cloudsmith.",
     ]);
   });
 
@@ -265,13 +318,21 @@ function createFlow(options = {}) {
     commands: { async executeCommand() {} },
     env: {
       clipboard: { async writeText() {} },
-      async openExternal() {},
+      async openExternal(...args) {
+        return typeof options.openExternal === "function"
+          ? options.openExternal(...args)
+          : true;
+      },
     },
     window: {
       async showErrorMessage(message) { error.push(message); },
       async showInformationMessage(message) { information.push(message); },
       async showWarningMessage(message) { warning.push(message); },
-      async showQuickPick() { return undefined; },
+      async showQuickPick(...args) {
+        return typeof options.showQuickPick === "function"
+          ? options.showQuickPick(...args)
+          : undefined;
+      },
     },
   };
   const registration = registerVulnerabilityCommands({
@@ -305,6 +366,7 @@ function createFlow(options = {}) {
     vulnerabilityStateService,
     normalizeCvssScore: value => Number(value),
     formatApiError: () => "Retry.",
+    openExternalWithFeedback,
     isCurrentSelection: () => false,
     isCurrentPackageSelection: () => false,
     isCurrentDependencySelection: () => false,

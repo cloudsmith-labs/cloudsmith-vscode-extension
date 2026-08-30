@@ -2972,7 +2972,7 @@ suite("UpstreamPullService", () => {
     assert.strictEqual(result.pullResult.errors, 5);
     assert.strictEqual(result.pullResult.authFailed, 5);
     assert.deepStrictEqual(errors, [
-      "Authentication failed. Check your API key in Cloudsmith settings.",
+      "Authentication failed. Check Cloudsmith authentication in Settings and retry.",
     ]);
   });
 

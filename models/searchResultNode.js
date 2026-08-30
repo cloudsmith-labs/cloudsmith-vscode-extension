@@ -9,6 +9,9 @@ const { LicenseClassifier } = require("../util/licenseClassifier");
 const { getFormatIconPath } = require("../util/formatIcons");
 const { packageCollectionIdentity } = require("../util/collectionIdentity");
 const { fromApiPackageRecord } = require("../domain/packageAdapters");
+const packageDomain = require("../domain/package");
+const { InstallCommandBuilder } = require("../util/installCommandBuilder");
+const { hasInstallGuidanceForPackage } = require("../domain/installGuidanceSupport");
 const VulnerabilitySummaryNode = require("./vulnerabilitySummaryNode");
 const { markSelection } = require("../util/selectionProvenance");
 const { buildPackageRowDescription } = require("../util/packageTreePresentation");
@@ -182,6 +185,11 @@ class SearchResultNode {
             found: this.package?.identityState === "exact",
             exact: this.package?.identityState === "exact",
             copyable: this.package?.copyable === true,
+            installGuidance: hasInstallGuidanceForPackage(
+                packageDomain,
+                InstallCommandBuilder,
+                this.package
+            ),
             vulnerable: Boolean(this.package?.vulnerability && (
                 this.package.vulnerability.detected === true
                 || (

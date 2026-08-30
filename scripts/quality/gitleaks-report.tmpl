@@ -1,0 +1,12 @@
+[
+{{- range $index, $finding := . }}
+{{- if $index }},{{ end }}
+  {
+    "ruleId": {{ printf "%q" $finding.RuleID }},
+    "file": {{ printf "%q" $finding.File }},
+    "startLine": {{ $finding.StartLine }},
+    "endLine": {{ $finding.EndLine }},
+    "commit": {{ printf "%q" $finding.Commit }}
+  }
+{{- end }}
+]

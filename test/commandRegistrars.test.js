@@ -1,5 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const assert = require("assert");
+const vscode = require("vscode");
 const manifest = require("../package.json");
 const { registerAuthenticationCommands } = require("../commands/authentication");
 const { registerSettingsHelpCommands } = require("../commands/settingsHelp");
@@ -17,6 +18,13 @@ const {
   serializePackageInspection,
 } = require("../util/packageInspection");
 const { normalizeCvssScore } = require("../util/vulnerabilitySeverity");
+const { openExternalWithFeedback } = require("../util/externalNavigation");
+const { HELP_LINKS } = require("../util/helpLinks");
+const {
+  InstallCommandBuilder,
+  InstallCommandValidationError,
+} = require("../util/installCommandBuilder");
+const { helpProvider } = require("../views/helpProvider");
 
 const INTERNAL_COMMANDS = [
   "cloudsmith-vsc.scanDependenciesPending",
@@ -75,6 +83,8 @@ function baseDependencies(recorder) {
     serializePackageCollectionInspection,
     serializePackageInspection,
     normalizeCvssScore,
+    openExternalWithFeedback,
+    helpLinks: HELP_LINKS,
   };
 }
 
@@ -348,6 +358,43 @@ suite("Command registrars", () => {
     ]);
     assert.strictEqual(prompts, 0);
     assert.strictEqual(loginCalls, 0);
+  });
+
+  test("QH-052 registered CLI-import callback owns the operation and propagates its result", async () => {
+    const recorder = recordingRegistration();
+    const operation = Object.freeze({ id: "cli-import" });
+    const importResult = Object.freeze({ ok: true, source: "cloudsmith-cli" });
+    const importedOperations = [];
+    const handledResults = [];
+    let beginCalls = 0;
+    registerAuthenticationCommands({
+      ...baseDependencies(recorder),
+      connectionManager: {
+        beginCredentialOperation() {
+          beginCalls += 1;
+          return operation;
+        },
+        isOperationCurrent: value => value === operation,
+      },
+      credentialManager: {},
+      ssoManager: {
+        async importFromCLI(value) {
+          importedOperations.push(value);
+          return importResult;
+        },
+      },
+      async handleAuthenticationResult(result) {
+        handledResults.push(result);
+      },
+    });
+
+    const callback = recorder.handlers.get("cloudsmith-vsc.importCLICredentials");
+    assert.strictEqual(typeof callback, "function");
+    await callback();
+
+    assert.strictEqual(beginCalls, 1);
+    assert.deepStrictEqual(importedOperations, [operation]);
+    assert.deepStrictEqual(handledResults, [importResult]);
   });
 
   test("SSO prompt rechecks operation ownership before starting login services", async () => {
@@ -629,19 +676,68 @@ suite("Command registrars", () => {
           async executeCommand(...args) { commands.push(args); },
         },
         env: {
-          async openExternal(value) { opened.push(value); },
+          async openExternal(value) { opened.push(value); return true; },
         },
         Uri: { parse: value => value },
+        window: { async showWarningMessage() {} },
       },
     });
 
     await recorder.handlers.get("cloudsmith-vsc.openSettings")();
-    await recorder.handlers.get("cloudsmith-vscode-extension.cloudsmithDocs")();
+    const openDocumentation = recorder.handlers.get("cloudsmith-vscode-extension.cloudsmithDocs");
+    for (const link of HELP_LINKS) await openDocumentation(link.id);
     assert.deepStrictEqual(commands, [[
       "workbench.action.openSettings",
       "@ext:Cloudsmith.cloudsmith-vsc",
     ]]);
-    assert.deepStrictEqual(opened, ["https://docs.cloudsmith.com/"]);
+    assert.deepStrictEqual(opened, HELP_LINKS.map(link => link.url));
+  });
+
+  test("Help navigation reports refused and rejected external opens", async () => {
+    const recorder = recordingRegistration();
+    const warnings = [];
+    const outcomes = [false, new Error("platform rejected"), true];
+    registerSettingsHelpCommands({
+      ...baseDependencies(recorder),
+      vscode: {
+        env: {
+          async openExternal() {
+            const outcome = outcomes.shift();
+            if (outcome instanceof Error) throw outcome;
+            return outcome;
+          },
+        },
+        Uri: { parse: value => value },
+        window: {
+          async showWarningMessage(message) { warnings.push(message); },
+        },
+      },
+    });
+
+    const openDocumentation = recorder.handlers.get("cloudsmith-vscode-extension.cloudsmithDocs");
+    assert.strictEqual(await openDocumentation(), false);
+    assert.strictEqual(await openDocumentation(), false);
+    assert.strictEqual(await openDocumentation(), true);
+    assert.deepStrictEqual(warnings, [
+      "Could not open the extension documentation.",
+      "Could not open the extension documentation.",
+    ]);
+  });
+
+  test("Help tree items route authoritative link IDs through the truthful navigation command", () => {
+    const provider = new helpProvider({});
+    const children = provider.getChildren();
+    assert.deepStrictEqual(children.map(child => ({
+      id: child.command.arguments[0],
+      command: child.command.command,
+      url: child.tooltip,
+      accessibleName: child.getTreeItem().accessibilityInformation?.label,
+    })), HELP_LINKS.map(link => ({
+      id: link.id,
+      command: "cloudsmith-vscode-extension.cloudsmithDocs",
+      url: link.url,
+      accessibleName: link.label,
+    })));
   });
 
   test("settings workspace selection updates configuration and presentation", async () => {
@@ -1054,6 +1150,124 @@ suite("Command registrars", () => {
     ]);
   });
 
+  test("registered install command publishes usable guidance through real host dispatch", async () => {
+    const commandIds = new Map();
+    const clipboardWrites = [];
+    const informationMessages = [];
+    const registration = registerPackageCommands({
+      ...baseDependencies({
+        registerCommand(id, handler) {
+          const testId = `cloudsmith-vsc.test.install-host.${id}`;
+          commandIds.set(id, testId);
+          return vscode.commands.registerCommand(testId, handler);
+        },
+      }),
+      vscode: {
+        env: {
+          clipboard: {
+            async writeText(value) { clipboardWrites.push(value); },
+          },
+        },
+        workspace: { getConfiguration: () => ({ get: () => false }) },
+        window: {
+          showErrorMessage() {},
+          showWarningMessage() {},
+          showInformationMessage(message) { informationMessages.push(message); },
+          async showQuickPick(items) { return items[0]; },
+        },
+      },
+      packageAdapters,
+      packageDomain,
+      recentPackages: { add() {}, getAll: () => [] },
+      InstallCommandBuilder,
+      InstallCommandValidationError,
+    });
+    const pkg = packageDomain.createExactPackage({
+      workspace: "workspace-a",
+      repository: "repo-a",
+      packageIdentifier: "python-package-one",
+      name: "sample-package",
+      version: "1.2.3",
+      format: "python",
+      status: "Completed",
+      copyable: true,
+    });
+
+    try {
+      await vscode.commands.executeCommand(
+        commandIds.get("cloudsmith-vsc.copyInstallCommand"),
+        pkg
+      );
+
+      assert.strictEqual(clipboardWrites.length, 1);
+      assert.match(clipboardWrites[0], /(?:^|\n)pip install 'sample-package==1\.2\.3' --index-url https:\/\/dl\.cloudsmith\.io\/basic\/workspace-a\/repo-a\/python\/simple\//u);
+      assert.deepStrictEqual(informationMessages, ["Install command copied."]);
+    } finally {
+      registration.dispose();
+    }
+  });
+
+  test("package and package-group navigation report refused and rejected opens and record only confirmed history", async () => {
+    const recorder = recordingRegistration();
+    const recent = [];
+    const warnings = [];
+    const opened = [];
+    const outcomes = [false, new Error("platform rejected"), true, false, new Error("platform rejected")];
+    const pkg = Object.freeze({
+      workspace: "workspace-a",
+      repository: "repo-a",
+      packageIdentifier: "package-one",
+      name: "widget",
+      version: "1.0.0",
+      format: "npm",
+    });
+    const group = Object.freeze({
+      workspace: "workspace-a",
+      repository: "repo-a",
+      name: "widget",
+    });
+    registerPackageCommands({
+      ...baseDependencies(recorder),
+      vscode: {
+        Uri: { parse: value => value },
+        env: {
+          async openExternal(value) {
+            opened.push(value);
+            const outcome = outcomes.shift();
+            if (outcome instanceof Error) throw outcome;
+            return outcome;
+          },
+        },
+        window: { async showWarningMessage(message) { warnings.push(message); } },
+      },
+      packageAdapters: {
+        fromPackageSelection: value => value,
+        fromPackageGroupNode: value => value,
+      },
+      packageDomain: { assertExactPackage: value => value },
+      recentPackages: { add: value => recent.push(value), getAll: () => [] },
+      buildPackageUrl: () => "https://app.cloudsmith.com/workspace-a/repo-a/widget/1.0.0/",
+      buildPackageGroupUrl: () => "https://app.cloudsmith.com/workspace-a/repo-a/widget/",
+    });
+
+    const openPackage = recorder.handlers.get("cloudsmith-vsc.openPackage");
+    await openPackage(pkg);
+    await openPackage(pkg);
+    await openPackage(pkg);
+    const openPackageGroup = recorder.handlers.get("cloudsmith-vsc.openPackageGroup");
+    await openPackageGroup(group);
+    await openPackageGroup(group);
+
+    assert.strictEqual(opened.length, 5);
+    assert.deepStrictEqual(recent, [pkg]);
+    assert.deepStrictEqual(warnings, [
+      "Could not open this package in Cloudsmith.",
+      "Could not open this package in Cloudsmith.",
+      "Could not open this package group in Cloudsmith.",
+      "Could not open this package group in Cloudsmith.",
+    ]);
+  });
+
   test("package inspection contains a failed API result at the registrar boundary", async () => {
     const recorder = recordingRegistration();
     const errors = [];
@@ -1357,6 +1571,94 @@ suite("Command registrars", () => {
       query: "format:npm",
       page: 1,
     }]);
+  });
+
+  test("QH-051 registered license-search callback searches, records history, and focuses results", async () => {
+    const recorder = recordingRegistration();
+    const selectedLicense = Object.freeze({
+      label: "Apache-2.0",
+      query: "license:Apache-2.0",
+    });
+    const descriptors = [];
+    const executions = [];
+    const history = [];
+    const focusCalls = [];
+    const recentConstructions = [];
+    const context = Object.freeze({ kind: "extension-context" });
+    const authoritativeResult = Object.freeze({ status: "complete", count: 2 });
+    const execution = deferred();
+    class RecentSearches {
+      constructor(value, workspace) {
+        recentConstructions.push({ context: value, workspace });
+      }
+
+      async add(entry) {
+        history.push(entry);
+      }
+    }
+    registerSearchCommands({
+      ...baseDependencies(recorder),
+      context,
+      vscode: {
+        QuickPickItemKind: { Separator: 1 },
+        commands: {
+          async executeCommand(...args) {
+            focusCalls.push(args);
+          },
+        },
+        workspace: { getConfiguration: () => ({ get: () => "" }) },
+        window: {
+          async showQuickPick(items, options) {
+            assert.strictEqual(options.placeHolder, "Select a license to search for");
+            assert.ok(items.includes(selectedLicense));
+            return selectedLicense;
+          },
+        },
+      },
+      workspaceAccess: workspaceCollectionHarness().access,
+      LicenseClassifier: {
+        getSearchQuickPickItems: () => [selectedLicense],
+        buildRestrictiveQuery: () => "license:restrictive",
+        buildLicenseQuery() { throw new Error("selected canonical query must be used"); },
+      },
+      RecentSearches,
+      searchProvider: {
+        beginSearch(descriptor) {
+          descriptors.push(descriptor);
+          return Object.freeze({ descriptor });
+        },
+        executeSearch(operation) {
+          executions.push(operation);
+          return execution.promise;
+        },
+      },
+    });
+
+    const callback = recorder.handlers.get("cloudsmith-vsc.searchByLicense");
+    assert.strictEqual(typeof callback, "function");
+    const pendingSearch = callback();
+    await new Promise(resolve => setImmediate(resolve));
+
+    const expectedDescriptor = {
+      kind: "workspace",
+      workspace: "workspace-a",
+      query: "license:Apache-2.0",
+      page: 1,
+    };
+    assert.deepStrictEqual(descriptors, [expectedDescriptor]);
+    assert.strictEqual(executions.length, 1);
+    assert.deepStrictEqual(executions[0].descriptor, expectedDescriptor);
+    assert.deepStrictEqual(recentConstructions, [{ context, workspace: "workspace-a" }]);
+    assert.deepStrictEqual(history, [{
+      workspace: "workspace-a",
+      query: "license:Apache-2.0",
+      scope: { kind: "workspace" },
+    }]);
+    assert.deepStrictEqual(focusCalls, []);
+
+    execution.resolve(authoritativeResult);
+    assert.strictEqual(await pendingSearch, undefined);
+    assert.deepStrictEqual(focusCalls, [["cloudsmithSearchView.focus"]]);
   });
 
   test("guided search cancellation stops before repository or provider work", async () => {
@@ -1957,7 +2259,7 @@ suite("Command registrars", () => {
       isCurrentSelection: item => item?.current === true,
       vscode: {
         Uri: { parse: value => value },
-        env: { openExternal: async value => opened.push(value) },
+        env: { openExternal: async value => { opened.push(value); return true; } },
         window: { showWarningMessage: message => warnings.push(message) },
       },
     });
@@ -1981,6 +2283,33 @@ suite("Command registrars", () => {
       "https://github.com/advisories/GHSA-abcd-1234-wxyz",
     ]);
     assert.strictEqual(warnings.length, 7);
+  });
+
+  test("CVE navigation reports refused and rejected external opens", async () => {
+    const recorder = recordingRegistration();
+    const warnings = [];
+    const outcomes = [false, new Error("platform rejected")];
+    registerVulnerabilityCommands({
+      ...baseDependencies(recorder),
+      vscode: {
+        Uri: { parse: value => value },
+        env: {
+          async openExternal() {
+            const outcome = outcomes.shift();
+            if (outcome instanceof Error) throw outcome;
+            return outcome;
+          },
+        },
+        window: { async showWarningMessage(message) { warnings.push(message); } },
+      },
+    });
+    const handler = recorder.handlers.get("cloudsmith-vsc.openCVE");
+    await handler({ cveId: "CVE-2026-12345" });
+    await handler({ cveId: "CVE-2026-12345" });
+    assert.deepStrictEqual(warnings, [
+      "Could not open the vulnerability reference.",
+      "Could not open the vulnerability reference.",
+    ]);
   });
 
   test("vulnerability and quarantine selection cancellation never reaches providers", async () => {
@@ -2263,6 +2592,7 @@ suite("Command registrars", () => {
     const warnings = [];
     const recent = [];
     const promoted = [];
+    let installGuidanceBuilds = 0;
     const exactPackage = Object.freeze({
       identityState: "exact",
       workspace: "workspace-a",
@@ -2301,6 +2631,23 @@ suite("Command registrars", () => {
           if (!validPackages.has(value)) throw new TypeError("invalid package");
           return value;
         },
+        packageCoordinateFromExact(value) {
+          return {
+            workspace: value.workspace,
+            repository: value.repository,
+            name: value.name,
+            version: value.version,
+            format: value.format,
+            qualifiers: {},
+          };
+        },
+      },
+      InstallCommandBuilder: {
+        build() {
+          installGuidanceBuilds += 1;
+          return { command: "must not be built while deciding promotion" };
+        },
+        toClipboardCommand(value) { return value; },
       },
       recentPackages: {
         getAll: () => [],
@@ -2324,6 +2671,11 @@ suite("Command registrars", () => {
     ]);
     assert.deepStrictEqual(recent, []);
     assert.strictEqual(promoted.length, 1);
+    assert.strictEqual(
+      installGuidanceBuilds,
+      0,
+      "promotion eligibility must not execute the independent Install guidance pipeline"
+    );
     assert.strictEqual(promoted[0].value, exactPackage);
     assert.strictEqual(typeof promoted[0].options.refresh, "function");
   });
@@ -3096,7 +3448,7 @@ suite("Command registrars", () => {
       ...baseDependencies(recorder),
       vscode: {
         Uri: { parse: value => value },
-        env: { openExternal: async value => opened.push(value) },
+        env: { openExternal: async value => { opened.push(value); return true; } },
         window: { showWarningMessage: message => warnings.push(message) },
       },
     });
@@ -3104,6 +3456,7 @@ suite("Command registrars", () => {
     await handler({ licenseInfo: { licenseUrl: "https://spdx.org/licenses/Apache-2.0.html" } });
     for (const licenseUrl of [
       "https://user:secret@spdx.org/licenses/MIT.html",
+      "http://spdx.org/licenses/MIT.html",
       "javascript:alert(1)",
       "https://spdx.org/license\u0000/MIT",
       `https://spdx.org/${"a".repeat(2040)}`,
@@ -3111,6 +3464,58 @@ suite("Command registrars", () => {
       await handler({ licenseInfo: { licenseUrl } });
     }
     assert.deepStrictEqual(opened, ["https://spdx.org/licenses/Apache-2.0.html"]);
-    assert.strictEqual(warnings.length, 4);
+    assert.strictEqual(warnings.length, 5);
+  });
+
+  test("license navigation confirms non-allowlisted HTTPS hosts and reports refused opens", async () => {
+    const recorder = recordingRegistration();
+    const opened = [];
+    const prompts = [];
+    const warnings = [];
+    const choices = [undefined, "Open", "Open", "Open"];
+    const outcomes = [false, new Error("platform rejected"), true];
+    registerPackageCommands({
+      ...baseDependencies(recorder),
+      vscode: {
+        Uri: { parse: value => value },
+        env: {
+          async openExternal(value) {
+            opened.push(value);
+            const outcome = outcomes.shift();
+            if (outcome instanceof Error) throw outcome;
+            return outcome;
+          },
+        },
+        window: {
+          async showWarningMessage(message, ...options) {
+            if (options.length > 0) {
+              prompts.push([message, ...options]);
+              return choices.shift();
+            }
+            warnings.push(message);
+            return undefined;
+          },
+        },
+      },
+    });
+    const handler = recorder.handlers.get("cloudsmith-vsc.openLicenseUrl");
+    const item = { licenseInfo: { licenseUrl: "https://licenses.example/private/path?token=secret" } };
+    await handler(item);
+    await handler(item);
+    await handler(item);
+    await handler(item);
+
+    assert.strictEqual(prompts.length, 4);
+    assert.deepStrictEqual(prompts[0], [
+      "Open a license page on licenses.example? Continue only if you trust this site.",
+      { modal: true },
+      "Open",
+    ]);
+    assert.strictEqual(JSON.stringify(prompts).includes("token=secret"), false);
+    assert.strictEqual(opened.length, 3);
+    assert.deepStrictEqual(warnings, [
+      "Could not open the license URL.",
+      "Could not open the license URL.",
+    ]);
   });
 });

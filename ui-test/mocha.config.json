@@ -1,0 +1,8 @@
+{
+  "ui": "tdd",
+  "timeout": 45000,
+  "failZero": true,
+  "forbidOnly": true,
+  "forbidPending": true,
+  "reporter": "./ui-test/evidence-reporter.js"
+}

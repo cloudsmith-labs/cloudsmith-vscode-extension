@@ -29,6 +29,7 @@ suite("Package action capabilities", () => {
           found: true,
           exact: true,
           copyable: true,
+          installGuidance: true,
           ...evidence,
         });
         const packageSurface = surface === PACKAGE_ACTION_SURFACES.PACKAGE;
@@ -63,6 +64,7 @@ suite("Package action capabilities", () => {
       found: true,
       exact: true,
       copyable: true,
+      installGuidance: true,
       vulnerable: true,
       quarantined: true,
       policyViolation: true,
@@ -84,6 +86,7 @@ suite("Package action capabilities", () => {
       copyable: true,
       exact: true,
       found: true,
+      installGuidance: true,
       policyViolation: true,
       quarantined: true,
       restrictiveLicense: true,
@@ -101,6 +104,7 @@ suite("Package action capabilities", () => {
       found: true,
       exact: true,
       copyable: true,
+      installGuidance: true,
       vulnerable: true,
       quarantined: false,
     });
@@ -127,6 +131,24 @@ suite("Package action capabilities", () => {
     assert.ok(encoded.length <= 256);
   });
 
+  test("copyability cannot advertise Install without buildable guidance or disable independent promotion", () => {
+    const capabilities = derivePackageActionCapabilities({
+      surface: PACKAGE_ACTION_SURFACES.PACKAGE,
+      found: true,
+      exact: true,
+      copyable: true,
+      installGuidance: false,
+      quarantined: false,
+    });
+
+    assert.strictEqual(hasPackageAction(capabilities, PACKAGE_ACTIONS.INSTALL), false);
+    assert.strictEqual(hasPackageAction(capabilities, PACKAGE_ACTIONS.PROMOTE), true);
+    assert.strictEqual(
+      encodePackageActionContext(PACKAGE_ACTION_CONTEXT_FAMILIES.PACKAGE, capabilities),
+      "packageActions.inspect.open.findSafeVersion.showVulnerabilities.promote.showPromotionStatus"
+    );
+  });
+
   test("missing and malformed evidence grants no action", () => {
     for (const input of [undefined, null, {}, {
       surface: PACKAGE_ACTION_SURFACES.PACKAGE,
@@ -150,6 +172,72 @@ suite("Package action capabilities", () => {
       encodePackageActionContext("hostile", derivePackageActionCapabilities()),
       null
     );
+  });
+
+  test("invalid derivation returns the exact frozen deny-all action contract", () => {
+    const expectedActions = Object.fromEntries(
+      Object.values(PACKAGE_ACTIONS).map(action => [action, false])
+    );
+
+    for (const input of [undefined, null, {}, { surface: "unknown" }]) {
+      const capabilities = derivePackageActionCapabilities(input);
+      assert.deepStrictEqual(capabilities.actions, expectedActions);
+      assert.strictEqual(Object.isFrozen(capabilities.actions), true);
+    }
+  });
+
+  test("action lookup dispatches each known action independently", () => {
+    const allActions = Object.values(PACKAGE_ACTIONS);
+
+    for (const enabledAction of allActions) {
+      const actions = Object.fromEntries(
+        allActions.map(action => [action, action === enabledAction])
+      );
+
+      for (const requestedAction of allActions) {
+        assert.strictEqual(
+          hasPackageAction({ actions }, requestedAction),
+          requestedAction === enabledAction,
+          `${requestedAction} must not alias ${enabledAction}`
+        );
+      }
+    }
+  });
+
+  test("unknown package actions are always denied without coercion", () => {
+    const actions = Object.fromEntries(
+      Object.values(PACKAGE_ACTIONS).map(action => [action, true])
+    );
+    const unknownActions = [
+      undefined,
+      null,
+      "",
+      "unknown",
+      "__proto__",
+      {},
+      [],
+      Symbol("unknown"),
+    ];
+
+    for (const action of unknownActions) {
+      assert.doesNotThrow(() => hasPackageAction({ actions }, action));
+      assert.strictEqual(hasPackageAction({ actions }, action), false);
+    }
+  });
+
+  test("own data evidence on callable values remains supported", () => {
+    const input = function packageEvidence() {};
+    Object.assign(input, {
+      surface: PACKAGE_ACTION_SURFACES.PACKAGE,
+      found: true,
+      exact: true,
+      copyable: true,
+      installGuidance: true,
+    });
+
+    const capabilities = derivePackageActionCapabilities(input);
+    assert.strictEqual(hasPackageAction(capabilities, PACKAGE_ACTIONS.INSPECT), true);
+    assert.strictEqual(hasPackageAction(capabilities, PACKAGE_ACTIONS.INSTALL), true);
   });
 
   test("hostile and inherited capability data cannot throw or grant actions", () => {

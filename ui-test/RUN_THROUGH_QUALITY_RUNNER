@@ -1,0 +1,2 @@
+This regular-file sentinel makes direct ExTester entry fail before launch.
+Use `npm run test:ui:smoke` so the quality runner supplies fresh owned paths.

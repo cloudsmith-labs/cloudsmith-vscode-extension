@@ -1,11 +1,92 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const assert = require("assert");
+const fs = require("fs");
 const path = require("path");
 const vscode = require("vscode");
 const filterState = require("../util/filterState");
 const recentPackages = require("../util/recentPackages");
 const { createExactPackage } = require("../domain/package");
 const { UpstreamRuntime } = require("../util/upstreamRuntime");
+
+const PRODUCT_ROOT = path.resolve(__dirname, "..");
+const PRODUCT_MANIFEST = JSON.parse(fs.readFileSync(
+  path.join(PRODUCT_ROOT, "package.json"),
+  "utf8"
+));
+const TEST_HARNESS_ID = "cloudsmith-test.cloudsmith-vsc-test-harness";
+const TEST_HARNESS_ROOT = path.join(PRODUCT_ROOT, "test", "harness-extension");
+const SENSITIVE_EXTENSION_IDS = new Set([
+  "github.copilot",
+  "github.copilot-chat",
+  "typescriptteam.jsts-chat-features",
+  "vscode.git",
+  "vscode.github",
+  "vscode.github-authentication",
+  "vscode.mermaid-markdown-features",
+  "vscode.microsoft-authentication",
+]);
+
+function declaresCredentialOrAiCapability(extension) {
+  if (SENSITIVE_EXTENSION_IDS.has(String(extension?.id || "").toLowerCase())) return true;
+  const contributions = extension?.packageJSON?.contributes;
+  if (!contributions || typeof contributions !== "object" || Array.isArray(contributions)) {
+    return false;
+  }
+  return Object.keys(contributions).some(key => (
+    key === "authentication" || /^(?:chat|languageModel)/u.test(key)
+  ));
+}
+
+function assertCredentialAndAiInactivity(options = {}) {
+  const extensions = options.extensions || vscode.extensions.all;
+  const getChatConfiguration = options.getChatConfiguration
+    || (() => vscode.workspace.getConfiguration("chat"));
+  const activeCredentialExtensions = extensions
+    .filter(declaresCredentialOrAiCapability)
+    .filter(extension => extension.isActive)
+    .map(extension => extension.id)
+    .sort();
+  assert.deepStrictEqual(
+    activeCredentialExtensions,
+    [],
+    "Credential-capable built-in and AI extensions must remain inactive"
+  );
+  const chatConfiguration = getChatConfiguration();
+  assert.strictEqual(chatConfiguration.get("disableAIFeatures"), true);
+  assert.strictEqual(chatConfiguration.get("enabled"), false);
+}
+
+function isWithin(candidatePath, rootPath) {
+  const canonicalCandidate = (() => {
+    try {
+      return fs.realpathSync(candidatePath);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const parent = fs.realpathSync(path.dirname(candidatePath));
+      return path.join(parent, path.basename(candidatePath));
+    }
+  })();
+  const relative = path.relative(
+    fs.realpathSync(rootPath),
+    canonicalCandidate
+  );
+  return relative === ""
+    || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function isAllowedNonHarnessExtensionPath(candidatePath, expectedExtensionsDir, appRoot) {
+  return isWithin(candidatePath, expectedExtensionsDir)
+    || isWithin(candidatePath, appRoot);
+}
+
+function sameHostPath(left, right, platform = process.platform) {
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  const normalize = value => {
+    const normalized = pathApi.normalize(value);
+    return platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  return normalize(left) === normalize(right);
+}
 
 function deferred() {
   let resolve;
@@ -56,27 +137,167 @@ function createActivationContext(extensionPath, onCredentialRead) {
   };
 }
 
+function installOwnedHostResourceFakes() {
+  const originals = {
+    createDiagnosticCollection: vscode.languages.createDiagnosticCollection,
+    createOutputChannel: vscode.window.createOutputChannel,
+    createTreeView: vscode.window.createTreeView,
+    onDidChangeConfiguration: vscode.workspace.onDidChangeConfiguration,
+    registerTreeDataProvider: vscode.window.registerTreeDataProvider,
+  };
+  const disposable = () => ({ dispose() {} });
+  vscode.window.createOutputChannel = () => ({
+    append() {},
+    appendLine() {},
+    clear() {},
+    dispose() {},
+    show() {},
+  });
+  vscode.window.createTreeView = () => ({
+    description: "",
+    dispose() {},
+    message: undefined,
+    onDidCollapseElement: disposable,
+    onDidExpandElement: disposable,
+    reveal: async () => undefined,
+    title: "",
+  });
+  vscode.window.registerTreeDataProvider = disposable;
+  vscode.workspace.onDidChangeConfiguration = disposable;
+  vscode.languages.createDiagnosticCollection = () => ({
+    clear() {},
+    delete() {},
+    dispose() {},
+    forEach() {},
+    get() { return undefined; },
+    has() { return false; },
+    set() {},
+  });
+  return () => {
+    vscode.languages.createDiagnosticCollection = originals.createDiagnosticCollection;
+    vscode.window.createOutputChannel = originals.createOutputChannel;
+    vscode.window.createTreeView = originals.createTreeView;
+    vscode.workspace.onDidChangeConfiguration = originals.onDidChangeConfiguration;
+    vscode.window.registerTreeDataProvider = originals.registerTreeDataProvider;
+  };
+}
+
 suite("Extension activation smoke", () => {
-  test("activates on the intended VS Code runtime and registers contributed commands", async () => {
+  test("host path comparison follows platform identity semantics", () => {
+    assert.strictEqual(
+      sameHostPath(
+        "D:\\a\\cloudsmith-vscode-extension\\test\\harness-extension",
+        "d:\\a\\cloudsmith-vscode-extension\\test\\harness-extension",
+        "win32"
+      ),
+      true
+    );
+    assert.strictEqual(sameHostPath("/workspace/Harness", "/workspace/harness", "linux"), false);
+    assert.strictEqual(
+      sameHostPath("D:\\a\\harness", "d:\\a\\different", "win32"),
+      false
+    );
+  });
+
+  test("manually composes production activation in a real host with an in-memory credential boundary", async () => {
     const expectedVersion = process.env.EXPECTED_VSCODE_VERSION;
     assert.match(expectedVersion || "", /^\d+\.\d+\.\d+$/);
     assert.strictEqual(vscode.version, expectedVersion);
 
-    const extension = vscode.extensions.getExtension("Cloudsmith.cloudsmith-vsc");
-    assert.ok(extension, "Cloudsmith.cloudsmith-vsc was not loaded as the development extension");
+    assertCredentialAndAiInactivity();
+
+    const harnessExtension = vscode.extensions.getExtension(TEST_HARNESS_ID);
+    assert.ok(harnessExtension, "The credential-free test harness extension was not loaded");
+    assert.strictEqual(harnessExtension.isActive, false, "The inert harness must not autoactivate");
+    assert.strictEqual(
+      sameHostPath(
+        fs.realpathSync(harnessExtension.extensionPath),
+        fs.realpathSync(TEST_HARNESS_ROOT)
+      ),
+      true
+    );
+    assert.strictEqual(
+      sameHostPath(
+        fs.realpathSync(harnessExtension.extensionPath),
+        fs.realpathSync(PRODUCT_ROOT)
+      ),
+      false
+    );
+    assert.strictEqual(
+      vscode.extensions.getExtension("Cloudsmith.cloudsmith-vsc"),
+      undefined,
+      "The production manifest must not be installed or host-activated by the test runner"
+    );
+    const expectedExtensionsDirValue = process.env.EXPECTED_EXTENSIONS_DIR || "";
+    assert.strictEqual(path.isAbsolute(expectedExtensionsDirValue), true);
+    const expectedExtensionsDir = fs.realpathSync(expectedExtensionsDirValue);
+    const vscodeTestRoot = fs.realpathSync(path.join(PRODUCT_ROOT, ".vscode-test"));
+    const appRoot = fs.realpathSync(vscode.env.appRoot);
+    assert.strictEqual(
+      isWithin(appRoot, vscodeTestRoot),
+      true,
+      "The tested editor application must come from the controlled repository-local download"
+    );
+    assert.strictEqual(
+      isAllowedNonHarnessExtensionPath(
+        path.join(vscodeTestRoot, "extensions"),
+        expectedExtensionsDir,
+        appRoot
+      ),
+      false,
+      "A persistent repository-local extensions directory must not be trusted as editor-bundled provenance"
+    );
+    const repositoryExtensions = vscode.extensions.all
+      .filter(extension => (
+        isWithin(extension.extensionPath, PRODUCT_ROOT)
+        && !isWithin(extension.extensionPath, appRoot)
+      ))
+      .map(extension => extension.id)
+      .sort();
+    assert.deepStrictEqual(
+      repositoryExtensions,
+      [TEST_HARNESS_ID],
+      "Only the inert harness may be loaded from this repository"
+    );
+    assert.deepStrictEqual(
+      vscode.extensions.all
+        .filter(extension => (
+          !extension.isBuiltin
+          && extension.id !== TEST_HARNESS_ID
+          && !isAllowedNonHarnessExtensionPath(
+            extension.extensionPath,
+            expectedExtensionsDir,
+            appRoot
+          )
+        ))
+        .map(extension => extension.id)
+        .sort(),
+      [],
+      "Non-builtin seeded defaults must remain inside the unique temporary extensions directory"
+    );
+    const extensionModule = require("../extension");
+    let inMemoryCredentialReads = 0;
+    const context = createActivationContext(PRODUCT_ROOT, () => {
+      inMemoryCredentialReads += 1;
+    });
 
     const activationStartedAt = performance.now();
     await Promise.race([
-      extension.activate(),
+      extensionModule.activate(context),
       new Promise((_resolve, reject) => setTimeout(
-        () => reject(new Error("real Extension Host activation exceeded three seconds")),
+        () => reject(new Error("production activation composition exceeded three seconds")),
         3000
       )),
     ]);
     assert.ok(performance.now() - activationStartedAt < 3000);
-    assert.strictEqual(extension.isActive, true);
+    await new Promise(resolve => setImmediate(resolve));
+    assertCredentialAndAiInactivity();
+    assert.ok(
+      inMemoryCredentialReads > 0,
+      "production activation must use the explicit in-memory credential boundary"
+    );
 
-    const contributedCommands = (extension.packageJSON.contributes?.commands || [])
+    const contributedCommands = (PRODUCT_MANIFEST.contributes?.commands || [])
       .map((entry) => entry.command);
     assert.ok(contributedCommands.length > 0, "The extension manifest contributes no commands");
 
@@ -93,30 +314,47 @@ suite("Extension activation smoke", () => {
         `Expected compatibility command ${compatibilityCommand} to be registered`
       );
     }
-    await vscode.commands.executeCommand("cloudsmith-vsc.openSettings");
+    const originalExecuteCommand = vscode.commands.executeCommand;
+    const settingsTargets = [];
+    vscode.commands.executeCommand = async (command, ...args) => {
+      if (command === "workbench.action.openSettings") {
+        settingsTargets.push({ command, args });
+        return undefined;
+      }
+      return originalExecuteCommand.call(vscode.commands, command, ...args);
+    };
+    try {
+      await originalExecuteCommand.call(vscode.commands, "cloudsmith-vsc.openSettings");
+    } finally {
+      vscode.commands.executeCommand = originalExecuteCommand;
+    }
+    assert.deepStrictEqual(settingsTargets, [{
+      command: "workbench.action.openSettings",
+      args: ["@ext:Cloudsmith.cloudsmith-vsc"],
+    }]);
+    assertCredentialAndAiInactivity();
 
-    const viewIds = (extension.packageJSON.contributes?.views?.cloudsmithSideBar || [])
+    const viewIds = (PRODUCT_MANIFEST.contributes?.views?.cloudsmithSideBar || [])
       .map((entry) => entry.id);
     assert.deepStrictEqual(
       viewIds,
       ["cloudsmithView", "cloudsmithSearchView", "cloudsmithDependencyHealthView", "helpView"]
     );
-    for (const viewId of viewIds) {
-      assert.ok(
-        registeredCommands.has(`${viewId}.focus`),
-        `Expected VS Code to initialize the ${viewId} view contribution`
-      );
-    }
+    assert.strictEqual(
+      vscode.extensions.getExtension("Cloudsmith.cloudsmith-vsc"),
+      undefined,
+      "Manual composition must not register the production manifest with the host"
+    );
+    assertCredentialAndAiInactivity();
   });
 
   test("deactivation disposes registered commands and is idempotent", async () => {
-    const extension = vscode.extensions.getExtension("Cloudsmith.cloudsmith-vsc");
-    assert.ok(extension?.isActive, "The extension must be active before deactivation is exercised");
     assert.ok((await vscode.commands.getCommands(true)).includes("cloudsmith-vsc.refreshView"));
 
     const { deactivate } = require("../extension");
     await deactivate();
     await deactivate();
+    assertCredentialAndAiInactivity();
 
     assert.ok(
       !(await vscode.commands.getCommands(true)).includes("cloudsmith-vsc.refreshView"),
@@ -125,7 +363,6 @@ suite("Extension activation smoke", () => {
   });
 
   test("registers commands and returns before held background readiness", async () => {
-    const extension = vscode.extensions.getExtension("Cloudsmith.cloudsmith-vsc");
     const extensionModule = require("../extension");
     await extensionModule.deactivate();
     const upstreamReadiness = deferred();
@@ -135,8 +372,9 @@ suite("Extension activation smoke", () => {
     let secretReadStarted = false;
     let contextProjectionStarted = false;
     let commandsAtFirstContextProjection = null;
+    const settingsTargets = [];
     const activationRegistrations = new Set();
-    const context = createActivationContext(extension.extensionPath, () => {});
+    const context = createActivationContext(PRODUCT_ROOT, () => {});
     const originalSecretGet = context.secrets.get.bind(context.secrets);
     context.secrets.get = async key => {
       if (key !== "cloudsmith-vsc.authToken") return originalSecretGet(key);
@@ -160,6 +398,10 @@ suite("Extension activation smoke", () => {
         commandsAtFirstContextProjection ||= new Set(activationRegistrations);
         return contextProjection.promise;
       }
+      if (id === "workbench.action.openSettings") {
+        settingsTargets.push({ command: id, args });
+        return Promise.resolve(undefined);
+      }
       return originalExecuteCommand.call(vscode.commands, id, ...args);
     };
 
@@ -174,6 +416,7 @@ suite("Extension activation smoke", () => {
       ]);
       assert.ok(performance.now() - startedAt < 750);
       await new Promise(resolve => setImmediate(resolve));
+      assertCredentialAndAiInactivity();
       assert.strictEqual(upstreamStarted, true);
       assert.strictEqual(secretReadStarted, true);
       assert.strictEqual(contextProjectionStarted, true);
@@ -192,6 +435,10 @@ suite("Extension activation smoke", () => {
         );
       }
       await vscode.commands.executeCommand("cloudsmith-vsc.openSettings");
+      assert.deepStrictEqual(settingsTargets, [{
+        command: "workbench.action.openSettings",
+        args: ["@ext:Cloudsmith.cloudsmith-vsc"],
+      }]);
       const guardedResults = await Promise.race([
         Promise.all([
           vscode.commands.executeCommand("cloudsmith-vsc.searchPackages"),
@@ -203,10 +450,12 @@ suite("Extension activation smoke", () => {
         )),
       ]);
       assert.deepStrictEqual(guardedResults, [undefined, undefined]);
+      assertCredentialAndAiInactivity();
 
       const deactivationStartedAt = performance.now();
       await extensionModule.deactivate();
       assert.ok(performance.now() - deactivationStartedAt < 250);
+      assertCredentialAndAiInactivity();
     } finally {
       upstreamReadiness.resolve(false);
       secretRead.resolve(undefined);
@@ -215,14 +464,14 @@ suite("Extension activation smoke", () => {
       vscode.commands.registerCommand = originalRegisterCommand;
       vscode.commands.executeCommand = originalExecuteCommand;
       await extensionModule.deactivate();
+      assertCredentialAndAiInactivity();
     }
   });
 
   test("same-context reactivation owns exactly 64 callbacks and rolls back late failure", async () => {
-    const extension = vscode.extensions.getExtension("Cloudsmith.cloudsmith-vsc");
     const extensionModule = require("../extension");
     const expected = new Set([
-      ...extension.packageJSON.contributes.commands.map(entry => entry.command),
+      ...PRODUCT_MANIFEST.contributes.commands.map(entry => entry.command),
       "cloudsmith-vsc.scanDependenciesPending",
       "cloudsmith-vsc.scanDependenciesComplete",
       "cloudsmith-vsc.rescanDependencies",
@@ -234,12 +483,13 @@ suite("Extension activation smoke", () => {
     assert.strictEqual(expected.size, 64);
 
     const originalRegisterCommand = vscode.commands.registerCommand;
+    const restoreHostResources = installOwnedHostResourceFakes();
     const active = new Map();
     const registrations = [];
     let generation = 0;
     let failId = null;
     const credentialReadSnapshots = [];
-    const context = createActivationContext(extension.extensionPath, () => {
+    const context = createActivationContext(PRODUCT_ROOT, () => {
       credentialReadSnapshots.push({
         filters: filterState.activeFilters.size,
         recent: recentPackages.getAll().length,
@@ -274,6 +524,7 @@ suite("Extension activation smoke", () => {
 
       generation = 1;
       await extensionModule.activate(context);
+      assertCredentialAndAiInactivity();
       const first = registrations.filter(entry => entry.generation === 1);
       assert.strictEqual(first.length, 64);
       assert.strictEqual(active.size, 64);
@@ -282,6 +533,7 @@ suite("Extension activation smoke", () => {
 
       generation = 2;
       await extensionModule.activate(context);
+      assertCredentialAndAiInactivity();
       const second = registrations.filter(entry => entry.generation === 2);
       assert.strictEqual(second.length, 64);
       assert.strictEqual(active.size, 64);
@@ -291,22 +543,60 @@ suite("Extension activation smoke", () => {
       }
 
       await extensionModule.deactivate();
+      assertCredentialAndAiInactivity();
       assert.strictEqual(active.size, 0);
       assert.ok(second.every(entry => entry.disposed));
 
       generation = 3;
       failId = "cloudsmith-vsc.previewUpstreamResolution";
       await assert.rejects(extensionModule.activate(context), /late registrar failure/);
+      assertCredentialAndAiInactivity();
       const failed = registrations.filter(entry => entry.generation === 3);
       assert.strictEqual(failed.length, 63);
       assert.ok(failed.every(entry => entry.disposed));
       assert.strictEqual(active.size, 0);
     } finally {
       failId = null;
-      await extensionModule.deactivate();
-      vscode.commands.registerCommand = originalRegisterCommand;
-      filterState.clear();
-      recentPackages.clear();
+      try {
+        await extensionModule.deactivate();
+      } finally {
+        vscode.commands.registerCommand = originalRegisterCommand;
+        restoreHostResources();
+        filterState.clear();
+        recentPackages.clear();
+      }
+      assertCredentialAndAiInactivity();
     }
+  });
+
+  test("credential and AI inactivity assertions fail closed on hostile host state", () => {
+    const safeConfiguration = {
+      get(key) { return key === "disableAIFeatures"; },
+    };
+    assert.throws(
+      () => assertCredentialAndAiInactivity({
+        extensions: [{ id: "vscode.github-authentication", isActive: true }],
+        getChatConfiguration: () => safeConfiguration,
+      }),
+      /must remain inactive/u
+    );
+    assert.throws(
+      () => assertCredentialAndAiInactivity({
+        extensions: [{
+          id: "vendor.renamed-ai-provider",
+          isActive: true,
+          packageJSON: { contributes: { languageModelTools: [{ name: "fixture" }] } },
+        }],
+        getChatConfiguration: () => safeConfiguration,
+      }),
+      /must remain inactive/u
+    );
+    assert.throws(
+      () => assertCredentialAndAiInactivity({
+        extensions: [],
+        getChatConfiguration: () => ({ get: () => true }),
+      }),
+      /false/u
+    );
   });
 });

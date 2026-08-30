@@ -4,7 +4,14 @@ const fs = require("fs");
 const path = require("path");
 const zlib = require("zlib");
 const { spawnSync } = require("child_process");
+const { TextDecoder } = require("util");
 const yauzl = require("yauzl");
+const {
+  exactFileIdentity,
+  sameExactFileIdentity,
+  withStableSingleLinkFile,
+} = require("../quality/candidate-binding");
+const { withNonAuthQualityEnvironment } = require("../quality/non-auth-environment");
 const { FORMAT_ICON_FILES } = require("../../util/formatIconInventory");
 
 const root = path.resolve(__dirname, "../..");
@@ -16,6 +23,11 @@ const limits = Object.freeze({
   pathBytes: 160,
   totalBytes: 16 * 1024 * 1024,
 });
+const MAX_CHECKSUM_SIDECAR_BYTES = 4 * 1024;
+const MAX_PROVENANCE_SIDECAR_BYTES = 32 * 1024;
+const EXACT_FILE_READ_FLAGS = fs.constants.O_RDONLY
+  | (fs.constants.O_NOFOLLOW || 0)
+  | (fs.constants.O_NONBLOCK || 0);
 const generatedEntries = new Set(["[Content_Types].xml", "extension.vsixmanifest"]);
 const baseMedia = new Set([
   "media/icon.svg",
@@ -41,23 +53,38 @@ const sensitivePatterns = Object.freeze([
   { id: "developer-home-posix", expression: /\/(?:Users|home)\/[A-Za-z0-9._-]+\// },
   { id: "developer-home-windows", expression: /[A-Za-z]:\\Users\\[A-Za-z0-9._-]+\\/ },
   { id: "private-key", expression: /-----BEGIN (?:EC |OPENSSH |RSA )?PRIVATE KEY-----/ },
+  { id: "ssh-private-key", expression: /(?:PuTTY-User-Key-File-[23]:|---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----)/ },
+  { id: "url-userinfo", expression: /[a-z][a-z0-9+.-]{1,20}:\/\/[^\s/:@]{1,128}:[^\s/@]{1,256}@/i },
+  { id: "authorization-header", expression: /\bauthorization\s*:\s*(?:basic|bearer)\s+[A-Za-z0-9._~+/=-]{8,}/i },
   { id: "cloudsmith-token", expression: /csa_[A-Za-z0-9]{20,}/ },
   { id: "github-token", expression: /(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}/ },
+  { id: "npm-token", expression: /\bnpm_[A-Za-z0-9]{20,}/ },
+  { id: "gitlab-token", expression: /\bglpat-[A-Za-z0-9_-]{20,}/ },
+  { id: "azure-devops-token", expression: /\b[A-Za-z0-9]{75}AZDO[A-Za-z0-9]{5}\b/ },
+  { id: "gcp-api-key", expression: /\bAIza[A-Za-z0-9_-]{35}\b/ },
   { id: "openai-token", expression: /sk-[A-Za-z0-9]{20,}/ },
   { id: "slack-token", expression: /xox[baprs]-[A-Za-z0-9-]{20,}/ },
   { id: "aws-access-key", expression: /AKIA[0-9A-Z]{16}/ },
 ]);
 
-function runGit(arguments_, encoding = "utf8") {
-  const result = spawnSync("git", arguments_, {
-    cwd: root,
-    encoding,
-    maxBuffer: 64 * 1024 * 1024,
+function runGit(arguments_, encoding = "utf8", options = {}) {
+  const spawn = options.spawnSync || spawnSync;
+  return withNonAuthQualityEnvironment({
+    environment: options.environment || process.env,
+    platform: options.platform,
+    temporaryParent: options.temporaryParent,
+  }, environment => {
+    const result = spawn("git", arguments_, {
+      cwd: root,
+      encoding,
+      env: environment,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    if (result.status !== 0) {
+      throw new Error((result.stderr || result.stdout || "git command failed").toString().trim());
+    }
+    return result.stdout;
   });
-  if (result.status !== 0) {
-    throw new Error((result.stderr || result.stdout || "git command failed").toString().trim());
-  }
-  return result.stdout;
 }
 
 function isApprovedSourcePath(sourcePath) {
@@ -110,6 +137,17 @@ function buildExpectedInventory({ sourceSha = null } = {}) {
     ? runGit(["ls-tree", "-r", "-z", sourceSha], null)
     : runGit(["ls-files", "-s", "-z"], null);
   const tracked = parseGitEntries(output, sourceSha);
+  if (!sourceSha) {
+    const untracked = runGit(["ls-files", "--others", "--exclude-standard", "-z"], null)
+      .toString("utf8")
+      .split("\0")
+      .filter(Boolean);
+    for (const sourcePath of untracked) {
+      if (isApprovedSourcePath(sourcePath) && !tracked.has(sourcePath)) {
+        tracked.set(sourcePath, { mode: "100644", oid: null, untracked: true });
+      }
+    }
+  }
   const expected = new Map();
   for (const [sourcePath, metadata] of tracked) {
     if (!isApprovedSourcePath(sourcePath)) {
@@ -125,7 +163,9 @@ function buildExpectedInventory({ sourceSha = null } = {}) {
     expected.set(sourceToArchivePath(sourcePath), { sourcePath, ...metadata });
   }
   for (const required of ["package.json", "extension.js", "README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTORS.md"] ) {
-    if (!tracked.has(required) || !expected.has(sourceToArchivePath(required))) {
+    if (!tracked.has(required)
+      || tracked.get(required).untracked
+      || !expected.has(sourceToArchivePath(required))) {
       throw new Error(`Required packaged source is not tracked: ${required}`);
     }
   }
@@ -360,41 +400,114 @@ function openZip(buffer) {
   });
 }
 
-async function readStableArtifact(filePath) {
-  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
-  const handle = await fs.promises.open(filePath, flags);
-  try {
-    const before = await handle.stat({ bigint: true });
-    if (!before.isFile() || before.size <= 0 || before.size > BigInt(limits.archiveBytes)) {
-      throw new Error(`VSIX must be a non-empty regular file no larger than ${limits.archiveBytes} bytes`);
-    }
-    const expectedSize = Number(before.size);
-    const allocation = Buffer.alloc(expectedSize + 1);
-    let offset = 0;
-    while (offset < allocation.length) {
-      const { bytesRead } = await handle.read(allocation, offset, allocation.length - offset, offset);
-      if (!bytesRead) {
-        break;
-      }
-      offset += bytesRead;
-    }
-    if (offset !== expectedSize) {
-      throw new Error("VSIX changed size while it was being read");
-    }
-    const after = await handle.stat({ bigint: true });
-    for (const field of ["dev", "ino", "size", "mtimeNs", "ctimeNs"]) {
-      if (before[field] !== after[field]) {
-        throw new Error("VSIX metadata changed while it was being read");
-      }
-    }
-    return Buffer.from(allocation.subarray(0, expectedSize));
-  } finally {
-    await handle.close();
+function assertBoundedArtifactStat(stat, errorMessage) {
+  if (!stat.isFile() || stat.nlink !== 1n
+    || stat.size <= 0n || stat.size > BigInt(limits.archiveBytes)) {
+    throw new Error(errorMessage);
+  }
+  return stat;
+}
+
+function assertStableArtifactPath(filePath, descriptor, identity, fileSystem, errorMessage) {
+  const descriptorStat = assertBoundedArtifactStat(
+    fileSystem.fstatSync(descriptor, { bigint: true }),
+    errorMessage,
+  );
+  const pathStat = assertBoundedArtifactStat(
+    fileSystem.lstatSync(filePath, { bigint: true }),
+    errorMessage,
+  );
+  if (pathStat.isSymbolicLink()
+    || fileSystem.realpathSync(filePath) !== filePath
+    || !sameExactFileIdentity(identity, exactFileIdentity(descriptorStat))
+    || !sameExactFileIdentity(identity, exactFileIdentity(pathStat))) {
+    throw new Error(errorMessage);
   }
 }
 
-async function verifyVsix(filePath, { sourceSha = null } = {}) {
-  const buffer = await readStableArtifact(filePath);
+async function withStableArtifact(filePath, options = {}, consume) {
+  const fileSystem = options.fileSystem || fs;
+  const errorMessage = "VSIX pathname is not an exact bounded single-link file.";
+  const absolutePath = path.resolve(filePath);
+  let allocation;
+  let consumerError;
+  let descriptor;
+  let identity;
+  let result;
+  let transactionFailed = false;
+  try {
+    descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS);
+    const openedStat = assertBoundedArtifactStat(
+      fileSystem.fstatSync(descriptor, { bigint: true }),
+      errorMessage,
+    );
+    identity = exactFileIdentity(openedStat);
+    if (options.expectedIdentity
+      && !sameExactFileIdentity(options.expectedIdentity, identity)) {
+      throw new Error(errorMessage);
+    }
+    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
+    const expectedSize = Number(openedStat.size);
+    allocation = Buffer.allocUnsafe(expectedSize);
+    let offset = 0;
+    while (offset < expectedSize) {
+      const bytesRead = fileSystem.readSync(
+        descriptor,
+        allocation,
+        offset,
+        expectedSize - offset,
+        offset,
+      );
+      if (!Number.isSafeInteger(bytesRead) || bytesRead < 0
+        || bytesRead > expectedSize - offset) {
+        throw new Error(errorMessage);
+      }
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset !== expectedSize) throw new Error(errorMessage);
+    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
+    try {
+      result = await consume(allocation.subarray(0, expectedSize), identity);
+    } catch (error) {
+      consumerError = error;
+    }
+    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
+  } catch {
+    transactionFailed = true;
+  } finally {
+    if (Buffer.isBuffer(allocation)) allocation.fill(0);
+    if (descriptor !== undefined) {
+      try {
+        fileSystem.closeSync(descriptor);
+      } catch {
+        transactionFailed = true;
+      }
+    }
+  }
+  if (transactionFailed) throw new Error(errorMessage);
+  if (consumerError) throw consumerError;
+  return result;
+}
+
+function withBoundedNamedFile(filePath, options, consume) {
+  let semanticError;
+  const result = withStableSingleLinkFile(filePath, options, (bytes, identity) => {
+    try {
+      return consume(bytes, identity);
+    } catch (error) {
+      semanticError = error;
+      return undefined;
+    }
+  });
+  if (semanticError) throw semanticError;
+  return result;
+}
+
+async function verifyVsix(filePath, options = {}) {
+  const { sourceSha = null } = options;
+  return withStableArtifact(filePath, options, async (artifactBytes, artifactIdentity) => {
+  const buffer = artifactBytes;
   const central = parseCentralDirectory(buffer);
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
   if (!manifest.dependencies || Object.keys(manifest.dependencies).length) {
@@ -470,7 +583,8 @@ async function verifyVsix(filePath, { sourceSha = null } = {}) {
   assertEmbeddedMetadata(entries, expected, manifest);
 
   return {
-    buffer,
+    artifactIdentity,
+    buffer: Buffer.from(buffer),
     sha256: crypto.createHash("sha256").update(buffer).digest("hex"),
     archiveBytes: buffer.length,
     entryCount: ordinal,
@@ -482,30 +596,21 @@ async function verifyVsix(filePath, { sourceSha = null } = {}) {
       version: manifest.version,
     },
   };
+  });
 }
 
-function validateSidecars(filePath, verification, {
-  expectedSourceSha = null,
-  requirePublishable = false,
-} = {}) {
-  const checksumPath = `${filePath}.sha256`;
-  const provenancePath = `${filePath}.provenance.json`;
-  const checksum = fs.readFileSync(checksumPath, "utf8");
-  if (checksum !== `${verification.sha256}  ${path.basename(filePath)}\n`) {
-    throw new Error("Checksum sidecar does not match the verified VSIX");
-  }
-  const provenance = JSON.parse(fs.readFileSync(provenancePath, "utf8"));
+function validateProvenance(provenance, filePath, verification, options) {
   const allowedFields = new Set([
     "archiveBytes", "entryCount", "filename", "name", "nodeVersion", "npmVersion",
-    "publishable", "publisher", "schemaVersion", "sha256", "sourceClean",
-    "sourceCommitEpoch", "sourceSha", "totalUncompressedBytes", "version",
+    "npmInstallationSha256", "platform", "publishable", "publisher", "schemaVersion", "sha256",
+    "sourceClean", "sourceCommitEpoch", "sourceSha", "totalUncompressedBytes", "version",
   ]);
   const provenanceFields = Object.keys(provenance);
   if (
     provenanceFields.length !== allowedFields.size
     || provenanceFields.some((field) => !allowedFields.has(field))
   ) {
-    throw new Error("Provenance sidecar fields do not match schema version 1");
+    throw new Error("Provenance sidecar fields do not match schema version 3");
   }
   const expected = {
     filename: path.basename(filePath),
@@ -522,7 +627,7 @@ function validateSidecars(filePath, verification, {
       throw new Error(`Provenance sidecar field ${field} does not match the verified VSIX`);
     }
   }
-  if (provenance.schemaVersion !== 1 || !/^[0-9a-f]{40,64}$/.test(provenance.sourceSha || "")) {
+  if (provenance.schemaVersion !== 3 || !/^[0-9a-f]{40,64}$/.test(provenance.sourceSha || "")) {
     throw new Error("Provenance sidecar has an unsupported schema or invalid source SHA");
   }
   if (
@@ -534,28 +639,231 @@ function validateSidecars(filePath, verification, {
   ) {
     throw new Error("Provenance sidecar has invalid source cleanliness or commit metadata");
   }
-  if (!/^v\d+\.\d+\.\d+$/.test(provenance.nodeVersion || "") || !/^\d+\.\d+\.\d+$/.test(provenance.npmVersion || "")) {
+  if (!/^v\d+\.\d+\.\d+$/.test(provenance.nodeVersion || "")
+    || !/^\d+\.\d+\.\d+$/.test(provenance.npmVersion || "")
+    || !/^[a-f0-9]{64}$/u.test(provenance.npmInstallationSha256 || "")
+    || !new Set(["darwin", "linux", "win32"]).has(provenance.platform)) {
     throw new Error("Provenance sidecar has invalid Node.js or npm version metadata");
   }
-  if (expectedSourceSha && provenance.sourceSha !== expectedSourceSha) {
-    throw new Error("Provenance source SHA does not match the expected workflow source");
-  }
-  if (requirePublishable && (!provenance.sourceClean || !provenance.publishable)) {
-    throw new Error("Artifact handoff requires clean, publishable provenance");
-  }
-  const resolvedCommit = runGit(["rev-parse", "--verify", `${provenance.sourceSha}^{commit}`]).trim();
+  const git = options.runGitCommand || runGit;
+  const resolvedCommit = git(["rev-parse", "--verify", `${provenance.sourceSha}^{commit}`]).trim();
   if (resolvedCommit !== provenance.sourceSha) {
     throw new Error("Provenance source SHA does not resolve to the exact recorded commit");
   }
-  const commitEpoch = Number(runGit(["show", "-s", "--format=%ct", provenance.sourceSha]).trim());
+  const commitEpoch = Number(git(["show", "-s", "--format=%ct", provenance.sourceSha]).trim());
   if (commitEpoch !== provenance.sourceCommitEpoch) {
     throw new Error("Provenance commit epoch does not match the recorded source commit");
   }
-  return { checksumPath, provenancePath, provenance };
+  const repositoryRoot = path.resolve(options.repositoryRoot || root);
+  const fileSystem = options.fileSystem || fs;
+  const parseVersionPin = bytes => {
+    const match = /^(\d+\.\d+\.\d+)(?:\r?\n)?$/u.exec(bytes.toString("utf8"));
+    if (!match) throw new Error("Canonical toolchain provenance pin is unsafe or invalid");
+    return match[1];
+  };
+  const parseIntegrityPins = bytes => {
+    const pins = JSON.parse(bytes.toString("utf8"));
+    if (!pins || typeof pins !== "object" || Array.isArray(pins)
+      || JSON.stringify(Object.keys(pins).sort()) !== JSON.stringify(["posix", "win32"])
+      || !/^[a-f0-9]{64}$/u.test(pins.posix || "")
+      || !/^[a-f0-9]{64}$/u.test(pins.win32 || "")) {
+      throw new Error("Canonical toolchain provenance pin is unsafe or invalid");
+    }
+    return pins;
+  };
+  const readWorktreePin = (name, maximumBytes, parse) => withStableSingleLinkFile(
+    path.join(repositoryRoot, name),
+    {
+      errorMessage: "Canonical toolchain provenance pin is unsafe or invalid",
+      fileSystem,
+      maximumBytes,
+      minimumBytes: 1,
+    },
+    parse,
+  );
+  const readCommitPin = (name, maximumBytes, parse) => {
+    const object = `${provenance.sourceSha}:${name}`;
+    const sizeText = git(["cat-file", "-s", object]).trim();
+    if (!/^[1-9]\d*$/u.test(sizeText)) {
+      throw new Error("Canonical toolchain provenance pin is unsafe or invalid");
+    }
+    const size = Number(sizeText);
+    if (!Number.isSafeInteger(size) || size > maximumBytes) {
+      throw new Error("Canonical toolchain provenance pin is unsafe or invalid");
+    }
+    const value = git(["show", object]);
+    const bytes = Buffer.isBuffer(value) ? Buffer.from(value) : Buffer.from(value, "utf8");
+    if (bytes.length !== size) {
+      throw new Error("Canonical toolchain provenance pin is unsafe or invalid");
+    }
+    return parse(bytes);
+  };
+  const readPin = provenance.sourceClean ? readCommitPin : readWorktreePin;
+  const nodeVersion = readPin(".node-version", 64, parseVersionPin);
+  const npmVersion = readPin(".npm-version", 64, parseVersionPin);
+  const npmIntegrityPins = readPin(".npm-integrity", 256, parseIntegrityPins);
+  const npmIntegrity = npmIntegrityPins[provenance.platform === "win32" ? "win32" : "posix"];
+  if (provenance.nodeVersion !== `v${nodeVersion}`
+    || provenance.npmVersion !== npmVersion
+    || provenance.npmInstallationSha256 !== npmIntegrity) {
+    throw new Error("Provenance toolchain does not match the exact repository pins");
+  }
+  if (options.expectedSourceSha && provenance.sourceSha !== options.expectedSourceSha) {
+    throw new Error("Provenance source SHA does not match the expected workflow source");
+  }
+  if (options.requirePublishable && (!provenance.sourceClean || !provenance.publishable)) {
+    throw new Error("Artifact handoff requires clean, publishable provenance");
+  }
+  return provenance;
+}
+
+function readProvenanceSidecar(filePath, options = {}) {
+  const provenancePath = `${path.resolve(filePath)}.provenance.json`;
+  return withBoundedNamedFile(provenancePath, {
+    errorMessage: "Provenance sidecar is not an exact bounded single-link file.",
+    expectedIdentity: options.expectedIdentity,
+    fileSystem: options.fileSystem,
+    maximumBytes: MAX_PROVENANCE_SIDECAR_BYTES,
+    minimumBytes: 1,
+  }, (bytes, identity) => Object.freeze({
+    identity,
+    provenance: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
+  }));
+}
+
+function withStableSidecarSet(filePath, verification, options = {}, consume) {
+  const absolutePath = path.resolve(filePath);
+  const checksumPath = `${absolutePath}.sha256`;
+  const provenancePath = `${absolutePath}.provenance.json`;
+  if (!Buffer.isBuffer(verification?.buffer)
+    || verification.buffer.length !== verification.archiveBytes
+    || crypto.createHash("sha256").update(verification.buffer).digest("hex")
+      !== verification.sha256) {
+    throw new Error("Sidecar validation requires exact verified VSIX bytes");
+  }
+  return withBoundedNamedFile(absolutePath, {
+    errorMessage: "Verified VSIX pathname is not an exact bounded single-link file.",
+    expectedBytes: verification.archiveBytes,
+    expectedIdentity: verification.artifactIdentity,
+    fileSystem: options.fileSystem,
+    maximumBytes: limits.archiveBytes,
+    minimumBytes: 1,
+  }, (artifactBytes, artifactIdentity) => {
+    if (!artifactBytes.equals(verification.buffer)) {
+      throw new Error("Verified VSIX pathname does not contain the verified artifact bytes");
+    }
+    return withBoundedNamedFile(checksumPath, {
+      errorMessage: "Checksum sidecar is not an exact bounded single-link file.",
+      expectedIdentity: options.expectedChecksumIdentity,
+      fileSystem: options.fileSystem,
+      maximumBytes: MAX_CHECKSUM_SIDECAR_BYTES,
+      minimumBytes: 1,
+    }, (checksumBytes, checksumIdentity) => {
+      return withBoundedNamedFile(provenancePath, {
+        errorMessage: "Provenance sidecar is not an exact bounded single-link file.",
+        expectedIdentity: options.expectedProvenanceIdentity,
+        fileSystem: options.fileSystem,
+        maximumBytes: MAX_PROVENANCE_SIDECAR_BYTES,
+        minimumBytes: 1,
+      }, (provenanceBytes, provenanceIdentity) => {
+        return consume(Object.freeze({
+          absolutePath,
+          artifactBytes,
+          artifactIdentity,
+          checksumBytes,
+          checksumIdentity,
+          checksumPath,
+          provenanceBytes,
+          provenanceIdentity,
+          provenancePath,
+        }));
+      });
+    });
+  });
+}
+
+function validateSidecars(filePath, verification, options = {}) {
+  return withStableSidecarSet(filePath, verification, options, proof => {
+    const checksum = new TextDecoder("utf-8", { fatal: true }).decode(proof.checksumBytes);
+    if (checksum !== `${verification.sha256}  ${path.basename(proof.absolutePath)}\n`) {
+      throw new Error("Checksum sidecar does not match the verified VSIX");
+    }
+    const provenance = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(proof.provenanceBytes),
+    );
+    validateProvenance(provenance, proof.absolutePath, verification, options);
+    return Object.freeze({
+      artifactIdentity: proof.artifactIdentity,
+      checksumIdentity: proof.checksumIdentity,
+      checksumPath: proof.checksumPath,
+      provenance,
+      provenanceIdentity: proof.provenanceIdentity,
+      provenancePath: proof.provenancePath,
+    });
+  });
+}
+
+function artifactSourceSha(filePath, options = {}) {
+  const fileSystem = options.fileSystem || fs;
+  if (!fileSystem.existsSync(filePath)) return null;
+  try {
+    const { provenance } = readProvenanceSidecar(filePath, options);
+    return /^[0-9a-f]{40,64}$/.test(provenance?.sourceSha || "")
+      ? provenance.sourceSha
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function selectArtifactPath({ releasePath, developmentPath, expectedSourceSha, fileSystem = fs }) {
+  if (!/^[0-9a-f]{40,64}$/.test(expectedSourceSha || "")) {
+    throw new Error("Default VSIX selection requires an exact expected source SHA");
+  }
+  const candidates = [releasePath, developmentPath]
+    .filter(candidate => fileSystem.existsSync(candidate));
+  if (candidates.length === 0) {
+    throw new Error("No release or development VSIX artifact exists for the current package");
+  }
+  const matches = candidates.filter(candidate => (
+    artifactSourceSha(candidate, { fileSystem }) === expectedSourceSha
+  ));
+  if (matches.length === 0) {
+    throw new Error("No VSIX artifact has valid provenance for the expected source SHA");
+  }
+  if (matches.length > 1) {
+    throw new Error("VSIX artifact selection is ambiguous for the expected source SHA");
+  }
+  return matches[0];
+}
+
+function resolveExpectedSourceSha(options, currentSourceSha) {
+  if (options.currentSource
+    && !/^[0-9a-f]{40,64}$/.test(currentSourceSha || "")) {
+    throw new Error("Could not resolve the exact current source SHA");
+  }
+  if (options.currentSource
+    && options.expectedSourceSha
+    && options.expectedSourceSha !== currentSourceSha) {
+    throw new Error("Explicit expected source SHA does not match the current checkout");
+  }
+  return options.expectedSourceSha || currentSourceSha || null;
+}
+
+function verificationSourceSha(provenance, {
+  currentSource = false,
+  currentSourceDirty = false,
+} = {}) {
+  if (currentSourceDirty && !currentSource) {
+    throw new Error("Dirty-worktree verification state requires --current-source");
+  }
+  if (!provenance?.sourceClean || (currentSource && currentSourceDirty)) return null;
+  return provenance.sourceSha;
 }
 
 function parseCliArguments(arguments_) {
   const options = {
+    currentSource: false,
     expectedSourceSha: null,
     explicitPath: null,
     list: false,
@@ -566,6 +874,8 @@ function parseCliArguments(arguments_) {
     const argument = arguments_[index];
     if (argument === "--require-sidecars") {
       options.requireSidecars = true;
+    } else if (argument === "--current-source") {
+      options.currentSource = true;
     } else if (argument === "--require-publishable") {
       options.requirePublishable = true;
     } else if (argument === "--list") {
@@ -584,6 +894,12 @@ function parseCliArguments(arguments_) {
   if (options.expectedSourceSha !== null && !/^[0-9a-f]{40,64}$/.test(options.expectedSourceSha || "")) {
     throw new Error("--expected-source-sha requires a full hexadecimal commit SHA");
   }
+  if ((options.currentSource || options.expectedSourceSha) && !options.requireSidecars) {
+    throw new Error("VSIX source binding requires --require-sidecars");
+  }
+  if (!options.explicitPath && !options.currentSource && !options.expectedSourceSha) {
+    throw new Error("VSIX verification requires an explicit artifact path or source binding");
+  }
   if (options.requirePublishable && !options.requireSidecars) {
     throw new Error("--require-publishable requires --require-sidecars");
   }
@@ -596,16 +912,31 @@ async function main() {
   const filename = `${manifest.name}-${manifest.version}.vsix`;
   const releasePath = path.join(root, "out", "release", filename);
   const developmentPath = path.join(root, "out", "development", filename);
-  const filePath = path.resolve(options.explicitPath || (fs.existsSync(releasePath) ? releasePath : developmentPath));
+  const currentSourceSha = options.currentSource
+    ? runGit(["rev-parse", "--verify", "HEAD^{commit}"]).trim()
+    : null;
+  const currentSourceDirty = options.currentSource
+    ? runGit(["status", "--porcelain=v1", "--untracked-files=all"]).length > 0
+    : false;
+  const expectedSourceSha = resolveExpectedSourceSha(options, currentSourceSha);
+  const filePath = options.explicitPath
+    ? path.resolve(root, options.explicitPath)
+    : selectArtifactPath({ releasePath, developmentPath, expectedSourceSha });
   let sourceSha = null;
+  let provenanceIdentity;
   if (options.requireSidecars) {
-    const provenance = JSON.parse(fs.readFileSync(`${filePath}.provenance.json`, "utf8"));
-    sourceSha = provenance.sourceClean ? provenance.sourceSha : null;
+    const provenanceProof = readProvenanceSidecar(filePath);
+    provenanceIdentity = provenanceProof.identity;
+    sourceSha = verificationSourceSha(provenanceProof.provenance, {
+      currentSource: options.currentSource,
+      currentSourceDirty,
+    });
   }
   const verification = await verifyVsix(filePath, { sourceSha });
   if (options.requireSidecars) {
     validateSidecars(filePath, verification, {
-      expectedSourceSha: options.expectedSourceSha,
+      expectedSourceSha,
+      expectedProvenanceIdentity: provenanceIdentity,
       requirePublishable: options.requirePublishable,
     });
   }
@@ -632,8 +963,15 @@ module.exports = {
   limits,
   parseCentralDirectory,
   parseCliArguments,
+  readProvenanceSidecar,
+  runPackageGitCommand: runGit,
+  resolveExpectedSourceSha,
   scanSensitiveBytes,
+  selectArtifactPath,
+  verificationSourceSha,
   validateArchivePath,
   validateSidecars,
   verifyVsix,
+  withStableArtifact,
+  withStableSidecarSet,
 };

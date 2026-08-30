@@ -107,8 +107,12 @@ function safeUpstream(format, name, isActive = true, origin = "") {
 
 function deferred() {
   let resolve;
-  const promise = new Promise(res => { resolve = res; });
-  return { promise, resolve };
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 suite("RepositoryNode Test Suite", () => {
@@ -1188,6 +1192,275 @@ suite("RepositoryNode Test Suite", () => {
     assert.ok(labels.includes("Package loading canceled"));
     assert.strictEqual(labels.includes("Repository is empty"), false);
     assert.strictEqual(repositoryNode._packageState.complete, false);
+  });
+
+  test("QH-001 publishes package rows while upstream metadata remains pending", async function () {
+    this.timeout(2000);
+    const metadataGate = deferred();
+    const refreshes = [];
+    const repositoryNode = new RepositoryNodeImplementation(
+      { slug: "packages", slug_perm: "packages", name: "Packages" },
+      "acme",
+      context,
+      {
+        connectionManager,
+        upstreamInventory: {
+          getAllUpstreamData() { return metadataGate.promise; },
+        },
+        createPaginatedFetch: () => ({
+          async fetchCollection() {
+            const failure = collectionFailure(1, "timeout");
+            return makeCollectionResult({
+              items: [makePackage("authoritative-package")],
+              failures: [failure],
+              failureCount: 1,
+              termination: "request_failed",
+              pageCount: 1,
+              requestCount: 1,
+              pagination: makePagination(1, 1, 30, 1),
+            });
+          },
+        }),
+        requestRefresh: node => refreshes.push(node),
+      }
+    );
+    let publication;
+
+    try {
+      publication = repositoryNode.getChildren();
+      const outcome = await Promise.race([
+        publication.then(children => ({ kind: "published", children })),
+        new Promise(resolve => setTimeout(() => resolve({ kind: "timeout" }), 100)),
+      ]);
+
+      assert.strictEqual(
+        outcome.kind,
+        "published",
+        "package authority must not await supplementary upstream metadata"
+      );
+      assert.deepStrictEqual(
+        outcome.children
+          .filter(child => repositoryNode.ownsPackageSelection(child))
+          .map(child => child.name),
+        ["authoritative-package"]
+      );
+      assert.strictEqual(
+        outcome.children[0].getTreeItem().contextValue,
+        "repositoryPackagesPartial",
+        "typed package terminal truth must publish before retained rows and metadata"
+      );
+      assert.deepStrictEqual(outcome.children[0].terminalOutcome, {
+        kind: "partial",
+        scope: "repository",
+        authoritative: false,
+        action: "retry",
+      });
+      assert.strictEqual(
+        outcome.children.some(child => child instanceof UpstreamIndicatorNode),
+        false,
+        "pending metadata must not be fabricated into the first publication"
+      );
+
+      metadataGate.resolve(completeUpstreamState([
+        safeUpstream("npm", "npmjs", true, "https://registry.npmjs.org"),
+      ]));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepStrictEqual(refreshes, [repositoryNode]);
+
+      const settledChildren = await repositoryNode.getChildren();
+      assert.strictEqual(
+        settledChildren.some(child => child instanceof UpstreamIndicatorNode),
+        true,
+        "settled supplementary metadata must publish through a safe refresh"
+      );
+    } finally {
+      metadataGate.resolve(completeUpstreamState());
+      if (publication) await publication.catch(() => {});
+      repositoryNode.dispose();
+    }
+  });
+
+  test("QH-001 publishes package rows while entitlement metadata remains pending", async function () {
+    this.timeout(2000);
+    vscode.workspace.getConfiguration = () => ({
+      get(key) {
+        if (key === "showEntitlements") return true;
+        if (key === "showMaxPackages") return 30;
+        return false;
+      },
+    });
+    const entitlementGate = deferred();
+    const refreshes = [];
+    const repositoryNode = new RepositoryNodeImplementation(
+      { slug: "packages", slug_perm: "packages", name: "Packages" },
+      "acme",
+      context,
+      {
+        connectionManager,
+        upstreamInventory: {
+          async getAllUpstreamData() { return completeUpstreamState(); },
+        },
+        createPaginatedFetch: () => ({
+          async fetchCollection(endpoint) {
+            if (endpoint.includes("entitlements/")) return entitlementGate.promise;
+            return makeCollectionResult({
+              items: [makePackage("authoritative-package")],
+              complete: true,
+              pageCount: 1,
+              requestCount: 1,
+              pagination: makePagination(1, 1, 30, 1),
+            });
+          },
+        }),
+        requestRefresh: node => refreshes.push(node),
+      }
+    );
+
+    try {
+      const firstChildren = await repositoryNode.getChildren();
+      assert.deepStrictEqual(
+        firstChildren
+          .filter(child => repositoryNode.ownsPackageSelection(child))
+          .map(child => child.name),
+        ["authoritative-package"]
+      );
+      assert.strictEqual(
+        firstChildren.some(child => child instanceof EntitlementSummaryNode),
+        false
+      );
+
+      entitlementGate.resolve(makeCollectionResult({
+        items: [{ name: "CI", slug_perm: "ci", is_active: true }],
+        complete: true,
+        pageCount: 1,
+        requestCount: 1,
+        pagination: makePagination(1, 1, 50, 1),
+      }));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepStrictEqual(refreshes, [repositoryNode]);
+
+      const settledChildren = await repositoryNode.getChildren();
+      assert.strictEqual(
+        settledChildren.some(child => child instanceof EntitlementSummaryNode),
+        true
+      );
+    } finally {
+      entitlementGate.resolve(makeCollectionResult({ complete: true }));
+      repositoryNode.dispose();
+    }
+  });
+
+  test("QH-001 observes late metadata rejection without losing package authority", async function () {
+    this.timeout(2000);
+    const metadataGate = deferred();
+    const refreshes = [];
+    const unhandled = [];
+    const onUnhandled = reason => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    const repositoryNode = new RepositoryNodeImplementation(
+      { slug: "packages", slug_perm: "packages", name: "Packages" },
+      "acme",
+      context,
+      {
+        connectionManager,
+        upstreamInventory: {
+          getAllUpstreamData() { return metadataGate.promise; },
+        },
+        createPaginatedFetch: () => ({
+          async fetchCollection() {
+            return makeCollectionResult({
+              items: [makePackage("authoritative-package")],
+              complete: true,
+              pageCount: 1,
+              requestCount: 1,
+            });
+          },
+        }),
+        requestRefresh: node => {
+          refreshes.push(node);
+          return Promise.reject(new Error("refresh observer rejected"));
+        },
+      }
+    );
+
+    try {
+      const firstChildren = await repositoryNode.getChildren();
+      assert.deepStrictEqual(
+        firstChildren
+          .filter(child => repositoryNode.ownsPackageSelection(child))
+          .map(child => child.name),
+        ["authoritative-package"]
+      );
+
+      metadataGate.reject(new Error("late upstream failure"));
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepStrictEqual(unhandled, []);
+      assert.deepStrictEqual(refreshes, [repositoryNode]);
+
+      const settledChildren = await repositoryNode.getChildren();
+      assert.ok(settledChildren.some(child => (
+        child.getTreeItem().label === "Upstreams: failed to load"
+      )));
+      assert.deepStrictEqual(
+        settledChildren
+          .filter(child => repositoryNode.ownsPackageSelection(child))
+          .map(child => child.name),
+        ["authoritative-package"]
+      );
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+      metadataGate.resolve(completeUpstreamState());
+      repositoryNode.dispose();
+    }
+  });
+
+  test("QH-001 suppresses a stale metadata refresh after account replacement", async function () {
+    this.timeout(2000);
+    const metadataGate = deferred();
+    const refreshes = [];
+    const repositoryNode = new RepositoryNodeImplementation(
+      { slug: "packages", slug_perm: "packages", name: "Packages" },
+      "acme",
+      context,
+      {
+        connectionManager,
+        upstreamInventory: {
+          getAllUpstreamData() { return metadataGate.promise; },
+        },
+        createPaginatedFetch: () => ({
+          async fetchCollection() {
+            return makeCollectionResult({
+              items: [makePackage("authoritative-package")],
+              complete: true,
+              pageCount: 1,
+              requestCount: 1,
+            });
+          },
+        }),
+        requestRefresh: node => refreshes.push(node),
+      }
+    );
+
+    try {
+      const firstChildren = await repositoryNode.getChildren();
+      assert.strictEqual(
+        firstChildren.filter(child => repositoryNode.ownsPackageSelection(child)).length,
+        1
+      );
+      connectionManager.setState({ accountEpoch: 2 });
+      metadataGate.resolve(completeUpstreamState([
+        safeUpstream("npm", "stale", true, "https://registry.npmjs.org"),
+      ]));
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+
+      assert.deepStrictEqual(refreshes, []);
+      assert.strictEqual(repositoryNode._metadataLoaded, false);
+    } finally {
+      metadataGate.resolve(completeUpstreamState());
+      repositoryNode.dispose();
+    }
   });
 
   test("FUX-002 publishes machine-readable empty, failed, and cancelled package outcomes", async () => {

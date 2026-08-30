@@ -28,6 +28,7 @@ class helpProvider {
 
         return HELP_LINKS.map(link => new helpNode(
             link.label,
+            link.id,
             link.url,
             link.icon === 'cloudsmith' ? cloudsmithLogo : new vscode.ThemeIcon(
                 link.icon === 'github' ? 'logo-github' : 'link-external'
@@ -41,4 +42,3 @@ class helpProvider {
 }
 
 module.exports = { helpProvider };
-

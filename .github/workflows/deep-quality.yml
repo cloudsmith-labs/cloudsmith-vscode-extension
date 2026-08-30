@@ -1,0 +1,224 @@
+---
+name: Manual deep quality
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 22.23.2
+  CANDIDATE_SHA: ${{ github.sha }}
+
+jobs:
+  core-mutation:
+    name: Core mutation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Harden exact hosted Node.js runtime
+        if: runner.os == 'Linux'
+        run: node scripts/quality/harden-hosted-node-runtime.js
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify release-quality contracts
+        run: npm run verify:quality
+
+      - name: Run core mutation
+        id: mutation_run
+        run: |
+          set +e
+          npm run test:mutation:core
+          status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Verify exact core mutation evidence handoff
+        id: mutation_evidence_handoff
+        if: ${{ always() }}
+        env:
+          EXPECTED_MUTATION_EXIT_CODE: ${{ steps.mutation_run.outputs.exit_code }}
+          EXPECTED_MUTATION_OUTCOME: ${{ steps.mutation_run.outcome }}
+          EXPECTED_SOURCE_SHA: ${{ env.CANDIDATE_SHA }}
+        run: npm run quality:verify-mutation-evidence -- --mode core --expected-exit-code "$EXPECTED_MUTATION_EXIT_CODE" --expected-run-outcome "$EXPECTED_MUTATION_OUTCOME" --expected-source-sha "$EXPECTED_SOURCE_SHA"
+
+      - name: Upload core mutation evidence
+        if: ${{ always() && steps.mutation_evidence_handoff.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: core-mutation-evidence-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}
+          path: |
+            .quality/mutation/summary-core.json
+            .quality/mutation/mutation.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
+
+      - name: Set up the pinned secret scanner after mutation evidence
+        if: ${{ always() }}
+        uses: ./.github/actions/setup-gitleaks
+
+      - name: Scan complete Git history without suppressing mutation work
+        id: history_secret_scan
+        if: ${{ always() }}
+        run: npm run quality:secrets:history
+
+      - name: Upload only the value-blind history receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: history-secret-receipt-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}
+          path: .quality/secrets/history.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
+
+  signed-out-black-box-ui:
+    name: Signed-out packaged black-box UI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Harden exact hosted Node.js runtime
+        if: runner.os == 'Linux'
+        run: node scripts/quality/harden-hosted-node-runtime.js
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Set up the pinned secret scanner
+        uses: ./.github/actions/setup-gitleaks
+
+      - name: Run signed-out packaged black-box UI
+        id: ui_smoke
+        run: npm run test:ui:smoke
+
+      - name: Verify exact candidate and UI result binding
+        id: ui_evidence_handoff
+        if: ${{ always() }}
+        run: node scripts/quality/verify-ui-evidence.js
+
+      - name: Scan upload-eligible signed-out UI evidence
+        id: ui_evidence_secret_scan
+        if: ${{ always() }}
+        run: npm run quality:secrets:signed-out-evidence
+
+      - name: Verify detached staged signed-out UI evidence
+        id: ui_evidence_bundle
+        if: ${{ always() }}
+        env:
+          EXPECTED_SOURCE_SHA: ${{ env.CANDIDATE_SHA }}
+        run: node scripts/quality/verify-ui-evidence.js --bundle .quality/upload/signed-out-ui
+
+      - name: Upload safe signed-out UI receipts
+        if: ${{ always() && steps.ui_evidence_handoff.outcome == 'success' && steps.ui_evidence_secret_scan.outcome == 'success' && steps.ui_evidence_bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-out-ui-evidence-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}
+          path: |-
+            .quality/upload/signed-out-ui/evidence.json
+            .quality/upload/signed-out-ui/result.json
+            .quality/upload/signed-out-ui/ui-candidate.json
+            .quality/upload/signed-out-ui/ui-candidate.vsix
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
+
+  authenticated-production-ui:
+    name: Authenticated packaged production UI
+    runs-on: ubuntu-24.04
+    environment: cloudsmith-release-qualification
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Harden exact hosted Node.js runtime
+        if: runner.os == 'Linux'
+        run: node scripts/quality/harden-hosted-node-runtime.js
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Set up the pinned secret scanner
+        uses: ./.github/actions/setup-gitleaks
+
+      - name: Prepare and validate exact authenticated candidate without credentials
+        run: npm run quality:qualification:prepare-authenticated-ci
+
+      - name: Run authenticated packaged production UI
+        id: authenticated_qualification
+        timeout-minutes: 15
+        env:
+          CLOUDSMITH_QUALIFICATION_API_KEY: ${{ secrets.CLOUDSMITH_QUALIFICATION_API_KEY }}
+        run: xvfb-run -a node scripts/quality/run-authenticated-ci.js
+
+      - name: Always clean the authenticated profile session
+        id: authenticated_profile_cleanup
+        if: ${{ always() }}
+        run: node scripts/quality/authenticated-candidate-session.js cleanup
+
+      - name: Verify exact authenticated evidence binding
+        id: authenticated_evidence_handoff
+        if: ${{ always() }}
+        env:
+          EXPECTED_SOURCE_SHA: ${{ env.CANDIDATE_SHA }}
+        run: npm run quality:verify-authenticated-evidence
+
+      - name: Scan upload-eligible authenticated evidence
+        id: authenticated_evidence_secret_scan
+        if: ${{ always() }}
+        run: npm run quality:secrets:evidence
+
+      - name: Upload safe authenticated UI receipts
+        if: ${{ always() && steps.authenticated_evidence_handoff.outcome == 'success' && steps.authenticated_evidence_secret_scan.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: authenticated-ui-evidence-${{ env.CANDIDATE_SHA }}-${{ github.run_attempt }}
+          path: |
+            .quality/qualification/authenticated-candidate.json
+            .quality/qualification/authenticated-candidate.vsix
+            .quality/qualification/authenticated-ci.json
+            .quality/secrets/authenticated-ci.json
+            .quality/secrets/evidence.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30

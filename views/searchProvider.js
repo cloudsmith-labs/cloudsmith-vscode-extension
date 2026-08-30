@@ -81,7 +81,6 @@ class SearchProvider {
         this._activeRoot = null;
         this._activePage = null;
         this._disposed = false;
-        this._selectionGeneration = 0;
         this._packageSelections = new WeakMap();
         this._contextProjector = options.contextKeyProjector || new ContextKeyProjector({
             defaults: {
@@ -989,7 +988,6 @@ class SearchProvider {
             return this._contextProjector.dispose();
         }
         this._disposed = true;
-        this._selectionGeneration += 1;
         this._invalidateOperations();
         this._connectionSubscription?.dispose?.();
         this._vulnerabilityStateSubscription?.dispose?.();
@@ -1065,7 +1063,7 @@ class SearchProvider {
             }
             return [new InfoNode(
                 "Search packages across a Cloudsmith workspace",
-                "Use the search icon above or Ctrl+Shift+P \u2192 Search packages.",
+                "Run Search packages from the view toolbar or Command Palette.",
                 "Search by name, format, version, license, or policy status across repositories in a workspace.",
                 "search"
             )];
@@ -1103,7 +1101,6 @@ class SearchProvider {
 
     refresh() {
         if (!this._disposed) {
-            this._selectionGeneration += 1;
             this._pruneVulnerabilitySummaries(this._currentCommitted()?.results || []);
             this._scheduleContextUpdate();
             this._onDidChangeTreeData.fire();
@@ -1132,9 +1129,11 @@ class SearchProvider {
     ownsPackageSelection(selection) {
         if (this._disposed || !selection || typeof selection !== "object") return false;
         const ownership = this._packageSelections.get(selection);
+        const committed = ownership && this._currentCommitted(ownership.account);
         return Boolean(
             ownership
-            && ownership.generation === this._selectionGeneration
+            && committed
+            && committed.results.includes(selection)
             && this._isAccountCurrent(ownership.account)
         );
     }
@@ -1144,7 +1143,6 @@ class SearchProvider {
         for (const selection of selections) {
             if (!selection || typeof selection !== "object") continue;
             this._packageSelections.set(selection, Object.freeze({
-                generation: this._selectionGeneration,
                 account,
             }));
         }

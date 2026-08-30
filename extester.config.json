@@ -1,0 +1,32 @@
+{
+  "$schema": "./node_modules/vscode-extension-tester/resources/extester.schema.json",
+  "setup": {
+    "vscodeVersion": "1.131.0",
+    "type": "stable",
+    "storage": "./ui-test/RUN_THROUGH_QUALITY_RUNNER",
+    "extensionsDir": "./ui-test/RUN_THROUGH_QUALITY_RUNNER",
+    "installDependencies": false,
+    "noCache": false,
+    "packageOptions": {
+      "useYarn": false,
+      "followSymlinks": false
+    }
+  },
+  "run": {
+    "testFiles": [
+      "./ui-test/smoke.test.js"
+    ],
+    "vscodeVersion": "1.131.0",
+    "type": "stable",
+    "storage": "./ui-test/RUN_THROUGH_QUALITY_RUNNER",
+    "extensionsDir": "./ui-test/RUN_THROUGH_QUALITY_RUNNER",
+    "settings": "./ui-test/settings.json",
+    "cleanup": false,
+    "mochaConfig": "./ui-test/mocha.config.json",
+    "logLevel": "Info",
+    "offline": true,
+    "coverage": false,
+    "resources": [],
+    "locale": ""
+  }
+}

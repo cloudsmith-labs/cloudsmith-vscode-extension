@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cloudsmith.com/schemas/vscode-extension-remote-ci-receipt-v2.json",
+  "title": "Final-head remote CI receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "repository", "branch", "sourceSha", "sourceFingerprint", "capturedAt",
+    "pullRequest", "runs", "codeqlAggregate", "signedOutUiArtifact", "evidence"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 2 },
+    "repository": { "const": "cloudsmith-labs/cloudsmith-vscode-extension" },
+    "branch": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "sourceSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sourceFingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "capturedAt": { "type": "string", "format": "date-time" },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "const": "internal_docs/quality/remote-ci-api.json" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "pullRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["number", "draft", "state", "baseRef", "headRef", "headSha", "url"],
+      "properties": {
+        "number": { "type": "integer", "minimum": 1 },
+        "draft": { "const": true },
+        "state": { "const": "open" },
+        "baseRef": { "const": "main" },
+        "headRef": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "headSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "url": {
+          "type": "string",
+          "pattern": "^https://github\\.com/cloudsmith-labs/cloudsmith-vscode-extension/pull/[1-9][0-9]*$"
+        }
+      }
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "workflowFile", "workflowName", "event", "runId", "runAttempt",
+          "pullRequestNumber", "headSha", "status", "conclusion", "createdAt",
+          "completedAt", "url", "jobs"
+        ],
+        "properties": {
+          "workflowFile": {
+            "enum": [
+              ".github/workflows/main.yml",
+              ".github/workflows/codeql-analysis.yml",
+              "dynamic/github-code-scanning/codeql"
+            ]
+          },
+          "workflowName": { "type": "string", "minLength": 1 },
+          "event": { "enum": ["pull_request", "dynamic"] },
+          "runId": { "type": "integer", "minimum": 1 },
+          "runAttempt": { "type": "integer", "minimum": 1 },
+          "pullRequestNumber": { "type": "integer", "minimum": 1 },
+          "headSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+          "status": { "const": "completed" },
+          "conclusion": { "const": "success" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "completedAt": { "type": "string", "format": "date-time" },
+          "url": {
+            "type": "string",
+            "pattern": "^https://github\\.com/cloudsmith-labs/cloudsmith-vscode-extension/actions/runs/[1-9][0-9]*$"
+          },
+          "jobs": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id", "name", "databaseId", "status", "conclusion", "startedAt", "completedAt"
+              ],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "name": { "type": "string", "minLength": 1 },
+                "databaseId": { "type": "integer", "minimum": 1 },
+                "status": { "const": "completed" },
+                "conclusion": { "const": "success" },
+                "startedAt": { "type": "string", "format": "date-time" },
+                "completedAt": { "type": "string", "format": "date-time" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "codeqlAggregate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "databaseId", "name", "appSlug", "headSha", "status", "conclusion",
+        "startedAt", "completedAt", "annotationsCount", "title", "url"
+      ],
+      "properties": {
+        "databaseId": { "type": "integer", "minimum": 1 },
+        "name": { "const": "CodeQL" },
+        "appSlug": { "const": "github-advanced-security" },
+        "headSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "status": { "const": "completed" },
+        "conclusion": { "const": "success" },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" },
+        "annotationsCount": { "const": 0 },
+        "title": { "const": "No new alerts in code changed by this pull request" },
+        "url": {
+          "type": "string",
+          "pattern": "^https://github\\.com/cloudsmith-labs/cloudsmith-vscode-extension/runs/[1-9][0-9]*$"
+        }
+      }
+    },
+    "signedOutUiArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifactId", "name", "digest", "sizeBytes", "expired", "createdAt",
+        "updatedAt", "runId", "runAttempt", "headSha", "branch"
+      ],
+      "properties": {
+        "artifactId": { "type": "integer", "minimum": 1 },
+        "name": {
+          "type": "string",
+          "pattern": "^signed-out-ui-evidence-[a-f0-9]{40}-[1-9][0-9]*$"
+        },
+        "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "sizeBytes": { "type": "integer", "minimum": 1 },
+        "expired": { "const": false },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "runId": { "type": "integer", "minimum": 1 },
+        "runAttempt": { "type": "integer", "minimum": 1 },
+        "headSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "branch": { "type": "string", "minLength": 1, "maxLength": 255 }
+      }
+    }
+  }
+}

@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cloudsmith-labs/cloudsmith-vscode-extension/quality/finding.schema.json",
+  "title": "Cloudsmith VS Code quality finding",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "severity",
+    "domain",
+    "status",
+    "deterministicStatus",
+    "liveStatus",
+    "surface",
+    "workflowContract",
+    "failureClasses",
+    "customerImpact",
+    "reproductionConfidence",
+    "authoritativeExpectedOutcome",
+    "observedOutcome",
+    "firstKnownBadSha",
+    "evidence",
+    "rootCauseStatus",
+    "requiredEvidenceLayers",
+    "testLayerThatShouldHaveCaughtIt",
+    "whyItEscaped",
+    "regressionTest",
+    "mutationProof",
+    "fixedSha",
+    "liveVerification",
+    "releaseBlocking"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^QH-[0-9]{3,}$" },
+    "severity": { "enum": ["P0", "P1", "P2", "P3"] },
+    "domain": {
+      "enum": [
+        "product",
+        "test-harness",
+        "ci",
+        "release-evidence",
+        "security-environment",
+        "documentation",
+        "external-platform"
+      ]
+    },
+    "status": {
+      "enum": [
+        "open",
+        "closed",
+        "deferred",
+        "closed-non-issue"
+      ]
+    },
+    "deterministicStatus": { "enum": ["failing", "fixed", "not-applicable"] },
+    "liveStatus": { "enum": ["not-required", "pending", "blocked", "verified", "failed"] },
+    "surface": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "workflowContract": { "type": "string", "pattern": "^WF-[A-Z0-9-]+$" },
+    "failureClasses": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "contract-mismatch",
+          "provenance",
+          "canonical-identity",
+          "async-authority",
+          "stale-publication",
+          "terminal-state",
+          "pagination",
+          "boundedness",
+          "error-normalization",
+          "validation/security",
+          "auth-capability",
+          "cross-surface-parity",
+          "capability-composition",
+          "format-native-semantics",
+          "false-green-test",
+          "accessibility",
+          "documentation-drift"
+        ]
+      }
+    },
+    "customerImpact": { "type": "string", "minLength": 1 },
+    "reproductionConfidence": {
+      "enum": [
+        "confirmed-repeatable",
+        "confirmed-once",
+        "strong-static-evidence",
+        "suspected",
+        "blocked"
+      ]
+    },
+    "authoritativeExpectedOutcome": { "type": "string", "minLength": 1 },
+    "observedOutcome": { "type": "string", "minLength": 1 },
+    "firstKnownBadSha": { "type": ["string", "null"], "pattern": "^[a-f0-9]{7,40}$" },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "location", "summary"],
+        "properties": {
+          "kind": { "enum": ["test", "live-ui", "log", "screenshot", "source", "protocol"] },
+          "location": { "type": "string", "minLength": 1 },
+          "summary": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "rootCauseStatus": { "enum": ["unknown", "suspected", "proven"] },
+    "rootCause": { "type": ["string", "null"] },
+    "requiredEvidenceLayers": {
+      "description": "The lowest reviewed evidence layer or layers that authoritatively prove the escaped finding contract. This is independent of broader workflow qualification depth.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "unit",
+          "contract",
+          "extension-host",
+          "live-protocol",
+          "black-box-ui",
+          "documentation",
+          "durable-security-scan",
+          "external-confirmation"
+        ]
+      }
+    },
+    "testLayerThatShouldHaveCaughtIt": {
+      "description": "Records the layer where the defect escaped. The separately reviewed requiredEvidenceLayers field records the lowest authoritative closure layer; workflow-wide qualification depth does not override it.",
+      "enum": ["unit", "contract", "extension-host", "live-protocol", "black-box-ui", "documentation"]
+    },
+    "whyItEscaped": { "type": "string", "minLength": 1 },
+    "appearedCoveredBy": { "type": ["string", "null"] },
+    "falseGreenBoundary": { "type": ["string", "null"] },
+    "regressionTest": { "type": ["string", "null"] },
+    "mutationProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary"],
+      "properties": {
+        "status": {
+          "enum": ["not-started", "red-confirmed", "green-confirmed", "mutation-killed", "partial", "blocked", "not-applicable"]
+        },
+        "summary": { "type": "string" }
+      }
+    },
+    "fixedSha": { "type": ["string", "null"], "pattern": "^[a-f0-9]{7,40}$" },
+    "liveVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary"],
+      "properties": {
+        "summary": { "type": "string", "minLength": 1 }
+      }
+    },
+    "releaseBlocking": { "type": "boolean" }
+  }
+}

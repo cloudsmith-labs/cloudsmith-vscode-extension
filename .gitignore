@@ -9,6 +9,9 @@ coverage/
 *.map
 .tmp-vsix/
 .vsix-package/
+.quality/
+.stryker-tmp/
+test-resources/
 .env
 .DS_Store
 .src/

@@ -1,17 +1,9 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const path = require("path");
 const { spawnSync } = require("child_process");
-const { LIVE_TEST_SKIP_REASON } = require("../test/testInventories");
+const { CREDENTIAL_BOUNDARY_SKIP_REASON } = require("../test/testInventories");
 
 const root = path.resolve(__dirname, "..");
-const label = process.env.VSCODE_TEST_LABEL || "core";
-const zeroProbe = process.argv.includes("--zero-probe");
-if (label === "live") {
-  throw new Error("Use npm run test:live for the optional live Cloudsmith suite");
-}
-if (!new Set(["core", "smoke"]).has(label)) {
-  throw new Error("VSCODE_TEST_LABEL must be core or smoke for the default test gate");
-}
 
 function run(script, args = []) {
   const result = spawnSync(process.execPath, [path.join(root, "scripts", script), ...args], {
@@ -27,6 +19,53 @@ function run(script, args = []) {
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
-run("run-node-tests.js", zeroProbe ? ["--zero-probe"] : []);
-run("run-vscode-tests.js", ["--label", label, ...(zeroProbe ? ["--zero-probe"] : [])]);
-if (!zeroProbe) console.log(`Live tests skipped: ${LIVE_TEST_SKIP_REASON}`);
+function testPlan({ label = "core", zeroProbe = false, nodeTestMode = "full" } = {}) {
+  if (label === "live") {
+    throw new Error("Use npm run test:live for the optional live Cloudsmith suite");
+  }
+  if (!new Set(["core", "smoke"]).has(label)) {
+    throw new Error("VSCODE_TEST_LABEL must be core or smoke for the default test gate");
+  }
+  if (!new Set(["full", "host", "none"]).has(nodeTestMode)) {
+    throw new Error("nodeTestMode must be full, host, or none");
+  }
+  const probeArguments = zeroProbe ? ["--zero-probe"] : [];
+  return Object.freeze([
+    ...(nodeTestMode !== "none"
+      ? [Object.freeze({
+        script: "run-node-tests.js",
+        args: Object.freeze([
+          ...(nodeTestMode === "host" ? ["--host"] : []),
+          ...probeArguments,
+        ]),
+      })]
+      : []),
+    Object.freeze({
+      script: "run-vscode-tests.js",
+      args: Object.freeze(["--label", label, ...probeArguments]),
+    }),
+  ]);
+}
+
+if (require.main === module) {
+  const label = process.env.VSCODE_TEST_LABEL || "core";
+  const zeroProbe = process.argv.includes("--zero-probe");
+  const extensionMatrix = process.argv.includes("--extension-matrix");
+  const matrixNodeSetting = process.env.CLOUDSMITH_RUN_NODE_TESTS;
+  if (extensionMatrix && !new Set(["true", "host", "false"]).has(matrixNodeSetting)) {
+    throw new Error("The extension matrix must declare CLOUDSMITH_RUN_NODE_TESTS exactly");
+  }
+  const nodeTestMode = !extensionMatrix || matrixNodeSetting === "true"
+    ? "full"
+    : matrixNodeSetting === "host"
+      ? "host"
+      : "none";
+  for (const step of testPlan({ label, zeroProbe, nodeTestMode })) {
+    run(step.script, step.args);
+  }
+  if (!zeroProbe) {
+    console.log(`Deterministic live-suite boundary: ${CREDENTIAL_BOUNDARY_SKIP_REASON}`);
+  }
+}
+
+module.exports = { testPlan };

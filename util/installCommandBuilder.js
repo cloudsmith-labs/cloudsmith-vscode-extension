@@ -2,7 +2,9 @@
 // with Cloudsmith registry URLs pre-filled.
 
 const { createHash } = require("crypto");
-const { WEB_APP_BASE_URL, buildRepositoryUrl } = require("./webAppUrls");
+const {
+  installGuidanceSupportForFormat,
+} = require("../domain/installGuidanceSupport");
 
 const VERIFICATION_BANNER = "# Verify package details before running";
 const CLOUDSMITH_DOWNLOAD_HOST = "dl.cloudsmith.io";
@@ -648,6 +650,13 @@ class InstallCommandBuilder {
   static build(format, name, version, workspace, repo, opts) {
     const options = InstallCommandBuilder._validateOptions(opts);
     const validatedFormat = InstallCommandBuilder._validateCommandFormat(format);
+    const support = installGuidanceSupportForFormat(validatedFormat);
+    if (!support) {
+      throw new InstallCommandValidationError(
+        "Package format",
+        `does not have authoritative install guidance: ${validatedFormat}.`
+      );
+    }
     const validatedName = InstallCommandBuilder._validateCommandValue(name, "Package name");
     const validatedVersion = InstallCommandBuilder._validateCommandValue(
       version,
@@ -692,7 +701,7 @@ class InstallCommandBuilder {
     }
     const safeName = usesShellArguments ? InstallCommandBuilder.shellEscape(validatedName) : "";
     const safeVersion = usesShellArguments ? InstallCommandBuilder.shellEscape(validatedVersion) : "";
-    const shellArgument = value => usesShellArguments ? InstallCommandBuilder.shellEscape(value) : "";
+    const shellArgument = value => InstallCommandBuilder.shellEscape(value);
     const goVersion = `v${validatedVersion.replace(/^v+/i, "")}`;
     const cargoRegistry = InstallCommandBuilder._cargoRegistryName(
       validatedWorkspace,
@@ -703,14 +712,8 @@ class InstallCommandBuilder {
     const dartRepository = `https://dart.cloudsmith.io/${encodedWorkspace}/${encodedRepo}/`;
     let npmScopeOption = "";
     if (validatedFormat === "npm" && validatedName.startsWith("@")) {
-      const scopedName = validatedName.match(/^(@[A-Za-z0-9._~-]+)\/[A-Za-z0-9._~-]+$/);
-      if (!scopedName) {
-        throw new InstallCommandValidationError(
-          "npm package name",
-          "must use a valid @scope/package identity."
-        );
-      }
-      npmScopeOption = ` --${scopedName[1]}:registry=https://npm.cloudsmith.io/${encodedWorkspace}/${encodedRepo}/`;
+      const npmScope = validatedName.slice(0, validatedName.indexOf("/"));
+      npmScopeOption = ` --${npmScope}:registry=https://npm.cloudsmith.io/${encodedWorkspace}/${encodedRepo}/`;
     }
     const commands = {
       python: () => ({
@@ -789,8 +792,7 @@ class InstallCommandBuilder {
       }),
     };
 
-    // Formats with dedicated handlers
-    if (validatedFormat === "docker") {
+    if (support.strategy === "docker") {
       return InstallCommandBuilder._buildDocker(
         validatedName,
         validatedVersion,
@@ -799,7 +801,7 @@ class InstallCommandBuilder {
         { ...options, qualifiers }
       );
     }
-    if (validatedFormat === "rpm") {
+    if (support.strategy === "rpm") {
       return InstallCommandBuilder._buildRpm(
         validatedName,
         validatedVersion,
@@ -810,7 +812,7 @@ class InstallCommandBuilder {
         qualifiers
       );
     }
-    if (validatedFormat === "raw" || validatedFormat === "generic") {
+    if (support.strategy === "download") {
       return InstallCommandBuilder._buildRaw(
         validatedFormat,
         validatedName,
@@ -821,15 +823,20 @@ class InstallCommandBuilder {
       );
     }
 
-    const entryFactory = commands[validatedFormat];
-    if (!entryFactory) {
-      const repositoryUrl = buildRepositoryUrl(validatedWorkspace, validatedRepo) || WEB_APP_BASE_URL;
-      return {
-        command: `# Verify package details before running\n# No install command template for format: ${validatedFormat}`,
-        note: `Visit ${repositoryUrl} for setup instructions.`,
-      };
+    return InstallCommandBuilder._requireTemplateRenderer(
+      commands[validatedFormat],
+      validatedFormat
+    )();
+  }
+
+  static _requireTemplateRenderer(entryFactory, format) {
+    if (typeof entryFactory !== "function") {
+      throw new InstallCommandValidationError(
+        "Package format",
+        `does not have a usable install-guidance renderer: ${format}.`
+      );
     }
-    return entryFactory();
+    return entryFactory;
   }
 
   static _validateOptions(value) {
@@ -955,6 +962,12 @@ class InstallCommandBuilder {
     );
     const versionDigest = SHA256_DIGEST_PATTERN.test(version) ? version : null;
     const digest = InstallCommandBuilder._normalizeDockerDigest(qualifiedDigest || versionDigest);
+    if (!digest && !explicitTag && version === "") {
+      throw new InstallCommandValidationError(
+        "Docker tag or digest",
+        "is required to preserve an authoritative image identity."
+      );
+    }
     const tag = explicitTag || (digest ? null : InstallCommandBuilder._resolveDockerTag(version, {}));
     const result = {
       command: digest

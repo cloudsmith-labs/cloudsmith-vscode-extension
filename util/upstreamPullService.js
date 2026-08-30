@@ -504,7 +504,7 @@ class UpstreamPullService {
       if (!isExecutionCurrent()) {
         return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
       }
-      await this._showErrorMessage("Authentication failed. Check your API key in Cloudsmith settings.");
+      await this._showErrorMessage("Authentication failed. Check Cloudsmith authentication in Settings and retry.");
       return null;
     }
     if (!isExecutionCurrent()) {
@@ -512,7 +512,7 @@ class UpstreamPullService {
     }
     if (!apiKey) {
       const message = isPullThroughAvailable(this._authenticationCapabilitySource)
-        ? "Authentication failed. Check your API key in Cloudsmith settings."
+        ? "Authentication failed. Check Cloudsmith authentication in Settings and retry."
         : PULL_THROUGH_API_KEY_MESSAGE;
       await this._showErrorMessage(message);
       return null;
@@ -738,7 +738,7 @@ class UpstreamPullService {
         });
       }
       recomputeResultCounts(counts, details);
-      await this._showErrorMessage("Authentication failed. Check your API key in Cloudsmith settings.");
+      await this._showErrorMessage("Authentication failed. Check Cloudsmith authentication in Settings and retry.");
     } else if (state.canceled) {
       return {
         canceled: true,

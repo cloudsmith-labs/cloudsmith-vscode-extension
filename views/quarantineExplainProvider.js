@@ -12,6 +12,7 @@ const {
 const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiEndpoint } = require("../util/apiEndpoint");
 const { buildPackageUrl } = require("../util/webAppUrls");
+const { openExternalWithFeedback } = require("../util/externalNavigation");
 const { parseWebviewMessage } = require("../util/webviewMessage");
 const {
   captureAccount,
@@ -334,7 +335,13 @@ class QuarantineExplainProvider {
           this._packageActions?.showVulnerabilities
         );
       } else if (parsed.command === "openInCloudsmith" && trace.packageUrl) {
-        await this._openExternal(trace.packageUrl);
+        await openExternalWithFeedback({
+          target: trace.packageUrl,
+          openExternal: target => this._openExternal(target),
+          showWarningMessage: message => this._notifications.warning(message),
+          failureMessage: "Could not open this package in Cloudsmith.",
+          isCurrent: () => this._isOperationCurrent(operation),
+        });
       } else if (parsed.command === "copyReport") {
         await this._writeClipboard(this._buildPlainTextReport(trace));
         if (this._isOperationCurrent(operation)) {

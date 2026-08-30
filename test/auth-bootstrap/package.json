@@ -1,0 +1,40 @@
+{
+  "name": "cloudsmith-vsc",
+  "displayName": "Cloudsmith Authenticated CI Bootstrap",
+  "description": "Test-only same-ID SecretStorage bootstrap used by the authenticated qualification runner.",
+  "version": "2.3.0",
+  "publisher": "Cloudsmith",
+  "private": true,
+  "engines": {
+    "vscode": "^1.99.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onCommand:cloudsmith-vsc.qualification.authBootstrap.seed",
+    "onCommand:cloudsmith-vsc.qualification.authBootstrap.cleanup"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "cloudsmith-vsc.qualification.authBootstrap.seed",
+        "title": "Cloudsmith Qualification: Internal Seed"
+      },
+      {
+        "command": "cloudsmith-vsc.qualification.authBootstrap.cleanup",
+        "title": "Cloudsmith Qualification: Internal Cleanup"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "cloudsmith-vsc.qualification.authBootstrap.seed",
+          "when": "false"
+        },
+        {
+          "command": "cloudsmith-vsc.qualification.authBootstrap.cleanup",
+          "when": "false"
+        }
+      ]
+    }
+  }
+}

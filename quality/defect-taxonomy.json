@@ -1,0 +1,175 @@
+{
+  "schemaVersion": 3,
+  "idPattern": "^QH-[0-9]{3,}$",
+  "requiredFields": [
+    "id",
+    "severity",
+    "domain",
+    "status",
+    "deterministicStatus",
+    "liveStatus",
+    "surface",
+    "workflowContract",
+    "failureClasses",
+    "customerImpact",
+    "reproductionConfidence",
+    "authoritativeExpectedOutcome",
+    "observedOutcome",
+    "firstKnownBadSha",
+    "evidence",
+    "rootCauseStatus",
+    "requiredEvidenceLayers",
+    "testLayerThatShouldHaveCaughtIt",
+    "whyItEscaped",
+    "regressionTest",
+    "mutationProof",
+    "fixedSha",
+    "liveVerification",
+    "releaseBlocking"
+  ],
+  "severities": {
+    "P0": {
+      "releaseBlocking": true,
+      "definition": "Credential or secret exposure, destructive or corrupting behavior, or an extension that is broadly unusable."
+    },
+    "P1": {
+      "releaseBlocking": true,
+      "definition": "A broken core advertised workflow, false clean/success/complete state, wrong identity, dead primary action, unbounded core operation, or security-boundary bypass."
+    },
+    "P2": {
+      "releaseBlockingWhenCore": true,
+      "definition": "A material recoverable defect, important cross-surface inconsistency, major discoverability/feedback problem, or significant accessibility issue."
+    },
+    "P3": {
+      "releaseBlocking": false,
+      "definition": "Minor polish, low-impact accessibility, or another non-blocking presentation defect."
+    }
+  },
+  "domains": {
+    "product": {
+      "definition": "A defect in extension behavior, customer-visible state, or an extension-owned workflow contract."
+    },
+    "test-harness": {
+      "definition": "A defect in deterministic test execution, mutation analysis, or the machinery that proves product behavior."
+    },
+    "ci": {
+      "definition": "A defect in continuous-integration orchestration, matrix coverage, or required gate execution."
+    },
+    "release-evidence": {
+      "definition": "A defect in evidence provenance, aggregation, handoff, freshness, or release-verdict authority."
+    },
+    "security-environment": {
+      "definition": "A credential, secret, supply-chain, host-environment, or external security-boundary condition, including incidents that require explicit external closure evidence."
+    },
+    "documentation": {
+      "definition": "A defect confined to maintained documentation or documented workflow instructions."
+    },
+    "external-platform": {
+      "definition": "A limitation or defect owned by an operating system, host platform, or external tool rather than the extension."
+    }
+  },
+  "statuses": [
+    "open",
+    "closed",
+    "deferred",
+    "closed-non-issue"
+  ],
+  "deterministicStatuses": [
+    "failing",
+    "fixed",
+    "not-applicable"
+  ],
+  "liveStatuses": [
+    "not-required",
+    "pending",
+    "blocked",
+    "verified",
+    "failed"
+  ],
+  "failureClasses": [
+    "contract-mismatch",
+    "provenance",
+    "canonical-identity",
+    "async-authority",
+    "stale-publication",
+    "terminal-state",
+    "pagination",
+    "boundedness",
+    "error-normalization",
+    "validation/security",
+    "auth-capability",
+    "cross-surface-parity",
+    "capability-composition",
+    "format-native-semantics",
+    "false-green-test",
+    "accessibility",
+    "documentation-drift"
+  ],
+  "reproductionConfidences": [
+    "confirmed-repeatable",
+    "confirmed-once",
+    "strong-static-evidence",
+    "suspected",
+    "blocked"
+  ],
+  "rootCauseStatuses": [
+    "unknown",
+    "suspected",
+    "proven"
+  ],
+  "testLayers": [
+    "unit",
+    "contract",
+    "extension-host",
+    "live-protocol",
+    "black-box-ui",
+    "documentation"
+  ],
+  "evidenceLayers": [
+    "unit",
+    "contract",
+    "extension-host",
+    "live-protocol",
+    "black-box-ui",
+    "documentation",
+    "durable-security-scan",
+    "external-confirmation"
+  ],
+  "requiredEvidencePolicy": {
+    "derivationField": "testLayerThatShouldHaveCaughtIt",
+    "defaultByEscapedLayer": {
+      "unit": ["unit"],
+      "contract": ["contract"],
+      "extension-host": ["extension-host"],
+      "live-protocol": ["live-protocol"],
+      "black-box-ui": ["black-box-ui"],
+      "documentation": ["documentation"]
+    },
+    "externalSecurityOverride": {
+      "domain": "security-environment",
+      "severity": "P0",
+      "deterministicStatus": "not-applicable",
+      "requiredLayers": ["durable-security-scan", "external-confirmation"]
+    },
+    "findingOverrides": {
+      "QH-011": ["contract"],
+      "QH-012": ["contract"],
+      "QH-026": ["contract"]
+    },
+    "liveStatusLayers": [
+      "live-protocol",
+      "black-box-ui",
+      "durable-security-scan",
+      "external-confirmation"
+    ]
+  },
+  "mutationProofStatuses": [
+    "not-started",
+    "red-confirmed",
+    "green-confirmed",
+    "mutation-killed",
+    "partial",
+    "blocked",
+    "not-applicable"
+  ]
+}

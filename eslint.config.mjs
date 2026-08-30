@@ -1,7 +1,7 @@
 import globals from "globals";
 
 export default [{
-    ignores: [".vscode-test/**", "node_modules/**"],
+    ignores: [".quality/**", ".stryker-tmp/**", ".vscode-test/**", "node_modules/**"],
 }, {
     files: ["**/*.{js,mjs}"],
     languageOptions: {
@@ -44,7 +44,7 @@ export default [{
         "no-promise-executor-return": "error",
     },
 }, {
-    files: ["test/**/*.js"],
+    files: ["test/**/*.js", "ui-test/**/*.js"],
     languageOptions: {
         globals: {
             ...globals.mocha,

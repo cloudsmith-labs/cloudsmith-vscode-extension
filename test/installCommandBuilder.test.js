@@ -4,6 +4,7 @@ const {
   InstallCommandBuilder,
   InstallCommandValidationError,
 } = require("../util/installCommandBuilder");
+const { INSTALL_GUIDANCE_SUPPORT } = require("../domain/installGuidanceSupport");
 
 suite("InstallCommandBuilder Test Suite", () => {
 
@@ -22,14 +23,42 @@ suite("InstallCommandBuilder Test Suite", () => {
     );
   }
 
+  test("the frozen support inventory is the complete install-guidance format authority", () => {
+    assert.ok(Object.isFrozen(INSTALL_GUIDANCE_SUPPORT));
+    assert.deepStrictEqual(Object.keys(INSTALL_GUIDANCE_SUPPORT), [
+      "python",
+      "npm",
+      "maven",
+      "nuget",
+      "helm",
+      "cargo",
+      "go",
+      "ruby",
+      "conda",
+      "composer",
+      "dart",
+      "docker",
+      "rpm",
+      "raw",
+      "generic",
+    ]);
+    for (const support of Object.values(INSTALL_GUIDANCE_SUPPORT)) {
+      assert.ok(Object.isFrozen(support));
+      assert.ok(Object.isFrozen(support.requiredEvidence));
+      assert.ok(support.requiredEvidence.length > 0);
+    }
+  });
+
   test("python generates pip install with index-url", () => {
     const result = InstallCommandBuilder.build("python", "flask", "3.0.0", ws, repo);
     assert.strictEqual(
       result.command,
       "# Verify package details before running\npip install 'flask==3.0.0' --index-url https://dl.cloudsmith.io/basic/my-org/my-repo/python/simple/"
     );
-    assert.ok(result.note);
-    assert.ok(result.note.includes("basic"));
+    assert.strictEqual(
+      result.note,
+      'For private repositories, replace "basic" with an entitlement token.'
+    );
   });
 
   test("npm generates npm install with registry", () => {
@@ -38,7 +67,10 @@ suite("InstallCommandBuilder Test Suite", () => {
       result.command,
       "# Verify package details before running\nnpm install 'lodash@4.17.21' --save-exact --registry=https://npm.cloudsmith.io/my-org/my-repo/"
     );
-    assert.ok(result.note);
+    assert.strictEqual(
+      result.note,
+      "Run `npm login --registry=https://npm.cloudsmith.io/my-org/my-repo/` first for private repositories."
+    );
   });
 
   test("scoped npm packages override any inherited scope registry", () => {
@@ -115,9 +147,11 @@ suite("InstallCommandBuilder Test Suite", () => {
     assert.ok(!result.alternatives);
   });
 
-  test("docker falls back to latest when version is empty", () => {
-    const result = InstallCommandBuilder.build("docker", "nginx", "", ws, repo);
-    assert.ok(result.command.includes("nginx:latest"));
+  test("docker rejects a missing authoritative tag or digest instead of fabricating latest", () => {
+    assertValidationError(
+      () => InstallCommandBuilder.build("docker", "nginx", "", ws, repo),
+      "Docker tag or digest"
+    );
   });
 
   test("docker never treats a generic artifact checksum as an OCI manifest digest", () => {
@@ -325,6 +359,7 @@ suite("InstallCommandBuilder Test Suite", () => {
         + "cmd.exe /D /V:OFF /C \"set GOPROXY=https://golang.cloudsmith.io/my-org/my-repo/"
         + "&& set GONOPROXY=none&& go get github.com/gin-gonic/gin@v1.9.1\""
     );
+    assert.strictEqual(result.alternatives[1].commentStyle, "cmd");
     assert.doesNotMatch(result.alternatives[1].command, /,direct|\|direct/u);
   });
 
@@ -404,6 +439,31 @@ suite("InstallCommandBuilder Test Suite", () => {
     assert.doesNotMatch(result.command, /@vv/);
   });
 
+  test("go strips every redundant leading v before building the exact coordinate", () => {
+    const result = InstallCommandBuilder.build(
+      "go",
+      "github.com/gin-gonic/gin",
+      "vvv1.9.1",
+      ws,
+      repo
+    );
+    assert.match(result.command, /gin@v1\.9\.1'$/u);
+    assert.doesNotMatch(result.command, /@vv/u);
+  });
+
+  test("go does not strip a version marker from the middle of invalid version data", () => {
+    assertValidationError(
+      () => InstallCommandBuilder.build(
+        "go",
+        "github.com/gin-gonic/gin",
+        "1.v2.3",
+        ws,
+        repo
+      ),
+      "Go module version"
+    );
+  });
+
   test("ruby generates gem install", () => {
     const result = InstallCommandBuilder.build("ruby", "rails", "7.0.0", ws, repo);
     assert.strictEqual(
@@ -419,6 +479,18 @@ suite("InstallCommandBuilder Test Suite", () => {
       qualifiers: { platform: "x86_64-linux" },
     });
     assert.match(result.command, /--platform 'x86_64-linux'/);
+  });
+
+  test("ruby rejects an invalid platform with the exact qualifier field", () => {
+    assert.throws(
+      () => InstallCommandBuilder.build("ruby", "nokogiri", "1.18.0", ws, repo, {
+        qualifiers: { platform: "linux\n--install-dir=/tmp" },
+      }),
+      error => (
+        error instanceof InstallCommandValidationError
+        && error.field === "Ruby platform"
+      )
+    );
   });
 
   test("conda generates an exact build/subdir MatchSpec", () => {
@@ -634,12 +706,66 @@ suite("InstallCommandBuilder Test Suite", () => {
     );
   });
 
-  test("unknown format returns comment with link", () => {
-    const result = InstallCommandBuilder.build("unknown_format", "pkg", "1.0", ws, repo);
-    assert.ok(result.command.startsWith("#"));
-    assert.ok(result.command.includes("unknown_format"));
-    assert.ok(result.note);
-    assert.ok(result.note.includes(`app.cloudsmith.com/${ws}/${repo}`));
+  test("unknown format fails closed instead of returning comment-only guidance", () => {
+    assertValidationError(
+      () => InstallCommandBuilder.build("unknown_format", "pkg", "1.0", ws, repo),
+      "Package format"
+    );
+  });
+
+  test("release-critical validation failures retain exact actionable field copy", () => {
+    const cases = [
+      [
+        () => InstallCommandBuilder.build("unknown_format", "pkg", "1.0", ws, repo),
+        "Package format does not have authoritative install guidance: unknown_format.",
+      ],
+      [
+        () => InstallCommandBuilder.build("python", "", "1.0", ws, repo),
+        "Package name must be non-empty and contain no control characters or newlines.",
+      ],
+      [
+        () => InstallCommandBuilder.build("python", "pkg", "", ws, repo),
+        "Package version must be non-empty and contain no control characters or newlines.",
+      ],
+      [
+        () => InstallCommandBuilder.build("python", "-pkg", "1.0", ws, repo),
+        "Package name must not begin with a dash because package-manager options are not package identities.",
+      ],
+      [
+        () => InstallCommandBuilder.build("python", "pkg", "-1.0", ws, repo),
+        "Package version must not begin with a dash because package-manager options are not versions.",
+      ],
+    ];
+    for (const [operation, message] of cases) {
+      assert.throws(operation, error => (
+        error instanceof InstallCommandValidationError && error.message === message
+      ));
+    }
+  });
+
+  test("only download and container strategies accept an empty generic version", () => {
+    assert.match(
+      InstallCommandBuilder.build("raw", "artifact's", "", ws, repo, {
+        cdnUrl: "https://dl.cloudsmith.io/basic/my-org/my-repo/raw/files/pkg.bin",
+      }).command,
+      /curl -fL -O/u
+    );
+    assert.match(
+      InstallCommandBuilder.build("generic", "artifact", "", ws, repo, {
+        cdnUrl: "https://dl.cloudsmith.io/basic/my-org/my-repo/generic/files/pkg.bin",
+      }).command,
+      /curl -fL -O/u
+    );
+    assert.match(
+      InstallCommandBuilder.build("docker", "artifact", "", ws, repo, {
+        tags: { version: ["stable"] },
+      }).command,
+      /:stable$/u
+    );
+    assertValidationError(
+      () => InstallCommandBuilder.build("npm", "artifact", "", ws, repo),
+      "Package version"
+    );
   });
 
   test("all private-repo formats have a note", () => {

@@ -1,5 +1,9 @@
 const assert = require('assert');
-const { SearchQueryBuilder } = require('../util/searchQueryBuilder');
+const {
+	escapeCloudsmithQueryValue,
+	isValidAdvancedQuery,
+	SearchQueryBuilder,
+} = require('../util/searchQueryBuilder');
 const { buildAdvancedSearchQuery } = require('../commands/support');
 
 suite('SearchQueryBuilder Test Suite', () => {
@@ -127,6 +131,44 @@ suite('SearchQueryBuilder Test Suite', () => {
 		);
 	});
 
+	test('advanced query validation has exact type, whitespace, control, and length boundaries', () => {
+		for (const value of [undefined, null, 0, false, {}, [], Symbol('query')]) {
+			assert.doesNotThrow(() => isValidAdvancedQuery(value));
+			assert.strictEqual(isValidAdvancedQuery(value), false);
+		}
+		assert.strictEqual(isValidAdvancedQuery(''), false);
+		assert.strictEqual(isValidAdvancedQuery('   '), false);
+		assert.strictEqual(isValidAdvancedQuery(' \t '), false);
+		assert.strictEqual(isValidAdvancedQuery(' name:widget '), true);
+		assert.strictEqual(isValidAdvancedQuery('name:widget\u202e'), false);
+		assert.strictEqual(isValidAdvancedQuery('x'.repeat(2048)), true);
+		assert.strictEqual(isValidAdvancedQuery('x'.repeat(2049)), false);
+	});
+
+	test('advanced() rejects every non-string with the public type error', () => {
+		for (const query of [undefined, null, 0, false, {}, [], Symbol('query')]) {
+			assert.throws(
+				() => new SearchQueryBuilder().advanced(query),
+				{
+					name: 'TypeError',
+					message: 'Advanced Cloudsmith query must be a string.',
+				}
+			);
+		}
+	});
+
+	test('advanced() trims boundary whitespace before enforcing the transmitted length', () => {
+		assert.strictEqual(
+			new SearchQueryBuilder().advanced('  name:widget  ').build(),
+			'name:widget'
+		);
+		const maximumQuery = 'x'.repeat(2048);
+		assert.strictEqual(
+			new SearchQueryBuilder().advanced(` ${maximumQuery} `).build(),
+			maximumQuery
+		);
+	});
+
 	test('advanced() rejects blank, control-bearing, bidi, and oversized query text', () => {
 		for (const query of ['', '   ', 'name:foo\nOR name:bar', 'name:foo\u202e', 'x'.repeat(2049)]) {
 			assert.throws(
@@ -181,6 +223,57 @@ suite('SearchQueryBuilder Test Suite', () => {
 		assert.strictEqual(
 			new SearchQueryBuilder().name('foo&&bar||baz').build(),
 			'name:foo\\&&bar\\||baz'
+		);
+	});
+
+	test('leading multi-character boolean symbols are escaped as one operator token', () => {
+		assert.strictEqual(escapeCloudsmithQueryValue('&&hostile'), '\\&&hostile');
+		assert.strictEqual(escapeCloudsmithQueryValue('||hostile'), '\\||hostile');
+		assert.strictEqual(escapeCloudsmithQueryValue('safe&&hostile'), 'safe\\&&hostile');
+	});
+
+	test('escaping normalizes non-string field values before applying query syntax', () => {
+		const cases = [
+			[42, '42'],
+			[false, 'false'],
+			[null, 'null'],
+			[undefined, 'undefined'],
+			[{ toString: () => 'pkg:value' }, 'pkg\\:value'],
+		];
+		for (const [input, expected] of cases) {
+			assert.strictEqual(escapeCloudsmithQueryValue(input), expected);
+		}
+	});
+
+	test('strict fields expose exact finite, whitespace, and maximum-length contracts', () => {
+		for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+			assert.throws(
+				() => new SearchQueryBuilder().versionAtLeast(value),
+				{
+					name: 'TypeError',
+					message: 'Cloudsmith query field value must be finite.',
+				}
+			);
+		}
+
+		for (const value of [undefined, null, {}, ' name', 'name ', '\tname', 'name\t']) {
+			assert.throws(
+				() => new SearchQueryBuilder().exactName(value),
+				{
+					name: 'TypeError',
+					message: 'Cloudsmith query field value is invalid.',
+				}
+			);
+		}
+
+		const maximumValue = 'x'.repeat(2048);
+		assert.doesNotThrow(() => new SearchQueryBuilder().exactName(maximumValue));
+		assert.throws(
+			() => new SearchQueryBuilder().exactName(`${maximumValue}x`),
+			{
+				name: 'TypeError',
+				message: 'Cloudsmith query field value is invalid.',
+			}
 		);
 	});
 

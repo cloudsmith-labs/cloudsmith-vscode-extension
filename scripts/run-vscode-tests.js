@@ -1,7 +1,15 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const path = require("path");
 const { spawnSync } = require("child_process");
-const { LIVE_REQUIRED_ENV, SSO_LIVE_REQUIRED_ENV } = require("../test/testInventories");
+const {
+  QUALIFICATION_REQUIRED_ENV,
+  assertCredentialFreeRequiredEnvironment,
+  assertExpectedZeroTestFailure,
+  createIsolatedQualificationRoot,
+  exportIsolatedQualificationRoot,
+  removeIsolatedQualificationRoot,
+  sanitizeQualificationEnvironment,
+} = require("../test/testInventories");
 
 const root = path.resolve(__dirname, "..");
 const isWindows = process.platform === "win32";
@@ -15,25 +23,10 @@ const zeroProbe = process.argv.includes("--zero-probe");
 const labelIndex = process.argv.indexOf("--label");
 const label = labelIndex === -1 ? (process.env.VSCODE_TEST_LABEL || "core") : process.argv[labelIndex + 1];
 
-if (!label || !["core", "smoke", "live", "sso-live"].includes(label)) {
-  throw new Error("The VS Code test label must be core, smoke, live, or sso-live");
+if (!label || !["core", "smoke"].includes(label)) {
+  throw new Error("The VS Code qualification label must be core or smoke; credential-bearing live automation is excluded");
 }
-if (label === "sso-live") {
-  const missing = SSO_LIVE_REQUIRED_ENV.filter(name => !process.env[name]);
-  if (missing.length > 0) {
-    throw new Error(`SSO live test configuration is incomplete; set: ${missing.join(", ")}`);
-  }
-}
-if (label === "live") {
-  if (process.env.CLOUDSMITH_LIVE_TESTS !== "1") {
-    throw new Error("Set CLOUDSMITH_LIVE_TESTS=1 to explicitly opt in to the optional live test suite");
-  }
-  const missing = LIVE_REQUIRED_ENV.filter(name => !process.env[name]);
-  if (missing.length > 0) {
-    throw new Error(`Live test configuration is incomplete; set: ${missing.join(", ")}`);
-  }
-}
-
+assertCredentialFreeRequiredEnvironment(QUALIFICATION_REQUIRED_ENV);
 const cliArguments = [
   "--label",
   label,
@@ -46,13 +39,35 @@ const cliArguments = [
 let command = cli;
 let commandArguments = cliArguments;
 if (process.platform === "linux") {
-  const preflight = spawnSync("sh", ["-c", "command -v xvfb-run"], { encoding: "utf8" });
+  const preflight = spawnSync("/bin/sh", ["-c", "command -v xvfb-run"], {
+    encoding: "utf8",
+    env: { PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+  });
   const xvfbRun = preflight.stdout?.trim();
   if (preflight.error || preflight.status !== 0 || !path.isAbsolute(xvfbRun)) {
     throw new Error("xvfb-run is required to execute VS Code extension tests on Linux");
   }
   command = xvfbRun;
   commandArguments = ["-a", cli, ...cliArguments];
+}
+
+const isolatedHome = createIsolatedQualificationRoot(label);
+let qualificationEnvironment;
+try {
+  const isolatedHomeProof = exportIsolatedQualificationRoot(isolatedHome);
+  qualificationEnvironment = Object.freeze({
+    ...sanitizeQualificationEnvironment(process.env, isolatedHome),
+    VSCODE_TEST_LABEL: label,
+    CLOUDSMITH_QUALITY_LAUNCHER_HOME: isolatedHome,
+    CLOUDSMITH_QUALITY_LAUNCHER_PROOF: isolatedHomeProof,
+  });
+} catch (error) {
+  removeIsolatedQualificationRoot(isolatedHome);
+  throw error;
+}
+
+function cleanupLauncherHome() {
+  removeIsolatedQualificationRoot(isolatedHome);
 }
 
 if (!zeroProbe) {
@@ -62,15 +77,24 @@ if (!zeroProbe) {
   // shim there.
   if (!isWindows) {
     process.chdir(root);
-    process.execve(command, [command, ...commandArguments], process.env);
-    throw new Error("Failed to replace the VS Code test launcher");
+    try {
+      process.execve(command, [command, ...commandArguments], qualificationEnvironment);
+      throw new Error("Failed to replace the VS Code test launcher");
+    } finally {
+      cleanupLauncherHome();
+    }
   }
-  const result = spawnSync(command, commandArguments, {
-    cwd: root,
-    env: process.env,
-    shell: true,
-    stdio: "inherit",
-  });
+  let result;
+  try {
+    result = spawnSync(command, commandArguments, {
+      cwd: root,
+      env: qualificationEnvironment,
+      shell: true,
+      stdio: "inherit",
+    });
+  } finally {
+    cleanupLauncherHome();
+  }
   if (result.error) throw result.error;
   if (result.signal) {
     console.error(`VS Code tests terminated by signal ${result.signal}`);
@@ -79,19 +103,19 @@ if (!zeroProbe) {
   process.exit(result.status ?? 1);
 }
 
-const result = spawnSync(command, commandArguments, {
-  cwd: root,
-  encoding: "utf8",
-  env: process.env,
-  shell: isWindows,
-  stdio: "pipe",
-});
+let result;
+try {
+  result = spawnSync(command, commandArguments, {
+    cwd: root,
+    encoding: "utf8",
+    env: qualificationEnvironment,
+    shell: isWindows,
+    stdio: "pipe",
+  });
+} finally {
+  cleanupLauncherHome();
+}
 const output = `${result.stdout || ""}${result.stderr || ""}`;
 process.stdout.write(output);
-if (result.error || result.signal || result.status !== 1) {
-  throw new Error("Zero-test probe did not produce Mocha's expected failure status");
-}
-if (!/\b0 passing\b/.test(output) || !/\b1 test failed\b/.test(output)) {
-  throw new Error("Zero-test probe failed before reaching Mocha's fail-zero guard");
-}
+assertExpectedZeroTestFailure(result, output);
 console.log("Confirmed that the real test entrypoint rejects a zero-test run.");
