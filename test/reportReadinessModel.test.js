@@ -19,7 +19,10 @@ const {
   validateUiResult,
 } = require("../scripts/quality/report");
 const { verifyQualityContracts } = require("../scripts/quality/verify-workflows");
-const { writeRemoteCiEvidence } = require("../scripts/quality/collect-remote-ci");
+const {
+  buildReceipt,
+  writeRemoteCiEvidence,
+} = require("../scripts/quality/collect-remote-ci");
 const {
   verifySignedOutUiEvidence,
 } = require("../scripts/quality/verify-ui-evidence");
@@ -289,6 +292,33 @@ suite("two-lane release-readiness model", () => {
       );
     }
     assert.strictEqual(calls.length, 2);
+  });
+
+  test("remote CI collection canonicalizes GitHub timestamps", () => {
+    const exact = remoteCiReceipt();
+    const snapshot = remoteCiApiEvidence(exact).value;
+    snapshot.runs[0].created_at = "2026-08-30T04:19:21Z";
+    snapshot.runs[0].updated_at = "2026-08-30T04:38:43Z";
+    for (const job of snapshot.jobsByRunId[String(exact.runs[0].runId)].jobs) {
+      job.started_at = "2026-08-30T04:19:24Z";
+      job.completed_at = "2026-08-30T04:35:56Z";
+    }
+
+    const receipt = buildReceipt(
+      snapshot,
+      SOURCE,
+      exact.branch,
+      [exact.runs[0].runId],
+    );
+    assert.strictEqual(receipt.runs[0].createdAt, "2026-08-30T04:19:21.000Z");
+    assert.strictEqual(receipt.runs[0].completedAt, "2026-08-30T04:38:43.000Z");
+    assert.deepStrictEqual(
+      receipt.runs[0].jobs.map(job => [job.startedAt, job.completedAt]),
+      exact.runs[0].jobs.map(() => [
+        "2026-08-30T04:19:24.000Z",
+        "2026-08-30T04:35:56.000Z",
+      ]),
+    );
   });
 
   test("requires exact successful final-head remote CI before readiness", () => {

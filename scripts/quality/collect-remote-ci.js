@@ -84,6 +84,14 @@ function writeRemoteCiEvidence(relativePath, value, root = ROOT, writer = writeJ
   return writer(relativePath, value, root, OUTPUT_OPTIONS);
 }
 
+function canonicalRemoteTimestamp(value) {
+  const milliseconds = Date.parse(value);
+  if (typeof value !== "string" || !Number.isFinite(milliseconds)) {
+    throw new Error("GitHub API returned an invalid timestamp.");
+  }
+  return new Date(milliseconds).toISOString();
+}
+
 function buildReceipt(snapshot, source, branch, runIds) {
   const pull = snapshot.pullRequest;
   const runs = WORKFLOWS.map((workflow, index) => {
@@ -100,8 +108,8 @@ function buildReceipt(snapshot, source, branch, runIds) {
       headSha: raw.head_sha,
       status: raw.status,
       conclusion: raw.conclusion,
-      createdAt: raw.created_at,
-      completedAt: raw.updated_at,
+      createdAt: canonicalRemoteTimestamp(raw.created_at),
+      completedAt: canonicalRemoteTimestamp(raw.updated_at),
       url: raw.html_url,
       jobs: workflow.jobs.map(([id, name]) => {
         const job = rawJobs.find(item => item.name === name);
@@ -112,8 +120,8 @@ function buildReceipt(snapshot, source, branch, runIds) {
           databaseId: job.id,
           status: job.status,
           conclusion: job.conclusion,
-          startedAt: job.started_at,
-          completedAt: job.completed_at,
+          startedAt: canonicalRemoteTimestamp(job.started_at),
+          completedAt: canonicalRemoteTimestamp(job.completed_at),
         };
       }),
     };
