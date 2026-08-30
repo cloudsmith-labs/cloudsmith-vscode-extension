@@ -19,20 +19,26 @@ function run(script, args = []) {
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
-function testPlan({ label = "core", zeroProbe = false, runNodeTests = true } = {}) {
+function testPlan({ label = "core", zeroProbe = false, nodeTestMode = "full" } = {}) {
   if (label === "live") {
     throw new Error("Use npm run test:live for the optional live Cloudsmith suite");
   }
   if (!new Set(["core", "smoke"]).has(label)) {
     throw new Error("VSCODE_TEST_LABEL must be core or smoke for the default test gate");
   }
-  if (typeof runNodeTests !== "boolean") {
-    throw new Error("runNodeTests must be an exact boolean");
+  if (!new Set(["full", "host", "none"]).has(nodeTestMode)) {
+    throw new Error("nodeTestMode must be full, host, or none");
   }
   const probeArguments = zeroProbe ? ["--zero-probe"] : [];
   return Object.freeze([
-    ...(runNodeTests
-      ? [Object.freeze({ script: "run-node-tests.js", args: Object.freeze(probeArguments) })]
+    ...(nodeTestMode !== "none"
+      ? [Object.freeze({
+        script: "run-node-tests.js",
+        args: Object.freeze([
+          ...(nodeTestMode === "host" ? ["--host"] : []),
+          ...probeArguments,
+        ]),
+      })]
       : []),
     Object.freeze({
       script: "run-vscode-tests.js",
@@ -46,11 +52,15 @@ if (require.main === module) {
   const zeroProbe = process.argv.includes("--zero-probe");
   const extensionMatrix = process.argv.includes("--extension-matrix");
   const matrixNodeSetting = process.env.CLOUDSMITH_RUN_NODE_TESTS;
-  if (extensionMatrix && !new Set(["true", "false"]).has(matrixNodeSetting)) {
+  if (extensionMatrix && !new Set(["true", "host", "false"]).has(matrixNodeSetting)) {
     throw new Error("The extension matrix must declare CLOUDSMITH_RUN_NODE_TESTS exactly");
   }
-  const runNodeTests = !extensionMatrix || matrixNodeSetting === "true";
-  for (const step of testPlan({ label, zeroProbe, runNodeTests })) {
+  const nodeTestMode = !extensionMatrix || matrixNodeSetting === "true"
+    ? "full"
+    : matrixNodeSetting === "host"
+      ? "host"
+      : "none";
+  for (const step of testPlan({ label, zeroProbe, nodeTestMode })) {
     run(step.script, step.args);
   }
   if (!zeroProbe) {

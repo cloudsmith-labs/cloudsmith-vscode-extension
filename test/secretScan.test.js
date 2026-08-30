@@ -444,7 +444,10 @@ function createReleaseExposureFixture(root) {
 function writeReleaseProgressAtSecretScan(root, source) {
   const plan = getGatePlan("release");
   const inventoryByStep = {
-    "standalone-tests": TEST_INVENTORIES.STANDALONE_NODE_TESTS,
+    "standalone-tests": [
+      ...TEST_INVENTORIES.STANDALONE_NODE_TESTS,
+      ...TEST_INVENTORIES.HOST_NODE_TESTS,
+    ],
     "extension-host-core": TEST_INVENTORIES.VSCODE_CORE_TESTS,
     "extension-host-smoke": TEST_INVENTORIES.VSCODE_SMOKE_TESTS,
   };

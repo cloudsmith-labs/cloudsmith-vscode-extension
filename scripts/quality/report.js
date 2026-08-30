@@ -1228,7 +1228,10 @@ function workflowLayerStatus(workflow, layer, options, inventories, liveMatrix) 
 function evidenceItemStatus(item, receiptById, inventories) {
   const file = item.testFile;
   let receipt = null;
-  if ((inventories.STANDALONE_NODE_TESTS || []).includes(file)) {
+  if ([
+    ...(inventories.STANDALONE_NODE_TESTS || []),
+    ...(inventories.HOST_NODE_TESTS || []),
+  ].includes(file)) {
     receipt = receiptById.get("standalone-tests");
   } else if ((inventories.VSCODE_SMOKE_TESTS || []).includes(file)) {
     receipt = receiptById.get("extension-host-smoke");

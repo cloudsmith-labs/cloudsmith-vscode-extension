@@ -23,6 +23,9 @@ both required. Passing one never implies that the other ran.
       retry-eligible errors on the exact
       verified temporary VSIX identities and retained nonrecursive fail-closed
       behavior for substitution, unexpected entries, and retry exhaustion.
+- [ ] Ubuntu core executed the complete standalone Node inventory; Windows and
+      macOS executed the reviewed native-host inventory plus real Extension
+      Host smoke, and Windows completed its canonical package preflight.
 - [ ] Local qualification uses exactly
       `$HOME/.cloudsmith-vscode-qualification/{user-data,extensions}` and not a
       normal VS Code profile.

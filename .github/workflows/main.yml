@@ -168,11 +168,11 @@ jobs:
           - os: windows-2025
             vscode: 1.134.0
             label: smoke
-            node-tests: "true"
+            node-tests: "host"
           - os: macos-15
             vscode: 1.134.0
             label: smoke
-            node-tests: "true"
+            node-tests: "host"
     env:
       VSCODE_TEST_VERSION: ${{ matrix.vscode }}
       VSCODE_TEST_LABEL: ${{ matrix.label }}

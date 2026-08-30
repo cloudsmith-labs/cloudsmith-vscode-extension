@@ -38,6 +38,7 @@ const {
   stepArtifactPaths,
   testEvidenceProofForStep,
   validateArtifactBinding,
+  validateTestEvidence,
   validateTestEvidenceBinding,
 } = require("../scripts/quality/gate");
 const {
@@ -255,7 +256,10 @@ function testEvidenceFileFingerprint(value) {
 
 function testEvidence(step, source = SOURCE_IDENTITY) {
   const inventory = {
-    "standalone-tests": TEST_INVENTORIES.STANDALONE_NODE_TESTS,
+    "standalone-tests": [
+      ...TEST_INVENTORIES.STANDALONE_NODE_TESTS,
+      ...TEST_INVENTORIES.HOST_NODE_TESTS,
+    ],
     "extension-host-core": TEST_INVENTORIES.VSCODE_CORE_TESTS,
     "extension-host-smoke": TEST_INVENTORIES.VSCODE_SMOKE_TESTS,
   }[step.id] || ["test/placeholder.test.js"];
@@ -2858,6 +2862,23 @@ suite("Quality gate runner", () => {
     assert.strictEqual(
       release.find(step => step.id === "release-checklist").artifactPath,
       ".quality/gates/live-qualification-status.json"
+    );
+  });
+
+  test("standalone evidence requires the reviewed native-host inventory", () => {
+    const step = getGatePlan("fast").find(item => item.id === "standalone-tests");
+    const complete = testEvidence(step);
+    assert.strictEqual(validateTestEvidence(complete, step, SOURCE_IDENTITY), null);
+    assert.ok(complete.tests.some(test => TEST_INVENTORIES.HOST_NODE_TESTS.includes(test.file)));
+
+    const withoutHost = clone(complete);
+    withoutHost.tests = withoutHost.tests.filter(test => (
+      !TEST_INVENTORIES.HOST_NODE_TESTS.includes(test.file)
+    ));
+    withoutHost.counts.passed = withoutHost.tests.length;
+    assert.strictEqual(
+      validateTestEvidence(withoutHost, step, SOURCE_IDENTITY),
+      "suite-inventory-mismatch",
     );
   });
 

@@ -29,13 +29,14 @@ const {
   withCanonicalNpmLauncher,
 } = require("./canonical-node-runtime");
 const {
+  HOST_NODE_TESTS,
   STANDALONE_NODE_TESTS,
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,
 } = require("../../test/testInventories");
 
 const TEST_INVENTORIES_BY_SUITE = Object.freeze({
-  "standalone-tests": STANDALONE_NODE_TESTS,
+  "standalone-tests": Object.freeze([...STANDALONE_NODE_TESTS, ...HOST_NODE_TESTS]),
   "extension-host-core": VSCODE_CORE_TESTS,
   "extension-host-smoke": VSCODE_SMOKE_TESTS,
 });

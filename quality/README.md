@@ -205,6 +205,14 @@ retries only potentially transient, retry-eligible Windows errors while removing
 temporary build tree; every retry revalidates the root, names, and file
 identities, and cleanup remains nonrecursive.
 
+The Ubuntu core rows run the complete standalone Node inventory. Windows and
+macOS smoke rows run the smaller reviewed native-host inventory in addition to
+their real Extension Host smoke; it proves the actual runner/platform binding,
+qualification-profile lifecycle, host-native VSIX descriptor transport, and
+exact package-tree cleanup. Windows also performs the canonical package
+preflight. The host inventory is not a substitute for the complete suite: full
+local and Ubuntu runs always execute both inventories.
+
 On macOS, the no-argument prepare and launch commands first resolve
 `command -v code`, canonicalize it to a real app-bundled CLI, and then fall back
 to `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code`.

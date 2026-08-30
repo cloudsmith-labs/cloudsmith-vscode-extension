@@ -5,6 +5,7 @@ const path = require("path");
 const {
   CREDENTIAL_BOUNDARY_EXCLUDED_TESTS,
   CREDENTIAL_BOUNDARY_SKIP_REASON,
+  HOST_NODE_TESTS,
   QUALIFICATION_REQUIRED_ENV,
   STANDALONE_NODE_TESTS,
   VSCODE_CORE_TESTS,
@@ -22,6 +23,7 @@ const MAX_TEST_TRAVERSAL_DEPTH = 8;
 const MAX_TEST_TRAVERSAL_ENTRIES = 512;
 const inventories = Object.freeze({
   credentialBoundaryExcluded: CREDENTIAL_BOUNDARY_EXCLUDED_TESTS,
+  host: HOST_NODE_TESTS,
   node: STANDALONE_NODE_TESTS,
   smoke: VSCODE_SMOKE_TESTS,
   vscode: VSCODE_CORE_TESTS,
@@ -70,39 +72,40 @@ suite("test runner inventories", () => {
     assert.match(vscodeConfig, /VSCODE_SMOKE_TESTS/);
     assert.doesNotMatch(vscodeConfig, /LIVE_TESTS|SSO_LIVE_TESTS|label: "live"|label: "sso-live"/);
     assert.match(vscodeConfig, /"1\.134\.0"/);
+    assert.match(nodeRunner, /HOST_NODE_TESTS/);
     assert.match(nodeRunner, /STANDALONE_NODE_TESTS/);
     const combinedRunner = fs.readFileSync(path.join(root, "scripts", "run-tests.js"), "utf8");
     assert.match(combinedRunner, /CREDENTIAL_BOUNDARY_SKIP_REASON/);
-    const plan = (label, zeroProbe, runNodeTests) => testPlan({
+    const plan = (label, zeroProbe, nodeTestMode) => testPlan({
       label,
       zeroProbe,
-      runNodeTests,
+      nodeTestMode,
     }).map(step => [step.script, [...step.args]]);
-    assert.deepStrictEqual(plan("core", false, true), [
+    assert.deepStrictEqual(plan("core", false, "full"), [
       ["run-node-tests.js", []],
       ["run-vscode-tests.js", ["--label", "core"]],
     ]);
-    assert.deepStrictEqual(plan("smoke", false, false), [
+    assert.deepStrictEqual(plan("smoke", false, "none"), [
       ["run-vscode-tests.js", ["--label", "smoke"]],
     ]);
-    assert.deepStrictEqual(plan("smoke", false, true), [
-      ["run-node-tests.js", []],
+    assert.deepStrictEqual(plan("smoke", false, "host"), [
+      ["run-node-tests.js", ["--host"]],
       ["run-vscode-tests.js", ["--label", "smoke"]],
     ]);
-    assert.deepStrictEqual(plan("core", true, true), [
+    assert.deepStrictEqual(plan("core", true, "full"), [
       ["run-node-tests.js", ["--zero-probe"]],
       ["run-vscode-tests.js", ["--label", "core", "--zero-probe"]],
     ]);
-    assert.deepStrictEqual(plan("smoke", true, false), [
+    assert.deepStrictEqual(plan("smoke", true, "none"), [
       ["run-vscode-tests.js", ["--label", "smoke", "--zero-probe"]],
     ]);
-    assert.deepStrictEqual(plan("smoke", true, true), [
-      ["run-node-tests.js", ["--zero-probe"]],
+    assert.deepStrictEqual(plan("smoke", true, "host"), [
+      ["run-node-tests.js", ["--host", "--zero-probe"]],
       ["run-vscode-tests.js", ["--label", "smoke", "--zero-probe"]],
     ]);
     assert.throws(
-      () => testPlan({ label: "smoke", runNodeTests: "true" }),
-      /runNodeTests must be an exact boolean/u,
+      () => testPlan({ label: "smoke", nodeTestMode: "true" }),
+      /nodeTestMode must be full, host, or none/u,
     );
     const vscodeRunner = fs.readFileSync(path.join(root, "scripts", "run-vscode-tests.js"), "utf8");
     assert.match(vscodeRunner, /process\.execve/);

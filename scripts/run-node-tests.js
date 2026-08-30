@@ -2,7 +2,7 @@
 const path = require("path");
 const fs = require("fs");
 const { spawnSync } = require("child_process");
-const { STANDALONE_NODE_TESTS } = require("../test/testInventories");
+const { HOST_NODE_TESTS, STANDALONE_NODE_TESTS } = require("../test/testInventories");
 
 const root = path.resolve(__dirname, "..");
 const PINNED_MOCHA_VERSION = "11.8.0";
@@ -25,6 +25,16 @@ if (mochaManifest.version !== PINNED_MOCHA_VERSION) {
 }
 const mocha = path.join(path.dirname(mochaManifestPath), "bin", "mocha.js");
 const zeroProbe = process.argv.includes("--zero-probe");
+const hostOnly = process.argv.includes("--host");
+const unknownArguments = process.argv.slice(2).filter(argument => (
+  !new Set(["--host", "--zero-probe"]).has(argument)
+));
+if (unknownArguments.length > 0) {
+  throw new Error(`Unknown Node test argument: ${unknownArguments[0]}`);
+}
+const selectedTests = hostOnly
+  ? HOST_NODE_TESTS
+  : [...STANDALONE_NODE_TESTS, ...HOST_NODE_TESTS];
 const args = [
   "--fail-zero",
   "--forbid-only",
@@ -35,7 +45,7 @@ const args = [
     ? ["--reporter", path.join(root, "scripts", "quality", "mocha-evidence-reporter.js")]
     : []),
   ...(zeroProbe ? ["--grep", "__m10_node_zero_test_probe_no_match__"] : []),
-  ...STANDALONE_NODE_TESTS,
+  ...selectedTests,
 ];
 const result = spawnSync(process.execPath, [mocha, ...args], {
   cwd: root,

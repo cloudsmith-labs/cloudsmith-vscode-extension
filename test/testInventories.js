@@ -85,6 +85,10 @@ const STANDALONE_NODE_TESTS = Object.freeze([
   "test/integration/manifestParser.test.js",
 ]);
 
+const HOST_NODE_TESTS = Object.freeze([
+  "test/hostRuntime.test.js",
+]);
+
 const VSCODE_CORE_TESTS = Object.freeze([
   "test/authSessionManager.test.js",
   "test/cloudsmithAPI.test.js",
@@ -363,6 +367,7 @@ const QUALIFICATION_REQUIRED_ENV = Object.freeze(
 module.exports = {
   CREDENTIAL_BOUNDARY_EXCLUDED_TESTS,
   CREDENTIAL_BOUNDARY_SKIP_REASON,
+  HOST_NODE_TESTS,
   QUALIFICATION_REQUIRED_ENV,
   STANDALONE_NODE_TESTS,
   VSCODE_CORE_TESTS,
