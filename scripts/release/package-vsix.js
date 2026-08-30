@@ -1,5 +1,6 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const fs = require("fs");
+const crypto = require("crypto");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
@@ -24,6 +25,8 @@ const { validateSidecars, verifyVsix } = require("./verify-vsix");
 
 const root = path.resolve(__dirname, "../..");
 const VSCE_ENTRY_EVAL = "require(process.argv[1])(process.argv);";
+const packageCleanupFailures = new WeakSet();
+const WINDOWS_PACKAGE_CLEANUP_RETRIES = 32;
 
 function exactAbsolutePath(value, errorMessage) {
   if (typeof value !== "string" || !path.isAbsolute(value)
@@ -143,10 +146,10 @@ function resolveOutputPath(directory, filename) {
   return resolved;
 }
 
-function packageBuildDirectoryIdentity(directory) {
-  const stat = fs.lstatSync(directory, { bigint: true });
+function packageBuildDirectoryIdentity(directory, fileSystem = fs) {
+  const stat = fileSystem.lstatSync(directory, { bigint: true });
   if (stat.isSymbolicLink() || !stat.isDirectory()
-    || fs.realpathSync(directory) !== directory) {
+    || fileSystem.realpathSync(directory) !== directory) {
     throw new Error("Release package temporary directory must remain an exact real directory.");
   }
   return Object.freeze({
@@ -158,11 +161,53 @@ function packageBuildDirectoryIdentity(directory) {
   });
 }
 
-function packageCleanupError() {
-  throw new Error("Release package temporary cleanup refused an unsafe or changed tree.");
+function packageCleanupErrorCode(cause) {
+  let descriptor = null;
+  try {
+    descriptor = cause && (typeof cause === "object" || typeof cause === "function")
+      ? Object.getOwnPropertyDescriptor(cause, "code")
+      : null;
+  } catch {
+    return null;
+  }
+  return descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value")
+    && typeof descriptor.value === "string" && /^[A-Z][A-Z0-9_]{1,23}$/u.test(descriptor.value)
+    ? descriptor.value
+    : null;
 }
 
-function exactPackageBuildRoot(directory, identity, expectedNames, fileSystem) {
+function packageCleanupError(stage = "validation", cause = null) {
+  const code = packageCleanupErrorCode(cause);
+  const detail = code ? `${stage}:${code}` : stage;
+  const error = new Error(
+    `Release package temporary cleanup refused an unsafe or changed tree [${detail}].`,
+  );
+  packageCleanupFailures.add(error);
+  throw error;
+}
+
+function isPackageCleanupFailure(error) {
+  return Boolean(error && (typeof error === "object" || typeof error === "function")
+    && packageCleanupFailures.has(error));
+}
+
+function assertPackageCleanupPathAbsent(target, fileSystem, stage) {
+  try {
+    fileSystem.lstatSync(target);
+  } catch (error) {
+    if (packageCleanupErrorCode(error) === "ENOENT") return;
+    packageCleanupError(stage, error);
+  }
+  packageCleanupError(stage);
+}
+
+function exactPackageBuildRoot(
+  directory,
+  identity,
+  expectedNames,
+  fileSystem,
+  stage = "root-validation",
+) {
   const stat = fileSystem.lstatSync(directory, { bigint: true });
   if (stat.isSymbolicLink() || !stat.isDirectory()
     || String(stat.dev) !== String(identity?.dev)
@@ -171,32 +216,38 @@ function exactPackageBuildRoot(directory, identity, expectedNames, fileSystem) {
     || String(stat.mode) !== String(identity?.mode)
     || String(stat.uid) !== String(identity?.uid)
     || fileSystem.realpathSync(directory) !== directory) {
-    packageCleanupError();
+    packageCleanupError(stage);
   }
   const names = fileSystem.readdirSync(directory).sort();
   if (JSON.stringify(names) !== JSON.stringify([...expectedNames].sort())) {
-    packageCleanupError();
+    packageCleanupError(stage);
   }
 }
 
-function exactPackageBuildFile(directory, expected, fileSystem) {
+function exactPackageBuildFile(
+  directory,
+  expected,
+  fileSystem,
+  stage = "file-validation",
+) {
   if (!expected || expected.kind !== "file" || typeof expected.name !== "string"
     || path.basename(expected.name) !== expected.name
     || /[\/\\\u0000-\u001f\u007f]/u.test(expected.name)) {
-    packageCleanupError();
+    packageCleanupError(stage);
   }
   const target = path.join(directory, expected.name);
   const stat = fileSystem.lstatSync(target, { bigint: true });
   if (stat.isSymbolicLink() || !stat.isFile()
     || !sameExactFileIdentity(expected.identity, exactFileIdentity(stat))) {
-    packageCleanupError();
+    packageCleanupError(stage);
   }
   return target;
 }
 
 function transientPackageCleanupError(error, operation) {
-  return error && (error.code === "EPERM" || error.code === "EBUSY"
-    || (operation === "rmdir" && error.code === "ENOTEMPTY"));
+  const code = packageCleanupErrorCode(error);
+  return code === "EPERM" || code === "EBUSY"
+    || (operation === "rmdir" && code === "ENOTEMPTY");
 }
 
 function boundedRetryDelay(attempt) {
@@ -213,75 +264,313 @@ function removePackageBuildDirectory(
   const fileSystem = options.fileSystem || fs;
   const platform = options.platform || process.platform;
   const retryDelay = options.retryDelay || boundedRetryDelay;
-  const maximumRetries = platform === "win32" ? 6 : 0;
+  const maximumRetries = platform === "win32" ? WINDOWS_PACKAGE_CLEANUP_RETRIES : 0;
   const expectedByName = new Map();
+  let cleanupContainer = null;
+  let cleanupDirectory = directory;
   try {
     if (!Array.isArray(expectedRootEntries) || expectedRootEntries.length > 2) {
-      packageCleanupError();
+      packageCleanupError("entry-inventory");
     }
     for (const expected of expectedRootEntries) {
       if (!expected || expected.kind !== "file" || typeof expected.name !== "string"
         || path.basename(expected.name) !== expected.name
         || /[\/\\\u0000-\u001f\u007f]/u.test(expected.name)
         || expectedByName.has(expected.name)) {
-        packageCleanupError();
+        packageCleanupError("entry-inventory");
       }
       expectedByName.set(expected.name, expected);
     }
-    exactPackageBuildRoot(directory, identity, expectedByName.keys(), fileSystem);
+    exactPackageBuildRoot(
+      directory,
+      identity,
+      expectedByName.keys(),
+      fileSystem,
+      "initial-root-validation",
+    );
     for (const expected of expectedRootEntries) {
-      exactPackageBuildFile(directory, expected, fileSystem);
+      exactPackageBuildFile(directory, expected, fileSystem, "initial-file-validation");
+    }
+
+    const cleanupToken = crypto.randomBytes(16).toString("hex");
+    cleanupContainer = path.join(
+      path.dirname(directory),
+      `.${path.basename(directory)}.cleanup-${cleanupToken}`,
+    );
+    if (fileSystem.existsSync(cleanupContainer)) {
+      packageCleanupError("quarantine-collision");
+    }
+    fileSystem.mkdirSync(cleanupContainer, { mode: 0o700 });
+    if (platform !== "win32") fileSystem.chmodSync(cleanupContainer, 0o700);
+    const cleanupContainerIdentity = packageBuildDirectoryIdentity(
+      cleanupContainer,
+      fileSystem,
+    );
+    exactPackageBuildRoot(
+      cleanupContainer,
+      cleanupContainerIdentity,
+      [],
+      fileSystem,
+      "quarantine-container-validation",
+    );
+    cleanupDirectory = path.join(cleanupContainer, "tree");
+    let quarantineAttempt = 0;
+    while (true) {
+      exactPackageBuildRoot(
+        directory,
+        identity,
+        expectedByName.keys(),
+        fileSystem,
+        "quarantine-rename-root-validation",
+      );
+      for (const expected of expectedRootEntries) {
+        exactPackageBuildFile(
+          directory,
+          expected,
+          fileSystem,
+          "quarantine-rename-file-validation",
+        );
+      }
+      exactPackageBuildRoot(
+        cleanupContainer,
+        cleanupContainerIdentity,
+        [],
+        fileSystem,
+        "quarantine-rename-container-validation",
+      );
+      assertPackageCleanupPathAbsent(
+        cleanupDirectory,
+        fileSystem,
+        "quarantine-rename-target-occupied",
+      );
+      try {
+        fileSystem.renameSync(directory, cleanupDirectory);
+      } catch (error) {
+        if (quarantineAttempt >= maximumRetries
+          || !transientPackageCleanupError(error, "rename")) {
+          packageCleanupError("quarantine-rename-retry-exhausted", error);
+        }
+        retryDelay(quarantineAttempt);
+        quarantineAttempt += 1;
+        continue;
+      }
+      break;
+    }
+    assertPackageCleanupPathAbsent(
+      directory,
+      fileSystem,
+      "original-path-reoccupied-after-quarantine",
+    );
+    exactPackageBuildRoot(
+      cleanupContainer,
+      cleanupContainerIdentity,
+      [path.basename(cleanupDirectory)],
+      fileSystem,
+      "quarantine-container-validation",
+    );
+    exactPackageBuildRoot(
+      cleanupDirectory,
+      identity,
+      expectedByName.keys(),
+      fileSystem,
+      "quarantined-root-validation",
+    );
+    for (const expected of expectedRootEntries) {
+      exactPackageBuildFile(
+        cleanupDirectory,
+        expected,
+        fileSystem,
+        "quarantined-file-validation",
+      );
     }
 
     for (const expected of expectedRootEntries) {
       let attempt = 0;
       while (true) {
-        exactPackageBuildRoot(directory, identity, expectedByName.keys(), fileSystem);
-        const target = exactPackageBuildFile(directory, expected, fileSystem);
+        assertPackageCleanupPathAbsent(
+          directory,
+          fileSystem,
+          "original-path-reoccupied-before-unlink",
+        );
+        exactPackageBuildRoot(
+          cleanupDirectory,
+          identity,
+          expectedByName.keys(),
+          fileSystem,
+          "unlink-root-validation",
+        );
+        const target = exactPackageBuildFile(
+          cleanupDirectory,
+          expected,
+          fileSystem,
+          "unlink-file-validation",
+        );
         try {
           fileSystem.unlinkSync(target);
-          try {
-            fileSystem.lstatSync(target);
-            packageCleanupError();
-          } catch (error) {
-            if (error.code !== "ENOENT") throw error;
-          }
-          expectedByName.delete(expected.name);
-          break;
         } catch (error) {
           if (attempt >= maximumRetries || !transientPackageCleanupError(error, "unlink")) {
-            throw error;
+            packageCleanupError("unlink-retry-exhausted", error);
           }
-          exactPackageBuildRoot(directory, identity, expectedByName.keys(), fileSystem);
-          exactPackageBuildFile(directory, expected, fileSystem);
+          exactPackageBuildRoot(
+            cleanupDirectory,
+            identity,
+            expectedByName.keys(),
+            fileSystem,
+            "unlink-retry-root-validation",
+          );
+          exactPackageBuildFile(
+            cleanupDirectory,
+            expected,
+            fileSystem,
+            "unlink-retry-file-validation",
+          );
           retryDelay(attempt);
+          assertPackageCleanupPathAbsent(
+            directory,
+            fileSystem,
+            "original-path-reoccupied-during-unlink-retry",
+          );
           attempt += 1;
+          continue;
         }
+        try {
+          fileSystem.lstatSync(target);
+          packageCleanupError("unlink-postcondition");
+        } catch (error) {
+          if (isPackageCleanupFailure(error)) throw error;
+          if (packageCleanupErrorCode(error) !== "ENOENT") {
+            packageCleanupError("unlink-postcondition", error);
+          }
+        }
+        expectedByName.delete(expected.name);
+        assertPackageCleanupPathAbsent(
+          directory,
+          fileSystem,
+          "original-path-reoccupied-after-unlink",
+        );
+        break;
       }
     }
 
     let attempt = 0;
     while (true) {
-      exactPackageBuildRoot(directory, identity, [], fileSystem);
+      assertPackageCleanupPathAbsent(
+        directory,
+        fileSystem,
+        "original-path-reoccupied-before-rmdir",
+      );
+      exactPackageBuildRoot(
+        cleanupDirectory,
+        identity,
+        [],
+        fileSystem,
+        "rmdir-root-validation",
+      );
       try {
-        fileSystem.rmdirSync(directory);
-        break;
+        fileSystem.rmdirSync(cleanupDirectory);
       } catch (error) {
         if (attempt >= maximumRetries || !transientPackageCleanupError(error, "rmdir")) {
-          throw error;
+          packageCleanupError("rmdir-retry-exhausted", error);
         }
-        exactPackageBuildRoot(directory, identity, [], fileSystem);
+        exactPackageBuildRoot(
+          cleanupDirectory,
+          identity,
+          [],
+          fileSystem,
+          "rmdir-retry-root-validation",
+        );
         retryDelay(attempt);
+        assertPackageCleanupPathAbsent(
+          directory,
+          fileSystem,
+          "original-path-reoccupied-during-rmdir-retry",
+        );
         attempt += 1;
+        continue;
       }
+      assertPackageCleanupPathAbsent(
+        directory,
+        fileSystem,
+        "original-path-reoccupied-after-rmdir",
+      );
+      break;
     }
-    if (fileSystem.existsSync(directory)) packageCleanupError();
+    if (fileSystem.existsSync(cleanupDirectory)) packageCleanupError("rmdir-postcondition");
+    exactPackageBuildRoot(
+      cleanupContainer,
+      cleanupContainerIdentity,
+      [],
+      fileSystem,
+      "quarantine-container-final-validation",
+    );
+    assertPackageCleanupPathAbsent(
+      directory,
+      fileSystem,
+      "original-path-reoccupied-before-quarantine-rmdir",
+    );
+    attempt = 0;
+    while (true) {
+      exactPackageBuildRoot(
+        cleanupContainer,
+        cleanupContainerIdentity,
+        [],
+        fileSystem,
+        "quarantine-rmdir-validation",
+      );
+      assertPackageCleanupPathAbsent(
+        cleanupDirectory,
+        fileSystem,
+        "quarantine-tree-reoccupied-before-container-rmdir",
+      );
+      assertPackageCleanupPathAbsent(
+        directory,
+        fileSystem,
+        "original-path-reoccupied-before-quarantine-rmdir",
+      );
+      try {
+        fileSystem.rmdirSync(cleanupContainer);
+      } catch (error) {
+        if (attempt >= maximumRetries || !transientPackageCleanupError(error, "rmdir")) {
+          packageCleanupError("quarantine-rmdir-retry-exhausted", error);
+        }
+        exactPackageBuildRoot(
+          cleanupContainer,
+          cleanupContainerIdentity,
+          [],
+          fileSystem,
+          "quarantine-rmdir-retry-validation",
+        );
+        retryDelay(attempt);
+        assertPackageCleanupPathAbsent(
+          directory,
+          fileSystem,
+          "original-path-reoccupied-during-quarantine-rmdir-retry",
+        );
+        attempt += 1;
+        continue;
+      }
+      break;
+    }
+    assertPackageCleanupPathAbsent(
+      cleanupContainer,
+      fileSystem,
+      "quarantine-container-rmdir-postcondition",
+    );
+    assertPackageCleanupPathAbsent(
+      directory,
+      fileSystem,
+      "original-path-reoccupied-after-quarantine-rmdir",
+    );
     return true;
-  } catch {
+  } catch (error) {
+    if (typeof cleanupContainer === "string" && path.isAbsolute(cleanupContainer)) {
+      preserveNonAuthCleanupSubtree(cleanupContainer);
+    }
     if (typeof directory === "string" && path.isAbsolute(directory)) {
       preserveNonAuthCleanupSubtree(directory);
     }
-    packageCleanupError();
+    if (isPackageCleanupFailure(error)) throw error;
+    packageCleanupError("unexpected-cleanup-failure", error);
   }
 }
 

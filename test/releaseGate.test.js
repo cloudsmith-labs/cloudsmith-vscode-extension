@@ -52,6 +52,14 @@ const {
   withStableArtifact,
 } = require("../scripts/release/verify-vsix");
 
+function packageCleanupQuarantine(scratch, ownedRoot) {
+  const prefix = `.${path.basename(ownedRoot)}.cleanup-`;
+  const names = fs.readdirSync(scratch).filter(name => name.startsWith(prefix));
+  assert.strictEqual(names.length, 1, "expected one preserved package cleanup quarantine");
+  const container = path.join(scratch, names[0]);
+  return Object.freeze({ container, tree: path.join(container, "tree") });
+}
+
 function sidecarFixture() {
   const directory = fs.realpathSync(fs.mkdtempSync(path.join(
     os.tmpdir(),
@@ -1435,7 +1443,7 @@ suite("M9 release gate helpers", () => {
     }
   });
 
-  test("release package cleanup fails closed on final owned-root substitution", () => {
+  test("release package cleanup preserves a substitute captured by quarantine rename", () => {
     const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
       os.tmpdir(),
       "release-package-cleanup-final-swap-",
@@ -1452,33 +1460,87 @@ suite("M9 release gate helpers", () => {
       ownedRoot,
       "temporary.vsix",
     ))];
-    const originalRmdir = fs.rmdirSync;
+    const fileSystem = Object.create(fs);
     let substituted = false;
+    fileSystem.renameSync = (source, target) => {
+      if (!substituted && source === ownedRoot) {
+        substituted = true;
+        fs.renameSync(ownedRoot, displacedOwnedRoot);
+        fs.renameSync(victim, ownedRoot);
+      }
+      return fs.renameSync(source, target);
+    };
     try {
-      fs.rmdirSync = function substituteAtFinalRemoval(target, options) {
-        if (!substituted && target === ownedRoot) {
-          substituted = true;
-          fs.renameSync(ownedRoot, displacedOwnedRoot);
-          fs.renameSync(victim, ownedRoot);
-        }
-        return originalRmdir.call(fs, target, options);
-      };
       withExpectedCleanupTaint(() => {
         assert.throws(
-          () => removePackageBuildDirectory(ownedRoot, identity, expectedEntries),
-          /temporary cleanup refused an unsafe or changed tree/u,
+          () => removePackageBuildDirectory(
+            ownedRoot,
+            identity,
+            expectedEntries,
+            { fileSystem },
+          ),
+          /quarantined-root-validation/u,
         );
       });
-    } finally {
-      fs.rmdirSync = originalRmdir;
-    }
-    try {
+      const quarantine = packageCleanupQuarantine(scratch, ownedRoot);
       assert.strictEqual(substituted, true);
       assert.strictEqual(
-        fs.readFileSync(path.join(ownedRoot, "preserve.txt"), "utf8"),
+        fs.readFileSync(path.join(quarantine.tree, "preserve.txt"), "utf8"),
         "synthetic victim survives\n",
       );
-      assert.strictEqual(fs.existsSync(displacedOwnedRoot), true);
+      assert.strictEqual(
+        fs.readFileSync(path.join(displacedOwnedRoot, "temporary.vsix"), "utf8"),
+        "synthetic build bytes\n",
+      );
+      assert.strictEqual(fs.existsSync(ownedRoot), false);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup refuses an original path reoccupied after quarantine", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-reoccupied-after-rename-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const victim = path.join(scratch, "preserve-victim");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(path.join(ownedRoot, "temporary.vsix"), "synthetic build bytes\n");
+    fs.mkdirSync(victim);
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "reoccupied victim survives\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(path.join(
+      ownedRoot,
+      "temporary.vsix",
+    ))];
+    const fileSystem = Object.create(fs);
+    fileSystem.renameSync = (source, target) => {
+      const result = fs.renameSync(source, target);
+      if (source === ownedRoot) fs.renameSync(victim, ownedRoot);
+      return result;
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(
+          () => removePackageBuildDirectory(
+            ownedRoot,
+            identity,
+            expectedEntries,
+            { fileSystem },
+          ),
+          /original-path-reoccupied-after-quarantine/u,
+        );
+      });
+      const quarantine = packageCleanupQuarantine(scratch, ownedRoot);
+      assert.strictEqual(
+        fs.readFileSync(path.join(ownedRoot, "preserve.txt"), "utf8"),
+        "reoccupied victim survives\n",
+      );
+      assert.strictEqual(
+        fs.readFileSync(path.join(quarantine.tree, "temporary.vsix"), "utf8"),
+        "synthetic build bytes\n",
+      );
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
@@ -1529,7 +1591,9 @@ suite("M9 release gate helpers", () => {
     const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
     const fileSystem = Object.create(fs);
     let attempts = 0;
+    const destructiveTargets = [];
     fileSystem.unlinkSync = target => {
+      destructiveTargets.push(target);
       attempts += 1;
       if (attempts < 3) {
         const error = new Error("synthetic sharing violation");
@@ -1547,6 +1611,253 @@ suite("M9 release gate helpers", () => {
       ), true);
       assert.strictEqual(attempts, 3);
       assert.strictEqual(fs.existsSync(ownedRoot), false);
+      assert.strictEqual(destructiveTargets.every(target => (
+        path.basename(path.dirname(target)) === "tree"
+        && path.basename(path.dirname(path.dirname(target))).startsWith(".owned-build.cleanup-")
+        && !target.startsWith(`${ownedRoot}${path.sep}`)
+      )), true);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup tolerates a hosted Windows file lock beyond the former retry window", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-extended-retry-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    let attempts = 0;
+    fileSystem.unlinkSync = target => {
+      attempts += 1;
+      if (attempts < 9) {
+        const error = new Error("synthetic prolonged file lock");
+        error.code = "EBUSY";
+        throw error;
+      }
+      return fs.unlinkSync(target);
+    };
+    try {
+      assert.strictEqual(removePackageBuildDirectory(
+        ownedRoot,
+        identity,
+        expectedEntries,
+        { fileSystem, platform: "win32", retryDelay: () => {} },
+      ), true);
+      assert.strictEqual(attempts, 9);
+      assert.strictEqual(fs.existsSync(ownedRoot), false);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup retries a prolonged transient Windows quarantine rename", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-rename-retry-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    let attempts = 0;
+    fileSystem.renameSync = (source, target) => {
+      if (source === ownedRoot) {
+        attempts += 1;
+        if (attempts < 9) {
+          const error = new Error("synthetic prolonged directory lock");
+          error.code = "EBUSY";
+          throw error;
+        }
+      }
+      return fs.renameSync(source, target);
+    };
+    try {
+      assert.strictEqual(removePackageBuildDirectory(
+        ownedRoot,
+        identity,
+        expectedEntries,
+        { fileSystem, platform: "win32", retryDelay: () => {} },
+      ), true);
+      assert.strictEqual(attempts, 9);
+      assert.strictEqual(fs.existsSync(ownedRoot), false);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup preserves the source after bounded quarantine rename retries", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-rename-exhausted-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    let attempts = 0;
+    fileSystem.renameSync = (source, target) => {
+      if (source === ownedRoot) {
+        attempts += 1;
+        const error = new Error("persistent synthetic directory lock");
+        error.code = "EPERM";
+        throw error;
+      }
+      return fs.renameSync(source, target);
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          expectedEntries,
+          { fileSystem, platform: "win32", retryDelay: () => {} },
+        ), /quarantine-rename-retry-exhausted:EPERM/u);
+      });
+      assert.strictEqual(attempts, 33);
+      assert.strictEqual(fs.readFileSync(artifact, "utf8"), "synthetic build bytes\n");
+      const quarantine = packageCleanupQuarantine(scratch, ownedRoot);
+      assert.deepStrictEqual(fs.readdirSync(quarantine.container), []);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup diagnostics expose only a fixed stage and error code", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-safe-diagnostic-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    fileSystem.unlinkSync = () => {
+      const error = new Error(`untrusted detail at ${artifact}`);
+      error.code = "EACCES";
+      throw error;
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          expectedEntries,
+          { fileSystem, platform: "win32", retryDelay: () => {} },
+        ), error => {
+          assert.strictEqual(
+            error.message,
+            "Release package temporary cleanup refused an unsafe or changed tree "
+              + "[unlink-retry-exhausted:EACCES].",
+          );
+          assert.strictEqual(error.message.includes(artifact), false);
+          assert.strictEqual(error.message.includes("untrusted detail"), false);
+          return true;
+        });
+      });
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup contains an uninspectable refusal", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-hostile-error-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    fileSystem.unlinkSync = () => {
+      throw new Proxy({}, {
+        getOwnPropertyDescriptor() {
+          throw new Error("untrusted inspection detail");
+        },
+      });
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          expectedEntries,
+          { fileSystem, platform: "win32", retryDelay: () => {} },
+        ), error => {
+          assert.strictEqual(
+            error.message,
+            "Release package temporary cleanup refused an unsafe or changed tree "
+              + "[unlink-retry-exhausted].",
+          );
+          assert.strictEqual(error.message.includes("untrusted inspection detail"), false);
+          return true;
+        });
+      });
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup does not trust a forged internal-error marker", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-forged-marker-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    fileSystem.lstatSync = () => {
+      throw new Proxy({}, {
+        getOwnPropertyDescriptor(_target, key) {
+          if (typeof key === "symbol") {
+            return { configurable: true, value: true };
+          }
+          if (key === "message") {
+            return { configurable: true, value: `untrusted detail at ${artifact}` };
+          }
+          return undefined;
+        },
+      });
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          expectedEntries,
+          { fileSystem, platform: "win32", retryDelay: () => {} },
+        ), error => {
+          assert.strictEqual(
+            error.message,
+            "Release package temporary cleanup refused an unsafe or changed tree "
+              + "[unexpected-cleanup-failure].",
+          );
+          assert.strictEqual(error.message.includes(artifact), false);
+          return true;
+        });
+      });
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
@@ -1561,10 +1872,10 @@ suite("M9 release gate helpers", () => {
     fs.mkdirSync(ownedRoot);
     const identity = packageBuildDirectoryIdentity(ownedRoot);
     const fileSystem = Object.create(fs);
-    let attempts = 0;
+    let treeAttempts = 0;
     fileSystem.rmdirSync = target => {
-      attempts += 1;
-      if (attempts === 1) {
+      if (path.basename(target) === "tree") treeAttempts += 1;
+      if (path.basename(target) === "tree" && treeAttempts === 1) {
         const error = new Error("synthetic scanner lock");
         error.code = "ENOTEMPTY";
         throw error;
@@ -1578,7 +1889,123 @@ suite("M9 release gate helpers", () => {
         [],
         { fileSystem, platform: "win32", retryDelay: () => {} },
       ), true);
-      assert.strictEqual(attempts, 2);
+      assert.strictEqual(treeAttempts, 2);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup retries a transient Windows quarantine-container lock", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-container-rmdir-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    fs.mkdirSync(ownedRoot);
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const fileSystem = Object.create(fs);
+    let containerAttempts = 0;
+    fileSystem.rmdirSync = target => {
+      if (path.basename(target).startsWith(".owned-build.cleanup-")) {
+        containerAttempts += 1;
+        if (containerAttempts === 1) {
+          const error = new Error("synthetic scanner lock on quarantine container");
+          error.code = "EBUSY";
+          throw error;
+        }
+      }
+      return fs.rmdirSync(target);
+    };
+    try {
+      assert.strictEqual(removePackageBuildDirectory(
+        ownedRoot,
+        identity,
+        [],
+        { fileSystem, platform: "win32", retryDelay: () => {} },
+      ), true);
+      assert.strictEqual(containerAttempts, 2);
+      assert.strictEqual(fs.existsSync(ownedRoot), false);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup preserves a quarantine after bounded container-removal retries", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-container-exhausted-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    fs.mkdirSync(ownedRoot);
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const fileSystem = Object.create(fs);
+    let containerAttempts = 0;
+    fileSystem.rmdirSync = target => {
+      if (path.basename(target).startsWith(".owned-build.cleanup-")) {
+        containerAttempts += 1;
+        const error = new Error("persistent synthetic quarantine lock");
+        error.code = "EPERM";
+        throw error;
+      }
+      return fs.rmdirSync(target);
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          [],
+          { fileSystem, platform: "win32", retryDelay: () => {} },
+        ), /quarantine-rmdir-retry-exhausted:EPERM/u);
+      });
+      assert.strictEqual(containerAttempts, 33);
+      const quarantine = packageCleanupQuarantine(scratch, ownedRoot);
+      assert.deepStrictEqual(fs.readdirSync(quarantine.container), []);
+      assert.strictEqual(fs.existsSync(ownedRoot), false);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup revalidates quarantine inventory before container retry", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-container-drift-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    fs.mkdirSync(ownedRoot);
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const fileSystem = Object.create(fs);
+    let container;
+    fileSystem.rmdirSync = target => {
+      if (path.basename(target).startsWith(".owned-build.cleanup-")) {
+        container = target;
+        const error = new Error("synthetic transient quarantine lock");
+        error.code = "EBUSY";
+        throw error;
+      }
+      return fs.rmdirSync(target);
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          [],
+          {
+            fileSystem,
+            platform: "win32",
+            retryDelay: () => fs.writeFileSync(
+              path.join(container, "preserve.txt"),
+              "quarantine drift survives\n",
+            ),
+          },
+        ), /quarantine-rmdir-validation/u);
+      });
+      assert.strictEqual(
+        fs.readFileSync(path.join(container, "preserve.txt"), "utf8"),
+        "quarantine drift survives\n",
+      );
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
@@ -1613,7 +2040,11 @@ suite("M9 release gate helpers", () => {
           { fileSystem, platform: "win32", retryDelay: () => {} },
         ), /temporary cleanup refused an unsafe or changed tree/u);
       });
-      assert.strictEqual(fs.readFileSync(artifact, "utf8"), "synthetic replacement bytes\n");
+      const quarantine = packageCleanupQuarantine(scratch, ownedRoot);
+      assert.strictEqual(
+        fs.readFileSync(path.join(quarantine.tree, "temporary.vsix"), "utf8"),
+        "synthetic replacement bytes\n",
+      );
       assert.strictEqual(fs.readFileSync(displaced, "utf8"), "synthetic original bytes\n");
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
@@ -1632,7 +2063,9 @@ suite("M9 release gate helpers", () => {
     const identity = packageBuildDirectoryIdentity(ownedRoot);
     const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
     const fileSystem = Object.create(fs);
-    fileSystem.unlinkSync = () => {
+    let quarantinedRoot;
+    fileSystem.unlinkSync = target => {
+      quarantinedRoot = path.dirname(target);
       const error = new Error("synthetic sharing violation");
       error.code = "EBUSY";
       throw error;
@@ -1646,31 +2079,36 @@ suite("M9 release gate helpers", () => {
           {
             fileSystem,
             platform: "win32",
-            retryDelay: () => fs.chmodSync(ownedRoot, 0o755),
+            retryDelay: () => fs.chmodSync(quarantinedRoot, 0o755),
           },
         ), /temporary cleanup refused an unsafe or changed tree/u);
       });
-      assert.strictEqual(fs.existsSync(artifact), true);
+      const quarantine = packageCleanupQuarantine(scratch, ownedRoot);
+      assert.strictEqual(fs.existsSync(path.join(quarantine.tree, "temporary.vsix")), true);
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
   });
 
-  test("release package cleanup rejects retry-time root substitution and sibling insertion", () => {
-    for (const mutation of ["root", "sibling"]) {
+  test("release package cleanup rejects reoccupation and quarantine drift during a Windows retry", () => {
+    for (const mutation of ["original-reoccupation", "quarantine-sibling"]) {
       const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
         os.tmpdir(),
         `release-package-cleanup-windows-${mutation}-`,
       )));
       const ownedRoot = path.join(scratch, "owned-build");
       const artifact = path.join(ownedRoot, "temporary.vsix");
-      const displaced = path.join(scratch, "displaced-owned-build");
+      const victim = path.join(scratch, "preserve-victim");
       fs.mkdirSync(ownedRoot);
       fs.writeFileSync(artifact, "synthetic build bytes\n");
+      fs.mkdirSync(victim);
+      fs.writeFileSync(path.join(victim, "preserve.txt"), "retry victim survives\n");
       const identity = packageBuildDirectoryIdentity(ownedRoot);
       const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
       const fileSystem = Object.create(fs);
-      fileSystem.unlinkSync = () => {
+      let quarantinedRoot;
+      fileSystem.unlinkSync = target => {
+        quarantinedRoot = path.dirname(target);
         const error = new Error("synthetic sharing violation");
         error.code = "EBUSY";
         throw error;
@@ -1685,23 +2123,152 @@ suite("M9 release gate helpers", () => {
               fileSystem,
               platform: "win32",
               retryDelay: () => {
-                if (mutation === "root") {
-                  fs.renameSync(ownedRoot, displaced);
-                  fs.mkdirSync(ownedRoot);
+                if (mutation === "original-reoccupation") {
+                  fs.renameSync(victim, ownedRoot);
                 } else {
-                  fs.writeFileSync(path.join(ownedRoot, "unexpected.txt"), "preserve\n");
+                  fs.writeFileSync(path.join(quarantinedRoot, "unexpected.txt"), "preserve\n");
                 }
               },
             },
           ), /temporary cleanup refused an unsafe or changed tree/u);
         });
-        assert.strictEqual(
-          fs.existsSync(mutation === "root" ? path.join(displaced, "temporary.vsix") : artifact),
-          true,
-        );
+        const quarantine = packageCleanupQuarantine(scratch, ownedRoot);
+        assert.strictEqual(fs.existsSync(path.join(quarantine.tree, "temporary.vsix")), true);
+        if (mutation === "original-reoccupation") {
+          assert.strictEqual(
+            fs.readFileSync(path.join(ownedRoot, "preserve.txt"), "utf8"),
+            "retry victim survives\n",
+          );
+        } else {
+          assert.strictEqual(
+            fs.readFileSync(path.join(quarantine.tree, "unexpected.txt"), "utf8"),
+            "preserve\n",
+          );
+          assert.strictEqual(fs.existsSync(victim), true);
+        }
       } finally {
         fs.rmSync(scratch, { recursive: true, force: true });
       }
+    }
+  });
+
+  test("release package cleanup preserves an original path reoccupied during quarantined unlink", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-unlink-reoccupation-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    const victim = path.join(scratch, "preserve-victim");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    fs.mkdirSync(victim);
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "unlink victim survives\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    fileSystem.unlinkSync = target => {
+      fs.renameSync(victim, ownedRoot);
+      return fs.unlinkSync(target);
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          expectedEntries,
+          { fileSystem, platform: "win32", retryDelay: () => {} },
+        ), /original-path-reoccupied-after-unlink/u);
+      });
+      const quarantine = packageCleanupQuarantine(scratch, ownedRoot);
+      assert.strictEqual(fs.existsSync(path.join(quarantine.tree, "temporary.vsix")), false);
+      assert.strictEqual(
+        fs.readFileSync(path.join(ownedRoot, "preserve.txt"), "utf8"),
+        "unlink victim survives\n",
+      );
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup preserves an original path reoccupied during quarantined rmdir", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-rmdir-reoccupation-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const victim = path.join(scratch, "preserve-victim");
+    fs.mkdirSync(ownedRoot);
+    fs.mkdirSync(victim);
+    fs.writeFileSync(path.join(victim, "preserve.txt"), "rmdir victim survives\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const fileSystem = Object.create(fs);
+    fileSystem.rmdirSync = target => {
+      if (path.basename(target) === "tree") fs.renameSync(victim, ownedRoot);
+      return fs.rmdirSync(target);
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          [],
+          { fileSystem, platform: "win32", retryDelay: () => {} },
+        ), /original-path-reoccupied-after-rmdir/u);
+      });
+      packageCleanupQuarantine(scratch, ownedRoot);
+      assert.strictEqual(
+        fs.readFileSync(path.join(ownedRoot, "preserve.txt"), "utf8"),
+        "rmdir victim survives\n",
+      );
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup rejects a quarantine creation collision without overwriting it", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-quarantine-collision-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    let collision;
+    let destructiveCall = false;
+    fileSystem.mkdirSync = (target, options) => {
+      collision = target;
+      fs.mkdirSync(target, options);
+      fs.writeFileSync(path.join(target, "preserve.txt"), "collision survives\n");
+      return fs.mkdirSync(target, options);
+    };
+    fileSystem.unlinkSync = () => {
+      destructiveCall = true;
+    };
+    fileSystem.rmdirSync = () => {
+      destructiveCall = true;
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          expectedEntries,
+          { fileSystem },
+        ), /unexpected-cleanup-failure:EEXIST/u);
+      });
+      assert.strictEqual(destructiveCall, false);
+      assert.strictEqual(
+        fs.readFileSync(path.join(collision, "preserve.txt"), "utf8"),
+        "collision survives\n",
+      );
+      assert.strictEqual(fs.readFileSync(artifact, "utf8"), "synthetic build bytes\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
     }
   });
 
@@ -1769,8 +2336,9 @@ suite("M9 release gate helpers", () => {
           { fileSystem, platform: "win32", retryDelay: () => {} },
         ), /temporary cleanup refused an unsafe or changed tree/u);
       });
-      assert.strictEqual(attempts, 7);
-      assert.strictEqual(fs.existsSync(artifact), true);
+      assert.strictEqual(attempts, 33);
+      const quarantine = packageCleanupQuarantine(scratch, ownedRoot);
+      assert.strictEqual(fs.existsSync(path.join(quarantine.tree, "temporary.vsix")), true);
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
@@ -1792,7 +2360,7 @@ suite("M9 release gate helpers", () => {
     const fileSystem = Object.create(fs);
     let secondAttempts = 0;
     fileSystem.unlinkSync = target => {
-      if (target === second) {
+      if (path.basename(target) === path.basename(second)) {
         secondAttempts += 1;
         const error = new Error("persistent synthetic second-file lock");
         error.code = "EBUSY";
@@ -1809,10 +2377,14 @@ suite("M9 release gate helpers", () => {
           { fileSystem, platform: "win32", retryDelay: () => {} },
         ), /temporary cleanup refused an unsafe or changed tree/u);
       });
-      assert.strictEqual(fs.existsSync(first), false);
-      assert.strictEqual(fs.readFileSync(second, "utf8"), "synthetic second bytes\n");
-      assert.strictEqual(fs.existsSync(ownedRoot), true);
-      assert.strictEqual(secondAttempts, 7);
+      const quarantine = packageCleanupQuarantine(scratch, ownedRoot);
+      assert.strictEqual(fs.existsSync(path.join(quarantine.tree, "first.vsix")), false);
+      assert.strictEqual(
+        fs.readFileSync(path.join(quarantine.tree, "second.vsix"), "utf8"),
+        "synthetic second bytes\n",
+      );
+      assert.strictEqual(fs.existsSync(ownedRoot), false);
+      assert.strictEqual(secondAttempts, 33);
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }

@@ -19,10 +19,13 @@ both required. Passing one never implies that the other ran.
 - [ ] Linux CI hardened only the exact pinned hosted toolcache immediately
       after setup and then passed the unchanged canonical Node/npm validators;
       any wrong root, version, link, replacement, or writable residue failed.
-- [ ] Windows packaging cleanup retried only potentially transient,
-      retry-eligible errors on the exact
-      verified temporary VSIX identities and retained nonrecursive fail-closed
-      behavior for substitution, unexpected entries, and retry exhaustion.
+- [ ] Packaging atomically quarantined the exact verified temporary VSIX tree
+      under a fresh unpredictable sibling, proved the original path remained
+      absent, and preserved any substitute, collision, or reoccupying path.
+      Windows retried only potentially transient, retry-eligible errors and
+      retained nonrecursive fail-closed behavior for unexpected entries and
+      retry exhaustion; the bound permits at most 32 retries for the quarantine
+      rename and per owned entry, quarantined tree, or quarantine container.
 - [ ] Ubuntu core executed the complete standalone Node inventory; Windows and
       macOS executed the reviewed native-host inventory plus real Extension
       Host smoke, and Windows completed its canonical package preflight.

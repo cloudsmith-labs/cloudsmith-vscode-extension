@@ -200,10 +200,15 @@ group/other-writable. Every Linux workflow therefore hardens only the pinned
 distribution and its npm runtime immediately after setup, proves stable
 path/inode ownership through descriptor-bound permission changes, and then runs
 the unchanged canonical Node/npm validators. Wrong versions, roots, links,
-replacements, or residual writable bits fail closed. Windows release packaging
-retries only potentially transient, retry-eligible Windows errors while removing its exact two-file
-temporary build tree; every retry revalidates the root, names, and file
-identities, and cleanup remains nonrecursive.
+replacements, or residual writable bits fail closed. Release packaging first
+atomically moves its exact two-file temporary build tree into a fresh,
+unpredictable sibling quarantine and proves the original path remains absent.
+Substitution, quarantine collision, or reoccupation of the original path fails
+closed without deleting the occupant. Windows then retries only potentially
+transient, retry-eligible errors, with at most 32 retries for the quarantine
+rename and per owned entry, quarantined tree, or quarantine container; every
+retry revalidates the relevant identity and inventory, and cleanup remains
+nonrecursive.
 
 The Ubuntu core rows run the complete standalone Node inventory. Windows and
 macOS smoke rows run the smaller reviewed native-host inventory in addition to
