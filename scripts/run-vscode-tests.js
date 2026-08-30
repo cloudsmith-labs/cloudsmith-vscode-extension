@@ -4,6 +4,7 @@ const { spawnSync } = require("child_process");
 const {
   QUALIFICATION_REQUIRED_ENV,
   assertCredentialFreeRequiredEnvironment,
+  assertExpectedZeroTestFailure,
   createIsolatedQualificationRoot,
   exportIsolatedQualificationRoot,
   removeIsolatedQualificationRoot,
@@ -116,10 +117,5 @@ try {
 }
 const output = `${result.stdout || ""}${result.stderr || ""}`;
 process.stdout.write(output);
-if (result.error || result.signal || result.status !== 1) {
-  throw new Error("Zero-test probe did not produce Mocha's expected failure status");
-}
-if (!/\b0 passing\b/.test(output) || !/\b1 test failed\b/.test(output)) {
-  throw new Error("Zero-test probe failed before reaching Mocha's fail-zero guard");
-}
+assertExpectedZeroTestFailure(result, output);
 console.log("Confirmed that the real test entrypoint rejects a zero-test run.");

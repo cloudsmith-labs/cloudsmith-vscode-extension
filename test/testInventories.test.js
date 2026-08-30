@@ -11,6 +11,7 @@ const {
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,
   assertCredentialFreeRequiredEnvironment,
+  assertExpectedZeroTestFailure,
   createIsolatedQualificationRoot,
   exportIsolatedQualificationRoot,
   removeIsolatedQualificationRoot,
@@ -444,5 +445,36 @@ suite("test runner inventories", () => {
       "^11.7.6"
     );
     assert.strictEqual(lockfile.packages["node_modules/mocha"].version, "11.8.0");
+  });
+
+  test("the Extension Host zero-test proof rejects success but tolerates wrapper failure codes", () => {
+    const output = "  0 passing (1ms)\n1 test failed.\nExit code:   1\n";
+    for (const status of [1, 5, 255]) {
+      assert.strictEqual(assertExpectedZeroTestFailure({ status }, output), true);
+    }
+    for (const result of [
+      { status: 0 },
+      { status: null },
+      { status: -1 },
+      { status: 256 },
+      { status: 1, signal: "SIGTERM" },
+      { status: 1, error: new Error("synthetic launch failure") },
+    ]) {
+      assert.throws(
+        () => assertExpectedZeroTestFailure(result, output),
+        /nonzero failure status/u,
+      );
+    }
+    for (const incomplete of [
+      "0 passing\n1 test failed.\n",
+      "1 passing\n1 test failed.\nExit code: 1\n",
+      "0 passing\nExit code: 1\n",
+      "0 passing\n1 test failed.\nExit code: 0\n",
+    ]) {
+      assert.throws(
+        () => assertExpectedZeroTestFailure({ status: 1 }, incomplete),
+        /fail-zero guard/u,
+      );
+    }
   });
 });

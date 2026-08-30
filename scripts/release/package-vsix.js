@@ -146,10 +146,19 @@ function resolveOutputPath(directory, filename) {
   return resolved;
 }
 
+function samePackagePath(left, right, platform = process.platform) {
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  const normalize = value => {
+    const normalized = pathApi.normalize(value);
+    return platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  return normalize(left) === normalize(right);
+}
+
 function packageBuildDirectoryIdentity(directory, fileSystem = fs) {
   const stat = fileSystem.lstatSync(directory, { bigint: true });
   if (stat.isSymbolicLink() || !stat.isDirectory()
-    || fileSystem.realpathSync(directory) !== directory) {
+    || !samePackagePath(fileSystem.realpathSync(directory), directory)) {
     throw new Error("Release package temporary directory must remain an exact real directory.");
   }
   return Object.freeze({
@@ -214,13 +223,15 @@ function exactPackageBuildRoot(
     || String(stat.gid) !== String(identity?.gid)
     || String(stat.ino) !== String(identity?.ino)
     || String(stat.mode) !== String(identity?.mode)
-    || String(stat.uid) !== String(identity?.uid)
-    || fileSystem.realpathSync(directory) !== directory) {
+    || String(stat.uid) !== String(identity?.uid)) {
     packageCleanupError(stage);
+  }
+  if (!samePackagePath(fileSystem.realpathSync(directory), directory)) {
+    packageCleanupError(`${stage}-path`);
   }
   const names = fileSystem.readdirSync(directory).sort();
   if (JSON.stringify(names) !== JSON.stringify([...expectedNames].sort())) {
-    packageCleanupError(stage);
+    packageCleanupError(`${stage}-inventory`);
   }
 }
 
@@ -733,4 +744,5 @@ module.exports = {
   removePackageBuildDirectory,
   runPackageCommand: run,
   resolveOutputPath,
+  samePackagePath,
 };

@@ -360,6 +360,22 @@ function removeIsolatedQualificationRoot(runRoot) {
   isolatedQualificationRoots.delete(resolved);
 }
 
+function assertExpectedZeroTestFailure(result, output) {
+  if (!result || typeof result !== "object" || Array.isArray(result)
+    || result.error || result.signal
+    || !Number.isSafeInteger(result.status)
+    || result.status <= 0 || result.status > 255) {
+    throw new Error("Zero-test probe did not produce a nonzero failure status");
+  }
+  if (typeof output !== "string"
+    || !/\b0 passing\b/u.test(output)
+    || !/\b1 test failed\b/u.test(output)
+    || !/\bExit code:\s+1\b/u.test(output)) {
+    throw new Error("Zero-test probe failed before reaching Mocha's fail-zero guard");
+  }
+  return true;
+}
+
 const QUALIFICATION_REQUIRED_ENV = Object.freeze(
   assertCredentialFreeRequiredEnvironment([])
 );
@@ -373,6 +389,7 @@ module.exports = {
   VSCODE_CORE_TESTS,
   VSCODE_SMOKE_TESTS,
   assertCredentialFreeRequiredEnvironment,
+  assertExpectedZeroTestFailure,
   adoptIsolatedQualificationRoot,
   createIsolatedQualificationRoot,
   exportIsolatedQualificationRoot,

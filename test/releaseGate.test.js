@@ -25,6 +25,7 @@ const {
   removePackageBuildDirectory,
   resolveOutputPath,
   runPackageCommand,
+  samePackagePath,
 } = require("../scripts/release/package-vsix");
 const {
   scanAcceptedEvidence,
@@ -1441,6 +1442,21 @@ suite("M9 release gate helpers", () => {
     } finally {
       fs.rmSync(evidenceRoot, { recursive: true, force: true });
     }
+  });
+
+  test("release package path identity follows host filesystem semantics", () => {
+    assert.strictEqual(
+      samePackagePath("D:\\Temp\\Owned-Build", "d:/temp/owned-build", "win32"),
+      true,
+    );
+    assert.strictEqual(
+      samePackagePath("D:\\Temp\\Owned-Build", "d:\\temp\\different", "win32"),
+      false,
+    );
+    assert.strictEqual(
+      samePackagePath("/tmp/Owned-Build", "/tmp/owned-build", "linux"),
+      false,
+    );
   });
 
   test("release package cleanup preserves a substitute captured by quarantine rename", () => {
