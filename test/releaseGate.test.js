@@ -2983,7 +2983,7 @@ suite("M9 release gate helpers", () => {
     }
   });
 
-  test("sidecar validation rejects artifact and sidecar swaps between lstat and open", () => {
+  test("sidecar validation rejects artifact and sidecar swaps after descriptor open", () => {
     for (const selected of ["filePath", "checksumPath", "provenancePath"]) {
       const fixture = sidecarFixture();
       const target = fixture[selected];
@@ -2992,12 +2992,13 @@ suite("M9 release gate helpers", () => {
       let swapped = false;
       const fileSystem = Object.create(fs);
       fileSystem.openSync = (openedPath, flags) => {
+        const descriptor = fs.openSync(openedPath, flags);
         if (!swapped && openedPath === target) {
           fs.renameSync(target, displaced);
           fs.writeFileSync(target, originalBytes);
           swapped = true;
         }
-        return fs.openSync(openedPath, flags);
+        return descriptor;
       };
       try {
         assert.throws(

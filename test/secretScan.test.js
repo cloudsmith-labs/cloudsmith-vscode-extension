@@ -2423,7 +2423,7 @@ suite("secret exposure gate", () => {
     assert.strictEqual(requestedBytes, originalBytes.length);
   });
 
-  test("bounded release UI loader rejects a final-path replacement before reading it", () => {
+  test("bounded release UI loader rejects a final-path replacement after descriptor open", () => {
     const relativePath = ".quality/ui/result.json";
     const target = path.join(scratch, ...relativePath.split("/"));
     const displaced = path.join(scratch, ".quality", "ui", "displaced-result.json");
@@ -2435,12 +2435,13 @@ suite("secret exposure gate", () => {
     let replaced = false;
     let descriptorReads = 0;
     fileSystem.openSync = (file, flags, mode) => {
+      const descriptor = fs.openSync(file, flags, mode);
       if (file === target && !replaced) {
         replaced = true;
         fs.renameSync(target, displaced);
         fs.renameSync(replacement, target);
       }
-      return fs.openSync(file, flags, mode);
+      return descriptor;
     };
     fileSystem.readSync = (...arguments_) => {
       descriptorReads += 1;
@@ -2472,12 +2473,13 @@ suite("secret exposure gate", () => {
     let replaced = false;
     let descriptorReads = 0;
     fileSystem.openSync = (file, flags, mode) => {
+      const descriptor = fs.openSync(file, flags, mode);
       if (file === target && !replaced) {
         replaced = true;
         fs.renameSync(qualityRoot, displacedRoot);
         fs.renameSync(replacementRoot, qualityRoot);
       }
-      return fs.openSync(file, flags, mode);
+      return descriptor;
     };
     fileSystem.readSync = (...arguments_) => {
       descriptorReads += 1;
@@ -3511,12 +3513,13 @@ suite("secret exposure gate", () => {
     let descriptorReads = 0;
     const fileSystem = Object.create(fs);
     fileSystem.openSync = (target, flags, mode) => {
+      const descriptor = fs.openSync(target, flags, mode);
       if (target === proof && !replaced) {
         replaced = true;
         fs.renameSync(proof, original);
         fs.renameSync(replacement, proof);
       }
-      return fs.openSync(target, flags, mode);
+      return descriptor;
     };
     fileSystem.readFileSync = (...arguments_) => {
       if (typeof arguments_[0] === "number") descriptorReads += 1;

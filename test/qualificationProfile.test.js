@@ -1079,18 +1079,23 @@ suite("qualification candidate isolation", () => {
     assert.strictEqual(grew, true);
   });
 
-  test("package output enforces its byte bound before opening", () => {
+  test("package output enforces its byte bound after safe open and before reading", () => {
     const fixture = packageOutputFixture();
     let opened = false;
+    let read = false;
     const fileSystem = Object.create(fs);
-    fileSystem.lstatSync = (target, options) => {
-      const stat = fs.lstatSync(target, options);
-      if (target === fixture.output) stat.size = BigInt(16 * 1024 + 1);
+    fileSystem.fstatSync = (descriptor, options) => {
+      const stat = fs.fstatSync(descriptor, options);
+      stat.size = BigInt(16 * 1024 + 1);
       return stat;
     };
     fileSystem.openSync = (...arguments_) => {
       opened = true;
       return fs.openSync(...arguments_);
+    };
+    fileSystem.readSync = (...arguments_) => {
+      read = true;
+      return fs.readSync(...arguments_);
     };
     assert.throws(
       () => parsePackageOutput(
@@ -1102,7 +1107,8 @@ suite("qualification candidate isolation", () => {
       ),
       /exact bounded single-link file/u,
     );
-    assert.strictEqual(opened, false);
+    assert.strictEqual(opened, true);
+    assert.strictEqual(read, false);
   });
 
   test("injected artifact verifier rejects identityless and forged results", async () => {
