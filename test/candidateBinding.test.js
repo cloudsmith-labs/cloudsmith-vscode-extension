@@ -15,6 +15,7 @@ const {
   LIVE_CANDIDATE_RECEIPT,
   candidateBindingFromReceipt,
   digestStableSingleLinkFile,
+  exactFileIdentity,
   profileRootIdentity,
   validateAuthenticatedExecutionReceipt,
   validateCandidateBinding,
@@ -151,7 +152,7 @@ suite("live qualification candidate binding", () => {
     assert.strictEqual(proofRead, false);
   });
 
-  test("rejects hard links and special-file proofs without reading or hashing bytes", function () {
+  test("rejects hard links and special-file proofs after safe open without reading or hashing bytes", function () {
     if (process.platform === "win32") this.skip();
     const fixture = candidateFixture(roots);
     const hardLink = path.join(fixture.root, "candidate-hard-link.vsix");
@@ -196,16 +197,17 @@ suite("live qualification candidate binding", () => {
         /Synthetic exact-file rejection/u,
       );
     }
-    assert.strictEqual(opened, 0);
+    assert.ok(opened >= 3);
     assert.strictEqual(descriptorReads, 0);
     assert.strictEqual(digests, 0);
   });
 
-  test("rejects a regular-file path swap before reading or hashing replacement bytes", () => {
+  test("rejects an expected-identity path swap before reading or hashing replacement bytes", () => {
     const fixture = candidateFixture(roots);
     const original = path.join(fixture.root, "original-candidate.vsix");
     const replacement = path.join(fixture.root, "replacement-candidate.vsix");
     fs.writeFileSync(replacement, Buffer.alloc(fixture.bytes.length, 0x5a));
+    const expectedIdentity = exactFileIdentity(fs.lstatSync(fixture.artifactPath, { bigint: true }));
     let replaced = false;
     let descriptorReads = 0;
     let digests = 0;
@@ -230,6 +232,7 @@ suite("live qualification candidate binding", () => {
           return "a".repeat(64);
         },
         errorMessage: "Synthetic exact-file rejection.",
+        expectedIdentity,
         fileSystem,
         maximumBytes: 12 * 1024 * 1024,
         minimumBytes: 1,

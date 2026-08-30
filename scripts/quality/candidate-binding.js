@@ -148,36 +148,33 @@ function withStableSingleLinkFile(file, options = {}, consume) {
   let result;
   let completed = false;
   try {
-    const pathStat = assertBoundedSingleLinkFile(
-      fileSystem.lstatSync(file, { bigint: true }),
-      minimumBytes,
-      maximumBytes,
-      errorMessage,
-    );
-    if (expectedBytes !== undefined && pathStat.size !== BigInt(expectedBytes)) {
-      throw new Error(errorMessage);
-    }
-    if (pathStat.isSymbolicLink()
-      || !sameFilesystemPath(fileSystem.realpathSync(file), file)) {
-      throw new Error(errorMessage);
-    }
-    const pathIdentity = exactFileIdentity(pathStat);
-    if (options.expectedIdentity
-      && !sameExactFileIdentity(options.expectedIdentity, pathIdentity)) {
-      throw new Error(errorMessage);
-    }
-
-    // The descriptor is fstat-bound to pathIdentity before any bytes are read,
-    // and assertStableOpenFile repeats both checks after the read and consumer.
-    descriptor = fileSystem.openSync(file, EXACT_FILE_READ_FLAGS); // codeql[js/file-system-race]
+    // Opening is the operation's linearization point. The descriptor is
+    // validated before any pathname observation or byte read, then the stable
+    // pathname/descriptor binding is repeated after the read and consumer.
+    descriptor = fileSystem.openSync(file, EXACT_FILE_READ_FLAGS);
     const openedStat = assertBoundedSingleLinkFile(
       fileSystem.fstatSync(descriptor, { bigint: true }),
       minimumBytes,
       maximumBytes,
       errorMessage,
     );
+    if (expectedBytes !== undefined && openedStat.size !== BigInt(expectedBytes)) {
+      throw new Error(errorMessage);
+    }
     const openedIdentity = exactFileIdentity(openedStat);
-    if (!sameExactFileIdentity(pathIdentity, openedIdentity)) throw new Error(errorMessage);
+    if (options.expectedIdentity
+      && !sameExactFileIdentity(options.expectedIdentity, openedIdentity)) {
+      throw new Error(errorMessage);
+    }
+    assertStableOpenFile(
+      file,
+      descriptor,
+      openedIdentity,
+      minimumBytes,
+      maximumBytes,
+      fileSystem,
+      errorMessage,
+    );
 
     const openedBytes = Number(openedStat.size);
     bytes = Buffer.allocUnsafe(openedBytes);

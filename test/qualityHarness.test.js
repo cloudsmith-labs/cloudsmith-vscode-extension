@@ -4959,7 +4959,7 @@ suite("Quality gate runner", () => {
     }
   });
 
-  test("evidence handoff rejects a same-byte gate summary replacement at open", () => {
+  test("evidence handoff rejects a same-byte gate summary replacement after descriptor open", () => {
     const fixture = createEvidenceHandoffFixture();
     const target = path.join(
       fs.realpathSync(fixture.root),
@@ -4974,12 +4974,13 @@ suite("Quality gate runner", () => {
     let swapped = false;
     let readCalls = 0;
     fileSystem.openSync = function substituteSummaryAtOpen(file, flags, ...rest) {
+      const descriptor = originalOpen.call(fs, file, flags, ...rest);
       if (!swapped && file === target) {
         fs.renameSync(target, displaced);
         fs.renameSync(replacement, target);
         swapped = true;
       }
-      return originalOpen.call(fs, file, flags, ...rest);
+      return descriptor;
     };
     fileSystem.readSync = function countSummaryReads(...arguments_) {
       readCalls += 1;
@@ -5063,7 +5064,7 @@ suite("Quality gate runner", () => {
           root: fixture.root,
           source: fixture.source,
         }),
-        /bundle bytes do not match|Gate receipts changed|generation changed/u,
+        /bundle bytes do not match|Gate receipts changed|generation changed|Evidence file is unsafe or changed/u,
       );
       assert.strictEqual(swapped, true);
     } finally {
