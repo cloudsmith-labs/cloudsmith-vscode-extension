@@ -30,6 +30,10 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
 
+      - name: Harden exact hosted Node.js runtime
+        if: runner.os == 'Linux'
+        run: node scripts/quality/harden-hosted-node-runtime.js
+
       - name: Install locked dependencies without lifecycle scripts
         run: npm ci --ignore-scripts --no-audit --no-fund
 
@@ -103,6 +107,10 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
 
+      - name: Harden exact hosted Node.js runtime
+        if: runner.os == 'Linux'
+        run: node scripts/quality/harden-hosted-node-runtime.js
+
       - name: Install locked dependencies without lifecycle scripts
         run: npm ci --ignore-scripts --no-audit --no-fund
 
@@ -162,6 +170,10 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
+
+      - name: Harden exact hosted Node.js runtime
+        if: runner.os == 'Linux'
+        run: node scripts/quality/harden-hosted-node-runtime.js
 
       - name: Install locked dependencies without lifecycle scripts
         run: npm ci --ignore-scripts --no-audit --no-fund

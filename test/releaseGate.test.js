@@ -16,6 +16,9 @@ const {
   withCanonicalNpmLauncher,
 } = require("../scripts/quality/canonical-node-runtime");
 const {
+  hardenHostedNodeRuntime,
+} = require("../scripts/quality/harden-hosted-node-runtime");
+const {
   authenticatePackageNpmRuntime,
   canonicalVscePackageInvocation,
   packageBuildDirectoryIdentity,
@@ -230,7 +233,302 @@ function createCanonicalNpmFixture(fixtureRoot, options = {}) {
   };
 }
 
+function makeTreeGroupWritable(target) {
+  const stat = fs.lstatSync(target);
+  if (stat.isSymbolicLink()) return;
+  fs.chmodSync(target, stat.mode | 0o022);
+  if (stat.isDirectory()) {
+    for (const name of fs.readdirSync(target)) {
+      makeTreeGroupWritable(path.join(target, name));
+    }
+  }
+}
+
 suite("M9 release gate helpers", () => {
+  test("hosted Linux hardening converts the exact writable toolcache into canonical runtime evidence", () => {
+    const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "hosted-node-hardening-",
+    )));
+    try {
+      fs.writeFileSync(path.join(fixtureRoot, ".node-version"), "22.23.2\n");
+      const toolCache = path.join(fixtureRoot, "toolcache");
+      const distributionRoot = path.join(toolCache, "node", "22.23.2", process.arch);
+      const nodeExecutable = path.join(distributionRoot, "bin", "node");
+      createCanonicalNpmFixture(fixtureRoot, { nodeExecutable });
+      makeTreeGroupWritable(distributionRoot);
+
+      assert.throws(
+        () => assertExactNodeExecutable(nodeExecutable),
+        /unsafe or invalid/u,
+      );
+      assert.throws(
+        () => assertCanonicalNpmRuntime(fixtureRoot, undefined, {
+          nodeExecutable,
+          platform: "linux",
+        }),
+        /unsafe or invalid/u,
+      );
+
+      const result = hardenHostedNodeRuntime({
+        architecture: process.arch,
+        currentVersion: "v22.23.2",
+        nodeExecutable,
+        repositoryRoot: fixtureRoot,
+        toolCache,
+      });
+      assert.strictEqual(result.nodeExecutable, nodeExecutable);
+      assert.doesNotThrow(() => assertExactNodeExecutable(nodeExecutable));
+      assert.doesNotThrow(() => assertCanonicalNpmRuntime(fixtureRoot, undefined, {
+        nodeExecutable,
+        platform: "linux",
+      }));
+    } finally {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("hosted Linux hardening rejects a runtime outside the exact pinned toolcache root", () => {
+    const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "hosted-node-wrong-root-",
+    )));
+    try {
+      fs.writeFileSync(path.join(fixtureRoot, ".node-version"), "22.23.2\n");
+      const toolCache = path.join(fixtureRoot, "toolcache");
+      const distributionRoot = path.join(toolCache, "node", "22.23.2", process.arch);
+      createCanonicalNpmFixture(fixtureRoot, {
+        nodeExecutable: path.join(distributionRoot, "bin", "node"),
+      });
+      const wrongExecutable = path.join(fixtureRoot, "wrong", "bin", "node");
+      fs.mkdirSync(path.dirname(wrongExecutable), { recursive: true });
+      fs.writeFileSync(wrongExecutable, "wrong runtime\n", { mode: 0o700 });
+      makeTreeGroupWritable(distributionRoot);
+      assert.throws(() => hardenHostedNodeRuntime({
+        architecture: process.arch,
+        currentVersion: "v22.23.2",
+        nodeExecutable: wrongExecutable,
+        repositoryRoot: fixtureRoot,
+        toolCache,
+      }), /refused an unsafe or changed tree/u);
+      assert.notStrictEqual(fs.lstatSync(distributionRoot).mode & 0o022, 0);
+    } finally {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("hosted Linux hardening rejects links inside the selected npm runtime tree", () => {
+    const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "hosted-node-link-",
+    )));
+    try {
+      fs.writeFileSync(path.join(fixtureRoot, ".node-version"), "22.23.2\n");
+      const toolCache = path.join(fixtureRoot, "toolcache");
+      const distributionRoot = path.join(toolCache, "node", "22.23.2", process.arch);
+      const nodeExecutable = path.join(distributionRoot, "bin", "node");
+      const fixture = createCanonicalNpmFixture(fixtureRoot, { nodeExecutable });
+      fs.symlinkSync("package.json", path.join(fixture.packageRoot, "linked-package.json"));
+      makeTreeGroupWritable(distributionRoot);
+      assert.throws(() => hardenHostedNodeRuntime({
+        architecture: process.arch,
+        currentVersion: "v22.23.2",
+        nodeExecutable,
+        repositoryRoot: fixtureRoot,
+        toolCache,
+      }), /refused an unsafe or changed tree/u);
+    } finally {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("hosted Linux hardening rejects residual writable bits after a false chmod", () => {
+    const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "hosted-node-residual-mode-",
+    )));
+    try {
+      fs.writeFileSync(path.join(fixtureRoot, ".node-version"), "22.23.2\n");
+      const toolCache = path.join(fixtureRoot, "toolcache");
+      const distributionRoot = path.join(toolCache, "node", "22.23.2", process.arch);
+      const nodeExecutable = path.join(distributionRoot, "bin", "node");
+      createCanonicalNpmFixture(fixtureRoot, { nodeExecutable });
+      makeTreeGroupWritable(distributionRoot);
+      const fileSystem = Object.create(fs);
+      fileSystem.fchmodSync = () => {};
+      assert.throws(() => hardenHostedNodeRuntime({
+        architecture: process.arch,
+        currentVersion: "v22.23.2",
+        fileSystem,
+        nodeExecutable,
+        repositoryRoot: fixtureRoot,
+        toolCache,
+      }), /refused an unsafe or changed tree/u);
+    } finally {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("hosted Linux hardening rejects a same-inode same-size Node rewrite during chmod", () => {
+    const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "hosted-node-rewrite-",
+    )));
+    try {
+      fs.writeFileSync(path.join(fixtureRoot, ".node-version"), "22.23.2\n");
+      const toolCache = path.join(fixtureRoot, "toolcache");
+      const distributionRoot = path.join(toolCache, "node", "22.23.2", process.arch);
+      const nodeExecutable = path.join(distributionRoot, "bin", "node");
+      createCanonicalNpmFixture(fixtureRoot, { nodeExecutable });
+      makeTreeGroupWritable(distributionRoot);
+      const original = fs.readFileSync(nodeExecutable);
+      const replacement = Buffer.from(original);
+      replacement[0] ^= 0xff;
+      const originalIdentity = fs.lstatSync(nodeExecutable, { bigint: true });
+      const fileSystem = Object.create(fs);
+      let rewritten = false;
+      fileSystem.fchmodSync = (descriptor, mode) => {
+        if (!rewritten) {
+          rewritten = true;
+          fs.writeFileSync(nodeExecutable, replacement);
+        }
+        fs.fchmodSync(descriptor, mode);
+      };
+      assert.throws(() => hardenHostedNodeRuntime({
+        architecture: process.arch,
+        currentVersion: "v22.23.2",
+        fileSystem,
+        nodeExecutable,
+        repositoryRoot: fixtureRoot,
+        toolCache,
+      }), /refused an unsafe or changed tree/u);
+      const changedIdentity = fs.lstatSync(nodeExecutable, { bigint: true });
+      assert.strictEqual(changedIdentity.ino, originalIdentity.ino);
+      assert.strictEqual(changedIdentity.size, originalIdentity.size);
+      assert.strictEqual(rewritten, true);
+    } finally {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("hosted Linux hardening rejects Node replacement between final snapshot and validation", () => {
+    const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "hosted-node-final-swap-",
+    )));
+    try {
+      fs.writeFileSync(path.join(fixtureRoot, ".node-version"), "22.23.2\n");
+      const toolCache = path.join(fixtureRoot, "toolcache");
+      const distributionRoot = path.join(toolCache, "node", "22.23.2", process.arch);
+      const nodeExecutable = path.join(distributionRoot, "bin", "node");
+      createCanonicalNpmFixture(fixtureRoot, { nodeExecutable });
+      makeTreeGroupWritable(distributionRoot);
+      const displaced = path.join(fixtureRoot, "original-node");
+      const initialNodeStat = fs.lstatSync(nodeExecutable, { bigint: true });
+      const fileSystem = Object.create(fs);
+      let nodeDigestCloses = 0;
+      let nodeStatsAfterSecondDigest = 0;
+      const readDescriptors = new Set();
+      fileSystem.readSync = (descriptor, ...arguments_) => {
+        readDescriptors.add(descriptor);
+        return fs.readSync(descriptor, ...arguments_);
+      };
+      fileSystem.closeSync = descriptor => {
+        const descriptorStat = fs.fstatSync(descriptor, { bigint: true });
+        fs.closeSync(descriptor);
+        if (readDescriptors.delete(descriptor)
+          && descriptorStat.dev === initialNodeStat.dev
+          && descriptorStat.ino === initialNodeStat.ino) {
+          nodeDigestCloses += 1;
+        }
+      };
+      fileSystem.lstatSync = (target, options) => {
+        if (nodeDigestCloses === 2 && target === nodeExecutable) {
+          nodeStatsAfterSecondDigest += 1;
+          if (nodeStatsAfterSecondDigest === 2) {
+            fs.renameSync(nodeExecutable, displaced);
+            fs.writeFileSync(
+              nodeExecutable,
+              "stable replacement runtime bytes\n",
+              { mode: 0o700 },
+            );
+          }
+        }
+        return fs.lstatSync(target, options);
+      };
+      assert.throws(() => hardenHostedNodeRuntime({
+        architecture: process.arch,
+        currentVersion: "v22.23.2",
+        fileSystem,
+        nodeExecutable,
+        repositoryRoot: fixtureRoot,
+        toolCache,
+      }), /refused an unsafe or changed tree|unsafe or invalid/u);
+      assert.strictEqual(fs.existsSync(displaced), true);
+    } finally {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("hosted Linux hardening rechecks Node identity after terminal realpath resolution", () => {
+    const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "hosted-node-terminal-realpath-swap-",
+    )));
+    try {
+      fs.writeFileSync(path.join(fixtureRoot, ".node-version"), "22.23.2\n");
+      const toolCache = path.join(fixtureRoot, "toolcache");
+      const distributionRoot = path.join(toolCache, "node", "22.23.2", process.arch);
+      const nodeExecutable = path.join(distributionRoot, "bin", "node");
+      createCanonicalNpmFixture(fixtureRoot, { nodeExecutable });
+      makeTreeGroupWritable(distributionRoot);
+      const initialNodeStat = fs.lstatSync(nodeExecutable, { bigint: true });
+      const displaced = path.join(fixtureRoot, "terminal-original-node");
+      const fileSystem = Object.create(fs);
+      const readDescriptors = new Set();
+      let nodeDigestCloses = 0;
+      let swapped = false;
+      fileSystem.readSync = (descriptor, ...arguments_) => {
+        readDescriptors.add(descriptor);
+        return fs.readSync(descriptor, ...arguments_);
+      };
+      fileSystem.closeSync = descriptor => {
+        const descriptorStat = fs.fstatSync(descriptor, { bigint: true });
+        fs.closeSync(descriptor);
+        if (readDescriptors.delete(descriptor)
+          && descriptorStat.dev === initialNodeStat.dev
+          && descriptorStat.ino === initialNodeStat.ino) {
+          nodeDigestCloses += 1;
+        }
+      };
+      fileSystem.realpathSync = target => {
+        const resolved = fs.realpathSync(target);
+        if (!swapped && nodeDigestCloses === 3 && target === nodeExecutable) {
+          swapped = true;
+          fs.renameSync(nodeExecutable, displaced);
+          fs.writeFileSync(nodeExecutable, "terminal replacement runtime\n", { mode: 0o700 });
+        }
+        return resolved;
+      };
+      assert.throws(() => hardenHostedNodeRuntime({
+        architecture: process.arch,
+        currentVersion: "v22.23.2",
+        fileSystem,
+        nodeExecutable,
+        repositoryRoot: fixtureRoot,
+        toolCache,
+      }), /refused an unsafe or changed tree/u);
+      assert.strictEqual(swapped, true);
+      assert.strictEqual(fs.existsSync(displaced), true);
+    } finally {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+
+
+
+
   test("Quality explicitly verifies architecture before the build candidate can pass", () => {
     const workflow = fs.readFileSync(path.join(__dirname, "../.github/workflows/main.yml"), "utf8");
     assert.match(workflow, /- name: Verify architecture boundaries\s+run: npm run verify:architecture/);
@@ -1213,6 +1511,308 @@ suite("M9 release gate helpers", () => {
         "moved victim survives\n",
       );
       assert.strictEqual(fs.existsSync(artifact), true);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup retries transient Windows file locks against the same identity", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-retry-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    let attempts = 0;
+    fileSystem.unlinkSync = target => {
+      attempts += 1;
+      if (attempts < 3) {
+        const error = new Error("synthetic sharing violation");
+        error.code = attempts === 1 ? "EPERM" : "EBUSY";
+        throw error;
+      }
+      return fs.unlinkSync(target);
+    };
+    try {
+      assert.strictEqual(removePackageBuildDirectory(
+        ownedRoot,
+        identity,
+        expectedEntries,
+        { fileSystem, platform: "win32", retryDelay: () => {} },
+      ), true);
+      assert.strictEqual(attempts, 3);
+      assert.strictEqual(fs.existsSync(ownedRoot), false);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup retries a transient Windows final-directory lock", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-rmdir-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    fs.mkdirSync(ownedRoot);
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const fileSystem = Object.create(fs);
+    let attempts = 0;
+    fileSystem.rmdirSync = target => {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error("synthetic scanner lock");
+        error.code = "ENOTEMPTY";
+        throw error;
+      }
+      return fs.rmdirSync(target);
+    };
+    try {
+      assert.strictEqual(removePackageBuildDirectory(
+        ownedRoot,
+        identity,
+        [],
+        { fileSystem, platform: "win32", retryDelay: () => {} },
+      ), true);
+      assert.strictEqual(attempts, 2);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup rejects file replacement during a Windows retry", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-swap-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    const displaced = path.join(scratch, "original.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic original bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    fileSystem.unlinkSync = target => {
+      fs.renameSync(target, displaced);
+      fs.writeFileSync(target, "synthetic replacement bytes\n");
+      const error = new Error("synthetic sharing violation after replacement");
+      error.code = "EBUSY";
+      throw error;
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          expectedEntries,
+          { fileSystem, platform: "win32", retryDelay: () => {} },
+        ), /temporary cleanup refused an unsafe or changed tree/u);
+      });
+      assert.strictEqual(fs.readFileSync(artifact, "utf8"), "synthetic replacement bytes\n");
+      assert.strictEqual(fs.readFileSync(displaced, "utf8"), "synthetic original bytes\n");
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup rejects root permission drift during a Windows retry", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-mode-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    fs.mkdirSync(ownedRoot, { mode: 0o700 });
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    fileSystem.unlinkSync = () => {
+      const error = new Error("synthetic sharing violation");
+      error.code = "EBUSY";
+      throw error;
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          expectedEntries,
+          {
+            fileSystem,
+            platform: "win32",
+            retryDelay: () => fs.chmodSync(ownedRoot, 0o755),
+          },
+        ), /temporary cleanup refused an unsafe or changed tree/u);
+      });
+      assert.strictEqual(fs.existsSync(artifact), true);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup rejects retry-time root substitution and sibling insertion", () => {
+    for (const mutation of ["root", "sibling"]) {
+      const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+        os.tmpdir(),
+        `release-package-cleanup-windows-${mutation}-`,
+      )));
+      const ownedRoot = path.join(scratch, "owned-build");
+      const artifact = path.join(ownedRoot, "temporary.vsix");
+      const displaced = path.join(scratch, "displaced-owned-build");
+      fs.mkdirSync(ownedRoot);
+      fs.writeFileSync(artifact, "synthetic build bytes\n");
+      const identity = packageBuildDirectoryIdentity(ownedRoot);
+      const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+      const fileSystem = Object.create(fs);
+      fileSystem.unlinkSync = () => {
+        const error = new Error("synthetic sharing violation");
+        error.code = "EBUSY";
+        throw error;
+      };
+      try {
+        withExpectedCleanupTaint(() => {
+          assert.throws(() => removePackageBuildDirectory(
+            ownedRoot,
+            identity,
+            expectedEntries,
+            {
+              fileSystem,
+              platform: "win32",
+              retryDelay: () => {
+                if (mutation === "root") {
+                  fs.renameSync(ownedRoot, displaced);
+                  fs.mkdirSync(ownedRoot);
+                } else {
+                  fs.writeFileSync(path.join(ownedRoot, "unexpected.txt"), "preserve\n");
+                }
+              },
+            },
+          ), /temporary cleanup refused an unsafe or changed tree/u);
+        });
+        assert.strictEqual(
+          fs.existsSync(mutation === "root" ? path.join(displaced, "temporary.vsix") : artifact),
+          true,
+        );
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("release package cleanup never retries non-transient or non-Windows failures", () => {
+    for (const [platform, code] of [["win32", "EACCES"], ["linux", "EBUSY"]]) {
+      const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+        os.tmpdir(),
+        `release-package-cleanup-${platform}-`,
+      )));
+      const ownedRoot = path.join(scratch, "owned-build");
+      const artifact = path.join(ownedRoot, "temporary.vsix");
+      fs.mkdirSync(ownedRoot);
+      fs.writeFileSync(artifact, "synthetic build bytes\n");
+      const identity = packageBuildDirectoryIdentity(ownedRoot);
+      const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+      const fileSystem = Object.create(fs);
+      let attempts = 0;
+      fileSystem.unlinkSync = () => {
+        attempts += 1;
+        const error = new Error("synthetic refusal");
+        error.code = code;
+        throw error;
+      };
+      try {
+        withExpectedCleanupTaint(() => {
+          assert.throws(() => removePackageBuildDirectory(
+            ownedRoot,
+            identity,
+            expectedEntries,
+            { fileSystem, platform, retryDelay: () => {} },
+          ), /temporary cleanup refused an unsafe or changed tree/u);
+        });
+        assert.strictEqual(attempts, 1);
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("release package cleanup fails closed after bounded Windows lock retries", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-exhausted-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const artifact = path.join(ownedRoot, "temporary.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(artifact, "synthetic build bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [expectedExactCleanupTreeEntry(artifact)];
+    const fileSystem = Object.create(fs);
+    let attempts = 0;
+    fileSystem.unlinkSync = () => {
+      attempts += 1;
+      const error = new Error("persistent synthetic lock");
+      error.code = "EBUSY";
+      throw error;
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          expectedEntries,
+          { fileSystem, platform: "win32", retryDelay: () => {} },
+        ), /temporary cleanup refused an unsafe or changed tree/u);
+      });
+      assert.strictEqual(attempts, 7);
+      assert.strictEqual(fs.existsSync(artifact), true);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package cleanup preserves the exact remainder after partial Windows deletion", () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-cleanup-windows-partial-",
+    )));
+    const ownedRoot = path.join(scratch, "owned-build");
+    const first = path.join(ownedRoot, "first.vsix");
+    const second = path.join(ownedRoot, "second.vsix");
+    fs.mkdirSync(ownedRoot);
+    fs.writeFileSync(first, "synthetic first bytes\n");
+    fs.writeFileSync(second, "synthetic second bytes\n");
+    const identity = packageBuildDirectoryIdentity(ownedRoot);
+    const expectedEntries = [first, second].map(expectedExactCleanupTreeEntry);
+    const fileSystem = Object.create(fs);
+    let secondAttempts = 0;
+    fileSystem.unlinkSync = target => {
+      if (target === second) {
+        secondAttempts += 1;
+        const error = new Error("persistent synthetic second-file lock");
+        error.code = "EBUSY";
+        throw error;
+      }
+      return fs.unlinkSync(target);
+    };
+    try {
+      withExpectedCleanupTaint(() => {
+        assert.throws(() => removePackageBuildDirectory(
+          ownedRoot,
+          identity,
+          expectedEntries,
+          { fileSystem, platform: "win32", retryDelay: () => {} },
+        ), /temporary cleanup refused an unsafe or changed tree/u);
+      });
+      assert.strictEqual(fs.existsSync(first), false);
+      assert.strictEqual(fs.readFileSync(second, "utf8"), "synthetic second bytes\n");
+      assert.strictEqual(fs.existsSync(ownedRoot), true);
+      assert.strictEqual(secondAttempts, 7);
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }

@@ -7568,6 +7568,45 @@ suite("Quality contract verifier fixtures", function () {
     }
   });
 
+  test("rejects missing or reordered hosted Linux runtime hardening", () => {
+    const workflowPath = ".github/workflows/main.yml";
+    const workflow = fs.readFileSync(path.join(root, workflowPath), "utf8");
+    const exactSteps = [
+      "      - name: Set up exact Node.js",
+      "        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
+      "        with:",
+      "          node-version: ${{ env.NODE_VERSION }}",
+      "          package-manager-cache: false",
+      "",
+      "      - name: Harden exact hosted Node.js runtime",
+      "        if: runner.os == 'Linux'",
+      "        run: node scripts/quality/harden-hosted-node-runtime.js",
+    ].join("\n");
+    const withoutHardening = workflow.replace(
+      "\n      - name: Harden exact hosted Node.js runtime\n"
+        + "        if: runner.os == 'Linux'\n"
+        + "        run: node scripts/quality/harden-hosted-node-runtime.js\n",
+      "\n",
+    );
+    const reordered = workflow.replace(exactSteps, [
+      "      - name: Harden exact hosted Node.js runtime",
+      "        if: runner.os == 'Linux'",
+      "        run: node scripts/quality/harden-hosted-node-runtime.js",
+      "",
+      "      - name: Set up exact Node.js",
+      "        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
+      "        with:",
+      "          node-version: ${{ env.NODE_VERSION }}",
+      "          package-manager-cache: false",
+    ].join("\n"));
+    for (const changed of [withoutHardening, reordered]) {
+      assert.ok(verifyQualityContracts({
+        root,
+        sourceOverrides: { [workflowPath]: changed },
+      }).errors.some(error => /CI must (?:verify|execute|build)/u.test(error)));
+    }
+  });
+
   test("rejects bypasses around changed and core mutation evidence handoffs", () => {
     const workflowPath = ".github/workflows/main.yml";
     const deepWorkflowPath = ".github/workflows/deep-quality.yml";

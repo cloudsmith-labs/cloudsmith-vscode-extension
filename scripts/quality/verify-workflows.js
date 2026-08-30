@@ -153,6 +153,7 @@ function verifyEvidenceHandoffContract(
   const authenticatedVerifierPath = "scripts/quality/verify-authenticated-evidence.js";
   const authenticatedSessionPath = "scripts/quality/authenticated-candidate-session.js";
   const processTreePath = "scripts/quality/process-tree.js";
+  const hostedNodeHardenerPath = "scripts/quality/harden-hosted-node-runtime.js";
   const gitleaksActionPath = ".github/actions/setup-gitleaks/action.yml";
   const deepWorkflowPath = ".github/workflows/deep-quality.yml";
   const workflowPath = ".github/workflows/main.yml";
@@ -170,6 +171,7 @@ function verifyEvidenceHandoffContract(
     resolveGitVisibleRegularFile(authenticatedVerifierPath, repositoryFiles, root);
     resolveGitVisibleRegularFile(authenticatedSessionPath, repositoryFiles, root);
     resolveGitVisibleRegularFile(processTreePath, repositoryFiles, root);
+    resolveGitVisibleRegularFile(hostedNodeHardenerPath, repositoryFiles, root);
     gitleaksActionTarget = resolveGitVisibleRegularFile(
       gitleaksActionPath,
       repositoryFiles,
@@ -399,6 +401,7 @@ function expectedQualityJob() {
     steps: [
       checkoutStep("Checkout exact source", true),
       setupNodeStep(),
+      hardenHostedNodeStep(),
       installStep(),
       {
         name: "Set up the pinned secret scanner",
@@ -452,6 +455,7 @@ function expectedChangedMutationJob() {
     steps: [
       checkoutStep("Checkout exact source with comparison history", true),
       setupNodeStep(),
+      hardenHostedNodeStep(),
       installStep(),
       {
         name: "Run changed high-risk mutation gate",
@@ -512,6 +516,7 @@ function expectedExtensionTestsJob() {
     steps: [
       checkoutStep("Checkout exact source", true),
       setupNodeStep(),
+      hardenHostedNodeStep(),
       installStep(),
       {
         name: "Log test runtime",
@@ -543,6 +548,7 @@ function expectedPackageJob() {
     steps: [
       checkoutStep("Checkout exact source in a fresh job", false),
       setupNodeStep(),
+      hardenHostedNodeStep(),
       installStep(),
       {
         name: "Set up the pinned secret scanner",
@@ -617,6 +623,7 @@ function expectedCoreMutationJob() {
     steps: [
       checkoutStep("Checkout exact source", true),
       setupNodeStep(),
+      hardenHostedNodeStep(),
       installStep(),
       { name: "Verify release-quality contracts", run: "npm run verify:quality" },
       {
@@ -682,6 +689,7 @@ function expectedSignedOutUiJob() {
     steps: [
       checkoutStep("Checkout exact source", true),
       setupNodeStep(),
+      hardenHostedNodeStep(),
       installStep(),
       {
         name: "Set up the pinned secret scanner",
@@ -741,6 +749,7 @@ function expectedAuthenticatedUiJob() {
     steps: [
       checkoutStep("Checkout exact source", true),
       setupNodeStep(),
+      hardenHostedNodeStep(),
       installStep(),
       {
         name: "Set up the pinned secret scanner",
@@ -843,6 +852,14 @@ function setupNodeStep() {
       "node-version": "${{ env.NODE_VERSION }}",
       "package-manager-cache": false,
     },
+  };
+}
+
+function hardenHostedNodeStep() {
+  return {
+    name: "Harden exact hosted Node.js runtime",
+    if: "runner.os == 'Linux'",
+    run: "node scripts/quality/harden-hosted-node-runtime.js",
   };
 }
 

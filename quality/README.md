@@ -195,6 +195,16 @@ Candidate receipt schema v3 also binds the exact Node version, npm version,
 full npm-installation fingerprint, and producer platform to the repository's
 reviewed toolchain pins.
 
+GitHub's Ubuntu runner image may leave the exact `setup-node` toolcache
+group/other-writable. Every Linux workflow therefore hardens only the pinned
+distribution and its npm runtime immediately after setup, proves stable
+path/inode ownership through descriptor-bound permission changes, and then runs
+the unchanged canonical Node/npm validators. Wrong versions, roots, links,
+replacements, or residual writable bits fail closed. Windows release packaging
+retries only potentially transient, retry-eligible Windows errors while removing its exact two-file
+temporary build tree; every retry revalidates the root, names, and file
+identities, and cleanup remains nonrecursive.
+
 On macOS, the no-argument prepare and launch commands first resolve
 `command -v code`, canonicalize it to a real app-bundled CLI, and then fall back
 to `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code`.

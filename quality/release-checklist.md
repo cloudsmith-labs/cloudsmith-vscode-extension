@@ -16,6 +16,13 @@ both required. Passing one never implies that the other ran.
       executable with npm from that runtime distribution, matching
       `.npm-version` and the platform-specific `.npm-integrity` fingerprint;
       conflicting PATH, local-bin, or standalone npm entries were rejected.
+- [ ] Linux CI hardened only the exact pinned hosted toolcache immediately
+      after setup and then passed the unchanged canonical Node/npm validators;
+      any wrong root, version, link, replacement, or writable residue failed.
+- [ ] Windows packaging cleanup retried only potentially transient,
+      retry-eligible errors on the exact
+      verified temporary VSIX identities and retained nonrecursive fail-closed
+      behavior for substitution, unexpected entries, and retry exhaustion.
 - [ ] Local qualification uses exactly
       `$HOME/.cloudsmith-vscode-qualification/{user-data,extensions}` and not a
       normal VS Code profile.
