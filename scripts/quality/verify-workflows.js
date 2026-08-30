@@ -397,7 +397,7 @@ function expectedQualityJob() {
   return {
     name: "Quality",
     "runs-on": "ubuntu-24.04",
-    "timeout-minutes": 15,
+    "timeout-minutes": 30,
     steps: [
       checkoutStep("Checkout exact source", true),
       setupNodeStep(),

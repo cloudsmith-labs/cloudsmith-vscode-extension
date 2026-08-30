@@ -7421,6 +7421,25 @@ suite("Release checklist and deterministic quality report", () => {
 
 suite("Quality contract verifier fixtures", function () {
   this.timeout(60_000);
+  test("rejects the obsolete Quality timeout that interrupts authoritative evidence", () => {
+    const workflowPath = ".github/workflows/main.yml";
+    const workflow = yaml.load(
+      fs.readFileSync(path.join(root, workflowPath), "utf8"),
+      { schema: yaml.CORE_SCHEMA }
+    );
+    workflow.jobs.quality["timeout-minutes"] = 15;
+
+    const result = verifyQualityContracts({
+      root,
+      sourceOverrides: {
+        [workflowPath]: yaml.dump(workflow, { lineWidth: -1, noRefs: true }),
+      },
+    });
+    assert.ok(result.errors.includes(
+      "CI must verify the exact fast-gate evidence immediately before a verifier-gated upload."
+    ));
+  });
+
   test("rejects whole-object replacements of deterministic release jobs", () => {
     const workflowPath = ".github/workflows/main.yml";
     const workflow = yaml.load(
