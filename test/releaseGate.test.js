@@ -2932,6 +2932,41 @@ suite("M9 release gate helpers", () => {
     }
   });
 
+  test("VSIX pathname replacement after descriptor open fails before reading", async () => {
+    const fixture = sidecarFixture();
+    const displaced = `${fixture.filePath}.descriptor`;
+    const fileSystem = Object.create(fs);
+    let descriptorReads = 0;
+    let swapped = false;
+    fileSystem.openSync = (openedPath, flags) => {
+      const descriptor = fs.openSync(openedPath, flags);
+      if (!swapped && openedPath === fixture.filePath) {
+        fs.renameSync(fixture.filePath, displaced);
+        fs.writeFileSync(fixture.filePath, fixture.verification.buffer);
+        swapped = true;
+      }
+      return descriptor;
+    };
+    fileSystem.readSync = (...arguments_) => {
+      descriptorReads += 1;
+      return fs.readSync(...arguments_);
+    };
+    try {
+      await assert.rejects(
+        withStableArtifact(
+          fixture.filePath,
+          { fileSystem },
+          async bytes => Buffer.from(bytes),
+        ),
+        /exact bounded single-link file/u,
+      );
+      assert.strictEqual(swapped, true);
+      assert.strictEqual(descriptorReads, 0);
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
   test("VSIX descriptor reads never request bytes beyond the opened size", async () => {
     const fixture = sidecarFixture();
     const requests = [];

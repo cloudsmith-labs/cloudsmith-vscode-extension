@@ -436,26 +436,17 @@ async function withStableArtifact(filePath, options = {}, consume) {
   let result;
   let transactionFailed = false;
   try {
-    const pathStat = assertBoundedArtifactStat(
-      fileSystem.lstatSync(absolutePath, { bigint: true }),
-      errorMessage,
-    );
-    if (pathStat.isSymbolicLink() || fileSystem.realpathSync(absolutePath) !== absolutePath) {
-      throw new Error(errorMessage);
-    }
-    identity = exactFileIdentity(pathStat);
-    if (options.expectedIdentity
-      && !sameExactFileIdentity(options.expectedIdentity, identity)) {
-      throw new Error(errorMessage);
-    }
     descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS);
     const openedStat = assertBoundedArtifactStat(
       fileSystem.fstatSync(descriptor, { bigint: true }),
       errorMessage,
     );
-    if (!sameExactFileIdentity(identity, exactFileIdentity(openedStat))) {
+    identity = exactFileIdentity(openedStat);
+    if (options.expectedIdentity
+      && !sameExactFileIdentity(options.expectedIdentity, identity)) {
       throw new Error(errorMessage);
     }
+    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
     const expectedSize = Number(openedStat.size);
     allocation = Buffer.allocUnsafe(expectedSize);
     let offset = 0;
