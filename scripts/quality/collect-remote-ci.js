@@ -9,6 +9,8 @@ const { sourceIdentity } = require("./evidence");
 const REPOSITORY = "cloudsmith-labs/cloudsmith-vscode-extension";
 const API_OUTPUT = "internal_docs/quality/remote-ci-api.json";
 const RECEIPT_OUTPUT = "internal_docs/quality/remote-ci.json";
+const OUTPUTS = new Set([API_OUTPUT, RECEIPT_OUTPUT]);
+const OUTPUT_OPTIONS = Object.freeze({ subtree: "internal_docs/quality" });
 const MAX_API_BYTES = 16 * 1024 * 1024;
 const WORKFLOWS = Object.freeze([
   Object.freeze({
@@ -73,6 +75,13 @@ function gitValue(args) {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "inherit"],
   }).trim();
+}
+
+function writeRemoteCiEvidence(relativePath, value, root = ROOT, writer = writeJson) {
+  if (!OUTPUTS.has(relativePath)) {
+    throw new Error("Remote CI evidence output is not an authorized ignored path.");
+  }
+  return writer(relativePath, value, root, OUTPUT_OPTIONS);
 }
 
 function buildReceipt(snapshot, source, branch, runIds) {
@@ -160,7 +169,7 @@ function main(argv = process.argv.slice(2)) {
     jobsByRunId,
     runListsByWorkflow,
   };
-  writeJson(API_OUTPUT, snapshot, ROOT);
+  writeRemoteCiEvidence(API_OUTPUT, snapshot, ROOT);
   const evidenceBytes = fs.readFileSync(`${ROOT}/${API_OUTPUT}`);
   const receipt = buildReceipt(
     snapshot,
@@ -175,10 +184,10 @@ function main(argv = process.argv.slice(2)) {
   if (gitValue(["status", "--porcelain", "--untracked-files=all"]) !== "") {
     throw new Error("Tracked source changed while remote CI evidence was collected.");
   }
-  writeJson(RECEIPT_OUTPUT, receipt, ROOT);
+  writeRemoteCiEvidence(RECEIPT_OUTPUT, receipt, ROOT);
   console.log(`Captured authoritative remote CI for ${source.sha}.`);
 }
 
 if (require.main === module) main();
 
-module.exports = { buildReceipt, main, parseArguments };
+module.exports = { buildReceipt, main, parseArguments, writeRemoteCiEvidence };

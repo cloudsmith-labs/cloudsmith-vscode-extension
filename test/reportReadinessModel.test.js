@@ -19,6 +19,7 @@ const {
   validateUiResult,
 } = require("../scripts/quality/report");
 const { verifyQualityContracts } = require("../scripts/quality/verify-workflows");
+const { writeRemoteCiEvidence } = require("../scripts/quality/collect-remote-ci");
 const {
   verifySignedOutUiEvidence,
 } = require("../scripts/quality/verify-ui-evidence");
@@ -232,6 +233,64 @@ function validUiResult(receipt) {
 }
 
 suite("two-lane release-readiness model", () => {
+  test("remote CI collection writes only its exact ignored evidence targets", () => {
+    const calls = [];
+    const writer = (...args) => {
+      calls.push(args);
+      return "/synthetic/ignored-output.json";
+    };
+    const value = Object.freeze({ schemaVersion: 1 });
+    assert.strictEqual(
+      writeRemoteCiEvidence(
+        "internal_docs/quality/remote-ci-api.json",
+        value,
+        "/synthetic/repository",
+        writer,
+      ),
+      "/synthetic/ignored-output.json",
+    );
+    assert.strictEqual(
+      writeRemoteCiEvidence(
+        "internal_docs/quality/remote-ci.json",
+        value,
+        "/synthetic/repository",
+        writer,
+      ),
+      "/synthetic/ignored-output.json",
+    );
+    assert.deepStrictEqual(calls, [
+      [
+        "internal_docs/quality/remote-ci-api.json",
+        value,
+        "/synthetic/repository",
+        { subtree: "internal_docs/quality" },
+      ],
+      [
+        "internal_docs/quality/remote-ci.json",
+        value,
+        "/synthetic/repository",
+        { subtree: "internal_docs/quality" },
+      ],
+    ]);
+    for (const unauthorized of [
+      ".quality/remote-ci.json",
+      "internal_docs/quality/alternate.json",
+      "internal_docs/quality/../remote-ci.json",
+      "internal_docs\\quality\\remote-ci.json",
+    ]) {
+      assert.throws(
+        () => writeRemoteCiEvidence(
+          unauthorized,
+          value,
+          "/synthetic/repository",
+          writer,
+        ),
+        /not an authorized ignored path/u,
+      );
+    }
+    assert.strictEqual(calls.length, 2);
+  });
+
   test("requires exact successful final-head remote CI before readiness", () => {
     const exact = remoteCiReceipt();
     const options = { apiEvidence: remoteCiApiEvidence(exact) };
