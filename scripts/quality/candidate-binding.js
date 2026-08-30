@@ -169,6 +169,7 @@ function withStableSingleLinkFile(file, options = {}, consume) {
 
     // The descriptor is fstat-bound to pathIdentity before any bytes are read,
     // and assertStableOpenFile repeats both checks after the read and consumer.
+
     // codeql[js/file-system-race]
     descriptor = fileSystem.openSync(file, EXACT_FILE_READ_FLAGS);
     const openedStat = assertBoundedSingleLinkFile(
