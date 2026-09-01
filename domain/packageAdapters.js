@@ -183,10 +183,7 @@ function fromPackageDetailNode(value) {
           required: true,
           unwrapDepth: 0,
         }),
-        consensusString(value, ["_detailValue"], "detail value", {
-          required: true,
-          unwrapDepth: 0,
-        })
+        readDetailText(value, "_detailValue")
       ));
     }
     const directId = hasOwnSuppliedValue(value, "id");
@@ -197,10 +194,7 @@ function fromPackageDetailNode(value) {
           required: true,
           unwrapDepth: 0,
         }),
-        consensusString(value, ["value"], "detail value", {
-          required: true,
-          unwrapDepth: MAX_WRAPPER_DEPTH,
-        })
+        readDetailText(value, "value")
       ));
     }
     const label = readOwn(value, "label");
@@ -214,10 +208,7 @@ function fromPackageDetailNode(value) {
             required: true,
             unwrapDepth: 0,
           }),
-          consensusString(label, ["value"], "detail value", {
-            required: true,
-            unwrapDepth: MAX_WRAPPER_DEPTH,
-          })
+          readDetailText(label, "value")
         ));
       }
     }
@@ -968,7 +959,7 @@ function deriveApiCoordinateQualifiers(record, coordinate) {
   };
   const architecture = () => {
     const values = [];
-    const nested = evidence([], ["architecture"], "architecture");
+    const nested = evidence(["architecture"], ["architecture"], "architecture");
     if (nested) values.push(nested);
     const listed = singleArchitectureName(record);
     if (listed) values.push(listed);
@@ -977,7 +968,7 @@ function deriveApiCoordinateQualifiers(record, coordinate) {
 
   if (format === "maven") {
     const extension = evidence(
-      ["extension"],
+      ["extension", "packaging"],
       ["extension", "packaging", "type"],
       "extension"
     );
@@ -1066,7 +1057,11 @@ function deriveApiCoordinateQualifiers(record, coordinate) {
   }
 
   if (format === "ruby") {
-    const platform = evidence([], ["ruby_platform", "platform"], "Ruby platform")
+    const platform = evidence(
+      ["ruby_platform"],
+      ["ruby_platform", "platform"],
+      "Ruby platform"
+    )
       || architecture();
     if (platform) qualifier.platform = platform;
   }
@@ -1259,12 +1254,10 @@ function validateCanonicalProjection(record, pkg) {
   const stringFields = [
     ["name", ["name"]],
     ["coordinateName", ["coordinateName"]],
-    ["version", ["version"]],
     ["format", ["format"]],
     ["slug", ["slug"]],
     ["status", ["status", "status_str", "status_str_raw"]],
     ["statusReason", ["statusReason", "status_reason"]],
-    ["uploadedAt", ["uploadedAt", "uploaded_at"]],
     ["checksumSha256", ["checksumSha256", "checksum_sha256"]],
     ["versionDigest", ["versionDigest", "version_digest"]],
     ["cdnUrl", ["cdnUrl", "cdn_url"]],
@@ -1280,6 +1273,16 @@ function validateCanonicalProjection(record, pkg) {
       throw projectionConflict(field);
     }
   }
+  validateCanonicalEmptyProjection(record, ["version"], "version", pkg.version, {
+    allowNumber: true,
+  });
+  validateCanonicalEmptyProjection(
+    record,
+    ["uploadedAt", "uploaded_at"],
+    "uploadedAt",
+    pkg.uploadedAt
+  );
+  validateCanonicalCoordinateProjection(record, pkg);
   if (hasAnyOwnDataValue(record, ["copyable", "is_copyable"])) {
     const copyable = consensusBoolean(record, ["copyable", "is_copyable"], "copyable", {
       required: true,
@@ -1327,6 +1330,97 @@ function validateCanonicalProjection(record, pkg) {
     if (hasMaxSeverity && vulnerability.maxSeverity !== pkg.vulnerability.maxSeverity) {
       throw projectionConflict("vulnerability.maxSeverity");
     }
+  }
+}
+
+function validateCanonicalEmptyProjection(record, aliases, field, canonical, options = {}) {
+  for (const alias of aliases) {
+    const projected = readCanonicalProjectionAlias(record, alias, options);
+    if (!projected.supplied) continue;
+    if (projected.value !== canonical) throw projectionConflict(field);
+  }
+}
+
+function readCanonicalProjectionAlias(record, alias, options) {
+  assertNoInheritedProperty(record, alias);
+  const descriptor = Object.getOwnPropertyDescriptor(record, alias);
+  if (!descriptor) return { supplied: false, value: null };
+  if (!("value" in descriptor)) {
+    throw adapterError("accessor_property", alias, `The ${alias} value must be a data property.`);
+  }
+  if (descriptor.value === undefined || descriptor.value === null) {
+    return { supplied: false, value: null };
+  }
+  let projected = descriptor.value;
+  if (projected && typeof projected === "object") {
+    requireRecord(projected, `${alias} wrapper`, { plain: true });
+    const names = Object.getOwnPropertyNames(projected);
+    if (
+      names.some(name => name !== "id" && name !== "value")
+      || !Object.prototype.hasOwnProperty.call(projected, "value")
+    ) {
+      throw adapterError("invalid_record", alias, `The ${alias} wrapper is invalid.`);
+    }
+    if (Object.prototype.hasOwnProperty.call(projected, "id")) {
+      consensusString(projected, ["id"], `${alias} wrapper id`, {
+        required: true,
+        unwrapDepth: 0,
+      });
+    }
+    projected = readOwn(projected, "value");
+    if (projected === undefined || projected === null) {
+      return { supplied: true, value: null };
+    }
+  }
+  if (typeof projected === "string") return { supplied: true, value: projected };
+  if (options.allowNumber && typeof projected === "number" && Number.isFinite(projected)) {
+    return { supplied: true, value: String(projected) };
+  }
+  throw adapterError("invalid_alias", alias, `The ${alias} value is invalid.`);
+}
+
+function validateCanonicalCoordinateProjection(record, pkg) {
+  const mavenArtifactId = canonicalMavenFormat(pkg.format)
+    ? resolveMavenArtifactId(pkg.name)
+    : pkg.name;
+  if (canonicalMavenFormat(pkg.format)) {
+    const projectedType = consensusString(
+      record,
+      ["extension", "packaging"],
+      "Maven type",
+      { required: false, unwrapDepth: MAX_WRAPPER_DEPTH }
+    );
+    if (
+      projectedType !== null
+      && projectedType.replace(/^\./u, "") !== (pkg.qualifiers.type || "jar")
+    ) {
+      throw projectionConflict("qualifiers.type");
+    }
+  }
+  const coordinateName = resolveCoordinateName(
+    record,
+    { coordinateName: pkg.coordinateName },
+    pkg.name,
+    pkg.format,
+    MAX_WRAPPER_DEPTH,
+    mavenArtifactId
+  );
+  if (coordinateName !== pkg.coordinateName) throw projectionConflict("coordinateName");
+  const qualifiers = resolveCoordinateQualifiers(
+    record,
+    { coordinateQualifiers: pkg.qualifiers },
+    {
+      name: pkg.name,
+      format: pkg.format,
+      version: pkg.version,
+      workspace: pkg.workspace,
+      repository: pkg.repository,
+      unwrapDepth: MAX_WRAPPER_DEPTH,
+      mavenArtifactId,
+    }
+  );
+  if (JSON.stringify(qualifiers) !== JSON.stringify(pkg.qualifiers)) {
+    throw projectionConflict("qualifiers");
   }
 }
 
@@ -1942,10 +2036,58 @@ function requireExact(value, field) {
   return value;
 }
 
+function readDetailText(record, field) {
+  const value = readOwn(record, field);
+  if (value === undefined || value === null) return "Not available";
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype || value.length > 100) {
+      throw adapterError("invalid_array", field, `The ${field} value is invalid.`);
+    }
+    assertNoSymbolProperties(value, field);
+    assertNoOwnAccessors(value, field);
+    const names = Object.getOwnPropertyNames(value);
+    if (names.some(name => name !== "length" && !/^(0|[1-9]\d*)$/u.test(name))) {
+      throw adapterError("invalid_array", field, `The ${field} value is invalid.`);
+    }
+    const items = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const item = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!item || !("value" in item)) {
+        throw adapterError("invalid_array", field, `The ${field} value is invalid.`);
+      }
+      items.push(detailScalarText(item.value, field, 500));
+    }
+    return validateDetailText(items.join(","), field);
+  }
+  return validateDetailText(detailScalarText(value, field, 8192), field);
+}
+
+function detailScalarText(value, field, maximumLength) {
+  if (typeof value === "string") {
+    if (value.length > maximumLength) {
+      throw adapterError("invalid_string", field, `The ${field} value is invalid.`);
+    }
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "boolean") return String(value);
+  throw adapterError("invalid_detail_value", field, `The ${field} value is invalid.`);
+}
+
+function validateDetailText(value, field) {
+  if (
+    value.length > 8192
+    || /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u.test(value)
+  ) {
+    throw adapterError("invalid_string", field, `The ${field} value is invalid.`);
+  }
+  return value;
+}
+
 function createPackageDetail(id, value) {
   return Object.freeze({
     id: boundaryString(id, "detail id", 256),
-    value: boundaryString(value, "detail value", 8192, { trim: false }),
+    value: validateDetailText(value, "detail value"),
   });
 }
 

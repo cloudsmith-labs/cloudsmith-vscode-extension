@@ -13,6 +13,7 @@
     "domain/authCapabilities.js",
     "domain/installGuidanceSupport.js",
     "domain/packageActionCapabilities.js",
+    "domain/packageAdapters.js:1336-1342",
     "util/searchQueryBuilder.js",
     "util/vulnerabilityReportProjection.js",
     "util/externalNavigation.js",
@@ -20,15 +21,15 @@
     "util/vulnerabilityStateService.js:616-718",
     "util/installCommandBuilder.js:650-830"
   ],
-  "measuredAtSha": "8e9985d51ed34b3022f8276b6c9034ecaa4291c8",
+  "measuredAtSha": "8831147d82a75bd57053a9c423a927ce481bb030",
   "metrics": {
-    "mutants": 1570,
-    "killed": 1405,
+    "mutants": 1578,
+    "killed": 1413,
     "survived": 61,
     "timeout": 0,
     "noCoverage": 0,
     "ignored": 104,
-    "score": 95.84
+    "score": 95.86
   },
   "files": {
     "domain/authCapabilities.js": {
@@ -40,7 +41,7 @@
       "score": 90
     },
     "domain/installGuidanceSupport.js": {
-      "testFiles": ["test/installCommandBuilder.test.js", "test/installGuidanceSupport.test.js"],
+      "testFiles": ["test/installCommandBuilder.test.js", "test/installGuidanceSupport.test.js", "test/packageDomain.test.js"],
       "mutants": 233,
       "killed": 146,
       "survived": 4,
@@ -54,6 +55,14 @@
       "survived": 11,
       "ignored": 17,
       "score": 92.09
+    },
+    "domain/packageAdapters.js:1336-1342": {
+      "testFiles": ["test/packageDomain.test.js"],
+      "mutants": 8,
+      "killed": 8,
+      "survived": 0,
+      "ignored": 0,
+      "score": 100
     },
     "util/searchQueryBuilder.js": {
       "testFiles": ["test/searchQueryBuilder.test.js"],
@@ -96,7 +105,7 @@
       "score": 96.17
     },
     "util/installCommandBuilder.js:650-830": {
-      "testFiles": ["test/installCommandBuilder.test.js"],
+      "testFiles": ["test/installCommandBuilder.test.js", "test/packageDomain.test.js"],
       "mutants": 171,
       "killed": 168,
       "survived": 3,
@@ -481,7 +490,7 @@
   "thresholds": {
     "high": 95,
     "low": 90,
-    "break": 95.84
+    "break": 95.86
   },
   "policy": "Core mutation may not fall below the measured aggregate score. Changed mode enforces every selected target's measured score because per-target baselines legitimately differ. Timeout, runtime-error, compile-error, uncovered, missing-target, and no-mutant results fail automatically. Every surviving mutant must retain its exact reviewed fingerprint and an allowed equivalent classification; a new, changed, or meaningful survivor fails closed."
 }

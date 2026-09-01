@@ -4,6 +4,7 @@ const assert = require("assert");
 const path = require("path");
 const vscode = require("vscode");
 const { registerPackageCommands } = require("../commands/packages");
+const { registerVulnerabilityCommands } = require("../commands/vulnerabilities");
 const PackageNode = require("../models/packageNode");
 const PackageDetailsNode = require("../models/packageDetailsNode");
 const SearchResultNode = require("../models/searchResultNode");
@@ -14,12 +15,25 @@ const {
   PackageAdapterError,
   fromApiPackageRecord,
 } = packageAdapters;
-const { createPackageCoordinate } = require("../domain/package");
+const packageDomain = require("../domain/package");
+const { createPackageCoordinate } = packageDomain;
 const {
   PACKAGE_ACTIONS,
 } = require("../domain/packageActionCapabilities");
+const { apiEndpoint } = require("../util/apiEndpoint");
 const { captureAccount, isAccountCurrent } = require("../util/accountOperation");
+const { openExternalWithFeedback } = require("../util/externalNavigation");
+const {
+  InstallCommandBuilder,
+  InstallCommandValidationError,
+} = require("../util/installCommandBuilder");
+const {
+  serializePackageCollectionInspection,
+  serializePackageInspection,
+} = require("../util/packageInspection");
 const { isSelectionCurrent, markSelection } = require("../util/selectionProvenance");
+const { buildPackageGroupUrl, buildPackageUrl } = require("../util/webAppUrls");
+const { normalizeCvssScore } = require("../util/vulnerabilitySeverity");
 
 suite("Package Metadata Flow Test Suite", () => {
   let originalGetConfiguration;
@@ -90,6 +104,27 @@ suite("Package Metadata Flow Test Suite", () => {
       version: ["latest"],
       info: ["upstream"],
     });
+  });
+
+  test("real Conda nodes retain canonical CDN scope during projection validation", () => {
+    const record = {
+      ...pkg,
+      name: "numpy",
+      format: "conda",
+      slug_perm: "numpy-conda-perm",
+      version: "2.1.0",
+      identifiers: { build: "py311h123_0", subdir: "linux-64" },
+      filename: "numpy-2.1.0-py311h123_0.conda",
+      cdn_url: "https://dl.cloudsmith.io/basic/workspace-a/repo-a/conda/linux-64/numpy-2.1.0-py311h123_0.conda",
+    };
+    for (const NodeType of [PackageNode, SearchResultNode]) {
+      const node = new NodeType(record, {});
+      assert.strictEqual(packageAdapters.fromPackageSelection(node), node.package);
+      assert.deepStrictEqual(node.package.qualifiers, {
+        build: "py311h123_0",
+        subdir: "linux-64",
+      });
+    }
   });
 
   test("real package-detail command arguments copy only while inherited selection is current", async () => {
@@ -191,6 +226,344 @@ suite("Package Metadata Flow Test Suite", () => {
     await copySelected(rawNode);
     assert.deepStrictEqual(copied, ["1.2.3", "Completed"]);
     assert.deepStrictEqual(information, ["Value copied."]);
+  });
+
+  test("real package-detail rows copy exactly the bounded text they render", async () => {
+    const accountState = Object.freeze({
+      activationId: "activation-detail",
+      accountEpoch: 1,
+      sessionConnected: true,
+      status: "connected",
+    });
+    const connectionManager = { getState: () => accountState };
+    const owner = new PackageNode(pkg, {}, { connectionManager });
+    const handlers = new Map();
+    const copied = [];
+    const information = [];
+    const warnings = [];
+    registerPackageCommands({
+      registerCommand(id, handler) {
+        handlers.set(id, handler);
+        return { dispose() {} };
+      },
+      vscode: {
+        env: { clipboard: { async writeText(value) { copied.push(value); } } },
+        window: {
+          showInformationMessage(message) { information.push(message); },
+          showWarningMessage(message) { warnings.push(message); },
+        },
+      },
+      workspaceAccess: {
+        connectionManager,
+        captureAccount,
+        isAccountCurrent,
+      },
+      packageAdapters,
+      LicenseClassifier: { buildRestrictiveQuery: () => "license:restrictive" },
+      isCurrentSelection: isSelectionCurrent,
+    });
+
+    const cases = [
+      { id: "Tags", value: ["latest", "stable"] },
+      { id: "Empty", value: "" },
+      { id: "Uploaded at", value: null },
+      { id: "Status", value: "Completed" },
+    ];
+    const rendered = [];
+    for (const detail of cases) {
+      const node = new PackageDetailsNode(detail, {}, owner);
+      const treeItem = node.getTreeItem();
+      rendered.push(treeItem.description);
+      await handlers.get("cloudsmith-vsc.copySelected")(treeItem.command.arguments[0]);
+    }
+
+    assert.deepStrictEqual(rendered, ["latest,stable", "", "Not available", "Completed"]);
+    assert.deepStrictEqual(copied, rendered);
+    assert.deepStrictEqual(information, cases.map(() => "Value copied."));
+    assert.deepStrictEqual(warnings, []);
+    assert.strictEqual(copied.includes("[object Object]"), false);
+  });
+
+  test("real Explorer and Search versionless rows reach inspect, open, Show, and Copy outcomes", async () => {
+    const accountState = Object.freeze({
+      activationId: "activation-package-actions",
+      accountEpoch: 1,
+      sessionConnected: true,
+      status: "connected",
+    });
+    const connectionManager = { getState: () => accountState };
+    const handlers = new Map();
+    const records = new Map();
+    const documents = [];
+    const opened = [];
+    const copied = [];
+    const warnings = [];
+    const errors = [];
+    const recent = [];
+    let inspectedEndpoint = null;
+    class TestCloudsmithAPI {
+      async get(endpoint) {
+        inspectedEndpoint = endpoint;
+        const identifier = endpoint.split("/").filter(Boolean).at(-1);
+        return { ok: true, data: records.get(identifier) };
+      }
+    }
+    class SearchQueryBuilder {}
+    registerPackageCommands({
+      registerCommand(id, handler) {
+        handlers.set(id, handler);
+        return { dispose() {} };
+      },
+      vscode: {
+        Uri: vscode.Uri,
+        workspace: {
+          getConfiguration: () => ({ get: key => key === "inspectOutput" }),
+          async openTextDocument(options) {
+            documents.push(options);
+            return options;
+          },
+        },
+        env: {
+          clipboard: { async writeText(value) { copied.push(value); } },
+          async openExternal(target) {
+            opened.push(target.toString());
+            return true;
+          },
+        },
+        window: {
+          async showQuickPick(items) { return items[0]; },
+          async showTextDocument() {},
+          showInformationMessage() {},
+          showWarningMessage(message) { warnings.push(message); },
+          showErrorMessage(message) { errors.push(message); },
+        },
+      },
+      context: {},
+      workspaceAccess: { connectionManager, captureAccount, isAccountCurrent },
+      packageAdapters,
+      packageDomain,
+      recentPackages: { getAll: () => [], add(value) { recent.push(value); } },
+      cloudsmithProvider: { refresh() {} },
+      searchProvider: { refresh() {} },
+      dependencyHealthProvider: { refresh() {} },
+      inspectOutputChannel: { append() {}, clear() {}, show() {} },
+      CloudsmithAPI: TestCloudsmithAPI,
+      apiEndpoint,
+      PaginatedFetch: class {},
+      packageCollectionIdentity: () => "identity",
+      SearchQueryBuilder,
+      LicenseClassifier: { buildRestrictiveQuery: () => "license:restrictive" },
+      InstallCommandBuilder,
+      InstallCommandValidationError,
+      buildPackageUrl,
+      buildPackageGroupUrl,
+      filterState: { activeFilters: new Map() },
+      serializePackageCollectionInspection,
+      serializePackageInspection,
+      formatApiError: () => "unavailable",
+      openExternalWithFeedback,
+      isCurrentSelection: isSelectionCurrent,
+      isCurrentPackageSelection: isSelectionCurrent,
+      isCurrentPackageGroupSelection: isSelectionCurrent,
+      isCurrentRepositorySelection: isSelectionCurrent,
+      isCurrentEntitlementSelection: isSelectionCurrent,
+    });
+
+    for (const [NodeType, suffix] of [
+      [PackageNode, "explorer"],
+      [SearchResultNode, "search"],
+    ]) {
+      const record = {
+        ...pkg,
+        name: `artifact-${suffix}.bin`,
+        slug: `artifact-${suffix}`,
+        slug_perm: `artifact-${suffix}-perm`,
+        version: "",
+        uploaded_at: undefined,
+        cdn_url: `https://dl.cloudsmith.io/basic/workspace-a/repo-a/raw/files/artifact-${suffix}.bin`,
+        filename: `artifact-${suffix}.bin`,
+        is_copyable: true,
+      };
+      records.set(record.slug_perm, record);
+      const node = new NodeType(record, {}, { connectionManager });
+      const documentStart = documents.length;
+      const openedStart = opened.length;
+      const copiedStart = copied.length;
+
+      await handlers.get("cloudsmith-vsc.inspectPackage")(node);
+      await handlers.get("cloudsmith-vsc.openPackage")(node);
+      await handlers.get("cloudsmith-vsc.copyInstallCommand")(node);
+      await handlers.get("cloudsmith-vsc.showInstallCommand")(node);
+
+      assert.strictEqual(
+        inspectedEndpoint,
+        `packages/workspace-a/repo-a/${record.slug_perm}/`
+      );
+      const producedDocuments = documents.slice(documentStart);
+      const inspection = JSON.parse(producedDocuments.find(item => item.language === "json").content);
+      assert.strictEqual(inspection.packageIdentifier, record.slug_perm);
+      assert.strictEqual(inspection.version, "");
+      assert.strictEqual(inspection.uploadedAt, null);
+
+      const expectedUrl = `https://app.cloudsmith.com/workspace-a/repo-a/raw/${record.name}//${record.slug_perm}`;
+      assert.deepStrictEqual(opened.slice(openedStart), [expectedUrl]);
+
+      const guidanceDocument = producedDocuments.find(item => item.language !== "json");
+      const copiedGuidance = copied.slice(copiedStart);
+      assert.strictEqual(copiedGuidance.length, 1);
+      assert.strictEqual(guidanceDocument.content, copiedGuidance[0]);
+      assert.match(copiedGuidance[0], new RegExp(record.cdn_url.replaceAll(".", "\\."), "u"));
+    }
+
+    assert.deepStrictEqual(warnings, []);
+    assert.deepStrictEqual(errors, []);
+    assert.strictEqual(recent.length, 8);
+  });
+
+  test("real Explorer and Search nodes skip safe-version siblings before the final action", async () => {
+    const accountState = Object.freeze({
+      activationId: "activation-safe-version",
+      accountEpoch: 1,
+      sessionConnected: true,
+      status: "connected",
+    });
+    const connectionManager = { getState: () => accountState };
+    const sourceRecord = {
+      ...pkg,
+      format: "ruby",
+      name: "native-gem",
+      slug_perm: "native-gem-source",
+      version: "1.0.0",
+      uploaded_at: undefined,
+      identifiers: { ruby_platform: "x86_64-linux" },
+    };
+
+    for (const NodeType of [PackageNode, SearchResultNode]) {
+      const handlers = new Map();
+      const copied = [];
+      const information = [];
+      const warnings = [];
+      const errors = [];
+      const verified = [];
+      let picker = 0;
+      class TestRemediationHelper {
+        async findSafeVersions() {
+          return {
+            success: true,
+            complete: true,
+            totalCount: 2,
+            absenceProven: false,
+            versions: [
+              {
+                namespace: "workspace-a",
+                repository: "repo-a",
+                slug_perm: `${NodeType.name}-sibling`,
+                name: "native-gem",
+                version: "2.0.0",
+                format: "ruby",
+                status_str: "Completed",
+                is_copyable: true,
+                deny_policy_violated: false,
+                identifiers: { ruby_platform: "java" },
+              },
+              {
+                namespace: "workspace-a",
+                repository: "repo-a",
+                slug_perm: `${NodeType.name}-compatible`,
+                name: "native-gem",
+                version: "3.0.0",
+                format: "ruby",
+                status_str: "Completed",
+                is_copyable: true,
+                deny_policy_violated: false,
+                identifiers: { ruby_platform: "x86_64-linux" },
+              },
+            ],
+          };
+        }
+      }
+      registerVulnerabilityCommands({
+        registerCommand(id, handler) {
+          handlers.set(id, handler);
+          return { dispose() {} };
+        },
+        vscode: {
+          QuickPickItemKind: { Separator: 1 },
+          env: { clipboard: { async writeText(value) { copied.push(value); } } },
+          window: {
+            async showQuickPick(items) {
+              picker += 1;
+              return picker === 1
+                ? items.find(item => item.package)
+                : items.find(item => item.id === "copy");
+            },
+            showInformationMessage(message) { information.push(message); },
+            showWarningMessage(message) { warnings.push(message); },
+            showErrorMessage(message) { errors.push(message); },
+          },
+        },
+        context: {},
+        workspaceAccess: { connectionManager, captureAccount, isAccountCurrent },
+        packageAdapters,
+        packageDomain,
+        recentPackages: { getAll: () => [], add() {} },
+        CloudsmithAPI: class {},
+        RemediationHelper: TestRemediationHelper,
+        InstallCommandBuilder,
+        InstallCommandValidationError,
+        buildPackageUrl,
+        vulnerabilityProvider: { async show() {} },
+        quarantineExplainProvider: { async show() {} },
+        cloudsmithProvider: { refreshNode() {} },
+        searchProvider: { refreshNode() {} },
+        dependencyHealthProvider: { refreshNode() {}, getLastSuccessfulScope: () => null },
+        vulnerabilityStateService: {
+          prime() {},
+          async resolve(packageValue) {
+            if (packageValue.version === "1.0.0") {
+              return Object.freeze({
+                status: "complete-vulnerable",
+                complete: true,
+                stale: false,
+                count: 1,
+                records: Object.freeze([Object.freeze({
+                  vulnerability_id: "CVE-2026-0001",
+                })]),
+              });
+            }
+            verified.push(packageValue.version);
+            return Object.freeze({
+              status: "complete-clean",
+              complete: true,
+              stale: false,
+              count: 0,
+              records: Object.freeze([]),
+            });
+          },
+        },
+        normalizeCvssScore,
+        formatApiError: error => error.message,
+        isCurrentSelection: isSelectionCurrent,
+        isCurrentPackageSelection: isSelectionCurrent,
+        isCurrentDependencySelection: isSelectionCurrent,
+      });
+
+      const source = new NodeType(sourceRecord, {}, { connectionManager });
+      assert.strictEqual(isSelectionCurrent(source), true, NodeType.name);
+      assert.strictEqual(
+        packageAdapters.fromPackageSelection(source).qualifiers.platform,
+        "x86_64-linux",
+        NodeType.name
+      );
+      await handlers.get("cloudsmith-vsc.findSafeVersion")(source);
+
+      assert.deepStrictEqual(warnings, [], NodeType.name);
+      assert.deepStrictEqual(errors, [], NodeType.name);
+      assert.deepStrictEqual(information, ["Version copied."], NodeType.name);
+      assert.deepStrictEqual(verified, ["3.0.0"], NodeType.name);
+      assert.deepStrictEqual(copied, ["3.0.0"], NodeType.name);
+      assert.strictEqual(picker, 2, NodeType.name);
+    }
   });
 
   test("SearchResultNode preserves install-command metadata", () => {

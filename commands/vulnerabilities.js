@@ -296,7 +296,10 @@ function registerVulnerabilityCommands(deps) {
           || pkg.repository !== source.repository
           || pkg.name !== source.name
           || pkg.format !== source.format
-          || !sameRemediationIdentity(source, pkg)
+          || (
+            pkg.coordinateName !== source.coordinateName
+            && String(source.format || "").trim().toLowerCase() !== "maven"
+          )
           || pkg.version === source.version
           || definitelyViolatesCompatibility(
             pkg.version,
@@ -307,12 +310,26 @@ function registerVulnerabilityCommands(deps) {
         ) {
           throw new TypeError("Safe-version result escaped its selected package scope.");
         }
+        if (!sameRemediationIdentity(source, pkg)) continue;
         if (isRejectedSafeVersionCandidate(pkg)) continue;
         versions.push(pkg);
       }
     } catch {
       if (!isFindCurrent()) return;
       vscode.window.showErrorMessage("Could not safely interpret the available package versions.");
+      return;
+    }
+    if (versions.length === 0) {
+      if (!isFindCurrent()) return;
+      if (result.complete === true) {
+        vscode.window.showInformationMessage(
+          `No compatible safe version for "${source.name}" is available in ${source.repository}.${reportedFixCopy(fixedVersions)}`
+        );
+      } else {
+        vscode.window.showWarningMessage(
+          "Could not verify whether compatible safe versions are available. Retry."
+        );
+      }
       return;
     }
     const verification = await Promise.all(versions.map(async pkg => {
@@ -731,7 +748,11 @@ function sameRemediationIdentity(source, candidate) {
     return typeof source.qualifiers.subdir === "string"
       && typeof candidate.qualifiers.subdir === "string"
       && source.qualifiers.subdir.length > 0
-      && source.qualifiers.subdir === candidate.qualifiers.subdir;
+      && source.qualifiers.subdir === candidate.qualifiers.subdir
+      && typeof source.qualifiers.build === "string"
+      && typeof candidate.qualifiers.build === "string"
+      && source.qualifiers.build.length > 0
+      && source.qualifiers.build === candidate.qualifiers.build;
   }
   if (format === "rpm") {
     return typeof source.qualifiers.architecture === "string"

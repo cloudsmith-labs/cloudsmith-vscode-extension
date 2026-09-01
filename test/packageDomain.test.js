@@ -978,6 +978,37 @@ suite("Canonical package domain", () => {
         error => error instanceof PackageAdapterError
       );
     }
+
+    for (const fixture of [
+      {
+        record: apiRecord({
+          format: "ruby",
+          identifiers: { ruby_platform: "x86_64-linux" },
+        }),
+        conflict: { ruby_platform: "java" },
+      },
+      {
+        record: apiRecord({
+          format: "maven",
+          name: "demo",
+          identifiers: { group_id: "com.example", extension: "jar" },
+        }),
+        conflict: { packaging: "war" },
+      },
+      {
+        record: apiRecord({
+          format: "rpm",
+          architectures: [{ name: "x86_64" }],
+        }),
+        conflict: { architecture: "aarch64" },
+      },
+    ]) {
+      const canonical = fromApiPackageRecord(fixture.record);
+      assert.throws(
+        () => fromPackageSelection({ package: canonical, ...fixture.conflict }),
+        PackageAdapterError
+      );
+    }
   });
 
   test("bounds wrapper depth and never invokes accessors or object coercion", () => {
@@ -1058,6 +1089,171 @@ suite("Canonical package domain", () => {
         error => error instanceof PackageAdapterError
       );
     }
+  });
+
+  test("canonical empty and absent package projections preserve authority without masking conflicts", () => {
+    const versionless = fromApiPackageRecord(apiRecord({
+      format: "raw",
+      name: "artifact.bin",
+      version: "",
+      uploaded_at: undefined,
+    }));
+    const acceptedVersionAliases = [
+      {},
+      { version: undefined },
+      { version: null },
+      { version: "" },
+      { version: { id: "Version", value: "" } },
+    ];
+    const acceptedUploadedAliases = [
+      {},
+      { uploadedAt: undefined },
+      { uploadedAt: null },
+      { uploaded_at: undefined },
+      { uploaded_at: null },
+      { uploaded_at: { id: "Uploaded at", value: null } },
+    ];
+
+    for (const versionAlias of acceptedVersionAliases) {
+      for (const uploadedAlias of acceptedUploadedAliases) {
+        assert.strictEqual(fromPackageSelection({
+          package: versionless,
+          ...versionAlias,
+          ...uploadedAlias,
+        }), versionless);
+      }
+    }
+
+    for (const conflict of [
+      { version: { id: "Version", value: "1.0.0" } },
+      { uploaded_at: { id: "Uploaded at", value: "2026-09-01T00:00:00Z" } },
+    ]) {
+      assert.throws(
+        () => fromPackageSelection({ package: versionless, ...conflict }),
+        error => error instanceof PackageAdapterError
+          && error.code === "conflicting_canonical_projection"
+      );
+    }
+
+    const populated = fromApiPackageRecord(apiRecord({
+      uploaded_at: "2026-09-01T00:00:00Z",
+    }));
+    for (const conflict of [
+      { version: { id: "Version", value: "" } },
+      { version: { id: "Version", value: null } },
+      { uploaded_at: { id: "Uploaded at", value: null } },
+      { uploaded_at: { id: "Uploaded at", value: "" } },
+    ]) {
+      assert.throws(
+        () => fromPackageSelection({ package: populated, ...conflict }),
+        error => error instanceof PackageAdapterError
+          && error.code === "conflicting_canonical_projection"
+      );
+    }
+  });
+
+  test("canonical package projections retain strict native qualifier consensus", () => {
+    const fixtures = [
+      {
+        record: apiRecord({
+          format: "maven",
+          name: "demo",
+          identifiers: {
+            group_id: "com.example",
+            extension: "test-jar",
+            classifier: "tests",
+          },
+        }),
+        agreeing: {
+          identifiers: {
+            group_id: "com.example",
+            extension: "test-jar",
+            classifier: "tests",
+          },
+        },
+        conflicting: {
+          identifiers: {
+            group_id: "org.other",
+            extension: "test-jar",
+            classifier: "tests",
+          },
+        },
+      },
+      {
+        record: apiRecord({
+          format: "ruby",
+          name: "native-gem",
+          identifiers: { ruby_platform: "x86_64-linux" },
+        }),
+        agreeing: { identifiers: { ruby_platform: "x86_64-linux" } },
+        conflicting: { identifiers: { ruby_platform: "java" } },
+      },
+      {
+        record: apiRecord({
+          format: "conda",
+          name: "numpy",
+          identifiers: { build: "py311h123_0", subdir: "linux-64" },
+        }),
+        agreeing: { identifiers: { build: "py311h123_0", subdir: "linux-64" } },
+        conflicting: { identifiers: { build: "py312h456_0", subdir: "osx-64" } },
+      },
+    ];
+
+    for (const fixture of fixtures) {
+      const canonical = fromApiPackageRecord(fixture.record);
+      assert.strictEqual(fromPackageSelection({
+        package: canonical,
+        name: canonical.name,
+        format: canonical.format,
+        ...fixture.agreeing,
+      }), canonical);
+      assert.throws(
+        () => fromPackageSelection({
+          package: canonical,
+          name: canonical.name,
+          format: canonical.format,
+          ...fixture.conflicting,
+        }),
+        PackageAdapterError
+      );
+    }
+  });
+
+  test("canonical projection aliases reject malformed wrappers without invoking user code", () => {
+    const canonical = fromApiPackageRecord(apiRecord());
+    let getterCalls = 0;
+    let coercionCalls = 0;
+    const accessor = {};
+    Object.defineProperty(accessor, "value", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return canonical.version;
+      },
+    });
+    const inherited = Object.create({ value: canonical.version });
+
+    for (const version of [
+      accessor,
+      inherited,
+      { id: "Version", value: { value: canonical.version } },
+      { id: "Version", value: canonical.version, unexpected: true },
+      { id: {}, value: canonical.version },
+      [canonical.version],
+      {
+        toString() {
+          coercionCalls += 1;
+          return canonical.version;
+        },
+      },
+    ]) {
+      assert.throws(
+        () => fromPackageSelection({ package: canonical, version }),
+        PackageAdapterError
+      );
+    }
+    assert.strictEqual(getterCalls, 0);
+    assert.strictEqual(coercionCalls, 0);
   });
 
   test("selection dispatch requires full consensus across overlapping legacy shapes", () => {
@@ -1260,6 +1456,72 @@ suite("Canonical package domain", () => {
       _detailValue: "1.2.3",
       label: { id: "Version", value: "2.0.0" },
     }), PackageAdapterError);
+  });
+
+  test("package detail projection accepts truthful text and rejects object-shaped coercion", () => {
+    const accepted = [
+      [{ id: "Tags", value: ["latest", "stable"] }, "latest,stable"],
+      [{ id: "Empty", value: "" }, ""],
+      [{ id: "Missing", value: null }, "Not available"],
+      [{ id: "Undefined", value: undefined }, "Not available"],
+      [{ id: "Count", value: 7 }, "7"],
+      [{ id: "Policy", value: false }, "false"],
+      [{ id: "Status", value: "Completed" }, "Completed"],
+    ];
+    for (const [label, expected] of accepted) {
+      assert.deepStrictEqual(fromPackageDetailNode({ label }), {
+        id: label.id,
+        value: expected,
+      });
+    }
+
+    let getterCalls = 0;
+    let coercionCalls = 0;
+    const accessor = [];
+    Object.defineProperty(accessor, "0", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return "forged";
+      },
+    });
+    accessor.length = 1;
+    const sparse = new Array(2);
+    sparse[1] = "present";
+    const symbolArray = ["latest"];
+    symbolArray[Symbol("hidden")] = "forged";
+    const extraPropertyArray = ["latest"];
+    extraPropertyArray.extra = "forged";
+
+    for (const value of [
+      { nested: true },
+      [["nested"]],
+      sparse,
+      accessor,
+      symbolArray,
+      extraPropertyArray,
+      new Array(101).fill("tag"),
+      ["x".repeat(501)],
+      new Array(17).fill("x".repeat(500)),
+      {
+        toString() {
+          coercionCalls += 1;
+          return "forged";
+        },
+      },
+    ]) {
+      assert.throws(
+        () => fromPackageDetailNode({ label: { id: "Tags", value } }),
+        PackageAdapterError
+      );
+    }
+    assert.throws(() => fromPackageDetailNode({
+      _detailId: "Tags",
+      _detailValue: ["latest"],
+      label: { id: "Tags", value: ["stable"] },
+    }), PackageAdapterError);
+    assert.strictEqual(getterCalls, 0);
+    assert.strictEqual(coercionCalls, 0);
   });
 
   test("rejects symbol-keyed and inherited semantic properties without invoking getters", () => {
