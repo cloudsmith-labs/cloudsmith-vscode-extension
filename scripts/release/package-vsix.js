@@ -21,7 +21,10 @@ const {
   withCanonicalNpmLauncher,
 } = require("../quality/canonical-node-runtime");
 const { assertVersionState } = require("./verify-version");
-const { validateSidecars, verifyVsix } = require("./verify-vsix");
+const {
+  validateSidecars,
+  verifyFreshVsix,
+} = require("./verify-vsix");
 
 const root = path.resolve(__dirname, "../..");
 const VSCE_ENTRY_EVAL = "require(process.argv[1])(process.argv);";
@@ -756,8 +759,9 @@ async function main() {
         commandError = error;
       }
       buildStage = `${ordinal}-output-receipt`;
+      let outputReceipt;
       try {
-        capturePackageBuildOutputAfterCommand(
+        outputReceipt = capturePackageBuildOutputAfterCommand(
           tempDirectory,
           outputPath,
           cleanupBuildEntries,
@@ -772,7 +776,10 @@ async function main() {
         throw new Error("VSCE prepublish changed the clean source checkout");
       }
       buildStage = `${ordinal}-artifact-verification`;
-      const verification = await verifyVsix(outputPath, { sourceSha: sourceReference });
+      const verification = await verifyFreshVsix(outputPath, {
+        expectedIdentity: outputReceipt.identity,
+        sourceSha: sourceReference,
+      });
       buildResults.push(verification);
     }
 
@@ -813,7 +820,11 @@ async function main() {
     writeAtomically(provenancePath, `${JSON.stringify(provenance, null, 2)}\n`);
 
     buildStage = "published-artifact-verification";
-    const written = await verifyVsix(outputPath, { sourceSha: sourceReference });
+    const publishedReceipt = capturePackageBuildOutput(outputDirectory, outputPath);
+    const written = await verifyFreshVsix(outputPath, {
+      expectedIdentity: publishedReceipt.identity,
+      sourceSha: sourceReference,
+    });
     validateSidecars(outputPath, written, {
       expectedSourceSha: sourceSha,
       requirePublishable: releaseBuild,

@@ -1184,7 +1184,7 @@ suite("authenticated CI SecretStorage bootstrap", () => {
     let readAttempted = false;
     let scannerReached = false;
     try {
-      fs.openSync = function replaceRuntimeLogWithFifo(target, flags, ...arguments_) {
+      fs.openSync = function replaceRuntimeLogWithFifo(target, flags) {
         if (!replaced && target === logFile) {
           fs.renameSync(logFile, displaced);
           const fixture = spawnSync("mkfifo", [logFile], { stdio: "ignore" });
@@ -1195,7 +1195,7 @@ suite("authenticated CI SecretStorage bootstrap", () => {
           replaced = true;
           assert.notStrictEqual(flags & fs.constants.O_NONBLOCK, 0);
         }
-        const descriptor = originalOpen.call(fs, target, flags, ...arguments_);
+        const descriptor = originalOpen.call(fs, target, flags, 0o600);
         if (replaced && target === logFile) fifoDescriptor = descriptor;
         return descriptor;
       };
@@ -1276,8 +1276,8 @@ suite("authenticated CI SecretStorage bootstrap", () => {
       let requestedBytes = 0;
       let scannerReached = false;
       try {
-        fs.openSync = function observeExactRuntimeLogOpen(target, flags, ...arguments_) {
-          const descriptor = originalOpen.call(fs, target, flags, ...arguments_);
+        fs.openSync = function observeExactRuntimeLogOpen(target, flags) {
+          const descriptor = originalOpen.call(fs, target, flags, 0o600);
           if (target === logFile) {
             exactOpenCount += 1;
             assert.notStrictEqual(flags & fs.constants.O_NONBLOCK, 0);

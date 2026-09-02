@@ -28,6 +28,17 @@ const MAX_PROVENANCE_SIDECAR_BYTES = 32 * 1024;
 const EXACT_FILE_READ_FLAGS = fs.constants.O_RDONLY
   | (fs.constants.O_NOFOLLOW || 0)
   | (fs.constants.O_NONBLOCK || 0);
+const unstableArtifactFailures = new WeakSet();
+const WINDOWS_ARTIFACT_VERIFICATION_RETRIES = 8;
+const EXACT_ARTIFACT_IDENTITY_KEYS = Object.freeze([
+  "changedNanoseconds",
+  "device",
+  "inode",
+  "links",
+  "mode",
+  "modifiedNanoseconds",
+  "size",
+]);
 const generatedEntries = new Set(["[Content_Types].xml", "extension.vsixmanifest"]);
 const baseMedia = new Set([
   "media/icon.svg",
@@ -425,18 +436,47 @@ function assertStableArtifactPath(filePath, descriptor, identity, fileSystem, er
   }
 }
 
-async function withStableArtifact(filePath, options = {}, consume) {
+function artifactTransactionFailure(transactionFailure, errorMessage, retryable = true) {
+  const error = new Error(errorMessage);
+  const code = (typeof transactionFailure === "object" || typeof transactionFailure === "function")
+    ? Object.getOwnPropertyDescriptor(transactionFailure, "code")
+    : null;
+  if (retryable && code && Object.prototype.hasOwnProperty.call(code, "value")
+    && new Set(["EBUSY", "EPERM"]).has(code.value)) {
+    unstableArtifactFailures.add(error);
+  }
+  return error;
+}
+
+function runArtifactTransaction(options, operation) {
+  const platform = options.platform || process.platform;
+  const retryDelay = options.retryDelay || boundedArtifactRetryDelay;
+  const maximumRetries = platform === "win32"
+    ? WINDOWS_ARTIFACT_VERIFICATION_RETRIES
+    : 0;
+  let attempt = 0;
+  while (true) {
+    try {
+      return operation();
+    } catch (error) {
+      if (attempt >= maximumRetries || !isUnstableArtifactFailure(error)) throw error;
+      retryDelay(attempt);
+      attempt += 1;
+    }
+  }
+}
+
+function captureStableArtifactSnapshot(filePath, options) {
   const fileSystem = options.fileSystem || fs;
   const errorMessage = "VSIX pathname is not an exact bounded single-link file.";
   const absolutePath = path.resolve(filePath);
   let allocation;
-  let consumerError;
   let descriptor;
   let identity;
-  let result;
-  let transactionFailed = false;
+  let transactionFailure = null;
+  let transactionRetryable = true;
   try {
-    descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS);
+    descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS, 0o600);
     const openedStat = assertBoundedArtifactStat(
       fileSystem.fstatSync(descriptor, { bigint: true }),
       errorMessage,
@@ -467,27 +507,124 @@ async function withStableArtifact(filePath, options = {}, consume) {
     }
     if (offset !== expectedSize) throw new Error(errorMessage);
     assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
-    try {
-      result = await consume(allocation.subarray(0, expectedSize), identity);
-    } catch (error) {
-      consumerError = error;
-    }
-    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
-  } catch {
-    transactionFailed = true;
+  } catch (error) {
+    transactionFailure = error;
   } finally {
-    if (Buffer.isBuffer(allocation)) allocation.fill(0);
     if (descriptor !== undefined) {
       try {
         fileSystem.closeSync(descriptor);
-      } catch {
-        transactionFailed = true;
+      } catch (error) {
+        transactionFailure = error;
+        transactionRetryable = false;
       }
     }
   }
-  if (transactionFailed) throw new Error(errorMessage);
-  if (consumerError) throw consumerError;
+  if (transactionFailure) {
+    if (Buffer.isBuffer(allocation)) allocation.fill(0);
+    throw artifactTransactionFailure(transactionFailure, errorMessage, transactionRetryable);
+  }
+  return { allocation, identity };
+}
+
+function rebindStableArtifactPath(filePath, identity, options) {
+  const fileSystem = options.fileSystem || fs;
+  const errorMessage = "VSIX pathname is not an exact bounded single-link file.";
+  const absolutePath = path.resolve(filePath);
+  let descriptor;
+  let transactionFailure = null;
+  let transactionRetryable = true;
+  try {
+    descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS, 0o600);
+    const reboundStat = assertBoundedArtifactStat(
+      fileSystem.fstatSync(descriptor, { bigint: true }),
+      errorMessage,
+    );
+    if (!sameExactFileIdentity(identity, exactFileIdentity(reboundStat))) {
+      throw new Error(errorMessage);
+    }
+    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
+  } catch (error) {
+    transactionFailure = error;
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        fileSystem.closeSync(descriptor);
+      } catch (error) {
+        transactionFailure = error;
+        transactionRetryable = false;
+      }
+    }
+  }
+  if (transactionFailure) {
+    throw artifactTransactionFailure(transactionFailure, errorMessage, transactionRetryable);
+  }
+}
+
+async function withStableArtifact(filePath, options = {}, consume) {
+  const snapshot = runArtifactTransaction(
+    options,
+    () => captureStableArtifactSnapshot(filePath, options),
+  );
+  let result;
+  try {
+    result = await consume(snapshot.allocation, snapshot.identity);
+  } catch (error) {
+    snapshot.allocation.fill(0);
+    throw error;
+  }
+  try {
+    runArtifactTransaction(
+      options,
+      () => rebindStableArtifactPath(filePath, snapshot.identity, options),
+    );
+  } finally {
+    snapshot.allocation.fill(0);
+  }
   return result;
+}
+
+function isUnstableArtifactFailure(error) {
+  return Boolean(error && (typeof error === "object" || typeof error === "function")
+    && unstableArtifactFailures.has(error));
+}
+
+function exactArtifactIdentity(value) {
+  if (!value || (typeof value !== "object" && typeof value !== "function")
+    || JSON.stringify(Object.keys(value).sort())
+      !== JSON.stringify([...EXACT_ARTIFACT_IDENTITY_KEYS].sort())) {
+    return false;
+  }
+  return EXACT_ARTIFACT_IDENTITY_KEYS.every(key => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value")
+      && typeof descriptor.value === "string" && /^\d+$/u.test(descriptor.value);
+  });
+}
+
+function boundedArtifactRetryDelay(attempt) {
+  const milliseconds = Math.min(25 * (2 ** attempt), 800);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+async function verifyFreshVsix(filePath, options = {}) {
+  const expectedIdentityDescriptor = Object.getOwnPropertyDescriptor(
+    options,
+    "expectedIdentity",
+  );
+  const expectedIdentity = expectedIdentityDescriptor
+    && Object.prototype.hasOwnProperty.call(expectedIdentityDescriptor, "value")
+    ? expectedIdentityDescriptor.value
+    : null;
+  if (!exactArtifactIdentity(expectedIdentity)) {
+    throw new Error("Fresh VSIX verification identity is unsafe or invalid.");
+  }
+  const verify = options.verifyVsix || verifyVsix;
+  return verify(filePath, {
+    expectedIdentity,
+    platform: options.platform || process.platform,
+    retryDelay: options.retryDelay || boundedArtifactRetryDelay,
+    sourceSha: options.sourceSha || null,
+  });
 }
 
 function withBoundedNamedFile(filePath, options, consume) {
@@ -971,6 +1108,7 @@ module.exports = {
   verificationSourceSha,
   validateArchivePath,
   validateSidecars,
+  verifyFreshVsix,
   verifyVsix,
   withStableArtifact,
   withStableSidecarSet,

@@ -6,7 +6,7 @@
       "package": "diff",
       "severity": "low",
       "owner": "release-engineering",
-      "reviewedOn": "2026-08-26",
+      "reviewedOn": "2026-09-01",
       "expiresOn": "2026-09-25",
       "rationale": "Development-only Mocha diff rendering; untrusted patches are not processed by the shipped extension.",
       "rejectedFixes": [
@@ -18,9 +18,9 @@
         },
         {
           "name": "mocha",
-          "version": "11.3.0",
+          "version": "12.0.0",
           "isSemVerMajor": true,
-          "reason": "npm proposes downgrading the explicitly pinned Mocha 11.8.0 test runner to 11.3.0; that regression is outside the supported locked toolchain and is not a forward security update."
+          "reason": "npm proposes a semver-major Mocha 12 runner change, while @vscode/test-cli 0.0.15 requires Mocha ^11.7.6; changing only the direct pin would retain a nested vulnerable Mocha 11 path rather than provide a complete supported fix."
         }
       ]
     },
@@ -29,7 +29,7 @@
       "package": "serialize-javascript",
       "severity": "high",
       "owner": "release-engineering",
-      "reviewedOn": "2026-08-26",
+      "reviewedOn": "2026-09-01",
       "expiresOn": "2026-09-25",
       "rationale": "Development-only Mocha parallel-worker option serialization; the reviewed test commands do not enable Mocha parallel mode, so this path is not reached in CI or the shipped extension.",
       "rejectedFixes": [
@@ -41,9 +41,9 @@
         },
         {
           "name": "mocha",
-          "version": "11.3.0",
+          "version": "12.0.0",
           "isSemVerMajor": true,
-          "reason": "npm proposes downgrading the explicitly pinned Mocha 11.8.0 test runner to 11.3.0; that regression is outside the supported locked toolchain and still carries the same serializer dependency family."
+          "reason": "npm proposes a semver-major Mocha 12 runner change, while @vscode/test-cli 0.0.15 requires Mocha ^11.7.6; changing only the direct pin would retain a nested vulnerable Mocha 11 path rather than provide a complete supported fix."
         }
       ]
     },
@@ -52,7 +52,7 @@
       "package": "serialize-javascript",
       "severity": "moderate",
       "owner": "release-engineering",
-      "reviewedOn": "2026-08-26",
+      "reviewedOn": "2026-09-01",
       "expiresOn": "2026-09-25",
       "rationale": "Development-only Mocha parallel-worker option serialization; the reviewed test commands do not enable Mocha parallel mode, so attacker-controlled array-like values do not reach this path in CI or the shipped extension.",
       "rejectedFixes": [
@@ -64,9 +64,9 @@
         },
         {
           "name": "mocha",
-          "version": "11.3.0",
+          "version": "12.0.0",
           "isSemVerMajor": true,
-          "reason": "npm proposes downgrading the explicitly pinned Mocha 11.8.0 test runner to 11.3.0; that regression is outside the supported locked toolchain and still carries the same serializer dependency family."
+          "reason": "npm proposes a semver-major Mocha 12 runner change, while @vscode/test-cli 0.0.15 requires Mocha ^11.7.6; changing only the direct pin would retain a nested vulnerable Mocha 11 path rather than provide a complete supported fix."
         }
       ]
     }

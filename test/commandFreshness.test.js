@@ -1358,7 +1358,7 @@ suite("Command selection freshness", () => {
     }
   });
 
-  test("safe-version candidates cannot cross native artifact identity variants", async () => {
+  test("all native artifact siblings reach a truthful complete no-compatible terminal", async () => {
     const cases = [
       {
         source: exactPackage({
@@ -1489,6 +1489,8 @@ suite("Command selection freshness", () => {
     for (const [index, fixture] of cases.entries()) {
       const registration = recorder();
       const errors = [];
+      const information = [];
+      const warnings = [];
       let pickerCalls = 0;
       class RemediationHelper {
         async findSafeVersions() {
@@ -1514,8 +1516,8 @@ suite("Command selection freshness", () => {
         RemediationHelper,
         vscode: {
           window: {
-            showInformationMessage() {},
-            showWarningMessage() {},
+            showInformationMessage: message => information.push(message),
+            showWarningMessage: message => warnings.push(message),
             showErrorMessage: message => errors.push(message),
             showQuickPick() { pickerCalls += 1; },
           },
@@ -1524,8 +1526,10 @@ suite("Command selection freshness", () => {
 
       await registration.handlers.get("cloudsmith-vsc.findSafeVersion")(fixture.source);
 
-      assert.deepStrictEqual(errors, [
-        "Could not safely interpret the available package versions.",
+      assert.deepStrictEqual(errors, []);
+      assert.deepStrictEqual(warnings, []);
+      assert.deepStrictEqual(information, [
+        `No compatible safe version for "${fixture.source.name}" is available in repo-a.`,
       ]);
       assert.strictEqual(pickerCalls, 0);
     }
@@ -1546,9 +1550,9 @@ suite("Command selection freshness", () => {
             status_str: "Completed",
             deny_policy_violated: false,
             is_copyable: true,
-            identifiers: { build: "py312h456_0", subdir: "linux-64" },
+            identifiers: { build: "py311h123_0", subdir: "linux-64" },
         },
-        expectedQualifiers: { build: "py312h456_0", subdir: "linux-64" },
+        expectedQualifiers: { build: "py311h123_0", subdir: "linux-64" },
       },
       {
         source: exactPackage({
@@ -1627,6 +1631,381 @@ suite("Command selection freshness", () => {
       assert.deepStrictEqual(errors, []);
       assert.strictEqual(publishedItems.length, 1);
       assert.deepStrictEqual(publishedItems[0].package.qualifiers, fixture.expectedQualifiers);
+    }
+  });
+
+  test("Ruby, Maven, and Conda siblings are skipped before the compatible candidate action", async () => {
+    const fixtures = [
+      {
+        label: "Ruby",
+        source: exactPackage({
+          format: "ruby",
+          qualifiers: { platform: "x86_64-linux" },
+        }),
+        sibling: {
+          name: "widget",
+          format: "ruby",
+          identifiers: { ruby_platform: "ruby" },
+        },
+        compatible: {
+          name: "widget",
+          format: "ruby",
+          identifiers: { ruby_platform: "x86_64-linux" },
+        },
+      },
+      {
+        label: "Maven",
+        source: exactPackage({
+          format: "maven",
+          name: "demo",
+          coordinateName: "com.example:demo",
+          qualifiers: { type: "test-jar", classifier: "tests" },
+        }),
+        sibling: {
+          name: "demo",
+          format: "maven",
+          identifiers: {
+            group_id: "org.other",
+            extension: "test-jar",
+            classifier: "tests",
+          },
+        },
+        compatible: {
+          name: "demo",
+          format: "maven",
+          identifiers: {
+            group_id: "com.example",
+            extension: "test-jar",
+            classifier: "tests",
+          },
+        },
+      },
+      {
+        label: "Maven-type",
+        source: exactPackage({
+          format: "maven",
+          name: "demo",
+          coordinateName: "com.example:demo",
+          qualifiers: { type: "test-jar", classifier: "tests" },
+        }),
+        sibling: {
+          name: "demo",
+          format: "maven",
+          identifiers: {
+            group_id: "com.example",
+            extension: "jar",
+            classifier: "tests",
+          },
+        },
+        compatible: {
+          name: "demo",
+          format: "maven",
+          identifiers: {
+            group_id: "com.example",
+            extension: "test-jar",
+            classifier: "tests",
+          },
+        },
+      },
+      {
+        label: "Maven-classifier",
+        source: exactPackage({
+          format: "maven",
+          name: "demo",
+          coordinateName: "com.example:demo",
+          qualifiers: { type: "test-jar", classifier: "tests" },
+        }),
+        sibling: {
+          name: "demo",
+          format: "maven",
+          identifiers: {
+            group_id: "com.example",
+            extension: "test-jar",
+            classifier: "sources",
+          },
+        },
+        compatible: {
+          name: "demo",
+          format: "maven",
+          identifiers: {
+            group_id: "com.example",
+            extension: "test-jar",
+            classifier: "tests",
+          },
+        },
+      },
+      {
+        label: "Conda",
+        source: exactPackage({
+          format: "conda",
+          qualifiers: { build: "py311h123_0", subdir: "linux-64" },
+        }),
+        sibling: {
+          name: "widget",
+          format: "conda",
+          identifiers: { build: "py312h456_0", subdir: "osx-64" },
+        },
+        compatible: {
+          name: "widget",
+          format: "conda",
+          identifiers: { build: "py311h123_0", subdir: "linux-64" },
+        },
+      },
+      {
+        label: "Conda-build",
+        source: exactPackage({
+          format: "conda",
+          qualifiers: { build: "py311h123_0", subdir: "linux-64" },
+        }),
+        sibling: {
+          name: "widget",
+          format: "conda",
+          identifiers: { build: "py312h456_0", subdir: "linux-64" },
+        },
+        compatible: {
+          name: "widget",
+          format: "conda",
+          identifiers: { build: "py311h123_0", subdir: "linux-64" },
+        },
+      },
+      {
+        label: "Conda-subdir",
+        source: exactPackage({
+          format: "conda",
+          qualifiers: { build: "py311h123_0", subdir: "linux-64" },
+        }),
+        sibling: {
+          name: "widget",
+          format: "conda",
+          identifiers: { build: "py311h123_0", subdir: "osx-64" },
+        },
+        compatible: {
+          name: "widget",
+          format: "conda",
+          identifiers: { build: "py311h123_0", subdir: "linux-64" },
+        },
+      },
+    ];
+
+    for (const [index, fixture] of fixtures.entries()) {
+      const registration = recorder();
+      const copied = [];
+      const errors = [];
+      const warnings = [];
+      const information = [];
+      const verifiedCandidateVersions = [];
+      let picker = 0;
+      class RemediationHelper {
+        async findSafeVersions() {
+          return {
+            success: true,
+            complete: true,
+            totalCount: 2,
+            absenceProven: false,
+            versions: [
+              {
+                namespace: "workspace-a",
+                repository: "repo-a",
+                slug_perm: `${fixture.label.toLowerCase()}-sibling-${index}`,
+                version: "2.0.0",
+                status_str: "Completed",
+                deny_policy_violated: false,
+                is_copyable: true,
+                ...fixture.sibling,
+              },
+              {
+                namespace: "workspace-a",
+                repository: "repo-a",
+                slug_perm: `${fixture.label.toLowerCase()}-compatible-${index}`,
+                version: "3.0.0",
+                status_str: "Completed",
+                deny_policy_violated: false,
+                is_copyable: true,
+                ...fixture.compatible,
+              },
+            ],
+          };
+        }
+      }
+      const vulnerabilityStateService = {
+        prime() {},
+        async resolve(pkg) {
+          if (pkg.version === fixture.source.version) return defaultVulnerabilityState(pkg);
+          verifiedCandidateVersions.push(pkg.version);
+          return defaultVulnerabilityState(pkg);
+        },
+      };
+      registerVulnerabilityCommands(vulnerabilityDeps(registration, {
+        RemediationHelper,
+        vulnerabilityStateService,
+        vscode: {
+          QuickPickItemKind: { Separator: 1 },
+          env: { clipboard: { async writeText(value) { copied.push(value); } } },
+          window: {
+            async showQuickPick(items) {
+              picker += 1;
+              return picker === 1
+                ? items.find(item => item.package)
+                : items.find(item => item.id === "copy");
+            },
+            showInformationMessage(message) { information.push(message); },
+            showWarningMessage(message) { warnings.push(message); },
+            showErrorMessage(message) { errors.push(message); },
+          },
+        },
+      }));
+
+      await registration.handlers.get("cloudsmith-vsc.findSafeVersion")(fixture.source);
+
+      assert.deepStrictEqual(verifiedCandidateVersions, ["3.0.0"], fixture.label);
+      assert.deepStrictEqual(copied, ["3.0.0"], fixture.label);
+      assert.deepStrictEqual(information, ["Version copied."], fixture.label);
+      assert.deepStrictEqual(warnings, [], fixture.label);
+      assert.deepStrictEqual(errors, [], fixture.label);
+      assert.strictEqual(picker, 2, fixture.label);
+    }
+  });
+
+  test("safe-version workspace, repository, name, format, and malformed escapes remain fatal", async () => {
+    const escapes = [
+      ["workspace", { namespace: "other-workspace" }],
+      ["repository", { repository: "other-repository" }],
+      ["name", { name: "unrelated" }],
+      ["format", { format: "ruby", identifiers: { ruby_platform: "ruby" } }],
+      ["malformed", { slug_perm: undefined }],
+    ];
+    for (const [label, escape] of escapes) {
+      const registration = recorder();
+      const errors = [];
+      const warnings = [];
+      const information = [];
+      let pickerCalls = 0;
+      let candidateVerifications = 0;
+      class RemediationHelper {
+        async findSafeVersions() {
+          const base = {
+            namespace: "workspace-a",
+            repository: "repo-a",
+            slug_perm: `escaped-${label}`,
+            name: "widget",
+            version: "2.0.0",
+            format: "npm",
+            status_str: "Completed",
+            deny_policy_violated: false,
+            is_copyable: true,
+          };
+          return {
+            success: true,
+            complete: true,
+            totalCount: 2,
+            absenceProven: false,
+            versions: [
+              { ...base, ...escape },
+              { ...base, slug_perm: `valid-after-${label}`, version: "3.0.0" },
+            ],
+          };
+        }
+      }
+      registerVulnerabilityCommands(vulnerabilityDeps(registration, {
+        RemediationHelper,
+        vulnerabilityStateService: {
+          prime() {},
+          async resolve(pkg) {
+            if (pkg.version !== "1.0.0") candidateVerifications += 1;
+            return defaultVulnerabilityState(pkg);
+          },
+        },
+        vscode: {
+          window: {
+            showInformationMessage: message => information.push(message),
+            showWarningMessage: message => warnings.push(message),
+            showErrorMessage: message => errors.push(message),
+            showQuickPick() { pickerCalls += 1; },
+          },
+        },
+      }));
+
+      await registration.handlers.get("cloudsmith-vsc.findSafeVersion")(exactPackage());
+
+      assert.deepStrictEqual(errors, [
+        "Could not safely interpret the available package versions.",
+      ], label);
+      assert.deepStrictEqual(warnings, [], label);
+      assert.deepStrictEqual(information, [], label);
+      assert.strictEqual(candidateVerifications, 0, label);
+      assert.strictEqual(pickerCalls, 0, label);
+    }
+  });
+
+  test("all-sibling completeness controls the no-compatible safe-version terminal", async () => {
+    for (const complete of [true, false]) {
+      const registration = recorder();
+      const information = [];
+      const warnings = [];
+      const errors = [];
+      let pickerCalls = 0;
+      let candidateVerifications = 0;
+      const source = exactPackage({
+        format: "ruby",
+        qualifiers: { platform: "x86_64-linux" },
+      });
+      class RemediationHelper {
+        async findSafeVersions() {
+          return {
+            success: true,
+            complete,
+            totalCount: complete ? 1 : null,
+            absenceProven: false,
+            versions: [{
+              namespace: "workspace-a",
+              repository: "repo-a",
+              slug_perm: "ruby-platform-sibling",
+              name: "widget",
+              version: "2.0.0",
+              format: "ruby",
+              status_str: "Completed",
+              deny_policy_violated: false,
+              is_copyable: true,
+              identifiers: { ruby_platform: "ruby" },
+            }],
+          };
+        }
+      }
+      registerVulnerabilityCommands(vulnerabilityDeps(registration, {
+        RemediationHelper,
+        vulnerabilityStateService: {
+          prime() {},
+          async resolve(pkg) {
+            if (pkg.version !== source.version) candidateVerifications += 1;
+            return defaultVulnerabilityState(pkg);
+          },
+        },
+        vscode: {
+          window: {
+            showInformationMessage: message => information.push(message),
+            showWarningMessage: message => warnings.push(message),
+            showErrorMessage: message => errors.push(message),
+            showQuickPick() { pickerCalls += 1; },
+          },
+        },
+      }));
+
+      await registration.handlers.get("cloudsmith-vsc.findSafeVersion")(source);
+
+      assert.deepStrictEqual(errors, []);
+      assert.strictEqual(candidateVerifications, 0);
+      assert.strictEqual(pickerCalls, 0);
+      if (complete) {
+        assert.deepStrictEqual(information, [
+          'No compatible safe version for "widget" is available in repo-a.',
+        ]);
+        assert.deepStrictEqual(warnings, []);
+      } else {
+        assert.deepStrictEqual(information, []);
+        assert.deepStrictEqual(warnings, [
+          "Could not verify whether compatible safe versions are available. Retry.",
+        ]);
+      }
     }
   });
 

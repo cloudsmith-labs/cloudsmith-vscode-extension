@@ -21,6 +21,7 @@ const {
 const MAX_FILTER_INPUT_LENGTH = 2048;
 const QUERY_CONTROL_OR_BIDI_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/;
 const TRUSTED_LICENSE_HOSTS = new Set(["spdx.org", "www.spdx.org"]);
+const VERSIONLESS_URL_PLACEHOLDER = "cloudsmith-vsc-versionless-package";
 
 function filterInputValidationMessage(value) {
   if (typeof value !== "string") return "Enter a filter query.";
@@ -355,14 +356,7 @@ function registerPackageCommands(deps) {
     if (!selected) return;
     const { package: pkg, isCurrent } = selected;
     if (!isCurrent()) return;
-    const url = buildPackageUrl(
-      pkg.workspace,
-      pkg.repository,
-      pkg.format,
-      pkg.name,
-      pkg.version,
-      pkg.packageIdentifier
-    );
+    const url = buildPackageNavigationUrl(buildPackageUrl, pkg);
     if (!url) {
       vscode.window.showWarningMessage("Could not open this package in Cloudsmith.");
       return;
@@ -628,6 +622,24 @@ function registerPackageCommands(deps) {
     ["cloudsmith-vsc.openLicenseUrl", openLicenseUrl],
     ["cloudsmith-vsc.copyEntitlementToken", copyEntitlementToken],
   ], deps);
+}
+
+function buildPackageNavigationUrl(buildPackageUrl, pkg) {
+  const versionless = pkg.version === ""
+    && ["generic", "raw"].includes(String(pkg.format || "").trim().toLowerCase());
+  const url = buildPackageUrl(
+    pkg.workspace,
+    pkg.repository,
+    pkg.format,
+    pkg.name,
+    versionless ? VERSIONLESS_URL_PLACEHOLDER : pkg.version,
+    pkg.packageIdentifier
+  );
+  if (!versionless || !url) return url;
+  const encodedIdentifier = encodeURIComponent(pkg.packageIdentifier);
+  const suffix = `/${VERSIONLESS_URL_PLACEHOLDER}/${encodedIdentifier}`;
+  if (!url.endsWith(suffix)) return null;
+  return `${url.slice(0, -suffix.length)}//${encodedIdentifier}`;
 }
 
 module.exports = { registerPackageCommands };
