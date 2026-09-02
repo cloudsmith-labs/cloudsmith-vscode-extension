@@ -436,16 +436,45 @@ function assertStableArtifactPath(filePath, descriptor, identity, fileSystem, er
   }
 }
 
-async function withStableArtifact(filePath, options = {}, consume) {
+function artifactTransactionFailure(transactionFailure, errorMessage, retryable = true) {
+  const error = new Error(errorMessage);
+  const code = (typeof transactionFailure === "object" || typeof transactionFailure === "function")
+    ? Object.getOwnPropertyDescriptor(transactionFailure, "code")
+    : null;
+  if (retryable && code && Object.prototype.hasOwnProperty.call(code, "value")
+    && new Set(["EBUSY", "EPERM"]).has(code.value)) {
+    unstableArtifactFailures.add(error);
+  }
+  return error;
+}
+
+function runArtifactTransaction(options, operation) {
+  const platform = options.platform || process.platform;
+  const retryDelay = options.retryDelay || boundedArtifactRetryDelay;
+  const maximumRetries = platform === "win32"
+    ? WINDOWS_ARTIFACT_VERIFICATION_RETRIES
+    : 0;
+  let attempt = 0;
+  while (true) {
+    try {
+      return operation();
+    } catch (error) {
+      if (attempt >= maximumRetries || !isUnstableArtifactFailure(error)) throw error;
+      retryDelay(attempt);
+      attempt += 1;
+    }
+  }
+}
+
+function captureStableArtifactSnapshot(filePath, options) {
   const fileSystem = options.fileSystem || fs;
   const errorMessage = "VSIX pathname is not an exact bounded single-link file.";
   const absolutePath = path.resolve(filePath);
   let allocation;
-  let consumerError;
   let descriptor;
   let identity;
-  let result;
   let transactionFailure = null;
+  let transactionRetryable = true;
   try {
     descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS);
     const openedStat = assertBoundedArtifactStat(
@@ -478,36 +507,79 @@ async function withStableArtifact(filePath, options = {}, consume) {
     }
     if (offset !== expectedSize) throw new Error(errorMessage);
     assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
-    try {
-      result = await consume(allocation.subarray(0, expectedSize), identity);
-    } catch (error) {
-      consumerError = error;
+  } catch (error) {
+    transactionFailure = error;
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        fileSystem.closeSync(descriptor);
+      } catch (error) {
+        transactionFailure = error;
+        transactionRetryable = false;
+      }
+    }
+  }
+  if (transactionFailure) {
+    if (Buffer.isBuffer(allocation)) allocation.fill(0);
+    throw artifactTransactionFailure(transactionFailure, errorMessage, transactionRetryable);
+  }
+  return { allocation, identity };
+}
+
+function rebindStableArtifactPath(filePath, identity, options) {
+  const fileSystem = options.fileSystem || fs;
+  const errorMessage = "VSIX pathname is not an exact bounded single-link file.";
+  const absolutePath = path.resolve(filePath);
+  let descriptor;
+  let transactionFailure = null;
+  let transactionRetryable = true;
+  try {
+    descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS);
+    const reboundStat = assertBoundedArtifactStat(
+      fileSystem.fstatSync(descriptor, { bigint: true }),
+      errorMessage,
+    );
+    if (!sameExactFileIdentity(identity, exactFileIdentity(reboundStat))) {
+      throw new Error(errorMessage);
     }
     assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
   } catch (error) {
     transactionFailure = error;
   } finally {
-    if (Buffer.isBuffer(allocation)) allocation.fill(0);
     if (descriptor !== undefined) {
       try {
         fileSystem.closeSync(descriptor);
       } catch (error) {
-        if (!transactionFailure) transactionFailure = error;
+        transactionFailure = error;
+        transactionRetryable = false;
       }
     }
   }
   if (transactionFailure) {
-    const error = new Error(errorMessage);
-    const code = (typeof transactionFailure === "object" || typeof transactionFailure === "function")
-      ? Object.getOwnPropertyDescriptor(transactionFailure, "code")
-      : null;
-    if (code && Object.prototype.hasOwnProperty.call(code, "value")
-      && new Set(["EBUSY", "EPERM"]).has(code.value)) {
-      unstableArtifactFailures.add(error);
-    }
+    throw artifactTransactionFailure(transactionFailure, errorMessage, transactionRetryable);
+  }
+}
+
+async function withStableArtifact(filePath, options = {}, consume) {
+  const snapshot = runArtifactTransaction(
+    options,
+    () => captureStableArtifactSnapshot(filePath, options),
+  );
+  let result;
+  try {
+    result = await consume(snapshot.allocation, snapshot.identity);
+  } catch (error) {
+    snapshot.allocation.fill(0);
     throw error;
   }
-  if (consumerError) throw consumerError;
+  try {
+    runArtifactTransaction(
+      options,
+      () => rebindStableArtifactPath(filePath, snapshot.identity, options),
+    );
+  } finally {
+    snapshot.allocation.fill(0);
+  }
   return result;
 }
 
@@ -546,25 +618,13 @@ async function verifyFreshVsix(filePath, options = {}) {
   if (!exactArtifactIdentity(expectedIdentity)) {
     throw new Error("Fresh VSIX verification identity is unsafe or invalid.");
   }
-  const platform = options.platform || process.platform;
-  const retryDelay = options.retryDelay || boundedArtifactRetryDelay;
   const verify = options.verifyVsix || verifyVsix;
-  const maximumRetries = platform === "win32"
-    ? WINDOWS_ARTIFACT_VERIFICATION_RETRIES
-    : 0;
-  let attempt = 0;
-  while (true) {
-    try {
-      return await verify(filePath, {
-        expectedIdentity,
-        sourceSha: options.sourceSha || null,
-      });
-    } catch (error) {
-      if (attempt >= maximumRetries || !isUnstableArtifactFailure(error)) throw error;
-      retryDelay(attempt);
-      attempt += 1;
-    }
-  }
+  return verify(filePath, {
+    expectedIdentity,
+    platform: options.platform || process.platform,
+    retryDelay: options.retryDelay || boundedArtifactRetryDelay,
+    sourceSha: options.sourceSha || null,
+  });
 }
 
 function withBoundedNamedFile(filePath, options, consume) {

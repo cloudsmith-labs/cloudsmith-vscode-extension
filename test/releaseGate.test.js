@@ -1603,7 +1603,8 @@ suite("M9 release gate helpers", () => {
     const outputPath = path.join(scratch, "candidate.vsix");
     fs.writeFileSync(outputPath, "synthetic candidate bytes\n");
     const receipt = capturePackageBuildOutput(scratch, outputPath);
-    const attempts = [];
+    const verifierCalls = [];
+    let openCalls = 0;
     const delays = [];
     try {
       const result = await verifyFreshVsix(outputPath, {
@@ -1614,31 +1615,237 @@ suite("M9 release gate helpers", () => {
           delays.push(attempt);
         },
         async verifyVsix(selectedPath, options) {
-          attempts.push({ selectedPath, options });
-          if (attempts.length < 3) {
-            const fileSystem = Object.create(fs);
-            fileSystem.openSync = () => {
+          verifierCalls.push({ selectedPath, options });
+          const fileSystem = Object.create(fs);
+          fileSystem.openSync = (...arguments_) => {
+            openCalls += 1;
+            if (openCalls < 3) {
               const error = new Error("synthetic hosted file lock");
               error.code = "EBUSY";
               throw error;
-            };
-            return withStableArtifact(
-              outputPath,
-              { fileSystem },
-              async () => assert.fail("locked artifact must not be consumed"),
-            );
-          }
-          return "verified";
+            }
+            return fs.openSync(...arguments_);
+          };
+          return withStableArtifact(outputPath, { ...options, fileSystem }, async () => "verified");
         },
       });
       assert.strictEqual(result, "verified");
-      assert.strictEqual(attempts.length, 3);
+      assert.strictEqual(verifierCalls.length, 1);
+      assert.strictEqual(openCalls, 4);
       assert.deepStrictEqual(delays, [0, 1]);
-      for (const attempt of attempts) {
-        assert.strictEqual(attempt.selectedPath, outputPath);
-        assert.strictEqual(attempt.options.expectedIdentity, receipt.identity);
-        assert.strictEqual(attempt.options.sourceSha, "a".repeat(40));
+      assert.strictEqual(verifierCalls[0].selectedPath, outputPath);
+      assert.strictEqual(verifierCalls[0].options.expectedIdentity, receipt.identity);
+      assert.strictEqual(verifierCalls[0].options.sourceSha, "a".repeat(40));
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package verification retries rebound without rerunning semantic consumption", async () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-verification-rebound-",
+    )));
+    const outputPath = path.join(scratch, "candidate.vsix");
+    fs.writeFileSync(outputPath, "synthetic candidate bytes\n");
+    const receipt = capturePackageBuildOutput(scratch, outputPath);
+    const fileSystem = Object.create(fs);
+    let consumeCalls = 0;
+    let openCalls = 0;
+    let readCalls = 0;
+    const delays = [];
+    fileSystem.openSync = (...arguments_) => {
+      openCalls += 1;
+      if ([2, 3].includes(openCalls)) {
+        const error = new Error("synthetic rebound file lock");
+        error.code = "EPERM";
+        throw error;
       }
+      return fs.openSync(...arguments_);
+    };
+    fileSystem.readSync = (...arguments_) => {
+      readCalls += 1;
+      return fs.readSync(...arguments_);
+    };
+    try {
+      const result = await withStableArtifact(outputPath, {
+        expectedIdentity: receipt.identity,
+        fileSystem,
+        platform: "win32",
+        retryDelay(attempt) {
+          delays.push(attempt);
+        },
+      }, async bytes => {
+        consumeCalls += 1;
+        return Buffer.from(bytes);
+      });
+      assert.deepStrictEqual(result, fs.readFileSync(outputPath));
+      assert.strictEqual(consumeCalls, 1);
+      assert.strictEqual(openCalls, 4);
+      assert.strictEqual(readCalls, 1);
+      assert.deepStrictEqual(delays, [0, 1]);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package verification closes failed snapshots before retry", async () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-verification-snapshot-",
+    )));
+    const outputPath = path.join(scratch, "candidate.vsix");
+    fs.writeFileSync(outputPath, "synthetic candidate bytes\n");
+    const receipt = capturePackageBuildOutput(scratch, outputPath);
+    const fileSystem = Object.create(fs);
+    let consumeCalls = 0;
+    let openDescriptors = 0;
+    let readCalls = 0;
+    const delays = [];
+    fileSystem.openSync = (...arguments_) => {
+      const descriptor = fs.openSync(...arguments_);
+      openDescriptors += 1;
+      return descriptor;
+    };
+    fileSystem.closeSync = descriptor => {
+      fs.closeSync(descriptor);
+      openDescriptors -= 1;
+    };
+    fileSystem.readSync = (...arguments_) => {
+      readCalls += 1;
+      if (readCalls < 3) {
+        const error = new Error("synthetic snapshot read lock");
+        error.code = "EBUSY";
+        throw error;
+      }
+      return fs.readSync(...arguments_);
+    };
+    try {
+      const result = await withStableArtifact(outputPath, {
+        expectedIdentity: receipt.identity,
+        fileSystem,
+        platform: "win32",
+        retryDelay(attempt) {
+          assert.strictEqual(openDescriptors, 0);
+          delays.push(attempt);
+        },
+      }, async bytes => {
+        consumeCalls += 1;
+        assert.strictEqual(openDescriptors, 0);
+        return Buffer.from(bytes);
+      });
+      assert.deepStrictEqual(result, fs.readFileSync(outputPath));
+      assert.strictEqual(consumeCalls, 1);
+      assert.strictEqual(openDescriptors, 0);
+      assert.strictEqual(readCalls, 3);
+      assert.deepStrictEqual(delays, [0, 1]);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package semantic failure is one-shot and skips rebound", async () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-verification-semantic-",
+    )));
+    const outputPath = path.join(scratch, "candidate.vsix");
+    fs.writeFileSync(outputPath, "synthetic candidate bytes\n");
+    const receipt = capturePackageBuildOutput(scratch, outputPath);
+    const fileSystem = Object.create(fs);
+    const semanticError = new Error("synthetic invalid archive semantics");
+    let capturedBytes;
+    let consumeCalls = 0;
+    let openCalls = 0;
+    fileSystem.openSync = (...arguments_) => {
+      openCalls += 1;
+      return fs.openSync(...arguments_);
+    };
+    try {
+      await assert.rejects(
+        withStableArtifact(outputPath, {
+          expectedIdentity: receipt.identity,
+          fileSystem,
+          platform: "win32",
+          retryDelay() {
+            assert.fail("semantic failures must not enter a retry phase");
+          },
+        }, async bytes => {
+          consumeCalls += 1;
+          capturedBytes = bytes;
+          throw semanticError;
+        }),
+        error => error === semanticError,
+      );
+      assert.strictEqual(consumeCalls, 1);
+      assert.strictEqual(openCalls, 1);
+      assert.ok(capturedBytes.every(byte => byte === 0));
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("release package verification never retries an uncertain descriptor close", async () => {
+    for (const failedClose of [1, 2]) {
+      const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+        os.tmpdir(),
+        "release-package-verification-close-",
+      )));
+      const outputPath = path.join(scratch, "candidate.vsix");
+      fs.writeFileSync(outputPath, "synthetic candidate bytes\n");
+      const receipt = capturePackageBuildOutput(scratch, outputPath);
+      const fileSystem = Object.create(fs);
+      let closeCalls = 0;
+      let consumeCalls = 0;
+      fileSystem.closeSync = descriptor => {
+        closeCalls += 1;
+        fs.closeSync(descriptor);
+        if (closeCalls === failedClose) {
+          const error = new Error("synthetic uncertain close");
+          error.code = "EPERM";
+          throw error;
+        }
+      };
+      try {
+        await assert.rejects(
+          withStableArtifact(outputPath, {
+            expectedIdentity: receipt.identity,
+            fileSystem,
+            platform: "win32",
+            retryDelay() {
+              assert.fail("uncertain descriptor close must never be retried");
+            },
+          }, async () => {
+            consumeCalls += 1;
+          }),
+          /exact bounded single-link file/u,
+        );
+        assert.strictEqual(consumeCalls, failedClose === 1 ? 0 : 1);
+        assert.strictEqual(closeCalls, failedClose);
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("release package real malformed archive failure is never retried", async () => {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      "release-package-verification-malformed-",
+    )));
+    const outputPath = path.join(scratch, "candidate.vsix");
+    fs.writeFileSync(outputPath, "synthetic malformed archive bytes\n");
+    const receipt = capturePackageBuildOutput(scratch, outputPath);
+    try {
+      await assert.rejects(
+        verifyFreshVsix(outputPath, {
+          expectedIdentity: receipt.identity,
+          platform: "win32",
+          retryDelay() {
+            assert.fail("malformed archive semantics must not be retried");
+          },
+        }),
+      );
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
@@ -1672,7 +1879,7 @@ suite("M9 release gate helpers", () => {
       assert.strictEqual(semanticAttempts, 1);
 
       let nonWindowsAttempts = 0;
-      const taggedFailure = async () => {
+      const taggedFailure = async (_selectedPath, options) => {
         nonWindowsAttempts += 1;
         const fileSystem = Object.create(fs);
         fileSystem.openSync = () => {
@@ -1680,7 +1887,7 @@ suite("M9 release gate helpers", () => {
           error.code = "EBUSY";
           throw error;
         };
-        return withStableArtifact(outputPath, { fileSystem }, async () => undefined);
+        return withStableArtifact(outputPath, { ...options, fileSystem }, async () => undefined);
       };
       await assert.rejects(
         verifyFreshVsix(outputPath, {
@@ -1731,11 +1938,15 @@ suite("M9 release gate helpers", () => {
             retryDelay() {
               assert.fail("forged or unreviewed codes must not be delayed");
             },
-            async verifyVsix() {
+            async verifyVsix(_selectedPath, options) {
               attempts += 1;
               const fileSystem = Object.create(fs);
               fileSystem.openSync = () => { throw failure; };
-              return withStableArtifact(outputPath, { fileSystem }, async () => undefined);
+              return withStableArtifact(
+                outputPath,
+                { ...options, fileSystem },
+                async () => undefined,
+              );
             },
           }),
           /exact bounded single-link file/u,
@@ -1767,7 +1978,7 @@ suite("M9 release gate helpers", () => {
           retryDelay() {
             assert.fail("identity drift must not be delayed or retried");
           },
-          async verifyVsix() {
+          async verifyVsix(_selectedPath, options) {
             attempts += 1;
             const fileSystem = Object.create(fs);
             let swapped = false;
@@ -1783,7 +1994,7 @@ suite("M9 release gate helpers", () => {
             try {
               return await withStableArtifact(
                 outputPath,
-                { expectedIdentity: receipt.identity, fileSystem },
+                { ...options, fileSystem },
                 async bytes => Buffer.from(bytes),
               );
             } finally {
@@ -1809,7 +2020,9 @@ suite("M9 release gate helpers", () => {
     const outputPath = path.join(scratch, "candidate.vsix");
     fs.writeFileSync(outputPath, "synthetic candidate bytes\n");
     const receipt = capturePackageBuildOutput(scratch, outputPath);
-    let attempts = 0;
+    let verifierCalls = 0;
+    let consumeCalls = 0;
+    let openCalls = 0;
     const delays = [];
     try {
       await assert.rejects(
@@ -1819,20 +2032,30 @@ suite("M9 release gate helpers", () => {
           retryDelay(attempt) {
             delays.push(attempt);
           },
-          async verifyVsix() {
-            attempts += 1;
+          async verifyVsix(_selectedPath, options) {
+            verifierCalls += 1;
             const fileSystem = Object.create(fs);
-            fileSystem.openSync = () => {
+            fileSystem.openSync = (...arguments_) => {
+              openCalls += 1;
+              if (openCalls === 1) return fs.openSync(...arguments_);
               const error = new Error("synthetic persistent descriptor instability");
               error.code = "EPERM";
               throw error;
             };
-            return withStableArtifact(outputPath, { fileSystem }, async () => undefined);
+            return withStableArtifact(
+              outputPath,
+              { ...options, fileSystem },
+              async () => {
+                consumeCalls += 1;
+              },
+            );
           },
         }),
         /exact bounded single-link file/u,
       );
-      assert.strictEqual(attempts, 9);
+      assert.strictEqual(verifierCalls, 1);
+      assert.strictEqual(consumeCalls, 1);
+      assert.strictEqual(openCalls, 10);
       assert.deepStrictEqual(delays, [0, 1, 2, 3, 4, 5, 6, 7]);
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
@@ -3214,6 +3437,41 @@ suite("M9 release gate helpers", () => {
         /exact bounded single-link file/u,
       );
       assert.strictEqual(consumed, true);
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("VSIX semantic verification runs after the snapshot descriptor is closed", async () => {
+    const fixture = sidecarFixture();
+    const fileSystem = Object.create(fs);
+    let openDescriptors = 0;
+    let openCalls = 0;
+    let capturedBytes;
+    fileSystem.openSync = (...arguments_) => {
+      openCalls += 1;
+      const descriptor = fs.openSync(...arguments_);
+      openDescriptors += 1;
+      return descriptor;
+    };
+    fileSystem.closeSync = descriptor => {
+      fs.closeSync(descriptor);
+      openDescriptors -= 1;
+    };
+    try {
+      const consumed = await withStableArtifact(
+        fixture.filePath,
+        { fileSystem },
+        async bytes => {
+          assert.strictEqual(openDescriptors, 0);
+          capturedBytes = bytes;
+          return Buffer.from(bytes);
+        },
+      );
+      assert.deepStrictEqual(consumed, fixture.verification.buffer);
+      assert.strictEqual(openCalls, 2);
+      assert.strictEqual(openDescriptors, 0);
+      assert.ok(capturedBytes.every(byte => byte === 0));
     } finally {
       fs.rmSync(fixture.directory, { recursive: true, force: true });
     }
