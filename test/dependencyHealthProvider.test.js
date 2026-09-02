@@ -33,6 +33,10 @@ const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { bindConnectionManager } = require("../util/connectionManager");
 const { analyzeUpstreamGaps } = require("../util/upstreamGapAnalyzer");
 const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
+const { DiagnosticsPublisher } = require("../util/diagnosticsPublisher");
+const { getFoundDependencyKey } = require("../util/foundDependencyKey");
+const { enrichLicenses } = require("../util/dependencyLicenseEnricher");
+const { enrichPolicies } = require("../util/dependencyPolicyEnricher");
 const { createPackageCoordinate, isExactPackage } = packageDomain;
 const { fromApiPackageRecord } = packageAdapters;
 const {
@@ -246,6 +250,110 @@ suite("DependencyHealthProvider Test Suite", () => {
       },
       clear() {
         this.current = [];
+      },
+    };
+  }
+
+  function createTrackingCancellationFactory() {
+    const sources = [];
+    return {
+      sources,
+      create() {
+        const delegate = createCancellationSource();
+        const state = { cancelCalls: 0, disposeCalls: 0 };
+        const source = {
+          token: delegate.token,
+          cancel() {
+            state.cancelCalls += 1;
+            return delegate.cancel();
+          },
+          dispose() {
+            state.disposeCalls += 1;
+            return delegate.dispose();
+          },
+          listenerCount: delegate.listenerCount,
+          state,
+        };
+        sources.push(source);
+        return source;
+      },
+    };
+  }
+
+  function createRealDiagnostics(readSource = async () => '{"dependencies":{}}') {
+    const collection = {
+      clearCalls: 0,
+      disposeCalls: 0,
+      replacements: [],
+      clear() { this.clearCalls += 1; },
+      dispose() { this.disposeCalls += 1; },
+      set(entries) { this.replacements.push(entries); },
+    };
+    return {
+      collection,
+      publisher: new DiagnosticsPublisher({
+        createDiagnosticCollection: () => collection,
+        readSource,
+      }),
+    };
+  }
+
+  function canonicalHealthRecord(name, values = {}) {
+    return {
+      namespace: "workspace-a",
+      repository: "repo-a",
+      slug_perm: `${name}-1.0.0`,
+      name,
+      version: "1.0.0",
+      format: "npm",
+      status_str: "Completed",
+      ...values,
+    };
+  }
+
+  function installSuccessfulPullScan(provider, dependencies) {
+    provider.lastWorkspace = "workspace-a";
+    provider.lastRepo = "repo-a";
+    provider._projectFolderPath = "/project";
+    provider._hasSuccessfulScan = true;
+    provider._fullTrees = [{
+      ecosystem: "npm",
+      sourceFile: "package.json",
+      dependencies,
+    }];
+    provider._displayTrees = provider._fullTrees.map(tree => ({
+      ...tree,
+      dependencies: tree.dependencies.slice(),
+    }));
+    provider._rebuildSummary();
+  }
+
+  function createMutableConnectionManager() {
+    let state = {
+      activationId: "activation-a",
+      accountEpoch: 1,
+      credentialPresent: true,
+      sessionConnected: true,
+      status: "connected",
+    };
+    const listeners = new Set();
+    return {
+      getState: () => Object.freeze({ ...state }),
+      getAuthenticationCapabilities() {
+        return { pullThroughAvailable: state.sessionConnected };
+      },
+      onDidChange(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      },
+      switchAccount() {
+        state = {
+          ...state,
+          activationId: "activation-b",
+          accountEpoch: state.accountEpoch + 1,
+        };
+        for (const listener of [...listeners]) listener(this.getState());
+        return this.getState();
       },
     };
   }
@@ -4502,6 +4610,7 @@ suite("DependencyHealthProvider Test Suite", () => {
       options
     ) => {
       refreshOptions = options;
+      return true;
     };
 
     await provider.pullDependencies();
@@ -4602,6 +4711,7 @@ suite("DependencyHealthProvider Test Suite", () => {
         options
       ) => {
         refreshArgs = { workspace, repo, dependency, options };
+        return true;
       };
 
       await provider.pullSingleDependency(pullCoordinate("requests", "2.31.0", "python"));
@@ -4611,9 +4721,10 @@ suite("DependencyHealthProvider Test Suite", () => {
       assert.strictEqual(refreshArgs.dependency.name, "requests");
       assert.strictEqual(refreshArgs.dependency.version, "2.31.0");
       assert.strictEqual(refreshArgs.dependency.format, "python");
-      assert.deepStrictEqual(refreshArgs.options, {
-        verificationReceipt: { swiftScopeVerified: true },
+      assert.deepStrictEqual(refreshArgs.options.verificationReceipt, {
+        swiftScopeVerified: true,
       });
+      assert.ok(refreshArgs.options.operation);
       assert.ok(preparationToken);
       assert.strictEqual(provider.lastRepo, "repo-a");
       assert.deepStrictEqual(notifications, ["requests@2.31.0 cached in repo-b"]);
@@ -4792,6 +4903,981 @@ suite("DependencyHealthProvider Test Suite", () => {
     assert.doesNotMatch(provider._warnings.join(" "), /vulnerability enrichment failed/);
   });
 
+  test("bulk pull cancellation during real coverage refresh is a normal terminal", async () => {
+    const dependency = createProblemDependency(
+      "cancel-bulk",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const api = createLookupApi(() => lookupPage([canonicalHealthRecord("cancel-bulk", {
+      status_str: "Quarantined",
+      status_reason: "Cancellation boundary",
+      deny_policy_violated: true,
+    })]));
+    const tracking = createTrackingCancellationFactory();
+    const progressCancellation = createCancellationSource();
+    let sourceReads = 0;
+    const diagnostics = createRealDiagnostics(async () => {
+      sourceReads += 1;
+      progressCancellation.cancel();
+      return '{"dependencies":{"cancel-bulk":"1.0.0"}}';
+    });
+    const errors = [];
+    const information = [];
+    const contextValues = new Map();
+    let enrichmentBoundarySeen = 0;
+    const provider = new DependencyHealthProvider(createContext(), diagnostics.publisher, {
+      createCancellationSource: () => tracking.create(),
+      createCloudsmithAPI: () => api,
+      executeCommand: async (command, key, value) => {
+        if (command === "setContext") contextValues.set(key, value);
+      },
+      userInteraction: createUserInteraction({
+        async withProgress(_options, task) {
+          return task({
+            report(update = {}) {
+              if (String(update.message || "").startsWith("Enriching newly covered")) {
+                enrichmentBoundarySeen += 1;
+              }
+            },
+          }, progressCancellation.token);
+        },
+        showErrorMessage: async message => errors.push(message),
+        showInformationMessage: async message => information.push(message),
+      }),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            pullResult: null,
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+    const treeEvents = [];
+    provider.onDidChangeTreeData(value => treeEvents.push(value));
+
+    await assert.doesNotReject(provider.pullDependencies());
+    await provider._contextProjector.whenIdle();
+
+    assert.strictEqual(api.calls.length, 1, "real exact coverage lookup must run");
+    assert.strictEqual(enrichmentBoundarySeen, 1, "real refresh must reach enrichment");
+    assert.strictEqual(sourceReads, 1, "real diagnostic preparation must read the manifest");
+    assert.deepStrictEqual(errors, []);
+    assert.deepStrictEqual(information, []);
+    assert.strictEqual(
+      provider._warnings.includes("Some dependency details could not be loaded. Retry the dependency scan."),
+      false
+    );
+    assert.strictEqual(diagnostics.collection.replacements.length, 0);
+    assert.strictEqual(contextValues.get("cloudsmith.depReportAvailable"), false);
+    assert.strictEqual(provider._activeDependencyOperation, null);
+    assert.strictEqual(provider._activeDependencyCancellation, null);
+    assert.strictEqual(tracking.sources.length, 1);
+    assert.strictEqual(tracking.sources[0].state.cancelCalls, 1);
+    assert.strictEqual(tracking.sources[0].state.disposeCalls, 1);
+    assert.strictEqual(tracking.sources[0].listenerCount(), 0);
+    const visible = await provider.getChildren();
+    assert.strictEqual(visible.some(node => (
+      node.getTreeItem().label === "Some dependency details could not be loaded. Retry the dependency scan."
+    )), false);
+    assert.ok(treeEvents.length > 0, "the public command cleanup must reconcile the live tree");
+    await provider.dispose();
+  });
+
+  test("single pull cancellation during real coverage refresh is a normal terminal", async () => {
+    const dependency = createProblemDependency(
+      "cancel-single",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const api = createLookupApi(() => lookupPage([canonicalHealthRecord("cancel-single", {
+      status_str: "Quarantined",
+      status_reason: "Cancellation boundary",
+      deny_policy_violated: true,
+    })]));
+    const tracking = createTrackingCancellationFactory();
+    const progressCancellation = createCancellationSource();
+    let sourceReads = 0;
+    const diagnostics = createRealDiagnostics(async () => {
+      sourceReads += 1;
+      progressCancellation.cancel();
+      return '{"dependencies":{"cancel-single":"1.0.0"}}';
+    });
+    const notifications = [];
+    let enrichmentBoundarySeen = 0;
+    const provider = new DependencyHealthProvider(createContext(), diagnostics.publisher, {
+      createCancellationSource: () => tracking.create(),
+      createCloudsmithAPI: () => api,
+      executeCommand: async () => {},
+      userInteraction: createUserInteraction({
+        async withProgress(_options, task) {
+          return task({
+            report(update = {}) {
+              if (String(update.message || "").startsWith("Enriching pulled dependency")) {
+                enrichmentBoundarySeen += 1;
+              }
+            },
+          }, progressCancellation.token);
+        },
+        showErrorMessage: async message => notifications.push(`error:${message}`),
+        showInformationMessage: async message => notifications.push(message),
+        showWarningMessage: async (_message, options, action) => (
+          options?.modal === true ? action : undefined
+        ),
+      }),
+      upstreamPullService: {
+        async prepareSingle() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            dependency,
+            plan: { skippedDependencies: [] },
+          };
+        },
+        async execute() {
+          return {
+            canceled: false,
+            pullResult: {
+              total: 1,
+              cached: 1,
+              alreadyExisted: 0,
+              notFound: 0,
+              formatMismatched: 0,
+              errors: 0,
+              networkErrors: 0,
+              authFailed: 0,
+              skipped: 0,
+              details: [{
+                status: "cached",
+                dependency: { name: "cancel-single", version: "1.0.0", format: "npm" },
+              }],
+            },
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+
+    await assert.doesNotReject(provider.pullSingleDependency(
+      pullCoordinate("cancel-single", "1.0.0")
+    ));
+
+    assert.strictEqual(api.calls.length, 1, "real single-package coverage lookup must run");
+    assert.strictEqual(enrichmentBoundarySeen, 1, "real single refresh must reach enrichment");
+    assert.strictEqual(sourceReads, 1, "real single diagnostic preparation must read the manifest");
+    assert.deepStrictEqual(notifications, []);
+    assert.strictEqual(
+      provider._warnings.includes("Some dependency details could not be loaded. Retry the dependency scan."),
+      false
+    );
+    assert.strictEqual(diagnostics.collection.replacements.length, 0);
+    assert.strictEqual(provider._activeDependencyOperation, null);
+    assert.strictEqual(provider._activeDependencyCancellation, null);
+    assert.strictEqual(tracking.sources.length, 1);
+    assert.strictEqual(tracking.sources[0].state.cancelCalls, 1);
+    assert.strictEqual(tracking.sources[0].state.disposeCalls, 1);
+    assert.strictEqual(tracking.sources[0].listenerCount(), 0);
+    await provider.dispose();
+  });
+
+  test("real enrichment cancellation codes do not become a persistent partial warning", async () => {
+    const dependency = createProblemDependency(
+      "enrichment-cancel",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const localCancellation = createCancellationSource();
+    localCancellation.cancel();
+    let licenseCalls = 0;
+    let policyCalls = 0;
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCloudsmithAPI: () => createLookupApi(() => lookupPage([
+        canonicalHealthRecord("enrichment-cancel", {
+          license: "MIT",
+          spdx_license: "MIT",
+        }),
+      ])),
+      enrichVulnerabilities: async dependencies => dependencies,
+      enrichLicenses: async (dependencies, options) => {
+        licenseCalls += 1;
+        return enrichLicenses(dependencies, {
+          ...options,
+          cancellationToken: localCancellation.token,
+        });
+      },
+      enrichPolicies: async (dependencies, options) => {
+        policyCalls += 1;
+        return enrichPolicies(dependencies, {
+          ...options,
+          cancellationToken: localCancellation.token,
+        });
+      },
+      executeCommand: async () => {},
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            pullResult: null,
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+
+    await provider.pullDependencies();
+
+    assert.strictEqual(licenseCalls, 1);
+    assert.strictEqual(policyCalls, 1);
+    assert.deepStrictEqual(provider._warnings, []);
+    assert.strictEqual(provider._fullTrees[0].dependencies[0].cloudsmithStatus, "FOUND");
+    assert.ok(provider.getReportData());
+    await provider.dispose();
+  });
+
+  test("canonical fallback evidence stays in parity across tree filter sort summary and reports", async () => {
+    const packageFor = (name, values) => fromApiPackageRecord(canonicalHealthRecord(name, values));
+    const dependencies = [
+      {
+        ...createDependency("quarantined-package", "1.0.0"),
+        cloudsmithStatus: "FOUND",
+        cloudsmithPackage: packageFor("quarantined-package", {
+          status_str: "Quarantined",
+          status_reason: "Blocked by canonical policy",
+          deny_policy_violated: true,
+        }),
+      },
+      {
+        ...createDependency("vulnerable-package", "1.0.0"),
+        cloudsmithStatus: "FOUND",
+        cloudsmithPackage: packageFor("vulnerable-package", {
+          num_vulnerabilities: 2,
+          max_severity: "Critical",
+          security_scan_status: "Scan Detected Vulnerabilities",
+        }),
+      },
+      {
+        ...createDependency("restrictive-package", "1.0.0"),
+        spdx_license: "MIT",
+        cloudsmithStatus: "FOUND",
+        cloudsmithPackage: packageFor("restrictive-package", {
+          license: "GNU General Public License v3.0",
+          spdx_license: "GPL-3.0-only",
+        }),
+      },
+      {
+        ...createDependency("clean-package", "1.0.0"),
+        cloudsmithStatus: "FOUND",
+        cloudsmithPackage: packageFor("clean-package", {
+          license: "MIT",
+          spdx_license: "MIT",
+        }),
+      },
+    ];
+    for (const dependency of dependencies) {
+      assert.strictEqual(isExactPackage(dependency.cloudsmithPackage), true);
+      assert.strictEqual(Object.hasOwn(dependency.cloudsmithPackage, "status_str"), false);
+      assert.strictEqual(Object.hasOwn(dependency.cloudsmithPackage, "max_severity"), false);
+      assert.strictEqual(Object.hasOwn(dependency.cloudsmithPackage, "spdx_license"), false);
+      assert.strictEqual(dependency.vulnerabilities, undefined);
+      assert.strictEqual(dependency.policy, undefined);
+      assert.strictEqual(dependency.license, undefined);
+    }
+
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      executeCommand: async () => {},
+    });
+    installSuccessfulPullScan(provider, dependencies);
+    const tree = provider._fullTrees[0];
+    const treeNodes = provider.buildDependencyNodesForTree(tree);
+    assert.strictEqual(treeNodes.find(node => node.name === "quarantined-package").state, "quarantined");
+    assert.strictEqual(treeNodes.find(node => node.name === "vulnerable-package").max_severity, "Critical");
+    assert.strictEqual(treeNodes.find(node => node.name === "restrictive-package").licenseInfo.tier, "restrictive");
+
+    provider._filterMode = FILTER_MODES.POLICY_VIOLATION;
+    assert.deepStrictEqual(
+      provider.buildDependencyNodesForTree(tree).map(node => node.name),
+      ["quarantined-package"]
+    );
+    provider._filterMode = FILTER_MODES.VULNERABLE;
+    assert.deepStrictEqual(
+      provider.buildDependencyNodesForTree(tree).map(node => node.name),
+      ["vulnerable-package"]
+    );
+    provider._filterMode = FILTER_MODES.RESTRICTIVE_LICENSE;
+    assert.deepStrictEqual(
+      provider.buildDependencyNodesForTree(tree).map(node => node.name),
+      ["restrictive-package"]
+    );
+    provider._filterMode = null;
+    provider._sortMode = SORT_MODES.SEVERITY;
+    assert.deepStrictEqual(
+      provider.buildDependencyNodesForTree(tree).map(node => node.name),
+      ["quarantined-package", "vulnerable-package", "restrictive-package", "clean-package"]
+    );
+
+    provider._rebuildSummary();
+    assert.strictEqual(provider._summary.quarantined, 1);
+    assert.strictEqual(provider._summary.policyViolations, 1);
+    assert.strictEqual(provider._summary.vulnerable, 1);
+    assert.strictEqual(provider._summary.severityCounts.Critical, 1);
+    assert.strictEqual(provider._summary.restrictiveLicenses, 1);
+    const compliance = buildComplianceReportData("project", dependencies, {
+      scanDate: "2026-09-01T12:00:00.000Z",
+    });
+    assert.deepStrictEqual(
+      compliance.policyViolationDeps.map(row => [row.name, row.detail]),
+      [["quarantined-package", "Blocked by canonical policy"]]
+    );
+    assert.deepStrictEqual(
+      compliance.vulnerableDeps
+        .filter(row => row.name === "vulnerable-package")
+        .map(row => [row.name, row.maxSeverity, row.vulnerabilityStatus]),
+      [["vulnerable-package", "Critical", "Detected"]]
+    );
+    assert.deepStrictEqual(
+      compliance.restrictiveLicenseDeps.map(row => [row.name, row.spdx]),
+      [["restrictive-package", "GPL-3.0-only"]]
+    );
+    const markdown = await provider.buildReport();
+    assert.match(markdown, /quarantined-package 1\.0\.0 — Blocked by canonical policy/);
+    await provider.dispose();
+  });
+
+  test("account switch during a deferred real coverage lookup cannot publish into the new account", async () => {
+    const dependency = createProblemDependency(
+      "account-a-package",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const lookupStarted = deferred();
+    const lookupGate = deferred();
+    const api = createLookupApi(async () => {
+      lookupStarted.resolve();
+      await lookupGate.promise;
+      return lookupPage([canonicalHealthRecord("account-a-package", {
+        status_str: "Quarantined",
+        deny_policy_violated: true,
+      })]);
+    });
+    const manager = createMutableConnectionManager();
+    const tracking = createTrackingCancellationFactory();
+    const diagnostics = createRealDiagnostics();
+    const contextWrites = [];
+    const provider = new DependencyHealthProvider(createContext(), diagnostics.publisher, {
+      accountResetOrchestrated: true,
+      connectionManager: manager,
+      createCancellationSource: () => tracking.create(),
+      createCloudsmithAPI: () => api,
+      executeCommand: async (command, key, value) => {
+        if (command === "setContext") contextWrites.push([key, value]);
+      },
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            pullResult: null,
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+    const treeEvents = [];
+    provider.onDidChangeTreeData(value => treeEvents.push(value));
+
+    const pull = provider.pullDependencies();
+    await lookupStarted.promise;
+    const accountB = manager.switchAccount();
+    await provider.resetForAccountChange(accountB);
+    await provider._contextProjector.whenIdle();
+    const treeBoundary = treeEvents.length;
+    const contextBoundary = contextWrites.length;
+    lookupGate.resolve();
+
+    await assert.doesNotReject(pull);
+    await provider._contextProjector.whenIdle();
+
+    assert.deepStrictEqual(provider._warnings, []);
+    assert.deepStrictEqual(provider._fullTrees, []);
+    assert.deepStrictEqual(provider._displayTrees, []);
+    assert.strictEqual(provider.getReportData(), null);
+    assert.strictEqual(provider._projectFolderPath, null);
+    assert.strictEqual(diagnostics.collection.replacements.length, 0);
+    assert.strictEqual(treeEvents.length, treeBoundary);
+    assert.strictEqual(
+      contextWrites.slice(contextBoundary).some(([key, value]) => (
+        key === "cloudsmith.depReportAvailable" && value === true
+      )),
+      false
+    );
+    assert.strictEqual(tracking.sources[0].state.cancelCalls, 1);
+    assert.strictEqual(tracking.sources[0].state.disposeCalls, 1);
+    assert.strictEqual(tracking.sources[0].listenerCount(), 0);
+    await provider.dispose();
+  });
+
+  test("a genuine diagnostics preparation failure remains visible and cleans pull ownership once", async () => {
+    const dependency = createProblemDependency(
+      "diagnostic-failure",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const sentinel = new Error("diagnostic source failed");
+    const diagnostics = createRealDiagnostics(async () => { throw sentinel; });
+    const tracking = createTrackingCancellationFactory();
+    const api = createLookupApi(() => lookupPage([canonicalHealthRecord("diagnostic-failure", {
+      status_str: "Quarantined",
+      status_reason: "Policy rejected",
+      deny_policy_violated: true,
+    })]));
+    const provider = new DependencyHealthProvider(createContext(), diagnostics.publisher, {
+      createCancellationSource: () => tracking.create(),
+      createCloudsmithAPI: () => api,
+      executeCommand: async () => {},
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            pullResult: null,
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+
+    await assert.rejects(provider.pullDependencies(), error => error === sentinel);
+
+    assert.strictEqual(api.calls.length, 1);
+    assert.strictEqual(diagnostics.collection.replacements.length, 0);
+    assert.strictEqual(provider._activeDependencyOperation, null);
+    assert.strictEqual(provider._activeDependencyCancellation, null);
+    assert.strictEqual(tracking.sources[0].state.cancelCalls, 0);
+    assert.strictEqual(tracking.sources[0].state.disposeCalls, 1);
+    assert.strictEqual(tracking.sources[0].listenerCount(), 0);
+    await provider.dispose();
+  });
+
+  test("supersession after real diagnostic preparation blocks replacement and every tail publication", async () => {
+    const dependency = createProblemDependency(
+      "diagnostic-supersession",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const tracking = createTrackingCancellationFactory();
+    const actualDiagnostics = createRealDiagnostics(async () => (
+      '{"dependencies":{"diagnostic-supersession":"1.0.0"}}'
+    ));
+    const contextWrites = [];
+    const treeEvents = [];
+    const baselineReport = { generated: "before-diagnostic-supersession" };
+    let provider;
+    let newerOperation = null;
+    let publicationBoundary = null;
+    const diagnostics = {
+      async prepare(options) {
+        const prepared = await actualDiagnostics.publisher.prepare(options);
+        await provider._contextProjector.whenIdle();
+        const oldOperation = provider._activeDependencyOperation;
+        provider._activeDependencyOperation = null;
+        const newerSource = tracking.create();
+        newerOperation = provider._beginDependencyOperation(oldOperation.account, newerSource);
+        provider._activeDependencyCancellation = newerSource;
+        publicationBoundary = {
+          context: contextWrites.length,
+          summary: provider._summary,
+          tree: treeEvents.length,
+        };
+        return prepared;
+      },
+      replace(entries) {
+        actualDiagnostics.publisher.replace(entries);
+      },
+      clear() {
+        actualDiagnostics.publisher.clear();
+      },
+    };
+    provider = new DependencyHealthProvider(createContext(), diagnostics, {
+      createCancellationSource: () => tracking.create(),
+      createCloudsmithAPI: () => createLookupApi(() => lookupPage([
+        canonicalHealthRecord("diagnostic-supersession", {
+          status_str: "Quarantined",
+          deny_policy_violated: true,
+        }),
+      ])),
+      executeCommand: async (command, key, value) => {
+        if (command === "setContext") contextWrites.push([key, value]);
+      },
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            pullResult: null,
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+    provider._warnings = ["baseline warning"];
+    provider._reportData = baselineReport;
+    provider._lastScanTimestamp = "2026-08-31T12:00:00.000Z";
+    provider.onDidChangeTreeData(value => treeEvents.push(value));
+
+    await provider.pullDependencies();
+    await provider._contextProjector.whenIdle();
+
+    assert.ok(newerOperation);
+    assert.ok(publicationBoundary);
+    assert.strictEqual(provider._activeDependencyOperation, newerOperation);
+    assert.strictEqual(provider._activeDependencyCancellation, newerOperation.cancellationSource);
+    assert.strictEqual(actualDiagnostics.collection.replacements.length, 0);
+    assert.deepStrictEqual(provider._warnings, ["baseline warning"]);
+    assert.strictEqual(provider.getReportData(), baselineReport);
+    assert.strictEqual(provider._lastScanTimestamp, "2026-08-31T12:00:00.000Z");
+    assert.strictEqual(provider._summary, publicationBoundary.summary);
+    assert.strictEqual(contextWrites.length, publicationBoundary.context);
+    assert.strictEqual(treeEvents.length, publicationBoundary.tree);
+    assert.strictEqual(tracking.sources[0].state.cancelCalls, 0);
+    assert.strictEqual(tracking.sources[0].state.disposeCalls, 1);
+    assert.strictEqual(tracking.sources[1].state.disposeCalls, 0);
+    await provider.dispose();
+    assert.strictEqual(tracking.sources[1].state.cancelCalls, 1);
+    assert.strictEqual(tracking.sources[1].state.disposeCalls, 1);
+  });
+
+  test("genuine enrichment failure keeps one warning and canonical fallback truth", async () => {
+    const dependency = createProblemDependency(
+      "fallback-package",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const api = createLookupApi(() => lookupPage([canonicalHealthRecord("fallback-package", {
+      status_str: "Quarantined",
+      status_reason: "Denied by canonical evidence",
+      deny_policy_violated: true,
+      num_vulnerabilities: 2,
+      max_severity: "Critical",
+      security_scan_status: "Scan Detected Vulnerabilities",
+      license: "GNU General Public License v3.0",
+      spdx_license: "GPL-3.0-only",
+    })]));
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCloudsmithAPI: () => api,
+      enrichVulnerabilities: async () => { throw new Error("vulnerability failed"); },
+      enrichLicenses: async () => { throw new Error("license failed"); },
+      enrichPolicies: async () => { throw new Error("policy failed"); },
+      executeCommand: async () => {},
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            pullResult: null,
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+
+    await provider.pullDependencies();
+
+    assert.deepStrictEqual(provider._warnings, [
+      "Some dependency details could not be loaded. Retry the dependency scan.",
+    ]);
+    const found = provider._fullTrees[0].dependencies[0];
+    assert.strictEqual(found.cloudsmithStatus, "FOUND");
+    assert.strictEqual(isExactPackage(found.cloudsmithPackage), true);
+    assert.strictEqual(found.vulnerabilities, undefined);
+    assert.strictEqual(found.policy, undefined);
+    assert.strictEqual(found.license, undefined);
+    assert.strictEqual(new DependencyHealthNode(found, {}).state, "quarantined");
+    assert.strictEqual(provider._summary.vulnerable, 1);
+    assert.strictEqual(provider._summary.severityCounts.Critical, 1);
+    assert.strictEqual(provider._summary.restrictiveLicenses, 1);
+    assert.strictEqual(provider._summary.policyViolations, 1);
+    assert.strictEqual(provider.getReportData().summary.criticalCount, 1);
+    assert.strictEqual(provider.getReportData().summary.restrictiveLicenseCount, 1);
+    assert.strictEqual(provider.getReportData().summary.policyViolationCount, 1);
+    await provider.dispose();
+  });
+
+  test("same-account supersession immediately before the final coverage batch blocks every old publication", async () => {
+    const dependency = createProblemDependency(
+      "superseded-package",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const tracking = createTrackingCancellationFactory();
+    const baselineReport = { account: "current", generated: true };
+    let provider;
+    let newerOperation = null;
+    let treeBoundary = 0;
+    let contextBoundary = 0;
+    const treeEvents = [];
+    const contextWrites = [];
+    const api = createLookupApi(() => {
+      const oldOperation = provider._activeDependencyOperation;
+      provider._activeDependencyOperation = null;
+      const newerSource = tracking.create();
+      newerOperation = provider._beginDependencyOperation(oldOperation.account, newerSource);
+      provider._activeDependencyCancellation = newerSource;
+      treeBoundary = treeEvents.length;
+      contextBoundary = contextWrites.length;
+      return apiFailure("network_error");
+    });
+    provider = new DependencyHealthProvider(createContext(), null, {
+      createCancellationSource: () => tracking.create(),
+      createCloudsmithAPI: () => api,
+      executeCommand: async (command, key, value) => {
+        if (command === "setContext") contextWrites.push([key, value]);
+      },
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            pullResult: null,
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+    provider._warnings = ["baseline warning"];
+    provider._reportData = baselineReport;
+    provider._lastScanTimestamp = "2026-09-01T00:00:00.000Z";
+    const baselineSummary = provider._summary;
+    provider.onDidChangeTreeData(value => treeEvents.push(value));
+
+    await provider.pullDependencies();
+    await provider._contextProjector.whenIdle();
+
+    assert.ok(newerOperation);
+    assert.strictEqual(provider._activeDependencyOperation, newerOperation);
+    assert.strictEqual(provider._activeDependencyCancellation, newerOperation.cancellationSource);
+    assert.strictEqual(provider._fullTrees[0].dependencies[0].cloudsmithStatus, "NOT_FOUND");
+    assert.deepStrictEqual(provider._warnings, ["baseline warning"]);
+    assert.strictEqual(provider.getReportData(), baselineReport);
+    assert.strictEqual(provider._summary, baselineSummary);
+    assert.strictEqual(treeEvents.length, treeBoundary);
+    assert.strictEqual(contextWrites.length, contextBoundary);
+    assert.strictEqual(tracking.sources[0].state.cancelCalls, 0);
+    assert.strictEqual(tracking.sources[0].state.disposeCalls, 1);
+    assert.strictEqual(tracking.sources[1].state.disposeCalls, 0);
+    await provider.dispose();
+    assert.strictEqual(tracking.sources[1].state.cancelCalls, 1);
+    assert.strictEqual(tracking.sources[1].state.disposeCalls, 1);
+  });
+
+  test("cancellation immediately before report storage preserves the prior report and context", async () => {
+    const dependency = createProblemDependency(
+      "report-boundary",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const tracking = createTrackingCancellationFactory();
+    const previousReport = { generated: "before-pull" };
+    const contextValues = new Map();
+    const treeEvents = [];
+    let treeBoundary = null;
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCancellationSource: () => tracking.create(),
+      createCloudsmithAPI: () => createLookupApi(() => lookupPage([
+        canonicalHealthRecord("report-boundary"),
+      ])),
+      executeCommand: async (command, key, value) => {
+        if (command === "setContext") contextValues.set(key, value);
+      },
+      reportDateFactory: () => {
+        treeBoundary = treeEvents.length;
+        tracking.sources[0].cancel();
+        return new Date("2026-09-01T12:00:00.000Z");
+      },
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            pullResult: null,
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+    provider._reportData = previousReport;
+    provider._lastScanTimestamp = "2026-08-31T12:00:00.000Z";
+    provider.onDidChangeTreeData(value => treeEvents.push(value));
+    await provider._updateContexts();
+
+    await provider.pullDependencies();
+    await provider._contextProjector.whenIdle();
+
+    assert.notStrictEqual(treeBoundary, null);
+    assert.strictEqual(provider.getReportData(), previousReport);
+    assert.strictEqual(provider._lastScanTimestamp, "2026-08-31T12:00:00.000Z");
+    assert.strictEqual(contextValues.get("cloudsmith.depReportAvailable"), true);
+    assert.strictEqual(treeEvents.length, treeBoundary + 1, "only command cleanup may refresh after cancellation");
+    assert.strictEqual(tracking.sources[0].state.cancelCalls, 1);
+    assert.strictEqual(tracking.sources[0].state.disposeCalls, 1);
+    assert.strictEqual(tracking.sources[0].listenerCount(), 0);
+    await provider.dispose();
+  });
+
+  test("account invalidation during delayed report context projection cannot restore Account A data", async () => {
+    const dependency = createProblemDependency(
+      "delayed-report",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const manager = createMutableConnectionManager();
+    const tracking = createTrackingCancellationFactory();
+    const reportContextStarted = deferred();
+    const reportContextGate = deferred();
+    const contextWrites = [];
+    let reportExistedBeforeAvailabilityWrite = false;
+    let provider;
+    provider = new DependencyHealthProvider(createContext(), null, {
+      accountResetOrchestrated: true,
+      connectionManager: manager,
+      createCancellationSource: () => tracking.create(),
+      createCloudsmithAPI: () => createLookupApi(() => lookupPage([
+        canonicalHealthRecord("delayed-report"),
+      ])),
+      deferInitialContextProjection: true,
+      executeCommand: async (command, key, value) => {
+        if (command !== "setContext") return;
+        contextWrites.push([key, value]);
+        if (key === "cloudsmith.depReportAvailable" && value === true) {
+          reportExistedBeforeAvailabilityWrite = Boolean(provider.getReportData());
+          reportContextStarted.resolve();
+          await reportContextGate.promise;
+        }
+      },
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            pullResult: null,
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+
+    const pull = provider.pullDependencies();
+    await reportContextStarted.promise;
+    assert.strictEqual(reportExistedBeforeAvailabilityWrite, true);
+    assert.ok(provider.getReportData(), "report data must exist before availability becomes true");
+
+    const accountB = manager.switchAccount();
+    const accountBoundary = contextWrites.length;
+    const reset = provider.resetForAccountChange(accountB);
+    assert.strictEqual(provider.getReportData(), null);
+    reportContextGate.resolve();
+
+    await assert.doesNotReject(pull);
+    await reset;
+    await provider._contextProjector.whenIdle();
+
+    assert.strictEqual(provider.getReportData(), null);
+    assert.strictEqual(provider._lastScanTimestamp, null);
+    assert.deepStrictEqual(provider._fullTrees, []);
+    assert.deepStrictEqual(provider._warnings, []);
+    assert.strictEqual(
+      contextWrites.slice(accountBoundary).some(([key, value]) => (
+        key === "cloudsmith.depReportAvailable" && value === true
+      )),
+      false
+    );
+    const reportAvailabilityWrites = contextWrites.filter(([key]) => (
+      key === "cloudsmith.depReportAvailable"
+    ));
+    assert.strictEqual(reportAvailabilityWrites.at(-1)[1], false);
+    assert.strictEqual(tracking.sources[0].state.cancelCalls, 1);
+    assert.strictEqual(tracking.sources[0].state.disposeCalls, 1);
+    assert.strictEqual(tracking.sources[0].listenerCount(), 0);
+    await provider.dispose();
+  });
+
+  test("late vulnerability state cannot rebuild a report owned by an active pull refresh", async () => {
+    const dependency = createProblemDependency(
+      "late-vulnerability",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const lookupStarted = deferred();
+    const lookupGate = deferred();
+    const tracking = createTrackingCancellationFactory();
+    let vulnerabilityListener = null;
+    const vulnerabilityStateService = {
+      prime() {
+        return Object.freeze({ status: "unknown", complete: false, count: null, records: [] });
+      },
+      onDidChange(listener) {
+        vulnerabilityListener = listener;
+        return { dispose() { vulnerabilityListener = null; } };
+      },
+    };
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCancellationSource: () => tracking.create(),
+      createCloudsmithAPI: () => createLookupApi(async () => {
+        lookupStarted.resolve();
+        await lookupGate.promise;
+        return lookupPage([canonicalHealthRecord("late-vulnerability")]);
+      }),
+      executeCommand: async () => {},
+      userInteraction: createUserInteraction(),
+      vulnerabilityStateService,
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            pullResult: null,
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+    const previousReport = { generated: "before-late-vulnerability" };
+    provider._reportData = previousReport;
+    provider._lastScanTimestamp = "2026-08-31T12:00:00.000Z";
+
+    const pull = provider.pullDependencies();
+    await lookupStarted.promise;
+    vulnerabilityListener({
+      identity: "workspace-a/repo-a/late-vulnerability/1.0.0/npm",
+      state: Object.freeze({
+        status: "complete-vulnerable",
+        complete: true,
+        count: 1,
+        records: Object.freeze([{ vulnerability_id: "CVE-2026-9001" }]),
+      }),
+      presentation: null,
+    });
+    assert.strictEqual(provider.getReportData(), previousReport);
+
+    tracking.sources[0].cancel();
+    lookupGate.resolve();
+    await assert.doesNotReject(pull);
+
+    assert.strictEqual(provider.getReportData(), previousReport);
+    assert.strictEqual(tracking.sources[0].state.cancelCalls, 1);
+    assert.strictEqual(tracking.sources[0].state.disposeCalls, 1);
+    assert.strictEqual(tracking.sources[0].listenerCount(), 0);
+    await provider.dispose();
+  });
+
+  test("late Account A enrichment callbacks cannot patch a colliding Account B row", async () => {
+    const dependency = createProblemDependency(
+      "collision-package",
+      "1.0.0",
+      "/project/package.json"
+    );
+    const enrichmentStarted = deferred();
+    const enrichmentGate = deferred();
+    let started = 0;
+    const waitThenPublish = async (dependencies, options, patch) => {
+      started += 1;
+      if (started === 3) enrichmentStarted.resolve();
+      await enrichmentGate.promise;
+      options.onProgress(new Map([[getFoundDependencyKey(dependencies[0]), patch]]));
+    };
+    const manager = createMutableConnectionManager();
+    const contextWrites = [];
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      accountResetOrchestrated: true,
+      connectionManager: manager,
+      createCloudsmithAPI: () => createLookupApi(() => lookupPage([
+        canonicalHealthRecord("collision-package"),
+      ])),
+      enrichVulnerabilities: async (dependencies, _workspace, options) => (
+        waitThenPublish(dependencies, options, { count: 9, detected: true, maxSeverity: "Critical" })
+      ),
+      enrichLicenses: async (dependencies, options) => (
+        waitThenPublish(dependencies, options, { classification: "restrictive", spdx: "GPL-3.0-only" })
+      ),
+      enrichPolicies: async (dependencies, options) => (
+        waitThenPublish(dependencies, options, { violated: true, denied: true })
+      ),
+      executeCommand: async (command, key, value) => {
+        if (command === "setContext") contextWrites.push([key, value]);
+      },
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            pullResult: null,
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+    const pull = provider.pullDependencies();
+    await enrichmentStarted.promise;
+
+    const accountB = manager.switchAccount();
+    await provider.resetForAccountChange(accountB);
+    const accountBDependency = {
+      ...createDependency("collision-package", "1.0.0"),
+      cloudsmithStatus: "FOUND",
+      cloudsmithPackage: fromApiPackageRecord(canonicalHealthRecord("collision-package")),
+    };
+    installSuccessfulPullScan(provider, [accountBDependency]);
+    provider._warnings = [];
+    provider._reportData = null;
+    await provider._updateContexts();
+    await provider._contextProjector.whenIdle();
+    const contextBoundary = contextWrites.length;
+    const treeEvents = [];
+    provider.onDidChangeTreeData(value => treeEvents.push(value));
+    enrichmentGate.resolve();
+
+    await pull;
+    await provider._contextProjector.whenIdle();
+
+    assert.strictEqual(provider._fullTrees[0].dependencies[0], accountBDependency);
+    assert.strictEqual(accountBDependency.vulnerabilities, undefined);
+    assert.strictEqual(accountBDependency.license, undefined);
+    assert.strictEqual(accountBDependency.policy, undefined);
+    assert.deepStrictEqual(provider._warnings, []);
+    assert.strictEqual(provider.getReportData(), null);
+    assert.strictEqual(treeEvents.length, 0);
+    assert.strictEqual(
+      contextWrites.slice(contextBoundary).some(([key, value]) => (
+        key === "cloudsmith.depReportAvailable" && value === true
+      )),
+      false
+    );
+    await provider.dispose();
+  });
+
   test("pullSingleDependency reserves the operation before asynchronous preparation", async () => {
     const preparationStarted = deferred();
     const preparationGate = deferred();
@@ -4861,6 +5947,7 @@ suite("DependencyHealthProvider Test Suite", () => {
     provider._refreshSingleDependencyAfterPull = async (_workspace, _repo, _dependency, _progress, token) => {
       refreshCalls += 1;
       await provider._publishDiagnostics(token);
+      return true;
     };
     const item = pullCoordinate("single-package", "1.0.0");
 
