@@ -28,6 +28,17 @@ const MAX_PROVENANCE_SIDECAR_BYTES = 32 * 1024;
 const EXACT_FILE_READ_FLAGS = fs.constants.O_RDONLY
   | (fs.constants.O_NOFOLLOW || 0)
   | (fs.constants.O_NONBLOCK || 0);
+const unstableArtifactFailures = new WeakSet();
+const WINDOWS_ARTIFACT_VERIFICATION_RETRIES = 8;
+const EXACT_ARTIFACT_IDENTITY_KEYS = Object.freeze([
+  "changedNanoseconds",
+  "device",
+  "inode",
+  "links",
+  "mode",
+  "modifiedNanoseconds",
+  "size",
+]);
 const generatedEntries = new Set(["[Content_Types].xml", "extension.vsixmanifest"]);
 const baseMedia = new Set([
   "media/icon.svg",
@@ -434,7 +445,7 @@ async function withStableArtifact(filePath, options = {}, consume) {
   let descriptor;
   let identity;
   let result;
-  let transactionFailed = false;
+  let transactionFailure = null;
   try {
     descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS);
     const openedStat = assertBoundedArtifactStat(
@@ -473,21 +484,87 @@ async function withStableArtifact(filePath, options = {}, consume) {
       consumerError = error;
     }
     assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
-  } catch {
-    transactionFailed = true;
+  } catch (error) {
+    transactionFailure = error;
   } finally {
     if (Buffer.isBuffer(allocation)) allocation.fill(0);
     if (descriptor !== undefined) {
       try {
         fileSystem.closeSync(descriptor);
-      } catch {
-        transactionFailed = true;
+      } catch (error) {
+        if (!transactionFailure) transactionFailure = error;
       }
     }
   }
-  if (transactionFailed) throw new Error(errorMessage);
+  if (transactionFailure) {
+    const error = new Error(errorMessage);
+    const code = (typeof transactionFailure === "object" || typeof transactionFailure === "function")
+      ? Object.getOwnPropertyDescriptor(transactionFailure, "code")
+      : null;
+    if (code && Object.prototype.hasOwnProperty.call(code, "value")
+      && new Set(["EBUSY", "EPERM"]).has(code.value)) {
+      unstableArtifactFailures.add(error);
+    }
+    throw error;
+  }
   if (consumerError) throw consumerError;
   return result;
+}
+
+function isUnstableArtifactFailure(error) {
+  return Boolean(error && (typeof error === "object" || typeof error === "function")
+    && unstableArtifactFailures.has(error));
+}
+
+function exactArtifactIdentity(value) {
+  if (!value || (typeof value !== "object" && typeof value !== "function")
+    || JSON.stringify(Object.keys(value).sort())
+      !== JSON.stringify([...EXACT_ARTIFACT_IDENTITY_KEYS].sort())) {
+    return false;
+  }
+  return EXACT_ARTIFACT_IDENTITY_KEYS.every(key => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value")
+      && typeof descriptor.value === "string" && /^\d+$/u.test(descriptor.value);
+  });
+}
+
+function boundedArtifactRetryDelay(attempt) {
+  const milliseconds = Math.min(25 * (2 ** attempt), 800);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+async function verifyFreshVsix(filePath, options = {}) {
+  const expectedIdentityDescriptor = Object.getOwnPropertyDescriptor(
+    options,
+    "expectedIdentity",
+  );
+  const expectedIdentity = expectedIdentityDescriptor
+    && Object.prototype.hasOwnProperty.call(expectedIdentityDescriptor, "value")
+    ? expectedIdentityDescriptor.value
+    : null;
+  if (!exactArtifactIdentity(expectedIdentity)) {
+    throw new Error("Fresh VSIX verification identity is unsafe or invalid.");
+  }
+  const platform = options.platform || process.platform;
+  const retryDelay = options.retryDelay || boundedArtifactRetryDelay;
+  const verify = options.verifyVsix || verifyVsix;
+  const maximumRetries = platform === "win32"
+    ? WINDOWS_ARTIFACT_VERIFICATION_RETRIES
+    : 0;
+  let attempt = 0;
+  while (true) {
+    try {
+      return await verify(filePath, {
+        expectedIdentity,
+        sourceSha: options.sourceSha || null,
+      });
+    } catch (error) {
+      if (attempt >= maximumRetries || !isUnstableArtifactFailure(error)) throw error;
+      retryDelay(attempt);
+      attempt += 1;
+    }
+  }
 }
 
 function withBoundedNamedFile(filePath, options, consume) {
@@ -971,6 +1048,7 @@ module.exports = {
   verificationSourceSha,
   validateArchivePath,
   validateSidecars,
+  verifyFreshVsix,
   verifyVsix,
   withStableArtifact,
   withStableSidecarSet,
