@@ -476,7 +476,7 @@ function captureStableArtifactSnapshot(filePath, options) {
   let transactionFailure = null;
   let transactionRetryable = true;
   try {
-    descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS);
+    descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS, 0o600);
     const openedStat = assertBoundedArtifactStat(
       fileSystem.fstatSync(descriptor, { bigint: true }),
       errorMessage,
@@ -534,7 +534,7 @@ function rebindStableArtifactPath(filePath, identity, options) {
   let transactionFailure = null;
   let transactionRetryable = true;
   try {
-    descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS);
+    descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS, 0o600);
     const reboundStat = assertBoundedArtifactStat(
       fileSystem.fstatSync(descriptor, { bigint: true }),
       errorMessage,

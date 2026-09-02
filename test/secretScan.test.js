@@ -2812,7 +2812,7 @@ suite("secret exposure gate", () => {
     fs.mkdtempSync = function rejectTrackedTemporaryRoot() {
       assert.fail("Tracked-current must not create a snapshot root.");
     };
-    fs.openSync = function permitReadOnlySource(target, flags, ...arguments_) {
+    fs.openSync = function permitReadOnlySource(target, flags) {
       assert.strictEqual(target, source);
       assert.strictEqual(
         flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT
@@ -2820,7 +2820,7 @@ suite("secret exposure gate", () => {
         0,
       );
       openedSources += 1;
-      return originalOpenSync.call(fs, target, flags, ...arguments_);
+      return originalOpenSync.call(fs, target, flags, 0o600);
     };
     fs.writeFileSync = function rejectTrackedWrite() {
       assert.fail("Tracked-current must not write captured bytes to disk.");

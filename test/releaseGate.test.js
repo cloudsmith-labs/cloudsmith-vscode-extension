@@ -3447,9 +3447,11 @@ suite("M9 release gate helpers", () => {
     const fileSystem = Object.create(fs);
     let openDescriptors = 0;
     let openCalls = 0;
+    const openModes = [];
     let capturedBytes;
     fileSystem.openSync = (...arguments_) => {
       openCalls += 1;
+      openModes.push(arguments_[2]);
       const descriptor = fs.openSync(...arguments_);
       openDescriptors += 1;
       return descriptor;
@@ -3471,6 +3473,7 @@ suite("M9 release gate helpers", () => {
       assert.deepStrictEqual(consumed, fixture.verification.buffer);
       assert.strictEqual(openCalls, 2);
       assert.strictEqual(openDescriptors, 0);
+      assert.deepStrictEqual(openModes, [0o600, 0o600]);
       assert.ok(capturedBytes.every(byte => byte === 0));
     } finally {
       fs.rmSync(fixture.directory, { recursive: true, force: true });
