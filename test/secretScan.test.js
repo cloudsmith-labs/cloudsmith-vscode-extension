@@ -35,7 +35,6 @@ const {
   SIGNED_OUT_UI_SCAN_EXCLUSIONS,
   UI_CANDIDATE_SCAN_EXCLUSIONS,
   executeScan,
-  isReviewedSyntheticHistoryFinding,
   isReviewedSyntheticTrackedFinding,
   parseArguments,
   parseSafeReport,
@@ -79,6 +78,67 @@ const NPM_INTEGRITY_BYTES = fs.readFileSync(path.join(ROOT, ".npm-integrity"));
 const NODE_VERSION = NODE_VERSION_BYTES.toString("utf8").trim();
 const NPM_VERSION = NPM_VERSION_BYTES.toString("utf8").trim();
 const NPM_INTEGRITY = JSON.parse(NPM_INTEGRITY_BYTES.toString("utf8"));
+const REVIEWED_SYNTHETIC_HISTORY_COMMITS = Object.freeze([
+  "8e54acd0430a7c1e9f6598d982e245afc5ef94a4",
+  "8831147d82a75bd57053a9c423a927ce481bb030",
+]);
+const REVIEWED_SYNTHETIC_HISTORY_PATH = "test/qualityHarness.test.js";
+
+function successfulProcess(stdout) {
+  return { status: 0, signal: null, error: null, stdout, stderr: "" };
+}
+
+function reviewedSyntheticHistoryGit(linesByCommit, offsetsByCommit = new Map()) {
+  return (executable, args) => {
+    assert.strictEqual(executable, "git");
+    if (args[0] === "ls-tree") {
+      const commit = args[3];
+      assert.ok(REVIEWED_SYNTHETIC_HISTORY_COMMITS.includes(commit));
+      assert.strictEqual(args.at(-1), REVIEWED_SYNTHETIC_HISTORY_PATH);
+      return successfulProcess(
+        `100644 blob ${"c".repeat(40)}\t${REVIEWED_SYNTHETIC_HISTORY_PATH}\0`,
+      );
+    }
+    assert.strictEqual(args[0], "grep");
+    const commit = args.at(-3);
+    assert.ok(REVIEWED_SYNTHETIC_HISTORY_COMMITS.includes(commit));
+    assert.strictEqual(args.at(-2), "--");
+    assert.strictEqual(args.at(-1), REVIEWED_SYNTHETIC_HISTORY_PATH);
+    const patterns = [];
+    for (let index = 0; index < args.length; index += 1) {
+      if (args[index] === "-e") patterns.push(args[index + 1]);
+    }
+    assert.strictEqual(patterns.length, 3);
+    const lines = linesByCommit.get(commit);
+    const offsets = offsetsByCommit.get(commit) || [20, 20];
+    assert.ok(Array.isArray(lines));
+    assert.strictEqual(lines.length, 2);
+    assert.strictEqual(offsets.length, 2);
+    const rows = [
+      `${commit}:${REVIEWED_SYNTHETIC_HISTORY_PATH}:${lines[0]}:${patterns[0]}`,
+      `${commit}:${REVIEWED_SYNTHETIC_HISTORY_PATH}:${lines[1]}:${patterns[0]}`,
+      `${commit}:${REVIEWED_SYNTHETIC_HISTORY_PATH}:${lines[0] - offsets[0]}:${patterns[1]}`,
+      `${commit}:${REVIEWED_SYNTHETIC_HISTORY_PATH}:${lines[1] - offsets[1]}:${patterns[2]}`,
+    ];
+    return successfulProcess(`${rows.join("\n")}\n`);
+  };
+}
+
+function reviewedSyntheticHistoryFindings(linesByCommit) {
+  const findings = [];
+  for (const commit of REVIEWED_SYNTHETIC_HISTORY_COMMITS) {
+    for (const line of linesByCommit.get(commit)) {
+      findings.push({
+        ruleId: "generic-api-key",
+        file: REVIEWED_SYNTHETIC_HISTORY_PATH,
+        startLine: line,
+        endLine: line,
+        commit,
+      });
+    }
+  }
+  return findings;
+}
 
 function writeToolchainPins(root) {
   fs.writeFileSync(path.join(root, ".node-version"), NODE_VERSION_BYTES);
@@ -828,7 +888,7 @@ suite("secret exposure gate", () => {
     assert.strictEqual(component.reviewedFixtureFindingCount, 2);
     assert.strictEqual(
       component.reviewedFixturePolicyId,
-      "qh-synthetic-cloudsmith-api-key-v2",
+      "qh-synthetic-cloudsmith-api-key-v3",
     );
 
     assert.throws(() => scanTracked(scratch, {
@@ -866,14 +926,12 @@ suite("secret exposure gate", () => {
     }), /reviewed synthetic tracked-finding policy is ambiguous/iu);
   });
 
-  test("history classification removes only both immutable reviewed fixture slots", async () => {
-    const reviewed = line => ({
-      ruleId: "generic-api-key",
-      file: "test/qualityHarness.test.js",
-      startLine: line,
-      endLine: line,
-      commit: "8e54acd0430a7c1e9f6598d982e245afc5ef94a4",
-    });
+  test("history classification binds two shifted fixture slots to each reviewed origin", async () => {
+    const linesByCommit = new Map([
+      [REVIEWED_SYNTHETIC_HISTORY_COMMITS[0], [173, 351]],
+      [REVIEWED_SYNTHETIC_HISTORY_COMMITS[1], [611, 877]],
+    ]);
+    const reviewed = reviewedSyntheticHistoryFindings(linesByCommit);
     const retained = {
       ruleId: "fixture-rule",
       file: "extension.js",
@@ -881,10 +939,6 @@ suite("secret exposure gate", () => {
       endLine: 3,
       commit: "5".repeat(40),
     };
-    assert.strictEqual(isReviewedSyntheticHistoryFinding({
-      ...reviewed(1731),
-      path: reviewed(1731).file,
-    }), true);
     const result = await executeScan({
       root: path.resolve(__dirname, ".."),
       mode: "history",
@@ -892,33 +946,174 @@ suite("secret exposure gate", () => {
       currentHead() {
         return "a".repeat(40);
       },
+      executeGit: reviewedSyntheticHistoryGit(linesByCommit),
       execute() {
         return {
           status: 1,
           signal: null,
           error: null,
-          stdout: JSON.stringify([reviewed(1731), reviewed(3567), retained]),
+          stdout: JSON.stringify([...reviewed, retained]),
           stderr: "",
         };
       },
     });
     assert.strictEqual(result.findingCount, 1);
-    assert.strictEqual(result.components[0].reviewedFixtureFindingCount, 2);
+    assert.strictEqual(result.components[0].reviewedFixtureFindingCount, 4);
     assert.strictEqual(
       result.components[0].reviewedFixturePolicyId,
-      "qh-synthetic-cloudsmith-api-key-v2",
+      "qh-synthetic-cloudsmith-api-key-v3",
     );
     assert.strictEqual(result.findings[0].path, "extension.js");
+    assert.doesNotMatch(JSON.stringify(result), FORBIDDEN_REPORT_FIELDS);
+
+    const run = (findings, executeGit = reviewedSyntheticHistoryGit(linesByCommit)) => (
+      executeScan({
+        root: path.resolve(__dirname, ".."),
+        mode: "history",
+        assertScannerVersion() {},
+        currentHead() {
+          return "a".repeat(40);
+        },
+        executeGit,
+        execute() {
+          return {
+            status: findings.length === 0 ? 0 : 1,
+            signal: null,
+            error: null,
+            stdout: JSON.stringify(findings),
+            stderr: "",
+          };
+        },
+      })
+    );
+
+    const boundaryOffsets = new Map(REVIEWED_SYNTHETIC_HISTORY_COMMITS.map(
+      commit => [commit, [128, 128]],
+    ));
+    const boundaryResult = await run(
+      reviewed,
+      reviewedSyntheticHistoryGit(linesByCommit, boundaryOffsets),
+    );
+    assert.strictEqual(boundaryResult.status, "passed");
+    assert.strictEqual(boundaryResult.findingCount, 0);
+
+    const outsideOffsets = new Map(boundaryOffsets);
+    outsideOffsets.set(REVIEWED_SYNTHETIC_HISTORY_COMMITS[0], [129, 128]);
+    await assert.rejects(
+      () => run(reviewed, reviewedSyntheticHistoryGit(linesByCommit, outsideOffsets)),
+      /reviewed synthetic history fixture occurrence is ambiguous/iu,
+    );
+
+    const beforeMarkerOffsets = new Map(boundaryOffsets);
+    beforeMarkerOffsets.set(REVIEWED_SYNTHETIC_HISTORY_COMMITS[0], [-1, 128]);
+    await assert.rejects(
+      () => run(reviewed, reviewedSyntheticHistoryGit(linesByCommit, beforeMarkerOffsets)),
+      /reviewed synthetic history fixture occurrence is ambiguous/iu,
+    );
+
+    const missingCandidateGit = (executable, args, options) => {
+      const result_ = reviewedSyntheticHistoryGit(
+        linesByCommit,
+        boundaryOffsets,
+      )(executable, args, options);
+      if (args[0] !== "grep" || args.at(-3) !== REVIEWED_SYNTHETIC_HISTORY_COMMITS[0]) {
+        return result_;
+      }
+      const commit = REVIEWED_SYNTHETIC_HISTORY_COMMITS[0];
+      const missingLine = linesByCommit.get(commit)[0];
+      const missingPrefix = `${commit}:${REVIEWED_SYNTHETIC_HISTORY_PATH}:${missingLine}:`;
+      return successfulProcess(result_.stdout
+        .split("\n")
+        .filter(row => !row.startsWith(missingPrefix))
+        .join("\n"));
+    };
+    await assert.rejects(
+      () => run(reviewed, missingCandidateGit),
+      /reviewed synthetic history fixture occurrence is ambiguous/iu,
+    );
+
+    await assert.rejects(
+      () => run(reviewed.slice(0, -1)),
+      /reviewed synthetic history-finding policy is incomplete/iu,
+    );
+    await assert.rejects(
+      () => run([...reviewed, { ...reviewed[0] }]),
+      /reviewed synthetic history-finding policy is ambiguous/iu,
+    );
+
+    const retainedVariants = [
+      { ...reviewed[0], startLine: 999, endLine: 999 },
+      { ...reviewed[0], file: "test/other.test.js" },
+      { ...reviewed[0], ruleId: "other-rule" },
+      { ...reviewed[0], commit: "d".repeat(40) },
+      { ...reviewed[0], endLine: reviewed[0].endLine + 1 },
+    ];
+    for (const variant of retainedVariants) {
+      const retainedResult = await run([...reviewed, variant]);
+      assert.strictEqual(retainedResult.status, "failed");
+      assert.strictEqual(retainedResult.findingCount, 1);
+    }
+
+    const markerMismatchGit = (executable, args, options) => {
+      const result_ = reviewedSyntheticHistoryGit(linesByCommit)(executable, args, options);
+      if (args[0] !== "grep" || args.at(-3) !== REVIEWED_SYNTHETIC_HISTORY_COMMITS[1]) {
+        return result_;
+      }
+      const patterns = [];
+      for (let index = 0; index < args.length; index += 1) {
+        if (args[index] === "-e") patterns.push(args[index + 1]);
+      }
+      const wrongSlot = patterns.at(-1);
+      return successfulProcess(result_.stdout
+        .split("\n")
+        .filter(row => !row.endsWith(`:${wrongSlot}`))
+        .join("\n"));
+    };
+    await assert.rejects(
+      () => run(reviewed, markerMismatchGit),
+      /reviewed synthetic history fixture test identity is ambiguous/iu,
+    );
+
+    const duplicateOccurrenceGit = (executable, args, options) => {
+      const result_ = reviewedSyntheticHistoryGit(linesByCommit)(executable, args, options);
+      if (args[0] !== "grep" || args.at(-3) !== REVIEWED_SYNTHETIC_HISTORY_COMMITS[0]) {
+        return result_;
+      }
+      const patterns = [];
+      for (let index = 0; index < args.length; index += 1) {
+        if (args[index] === "-e") patterns.push(args[index + 1]);
+      }
+      const commit = REVIEWED_SYNTHETIC_HISTORY_COMMITS[0];
+      const line = linesByCommit.get(commit)[0] + 1;
+      return successfulProcess(
+        `${result_.stdout}${commit}:${REVIEWED_SYNTHETIC_HISTORY_PATH}:${line}:${patterns[0]}\n`,
+      );
+    };
+    await assert.rejects(
+      () => run(reviewed, duplicateOccurrenceGit),
+      /reviewed synthetic history fixture occurrence is ambiguous/iu,
+    );
+
+    const nonBlobGit = (executable, args, options) => {
+      if (args[0] === "ls-tree") {
+        return successfulProcess(
+          `120000 blob ${"c".repeat(40)}\t${REVIEWED_SYNTHETIC_HISTORY_PATH}\0`,
+        );
+      }
+      return reviewedSyntheticHistoryGit(linesByCommit)(executable, args, options);
+    };
+    await assert.rejects(
+      () => run(reviewed, nonBlobGit),
+      /not one exact regular blob/iu,
+    );
   });
 
   test("history classification recognizes only the exact reviewed legacy location set", async () => {
-    const synthetic = line => ({
-      ruleId: "generic-api-key",
-      file: "test/qualityHarness.test.js",
-      startLine: line,
-      endLine: line,
-      commit: "8e54acd0430a7c1e9f6598d982e245afc5ef94a4",
-    });
+    const linesByCommit = new Map([
+      [REVIEWED_SYNTHETIC_HISTORY_COMMITS[0], [1731, 3567]],
+      [REVIEWED_SYNTHETIC_HISTORY_COMMITS[1], [2182, 4820]],
+    ]);
+    const synthetic = reviewedSyntheticHistoryFindings(linesByCommit);
     const legacy = [
       {
         ruleId: "generic-api-key",
@@ -949,12 +1144,13 @@ suite("secret exposure gate", () => {
       currentHead() {
         return "a".repeat(40);
       },
+      executeGit: reviewedSyntheticHistoryGit(linesByCommit),
       execute() {
         return {
           status: 1,
           signal: null,
           error: null,
-          stdout: JSON.stringify([synthetic(1731), synthetic(3567), ...findings]),
+          stdout: JSON.stringify([...synthetic, ...findings]),
           stderr: "",
         };
       },
@@ -2216,16 +2412,16 @@ suite("secret exposure gate", () => {
         endLine: 2,
         commit: "a".repeat(40),
       }],
-      reviewedFixtureFindingCount: 2,
-      reviewedFixturePolicyId: "qh-synthetic-cloudsmith-api-key-v2",
+      reviewedFixtureFindingCount: 4,
+      reviewedFixturePolicyId: "qh-synthetic-cloudsmith-api-key-v3",
     }], new Date("2026-08-27T00:00:00.000Z"));
     assert.strictEqual(document.status, "failed");
     assert.strictEqual(document.findingCount, 1);
     assert.strictEqual(document.scanner.version, GITLEAKS_VERSION);
-    assert.strictEqual(document.components[0].reviewedFixtureFindingCount, 2);
+    assert.strictEqual(document.components[0].reviewedFixtureFindingCount, 4);
     assert.strictEqual(
       document.components[0].reviewedFixturePolicyId,
-      "qh-synthetic-cloudsmith-api-key-v2",
+      "qh-synthetic-cloudsmith-api-key-v3",
     );
     assert.doesNotMatch(JSON.stringify(document), /(?:secretHash|fingerprint|match|entropy|author|email|message)/iu);
   });

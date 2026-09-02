@@ -412,7 +412,7 @@ suite("Package Metadata Flow Test Suite", () => {
       const copiedGuidance = copied.slice(copiedStart);
       assert.strictEqual(copiedGuidance.length, 1);
       assert.strictEqual(guidanceDocument.content, copiedGuidance[0]);
-      assert.match(copiedGuidance[0], new RegExp(record.cdn_url.replaceAll(".", "\\."), "u"));
+      assert.ok(copiedGuidance[0].includes(record.cdn_url));
     }
 
     assert.deepStrictEqual(warnings, []);

@@ -38,6 +38,7 @@ const INTRINSIC_BUFFER = Buffer;
 const INTRINSIC_BUFFER_ALLOC_UNSAFE = Buffer.allocUnsafe;
 const INTRINSIC_BUFFER_FROM = Buffer.from;
 const INTRINSIC_BUFFER_IS_BUFFER = Buffer.isBuffer;
+const INTRINSIC_BUFFER_TO_STRING = Buffer.prototype.toString;
 const INTRINSIC_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
 const INTRINSIC_GET_PROTOTYPE_OF = Object.getPrototypeOf;
 const INTRINSIC_HAS_OWN = Object.prototype.hasOwnProperty;
@@ -141,11 +142,11 @@ const EXACT_FILE_IDENTITY_KEYS = Object.freeze([
 ]);
 const REVIEWED_SYNTHETIC_FIXTURE_PATH = "test/qualityHarness.test.js";
 const REVIEWED_SYNTHETIC_FIXTURE_RULE = "generic-api-key";
-const REVIEWED_SYNTHETIC_FIXTURE_POLICY = "qh-synthetic-cloudsmith-api-key-v2";
-const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_FIRST_LINE = 1731;
-const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_SECOND_LINE = 3567;
-const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_COMMIT =
-  "8e54acd0430a7c1e9f6598d982e245afc5ef94a4";
+const REVIEWED_SYNTHETIC_FIXTURE_POLICY = "qh-synthetic-cloudsmith-api-key-v3";
+const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_COMMITS = Object.freeze([
+  "8e54acd0430a7c1e9f6598d982e245afc5ef94a4",
+  "8831147d82a75bd57053a9c423a927ce481bb030",
+]);
 const REVIEWED_LEGACY_HISTORY_POLICY = "reviewed-disposable-credential-history-v1";
 const REVIEWED_LEGACY_HISTORY_FINDINGS = Object.freeze([
   Object.freeze({
@@ -173,6 +174,22 @@ const REVIEWED_SYNTHETIC_FIXTURE_SUFFIX = Object.freeze(
 const REVIEWED_SYNTHETIC_FIXTURE_MARKERS = Object.freeze([
   Object.freeze(Array.from(INTRINSIC_BUFFER_FROM("synthetic", "ascii"))),
   Object.freeze(Array.from(INTRINSIC_BUFFER_FROM("sentinel", "ascii"))),
+]);
+const REVIEWED_SYNTHETIC_HISTORY_REGIONS = Object.freeze([
+  Object.freeze({
+    marker: Object.freeze(Array.from(INTRINSIC_BUFFER_FROM(
+      "private non-auth homes block OS config fallback and clean every outcome",
+      "ascii",
+    ))),
+    maximumLineOffset: 128,
+  }),
+  Object.freeze({
+    marker: Object.freeze(Array.from(INTRINSIC_BUFFER_FROM(
+      "non-auth gate children cannot inherit credential-shaped ambient values",
+      "ascii",
+    ))),
+    maximumLineOffset: 128,
+  }),
 ]);
 const UI_RESULT = ".quality/ui/result.json";
 const TRACKED_SOURCE_ERROR =
@@ -1328,6 +1345,134 @@ function reviewedSyntheticFixtureLine(bytes, lineNumber) {
   );
 }
 
+function reviewedFixturePatternText(bytes) {
+  let buffer;
+  try {
+    buffer = INTRINSIC_BUFFER_FROM(bytes);
+    return INTRINSIC_REFLECT_APPLY(INTRINSIC_BUFFER_TO_STRING, buffer, ["ascii"]);
+  } finally {
+    if (INTRINSIC_BUFFER_IS_BUFFER(buffer)) {
+      INTRINSIC_REFLECT_APPLY(INTRINSIC_UINT8_ARRAY_FILL, buffer, [0]);
+    }
+  }
+}
+
+function reviewedSyntheticHistoryOrigins(root, options = {}) {
+  const patterns = [
+    reviewedFixturePatternText(REVIEWED_SYNTHETIC_FIXTURE_PREFIX),
+    ...REVIEWED_SYNTHETIC_HISTORY_REGIONS.map(region => (
+      reviewedFixturePatternText(region.marker)
+    )),
+  ];
+  const origins = [];
+
+  for (let originIndex = 0;
+    originIndex < REVIEWED_SYNTHETIC_FIXTURE_HISTORY_COMMITS.length;
+    originIndex += 1) {
+    const commit = REVIEWED_SYNTHETIC_FIXTURE_HISTORY_COMMITS[originIndex];
+    const treeOutput = gitOutput([
+      "ls-tree",
+      "-z",
+      "--full-tree",
+      commit,
+      "--",
+      REVIEWED_SYNTHETIC_FIXTURE_PATH,
+    ], { ...options, root });
+    if (treeOutput.length > 512) {
+      throw new Error("Reviewed synthetic history origin exceeded its provenance bound.");
+    }
+    const treeEntries = treeOutput.split("\0");
+    if (treeEntries.length !== 2 || treeEntries[1] !== "") {
+      throw new Error("Reviewed synthetic history origin is not one exact Git entry.");
+    }
+    const separator = treeEntries[0].indexOf("\t");
+    const metadata = separator > 0
+      ? treeEntries[0].slice(0, separator).split(" ")
+      : [];
+    if (metadata.length !== 3
+      || !new Set(["100644", "100755"]).has(metadata[0])
+      || metadata[1] !== "blob"
+      || !/^[0-9a-f]{40}$/u.test(metadata[2])
+      || treeEntries[0].slice(separator + 1) !== REVIEWED_SYNTHETIC_FIXTURE_PATH) {
+      throw new Error("Reviewed synthetic history origin is not one exact regular blob.");
+    }
+
+    const grepArguments = [
+      "grep",
+      "--line-number",
+      "--only-matching",
+      "--fixed-strings",
+      "--no-color",
+    ];
+    for (let patternIndex = 0; patternIndex < patterns.length; patternIndex += 1) {
+      grepArguments.push("-e", patterns[patternIndex]);
+    }
+    grepArguments.push(
+      commit,
+      "--",
+      REVIEWED_SYNTHETIC_FIXTURE_PATH,
+    );
+    const grepOutput = gitOutput(grepArguments, { ...options, root });
+    if (grepOutput.length === 0 || grepOutput.length > 8192) {
+      throw new Error("Reviewed synthetic history markers are missing or oversized.");
+    }
+    const outputPrefix = `${commit}:${REVIEWED_SYNTHETIC_FIXTURE_PATH}:`;
+    const matchesByPattern = Array.from({ length: patterns.length }, () => []);
+    const rows = grepOutput.split("\n");
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      const row = rows[rowIndex];
+      if (row === "") continue;
+      if (!row.startsWith(outputPrefix)) {
+        throw new Error("Reviewed synthetic history marker output escaped its origin.");
+      }
+      const remainder = row.slice(outputPrefix.length);
+      const lineSeparator = remainder.indexOf(":");
+      const lineText = lineSeparator > 0 ? remainder.slice(0, lineSeparator) : "";
+      const match = lineSeparator > 0 ? remainder.slice(lineSeparator + 1) : "";
+      if (!/^[1-9][0-9]{0,6}$/u.test(lineText)) {
+        throw new Error("Reviewed synthetic history marker line is invalid.");
+      }
+      const line = Number(lineText);
+      const patternIndex = patterns.indexOf(match);
+      if (!INTRINSIC_NUMBER_IS_SAFE_INTEGER(line) || patternIndex < 0) {
+        throw new Error("Reviewed synthetic history marker output is invalid.");
+      }
+      if (matchesByPattern[patternIndex].includes(line)) {
+        throw new Error("Reviewed synthetic history marker output is ambiguous.");
+      }
+      matchesByPattern[patternIndex].push(line);
+    }
+
+    const slotLines = [];
+    for (let regionIndex = 0;
+      regionIndex < REVIEWED_SYNTHETIC_HISTORY_REGIONS.length;
+      regionIndex += 1) {
+      const markerLines = matchesByPattern[regionIndex + 1];
+      if (markerLines.length !== 1) {
+        throw new Error("Reviewed synthetic history fixture test identity is ambiguous.");
+      }
+      const startLine = markerLines[0];
+      const maximumLine = startLine
+        + REVIEWED_SYNTHETIC_HISTORY_REGIONS[regionIndex].maximumLineOffset;
+      const candidates = matchesByPattern[0].filter(line => (
+        line > startLine && line <= maximumLine
+      ));
+      if (candidates.length !== 1) {
+        throw new Error("Reviewed synthetic history fixture occurrence is ambiguous.");
+      }
+      slotLines.push(candidates[0]);
+    }
+    if (new Set(slotLines).size !== REVIEWED_SYNTHETIC_HISTORY_REGIONS.length) {
+      throw new Error("Reviewed synthetic history origin is incomplete.");
+    }
+    origins.push(INTRINSIC_OBJECT_FREEZE({
+      commit,
+      slotLines: INTRINSIC_OBJECT_FREEZE(slotLines),
+    }));
+  }
+  return INTRINSIC_OBJECT_FREEZE(origins);
+}
+
 function isReviewedSyntheticTrackedFinding(finding, sourceBytes) {
   return finding?.path === REVIEWED_SYNTHETIC_FIXTURE_PATH
     && finding.ruleId === REVIEWED_SYNTHETIC_FIXTURE_RULE
@@ -1336,13 +1481,21 @@ function isReviewedSyntheticTrackedFinding(finding, sourceBytes) {
     && reviewedSyntheticFixtureLine(sourceBytes, finding.startLine);
 }
 
-function isReviewedSyntheticHistoryFinding(finding) {
-  return finding?.path === REVIEWED_SYNTHETIC_FIXTURE_PATH
-    && finding.ruleId === REVIEWED_SYNTHETIC_FIXTURE_RULE
-    && finding.commit === REVIEWED_SYNTHETIC_FIXTURE_HISTORY_COMMIT
-    && finding.startLine === finding.endLine
-    && (finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_HISTORY_FIRST_LINE
-      || finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_HISTORY_SECOND_LINE);
+function reviewedSyntheticHistoryFindingSlot(finding, origins) {
+  if (finding?.path !== REVIEWED_SYNTHETIC_FIXTURE_PATH
+    || finding.ruleId !== REVIEWED_SYNTHETIC_FIXTURE_RULE
+    || finding.startLine !== finding.endLine) return null;
+  for (let originIndex = 0; originIndex < origins.length; originIndex += 1) {
+    if (finding.commit !== origins[originIndex].commit) continue;
+    for (let slotIndex = 0;
+      slotIndex < origins[originIndex].slotLines.length;
+      slotIndex += 1) {
+      if (finding.startLine === origins[originIndex].slotLines[slotIndex]) {
+        return { originIndex, slotIndex };
+      }
+    }
+  }
+  return null;
 }
 
 function reviewedLegacyHistoryFindingIndex(finding) {
@@ -2971,9 +3124,11 @@ function scanHistory(root, options = {}) {
     root,
     scanRoot: root,
   });
+  const reviewedOrigins = reviewedSyntheticHistoryOrigins(root, options);
   const findings = [];
-  let reviewedFirstSlot = false;
-  let reviewedSecondSlot = false;
+  const reviewedSlots = reviewedOrigins.map(origin => (
+    Array.from({ length: origin.slotLines.length }, () => false)
+  ));
   const reviewedLegacySlots = new Set();
   for (let index = 0; index < scannedFindings.length; index += 1) {
     const finding = scannedFindings[index];
@@ -2985,30 +3140,29 @@ function scanHistory(root, options = {}) {
       reviewedLegacySlots.add(legacyIndex);
       continue;
     }
-    if (!isReviewedSyntheticHistoryFinding(finding)) {
+    const reviewedSlot = reviewedSyntheticHistoryFindingSlot(finding, reviewedOrigins);
+    if (!reviewedSlot) {
       findings[findings.length] = finding;
       continue;
     }
-    if (finding.startLine === REVIEWED_SYNTHETIC_FIXTURE_HISTORY_FIRST_LINE) {
-      if (reviewedFirstSlot) {
-        throw new Error("Reviewed synthetic history-finding policy is ambiguous.");
-      }
-      reviewedFirstSlot = true;
-    } else {
-      if (reviewedSecondSlot) {
-        throw new Error("Reviewed synthetic history-finding policy is ambiguous.");
-      }
-      reviewedSecondSlot = true;
+    if (reviewedSlots[reviewedSlot.originIndex][reviewedSlot.slotIndex]) {
+      throw new Error("Reviewed synthetic history-finding policy is ambiguous.");
     }
+    reviewedSlots[reviewedSlot.originIndex][reviewedSlot.slotIndex] = true;
   }
-  if (reviewedFirstSlot !== reviewedSecondSlot) {
-    throw new Error("Reviewed synthetic history-finding policy is incomplete.");
+  for (let originIndex = 0; originIndex < reviewedSlots.length; originIndex += 1) {
+    if (reviewedSlots[originIndex].some(value => value !== true)) {
+      throw new Error("Reviewed synthetic history-finding policy is incomplete.");
+    }
   }
   if (reviewedLegacySlots.size > 0
     && reviewedLegacySlots.size !== REVIEWED_LEGACY_HISTORY_FINDINGS.length) {
     throw new Error("Reviewed legacy history-finding policy is incomplete.");
   }
-  const reviewedFixtureFindingCount = reviewedFirstSlot ? 2 : 0;
+  const reviewedFixtureFindingCount = reviewedSlots.reduce(
+    (count, slots) => count + slots.length,
+    0,
+  );
   const reviewedLegacyHistoryFindingCount = reviewedLegacySlots.size;
   return {
     id: "git-history-all-refs",
@@ -3490,7 +3644,6 @@ module.exports = {
   destroyUploadCandidateSnapshot,
   executeScan,
   extractVsix,
-  isReviewedSyntheticHistoryFinding,
   isReviewedSyntheticTrackedFinding,
   parseArguments,
   parseSafeReport,
