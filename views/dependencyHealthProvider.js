@@ -18,8 +18,9 @@ const {
   getDependencyOccurrenceKey,
   isDependencyLookupEligible,
 } = require("../util/dependencyRecord");
-const { assertWorkspacePackageCoordinate } = require("../domain/package");
+const { assertWorkspacePackageCoordinate, isExactPackage } = require("../domain/package");
 const {
+  DiagnosticPreparationCancelledError,
   MAX_DIAGNOSTIC_OCCURRENCES,
   createDiagnosticCandidate,
 } = require("../util/diagnosticsPublisher");
@@ -240,6 +241,7 @@ class DependencyHealthProvider {
     this._nextScanOperationId = 0;
     this._activeScanCancellation = null;
     this._activeDependencyCancellation = null;
+    this._releasedDependencyCancellations = new WeakSet();
     this._nextDependencyOperationId = 0;
     this._activeDependencyOperation = null;
     this._scanOperation = createScanOperation(SCAN_STATES.IDLE, 0);
@@ -303,24 +305,90 @@ class DependencyHealthProvider {
     return this._isDependencyOperationRunning();
   }
 
-  _beginDependencyOperation(account) {
-    if (!account || this._activeDependencyOperation) return null;
+  _beginDependencyOperation(account, cancellationSource, options = {}) {
+    const scope = snapshotDependencyScope(this.getLastSuccessfulScope());
+    if (
+      !account
+      || !scope
+      || !cancellationSource
+      || !cancellationSource.token
+      || this._activeDependencyOperation
+    ) return null;
     const operation = Object.freeze({
       id: ++this._nextDependencyOperationId,
       account,
+      cancellationSource,
+      cancellationToken: cancellationSource.token,
+      selectionGeneration: this._selectionGeneration,
+      scope,
+      invocationIsCurrent: typeof options.isCurrent === "function"
+        ? options.isCurrent
+        : null,
     });
     this._activeDependencyOperation = operation;
     return operation;
   }
 
-  _ownsDependencyOperation(operation) {
+  _isDependencyOperationScopeCurrent(operation) {
     return Boolean(
       !this._disposed
       && operation
-      && this._activeDependencyOperation === operation
-      && operation.id === this._nextDependencyOperationId
+      && operation.selectionGeneration === this._selectionGeneration
+      && sameDependencyScope(operation.scope, this.getLastSuccessfulScope())
+      && (!operation.invocationIsCurrent || safeAuthorityCheck(operation.invocationIsCurrent))
       && isAccountCurrent(this._connectionManager, operation.account)
     );
+  }
+
+  _ownsDependencyOperation(operation) {
+    return Boolean(
+      this._isDependencyOperationScopeCurrent(operation)
+      && this._activeDependencyOperation === operation
+      && operation.id === this._nextDependencyOperationId
+      && this._activeDependencyCancellation === operation.cancellationSource
+      && operation.cancellationToken === operation.cancellationSource.token
+      && !operation.cancellationToken.isCancellationRequested
+    );
+  }
+
+  _createDependencyRefreshAuthority(operation, workspace, repository, token) {
+    const targetWorkspace = normalizeAuthorityScopePart(workspace);
+    const targetRepository = normalizeAuthorityScopePart(repository);
+    if (
+      !operation
+      || token !== operation.cancellationToken
+      || !targetWorkspace
+      || !targetRepository
+      || targetWorkspace !== operation.scope.workspace
+    ) return null;
+    return Object.freeze({
+      operation,
+      workspace: targetWorkspace,
+      repository: targetRepository,
+      token,
+    });
+  }
+
+  _ownsDependencyRefreshAuthority(authority) {
+    return Boolean(
+      authority
+      && authority.token === authority.operation?.cancellationToken
+      && authority.workspace === authority.operation?.scope?.workspace
+      && normalizeAuthorityScopePart(authority.repository) === authority.repository
+      && this._ownsDependencyOperation(authority.operation)
+    );
+  }
+
+  _releaseDependencyCancellation(cancellationSource, options = {}) {
+    if (!cancellationSource || typeof cancellationSource !== "object") return false;
+    if (this._releasedDependencyCancellations.has(cancellationSource)) return false;
+    this._releasedDependencyCancellations.add(cancellationSource);
+    if (options.cancel === true) cancellationSource.cancel();
+    cancellationSource.dispose();
+    if (this._activeDependencyCancellation === cancellationSource) {
+      this._activeDependencyCancellation = null;
+    }
+    return true;
   }
 
   _detachDependencyOperation() {
@@ -338,8 +406,10 @@ class DependencyHealthProvider {
     return ["direct", "flat", "tree"].includes(candidate) ? candidate : "flat";
   }
 
-  async _updateContexts() {
+  async _updateContexts(options = {}) {
     if (this._disposed) return false;
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (isCurrent && !safeAuthorityCheck(isCurrent)) return false;
     const connected = Boolean(captureAccount(this._connectionManager))
       && !this._pendingAccountIdentity;
     const scanRunning = this.isScanRunning();
@@ -355,8 +425,11 @@ class DependencyHealthProvider {
       ),
       "cloudsmith.depRepoSelected": connected && Boolean(this.lastRepo),
       "cloudsmith.depReportAvailable": connected && Boolean(this._reportData),
-    });
-    if (result.error) throw result.error;
+    }, { isCurrent });
+    if (result.error) {
+      if (isCurrent && !safeAuthorityCheck(isCurrent)) return false;
+      throw result.error;
+    }
     return result.applied;
   }
 
@@ -402,8 +475,7 @@ class DependencyHealthProvider {
       this._activeScanCancellation.cancel();
     }
     if (this._activeDependencyCancellation) {
-      this._activeDependencyCancellation.cancel();
-      this._activeDependencyCancellation = null;
+      this._releaseDependencyCancellation(this._activeDependencyCancellation, { cancel: true });
     }
     this._detachDependencyOperation();
     this.dependencies = [];
@@ -512,10 +584,58 @@ class DependencyHealthProvider {
     return this._reportData;
   }
 
-  async _storeReportData(scanDate) {
-    this._lastScanTimestamp = normalizeReportTimestamp(scanDate);
-    this._reportData = this._buildComplianceReportData(this._lastScanTimestamp);
-    await this._updateContexts();
+  async _storeReportData(scanDate, options = {}) {
+    const nextTimestamp = normalizeReportTimestamp(scanDate);
+    const nextReport = this._buildComplianceReportData(nextTimestamp);
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (!isCurrent) {
+      this._lastScanTimestamp = nextTimestamp;
+      this._reportData = nextReport;
+      await this._updateContexts();
+      return true;
+    }
+    if (!safeAuthorityCheck(isCurrent)) return false;
+
+    const previousTimestamp = this._lastScanTimestamp;
+    const previousReport = this._reportData;
+    this._lastScanTimestamp = nextTimestamp;
+    this._reportData = nextReport;
+    let projected = false;
+    try {
+      projected = await this._updateContexts({ isCurrent });
+    } catch (error) {
+      if (this._rollbackDependencyReport(
+        options.authority,
+        nextReport,
+        previousReport,
+        previousTimestamp
+      )) {
+        await this._updateContexts().catch(() => {});
+      }
+      if (!safeAuthorityCheck(isCurrent)) return false;
+      throw error;
+    }
+    if (projected && safeAuthorityCheck(isCurrent)) return true;
+    if (this._rollbackDependencyReport(
+      options.authority,
+      nextReport,
+      previousReport,
+      previousTimestamp
+    )) {
+      await this._updateContexts().catch(() => {});
+    }
+    return false;
+  }
+
+  _rollbackDependencyReport(authority, candidate, previousReport, previousTimestamp) {
+    if (
+      !authority
+      || this._reportData !== candidate
+      || !this._isDependencyOperationScopeCurrent(authority.operation)
+    ) return false;
+    this._reportData = previousReport;
+    this._lastScanTimestamp = previousTimestamp;
+    return true;
   }
 
   _buildComplianceReportData(scanDate) {
@@ -868,10 +988,12 @@ class DependencyHealthProvider {
     });
   }
 
-  async _prepareDiagnostics(scanState, cancellationToken) {
+  async _prepareDiagnostics(scanState, cancellationToken, options = {}) {
     if (!this._diagnosticsPublisher) {
       return { entries: [], warnings: [], stats: null };
     }
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (isCurrent && !safeAuthorityCheck(isCurrent)) return null;
 
     const candidates = [];
     let examinedDirectDependencies = 0;
@@ -900,19 +1022,23 @@ class DependencyHealthProvider {
         }));
       }
     }
-    if (candidateLimitReached) {
+    if (candidateLimitReached && (!isCurrent || safeAuthorityCheck(isCurrent))) {
       appendUniqueWarning(
         scanState._warnings,
         "Dependency diagnostic evaluation reached its safety limit; dependency health results remain complete."
       );
     }
 
+    if (isCurrent && !safeAuthorityCheck(isCurrent)) return null;
+
     const prepared = await this._diagnosticsPublisher.prepare({
       workspaceFolder: scanState._projectFolderPath,
       candidates,
       cancellationToken,
     });
+    if (isCurrent && !safeAuthorityCheck(isCurrent)) return null;
     for (const warning of prepared.warnings) {
+      if (isCurrent && !safeAuthorityCheck(isCurrent)) return null;
       appendUniqueWarning(scanState._warnings, warning);
     }
     return prepared;
@@ -1170,15 +1296,20 @@ class DependencyHealthProvider {
   ) {
     const formats = Object.keys(dependenciesByFormat);
     const progressLabel = options.progressLabel || "Matching coverage";
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
 
-    if (formats.length === 0 || totalDependencies === 0) {
+    if (
+      formats.length === 0
+      || totalDependencies === 0
+      || !publicationIsCurrent(token, isCurrent)
+    ) {
       return 0;
     }
 
     let completed = 0;
     const requestBudget = createLookupRequestBudget(this._lookupRequestLimit);
     for (const format of formats) {
-      if (token.isCancellationRequested) {
+      if (!publicationIsCurrent(token, isCurrent)) {
         return completed;
       }
 
@@ -1194,15 +1325,25 @@ class DependencyHealthProvider {
         progressLabel,
         requestBudget,
         options.verificationReceipt || null,
-        options.verificationReceipts || null
+        options.verificationReceipts || null,
+        { isCurrent }
       );
     }
 
     return completed;
   }
 
-  async _flushCoverageMatchBatch(pendingMatches, completed, totalDependencies, progress, progressLabel) {
-    if (pendingMatches.length === 0) {
+  async _flushCoverageMatchBatch(
+    pendingMatches,
+    completed,
+    totalDependencies,
+    progress,
+    progressLabel,
+    options = {}
+  ) {
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (pendingMatches.length === 0 || !publicationIsCurrent(options.token, isCurrent)) {
+      pendingMatches.length = 0;
       return completed;
     }
 
@@ -1217,7 +1358,7 @@ class DependencyHealthProvider {
       message: `${progressLabel}... ${completed}/${totalDependencies}`,
       increment: totalDependencies > 0 ? (batchSize * 100) / totalDependencies : 100,
     });
-    this.refresh();
+    this.refresh({ isCurrent });
     await this._scheduler.yield();
 
     return completed;
@@ -1244,10 +1385,11 @@ class DependencyHealthProvider {
     this._displayTrees = applyCoverageMatchBatchToTrees(this._displayTrees, matchMap);
   }
 
-  _createDebouncedEnrichmentHandler(patchApplier) {
+  _createDebouncedEnrichmentHandler(patchApplier, options = {}) {
     let pendingPatchMaps = [];
     let flushTimeout = null;
     let disposed = false;
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
 
     const flush = () => {
       if (flushTimeout) {
@@ -1256,7 +1398,11 @@ class DependencyHealthProvider {
       }
 
       if (disposed || pendingPatchMaps.length === 0) {
-        return;
+        return false;
+      }
+      if (isCurrent && !safeAuthorityCheck(isCurrent)) {
+        pendingPatchMaps = [];
+        return false;
       }
 
       const mergedPatchMap = mergePatchMaps(pendingPatchMaps);
@@ -1264,12 +1410,18 @@ class DependencyHealthProvider {
 
       patchApplier(mergedPatchMap);
       this._rebuildSummary();
-      this.refresh();
+      this.refresh({ isCurrent });
+      return true;
     };
 
     const handler = {
       onProgress: (patchMap) => {
-        if (disposed || !(patchMap instanceof Map) || patchMap.size === 0) {
+        if (
+          disposed
+          || (isCurrent && !safeAuthorityCheck(isCurrent))
+          || !(patchMap instanceof Map)
+          || patchMap.size === 0
+        ) {
           return;
         }
 
@@ -1309,16 +1461,18 @@ class DependencyHealthProvider {
     progressLabel = "Matching coverage",
     requestBudget = null,
     verificationReceipt = null,
-    verificationReceipts = null
+    verificationReceipts = null,
+    options = {}
   ) {
     const uniqueDependencies = dependencies.slice();
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
     const api = uniqueDependencies.some((dependency) => getConcreteDependencyVersion(dependency))
       ? this._services.createCloudsmithAPI()
       : null;
     const statusCounts = new Map();
 
     for (let index = 0; index < uniqueDependencies.length; index += COVERAGE_MATCH_BATCH_SIZE) {
-      if (token.isCancellationRequested) {
+      if (!publicationIsCurrent(token, isCurrent)) {
         return completed;
       }
 
@@ -1326,7 +1480,7 @@ class DependencyHealthProvider {
       const pendingMatches = [];
 
       await runPromisePool(dependencyBatch, LOOKUP_CONCURRENCY, async (dependency) => {
-        if (token.isCancellationRequested) {
+        if (!publicationIsCurrent(token, isCurrent)) {
           return;
         }
 
@@ -1351,44 +1505,66 @@ class DependencyHealthProvider {
             "The Cloudsmith lookup failed unexpectedly without proving package absence."
           );
         }
+        if (!publicationIsCurrent(token, isCurrent)) return;
         statusCounts.set(result.status, (statusCounts.get(result.status) || 0) + 1);
         pendingMatches.push({ dependency, result });
       });
+
+      if (!publicationIsCurrent(token, isCurrent)) {
+        pendingMatches.length = 0;
+        return completed;
+      }
 
       completed = await this._flushCoverageMatchBatch(
         pendingMatches,
         completed,
         totalDependencies,
         progress,
-        progressLabel
+        progressLabel,
+        { token, isCurrent }
       );
 
-      if (token.isCancellationRequested) {
+      if (!publicationIsCurrent(token, isCurrent)) {
         return completed;
       }
     }
 
-    appendCoverageLookupWarnings(this._warnings, format, statusCounts);
+    if (publicationIsCurrent(token, isCurrent)) {
+      appendCoverageLookupWarnings(this._warnings, format, statusCounts);
+    }
     return completed;
   }
 
-  async _runEnrichmentPasses(cloudsmithWorkspace, cloudsmithRepo, progress, token) {
+  async _runEnrichmentPasses(cloudsmithWorkspace, cloudsmithRepo, progress, token, options = {}) {
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (!publicationIsCurrent(token, isCurrent)) return;
     const dependencies = this._fullTrees.flatMap((tree) => tree.dependencies);
     const lookupEligibleDependencies = dependencies.filter(isLookupEligibleForConsumer);
     const tasks = [
-      this._runVulnerabilityEnrichment(lookupEligibleDependencies, cloudsmithWorkspace, progress, token),
-      this._runLicenseEnrichment(lookupEligibleDependencies, token),
-      this._runPolicyEnrichment(lookupEligibleDependencies, token),
+      this._runVulnerabilityEnrichment(lookupEligibleDependencies, cloudsmithWorkspace, progress, token, options),
+      this._runLicenseEnrichment(lookupEligibleDependencies, token, options),
+      this._runPolicyEnrichment(lookupEligibleDependencies, token, options),
     ];
 
     const uncoveredDependencies = dependencies.filter((dependency) => isAbsentCoverageStatus(dependency.cloudsmithStatus));
     if (uncoveredDependencies.length > 0) {
-      tasks.push(this._runUpstreamGapAnalysis(uncoveredDependencies, cloudsmithWorkspace, cloudsmithRepo, progress, token));
+      tasks.push(this._runUpstreamGapAnalysis(
+        uncoveredDependencies,
+        cloudsmithWorkspace,
+        cloudsmithRepo,
+        progress,
+        token,
+        options
+      ));
     }
 
     const results = await Promise.allSettled(tasks);
+    if (!publicationIsCurrent(token, isCurrent)) return;
     for (const result of results) {
-      if (result.status !== "rejected") {
+      if (
+        result.status !== "rejected"
+        || isDependencyEnrichmentCancellation(result.reason, token, isCurrent)
+      ) {
         continue;
       }
 
@@ -1399,7 +1575,9 @@ class DependencyHealthProvider {
     }
   }
 
-  async _runVulnerabilityEnrichment(dependencies, workspace, progress, token) {
+  async _runVulnerabilityEnrichment(dependencies, workspace, progress, token, options = {}) {
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (!publicationIsCurrent(token, isCurrent)) return;
     const handler = this._createDebouncedEnrichmentHandler((patchMap) => {
       this._fullTrees = applyFoundOverlayPatch(this._fullTrees, patchMap, (dependency, vulnerabilities) => ({
         ...dependency,
@@ -1409,13 +1587,15 @@ class DependencyHealthProvider {
         ...dependency,
         vulnerabilities,
       }));
-    });
+    }, { isCurrent });
 
     try {
       await this._services.enrichVulnerabilities(dependencies, workspace, {
         context: this.context,
+        account: options.account || null,
         cancellationToken: token,
         onProgress: (patchMap, meta = {}) => {
+          if (!publicationIsCurrent(token, isCurrent)) return;
           if (meta.total > 0) {
             progress.report({
               message: `Loading vulnerability details... ${meta.completed}/${meta.total}`,
@@ -1430,7 +1610,9 @@ class DependencyHealthProvider {
     }
   }
 
-  async _runLicenseEnrichment(dependencies, token) {
+  async _runLicenseEnrichment(dependencies, token, options = {}) {
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (!publicationIsCurrent(token, isCurrent)) return;
     const handler = this._createDebouncedEnrichmentHandler((patchMap) => {
       this._fullTrees = applyFoundOverlayPatch(this._fullTrees, patchMap, (dependency, license) => ({
         ...dependency,
@@ -1440,12 +1622,13 @@ class DependencyHealthProvider {
         ...dependency,
         license,
       }));
-    });
+    }, { isCurrent });
 
     try {
       await this._services.enrichLicenses(dependencies, {
         cancellationToken: token,
         onProgress: (patchMap) => {
+          if (!publicationIsCurrent(token, isCurrent)) return;
           handler.onProgress(patchMap);
         },
       });
@@ -1455,7 +1638,9 @@ class DependencyHealthProvider {
     }
   }
 
-  async _runPolicyEnrichment(dependencies, token) {
+  async _runPolicyEnrichment(dependencies, token, options = {}) {
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (!publicationIsCurrent(token, isCurrent)) return;
     const handler = this._createDebouncedEnrichmentHandler((patchMap) => {
       this._fullTrees = applyFoundOverlayPatch(this._fullTrees, patchMap, (dependency, policy) => ({
         ...dependency,
@@ -1465,12 +1650,13 @@ class DependencyHealthProvider {
         ...dependency,
         policy,
       }));
-    });
+    }, { isCurrent });
 
     try {
       await this._services.enrichPolicies(dependencies, {
         cancellationToken: token,
         onProgress: (patchMap) => {
+          if (!publicationIsCurrent(token, isCurrent)) return;
           handler.onProgress(patchMap);
         },
       });
@@ -1480,14 +1666,24 @@ class DependencyHealthProvider {
     }
   }
 
-  async _runUpstreamGapAnalysis(uncoveredDependencies, workspace, repo, progress, token) {
-    const account = captureAccount(this._connectionManager);
-    if (!account) return;
+  async _runUpstreamGapAnalysis(
+    uncoveredDependencies,
+    workspace,
+    repo,
+    progress,
+    token,
+    options = {}
+  ) {
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (!publicationIsCurrent(token, isCurrent)) return;
+    const account = options.account || captureAccount(this._connectionManager);
+    if (!account || !isAccountCurrent(this._connectionManager, account)) return;
     const repositoryCollection = repo
       ? { items: [repo], complete: true, incomplete: false, partial: false }
       : await (this._services.fetchRepositories
-        ? this._services.fetchRepositories(workspace, token)
-        : this._fetchWorkspaceRepositories(workspace, token));
+        ? this._services.fetchRepositories(workspace, token, { account, isCurrent })
+        : this._fetchWorkspaceRepositories(workspace, token, account));
+    if (!publicationIsCurrent(token, isCurrent)) return;
     const normalizedRepositories = normalizeRepositoryCollection(repositoryCollection);
     if (!normalizedRepositories.complete) {
       appendUniqueWarning(
@@ -1507,7 +1703,7 @@ class DependencyHealthProvider {
         upstreamStatus: gap.upstreamStatus,
         upstreamDetail: gap.upstreamDetail,
       }));
-    });
+    }, { isCurrent });
 
     try {
       const legacyCompatibleDependencies = uncoveredDependencies.map((dependency) => ({
@@ -1524,6 +1720,7 @@ class DependencyHealthProvider {
           cancellationToken: token,
           repositoriesComplete: normalizedRepositories.complete,
           onProgress: (patchMap, meta = {}) => {
+            if (!publicationIsCurrent(token, isCurrent)) return;
             if (meta.terminal === true && meta.outcome === "cancelled") {
               return;
             }
@@ -1539,10 +1736,12 @@ class DependencyHealthProvider {
                     : `Upstream coverage checked: ${meta.completed}/${meta.total}`
                   : `Checking upstream coverage... ${meta.completed}/${meta.total}`,
               });
+              if (!publicationIsCurrent(token, isCurrent)) return;
               if (terminalPartial) {
                 appendUniqueWarning(this._warnings, UPSTREAM_COVERAGE_INCOMPLETE_WARNING);
               }
             }
+            if (!publicationIsCurrent(token, isCurrent)) return;
             handler.onProgress(patchMap);
           },
         }
@@ -1553,11 +1752,12 @@ class DependencyHealthProvider {
     }
   }
 
-  async _fetchWorkspaceRepositories(workspace, token) {
+  async _fetchWorkspaceRepositories(workspace, token, account = null) {
     const result = await fetchWorkspaceRepositories(this.context, workspace, {
       connectionManager: this._connectionManager,
       cloudsmithAPI: this._services.createCloudsmithAPI(),
       cancellationToken: token,
+      account,
       retry: "never",
       withProgress: async (_options, task) => task({ report() {} }),
     });
@@ -1569,16 +1769,26 @@ class DependencyHealthProvider {
     };
   }
 
-  async _publishDiagnostics(cancellationToken) {
+  async _publishDiagnostics(cancellationToken, options = {}) {
     if (!this._diagnosticsPublisher) {
-      return;
+      return true;
     }
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (isCurrent && !safeAuthorityCheck(isCurrent)) return false;
 
-    const prepared = await this._prepareDiagnostics(this, cancellationToken);
-    if (cancellationToken && cancellationToken.isCancellationRequested) {
-      return;
+    let prepared;
+    try {
+      prepared = await this._prepareDiagnostics(this, cancellationToken, { isCurrent });
+    } catch (error) {
+      if (isDependencyRefreshCancellation(error, cancellationToken, isCurrent)) {
+        return false;
+      }
+      throw error;
     }
+    if (!prepared || (isCurrent && !safeAuthorityCheck(isCurrent))) return false;
+    if (cancellationToken && cancellationToken.isCancellationRequested) return false;
     this._diagnosticsPublisher.replace(prepared.entries);
+    return !isCurrent || safeAuthorityCheck(isCurrent);
   }
 
   buildDependencyNodesForTree(tree) {
@@ -1693,13 +1903,18 @@ class DependencyHealthProvider {
       return;
     }
 
-    const operation = this._beginDependencyOperation(account);
-    if (!operation) return;
     const cancellationSource = this._createCancellationSource();
+    const operation = this._beginDependencyOperation(account, cancellationSource);
+    if (!operation) {
+      this._releaseDependencyCancellation(cancellationSource);
+      return;
+    }
     this._activeDependencyCancellation = cancellationSource;
+    const operationIsCurrent = () => this._ownsDependencyOperation(operation);
 
     try {
-      await this._updateContexts();
+      await this._updateContexts({ isCurrent: operationIsCurrent });
+      if (!operationIsCurrent()) return;
       const result = await this._userInteraction.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -1709,10 +1924,12 @@ class DependencyHealthProvider {
         async (progress, token) => {
           const subscription = token.onCancellationRequested(() => cancellationSource.cancel());
           try {
+            if (!operationIsCurrent()) return { canceled: true };
             progress.report({ message: "Preparing pull-through request..." });
+            if (!operationIsCurrent()) return { canceled: true };
             const execution = await this._services.upstreamPullService.run({
-              workspace: this.lastWorkspace,
-              repositoryHint: this.lastRepo,
+              workspace: operation.scope.workspace,
+              repositoryHint: operation.scope.repository,
               dependencies,
               progress,
               token: cancellationSource.token,
@@ -1723,20 +1940,23 @@ class DependencyHealthProvider {
               return execution || { canceled: true };
             }
 
-            if (!this._ownsDependencyOperation(operation)) {
+            if (!operationIsCurrent()) {
               return { canceled: true };
             }
 
             progress.report({ message: "Refreshing Cloudsmith coverage..." });
-            await this._refreshCoverageAfterPull(
+            const refreshed = await this._refreshCoverageAfterPull(
               execution.workspace,
               execution.repository.slug,
               progress,
               cancellationSource.token,
-              { verificationReceipts: execution.verificationReceipts }
+              {
+                operation,
+                verificationReceipts: execution.verificationReceipts,
+              }
             );
 
-            if (cancellationSource.token.isCancellationRequested) {
+            if (!refreshed || !operationIsCurrent()) {
               return { canceled: true };
             }
 
@@ -1751,7 +1971,7 @@ class DependencyHealthProvider {
         return;
       }
 
-      if (!this._ownsDependencyOperation(operation)) {
+      if (!operationIsCurrent()) {
         return;
       }
 
@@ -1764,16 +1984,19 @@ class DependencyHealthProvider {
           buildPullSummaryMessage(result.pullResult, result.plan.skippedDependencies.length)
         );
       }
+    } catch (error) {
+      if (isDependencyRefreshCancellation(error, cancellationSource.token, operationIsCurrent)) {
+        return;
+      }
+      throw error;
     } finally {
-      cancellationSource.dispose();
-      if (this._activeDependencyOperation === operation) {
+      const ownedOperation = this._activeDependencyOperation === operation;
+      const ownedCancellation = this._activeDependencyCancellation === cancellationSource;
+      this._releaseDependencyCancellation(cancellationSource);
+      if (ownedOperation) {
         this._activeDependencyOperation = null;
       }
-      if (
-        this._activeDependencyOperation === null
-        && this._activeDependencyCancellation === cancellationSource
-      ) {
-        this._activeDependencyCancellation = null;
+      if ((ownedOperation || ownedCancellation) && !this._disposed) {
         await this._updateContexts();
         this.refresh();
       }
@@ -1837,14 +2060,21 @@ class DependencyHealthProvider {
     };
     if (!scopeIsCurrent()) return;
 
-    const operation = this._beginDependencyOperation(account);
-    if (!operation) return;
     const cancellationSource = this._createCancellationSource();
+    const operation = this._beginDependencyOperation(account, cancellationSource, {
+      isCurrent: invocationIsCurrent,
+    });
+    if (!operation) {
+      this._releaseDependencyCancellation(cancellationSource);
+      return;
+    }
     this._activeDependencyCancellation = cancellationSource;
+    const operationIsCurrent = () => this._ownsDependencyOperation(operation);
     let prepared = null;
 
     try {
-      await this._updateContexts();
+      await this._updateContexts({ isCurrent: operationIsCurrent });
+      if (!operationIsCurrent()) return;
       const result = await this._userInteraction.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -1854,10 +2084,12 @@ class DependencyHealthProvider {
         async (progress, token) => {
           const subscription = token.onCancellationRequested(() => cancellationSource.cancel());
           try {
+            if (!operationIsCurrent()) return { canceled: true };
             progress.report({ message: "Inspecting repository upstreams..." });
+            if (!operationIsCurrent()) return { canceled: true };
             prepared = await this._services.upstreamPullService.prepareSingle({
-              workspace: this.lastWorkspace,
-              repositoryHint: this.lastRepo,
+              workspace: operation.scope.workspace,
+              repositoryHint: operation.scope.repository,
               dependency,
               cancellationToken: cancellationSource.token,
               account,
@@ -1865,7 +2097,7 @@ class DependencyHealthProvider {
             if (
               !prepared
               || cancellationSource.token.isCancellationRequested
-              || !this._ownsDependencyOperation(operation)
+              || !operationIsCurrent()
               || !scopeIsCurrent()
             ) {
               return cancellationSource.token.isCancellationRequested
@@ -1874,7 +2106,15 @@ class DependencyHealthProvider {
             }
 
             const repositorySlug = String(prepared.repository?.slug || "").trim();
-            if (!repositorySlug) return null;
+            const preparedAuthority = this._createDependencyRefreshAuthority(
+              operation,
+              prepared.workspace,
+              repositorySlug,
+              cancellationSource.token
+            );
+            if (!preparedAuthority || !this._ownsDependencyRefreshAuthority(preparedAuthority)) {
+              return { canceled: true };
+            }
             const confirmed = await this._userInteraction.showWarningMessage(
               `Pull ${formatSingleDependencyLabel(prepared.dependency)} into ${prepared.workspace}/${repositorySlug}? This may use upstream credentials and write a package to Cloudsmith.`,
               { modal: true },
@@ -1883,13 +2123,14 @@ class DependencyHealthProvider {
             if (
               confirmed !== "Pull dependency"
               || cancellationSource.token.isCancellationRequested
-              || !this._ownsDependencyOperation(operation)
+              || !operationIsCurrent()
               || !scopeIsCurrent()
             ) {
               return { canceled: true };
             }
 
             progress.report({ message: "Triggering upstream pull..." });
+            if (!operationIsCurrent()) return { canceled: true };
             const execution = await this._services.upstreamPullService.execute(prepared, {
               progress,
               token: cancellationSource.token,
@@ -1899,7 +2140,7 @@ class DependencyHealthProvider {
               return execution || { canceled: true };
             }
 
-            if (!this._ownsDependencyOperation(operation)) {
+            if (!operationIsCurrent()) {
               return { canceled: true };
             }
 
@@ -1911,14 +2152,15 @@ class DependencyHealthProvider {
               const verificationReceipt = execution.verificationReceipts instanceof Map
                 ? execution.verificationReceipts.get(getDependencyArtifactKey(prepared.dependency))
                 : null;
-              await this._refreshSingleDependencyAfterPull(
+              const refreshed = await this._refreshSingleDependencyAfterPull(
                 prepared.workspace,
                 prepared.repository.slug,
                 prepared.dependency,
                 progress,
                 cancellationSource.token,
-                { verificationReceipt }
+                { operation, verificationReceipt }
               );
+              if (!refreshed || !operationIsCurrent()) return { canceled: true };
             }
 
             return {
@@ -1935,7 +2177,7 @@ class DependencyHealthProvider {
         return;
       }
 
-      if (!this._ownsDependencyOperation(operation)) {
+      if (!operationIsCurrent()) {
         return;
       }
 
@@ -1953,16 +2195,19 @@ class DependencyHealthProvider {
       } else {
         this._userInteraction.showInformationMessage(notification.message);
       }
+    } catch (error) {
+      if (isDependencyRefreshCancellation(error, cancellationSource.token, operationIsCurrent)) {
+        return;
+      }
+      throw error;
     } finally {
-      cancellationSource.dispose();
-      if (this._activeDependencyOperation === operation) {
+      const ownedOperation = this._activeDependencyOperation === operation;
+      const ownedCancellation = this._activeDependencyCancellation === cancellationSource;
+      this._releaseDependencyCancellation(cancellationSource);
+      if (ownedOperation) {
         this._activeDependencyOperation = null;
       }
-      if (
-        this._activeDependencyOperation === null
-        && this._activeDependencyCancellation === cancellationSource
-      ) {
-        this._activeDependencyCancellation = null;
+      if ((ownedOperation || ownedCancellation) && !this._disposed) {
         await this._updateContexts();
         this.refresh();
       }
@@ -1982,17 +2227,26 @@ class DependencyHealthProvider {
     token,
     options = {}
   ) {
-    await this._refreshCoverageForDependencies(
+    const authority = this._createDependencyRefreshAuthority(
+      options.operation,
+      cloudsmithWorkspace,
+      cloudsmithRepo,
+      token
+    );
+    if (!authority || !this._ownsDependencyRefreshAuthority(authority)) return false;
+    const result = await this._refreshCoverageForDependencies(
       cloudsmithWorkspace,
       cloudsmithRepo,
       null,
       progress,
       token,
       {
+        authority,
         refreshRemainingUpstream: true,
         verificationReceipts: options.verificationReceipts || null,
       }
     );
+    return result !== null && this._ownsDependencyRefreshAuthority(authority);
   }
 
   async _refreshSingleDependencyAfterPull(
@@ -2003,14 +2257,25 @@ class DependencyHealthProvider {
     token,
     options = {}
   ) {
-    await this._refreshCoverageForDependencies(
+    const authority = this._createDependencyRefreshAuthority(
+      options.operation,
+      cloudsmithWorkspace,
+      cloudsmithRepo,
+      token
+    );
+    if (!authority || !this._ownsDependencyRefreshAuthority(authority)) return false;
+    const result = await this._refreshCoverageForDependencies(
       cloudsmithWorkspace,
       cloudsmithRepo,
       [dependency],
       progress,
       token,
-      { verificationReceipt: options.verificationReceipt || null }
+      {
+        authority,
+        verificationReceipt: options.verificationReceipt || null,
+      }
     );
+    return result !== null && this._ownsDependencyRefreshAuthority(authority);
   }
 
   async _refreshCoverageForDependencies(
@@ -2021,6 +2286,13 @@ class DependencyHealthProvider {
     token,
     options = {}
   ) {
+    const authority = options.authority || null;
+    const isCurrent = authority
+      ? () => this._ownsDependencyRefreshAuthority(authority)
+      : typeof options.isCurrent === "function"
+        ? options.isCurrent
+        : () => true;
+    if (!publicationIsCurrent(token, isCurrent)) return null;
     const targetKeys = new Set(
       (Array.isArray(targetDependencies) ? targetDependencies : [])
         .map((dependency) => coverageLookupKey(dependency))
@@ -2037,9 +2309,13 @@ class DependencyHealthProvider {
     const totalDependencies = unresolvedDependencies.length;
 
     if (totalDependencies === 0) {
-      await this._publishDiagnostics(token);
+      if (!await this._publishDiagnostics(token, { isCurrent })) return null;
+      if (!publicationIsCurrent(token, isCurrent)) return null;
       this._rebuildSummary();
-      await this._storeReportData(this._reportDateFactory());
+      if (!publicationIsCurrent(token, isCurrent)) return null;
+      if (!await this._storeReportData(this._reportDateFactory(), { authority, isCurrent })) {
+        return null;
+      }
       return [];
     }
 
@@ -2067,8 +2343,10 @@ class DependencyHealthProvider {
         progressLabel: "Refreshing Cloudsmith coverage",
         verificationReceipt: options.verificationReceipt || null,
         verificationReceipts: options.verificationReceipts || null,
+        isCurrent,
       }
     );
+    if (!publicationIsCurrent(token, isCurrent)) return null;
 
     const newlyFoundDependencies = uniqueDependenciesForCoverage(
       this._fullTrees
@@ -2083,18 +2361,34 @@ class DependencyHealthProvider {
     );
 
     if (newlyFoundDependencies.length > 0) {
+      if (!publicationIsCurrent(token, isCurrent)) return null;
       progress.report({
         message: targetKeys.size > 0
           ? "Enriching pulled dependency..."
           : "Enriching newly covered dependencies...",
       });
+      if (!publicationIsCurrent(token, isCurrent)) return null;
+      const enrichmentOptions = {
+        account: authority?.operation?.account || null,
+        isCurrent,
+      };
       const enrichmentResults = await Promise.allSettled([
-        this._runVulnerabilityEnrichment(newlyFoundDependencies, cloudsmithWorkspace, progress, token),
-        this._runLicenseEnrichment(newlyFoundDependencies, token),
-        this._runPolicyEnrichment(newlyFoundDependencies, token),
+        this._runVulnerabilityEnrichment(
+          newlyFoundDependencies,
+          cloudsmithWorkspace,
+          progress,
+          token,
+          enrichmentOptions
+        ),
+        this._runLicenseEnrichment(newlyFoundDependencies, token, enrichmentOptions),
+        this._runPolicyEnrichment(newlyFoundDependencies, token, enrichmentOptions),
       ]);
+      if (!publicationIsCurrent(token, isCurrent)) return null;
       for (const result of enrichmentResults) {
-        if (result.status === "rejected") {
+        if (
+          result.status === "rejected"
+          && !isDependencyEnrichmentCancellation(result.reason, token, isCurrent)
+        ) {
           appendUniqueWarning(
             this._warnings,
             safeEnrichmentFailureMessage()
@@ -2104,25 +2398,37 @@ class DependencyHealthProvider {
     }
 
     if (options.refreshRemainingUpstream) {
+      if (!publicationIsCurrent(token, isCurrent)) return null;
       const remainingUncovered = this._fullTrees
         .flatMap((tree) => tree.dependencies)
         .filter((dependency) => isAbsentCoverageStatus(dependency.cloudsmithStatus));
       if (remainingUncovered.length > 0) {
         progress.report({ message: "Refreshing upstream availability..." });
+        if (!publicationIsCurrent(token, isCurrent)) return null;
         await this._runUpstreamGapAnalysis(
           remainingUncovered,
           cloudsmithWorkspace,
           cloudsmithRepo,
           progress,
-          token
+          token,
+          {
+            account: authority?.operation?.account || null,
+            isCurrent,
+          }
         );
+        if (!publicationIsCurrent(token, isCurrent)) return null;
       }
     }
 
-    await this._publishDiagnostics(token);
+    if (!await this._publishDiagnostics(token, { isCurrent })) return null;
+    if (!publicationIsCurrent(token, isCurrent)) return null;
     this._rebuildSummary();
-    await this._storeReportData(this._reportDateFactory());
-    this.refresh();
+    if (!publicationIsCurrent(token, isCurrent)) return null;
+    if (!await this._storeReportData(this._reportDateFactory(), { authority, isCurrent })) {
+      return null;
+    }
+    if (!publicationIsCurrent(token, isCurrent)) return null;
+    this.refresh({ isCurrent });
 
     return newlyFoundDependencies;
   }
@@ -2297,13 +2603,16 @@ class DependencyHealthProvider {
     return null;
   }
 
-  refresh() {
-    if (this._disposed) return;
+  refresh(options = {}) {
+    const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : null;
+    if (this._disposed || (isCurrent && !safeAuthorityCheck(isCurrent))) return false;
     this._vulnerabilityTreeGeneration += 1;
     this._vulnerabilitySummaries.clear();
     this._clearVulnerabilityRefreshTimers();
-    void this._updateContexts().catch(() => {});
+    void this._updateContexts({ isCurrent }).catch(() => {});
+    if (isCurrent && !safeAuthorityCheck(isCurrent)) return false;
     this._onDidChangeTreeData.fire();
+    return true;
   }
 
   refreshNode(element) {
@@ -2382,6 +2691,7 @@ class DependencyHealthProvider {
     if (
       !this._disposed
       && this._reportData
+      && !this._isDependencyOperationRunning()
       && event?.state?.status !== REPORT_VULNERABILITY_STATES.LOADING
     ) {
       this._reportData = this._buildComplianceReportData(this._lastScanTimestamp);
@@ -2454,9 +2764,7 @@ class DependencyHealthProvider {
       this._activeScanCancellation = null;
     }
     if (this._activeDependencyCancellation) {
-      this._activeDependencyCancellation.cancel();
-      this._activeDependencyCancellation.dispose();
-      this._activeDependencyCancellation = null;
+      this._releaseDependencyCancellation(this._activeDependencyCancellation, { cancel: true });
     }
     this._detachDependencyOperation();
     this._onDidChangeTreeData.dispose();
@@ -2486,6 +2794,76 @@ function accountIdentity(state) {
     activationId: state.activationId,
     accountEpoch: state.accountEpoch,
   });
+}
+
+function normalizeAuthorityScopePart(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (
+    !normalized
+    || normalized.length > 256
+    || LOOKUP_CONTROL_OR_BIDI.test(normalized)
+    || /[\\/?#]/u.test(normalized)
+  ) return null;
+  return normalized;
+}
+
+function snapshotDependencyScope(scope) {
+  if (!scope || typeof scope !== "object") return null;
+  const workspace = normalizeAuthorityScopePart(scope.workspace);
+  const repository = scope.repository == null
+    ? null
+    : normalizeAuthorityScopePart(scope.repository);
+  const projectFolder = typeof scope.projectFolder === "string" && scope.projectFolder
+    ? scope.projectFolder
+    : null;
+  if (!workspace || (scope.repository != null && !repository) || !projectFolder) return null;
+  return Object.freeze({ workspace, repository, projectFolder });
+}
+
+function sameDependencyScope(left, right) {
+  const normalizedLeft = snapshotDependencyScope(left);
+  const normalizedRight = snapshotDependencyScope(right);
+  return Boolean(
+    normalizedLeft
+    && normalizedRight
+    && normalizedLeft.workspace === normalizedRight.workspace
+    && normalizedLeft.repository === normalizedRight.repository
+    && normalizedLeft.projectFolder === normalizedRight.projectFolder
+  );
+}
+
+function safeAuthorityCheck(isCurrent) {
+  try {
+    return typeof isCurrent !== "function" || isCurrent() === true;
+  } catch {
+    return false;
+  }
+}
+
+function publicationIsCurrent(token, isCurrent) {
+  return Boolean(
+    !(token && token.isCancellationRequested)
+    && safeAuthorityCheck(isCurrent)
+  );
+}
+
+function isDependencyRefreshCancellation(error, token, isCurrent) {
+  return Boolean(
+    (token && token.isCancellationRequested)
+    || !safeAuthorityCheck(isCurrent)
+    || error instanceof DiagnosticPreparationCancelledError
+    || error?.code === "ERR_DEPENDENCY_DIAGNOSTIC_PREPARATION_CANCELLED"
+    || error?.code === "ERR_DEPENDENCY_ENRICHMENT_CANCELLED"
+  );
+}
+
+function isDependencyEnrichmentCancellation(error, token, isCurrent) {
+  return Boolean(
+    (token && token.isCancellationRequested)
+    || !safeAuthorityCheck(isCurrent)
+    || error?.code === "ERR_DEPENDENCY_ENRICHMENT_CANCELLED"
+  );
 }
 
 function sameAccountIdentity(left, right) {
@@ -4776,14 +5154,16 @@ function buildComplianceReportData(projectName, dependencies, options = {}) {
       }
 
       const licenseData = dependency.license || null;
-      const inspection = dependency.cloudsmithPackage
-        ? LicenseClassifier.inspect(dependency.cloudsmithPackage)
-        : LicenseClassifier.inspect(null);
+      const inspection = getDependencyLicenseInspection(dependency);
+      const compatibilitySpdx = !isExactPackage(dependency.cloudsmithPackage)
+        ? dependency.spdx_license
+        : null;
       const spdx = licenseData && licenseData.spdx
         ? licenseData.spdx
-        : dependency.spdx_license
-          ? dependency.spdx_license
-          : inspection.spdxLicense || inspection.displayValue || "";
+        : inspection.spdxLicense
+          || inspection.displayValue
+          || compatibilitySpdx
+          || "";
 
       return {
         ...complianceRowProvenance(dependency),
@@ -5164,7 +5544,7 @@ function buildDependencyHealthReport(projectName, dependencies, summary, generat
     .filter((dependency) => isAbsentCoverageStatus(dependency.cloudsmithStatus))
     .sort((left, right) => compareDependencies(left, right, SORT_MODES.COVERAGE, false));
   const policyViolations = reportDependencies
-    .filter((dependency) => dependency.policy && dependency.policy.violated)
+    .filter((dependency) => getDependencyPolicyData(dependency)?.violated === true)
     .sort((left, right) => compareDependencies(left, right, SORT_MODES.SEVERITY, false));
 
   const lines = [
@@ -5233,7 +5613,9 @@ function buildDependencyHealthReport(projectName, dependencies, summary, generat
     lines.push("");
     lines.push("## Policy Compliance");
     for (const dependency of policyViolations) {
-      const reason = dependency.policy.denied ? "deny policy violated" : "policy violated";
+      const policy = getDependencyPolicyData(dependency);
+      const reason = policy.statusReason
+        || (policy.denied ? "deny policy violated" : "policy violated");
       lines.push(`- ${dependency.name} ${dependency.version || ""} — ${reason}`.trim());
     }
   }
@@ -5298,7 +5680,9 @@ function getDependencyVulnerabilityData(dependency) {
     countKnown: state.count !== null,
     detected: state.detected,
     unknown: state.unknown,
-    maxSeverity: cloudsmithPackage.max_severity || null,
+    maxSeverity: isExactPackage(cloudsmithPackage)
+      ? cloudsmithPackage.vulnerability.maxSeverity
+      : cloudsmithPackage.max_severity || null,
   };
 }
 
@@ -5319,21 +5703,58 @@ function getDependencyPolicyData(dependency) {
     return null;
   }
 
-  const status = String(cloudsmithPackage.status_str || "").trim() || null;
+  const exact = isExactPackage(cloudsmithPackage);
+  const status = String(
+    exact ? cloudsmithPackage.status || "" : cloudsmithPackage.status_str || ""
+  ).trim() || null;
   const quarantined = status === "Quarantined";
-  const denied = quarantined || Boolean(cloudsmithPackage.deny_policy_violated);
-  const violated = denied
-    || Boolean(cloudsmithPackage.policy_violated)
-    || Boolean(cloudsmithPackage.license_policy_violated)
-    || Boolean(cloudsmithPackage.vulnerability_policy_violated);
+  const denied = quarantined || Boolean(
+    exact
+      ? cloudsmithPackage.policy.denyViolated
+      : cloudsmithPackage.deny_policy_violated
+  );
+  const violated = denied || Boolean(
+    exact
+      ? cloudsmithPackage.policy.violated
+        || cloudsmithPackage.policy.licenseViolated
+        || cloudsmithPackage.policy.vulnerabilityViolated
+      : cloudsmithPackage.policy_violated
+        || cloudsmithPackage.license_policy_violated
+        || cloudsmithPackage.vulnerability_policy_violated
+  );
 
   return {
     violated,
     denied,
     quarantined,
     status,
-    statusReason: String(cloudsmithPackage.status_reason || "").trim() || null,
+    statusReason: String(
+      exact ? cloudsmithPackage.statusReason || "" : cloudsmithPackage.status_reason || ""
+    ).trim() || null,
   };
+}
+
+function getDependencyLicenseInspection(dependency) {
+  if (dependency?.license) {
+    return LicenseClassifier.inspect({
+      license: dependency.license.display || dependency.license.raw || null,
+      spdx_license: dependency.license.spdx || null,
+      raw_license: dependency.license.raw || null,
+      license_url: dependency.license.url || null,
+    });
+  }
+
+  const cloudsmithPackage = dependency?.cloudsmithPackage;
+  if (!cloudsmithPackage) return LicenseClassifier.inspect(null);
+  if (!isExactPackage(cloudsmithPackage)) {
+    return LicenseClassifier.inspect(cloudsmithPackage);
+  }
+  return LicenseClassifier.inspect({
+    license: cloudsmithPackage.license.declared,
+    spdx_license: cloudsmithPackage.license.spdx,
+    raw_license: cloudsmithPackage.license.raw,
+    license_url: cloudsmithPackage.license.url,
+  });
 }
 
 function getDependencyLicenseClassification(dependency) {
@@ -5341,11 +5762,7 @@ function getDependencyLicenseClassification(dependency) {
     return dependency.license.classification;
   }
 
-  if (!dependency.cloudsmithPackage) {
-    return "unknown";
-  }
-
-  const inspection = LicenseClassifier.inspect(dependency.cloudsmithPackage);
+  const inspection = getDependencyLicenseInspection(dependency);
   switch (inspection.tier) {
     case "permissive":
       return "permissive";
