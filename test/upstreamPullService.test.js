@@ -4,11 +4,16 @@ const {
   findPythonDistributionUrl,
 } = require("../util/registryEndpoints");
 const {
+  PULL_STATUS,
   UpstreamPullService: UpstreamPullServiceImplementation,
 } = require("../util/upstreamPullService");
 const { UpstreamChecker } = require("../util/upstreamChecker");
 const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
 const { getDependencyArtifactKey } = require("../util/dependencyRecord");
+const {
+  createBulkScanAbsenceEvidence,
+  getReusableBulkScanAbsenceProof,
+} = require("../util/exactPackageEvidence");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 
 function createResponse(status, body, headers = {}) {
@@ -450,7 +455,8 @@ suite("UpstreamPullService", () => {
     });
 
     assert.strictEqual(calls.length, 2);
-    assert.deepStrictEqual(result, {
+    const { package: exactPackage, ...outcome } = result;
+    assert.deepStrictEqual(outcome, {
       workspace: "workspace",
       repository: "repo-b",
       absent: false,
@@ -458,6 +464,9 @@ suite("UpstreamPullService", () => {
       complete: true,
       stale: false,
     });
+    assert.strictEqual(exactPackage.workspace, "workspace");
+    assert.strictEqual(exactPackage.repository, "repo-b");
+    assert.strictEqual(exactPackage.packageIdentifier, "target-package-1");
   });
 
   test("exact pull absence lookup accepts only authoritative exhaustive absence", async () => {
@@ -1227,7 +1236,7 @@ suite("UpstreamPullService", () => {
     assert.strictEqual(result.stale, true);
   });
 
-  test("pull-all verifies exact target absence before confirmation and again before write", async () => {
+  test("pull-all establishes exact target absence once before confirmation and carries the proof into write", async () => {
     const absenceCalls = [];
     const confirmations = [];
     const events = [];
@@ -1298,17 +1307,223 @@ suite("UpstreamPullService", () => {
     assert.strictEqual(result.pullResult.cached, 1);
     assert.deepStrictEqual(absenceCalls, [
       { workspace: "workspace", repository: "repo-b", name: "target-package" },
-      { workspace: "workspace", repository: "repo-b", name: "target-package" },
     ]);
     assert.strictEqual(confirmations.length, 1);
     assert.deepStrictEqual(events, [
       "repository-pick",
       "absence-1",
       "confirm",
-      "absence-2",
       "credential",
       "registry-write",
     ]);
+  });
+
+  test("bulk preparation reuses 100 current authoritative scan absences without package lookups", async () => {
+    const account = { activationId: "account-a", accountEpoch: 1 };
+    const token = cancellationToken();
+    const dependencies = Array.from({ length: 100 }, (_, index) => ({
+      name: `package-${index}`,
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "ABSENT",
+    }));
+    const absenceEvidence = createBulkScanAbsenceEvidence({
+      account,
+      workspace: "workspace",
+      repository: null,
+      projectFolder: "/project",
+      scanId: 7,
+      selectionGeneration: 3,
+      operationId: 11,
+      cancellationToken: token,
+      dependencies,
+    });
+    let absenceLookups = 0;
+    let confirmations = 0;
+    const service = new UpstreamPullService({}, {
+      connectionManager: {
+        getState() { return { ...account, sessionConnected: true }; },
+        getAuthenticationCapabilities: apiKeyCapabilities,
+      },
+      fetchRepositories: async () => ({
+        items: [{ slug: "repo", name: "Repo" }],
+        complete: true,
+      }),
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
+          return completeRepositoryState({
+            npm: [safeUpstream("npm", "npm", { is_active: true })],
+          });
+        },
+      },
+      checkPackageAbsence: async () => {
+        absenceLookups += 1;
+        throw new Error("current scan evidence should own this absence");
+      },
+      showQuickPick: async items => items[0],
+      showWarningMessage: async (_message, _options, action) => {
+        confirmations += 1;
+        return action;
+      },
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+    });
+
+    const prepared = await service.prepare({
+      workspace: "workspace",
+      dependencies,
+      cancellationToken: token,
+      account,
+      absenceEvidence,
+      isCurrent: () => true,
+      projectFolder: "/project",
+    });
+
+    assert.ok(prepared);
+    assert.strictEqual(absenceLookups, 0);
+    assert.strictEqual(confirmations, 1);
+    assert.strictEqual(prepared.plan.pullableDependencies.length, 100);
+  });
+
+  test("bulk scan absence evidence fails closed across status, account, scope, project, and operation token", () => {
+    const account = { activationId: "account-a", accountEpoch: 1 };
+    const token = cancellationToken();
+    const absent = {
+      name: "absent-package",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "ABSENT",
+    };
+    const unknown = {
+      name: "unknown-package",
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "UNKNOWN",
+    };
+    const evidence = createBulkScanAbsenceEvidence({
+      account,
+      workspace: "workspace",
+      repository: "repo",
+      projectFolder: "/project",
+      scanId: 7,
+      selectionGeneration: 3,
+      operationId: 11,
+      cancellationToken: token,
+      dependencies: [absent, unknown],
+    });
+    const expected = {
+      account,
+      workspace: "workspace",
+      repository: "repo",
+      projectFolder: "/project",
+      dependency: absent,
+      cancellationToken: token,
+    };
+
+    assert.ok(getReusableBulkScanAbsenceProof(evidence, expected));
+    assert.strictEqual(getReusableBulkScanAbsenceProof(evidence, {
+      ...expected,
+      dependency: unknown,
+    }), null);
+    assert.strictEqual(getReusableBulkScanAbsenceProof(evidence, {
+      ...expected,
+      account: { activationId: "account-b", accountEpoch: 2 },
+    }), null);
+    assert.strictEqual(getReusableBulkScanAbsenceProof(evidence, {
+      ...expected,
+      repository: "other-repo",
+    }), null);
+    assert.strictEqual(getReusableBulkScanAbsenceProof(evidence, {
+      ...expected,
+      projectFolder: "/other-project",
+    }), null);
+    assert.strictEqual(getReusableBulkScanAbsenceProof(evidence, {
+      ...expected,
+      cancellationToken: cancellationToken(),
+    }), null);
+    token.cancel();
+    assert.strictEqual(getReusableBulkScanAbsenceProof(evidence, expected), null);
+  });
+
+  test("bulk preparation verifies only missing scan evidence with eight bounded workers", async () => {
+    const account = { activationId: "account-a", accountEpoch: 1 };
+    const token = cancellationToken();
+    const dependencies = Array.from({ length: 100 }, (_, index) => ({
+      name: `package-${index}`,
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "ABSENT",
+    }));
+    const absenceEvidence = createBulkScanAbsenceEvidence({
+      account,
+      workspace: "workspace",
+      repository: "repo",
+      projectFolder: "/project",
+      scanId: 7,
+      selectionGeneration: 3,
+      operationId: 11,
+      cancellationToken: token,
+      dependencies: dependencies.slice(0, 87),
+    });
+    const gate = deferred();
+    let lookups = 0;
+    let active = 0;
+    let maxActive = 0;
+    const service = new UpstreamPullService({}, {
+      connectionManager: {
+        getState() { return { ...account, sessionConnected: true }; },
+        getAuthenticationCapabilities: apiKeyCapabilities,
+      },
+      fetchRepositories: async () => ({
+        items: [{ slug: "repo", name: "Repo" }],
+        complete: true,
+      }),
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
+          return completeRepositoryState({
+            npm: [safeUpstream("npm", "npm", { is_active: true })],
+          });
+        },
+      },
+      checkPackageAbsence: async ({ workspace, repository }) => {
+        lookups += 1;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await gate.promise;
+        active -= 1;
+        return {
+          workspace,
+          repository,
+          absent: true,
+          present: false,
+          complete: true,
+          stale: false,
+        };
+      },
+      showQuickPick: async items => items[0],
+      showWarningMessage: async (_message, _options, action) => action,
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+    });
+
+    const pending = service.prepare({
+      workspace: "workspace",
+      dependencies,
+      cancellationToken: token,
+      account,
+      absenceEvidence,
+      projectFolder: "/project",
+      isCurrent: () => true,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(lookups, 8);
+    gate.resolve();
+    const prepared = await pending;
+
+    assert.ok(prepared);
+    assert.strictEqual(lookups, 13);
+    assert.strictEqual(maxActive, 8);
   });
 
   test("pull-all and pull-single repository picks bound and neutralize hostile names", async () => {
@@ -1549,13 +1764,19 @@ suite("UpstreamPullService", () => {
         const prepared = method === "prepare"
           ? await service.prepare({ workspace: "workspace", dependencies: [dependency] })
           : await service.prepareSingle({ workspace: "workspace", dependency });
-        assert.strictEqual(prepared, null, `${testCase.name}:${method}`);
+        if (testCase.name === "present" && method === "prepare") {
+          assert.ok(prepared, `${testCase.name}:${method}`);
+          assert.strictEqual(prepared.plan.pullableDependencies.length, 0);
+          assert.strictEqual(prepared.plan.alreadyExistingDependencies.length, 1);
+        } else {
+          assert.strictEqual(prepared, null, `${testCase.name}:${method}`);
+        }
         assert.strictEqual(confirmationCalls, 0, `${testCase.name}:${method}`);
       }
     }
   });
 
-  test("a package appearing after confirmation becomes already-exists without a registry write", async () => {
+  test("a package appearing after single-package preparation becomes already-exists without a registry write", async () => {
     let absenceChecks = 0;
     let pullCalls = 0;
     const service = new UpstreamPullService({}, {
@@ -1592,15 +1813,16 @@ suite("UpstreamPullService", () => {
       throw new Error("must not write");
     };
 
-    const result = await service.run({
+    const prepared = await service.prepareSingle({
       workspace: "workspace",
-      dependencies: [{
+      dependency: {
         name: "target-package",
         version: "1.0.0",
         format: "npm",
         cloudsmithStatus: "ABSENT",
-      }],
+      },
     });
+    const result = await service.execute(prepared);
 
     assert.strictEqual(absenceChecks, 2);
     assert.strictEqual(pullCalls, 0);
@@ -1908,6 +2130,7 @@ suite("UpstreamPullService", () => {
   test("prepare builds a mixed-ecosystem confirmation with skipped formats", async () => {
     const warnings = [];
     const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
       fetchRepositories: async () => ({
         items: [{ slug: "repo", name: "Repo" }],
         complete: true,
@@ -1957,6 +2180,20 @@ suite("UpstreamPullService", () => {
     assert.match(
       warnings[0],
       /1 Python will be skipped \(no matching upstream is configured on this repository\)\./
+    );
+    service._pullDependency = async (_workspace, _repository, dependency) => ({
+      dependency,
+      status: PULL_STATUS.CACHED,
+      errorMessage: null,
+      networkError: false,
+    });
+    const execution = await service.execute(prepared);
+    assert.strictEqual(execution.pullResult.total, 2);
+    assert.strictEqual(execution.pullResult.cached, 1);
+    assert.strictEqual(execution.pullResult.skipped, 1);
+    assert.strictEqual(
+      execution.pullResult.details.find(detail => detail.dependency.name === "requests").status,
+      PULL_STATUS.SKIPPED
     );
   });
 
@@ -2969,11 +3206,98 @@ suite("UpstreamPullService", () => {
     });
 
     assert.strictEqual(calls.length, 3);
-    assert.strictEqual(result.pullResult.errors, 5);
-    assert.strictEqual(result.pullResult.authFailed, 5);
+    assert.strictEqual(result.pullResult.errors, 3);
+    assert.strictEqual(result.pullResult.authFailed, 3);
+    assert.strictEqual(result.pullResult.skipped, 2);
     assert.deepStrictEqual(errors, [
       "Authentication failed. Check Cloudsmith authentication in Settings and retry.",
     ]);
+  });
+
+  test("bulk trigger workers release before package visibility and start dependency six", async () => {
+    const visibility = deferred();
+    const threeTriggersStarted = deferred();
+    const triggeredKeys = new Set();
+    const triggerStarts = [];
+    let activeTriggers = 0;
+    let maxActiveTriggers = 0;
+    const dependencies = Array.from({ length: 100 }, (_, index) => ({
+      name: `package-${index}`,
+      version: "1.0.0",
+      format: "npm",
+      cloudsmithStatus: "ABSENT",
+    }));
+    const service = new UpstreamPullService({}, {
+      credentialManager: { async getApiKey() { return "api-key"; } },
+      fetchRepositories: async () => ({
+        items: [{ slug: "repo", name: "Repo" }],
+        complete: true,
+      }),
+      upstreamRuntime: {
+        async getRepositoryUpstreamStateForFormats() {
+          return completeRepositoryState({
+            npm: [safeUpstream("npm", "npm", { is_active: true })],
+          });
+        },
+      },
+      checkPackageAbsence: async ({ workspace, repository, dependency }) => {
+        if (!triggeredKeys.has(getDependencyArtifactKey(dependency))) {
+          return {
+            workspace,
+            repository,
+            absent: true,
+            present: false,
+            complete: true,
+            stale: false,
+          };
+        }
+        await visibility.promise;
+        return {
+          workspace,
+          repository,
+          absent: false,
+          present: true,
+          complete: true,
+          stale: false,
+        };
+      },
+      showQuickPick: async items => items[0],
+      showWarningMessage: async (_message, _options, action) => action,
+      showErrorMessage: async () => {},
+      showInformationMessage: async () => {},
+    });
+    service._pullDependency = async (_workspace, _repository, dependency) => {
+      activeTriggers += 1;
+      maxActiveTriggers = Math.max(maxActiveTriggers, activeTriggers);
+      triggerStarts.push(dependency.name);
+      triggeredKeys.add(getDependencyArtifactKey(dependency));
+      if (triggerStarts.length === 3) threeTriggersStarted.resolve();
+      await Promise.resolve();
+      activeTriggers -= 1;
+      return {
+        dependency,
+        status: "pending",
+        errorMessage: null,
+        networkError: false,
+        triggerSucceeded: true,
+      };
+    };
+
+    const pending = service.run({
+      workspace: "workspace",
+      dependencies,
+    });
+    await threeTriggersStarted.promise;
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    const sixthStartedBeforeVisibility = triggerStarts.includes("package-5");
+    visibility.resolve();
+    const result = await pending;
+
+    assert.strictEqual(sixthStartedBeforeVisibility, true);
+    assert.ok(maxActiveTriggers <= 5);
+    assert.strictEqual(result.pullResult.cached, 0);
+    assert.strictEqual(result.pullResult.triggeredUnconfirmed, 100);
   });
 
   test("contains throwing status observers and drains every launched pull before returning", async () => {

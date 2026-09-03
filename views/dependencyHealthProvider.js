@@ -27,6 +27,8 @@ const {
 const { fetchWorkspaceRepositories } = require("../util/workspaceRepositoryFetcher");
 const { SearchQueryBuilder } = require("../util/searchQueryBuilder");
 const {
+  createBulkScanAbsenceEvidence,
+  getReusableBulkPreflightPresencePackage,
   packageCandidateEvidenceShapeIsValid,
   qualifierEvidenceIsIncomplete,
 } = require("../util/exactPackageEvidence");
@@ -66,6 +68,7 @@ const {
 } = require("../util/upstreamGapAnalyzer");
 const {
   PULL_STATUS,
+  buildPullResult,
   buildPullSummaryMessage,
 } = require("../util/upstreamPullService");
 const DependencyHealthNode = require("../models/dependencyHealthNode");
@@ -92,6 +95,7 @@ const LOOKUP_PAGE_SIZE = 100;
 const LOOKUP_MAX_PAGES = 100;
 const LOOKUP_CONCURRENCY = 8;
 const LOOKUP_MAX_REQUESTS_PER_RESOLUTION = 2000;
+const BULK_VERIFICATION_DEADLINE_MS = 150000;
 const LOOKUP_MAX_PACKAGE_NAME_LENGTH = 2048;
 const LOOKUP_MAX_PACKAGE_FORMAT_LENGTH = 100;
 const LOOKUP_MAX_PACKAGE_VERSION_LENGTH = 2048;
@@ -99,6 +103,16 @@ const COVERAGE_MATCH_BATCH_SIZE = 50;
 const ENRICHMENT_PROGRESS_DEBOUNCE_MS = 500;
 const LOOKUP_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
 const UPSTREAM_COVERAGE_INCOMPLETE_WARNING = "Upstream coverage is incomplete. Positive matches are shown; missing coverage remains unknown.";
+const BULK_VERIFICATION_DELAYS_MS = Object.freeze([
+  0,
+  1000,
+  2000,
+  4000,
+  8000,
+  15000,
+  30000,
+  60000,
+]);
 
 const CLOUDSMITH_COVERAGE_STATUS = Object.freeze({
   CHECKING: "CHECKING",
@@ -239,6 +253,7 @@ class DependencyHealthProvider {
     this._reportData = null;
     this._lastScanTimestamp = null;
     this._nextScanOperationId = 0;
+    this._lastSuccessfulScanId = 0;
     this._activeScanCancellation = null;
     this._activeDependencyCancellation = null;
     this._releasedDependencyCancellations = new WeakSet();
@@ -247,6 +262,12 @@ class DependencyHealthProvider {
     this._scanOperation = createScanOperation(SCAN_STATES.IDLE, 0);
     this._hasSuccessfulScan = false;
     this._selectionGeneration = 0;
+    this._bulkVerificationDelaysMs = normalizeBulkVerificationDelays(
+      options.bulkVerificationDelaysMs
+    );
+    this._bulkVerificationDeadlineMs = normalizeBulkVerificationDeadline(
+      options.bulkVerificationDeadlineMs
+    );
     this._dependencySelections = new WeakMap();
     this._accountResetOrchestrated = options.accountResetOrchestrated === true;
     this._accountIdentity = accountIdentity(this._connectionManager?.getState?.());
@@ -491,6 +512,7 @@ class DependencyHealthProvider {
     this._reportData = null;
     this._lastScanTimestamp = null;
     this._hasSuccessfulScan = false;
+    this._lastSuccessfulScanId = 0;
     this._scanOperation = createScanOperation(SCAN_STATES.IDLE, this._nextScanOperationId);
     if (this._diagnosticsPublisher) {
       this._diagnosticsPublisher.clear();
@@ -968,6 +990,7 @@ class DependencyHealthProvider {
     // Selection authority follows committed scan snapshots. Presentation-only
     // refreshes keep the prior rows visible and must not make their actions inert.
     this._selectionGeneration += 1;
+    this._lastSuccessfulScanId = operationId;
     this.lastWorkspace = scope.workspace;
     this.lastRepo = scope.repository;
     this._warnings = scanWorker._warnings;
@@ -1326,7 +1349,11 @@ class DependencyHealthProvider {
         requestBudget,
         options.verificationReceipt || null,
         options.verificationReceipts || null,
-        { isCurrent }
+        {
+          authority: options.authority || null,
+          isCurrent,
+          verificationResults: options.verificationResults || null,
+        }
       );
     }
 
@@ -1486,18 +1513,32 @@ class DependencyHealthProvider {
 
         let result;
         try {
+          const artifactKey = getDependencyArtifactKey(dependency);
+          const verified = options.verificationResults instanceof Map
+            ? options.verificationResults.get(artifactKey) || null
+            : null;
+          const verifiedResult = verified
+            && verified.authority?.operation === options.authority?.operation
+            && verified.authority?.token === options.authority?.token
+            && verified.authority?.workspace === options.authority?.workspace
+            && verified.authority?.repository === options.authority?.repository
+            && verified.artifactKey === artifactKey
+            && verified.result
+            && typeof verified.result.status === "string"
+            ? verified.result
+            : null;
           const dependencyVerificationReceipt = verificationReceipts instanceof Map
-            ? verificationReceipts.get(getDependencyArtifactKey(dependency)) || null
+            ? verificationReceipts.get(artifactKey) || null
             : verificationReceipt;
-          result = await lookupExactDependency({
-            api,
-            cloudsmithWorkspace,
-            cloudsmithRepo,
-            dependency,
-            token,
-            requestBudget,
-            verificationReceipt: dependencyVerificationReceipt,
-          });
+          result = verifiedResult || await lookupExactDependency({
+              api,
+              cloudsmithWorkspace,
+              cloudsmithRepo,
+              dependency,
+              token,
+              requestBudget,
+              verificationReceipt: dependencyVerificationReceipt,
+            });
         } catch {
           result = createCoverageLookupResult(
             CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED,
@@ -1911,6 +1952,17 @@ class DependencyHealthProvider {
     }
     this._activeDependencyCancellation = cancellationSource;
     const operationIsCurrent = () => this._ownsDependencyOperation(operation);
+    const absenceEvidence = createBulkScanAbsenceEvidence({
+      account,
+      workspace: operation.scope.workspace,
+      repository: operation.scope.repository,
+      projectFolder: operation.scope.projectFolder,
+      scanId: this._lastSuccessfulScanId,
+      selectionGeneration: operation.selectionGeneration,
+      operationId: operation.id,
+      cancellationToken: operation.cancellationToken,
+      dependencies,
+    });
 
     try {
       await this._updateContexts({ isCurrent: operationIsCurrent });
@@ -1934,6 +1986,9 @@ class DependencyHealthProvider {
               progress,
               token: cancellationSource.token,
               account,
+              absenceEvidence,
+              isCurrent: operationIsCurrent,
+              projectFolder: operation.scope.projectFolder,
             });
 
             if (!execution || execution.canceled) {
@@ -1941,6 +1996,19 @@ class DependencyHealthProvider {
             }
 
             if (!operationIsCurrent()) {
+              return { canceled: true };
+            }
+
+            progress.report({ message: "Verifying triggered dependencies..." });
+            const verification = await this._verifyBulkTriggeredDependencies(
+              execution,
+              execution.workspace,
+              execution.repository.slug,
+              progress,
+              cancellationSource.token,
+              { operation }
+            );
+            if (!verification || !operationIsCurrent()) {
               return { canceled: true };
             }
 
@@ -1953,6 +2021,8 @@ class DependencyHealthProvider {
               {
                 operation,
                 verificationReceipts: execution.verificationReceipts,
+                verificationResults: verification.results,
+                targetDependencies: verification.targetDependencies,
               }
             );
 
@@ -1960,7 +2030,13 @@ class DependencyHealthProvider {
               return { canceled: true };
             }
 
-            return execution;
+            return {
+              ...execution,
+              pullResult: reconcileBulkPullResult(
+                execution.pullResult,
+                verification.results
+              ),
+            };
           } finally {
             subscription.dispose();
           }
@@ -2001,6 +2077,188 @@ class DependencyHealthProvider {
         this.refresh();
       }
     }
+  }
+
+  async _verifyBulkTriggeredDependencies(
+    execution,
+    cloudsmithWorkspace,
+    cloudsmithRepo,
+    progress,
+    token,
+    options = {}
+  ) {
+    const authority = this._createDependencyRefreshAuthority(
+      options.operation,
+      cloudsmithWorkspace,
+      cloudsmithRepo,
+      token
+    );
+    if (!authority || !this._ownsDependencyRefreshAuthority(authority)) return null;
+
+    if (!execution?.pullResult || !Array.isArray(execution.pullResult.details)) {
+      return {
+        results: new Map(),
+        targetDependencies: null,
+        triggeredDependencies: [],
+      };
+    }
+
+    const triggeredDependencies = uniqueDependenciesForCoverage(
+      execution.pullResult.details
+        .filter(detail => detail?.status === PULL_STATUS.TRIGGERED)
+        .map(detail => detail.dependency)
+        .filter(Boolean)
+    );
+    const targetDependencies = uniqueDependenciesForCoverage(
+      execution.pullResult.details
+        .filter(detail => (
+          detail?.status === PULL_STATUS.TRIGGERED
+          || detail?.status === PULL_STATUS.ALREADY_EXISTS
+        ))
+        .map(detail => detail.dependency)
+        .filter(Boolean)
+    );
+    const unresolved = new Map(triggeredDependencies.map(dependency => [
+      getDependencyArtifactKey(dependency),
+      dependency,
+    ]));
+    const results = new Map();
+    for (const detail of execution.pullResult.details) {
+      if (detail?.status !== PULL_STATUS.ALREADY_EXISTS || !detail.dependency) continue;
+      const artifactKey = getDependencyArtifactKey(detail.dependency);
+      const pkg = getReusableBulkPreflightPresencePackage(execution.presenceEvidence, {
+        account: authority.operation.account,
+        workspace: cloudsmithWorkspace,
+        repository: cloudsmithRepo,
+        projectFolder: authority.operation.scope.projectFolder,
+        cancellationToken: token,
+        dependency: detail.dependency,
+      });
+      if (!pkg) continue;
+      results.set(artifactKey, Object.freeze({
+        authority,
+        artifactKey,
+        result: createCoverageLookupResult(
+          CLOUDSMITH_COVERAGE_STATUS.FOUND,
+          pkg,
+          null
+        ),
+      }));
+    }
+    if (unresolved.size === 0) {
+      return { results, targetDependencies, triggeredDependencies };
+    }
+
+    const api = this._services.createCloudsmithAPI();
+    const requestBudget = createLookupRequestBudget(LOOKUP_MAX_REQUESTS_PER_RESOLUTION);
+    const deadlineAt = this._scheduler.now() + this._bulkVerificationDeadlineMs;
+    const triggerEvidence = execution.triggerEvidence instanceof Map
+      ? execution.triggerEvidence
+      : new Map();
+
+    let rateLimited = false;
+    for (let attempt = 0; attempt < this._bulkVerificationDelaysMs.length; attempt += 1) {
+      if (!this._ownsDependencyRefreshAuthority(authority)) return null;
+      if (this._scheduler.now() >= deadlineAt) break;
+      const delayMs = this._bulkVerificationDelaysMs[attempt];
+      if (delayMs > 0) {
+        const remainingMs = deadlineAt - this._scheduler.now();
+        if (remainingMs <= 0) break;
+        const delayed = await this._delayBulkVerification(
+          Math.min(delayMs, remainingMs),
+          authority
+        );
+        if (!delayed || !this._ownsDependencyRefreshAuthority(authority)) return null;
+        if (this._scheduler.now() >= deadlineAt) break;
+      }
+
+      const pass = [...unresolved.entries()];
+      if (pass.length === 0) break;
+      progress.report({
+        message: `Verifying triggered dependencies... ${triggeredDependencies.length - pass.length}/${triggeredDependencies.length}`,
+      });
+      await runPromisePool(pass, LOOKUP_CONCURRENCY, async ([artifactKey, dependency]) => {
+        if (!this._ownsDependencyRefreshAuthority(authority)) return false;
+        if (rateLimited) return false;
+        if (this._scheduler.now() >= deadlineAt) return false;
+        let result;
+        try {
+          result = await lookupExactDependency({
+            api,
+            cloudsmithWorkspace,
+            cloudsmithRepo,
+            dependency,
+            token,
+            requestBudget,
+            verificationReceipt: triggerEvidence.get(artifactKey) || null,
+            deadlineAt,
+            now: this._scheduler.now,
+          });
+        } catch {
+          result = createCoverageLookupResult(
+            CLOUDSMITH_COVERAGE_STATUS.LOOKUP_FAILED,
+            null,
+            "The Cloudsmith lookup failed unexpectedly without confirming the triggered package."
+          );
+        }
+        if (!this._ownsDependencyRefreshAuthority(authority)) return false;
+        results.set(artifactKey, Object.freeze({
+          authority,
+          artifactKey,
+          result,
+        }));
+        if (result.status === CLOUDSMITH_COVERAGE_STATUS.RATE_LIMITED) {
+          rateLimited = true;
+          return false;
+        }
+        if (result.status === CLOUDSMITH_COVERAGE_STATUS.FOUND) {
+          unresolved.delete(artifactKey);
+        }
+        return true;
+      });
+      if (!this._ownsDependencyRefreshAuthority(authority)) return null;
+      if (unresolved.size === 0) break;
+      if (rateLimited) break;
+    }
+
+    for (const [artifactKey] of unresolved) {
+      if (results.has(artifactKey)) continue;
+      results.set(artifactKey, Object.freeze({
+        authority,
+        artifactKey,
+        result: createCoverageLookupResult(
+          CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE,
+          null,
+          "Cloudsmith did not confirm the triggered package before verification finished."
+        ),
+      }));
+    }
+
+    return { results, targetDependencies, triggeredDependencies };
+  }
+
+  _delayBulkVerification(delayMs, authority) {
+    if (delayMs <= 0) return Promise.resolve(this._ownsDependencyRefreshAuthority(authority));
+    return new Promise((resolve) => {
+      let settled = false;
+      let timeoutHandle = null;
+      let cancellation = null;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutHandle !== null) this._scheduler.clearTimeout(timeoutHandle);
+        cancellation?.dispose?.();
+        resolve(value);
+      };
+      cancellation = authority.token?.onCancellationRequested?.(() => finish(false));
+      if (!this._ownsDependencyRefreshAuthority(authority)) {
+        finish(false);
+        return;
+      }
+      timeoutHandle = this._scheduler.setTimeout(() => {
+        finish(this._ownsDependencyRefreshAuthority(authority));
+      }, delayMs);
+    });
   }
 
   async pullSingleDependency(value, options = {}) {
@@ -2093,6 +2351,7 @@ class DependencyHealthProvider {
               dependency,
               cancellationToken: cancellationSource.token,
               account,
+              isCurrent: operationIsCurrent,
             });
             if (
               !prepared
@@ -2134,6 +2393,7 @@ class DependencyHealthProvider {
             const execution = await this._services.upstreamPullService.execute(prepared, {
               progress,
               token: cancellationSource.token,
+              isCurrent: operationIsCurrent,
             });
 
             if (!execution || execution.canceled) {
@@ -2237,13 +2497,16 @@ class DependencyHealthProvider {
     const result = await this._refreshCoverageForDependencies(
       cloudsmithWorkspace,
       cloudsmithRepo,
-      null,
+      Object.prototype.hasOwnProperty.call(options, "targetDependencies")
+        ? options.targetDependencies
+        : null,
       progress,
       token,
       {
         authority,
         refreshRemainingUpstream: true,
         verificationReceipts: options.verificationReceipts || null,
+        verificationResults: options.verificationResults || null,
       }
     );
     return result !== null && this._ownsDependencyRefreshAuthority(authority);
@@ -2293,6 +2556,7 @@ class DependencyHealthProvider {
         ? options.isCurrent
         : () => true;
     if (!publicationIsCurrent(token, isCurrent)) return null;
+    const refreshAllDependencies = targetDependencies == null;
     const targetKeys = new Set(
       (Array.isArray(targetDependencies) ? targetDependencies : [])
         .map((dependency) => coverageLookupKey(dependency))
@@ -2303,7 +2567,7 @@ class DependencyHealthProvider {
         .flatMap((tree) => tree.dependencies)
         .filter((dependency) => (
           isAbsentCoverageStatus(dependency.cloudsmithStatus)
-          && (targetKeys.size === 0 || targetKeys.has(coverageLookupKey(dependency)))
+          && (refreshAllDependencies || targetKeys.has(coverageLookupKey(dependency)))
         ))
     );
     const totalDependencies = unresolvedDependencies.length;
@@ -2324,7 +2588,7 @@ class DependencyHealthProvider {
         .flatMap((tree) => tree.dependencies)
         .filter((dependency) => (
           dependency.cloudsmithStatus === "FOUND"
-          && (targetKeys.size === 0 || targetKeys.has(coverageLookupKey(dependency)))
+          && (refreshAllDependencies || targetKeys.has(coverageLookupKey(dependency)))
         ))
         .map((dependency) => coverageLookupKey(dependency))
         .filter(Boolean)
@@ -2343,6 +2607,8 @@ class DependencyHealthProvider {
         progressLabel: "Refreshing Cloudsmith coverage",
         verificationReceipt: options.verificationReceipt || null,
         verificationReceipts: options.verificationReceipts || null,
+        verificationResults: options.verificationResults || null,
+        authority,
         isCurrent,
       }
     );
@@ -2356,14 +2622,14 @@ class DependencyHealthProvider {
           return dependency.cloudsmithStatus === "FOUND"
             && Boolean(key)
             && !previousFoundKeys.has(key)
-            && (targetKeys.size === 0 || targetKeys.has(key));
+            && (refreshAllDependencies || targetKeys.has(key));
         })
     );
 
     if (newlyFoundDependencies.length > 0) {
       if (!publicationIsCurrent(token, isCurrent)) return null;
       progress.report({
-        message: targetKeys.size > 0
+        message: !refreshAllDependencies
           ? "Enriching pulled dependency..."
           : "Enriching newly covered dependencies...",
       });
@@ -3020,6 +3286,8 @@ async function lookupExactDependency({
   token,
   requestBudget = null,
   verificationReceipt = null,
+  deadlineAt = null,
+  now = Date.now,
 }) {
   if (dependency && dependency.lookupEligibility
     && dependency.lookupEligibility.state === "unresolved") {
@@ -3116,6 +3384,17 @@ async function lookupExactDependency({
           pagesFetched
         );
       }
+      const remainingMs = Number.isFinite(deadlineAt)
+        ? deadlineAt - now()
+        : null;
+      if (remainingMs !== null && remainingMs <= 0) {
+        return createCoverageLookupResult(
+          CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE,
+          null,
+          "The Cloudsmith lookup reached the bulk verification deadline.",
+          pagesFetched
+        );
+      }
 
       let requestEndpoint;
       try {
@@ -3143,6 +3422,7 @@ async function lookupExactDependency({
         ),
         retry: "never",
         cancellationToken: token,
+        ...(remainingMs !== null ? { timeoutMs: Math.max(1, Math.min(30000, remainingMs)) } : {}),
       });
       if (token && token.isCancellationRequested) {
         return createCoverageLookupResult(
@@ -4882,7 +5162,7 @@ async function runPromisePool(items, concurrency, worker) {
         if (item === undefined) {
           break;
         }
-        await worker(item);
+        if (await worker(item) === false) break;
       }
     })());
   }
@@ -4940,6 +5220,34 @@ function normalizeScheduler(scheduler) {
     clearTimeout: scheduler.clearTimeout.bind(scheduler),
     yield: scheduler.yield.bind(scheduler),
   });
+}
+
+function normalizeBulkVerificationDelays(value) {
+  if (value === undefined) return BULK_VERIFICATION_DELAYS_MS;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 8) {
+    throw new TypeError("Bulk verification delays must contain between one and eight entries.");
+  }
+  const delays = value.map(delay => Number(delay));
+  if (
+    delays.some(delay => !Number.isSafeInteger(delay) || delay < 0 || delay > 60000)
+    || delays.reduce((total, delay) => total + delay, 0) > 120000
+  ) {
+    throw new TypeError("Bulk verification delays exceed the bounded verification deadline.");
+  }
+  return Object.freeze(delays);
+}
+
+function normalizeBulkVerificationDeadline(value) {
+  if (value === undefined) return BULK_VERIFICATION_DEADLINE_MS;
+  const deadlineMs = Number(value);
+  if (
+    !Number.isSafeInteger(deadlineMs)
+    || deadlineMs <= 0
+    || deadlineMs > BULK_VERIFICATION_DEADLINE_MS
+  ) {
+    throw new TypeError("Bulk verification deadline exceeds the supported boundary.");
+  }
+  return deadlineMs;
 }
 
 function normalizeUserInteraction(userInteraction) {
@@ -5017,6 +5325,32 @@ function formatSingleDependencyLabel(dependency) {
 
 function getSingleDependencyPullDetail(pullResult) {
   return pullResult && Array.isArray(pullResult.details) ? (pullResult.details[0] || null) : null;
+}
+
+function reconcileBulkPullResult(pullResult, verificationResults) {
+  const details = Array.isArray(pullResult?.details) ? pullResult.details : [];
+  const reconciled = details.map((detail) => {
+    if (detail?.status !== PULL_STATUS.TRIGGERED || !detail.dependency) return detail;
+    const artifactKey = getDependencyArtifactKey(detail.dependency);
+    const verified = verificationResults instanceof Map
+      ? verificationResults.get(artifactKey)
+      : null;
+    if (verified?.result?.status === CLOUDSMITH_COVERAGE_STATUS.FOUND) {
+      return {
+        ...detail,
+        status: PULL_STATUS.CACHED,
+        errorMessage: null,
+        networkError: false,
+      };
+    }
+    return {
+      ...detail,
+      status: PULL_STATUS.TRIGGERED,
+      errorMessage: "The registry request was accepted, but Cloudsmith has not confirmed the package in the target repository yet.",
+      networkError: false,
+    };
+  });
+  return buildPullResult(reconciled);
 }
 
 function isSuccessfulSingleDependencyPull(detail) {

@@ -12,6 +12,8 @@ const { fetchWorkspaceRepositories } = require("./workspaceRepositoryFetcher");
 const { PaginatedFetch } = require("./paginatedFetch");
 const { SearchQueryBuilder } = require("./searchQueryBuilder");
 const {
+  createBulkPreflightPresenceEvidence,
+  getReusableBulkScanAbsenceProof,
   packageCandidateEvidenceShapeIsValid,
   qualifierEvidenceIsIncomplete,
 } = require("./exactPackageEvidence");
@@ -54,6 +56,7 @@ const {
 } = require("./accountOperation");
 
 const MAX_CONCURRENT_PULLS = 5;
+const MAX_CONCURRENT_ABSENCE_CHECKS = 8;
 const INITIAL_AUTH_PROBE_CONCURRENCY = 3;
 const MAX_REGISTRY_REDIRECTS = 5;
 const REQUEST_TIMEOUT_MS = 30 * 1000;
@@ -85,10 +88,12 @@ const SAFE_REGISTRY_ERROR_MESSAGES = new Set([
   "Registry redirect target was rejected.",
   "Registry request exceeded the redirect limit.",
 ]);
+const BULK_PREPARATIONS = new WeakSet();
 
 const PULL_STATUS = Object.freeze({
   PENDING: "pending",
   PULLING: "pulling",
+  TRIGGERED: "triggered",
   CACHED: "cached",
   ALREADY_EXISTS: "exists",
   NOT_FOUND: "not_found",
@@ -169,12 +174,16 @@ class UpstreamPullService {
     cancellationToken = null,
     signal = null,
     account = null,
+    absenceEvidence = null,
+    isCurrent = null,
+    projectFolder = null,
   }) {
     if (!await this._requirePullThroughCapability()) return null;
     const operation = this._createPreparationOperation(
       cancellationToken || token,
       signal,
-      account
+      account,
+      isCurrent
     );
     if (!this._isPreparationCurrent(operation)) return null;
     const uncoveredDependencies = dedupePullDependencies(
@@ -278,7 +287,8 @@ class UpstreamPullService {
       workspace,
       repository.slug,
       plan.pullableDependencies,
-      operation
+      operation,
+      { absenceEvidence, allowAlreadyExisting: true, projectFolder }
     );
     if (!absence || !this._isPreparationCurrent(operation)) return null;
     if (!absence.ok) {
@@ -290,23 +300,48 @@ class UpstreamPullService {
       return null;
     }
 
-    const confirmation = await this._showWarningMessage(
-      buildPullConfirmationMessage(plan, repository.slug),
-      { modal: true },
-      "Pull dependencies"
+    const existingKeys = new Set(
+      absence.alreadyExistingDependencies.map(dependency => getDependencyArtifactKey(dependency))
     );
+    const verifiedPlan = {
+      ...plan,
+      pullableDependencies: plan.pullableDependencies.filter(dependency => (
+        !existingKeys.has(getDependencyArtifactKey(dependency))
+      )),
+      alreadyExistingDependencies: absence.alreadyExistingDependencies,
+    };
+    const presenceEvidence = createBulkPreflightPresenceEvidence({
+      account: operation.account,
+      workspace,
+      repository: repository.slug,
+      projectFolder,
+      cancellationToken: operation.cancellationToken,
+      packagesByArtifactKey: absence.presencePackages,
+    });
 
-    if (!this._isPreparationCurrent(operation) || confirmation !== "Pull dependencies") {
-      return null;
+    if (verifiedPlan.pullableDependencies.length > 0) {
+      const confirmation = await this._showWarningMessage(
+        buildPullConfirmationMessage(verifiedPlan, repository.slug),
+        { modal: true },
+        "Pull dependencies"
+      );
+
+      if (!this._isPreparationCurrent(operation) || confirmation !== "Pull dependencies") {
+        return null;
+      }
     }
 
-    return {
+    const prepared = {
       workspace,
       repository,
-      plan,
+      plan: verifiedPlan,
       account: operation.account,
+      absenceProofs: absence.proofs,
+      ...(presenceEvidence ? { presenceEvidence } : {}),
       repositorySearchComplete: repositoryCollection.complete && repositorySearch.complete,
     };
+    BULK_PREPARATIONS.add(prepared);
+    return prepared;
   }
 
   async prepareSingle({
@@ -317,12 +352,14 @@ class UpstreamPullService {
     cancellationToken = null,
     signal = null,
     account = null,
+    isCurrent = null,
   }) {
     if (!await this._requirePullThroughCapability()) return null;
     const operation = this._createPreparationOperation(
       cancellationToken || token,
       signal,
-      account
+      account,
+      isCurrent
     );
     if (!this._isPreparationCurrent(operation)) return null;
     const normalizedDependency = normalizeSingleDependency(dependency);
@@ -447,55 +484,89 @@ class UpstreamPullService {
     if (!this._isPreparedAccountCurrent(prepared)) {
       return { canceled: true, stale: true };
     }
+    const isBulkExecution = BULK_PREPARATIONS.has(prepared);
     const executionOperation = this._createPreparationOperation(
       options.token || null,
       options.signal || null,
-      prepared?.account || null
+      prepared?.account || null,
+      options.isCurrent || null
     );
     const isExecutionCurrent = () => this._isPreparationCurrent(executionOperation);
-    const absence = await this._verifyTargetAbsence(
-      prepared?.workspace,
-      prepared?.repository?.slug,
-      prepared?.plan?.pullableDependencies,
-      executionOperation
-    );
-    if (!absence || !isExecutionCurrent()) {
-      return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
-    }
-    if (!absence.ok) {
-      if (
-        absence.reason === "present"
-        && prepared?.plan?.pullableDependencies?.length === 1
-        && this._isPreparationCurrent(executionOperation)
-      ) {
-        const detail = toPublicPullDetail({
-          dependency: absence.dependency,
-          status: PULL_STATUS.ALREADY_EXISTS,
-          errorMessage: null,
-          networkError: false,
-        });
-        await publishStatus(
-          typeof options.onStatus === "function" ? options.onStatus : null,
-          detail
-        );
-        if (!this._isPreparationCurrent(executionOperation)) {
-          return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
-        }
-        return {
-          canceled: false,
-          pullResult: buildPullResult([detail]),
-        };
+    let absence;
+    if (isBulkExecution) {
+      absence = {
+        ok: true,
+        proofs: prepared.absenceProofs instanceof Map ? prepared.absenceProofs : new Map(),
+      };
+    } else {
+      absence = await this._verifyTargetAbsence(
+        prepared?.workspace,
+        prepared?.repository?.slug,
+        prepared?.plan?.pullableDependencies,
+        executionOperation
+      );
+      if (!absence || !isExecutionCurrent()) {
+        return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
       }
-      await this._showWarningMessage(buildAbsenceVerificationFailureMessage(
-        absence,
-        prepared.workspace,
-        prepared.repository.slug
-      ));
-      return { canceled: true, absenceUnverified: true };
+      if (!absence.ok) {
+        if (
+          absence.reason === "present"
+          && prepared?.plan?.pullableDependencies?.length === 1
+          && this._isPreparationCurrent(executionOperation)
+        ) {
+          const detail = toPublicPullDetail({
+            dependency: absence.dependency,
+            status: PULL_STATUS.ALREADY_EXISTS,
+            errorMessage: null,
+            networkError: false,
+          });
+          await publishStatus(
+            typeof options.onStatus === "function" ? options.onStatus : null,
+            detail
+          );
+          if (!this._isPreparationCurrent(executionOperation)) {
+            return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
+          }
+          return {
+            canceled: false,
+            pullResult: buildPullResult([detail]),
+          };
+        }
+        await this._showWarningMessage(buildAbsenceVerificationFailureMessage(
+          absence,
+          prepared.workspace,
+          prepared.repository.slug
+        ));
+        return { canceled: true, absenceUnverified: true };
+      }
     }
     executionOperation.absenceProofs = absence.proofs;
     if (!isExecutionCurrent()) {
       return { canceled: true, stale: !this._isPreparedAccountCurrent(prepared) };
+    }
+    const preflightDetails = isBulkExecution
+      ? [
+        ...(prepared?.plan?.alreadyExistingDependencies || []).map(dependency => toPublicPullDetail({
+        dependency,
+        status: PULL_STATUS.ALREADY_EXISTS,
+        errorMessage: null,
+        networkError: false,
+        })),
+        ...(prepared?.plan?.skippedDependencies || []).map(entry => toPublicPullDetail({
+          dependency: entry.dependency,
+          status: PULL_STATUS.SKIPPED,
+          errorMessage: entry.message || "Skipped because pull-through is unavailable.",
+          networkError: false,
+        })),
+      ]
+      : [];
+    if (isBulkExecution && prepared?.plan?.pullableDependencies?.length === 0) {
+      return {
+        canceled: false,
+        triggerEvidence: new Map(),
+        ...(prepared.presenceEvidence ? { presenceEvidence: prepared.presenceEvidence } : {}),
+        pullResult: buildPullResult(preflightDetails),
+      };
     }
     let apiKey;
     try {
@@ -523,9 +594,13 @@ class UpstreamPullService {
     const onStatus = typeof options.onStatus === "function" ? options.onStatus : null;
     const queue = prepared.plan.pullableDependencies.slice();
     let nextDependencyIndex = 0;
-    const details = [];
+    const details = preflightDetails.slice();
     const verificationReceipts = new Map();
-    const counts = createResultCounts(prepared.plan.pullableDependencies.length);
+    const triggerEvidence = new Map();
+    const counts = createResultCounts(
+      prepared.plan.pullableDependencies.length + preflightDetails.length
+    );
+    for (const detail of preflightDetails) updateResultCounts(counts, detail);
     const state = {
       authFailureCount: 0,
       nonAuthOutcomeCount: 0,
@@ -618,7 +693,20 @@ class UpstreamPullService {
           return;
         }
 
-        if (result.triggerSucceeded === true) {
+        if (result.triggerSucceeded === true && isBulkExecution) {
+          const artifactKey = getDependencyArtifactKey(dependency);
+          triggerEvidence.set(artifactKey, Object.freeze({
+            ...(result.dockerPlatformVerified === true
+              ? { dockerPlatformVerified: true }
+              : {}),
+          }));
+          result = {
+            dependency,
+            status: PULL_STATUS.TRIGGERED,
+            errorMessage: null,
+            networkError: false,
+          };
+        } else if (result.triggerSucceeded === true) {
           result = await this._verifyPostTriggerPresence(
             prepared.workspace,
             prepared.repository.slug,
@@ -732,7 +820,7 @@ class UpstreamPullService {
         nextDependencyIndex += 1;
         details.push({
           dependency,
-          status: PULL_STATUS.AUTH_FAILED,
+          status: PULL_STATUS.SKIPPED,
           errorMessage: "Skipped after repeated authentication failures.",
           networkError: false,
         });
@@ -753,10 +841,15 @@ class UpstreamPullService {
 
     return {
       canceled: false,
+      ...(isBulkExecution ? { triggerEvidence } : {}),
+      ...(isBulkExecution && prepared.presenceEvidence
+        ? { presenceEvidence: prepared.presenceEvidence }
+        : {}),
       ...(verificationReceipts.size > 0 ? { verificationReceipts } : {}),
       pullResult: {
         total: counts.total,
         cached: counts.cached,
+        triggeredUnconfirmed: counts.triggeredUnconfirmed,
         alreadyExisted: counts.alreadyExisted,
         notFound: counts.notFound,
         formatMismatched: counts.formatMismatched,
@@ -914,7 +1007,7 @@ class UpstreamPullService {
     }
   }
 
-  async _verifyTargetAbsence(workspace, repository, dependencies, operation) {
+  async _verifyTargetAbsence(workspace, repository, dependencies, operation, options = {}) {
     if (
       !this._isPreparationCurrent(operation)
       || !isBoundedIdentity(workspace)
@@ -924,8 +1017,28 @@ class UpstreamPullService {
     ) return null;
 
     const proofs = new Map();
+    const presencePackages = new Map();
+    const alreadyExistingDependencies = [];
+    const fallbackDependencies = [];
     for (const dependency of dependencies) {
-      if (!this._isPreparationCurrent(operation)) return null;
+      const reusableProof = getReusableBulkScanAbsenceProof(options.absenceEvidence, {
+        account: operation.account,
+        workspace,
+        repository,
+        projectFolder: options.projectFolder,
+        dependency,
+        cancellationToken: operation.cancellationToken,
+      });
+      if (reusableProof) {
+        proofs.set(reusableProof.artifactKey, new Set(reusableProof.observedIdentities));
+      } else {
+        fallbackDependencies.push(dependency);
+      }
+    }
+
+    let failure = null;
+    await runPromisePool(fallbackDependencies, MAX_CONCURRENT_ABSENCE_CHECKS, async (dependency) => {
+      if (!this._isPreparationCurrent(operation) || failure) return false;
       let result;
       try {
         result = await this._checkPackageAbsence({
@@ -939,29 +1052,43 @@ class UpstreamPullService {
       } catch {
         result = null;
       }
-      if (!this._isPreparationCurrent(operation)) return null;
+      if (!this._isPreparationCurrent(operation)) return false;
       const scoped = result
         && result.workspace === workspace
         && result.repository === repository
         && result.stale !== true;
-      if (
-        !scoped
-        || result.complete !== true
-        || result.absent !== true
-        || result.present !== false
-      ) {
-        return {
+      if (scoped && result.complete === true && result.present === true && result.absent === false) {
+        if (options.allowAlreadyExisting === true) {
+          alreadyExistingDependencies.push(dependency);
+          if (result.package) {
+            presencePackages.set(getDependencyArtifactKey(dependency), result.package);
+          }
+          return true;
+        }
+        failure = {
           ok: false,
-          reason: scoped && result?.present === true ? "present" : "unverified",
+          reason: "present",
           dependency,
         };
+        return false;
+      }
+      if (!scoped || result.complete !== true || result.absent !== true || result.present !== false) {
+        failure = {
+          ok: false,
+          reason: "unverified",
+          dependency,
+        };
+        return false;
       }
       proofs.set(
         getDependencyArtifactKey(dependency),
         new Set(Array.isArray(result.observedIdentities) ? result.observedIdentities : [])
       );
-    }
-    return { ok: true, proofs };
+      return true;
+    });
+    if (!this._isPreparationCurrent(operation)) return null;
+    if (failure) return failure;
+    return { ok: true, proofs, alreadyExistingDependencies, presencePackages };
   }
 
   async _checkExactPackageAbsence({
@@ -1070,6 +1197,17 @@ class UpstreamPullService {
           dockerPlatformVerified
         );
         if (present) {
+          let canonicalPackage;
+          try {
+            canonicalPackage = fromApiPackageRecord(present, {
+              expectedWorkspace: workspace,
+              expectedRepository: repository,
+              coordinateName: dependency.name,
+              coordinateQualifiers: dependency.qualifiers,
+            });
+          } catch {
+            return incompleteAbsenceResult(workspace, repository);
+          }
           return {
             workspace,
             repository,
@@ -1077,6 +1215,7 @@ class UpstreamPullService {
             present: true,
             complete: result.complete === true,
             stale: false,
+            package: canonicalPackage,
           };
         }
         for (const candidate of result.items) {
@@ -1243,10 +1382,15 @@ class UpstreamPullService {
     });
   }
 
-  _createPreparationOperation(cancellationToken, signal, account = null) {
+  _createPreparationOperation(cancellationToken, signal, account = null, isCurrent = null) {
     const capturedAccount = account
       || (this._connectionManager ? captureAccount(this._connectionManager) : null);
-    return { cancellationToken, signal, account: capturedAccount };
+    return {
+      cancellationToken,
+      signal,
+      account: capturedAccount,
+      isCurrent: typeof isCurrent === "function" ? isCurrent : null,
+    };
   }
 
   _isPreparationCurrent(operation) {
@@ -1254,6 +1398,7 @@ class UpstreamPullService {
       !operation
       || isCancellationRequested(operation.cancellationToken)
       || operation.signal?.aborted
+      || (operation.isCurrent && !safeCurrentCheck(operation.isCurrent))
     ) return false;
     return !this._connectionManager
       || Boolean(operation.account && isAccountCurrent(this._connectionManager, operation.account));
@@ -1853,16 +1998,16 @@ function exactPackageCandidateCollectionMatches(
       || dockerCandidateMatchesPlatform(candidate, requestedPlatform)
     )
   ));
-  if (identityCandidate) return true;
+  if (identityCandidate) return identityCandidate;
   if (format === "swift" && baselineIdentities instanceof Set) {
-    return candidates.some(candidate => (
+    return candidates.find(candidate => (
       !baselineIdentities.has(exactPackageCandidateIdentity(candidate))
       && exactPackageCandidateBaseNameMatches(candidate, dependency, format)
       && candidate.version === version
       && qualifierEvidenceIsIncomplete(candidate, dependency, format)
     ));
   }
-  return false;
+  return null;
 }
 
 function exactPackageCandidateEvidenceIsIncomplete(candidate, dependency, format, version) {
@@ -2321,15 +2466,25 @@ function buildPullExecutionPlan(workspace, repo, dependencies, activeUpstreamFor
 function buildPullConfirmationMessage(plan, repositoryLabel) {
   const totalCount = plan.dependencies.length;
   const pullableCount = plan.pullableDependencies.length;
-  const header = plan.skippedDependencies.length > 0
+  const alreadyExistingCount = Array.isArray(plan.alreadyExistingDependencies)
+    ? plan.alreadyExistingDependencies.length
+    : 0;
+  const header = plan.skippedDependencies.length > 0 || alreadyExistingCount > 0
     ? `Pull ${pullableCount} of ${totalCount} dependencies through ${repositoryLabel}?`
     : singleFormatPullHeader(plan.pullableDependencies, repositoryLabel);
-  const pulledLine = buildPullableSummary(plan.pullableDependencies, plan.skippedDependencies.length > 0);
+  const pulledLine = buildPullableSummary(
+    plan.pullableDependencies,
+    plan.skippedDependencies.length > 0 || alreadyExistingCount > 0
+  );
   const skippedLine = buildSkippedSummary(plan.skippedDependencies);
+  const existingLine = alreadyExistingCount > 0
+    ? `${alreadyExistingCount} ${alreadyExistingCount === 1 ? "dependency already exists" : "dependencies already exist"} in the target repository.`
+    : "";
 
   return [
     header,
     pulledLine,
+    existingLine,
     skippedLine,
     "Packages not already cached will be fetched from the upstream source.",
   ].filter(Boolean).join("\n");
@@ -2351,16 +2506,19 @@ function buildPullPlanErrorMessage(repositoryLabel, plan) {
 }
 
 function buildPullSummaryMessage(result, skippedCount) {
-  const pulledCount = result.cached + result.alreadyExisted;
+  const totalSkipped = result.skipped > 0 ? result.skipped : skippedCount;
   const parts = [
-    `Pulled ${pulledCount} of ${result.total} dependencies.`,
-    `${result.cached} cached`,
+    `${result.cached} of ${result.total} dependencies cached.`,
     `${result.alreadyExisted} already existed`,
     `${result.notFound} not found upstream`,
   ];
 
-  if (skippedCount > 0) {
-    parts.push(`${skippedCount} skipped`);
+  if (result.triggeredUnconfirmed > 0) {
+    parts.push(`${result.triggeredUnconfirmed} triggered but not yet confirmed`);
+  }
+
+  if (totalSkipped > 0) {
+    parts.push(`${totalSkipped} skipped`);
   }
 
   if (result.errors > 0) {
@@ -2376,6 +2534,9 @@ function buildProgressMessage(counts) {
 
   if (counts.cached > 0) {
     detail.push(`${counts.cached} cached`);
+  }
+  if (counts.triggeredUnconfirmed > 0) {
+    detail.push(`${counts.triggeredUnconfirmed} triggered`);
   }
   if (counts.notFound > 0) {
     detail.push(`${counts.notFound} not found`);
@@ -2396,6 +2557,7 @@ function createResultCounts(total) {
     total,
     completed: 0,
     cached: 0,
+    triggeredUnconfirmed: 0,
     alreadyExisted: 0,
     notFound: 0,
     formatMismatched: 0,
@@ -2413,6 +2575,7 @@ function buildPullResult(details) {
   return {
     total: counts.total,
     cached: counts.cached,
+    triggeredUnconfirmed: counts.triggeredUnconfirmed,
     alreadyExisted: counts.alreadyExisted,
     notFound: counts.notFound,
     formatMismatched: counts.formatMismatched,
@@ -2429,6 +2592,9 @@ function updateResultCounts(counts, result) {
   switch (result.status) {
     case PULL_STATUS.CACHED:
       counts.cached += 1;
+      break;
+    case PULL_STATUS.TRIGGERED:
+      counts.triggeredUnconfirmed += 1;
       break;
     case PULL_STATUS.ALREADY_EXISTS:
       counts.alreadyExisted += 1;
@@ -2876,6 +3042,14 @@ function isCancellationRequested(token) {
   return Boolean(token && token.isCancellationRequested);
 }
 
+function safeCurrentCheck(isCurrent) {
+  try {
+    return isCurrent() === true;
+  } catch {
+    return false;
+  }
+}
+
 async function publishStatus(onStatus, detail) {
   if (!onStatus) return true;
   try {
@@ -2929,5 +3103,6 @@ module.exports = {
   PULL_SKIP_REASON,
   PULL_STATUS,
   UpstreamPullService,
+  buildPullResult,
   buildPullSummaryMessage,
 };
