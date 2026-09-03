@@ -32,6 +32,8 @@ const {
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { bindConnectionManager } = require("../util/connectionManager");
 const { analyzeUpstreamGaps } = require("../util/upstreamGapAnalyzer");
+const { createBulkPreflightPresenceEvidence } = require("../util/exactPackageEvidence");
+const { PULL_STATUS } = require("../util/upstreamPullService");
 const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
 const { DiagnosticsPublisher } = require("../util/diagnosticsPublisher");
 const { getFoundDependencyKey } = require("../util/foundDependencyKey");
@@ -326,6 +328,27 @@ suite("DependencyHealthProvider Test Suite", () => {
       dependencies: tree.dependencies.slice(),
     }));
     provider._rebuildSummary();
+  }
+
+  function buildFakeTriggeredPullResult(dependencies) {
+    return {
+      total: dependencies.length,
+      cached: 0,
+      triggeredUnconfirmed: dependencies.length,
+      alreadyExisted: 0,
+      notFound: 0,
+      formatMismatched: 0,
+      errors: 0,
+      networkErrors: 0,
+      authFailed: 0,
+      skipped: 0,
+      details: dependencies.map(dependency => ({
+        dependency,
+        status: PULL_STATUS.TRIGGERED,
+        errorMessage: null,
+        networkError: false,
+      })),
+    };
   }
 
   function createMutableConnectionManager() {
@@ -4616,6 +4639,448 @@ suite("DependencyHealthProvider Test Suite", () => {
     await provider.pullDependencies();
 
     assert.strictEqual(refreshOptions.verificationReceipts, verificationReceipts);
+  });
+
+  test("bulk verification retries only unresolved identities and final refresh reuses exact results", async () => {
+    const alpha = { ...createProblemDependency("alpha", "1.0.0", "/project/package.json"), cloudsmithStatus: "ABSENT" };
+    const beta = { ...createProblemDependency("beta", "1.0.0", "/project/package.json"), cloudsmithStatus: "ABSENT" };
+    const gamma = { ...createProblemDependency("gamma", "1.0.0", "/project/package.json"), cloudsmithStatus: "ABSENT" };
+    const dependencies = [alpha, beta, gamma];
+    const lookupCounts = new Map();
+    const delays = [];
+    const notifications = [];
+    const api = createLookupApi((endpoint) => {
+      const decoded = decodeURIComponent(endpoint);
+      const dependency = dependencies.find(candidate => decoded.includes(candidate.name));
+      assert.ok(dependency);
+      const count = (lookupCounts.get(dependency.name) || 0) + 1;
+      lookupCounts.set(dependency.name, count);
+      const found = dependency.name === "alpha"
+        || (dependency.name === "beta" && count >= 2);
+      return lookupPage(found ? [canonicalHealthRecord(dependency.name)] : []);
+    });
+    const scheduler = {
+      now: Date.now,
+      setTimeout(callback, delayMs) {
+        delays.push(delayMs);
+        return setImmediate(callback);
+      },
+      clearTimeout(handle) { clearImmediate(handle); },
+      async yield() {},
+    };
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      bulkVerificationDelaysMs: [0, 5, 10],
+      createCloudsmithAPI: () => api,
+      enrichVulnerabilities: async values => values,
+      enrichLicenses: async values => values,
+      enrichPolicies: async values => values,
+      fetchRepositories: async () => ({ items: ["repo-a"], complete: true }),
+      analyzeUpstreamGaps: async () => {},
+      scheduler,
+      userInteraction: createUserInteraction({
+        showInformationMessage(message) {
+          notifications.push(message);
+        },
+      }),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            triggerEvidence: new Map(),
+            pullResult: {
+              total: 3,
+              cached: 0,
+              triggeredUnconfirmed: 3,
+              alreadyExisted: 0,
+              notFound: 0,
+              formatMismatched: 0,
+              errors: 0,
+              networkErrors: 0,
+              authFailed: 0,
+              skipped: 0,
+              details: dependencies.map(dependency => ({
+                dependency,
+                status: PULL_STATUS.TRIGGERED,
+                errorMessage: null,
+                networkError: false,
+              })),
+            },
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, dependencies);
+    provider._updateContexts = async () => true;
+    provider.refresh = () => true;
+
+    await provider.pullDependencies();
+
+    assert.deepStrictEqual(Object.fromEntries(lookupCounts), {
+      alpha: 1,
+      beta: 2,
+      gamma: 3,
+    });
+    assert.deepStrictEqual(delays, [5, 10]);
+    assert.strictEqual(api.calls.length, 6);
+    assert.deepStrictEqual(
+      provider._fullTrees[0].dependencies.map(dependency => dependency.cloudsmithStatus),
+      ["FOUND", "FOUND", "ABSENT"]
+    );
+    assert.ok(notifications.some(message => /2 of 3 dependencies cached/.test(message)));
+    assert.ok(notifications.some(message => /1 triggered but not yet confirmed/.test(message)));
+  });
+
+  test("cancellation during global verification stops future attempts and publication", async () => {
+    const dependency = {
+      ...createProblemDependency("cancelled-package", "1.0.0", "/project/package.json"),
+      cloudsmithStatus: "ABSENT",
+    };
+    const lookupStarted = deferred();
+    const lookupResult = deferred();
+    const notifications = [];
+    const cancellations = createTrackingCancellationFactory();
+    const api = createLookupApi(async () => {
+      lookupStarted.resolve();
+      await lookupResult.promise;
+      return lookupPage([canonicalHealthRecord(dependency.name)]);
+    });
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      bulkVerificationDelaysMs: [0, 5, 10],
+      createCancellationSource: () => cancellations.create(),
+      createCloudsmithAPI: () => api,
+      userInteraction: createUserInteraction({
+        showInformationMessage(message) { notifications.push(message); },
+      }),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            triggerEvidence: new Map(),
+            pullResult: {
+              total: 1,
+              cached: 0,
+              triggeredUnconfirmed: 1,
+              alreadyExisted: 0,
+              notFound: 0,
+              formatMismatched: 0,
+              errors: 0,
+              networkErrors: 0,
+              authFailed: 0,
+              skipped: 0,
+              details: [{
+                dependency,
+                status: PULL_STATUS.TRIGGERED,
+                errorMessage: null,
+                networkError: false,
+              }],
+            },
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+    provider._updateContexts = async () => true;
+    provider.refresh = () => true;
+
+    const pending = provider.pullDependencies();
+    await lookupStarted.promise;
+    cancellations.sources[0].cancel();
+    lookupResult.resolve();
+    await pending;
+
+    assert.strictEqual(api.calls.length, 1);
+    assert.strictEqual(provider._fullTrees[0].dependencies[0].cloudsmithStatus, "ABSENT");
+    assert.deepStrictEqual(notifications, []);
+    assert.strictEqual(provider.getReportData(), null);
+  });
+
+  test("global verification never confirms a same-version Maven qualifier sibling", async () => {
+    const dependency = {
+      ...createProblemDependency("com.example:demo", "1.2.3", "/project/pom.xml", "maven"),
+      cloudsmithStatus: "ABSENT",
+      qualifiers: { type: "test-jar", classifier: "tests" },
+    };
+    const notifications = [];
+    const api = createLookupApi(() => lookupPage([{
+      namespace: "workspace-a",
+      repository: "repo-a",
+      slug_perm: "demo-main",
+      name: "demo",
+      version: "1.2.3",
+      format: "maven",
+      identifiers: { group_id: "com.example" },
+      files: [{ filename: "demo-1.2.3.jar" }],
+    }]));
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      bulkVerificationDelaysMs: [0],
+      createCloudsmithAPI: () => api,
+      enrichVulnerabilities: async values => values,
+      enrichLicenses: async values => values,
+      enrichPolicies: async values => values,
+      fetchRepositories: async () => ({ items: ["repo-a"], complete: true }),
+      analyzeUpstreamGaps: async () => {},
+      userInteraction: createUserInteraction({
+        showInformationMessage(message) { notifications.push(message); },
+      }),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            triggerEvidence: new Map(),
+            pullResult: buildFakeTriggeredPullResult([dependency]),
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, [dependency]);
+    provider._updateContexts = async () => true;
+    provider.refresh = () => true;
+
+    await provider.pullDependencies();
+
+    assert.strictEqual(api.calls.length, 2);
+    assert.strictEqual(provider._fullTrees[0].dependencies[0].cloudsmithStatus, "ABSENT");
+    assert.ok(notifications.some(message => /0 of 1 dependencies cached/.test(message)));
+    assert.ok(notifications.some(message => /1 triggered but not yet confirmed/.test(message)));
+  });
+
+  test("300-dependency bulk simulation bounds global passes and performs no final redundant lookup", async () => {
+    const dependencies = Array.from({ length: 300 }, (_, index) => ({
+      ...createProblemDependency(
+        `package-${String(index).padStart(3, "0")}`,
+        "1.0.0",
+        "/project/package.json"
+      ),
+      cloudsmithStatus: "ABSENT",
+    }));
+    const attempts = new Map();
+    const delays = [];
+    const api = createLookupApi((endpoint) => {
+      const name = decodeURIComponent(endpoint).match(/package-\d{3}/)?.[0];
+      assert.ok(name);
+      const index = Number(name.slice("package-".length));
+      const attempt = (attempts.get(name) || 0) + 1;
+      attempts.set(name, attempt);
+      const found = index < 270 || (index < 290 && attempt >= 2);
+      return lookupPage(found ? [canonicalHealthRecord(name)] : []);
+    });
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      bulkVerificationDelaysMs: [0, 1, 2],
+      createCloudsmithAPI: () => api,
+      enrichVulnerabilities: async values => values,
+      enrichLicenses: async values => values,
+      enrichPolicies: async values => values,
+      fetchRepositories: async () => ({ items: ["repo-a"], complete: true }),
+      analyzeUpstreamGaps: async () => {},
+      scheduler: {
+        now: Date.now,
+        setTimeout(callback, delayMs) {
+          delays.push(delayMs);
+          return setImmediate(callback);
+        },
+        clearTimeout(handle) { clearImmediate(handle); },
+        async yield() {},
+      },
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            triggerEvidence: new Map(),
+            pullResult: buildFakeTriggeredPullResult(dependencies),
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, dependencies);
+    provider._updateContexts = async () => true;
+    provider.refresh = () => true;
+
+    await provider.pullDependencies();
+
+    assert.strictEqual(api.calls.length, 340);
+    assert.deepStrictEqual(delays, [1, 2]);
+    assert.strictEqual([...attempts.values()].filter(attempt => attempt === 1).length, 270);
+    assert.strictEqual([...attempts.values()].filter(attempt => attempt === 2).length, 20);
+    assert.strictEqual([...attempts.values()].filter(attempt => attempt === 3).length, 10);
+    assert.strictEqual(
+      provider._fullTrees[0].dependencies.filter(dependency => dependency.cloudsmithStatus === "FOUND").length,
+      290
+    );
+    assert.strictEqual(
+      provider._fullTrees[0].dependencies.filter(dependency => dependency.cloudsmithStatus === "ABSENT").length,
+      10
+    );
+  });
+
+  test("bulk verification deadline prevents final refresh from issuing post-deadline lookups", async () => {
+    const dependencies = Array.from({ length: 10 }, (_, index) => ({
+      ...createProblemDependency(`deadline-${index}`, "1.0.0", "/project/package.json"),
+      cloudsmithStatus: "ABSENT",
+    }));
+    let now = 0;
+    const api = createLookupApi(() => {
+      now = 10;
+      return lookupPage([]);
+    });
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      bulkVerificationDelaysMs: [0, 1],
+      bulkVerificationDeadlineMs: 10,
+      createCloudsmithAPI: () => api,
+      enrichVulnerabilities: async values => values,
+      enrichLicenses: async values => values,
+      enrichPolicies: async values => values,
+      fetchRepositories: async () => ({ items: ["repo-a"], complete: true }),
+      analyzeUpstreamGaps: async () => {},
+      scheduler: {
+        now: () => now,
+        setTimeout(callback) { return setImmediate(callback); },
+        clearTimeout(handle) { clearImmediate(handle); },
+        async yield() {},
+      },
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            triggerEvidence: new Map(),
+            pullResult: buildFakeTriggeredPullResult(dependencies),
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, dependencies);
+    provider._updateContexts = async () => true;
+    provider.refresh = () => true;
+
+    await provider.pullDependencies();
+
+    assert.strictEqual(api.calls.length, 1);
+    assert.strictEqual(api.callOptions[0].timeoutMs, 10);
+    assert.strictEqual(
+      provider._fullTrees[0].dependencies.filter(dependency => (
+        dependency.cloudsmithStatus === CLOUDSMITH_COVERAGE_STATUS.LOOKUP_INCOMPLETE
+      )).length,
+      9
+    );
+  });
+
+  test("bulk verification opens a shared rate-limit circuit after the active worker set", async () => {
+    const dependencies = Array.from({ length: 100 }, (_, index) => ({
+      ...createProblemDependency(`rate-limited-${index}`, "1.0.0", "/project/package.json"),
+      cloudsmithStatus: "ABSENT",
+    }));
+    const api = createLookupApi(() => apiFailure("rate_limited"));
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      bulkVerificationDelaysMs: [0, 1, 2],
+      createCloudsmithAPI: () => api,
+      fetchRepositories: async () => ({ items: ["repo-a"], complete: true }),
+      analyzeUpstreamGaps: async () => {},
+      scheduler: {
+        now: Date.now,
+        setTimeout(callback) { return setImmediate(callback); },
+        clearTimeout(handle) { clearImmediate(handle); },
+        async yield() {},
+      },
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run() {
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            triggerEvidence: new Map(),
+            pullResult: buildFakeTriggeredPullResult(dependencies),
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, dependencies);
+    provider._updateContexts = async () => true;
+    provider.refresh = () => true;
+
+    await provider.pullDependencies();
+
+    assert.ok(api.calls.length > 0);
+    assert.ok(api.calls.length <= 8);
+  });
+
+  test("bulk final refresh reuses authoritative preflight presence without duplicate lookups", async () => {
+    const dependencies = Array.from({ length: 10 }, (_, index) => ({
+      ...createProblemDependency(`existing-${index}`, "1.0.0", "/project/package.json"),
+      cloudsmithStatus: "ABSENT",
+    }));
+    const api = createLookupApi(() => {
+      throw new Error("preflight presence must suppress the final exact lookup");
+    });
+    const provider = new DependencyHealthProvider(createContext(), null, {
+      createCloudsmithAPI: () => api,
+      enrichVulnerabilities: async values => values,
+      enrichLicenses: async values => values,
+      enrichPolicies: async values => values,
+      fetchRepositories: async () => ({ items: ["repo-a"], complete: true }),
+      analyzeUpstreamGaps: async () => {},
+      userInteraction: createUserInteraction(),
+      upstreamPullService: {
+        async run(options) {
+          const packagesByArtifactKey = new Map(dependencies.map(dependency => [
+            getDependencyArtifactKey(dependency),
+            fromApiPackageRecord(canonicalHealthRecord(dependency.name)),
+          ]));
+          return {
+            workspace: "workspace-a",
+            repository: { slug: "repo-a" },
+            plan: { skippedDependencies: [] },
+            presenceEvidence: createBulkPreflightPresenceEvidence({
+              account: options.account,
+              workspace: "workspace-a",
+              repository: "repo-a",
+              projectFolder: options.projectFolder,
+              cancellationToken: options.token,
+              packagesByArtifactKey,
+            }),
+            pullResult: {
+              total: dependencies.length,
+              cached: 0,
+              triggeredUnconfirmed: 0,
+              alreadyExisted: dependencies.length,
+              notFound: 0,
+              formatMismatched: 0,
+              errors: 0,
+              networkErrors: 0,
+              authFailed: 0,
+              skipped: 0,
+              details: dependencies.map(dependency => ({
+                dependency,
+                status: PULL_STATUS.ALREADY_EXISTS,
+                errorMessage: null,
+                networkError: false,
+              })),
+            },
+          };
+        },
+      },
+    });
+    installSuccessfulPullScan(provider, dependencies);
+    provider._updateContexts = async () => true;
+    provider.refresh = () => true;
+
+    await provider.pullDependencies();
+
+    assert.strictEqual(api.calls.length, 0);
+    assert.strictEqual(
+      provider._fullTrees[0].dependencies.filter(dependency => dependency.cloudsmithStatus === "FOUND").length,
+      dependencies.length
+    );
   });
 
   test("pullSingleDependency refreshes coverage after a successful single-package pull", async () => {
