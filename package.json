@@ -1084,7 +1084,7 @@
   },
   "dependencies": {},
   "overrides": {
-    "qs": "6.15.3"
+    "qs": "6.16.0"
   },
   "devDependencies": {
     "@stryker-mutator/core": "10.0.0",
