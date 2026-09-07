@@ -234,12 +234,15 @@ class PackageNode {
       version: this.version.value,
       format: this.format,
       status,
+      scanStatus: this.package.vulnerability.scanStatus,
+      securityEvidence: this.package.vulnerability.evidence,
       policyViolated: this.policy_violated,
       denyPolicyViolated: this.deny_policy_violated,
       upstreamSource: this.upstreamSource,
     });
 
     return {
+      id: packageCollectionIdentity(this.package),
       label: pkg,
       description,
       tooltip: this._buildTooltip(),

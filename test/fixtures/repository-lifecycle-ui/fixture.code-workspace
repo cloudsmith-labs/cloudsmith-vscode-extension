@@ -1,0 +1,11 @@
+{
+  "folders": [],
+  "settings": {
+    "repositoryLifecycleFixture.enabled": true,
+    "cloudsmith-vsc.defaultWorkspace": "fixture-workspace",
+    "cloudsmith-vsc.groupByPackageGroups": false,
+    "cloudsmith-vsc.showEntitlements": false,
+    "cloudsmith-vsc.inspectOutput": true,
+    "cloudsmith-vsc.showMaxPackages": 30
+  }
+}

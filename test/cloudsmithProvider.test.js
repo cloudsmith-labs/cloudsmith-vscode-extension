@@ -8,6 +8,7 @@ const { replaceCollectionItems } = require("../util/paginatedFetch");
 const { fetchWorkspaces, normalizedWorkspaceName } = require("../util/workspaceFetcher");
 const { getWorkspaceContextProjector } = require("../util/workspaceContextProjector");
 const { RepositoryTerminalNode } = require("../models/repositoryTerminalNode");
+const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiFailure, apiSuccess } = require("./apiResultHelpers");
 const { registerOwnedOpenPackageCommand } = require("./helpers/registeredPackageAction");
 
@@ -171,6 +172,229 @@ suite("CloudsmithProvider", () => {
       ...options,
     });
   }
+
+  function lifecycleRecord(name, overrides = {}) {
+    return { namespace: "workspace-a", repository: "repo-a", slug_perm: name,
+      name, format: "npm", version: "1.0.0", is_copyable: false, ...overrides };
+  }
+
+  function lifecycleExplorer(respond, options = {}) {
+    const requests = [];
+    vscode.workspace.getConfiguration = () => ({ get(key) {
+      if (key === "showMaxPackages") return options.pageSize || 2;
+      if (key === "groupByPackageGroups") return options.grouped === true;
+      if (key === "defaultWorkspace") return "workspace-a";
+      return false;
+    } });
+    const api = new CloudsmithAPI({}, {
+      credentialManager: { async getApiKey() { return "test-only-in-memory"; } },
+      async fetchImpl(url, request) {
+        assert.strictEqual(request.method, "GET");
+        const parsed = new URL(url);
+        requests.push(parsed);
+        const reply = parsed.pathname.startsWith("/v1/repos/")
+          ? { data: [{ slug: "repo-a", slug_perm: "repo-a", name: "Repo A" }] }
+          : parsed.pathname.startsWith("/v1/quota/") ? { data: {}, count: 0 }
+            : await respond(parsed, requests.length);
+        const data = reply.data;
+        const count = reply.count ?? (Array.isArray(data) ? data.length : data.results.length);
+        return new Response(JSON.stringify(data), {
+          status: reply.status || 200,
+          headers: { "content-type": "application/json",
+            "x-pagination-page": parsed.searchParams.get("page") || "1",
+            "x-pagination-pagetotal": String(Math.max(1, Math.ceil(count / (options.pageSize || 2)))),
+            "x-pagination-pagesize": String(options.pageSize || 2),
+            "x-pagination-count": String(count) },
+        });
+      },
+    });
+    const provider = createProvider(null, {
+      createCloudsmithAPI: () => api,
+      fetchWorkspaceRepositories: (scopeContext, workspace, options) => require("../util/workspaceRepositoryFetcher")
+        .fetchWorkspaceRepositories(scopeContext, workspace, { ...options, cloudsmithAPI: api }),
+    });
+    const repository = provider._createRepositoryNode({ slug: "repo-a", name: "Repo A" }, "workspace-a");
+    return { provider, repository, requests, async publish() {
+      const children = await provider.getChildren(repository);
+      children.forEach(child => provider.getTreeItem(child));
+      return children;
+    } };
+  }
+
+  test("mixed lifecycle permutations preserve exact siblings and separate processing from rejected records", async () => {
+    const sibling = lifecycleRecord("sibling", { is_copyable: true });
+    const processing = lifecycleRecord("processing", { name: null, is_sync_in_progress: true });
+    const malformed = lifecycleRecord("malformed", { version: {} });
+    for (const transient of [processing, malformed, null]) {
+      for (const page of [[transient, sibling], [sibling, transient], [sibling, transient, lifecycleRecord("last")], [transient]]) {
+        const scenario = lifecycleExplorer(async () => ({ data: page }), { pageSize: 3 });
+        try {
+          const children = await scenario.publish();
+          const rows = children.filter(child => scenario.repository.ownsPackageSelection(child));
+          assert.deepStrictEqual(rows.map(row => row.package.packageIdentifier).sort(),
+            page.filter(item => item === sibling || item?.name === "last").map(item => item.slug_perm).sort());
+          assert.strictEqual(scenario.repository._packageState.traversalComplete, true);
+          assert.strictEqual(scenario.repository._packageState.complete, false);
+          assert.strictEqual(scenario.repository._packageState.resultKeys.length, page.length);
+          const terminal = children.find(child => child.terminalOutcome);
+          assert.strictEqual(terminal.terminalOutcome.kind, transient === processing ? "processing" : "partial");
+          assert.strictEqual(terminal.package, undefined);
+          assert.doesNotMatch(terminal.getTreeItem().contextValue, /packageActions/);
+          assert.strictEqual(scenario.requests.length, 1);
+        } finally { scenario.provider.dispose(); }
+      }
+    }
+  });
+
+  test("processing and rejected transport records preserve Load More budgets and never establish a trusted inventory", async () => {
+    for (const first of [
+      [lifecycleRecord("pending-a", { name: null, is_sync_awaiting: true }), lifecycleRecord("pending-b", { version: null, is_sync_in_progress: true })],
+      [null, null],
+      [lifecycleRecord("sibling"), lifecycleRecord("malformed", { version: {} })],
+    ]) {
+      let failLater = true;
+      const scenario = lifecycleExplorer(async url => {
+        if (url.searchParams.get("page") === "1") return { data: first, count: 3 };
+        if (failLater) return { data: {}, count: 3, status: 503 };
+        return { data: [lifecycleRecord("later")], count: 3 };
+      });
+      try {
+        const children = await scenario.publish();
+        assert.ok(children.some(child => child.getTreeItem().contextValue === "repositoryLoadMore"));
+        assert.strictEqual(scenario.repository._packageState.continuation.cumulative.itemCount, 2);
+        await scenario.repository.loadMorePackages();
+        assert.strictEqual(scenario.repository._packageState.requestCount, 2);
+        assert.ok((await scenario.publish()).some(child => child.getTreeItem().contextValue === "repositoryLoadMore"));
+        failLater = false;
+        await scenario.repository.loadMorePackages();
+        const settled = await scenario.publish();
+        assert.ok(settled.some(child => child.package?.packageIdentifier === "later"));
+        assert.strictEqual(scenario.repository._packageState.requestCount, 3);
+        assert.strictEqual(scenario.repository._packageState.resultKeys.length, 3);
+        assert.strictEqual(scenario.repository._packageState.continuation, null);
+        assert.strictEqual(scenario.repository._packageState.traversalComplete, true);
+        assert.strictEqual(scenario.repository._packageState.complete, false);
+        assert.strictEqual(scenario.requests.length, 3);
+      } finally { scenario.provider.dispose(); }
+    }
+  });
+
+  test("ingestion drift and duplicate permanent identities stop bounded traversal while retaining authorized siblings", async () => {
+    for (const failure of ["drift", "duplicate"]) {
+      const scenario = lifecycleExplorer(async url => url.searchParams.get("page") === "1"
+        ? { data: [lifecycleRecord("sibling"), lifecycleRecord("pending", { version: null, is_sync_in_flight: true })], count: 3 }
+        : { data: [lifecycleRecord(failure === "duplicate" ? "pending" : "later")], count: failure === "drift" ? 4 : 3 });
+      try {
+        await scenario.publish();
+        await scenario.repository.loadMorePackages();
+        const children = await scenario.publish();
+        assert.deepStrictEqual(children.filter(child => child.package).map(child => child.package.packageIdentifier), ["sibling"]);
+        assert.strictEqual(scenario.repository._packageState.continuation, null);
+        assert.strictEqual(scenario.repository._packageState.complete, false);
+        assert.strictEqual(scenario.repository._packageState.traversalComplete, false);
+        assert.strictEqual(scenario.requests.length, 2);
+        assert.strictEqual(children.find(child => child.terminalOutcome).terminalOutcome.kind, "partial");
+      } finally { scenario.provider.dispose(); }
+    }
+  });
+
+  test("scope conflicts concealed by malformed metadata and unusable envelopes cannot recover package authority", async () => {
+    for (const reply of [
+      { data: [lifecycleRecord("sibling"), lifecycleRecord("foreign", { name: null, repository: "foreign", is_sync_in_progress: true })], count: 2 },
+      { data: [lifecycleRecord("sibling"), lifecycleRecord("conflict", { status_reason: {}, workspace: "foreign" })], count: 2 },
+      { data: { results: [] }, count: 0 },
+      { data: {}, count: 0, status: 403 },
+      { data: {}, count: 0, status: 401 },
+    ]) {
+      const scenario = lifecycleExplorer(async () => reply);
+      try {
+        const children = await scenario.publish();
+        assert.strictEqual(children.some(child => child.package), false);
+        assert.strictEqual(children.find(child => child.terminalOutcome).terminalOutcome.kind, "failed");
+        assert.strictEqual(scenario.repository._packageState.processingCount, 0);
+        assert.strictEqual(scenario.repository._packageState.rejectedCount, 0);
+        assert.strictEqual(scenario.repository._packageState.continuation, null);
+      } finally { scenario.provider.dispose(); }
+    }
+  });
+
+  test("sync flags establish processing only with supported types and noncontradictory lifecycle evidence", async () => {
+    for (const flags of [
+      {}, { is_sync_in_progress: "true" }, { is_sync_in_progress: true, is_sync_completed: true },
+      { is_sync_awaiting: true, is_sync_failed: true }, { is_sync_in_progress: true, sync_progress: 101 },
+      { is_sync_in_progress: true, status: "1" }, { is_sync_in_progress: true, stage: "1" },
+      { is_sync_in_progress: true, status_str: 42 }, { is_sync_in_progress: true, status_str_raw: {} },
+      { is_sync_in_progress: true, is_sync_completed: null }, { is_sync_in_progress: true, status: null },
+      { is_sync_in_progress: true, stage: null }, { is_sync_in_progress: true, sync_progress: null },
+    ]) {
+      const scenario = lifecycleExplorer(async () => ({ data: [lifecycleRecord("unknown", { name: null, ...flags })] }));
+      try {
+        const children = await scenario.publish();
+        assert.strictEqual(scenario.repository._packageState.processingCount, 0);
+        assert.strictEqual(scenario.repository._packageState.rejectedCount, 1);
+        assert.strictEqual(children.find(child => child.terminalOutcome).terminalOutcome.kind, "partial");
+      } finally { scenario.provider.dispose(); }
+    }
+  });
+
+  test("grouped and ungrouped filtered Explorer refreshes preserve safe publication during scan transitions", async () => {
+    const { activeFilters } = require("../util/filterState");
+    activeFilters.set("workspace-a/repo-a", { query: "format:npm", label: "npm" });
+    try {
+      for (const grouped of [false, true]) {
+        let settled = false;
+        const scenario = lifecycleExplorer(async url => {
+          assert.strictEqual(url.searchParams.get("query"), "format:npm");
+          assert.strictEqual(url.pathname.endsWith("/groups/"), grouped);
+          return { data: grouped ? { results: [
+            { name: "sibling", format: "npm", count: 1 },
+            { name: "pending", format: "npm", count: settled ? 2 : 1 },
+          ] } : [lifecycleRecord("sibling", { is_copyable: true }), lifecycleRecord("pending", {
+            status_reason: "", security_scan_status: settled ? "Scan Detected No Vulnerabilities" : "Security Scanning in Progress",
+          })] };
+        }, { grouped });
+        try {
+          const first = await scenario.publish();
+          const old = first.filter(child => scenario.repository.ownsPackageSelection(child));
+          assert.strictEqual(old.length, 2);
+          if (!grouped) assert.match(old[1].getTreeItem().description, /Security scanning in progress/);
+          settled = true;
+          scenario.provider.refresh();
+          const roots = await scenario.provider.getChildren();
+          assert.strictEqual(scenario.provider.ownsPackageSelection(old[0]), false);
+          const current = roots.find(node => node.slug === "repo-a");
+          const second = await scenario.provider.getChildren(current);
+          const rows = second.filter(child => current.ownsPackageSelection(child));
+          assert.strictEqual(rows.length, 2);
+          assert.strictEqual(new Set(rows.map(row => row.name)).size, 2);
+          if (!grouped) {
+            assert.strictEqual(rows[1].getTreeItem().id, old[1].getTreeItem().id);
+            assert.strictEqual(rows[1].package.vulnerability.evidence, "clean");
+            assert.strictEqual(rows[1].getActionCapabilities().actions.promote, false);
+          }
+          assert.strictEqual(scenario.requests.filter(url => url.pathname.startsWith("/v1/packages/")).length, 2);
+        } finally { scenario.provider.dispose(); }
+      }
+    } finally { activeFilters.delete("workspace-a/repo-a"); }
+  });
+
+  test("unexpected package construction stays diagnosable and retains only previously authorized pages", async () => {
+    const scenario = lifecycleExplorer(async url => ({
+      data: url.searchParams.get("page") === "1"
+        ? [lifecycleRecord("sibling"), lifecycleRecord("second")]
+        : [lifecycleRecord("later")], count: 3,
+    }));
+    try {
+      await scenario.publish();
+      scenario.repository._createPackageNode = () => { throw new Error("untrusted failure details"); };
+      await scenario.repository.loadMorePackages();
+      const children = await scenario.publish();
+      assert.deepStrictEqual(children.filter(child => child.package).map(child => child.package.packageIdentifier), ["sibling", "second"]);
+      assert.strictEqual(scenario.repository._packageState.termination, "unexpected");
+      assert.strictEqual(scenario.repository._packageState.continuation, null);
+      assert.doesNotMatch(JSON.stringify(scenario.repository._packageState.failures), /untrusted failure details/);
+    } finally { scenario.provider.dispose(); }
+  });
 
   test("requires and shares one narrow upstream inventory facade", () => {
     assert.throws(
@@ -1092,6 +1316,55 @@ suite("CloudsmithProvider", () => {
       )), `real TreeView did not publish the terminal item: ${JSON.stringify(ledger)}`);
     } finally {
       provider.dispose();
+    }
+  });
+
+  test("real HTTP collection publishes a pending scan with empty optional metadata beside a valid sibling", async () => {
+    // Contract-derived: Cloudsmith's Package schema permits an empty status_reason.
+    // This is deliberately the real HTTP -> pagination -> adapter -> model -> provider path.
+    let requests = 0;
+    vscode.workspace.getConfiguration = () => ({ get(key) { return key === "showMaxPackages" ? 30 : false; } });
+    const metadata = deferred();
+    const record = name => ({
+      namespace: "workspace-a", repository: "repo-a", slug_perm: name,
+      name, format: "npm", version: "1.0.0", status_str: "Completed",
+    });
+    const api = new CloudsmithAPI({}, {
+      credentialManager: { async getApiKey() { return "test-only-in-memory"; } },
+      async fetchImpl(_url, request) {
+        requests += 1;
+        assert.strictEqual(request.method, "GET");
+        return new Response(JSON.stringify([
+          { ...record("sibling"), is_copyable: true },
+          { ...record("pending"), status_reason: "", security_scan_status: "Awaiting Security Scan", is_copyable: false },
+        ]), { headers: {
+          "content-type": "application/json",
+          "x-pagination-page": "1", "x-pagination-pagetotal": "1",
+          "x-pagination-pagesize": "30", "x-pagination-count": "2",
+        } });
+      },
+    });
+    const provider = createProvider(null, {
+      createCloudsmithAPI: () => api,
+      upstreamInventory: { getAllUpstreamData: () => metadata.promise },
+    });
+    const repository = provider._createRepositoryNode({ slug: "repo-a", name: "Repo A" }, "workspace-a");
+    try {
+      const children = await provider.getChildren(repository);
+      const packages = children.filter(child => repository.ownsPackageSelection(child));
+      assert.deepStrictEqual(packages.map(child => child.package.packageIdentifier), ["sibling", "pending"],
+        "a supported empty optional field must not erase either package row");
+      assert.strictEqual(packages[1].package.vulnerability.evidence, "unknown");
+      assert.strictEqual(packages[1].package.vulnerability.scanStatus, "Awaiting Security Scan");
+      assert.match(provider.getTreeItem(packages[1]).description, /Awaiting security scan/i);
+      assert.strictEqual(packages[1].getActionCapabilities().actions.open, true);
+      assert.strictEqual(packages[1].getActionCapabilities().actions.install, false);
+      assert.strictEqual(packages[1].getActionCapabilities().actions.promote, false);
+      assert.strictEqual(requests, 1, "publication must not look up pending rows individually");
+      assert.strictEqual(children.some(child => child.terminalOutcome), false);
+    } finally {
+      provider.dispose();
+      metadata.resolve(null);
     }
   });
 

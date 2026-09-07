@@ -78,6 +78,48 @@ suite("Package Metadata Flow Test Suite", () => {
     assert.match(searchItem.description, /repo/);
   });
 
+  test("package and Search preserve scan uncertainty and stable resource IDs through rescan transitions", () => {
+    for (const NodeType of [PackageNode, SearchResultNode]) {
+      const states = ["Awaiting Security Scan", "Security Scanning in Progress", "Scan Detected Vulnerabilities",
+        "Security Scanning Failed", "Security Scanning Disabled", "Security Scanning Skipped",
+        "Security Scanning Not Supported", "Future scan status"];
+      let identity;
+      for (const security_scan_status of states) {
+        const node = new NodeType({ ...pkg, status_reason: "", checksum_sha256: "", cdn_url: "",
+          security_scan_status, is_copyable: false, has_vulnerabilities: true }, {});
+        const item = node.getTreeItem();
+        identity ||= item.id;
+        assert.strictEqual(item.id, identity);
+        assert.strictEqual(packageAdapters.fromPackageSelection(node), node.package);
+        assert.strictEqual(node.getActionCapabilities().actions.inspect, true);
+        assert.strictEqual(node.getActionCapabilities().actions.open, true);
+        assert.strictEqual(node.getActionCapabilities().actions.install, false);
+        assert.strictEqual(node.getActionCapabilities().actions.promote, false);
+        assert.strictEqual(node.package.vulnerability.detected, true);
+        assert.strictEqual(node.package.vulnerability.count, null);
+        if (security_scan_status !== "Scan Detected Vulnerabilities") {
+          assert.strictEqual(node.package.vulnerability.evidence, "unknown");
+          assert.ok(item.description.toLowerCase().includes(security_scan_status.toLowerCase()));
+        }
+      }
+    }
+  });
+
+  test("current package and Search actions preserve absent optional slug and synchronization status", () => {
+    for (const NodeType of [PackageNode, SearchResultNode]) {
+      const record = { ...pkg, slug: null, status_str: null, status_reason: "", security_scan_status: "Awaiting Security Scan" };
+      const node = new NodeType(record, {});
+      assert.strictEqual(packageAdapters.fromPackageSelection(node), node.package);
+      assert.strictEqual(node.getActionCapabilities().actions.open, true);
+      for (const field of ["slug", "status_str"]) {
+        const original = node[field];
+        node[field] = { id: "Modified projection", value: "different" };
+        assert.throws(() => packageAdapters.fromPackageSelection(node), PackageAdapterError);
+        node[field] = original;
+      }
+    }
+  });
+
   setup(() => {
     originalGetConfiguration = vscode.workspace.getConfiguration;
     vscode.workspace.getConfiguration = () => ({
@@ -750,6 +792,10 @@ suite("Package Metadata Flow Test Suite", () => {
       ...baseDependency,
       cloudsmithPackage: packageWithoutStatus,
     }, null, {});
+    const emptyApiStatusNode = new DependencyHealthNode({
+      ...baseDependency,
+      cloudsmithPackage: { ...pkg, status_str: "" },
+    }, null, {});
     const invalidDisplayNodes = [{ unsafe: true }, 2].map(status => new DependencyHealthNode({
       ...baseDependency,
       cloudsmithPackage: packageWithoutStatus,
@@ -767,7 +813,7 @@ suite("Package Metadata Flow Test Suite", () => {
       "Status"
     );
     assert.strictEqual(details(policyNode).find(item => item.tooltip.startsWith("Status:")).description, "Policy quarantined");
-    for (const node of [noStatusNode, ...invalidDisplayNodes]) {
+    for (const node of [noStatusNode, emptyApiStatusNode, ...invalidDisplayNodes]) {
       const items = details(node);
       assert.strictEqual(items.some(item => item.tooltip.startsWith("Status:")), false);
       assert.ok(items.some(item => item.tooltip.startsWith("Version:") && item.label === "Version" && item.description === "1.0.0"));
@@ -775,7 +821,9 @@ suite("Package Metadata Flow Test Suite", () => {
         ["Not available", "Unknown", "undefined", "[object Object]"].includes(value)
       ))), false);
     }
-    assert.throws(() => fromApiPackageRecord({ ...pkg, status_str: "" }), /status/);
+    assert.strictEqual(emptyApiStatusNode.package.packageIdentifier, packageWithStatus.packageIdentifier);
+    assert.strictEqual(emptyApiStatusNode.cloudsmithStatus, "FOUND");
+    assert.throws(() => fromApiPackageRecord({ ...pkg, status_str: false }), /status/);
   });
 
   test("DependencyHealthNode reports unclassified match failures without exposing input", () => {

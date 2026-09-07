@@ -1076,6 +1076,170 @@ suite("Canonical package domain", () => {
     });
   });
 
+  test("contract-derived empty optional API metadata preserves exact package identity", () => {
+    // Official packages_list -> Package schema: these strings have no minLength.
+    // cloudsmith-io/cloudsmith-api-go d8df46fba17f8406633de8f8a0b041f50c624213,
+    // api/openapi.yaml; this is a contract-derived fixture, not a captured response.
+    const fields = [
+      ["status_reason", "statusReason", true],
+      ["checksum_sha256", "checksumSha256", false],
+      ["cdn_url", "cdnUrl", true],
+      ["status_str", "status", false, "status_str_raw"],
+    ];
+    const original = fromApiPackageRecord(apiRecord());
+    for (const [apiField, canonicalField, nullable, strictAlias = canonicalField] of fields) {
+      for (const value of [undefined, "", ...(nullable ? [null] : [])]) {
+        const record = apiRecord({ [apiField]: value });
+        if (value === undefined) delete record[apiField];
+        const pkg = fromApiPackageRecord(record);
+        assert.ok(isExactPackage(pkg), apiField);
+        assert.strictEqual(pkg[canonicalField], null, apiField);
+        assert.strictEqual(exactPackageIdentity(pkg), exactPackageIdentity(original), apiField);
+      }
+      for (const malformed of [false, 0, [], {}]) {
+        assert.throws(
+          () => fromApiPackageRecord(apiRecord({ [apiField]: malformed })),
+          error => PackageAdapterError.isTrusted(error) && error.field === apiField,
+          apiField
+        );
+        assert.throws(
+          () => fromApiPackageRecord(apiRecord({ [strictAlias]: malformed })),
+          error => PackageAdapterError.isTrusted(error) && error.field === strictAlias,
+          strictAlias
+        );
+      }
+      assert.throws(() => fromApiPackageRecord(apiRecord({
+        [apiField]: "first-value",
+        [strictAlias]: "different-value",
+      })), error => PackageAdapterError.isTrusted(error) && error.code === "conflicting_aliases");
+      assert.throws(
+        () => fromApiPackageRecord(apiRecord({ [strictAlias]: "" })),
+        error => PackageAdapterError.isTrusted(error) && error.field === strictAlias
+      );
+    }
+    assert.throws(
+      () => fromPackageNode(apiRecord({ status: "", status_str: undefined })),
+      error => PackageAdapterError.isTrusted(error) && error.field === "status"
+    );
+    for (const field of ["namespace", "repository", "slug_perm", "name", "version", "format"]) {
+      assert.throws(() => fromApiPackageRecord(apiRecord({ [field]: "" })), PackageAdapterError);
+    }
+  });
+
+  test("contract-derived optional API empties retain versionless and qualified format coordinates", () => {
+    const shapes = [
+      { format: "npm", name: "@scope/Package", version: "1.2.3" },
+      { format: "raw", name: "artifact.bin", version: "1.2.3" },
+      { format: "raw", name: "artifact.bin", version: null },
+      { format: "generic", name: null, version: null, filepath: "release/artifact.bin" },
+      {
+        format: "maven",
+        name: "demo",
+        version: "1.2.3",
+        extension: ".jar",
+        filename: "demo-1.2.3-tests.jar",
+        identifiers: { group_id: "com.example", classifier: "tests" },
+      },
+    ];
+    for (const shape of shapes) {
+      const original = fromApiPackageRecord(apiRecord(shape));
+      const pkg = fromApiPackageRecord(apiRecord({
+        ...shape,
+        status_reason: "",
+        status_str: "",
+        checksum_sha256: "",
+        cdn_url: "",
+      }));
+      assert.strictEqual(exactPackageIdentity(pkg), exactPackageIdentity(original), shape.format);
+      assert.deepStrictEqual(packageCoordinateFromExact(pkg), packageCoordinateFromExact(original));
+      assert.deepStrictEqual(pkg.qualifiers, original.qualifiers);
+    }
+  });
+
+  test("verified security scan lifecycle retains truthful status independently of exact identity", () => {
+    const cases = [
+      ["Awaiting Security Scan", "unknown", 0, false],
+      ["Security Scanning in Progress", "unknown", 0, false],
+      ["Scan Detected Vulnerabilities", "detected", 2, true],
+      ["Scan Detected No Vulnerabilities", "clean", 0, false],
+      ["Security Scanning Disabled", "unknown", 0, false],
+      ["Security Scanning Failed", "unknown", 0, false],
+      ["Security Scanning Skipped", "unknown", 0, false],
+      ["Security Scanning Not Supported", "unknown", 0, false],
+      ["Unrecognized future scan state", "unknown", 0, false],
+    ];
+    const original = fromApiPackageRecord(apiRecord());
+    for (const [scanStatus, evidence, count, detected] of cases) {
+      const pkg = fromApiPackageRecord(apiRecord({
+        security_scan_status: scanStatus,
+        num_vulnerabilities: count,
+        has_vulnerabilities: detected,
+        max_severity: detected ? "High" : "None",
+      }));
+      assert.strictEqual(exactPackageIdentity(pkg), exactPackageIdentity(original), scanStatus);
+      assert.deepStrictEqual(pkg.vulnerability, {
+        evidence,
+        detected,
+        count: evidence === "unknown" ? null : count,
+        maxSeverity: detected ? "High" : null,
+        scanStatus,
+      }, scanStatus);
+    }
+  });
+
+  test("security rescan retains positive evidence without claiming scan completeness", () => {
+    const incompleteScans = [
+      "Awaiting Security Scan",
+      "Security Scanning in Progress",
+      "Security Scanning Disabled",
+      "Security Scanning Failed",
+      "Security Scanning Skipped",
+      "Security Scanning Not Supported",
+      "Unrecognized future scan state",
+    ];
+    for (const scanStatus of incompleteScans) {
+      for (const positiveEvidence of [
+        { num_vulnerabilities: 2, has_vulnerabilities: true, max_severity: "High" },
+        { num_vulnerabilities: 0, has_vulnerabilities: true, max_severity: "High" },
+        { num_vulnerabilities: 2, has_vulnerabilities: false, max_severity: "High" },
+        { num_vulnerabilities: 0, has_vulnerabilities: false, max_severity: "High" },
+      ]) {
+        const pkg = fromApiPackageRecord(apiRecord({
+          ...positiveEvidence,
+          security_scan_status: scanStatus,
+        }));
+        assert.deepStrictEqual(pkg.vulnerability, {
+          evidence: "unknown",
+          detected: true,
+          count: null,
+          maxSeverity: "High",
+          scanStatus,
+        }, scanStatus);
+      }
+    }
+  });
+
+  test("contradictory completed scan evidence cannot retain an authoritative terminal status", () => {
+    const cases = [
+      { security_scan_status: "Scan Detected No Vulnerabilities", num_vulnerabilities: 2 },
+      { security_scan_status: "Scan Detected No Vulnerabilities", has_vulnerabilities: true },
+      { security_scan_status: "Scan Detected No Vulnerabilities", max_severity: "High" },
+      { security_scan_status: "Scan Detected Vulnerabilities", num_vulnerabilities: 0 },
+      {
+        security_scan_status: "Scan Detected Vulnerabilities",
+        num_vulnerabilities: 2,
+        has_vulnerabilities: false,
+      },
+    ];
+    for (const contradiction of cases) {
+      const pkg = fromApiPackageRecord(apiRecord(contradiction));
+      assert.strictEqual(pkg.vulnerability.evidence, "unknown");
+      assert.strictEqual(pkg.vulnerability.detected, true);
+      assert.strictEqual(pkg.vulnerability.count, null);
+      assert.strictEqual(pkg.vulnerability.scanStatus, null);
+    }
+  });
+
   test("canonical package evidence cannot be overwritten by stale presentation aliases", () => {
     const pkg = fromApiPackageRecord(apiRecord());
     assert.strictEqual(fromPackageSelection({ package: pkg }), pkg);

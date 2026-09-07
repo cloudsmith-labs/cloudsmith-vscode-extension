@@ -231,12 +231,15 @@ class SearchResultNode {
             format: this.format,
             repository: this.repository,
             status,
+            scanStatus: this.package.vulnerability.scanStatus,
+            securityEvidence: this.package.vulnerability.evidence,
             policyViolated: this.policy_violated,
             denyPolicyViolated: this.deny_policy_violated,
             upstreamSource: this.upstreamSource,
         });
 
         return {
+            id: packageCollectionIdentity(this.package),
             label: this.name,
             description,
             tooltip: this._buildTooltip(),

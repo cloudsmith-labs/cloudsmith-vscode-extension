@@ -1,0 +1,44 @@
+{
+  "name": "repository-lifecycle-fixture",
+  "displayName": "Repository lifecycle fixture",
+  "publisher": "cloudsmith-test",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": { "vscode": "^1.99.0" },
+  "main": "./extension.js",
+  "files": ["extension.js", "README.md"],
+  "contributes": {
+    "views": {
+      "explorer": [
+        { "id": "repositoryLifecycleFixture", "name": "Repository lifecycle fixture" }
+      ]
+    },
+    "commands": [
+      { "command": "repositoryLifecycleFixture.refresh", "title": "Lifecycle fixture: Refresh repository", "icon": "$(refresh)" },
+      { "command": "repositoryLifecycleFixture.settle", "title": "Lifecycle fixture: Complete processing", "icon": "$(check)" },
+      { "command": "repositoryLifecycleFixture.restart", "title": "Lifecycle fixture: Restart processing" },
+      { "command": "repositoryLifecycleFixture.inspect", "title": "Inspect fixture package" },
+      { "command": "repositoryLifecycleFixture.summary", "title": "Lifecycle fixture: Show transport summary" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "repositoryLifecycleFixture.refresh", "when": "view == repositoryLifecycleFixture", "group": "navigation@1" },
+        { "command": "repositoryLifecycleFixture.settle", "when": "view == repositoryLifecycleFixture", "group": "navigation@2" }
+      ],
+      "view/item/context": [
+        { "command": "repositoryLifecycleFixture.inspect", "when": "view == repositoryLifecycleFixture && viewItem =~ /packageActions\\..*inspect/", "group": "navigation@1" }
+      ]
+    },
+    "configuration": {
+      "title": "Repository lifecycle fixture",
+      "properties": {
+        "repositoryLifecycleFixture.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable this isolated, contract-derived rendering fixture. No live Cloudsmith request is made."
+        }
+      }
+    }
+  }
+}

@@ -10,6 +10,10 @@ function buildPackageRowDescription(values = {}) {
   if (status && status.toLowerCase() !== "completed") {
     addPart(parts, status);
   }
+  if (values.securityEvidence === "unknown" && values.scanStatus) {
+    const scan = text(values.scanStatus);
+    addPart(parts, scan.charAt(0).toUpperCase() + scan.slice(1).toLowerCase());
+  }
   if (values.denyPolicyViolated === true) {
     addPart(parts, "Deny policy violation");
   } else if (values.policyViolated === true) {
