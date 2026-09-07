@@ -88,6 +88,8 @@ suite("Package Metadata Flow Test Suite", () => {
         const node = new NodeType({ ...pkg, status_reason: "", checksum_sha256: "", cdn_url: "",
           security_scan_status, is_copyable: false, has_vulnerabilities: true }, {});
         const item = node.getTreeItem();
+        assert.strictEqual(typeof item.id, "string");
+        assert.strictEqual(item.id, packageDomain.exactPackageIdentity(node.package));
         identity ||= item.id;
         assert.strictEqual(item.id, identity);
         assert.strictEqual(packageAdapters.fromPackageSelection(node), node.package);
