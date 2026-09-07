@@ -29,6 +29,23 @@ const EXACT_FILE_READ_FLAGS = fs.constants.O_RDONLY
   | (fs.constants.O_NOFOLLOW || 0)
   | (fs.constants.O_NONBLOCK || 0);
 const unstableArtifactFailures = new WeakSet();
+const verificationFailureDiagnostics = new WeakMap();
+const verificationPhases = new Set(["snapshot", "rebind", "semantics", "sidecars"]);
+const verificationChecks = new Set([
+  "open", "descriptor-stat", "path-stat", "file-kind", "links", "size",
+  "expected-identity", "descriptor-identity", "path-identity", "canonical-path",
+  "read", "read-size", "close", "archive-validation", "central-directory",
+  "manifest", "source-inventory", "source-bytes", "module-closure", "embedded-metadata",
+  "artifact-file", "checksum-file", "provenance-file", "artifact-bytes",
+  "checksum-encoding", "checksum-bytes", "provenance-encoding", "provenance-json",
+  "provenance-fields", "provenance-values", "provenance-schema", "provenance-source",
+  "provenance-toolchain", "provenance-commit", "provenance-epoch",
+  "provenance-pin", "provenance-expected-source", "provenance-publishable",
+]);
+const verificationErrnos = new Set([
+  "EACCES", "EBUSY", "EIO", "EISDIR", "ELOOP", "EMFILE", "ENAMETOOLONG",
+  "ENOENT", "ENOTDIR", "EPERM", "ESTALE",
+]);
 const WINDOWS_ARTIFACT_VERIFICATION_RETRIES = 8;
 const EXACT_ARTIFACT_IDENTITY_KEYS = Object.freeze([
   "changedNanoseconds",
@@ -39,6 +56,50 @@ const EXACT_ARTIFACT_IDENTITY_KEYS = Object.freeze([
   "modifiedNanoseconds",
   "size",
 ]);
+
+function verificationFailureDiagnostic(error) {
+  return error && (typeof error === "object" || typeof error === "function")
+    ? verificationFailureDiagnostics.get(error) || null
+    : null;
+}
+
+function annotateVerificationFailure(error, phase, check, expected, actual) {
+  // Diagnostics must not inspect messages, invoke accessors, or change rejection
+  // and buffer cleanup when an untrusted thrown value is a hostile Proxy.
+  try {
+  if (!error || (typeof error !== "object" && typeof error !== "function")
+    || verificationFailureDiagnostics.has(error)
+    || !verificationPhases.has(phase) || !verificationChecks.has(check)) return error;
+  const code = phase === "snapshot" || phase === "rebind"
+    ? Object.getOwnPropertyDescriptor(error, "code")
+    : null;
+  const errno = code && Object.prototype.hasOwnProperty.call(code, "value")
+    && verificationErrnos.has(code.value) ? code.value : null;
+  const changed = expected && actual ? EXACT_ARTIFACT_IDENTITY_KEYS.filter(key => {
+    const left = Object.getOwnPropertyDescriptor(expected, key);
+    const right = Object.getOwnPropertyDescriptor(actual, key);
+    return !left || !right || !Object.prototype.hasOwnProperty.call(left, "value")
+      || !Object.prototype.hasOwnProperty.call(right, "value") || left.value !== right.value;
+  }) : [];
+  verificationFailureDiagnostics.set(error,
+    [phase, check, errno, changed.length ? changed.join(",") : null].filter(Boolean).join(":"));
+  return error;
+  } catch {
+    return error;
+  }
+}
+
+function verificationCheckError(message, phase, check, expected, actual) {
+  return annotateVerificationFailure(new Error(message), phase, check, expected, actual);
+}
+
+function runVerificationCheck(phase, check, operation) {
+  try {
+    return operation();
+  } catch (error) {
+    throw annotateVerificationFailure(error, phase, check);
+  }
+}
 const generatedEntries = new Set(["[Content_Types].xml", "extension.vsixmanifest"]);
 const baseMedia = new Set([
   "media/icon.svg",
@@ -411,33 +472,42 @@ function openZip(buffer) {
   });
 }
 
-function assertBoundedArtifactStat(stat, errorMessage) {
-  if (!stat.isFile() || stat.nlink !== 1n
-    || stat.size <= 0n || stat.size > BigInt(limits.archiveBytes)) {
-    throw new Error(errorMessage);
+function assertBoundedArtifactStat(stat, errorMessage, phase) {
+  if (!stat.isFile()) throw verificationCheckError(errorMessage, phase, "file-kind");
+  if (stat.nlink !== 1n) throw verificationCheckError(errorMessage, phase, "links");
+  if (stat.size <= 0n || stat.size > BigInt(limits.archiveBytes)) {
+    throw verificationCheckError(errorMessage, phase, "size");
   }
   return stat;
 }
 
-function assertStableArtifactPath(filePath, descriptor, identity, fileSystem, errorMessage) {
+function assertStableArtifactPath(filePath, descriptor, identity, fileSystem, errorMessage, phase) {
   const descriptorStat = assertBoundedArtifactStat(
-    fileSystem.fstatSync(descriptor, { bigint: true }),
-    errorMessage,
+    runVerificationCheck(phase, "descriptor-stat", () => fileSystem.fstatSync(descriptor, { bigint: true })),
+    errorMessage, phase,
   );
   const pathStat = assertBoundedArtifactStat(
-    fileSystem.lstatSync(filePath, { bigint: true }),
-    errorMessage,
+    runVerificationCheck(phase, "path-stat", () => fileSystem.lstatSync(filePath, { bigint: true })),
+    errorMessage, phase,
   );
   if (pathStat.isSymbolicLink()
-    || fileSystem.realpathSync(filePath) !== filePath
-    || !sameExactFileIdentity(identity, exactFileIdentity(descriptorStat))
-    || !sameExactFileIdentity(identity, exactFileIdentity(pathStat))) {
-    throw new Error(errorMessage);
+    || runVerificationCheck(phase, "canonical-path", () => fileSystem.realpathSync(filePath)) !== filePath) {
+    throw verificationCheckError(errorMessage, phase, "canonical-path");
+  }
+  const descriptorIdentity = exactFileIdentity(descriptorStat);
+  if (!sameExactFileIdentity(identity, descriptorIdentity)) {
+    throw verificationCheckError(errorMessage, phase, "descriptor-identity", identity, descriptorIdentity);
+  }
+  const pathIdentity = exactFileIdentity(pathStat);
+  if (!sameExactFileIdentity(identity, pathIdentity)) {
+    throw verificationCheckError(errorMessage, phase, "path-identity", identity, pathIdentity);
   }
 }
 
 function artifactTransactionFailure(transactionFailure, errorMessage, retryable = true) {
   const error = new Error(errorMessage);
+  const diagnostic = verificationFailureDiagnostic(transactionFailure);
+  if (diagnostic) verificationFailureDiagnostics.set(error, diagnostic);
   const code = (typeof transactionFailure === "object" || typeof transactionFailure === "function")
     ? Object.getOwnPropertyDescriptor(transactionFailure, "code")
     : null;
@@ -475,22 +545,25 @@ function captureStableArtifactSnapshot(filePath, options) {
   let identity;
   let transactionFailure = null;
   let transactionRetryable = true;
+  let check = "open";
   try {
     descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS, 0o600);
+    check = "descriptor-stat";
     const openedStat = assertBoundedArtifactStat(
       fileSystem.fstatSync(descriptor, { bigint: true }),
-      errorMessage,
+      errorMessage, "snapshot",
     );
     identity = exactFileIdentity(openedStat);
     if (options.expectedIdentity
       && !sameExactFileIdentity(options.expectedIdentity, identity)) {
-      throw new Error(errorMessage);
+      throw verificationCheckError(errorMessage, "snapshot", "expected-identity", options.expectedIdentity, identity);
     }
-    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
+    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage, "snapshot");
     const expectedSize = Number(openedStat.size);
     allocation = Buffer.allocUnsafe(expectedSize);
     let offset = 0;
     while (offset < expectedSize) {
+      check = "read";
       const bytesRead = fileSystem.readSync(
         descriptor,
         allocation,
@@ -500,21 +573,21 @@ function captureStableArtifactSnapshot(filePath, options) {
       );
       if (!Number.isSafeInteger(bytesRead) || bytesRead < 0
         || bytesRead > expectedSize - offset) {
-        throw new Error(errorMessage);
+        throw verificationCheckError(errorMessage, "snapshot", "read-size");
       }
       if (bytesRead === 0) break;
       offset += bytesRead;
     }
-    if (offset !== expectedSize) throw new Error(errorMessage);
-    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
+    if (offset !== expectedSize) throw verificationCheckError(errorMessage, "snapshot", "read-size");
+    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage, "snapshot");
   } catch (error) {
-    transactionFailure = error;
+    transactionFailure = annotateVerificationFailure(error, "snapshot", check);
   } finally {
     if (descriptor !== undefined) {
       try {
         fileSystem.closeSync(descriptor);
       } catch (error) {
-        transactionFailure = error;
+        transactionFailure = annotateVerificationFailure(error, "snapshot", "close");
         transactionRetryable = false;
       }
     }
@@ -533,24 +606,27 @@ function rebindStableArtifactPath(filePath, identity, options) {
   let descriptor;
   let transactionFailure = null;
   let transactionRetryable = true;
+  let check = "open";
   try {
     descriptor = fileSystem.openSync(absolutePath, EXACT_FILE_READ_FLAGS, 0o600);
+    check = "descriptor-stat";
     const reboundStat = assertBoundedArtifactStat(
       fileSystem.fstatSync(descriptor, { bigint: true }),
-      errorMessage,
+      errorMessage, "rebind",
     );
-    if (!sameExactFileIdentity(identity, exactFileIdentity(reboundStat))) {
-      throw new Error(errorMessage);
+    const reboundIdentity = exactFileIdentity(reboundStat);
+    if (!sameExactFileIdentity(identity, reboundIdentity)) {
+      throw verificationCheckError(errorMessage, "rebind", "expected-identity", identity, reboundIdentity);
     }
-    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage);
+    assertStableArtifactPath(absolutePath, descriptor, identity, fileSystem, errorMessage, "rebind");
   } catch (error) {
-    transactionFailure = error;
+    transactionFailure = annotateVerificationFailure(error, "rebind", check);
   } finally {
     if (descriptor !== undefined) {
       try {
         fileSystem.closeSync(descriptor);
       } catch (error) {
-        transactionFailure = error;
+        transactionFailure = annotateVerificationFailure(error, "rebind", "close");
         transactionRetryable = false;
       }
     }
@@ -570,7 +646,7 @@ async function withStableArtifact(filePath, options = {}, consume) {
     result = await consume(snapshot.allocation, snapshot.identity);
   } catch (error) {
     snapshot.allocation.fill(0);
-    throw error;
+    throw annotateVerificationFailure(error, "semantics", "archive-validation");
   }
   try {
     runArtifactTransaction(
@@ -627,16 +703,16 @@ async function verifyFreshVsix(filePath, options = {}) {
   });
 }
 
-function withBoundedNamedFile(filePath, options, consume) {
+function withBoundedNamedFile(filePath, options, consume, check) {
   let semanticError;
-  const result = withStableSingleLinkFile(filePath, options, (bytes, identity) => {
+  const result = runVerificationCheck("sidecars", check, () => withStableSingleLinkFile(filePath, options, (bytes, identity) => {
     try {
       return consume(bytes, identity);
     } catch (error) {
       semanticError = error;
       return undefined;
     }
-  });
+  }));
   if (semanticError) throw semanticError;
   return result;
 }
@@ -645,12 +721,14 @@ async function verifyVsix(filePath, options = {}) {
   const { sourceSha = null } = options;
   return withStableArtifact(filePath, options, async (artifactBytes, artifactIdentity) => {
   const buffer = artifactBytes;
-  const central = parseCentralDirectory(buffer);
-  const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const central = runVerificationCheck("semantics", "central-directory", () => parseCentralDirectory(buffer));
+  const manifest = runVerificationCheck("semantics", "manifest", () => (
+    JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"))
+  ));
   if (!manifest.dependencies || Object.keys(manifest.dependencies).length) {
     throw new Error("package.json dependencies must be explicitly empty before packaging");
   }
-  const { expected } = buildExpectedInventory({ sourceSha });
+  const { expected } = runVerificationCheck("semantics", "source-inventory", () => buildExpectedInventory({ sourceSha }));
   const requiredArchivePaths = new Set([...generatedEntries, ...expected.keys()]);
   const seen = new Set();
   const entries = new Map();
@@ -701,7 +779,9 @@ async function verifyVsix(filePath, options = {}) {
       scanSensitiveBytes(bytes, ordinal);
       entries.set(fileName, bytes);
       if (!generatedEntries.has(fileName)) {
-        assertSourceBytes(fileName, bytes, expected.get(fileName), manifest, sourceSha);
+        runVerificationCheck("semantics", "source-bytes", () => (
+          assertSourceBytes(fileName, bytes, expected.get(fileName), manifest, sourceSha)
+        ));
       }
     }
   } finally {
@@ -716,8 +796,8 @@ async function verifyVsix(filePath, options = {}) {
       throw new Error(`VSIX omits expected entry: ${required}`);
     }
   }
-  assertRelativeModuleClosure(entries, expected);
-  assertEmbeddedMetadata(entries, expected, manifest);
+  runVerificationCheck("semantics", "module-closure", () => assertRelativeModuleClosure(entries, expected));
+  runVerificationCheck("semantics", "embedded-metadata", () => assertEmbeddedMetadata(entries, expected, manifest));
 
   return {
     artifactIdentity,
@@ -737,6 +817,8 @@ async function verifyVsix(filePath, options = {}) {
 }
 
 function validateProvenance(provenance, filePath, verification, options) {
+  let check = "provenance-fields";
+  try {
   const allowedFields = new Set([
     "archiveBytes", "entryCount", "filename", "name", "nodeVersion", "npmVersion",
     "npmInstallationSha256", "platform", "publishable", "publisher", "schemaVersion", "sha256",
@@ -759,14 +841,17 @@ function validateProvenance(provenance, filePath, verification, options) {
     publisher: verification.manifest.publisher,
     version: verification.manifest.version,
   };
+  check = "provenance-values";
   for (const [field, value] of Object.entries(expected)) {
     if (provenance[field] !== value) {
       throw new Error(`Provenance sidecar field ${field} does not match the verified VSIX`);
     }
   }
+  check = "provenance-schema";
   if (provenance.schemaVersion !== 3 || !/^[0-9a-f]{40,64}$/.test(provenance.sourceSha || "")) {
     throw new Error("Provenance sidecar has an unsupported schema or invalid source SHA");
   }
+  check = "provenance-source";
   if (
     typeof provenance.sourceClean !== "boolean"
     || typeof provenance.publishable !== "boolean"
@@ -776,6 +861,7 @@ function validateProvenance(provenance, filePath, verification, options) {
   ) {
     throw new Error("Provenance sidecar has invalid source cleanliness or commit metadata");
   }
+  check = "provenance-toolchain";
   if (!/^v\d+\.\d+\.\d+$/.test(provenance.nodeVersion || "")
     || !/^\d+\.\d+\.\d+$/.test(provenance.npmVersion || "")
     || !/^[a-f0-9]{64}$/u.test(provenance.npmInstallationSha256 || "")
@@ -783,14 +869,17 @@ function validateProvenance(provenance, filePath, verification, options) {
     throw new Error("Provenance sidecar has invalid Node.js or npm version metadata");
   }
   const git = options.runGitCommand || runGit;
+  check = "provenance-commit";
   const resolvedCommit = git(["rev-parse", "--verify", `${provenance.sourceSha}^{commit}`]).trim();
   if (resolvedCommit !== provenance.sourceSha) {
     throw new Error("Provenance source SHA does not resolve to the exact recorded commit");
   }
+  check = "provenance-epoch";
   const commitEpoch = Number(git(["show", "-s", "--format=%ct", provenance.sourceSha]).trim());
   if (commitEpoch !== provenance.sourceCommitEpoch) {
     throw new Error("Provenance commit epoch does not match the recorded source commit");
   }
+  check = "provenance-pin";
   const repositoryRoot = path.resolve(options.repositoryRoot || root);
   const fileSystem = options.fileSystem || fs;
   const parseVersionPin = bytes => {
@@ -840,18 +929,24 @@ function validateProvenance(provenance, filePath, verification, options) {
   const npmVersion = readPin(".npm-version", 64, parseVersionPin);
   const npmIntegrityPins = readPin(".npm-integrity", 256, parseIntegrityPins);
   const npmIntegrity = npmIntegrityPins[provenance.platform === "win32" ? "win32" : "posix"];
+  check = "provenance-toolchain";
   if (provenance.nodeVersion !== `v${nodeVersion}`
     || provenance.npmVersion !== npmVersion
     || provenance.npmInstallationSha256 !== npmIntegrity) {
     throw new Error("Provenance toolchain does not match the exact repository pins");
   }
+  check = "provenance-expected-source";
   if (options.expectedSourceSha && provenance.sourceSha !== options.expectedSourceSha) {
     throw new Error("Provenance source SHA does not match the expected workflow source");
   }
+  check = "provenance-publishable";
   if (options.requirePublishable && (!provenance.sourceClean || !provenance.publishable)) {
     throw new Error("Artifact handoff requires clean, publishable provenance");
   }
   return provenance;
+  } catch (error) {
+    throw annotateVerificationFailure(error, "sidecars", check);
+  }
 }
 
 function readProvenanceSidecar(filePath, options = {}) {
@@ -865,7 +960,7 @@ function readProvenanceSidecar(filePath, options = {}) {
   }, (bytes, identity) => Object.freeze({
     identity,
     provenance: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
-  }));
+  }), "provenance-file");
 }
 
 function withStableSidecarSet(filePath, verification, options = {}, consume) {
@@ -876,7 +971,7 @@ function withStableSidecarSet(filePath, verification, options = {}, consume) {
     || verification.buffer.length !== verification.archiveBytes
     || crypto.createHash("sha256").update(verification.buffer).digest("hex")
       !== verification.sha256) {
-    throw new Error("Sidecar validation requires exact verified VSIX bytes");
+    throw verificationCheckError("Sidecar validation requires exact verified VSIX bytes", "sidecars", "artifact-bytes");
   }
   return withBoundedNamedFile(absolutePath, {
     errorMessage: "Verified VSIX pathname is not an exact bounded single-link file.",
@@ -887,7 +982,7 @@ function withStableSidecarSet(filePath, verification, options = {}, consume) {
     minimumBytes: 1,
   }, (artifactBytes, artifactIdentity) => {
     if (!artifactBytes.equals(verification.buffer)) {
-      throw new Error("Verified VSIX pathname does not contain the verified artifact bytes");
+      throw verificationCheckError("Verified VSIX pathname does not contain the verified artifact bytes", "sidecars", "artifact-bytes");
     }
     return withBoundedNamedFile(checksumPath, {
       errorMessage: "Checksum sidecar is not an exact bounded single-link file.",
@@ -914,20 +1009,23 @@ function withStableSidecarSet(filePath, verification, options = {}, consume) {
           provenanceIdentity,
           provenancePath,
         }));
-      });
-    });
-  });
+      }, "provenance-file");
+    }, "checksum-file");
+  }, "artifact-file");
 }
 
 function validateSidecars(filePath, verification, options = {}) {
   return withStableSidecarSet(filePath, verification, options, proof => {
-    const checksum = new TextDecoder("utf-8", { fatal: true }).decode(proof.checksumBytes);
+    const checksum = runVerificationCheck("sidecars", "checksum-encoding", () => (
+      new TextDecoder("utf-8", { fatal: true }).decode(proof.checksumBytes)
+    ));
     if (checksum !== `${verification.sha256}  ${path.basename(proof.absolutePath)}\n`) {
-      throw new Error("Checksum sidecar does not match the verified VSIX");
+      throw verificationCheckError("Checksum sidecar does not match the verified VSIX", "sidecars", "checksum-bytes");
     }
-    const provenance = JSON.parse(
-      new TextDecoder("utf-8", { fatal: true }).decode(proof.provenanceBytes),
-    );
+    const provenanceText = runVerificationCheck("sidecars", "provenance-encoding", () => (
+      new TextDecoder("utf-8", { fatal: true }).decode(proof.provenanceBytes)
+    ));
+    const provenance = runVerificationCheck("sidecars", "provenance-json", () => JSON.parse(provenanceText));
     validateProvenance(provenance, proof.absolutePath, verification, options);
     return Object.freeze({
       artifactIdentity: proof.artifactIdentity,
@@ -1106,6 +1204,7 @@ module.exports = {
   scanSensitiveBytes,
   selectArtifactPath,
   verificationSourceSha,
+  verificationFailureDiagnostic,
   validateArchivePath,
   validateSidecars,
   verifyFreshVsix,
