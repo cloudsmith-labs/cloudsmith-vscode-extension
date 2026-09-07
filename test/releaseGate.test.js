@@ -54,6 +54,7 @@ const {
   validateSidecars,
   validateArchivePath,
   verifyFreshVsix,
+  verificationFailureDiagnostic,
   verificationSourceSha,
   withStableArtifact,
 } = require("../scripts/release/verify-vsix");
@@ -148,9 +149,16 @@ function packageCliFailureFixture(kind) {
     const configuration = ${JSON.stringify(configuration)};
     const originalSpawn = childProcess.spawnSync;
     const originalRead = fs.readFileSync;
-    const receipt = { commandCalls: 0, manifestFailures: 0, outputPath: null };
+    const receipt = { commandCalls: 0, manifestFailures: 0, gitFailures: 0, outputPath: null };
     const saveReceipt = () => fs.writeFileSync(configuration.receiptPath, JSON.stringify(receipt));
     childProcess.spawnSync = function(command, arguments_, options) {
+      if (configuration.kind === "inventory-command" && receipt.commandCalls === 1
+        && command === "git" && ["ls-tree", "ls-files"].includes(arguments_[0])) {
+        receipt.gitFailures += 1;
+        saveReceipt();
+        return { status: 1, signal: null, stdout: "",
+          stderr: "Non-auth quality gitGlobalConfig must remain exactly empty." };
+      }
       if (command === process.execPath && arguments_.length === 7
         && arguments_[0] === "--eval"
         && arguments_[1] === "require(process.argv[1])(process.argv);"
@@ -160,9 +168,9 @@ function packageCliFailureFixture(kind) {
         receipt.commandCalls += 1;
         receipt.outputPath = arguments_[6];
         const bytes = Buffer.alloc(22);
-        if (configuration.kind === "falsy-manifest") {
-          // This bounded header reaches the manifest read; archive acceptance is
-          // never reached because that external read rejects with a falsy value.
+        if (configuration.kind !== "malformed-archive") {
+          // This bounded header reaches manifest and inventory reads. Archive
+          // acceptance is never reached because an external response rejects.
           bytes.writeUInt32LE(0x06054b50, 0);
           bytes.writeUInt16LE(1, 8);
           bytes.writeUInt16LE(1, 10);
@@ -201,6 +209,7 @@ function packageCliFailureFixture(kind) {
     const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
     assert.strictEqual(receipt.commandCalls, 1, "verification failure must prevent a second build");
     assert.strictEqual(receipt.manifestFailures, kind === "falsy-manifest" ? 1 : 0);
+    assert.strictEqual(receipt.gitFailures, kind === "inventory-command" ? 1 : 0);
     const buildDirectory = path.dirname(receipt.outputPath);
     assert.strictEqual(path.dirname(buildDirectory), boundary.paths.temporary);
     assert.match(path.basename(buildDirectory), /^cloudsmith-vsix-/u);
@@ -2261,6 +2270,75 @@ suite("M9 release gate helpers", () => {
     assert.strictEqual(result.status, 1);
     assert.strictEqual(result.stdout, "");
     assert.strictEqual(result.stderr.trim(), "Release package build failed [first-artifact-verification].");
+  });
+
+  test("release package CLI identifies inventory Git failure without accepting cleanup text from Git", function() {
+    this.timeout(35_000);
+    const result = packageCliFailureFixture("inventory-command");
+    assert.strictEqual(result.status, 1);
+    assert.strictEqual(result.stdout, "");
+    assert.match(result.stderr.trim(),
+      /^Release package build failed \[first-artifact-verification:inventory-(?:commit|worktree):git-command\]\.$/u);
+  });
+
+  test("release inventory Git diagnostics distinguish setup, command, cleanup and combined failure", () => {
+    for (const scenario of ["setup", "command", "cleanup", "combined"]) {
+      const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "release-inventory-git-")));
+      let calls = 0;
+      let failure;
+      try {
+        const exercise = () => {
+          try {
+            runPackageGitCommand(["ls-files", "-s", "-z"], null, {
+              diagnosticPhase: "inventory-worktree",
+              temporaryParent: scenario === "setup" ? "relative" : directory,
+              spawnSync(_command, _arguments, options) {
+                calls += 1;
+                if (scenario === "cleanup" || scenario === "combined") {
+                  fs.writeFileSync(options.env.GIT_CONFIG_GLOBAL, "synthetic fixture bytes");
+                }
+                return {
+                  status: scenario === "command" || scenario === "combined" ? 1 : 0,
+                  stdout: Buffer.alloc(0),
+                  stderr: "Non-auth quality gitGlobalConfig must remain exactly empty.",
+                };
+              },
+            });
+          } catch (error) {
+            failure = error;
+          }
+        };
+        if (scenario === "cleanup" || scenario === "combined") withExpectedCleanupTaint(exercise);
+        else exercise();
+        assert.ok(failure, `${scenario} must reject through the real non-auth boundary`);
+        assert.strictEqual(calls, scenario === "setup" ? 0 : 1);
+        const check = {
+          setup: "git-environment-setup",
+          command: "git-command",
+          cleanup: "git-environment-cleanup-empty",
+          combined: "git-environment-cleanup-after-command",
+        }[scenario];
+        assert.strictEqual(verificationFailureDiagnostic(failure), `inventory-worktree:${check}`);
+      } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("release inventory Git diagnostics preserve hostile callback failures without reading properties", () => {
+    let accessed = false;
+    const failure = {};
+    for (const key of ["message", "code", "errors"]) {
+      Object.defineProperty(failure, key, {
+        get() { accessed = true; throw new Error("synthetic private accessor"); },
+      });
+    }
+    assert.throws(() => runPackageGitCommand(["ls-tree"], null, {
+      diagnosticPhase: "inventory-commit",
+      spawnSync() { throw failure; },
+    }), error => error === failure);
+    assert.strictEqual(accessed, false);
+    assert.strictEqual(verificationFailureDiagnostic(failure), "inventory-commit:git-spawn");
   });
 
   test("release package settlement retains trusted verification diagnostics without file values", async () => {

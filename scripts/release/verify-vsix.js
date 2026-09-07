@@ -30,7 +30,8 @@ const EXACT_FILE_READ_FLAGS = fs.constants.O_RDONLY
   | (fs.constants.O_NONBLOCK || 0);
 const unstableArtifactFailures = new WeakSet();
 const verificationFailureDiagnostics = new WeakMap();
-const verificationPhases = new Set(["snapshot", "rebind", "semantics", "sidecars"]);
+const inventoryPhases = new Set(["inventory-commit", "inventory-worktree"]);
+const verificationPhases = new Set(["snapshot", "rebind", "semantics", "sidecars", ...inventoryPhases]);
 const verificationChecks = new Set([
   "open", "descriptor-stat", "path-stat", "file-kind", "links", "size",
   "expected-identity", "descriptor-identity", "path-identity", "canonical-path",
@@ -41,6 +42,11 @@ const verificationChecks = new Set([
   "provenance-fields", "provenance-values", "provenance-schema", "provenance-source",
   "provenance-toolchain", "provenance-commit", "provenance-epoch",
   "provenance-pin", "provenance-expected-source", "provenance-publishable",
+  "git-environment-setup", "git-spawn", "git-command", "git-environment-cleanup",
+  "git-environment-cleanup-after-command", "git-environment-cleanup-tree",
+  "git-environment-cleanup-empty", "git-environment-cleanup-ownership",
+  "git-environment-cleanup-taint", "git-environment-cleanup-reoccupied",
+  "git-environment-cleanup-quarantine", "parse", "source-stat", "source-mode", "required-source",
 ]);
 const verificationErrnos = new Set([
   "EACCES", "EBUSY", "EIO", "EISDIR", "ELOOP", "EMFILE", "ENAMETOOLONG",
@@ -139,24 +145,81 @@ const sensitivePatterns = Object.freeze([
   { id: "aws-access-key", expression: /AKIA[0-9A-Z]{16}/ },
 ]);
 
+function inventoryCleanupCheck(error) {
+  // This is called only after Git returned successfully. Match known boundary
+  // errors exactly; Git output and arbitrary error properties are never emitted.
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, "message");
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+      return "git-environment-cleanup";
+    }
+    const checks = new Map([
+      ["Non-auth quality boundary cleanup refused an unsafe or changed tree.", "git-environment-cleanup-tree"],
+      ["Non-auth quality boundary preserved an unsafe or changed tree.", "git-environment-cleanup-taint"],
+      ["Non-auth quality boundary path was reoccupied during cleanup.", "git-environment-cleanup-reoccupied"],
+      ["Non-auth quality boundary cleanup quarantine already exists.", "git-environment-cleanup-quarantine"],
+      ["Non-auth quality ownership marker is invalid.", "git-environment-cleanup-ownership"],
+      ["Non-auth quality boundary authentication refuses an unknown boundary.", "git-environment-cleanup-ownership"],
+    ]);
+    for (const role of ["cleanupTaint", "npmUserConfig", "npmGlobalConfig", "gitGlobalConfig"]) {
+      checks.set(`Non-auth quality ${role} must remain exactly empty.`, "git-environment-cleanup-empty");
+    }
+    for (const role of [
+      "boundary", "home", "xdgConfig", "xdgCache", "xdgData", "xdgState", "appData",
+      "localAppData", "temporary", "npmCache", "cleanupTaint", "npmUserConfig", "npmGlobalConfig",
+      "gitGlobalConfig", "ownership marker", "cleanup taint receipt",
+    ]) {
+      for (const kind of ["file", "directory"]) {
+        checks.set(`Non-auth quality ${role} is not the exact creator-owned private ${kind}.`,
+          "git-environment-cleanup-ownership");
+      }
+    }
+    return checks.get(descriptor.value) || "git-environment-cleanup";
+  } catch {
+    return "git-environment-cleanup";
+  }
+}
+
 function runGit(arguments_, encoding = "utf8", options = {}) {
   const spawn = options.spawnSync || spawnSync;
+  const phase = inventoryPhases.has(options.diagnosticPhase) ? options.diagnosticPhase : null;
+  let callbackState = "not-entered";
+  let callbackFailure;
+  try {
   return withNonAuthQualityEnvironment({
     environment: options.environment || process.env,
     platform: options.platform,
     temporaryParent: options.temporaryParent,
   }, environment => {
+    callbackState = "running";
+    let check = "git-spawn";
+    try {
     const result = spawn("git", arguments_, {
       cwd: root,
       encoding,
       env: environment,
       maxBuffer: 64 * 1024 * 1024,
     });
+    check = "git-command";
     if (result.status !== 0) {
       throw new Error((result.stderr || result.stdout || "git command failed").toString().trim());
     }
-    return result.stdout;
+    const output = result.stdout;
+    callbackState = "succeeded";
+    return output;
+    } catch (error) {
+      callbackState = "failed";
+      callbackFailure = error;
+      throw annotateVerificationFailure(error, phase, check);
+    }
   });
+  } catch (error) {
+    if (!phase) throw error;
+    const check = callbackState === "not-entered" ? "git-environment-setup"
+      : callbackState === "succeeded" ? inventoryCleanupCheck(error)
+      : error === callbackFailure ? "git-command" : "git-environment-cleanup-after-command";
+    throw annotateVerificationFailure(error, phase, check);
+  }
 }
 
 function isApprovedSourcePath(sourcePath) {
@@ -205,12 +268,13 @@ function parseGitEntries(buffer, sourceSha) {
 }
 
 function buildExpectedInventory({ sourceSha = null } = {}) {
+  const phase = sourceSha ? "inventory-commit" : "inventory-worktree";
   const output = sourceSha
-    ? runGit(["ls-tree", "-r", "-z", sourceSha], null)
-    : runGit(["ls-files", "-s", "-z"], null);
-  const tracked = parseGitEntries(output, sourceSha);
+    ? runGit(["ls-tree", "-r", "-z", sourceSha], null, { diagnosticPhase: phase })
+    : runGit(["ls-files", "-s", "-z"], null, { diagnosticPhase: phase });
+  const tracked = runVerificationCheck(phase, "parse", () => parseGitEntries(output, sourceSha));
   if (!sourceSha) {
-    const untracked = runGit(["ls-files", "--others", "--exclude-standard", "-z"], null)
+    const untracked = runGit(["ls-files", "--others", "--exclude-standard", "-z"], null, { diagnosticPhase: phase })
       .toString("utf8")
       .split("\0")
       .filter(Boolean);
@@ -225,12 +289,14 @@ function buildExpectedInventory({ sourceSha = null } = {}) {
     if (!isApprovedSourcePath(sourcePath)) {
       continue;
     }
-    const worktreeStats = sourceSha ? null : fs.lstatSync(path.join(root, sourcePath));
+    const worktreeStats = sourceSha ? null
+      : runVerificationCheck(phase, "source-stat", () => fs.lstatSync(path.join(root, sourcePath)));
     const forbiddenMode = sourceSha
       ? metadata.mode === "120000" || (Number.parseInt(metadata.mode.slice(-3), 8) & 0o111)
       : worktreeStats.isSymbolicLink() || !worktreeStats.isFile() || (worktreeStats.mode & 0o111);
     if (forbiddenMode) {
-      throw new Error(`Packaged source has a symbolic-link or executable Git mode: ${sourcePath}`);
+      throw verificationCheckError(`Packaged source has a symbolic-link or executable Git mode: ${sourcePath}`,
+        phase, "source-mode");
     }
     expected.set(sourceToArchivePath(sourcePath), { sourcePath, ...metadata });
   }
@@ -238,7 +304,7 @@ function buildExpectedInventory({ sourceSha = null } = {}) {
     if (!tracked.has(required)
       || tracked.get(required).untracked
       || !expected.has(sourceToArchivePath(required))) {
-      throw new Error(`Required packaged source is not tracked: ${required}`);
+      throw verificationCheckError(`Required packaged source is not tracked: ${required}`, phase, "required-source");
     }
   }
   return { expected, tracked };
