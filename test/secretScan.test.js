@@ -3465,9 +3465,9 @@ suite("secret exposure gate", () => {
   });
 
   test("scanner stdin descriptors reject invalid or ambiguous transport before execution", () => {
-    const descriptorPath = path.join(scratch, "closed-stdin-descriptor.txt");
-    fs.writeFileSync(descriptorPath, "public fixture\n");
-    const closedDescriptor = fs.openSync(descriptorPath, fs.constants.O_RDONLY);
+    const closedDescriptor = fs.openSync(
+      path.join(scratch, "closed-stdin-descriptor.txt"), "wx+", 0o600,
+    );
     fs.closeSync(closedDescriptor);
     const invalidOptions = [
       { inputFileDescriptor: -1 },
@@ -3486,7 +3486,9 @@ suite("secret exposure gate", () => {
         execute() { assert.fail("invalid transport must not execute"); },
       }), /descriptor is invalid/u);
     }
-    const descriptor = fs.openSync(descriptorPath, fs.constants.O_RDONLY);
+    const descriptor = fs.openSync(
+      path.join(scratch, "valid-stdin-descriptor.txt"), "wx+", 0o600,
+    );
     try {
       for (const conflict of [{ input: Buffer.alloc(0) }, { extraFileDescriptor: descriptor }]) {
         const options = { inputFileDescriptor: descriptor, ...conflict };
