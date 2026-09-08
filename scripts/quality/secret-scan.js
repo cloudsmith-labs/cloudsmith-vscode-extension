@@ -290,6 +290,27 @@ function privateScannerEnvironment(environment, scannerHome) {
   });
 }
 
+function assertDescriptorTransports(options) {
+  const { input, inputFileDescriptor, extraFileDescriptor } = options;
+  if (extraFileDescriptor !== undefined
+    && (!Number.isSafeInteger(extraFileDescriptor) || extraFileDescriptor < 0
+      || input !== undefined || inputFileDescriptor !== undefined)) {
+    throw new Error("Secret scanner inherited descriptor is invalid.");
+  }
+  if (inputFileDescriptor !== undefined) {
+    let valid = false;
+    if (Number.isSafeInteger(inputFileDescriptor) && inputFileDescriptor >= 0
+      && input === undefined) {
+      try {
+        valid = fs.fstatSync(inputFileDescriptor).isFile();
+      } catch {
+        valid = false;
+      }
+    }
+    if (!valid) throw new Error("Secret scanner stdin descriptor is invalid.");
+  }
+}
+
 function run(executable, args, options = {}) {
   const timeout = options.timeoutMilliseconds === undefined
     ? SCANNER_PROCESS_TIMEOUT_MS
@@ -298,21 +319,19 @@ function run(executable, args, options = {}) {
     || timeout > SCANNER_PROCESS_TIMEOUT_MS) {
     throw new Error("Secret scanner process timeout is invalid.");
   }
-  const extraFileDescriptor = options.extraFileDescriptor;
-  if (extraFileDescriptor !== undefined
-    && (!Number.isSafeInteger(extraFileDescriptor) || extraFileDescriptor < 0
-      || options.input !== undefined)) {
-    throw new Error("Secret scanner inherited descriptor is invalid.");
-  }
+  assertDescriptorTransports(options);
+  const { extraFileDescriptor, inputFileDescriptor } = options;
   const result = spawnSync(executable, args, {
     cwd: options.cwd || ROOT,
     encoding: "utf8",
     env: options.env || scannerEnvironment(),
-    input: options.input,
+    ...(inputFileDescriptor === undefined ? { input: options.input } : {}),
     maxBuffer: 2 * 1024 * 1024,
-    stdio: extraFileDescriptor === undefined
-      ? "pipe"
-      : ["pipe", "pipe", "pipe", extraFileDescriptor],
+    stdio: inputFileDescriptor !== undefined
+      ? [inputFileDescriptor, "pipe", "pipe"]
+      : extraFileDescriptor === undefined
+        ? "pipe"
+        : ["pipe", "pipe", "pipe", extraFileDescriptor],
     timeout,
     killSignal: "SIGKILL",
   });
@@ -1636,6 +1655,7 @@ function scanSnapshotEntryDescriptorSync(
   entry,
   options,
   errorMessage,
+  stdin = false,
 ) {
   const target = path.join(snapshotRoot, ...entry.manifest.path.split("/"));
   const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
@@ -1647,26 +1667,30 @@ function scanSnapshotEntryDescriptorSync(
     if (!stableSnapshotDescriptorState(target, descriptor, entry.snapshot.identity)) {
       throw new Error(errorMessage);
     }
-    const descriptorPath = inheritedDescriptorScanPath();
+    const descriptorPath = stdin ? null : inheritedDescriptorScanPath();
     const scanTarget = descriptorPath || target;
-    const result = scan("dir", scanTarget, {
+    // A regular file on stdin avoids pipe writes after binary detection exits early.
+    // Keep stdin mode: directory scanning may skip files named .zip altogether.
+    const result = scan(stdin ? "stdin" : "dir", stdin ? entry.manifest.path : scanTarget, {
       ...options,
       descriptorSourcePath: target,
       scanRoot: descriptorPath ? path.dirname(descriptorPath) : snapshotRoot,
-      ...(descriptorPath ? { extraFileDescriptor: descriptor } : {}),
+      ...(stdin
+        ? { inputFileDescriptor: descriptor }
+        : descriptorPath ? { extraFileDescriptor: descriptor } : {}),
     });
     if (result && typeof result.then === "function") throw new Error(errorMessage);
     if (!stableSnapshotDescriptorState(target, descriptor, entry.snapshot.identity)) {
       throw new Error(errorMessage);
     }
-    const reportedPath = descriptorPath
-      ? path.basename(descriptorPath)
-      : entry.manifest.path;
-    const normalized = normalizeTrackedFindings(result, reportedPath);
     const logicalPath = options.label
       ? `${options.label}/${entry.manifest.path}`
       : entry.manifest.path;
     assertRepositoryRelativePath(logicalPath);
+    const reportedPath = stdin
+      ? logicalPath
+      : descriptorPath ? path.basename(descriptorPath) : entry.manifest.path;
+    const normalized = normalizeTrackedFindings(result, reportedPath);
     findings = [];
     for (let index = 0; index < normalized.length; index += 1) {
       findings[index] = INTRINSIC_OBJECT_FREEZE({
@@ -1700,13 +1724,15 @@ function scanSnapshotEntriesSync(
 ) {
   const findings = [];
   for (const entry of entries) {
-    if (path.extname(entry.manifest.path).toLowerCase() === ".vsix") {
+    const extension = path.extname(entry.manifest.path).toLowerCase();
+    if (extension === ".vsix" || extension === ".zip") {
       findings.push(...scanSnapshotEntryDescriptorSync(
         scan,
         snapshotRoot,
         entry,
         options,
         errorMessage,
+        extension === ".zip",
       ));
       continue;
     }
@@ -2333,9 +2359,13 @@ function scanWithGitleaks(kind, target, options = {}) {
   if (!new Set(["dir", "git", "stdin"]).has(kind)) {
     throw new Error("Gitleaks scan kind is invalid.");
   }
+  assertDescriptorTransports(options);
+  if (kind !== "stdin" && options.inputFileDescriptor !== undefined) {
+    throw new Error("Secret scanner stdin descriptor is invalid.");
+  }
   if (kind === "stdin") {
     assertRepositoryRelativePath(target);
-    if (!Buffer.isBuffer(options.input)) {
+    if (!Buffer.isBuffer(options.input) && options.inputFileDescriptor === undefined) {
       throw new Error("Gitleaks stdin scan requires an exact byte snapshot.");
     }
   }
@@ -2365,7 +2395,11 @@ function scanWithGitleaks(kind, target, options = {}) {
     const result = execute("gitleaks", args, {
       cwd: root,
       env: privateScannerEnvironment(options.environment, scannerHome),
-      ...(kind === "stdin" ? { input: options.input } : {}),
+      ...(kind === "stdin"
+        ? options.inputFileDescriptor !== undefined
+          ? { inputFileDescriptor: options.inputFileDescriptor }
+          : { input: options.input }
+        : {}),
       ...(Number.isSafeInteger(options.extraFileDescriptor)
         ? { extraFileDescriptor: options.extraFileDescriptor }
         : {}),
