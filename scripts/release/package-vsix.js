@@ -23,6 +23,7 @@ const {
 const { assertVersionState } = require("./verify-version");
 const {
   validateSidecars,
+  verificationFailureDiagnostic,
   verifyFreshVsix,
 } = require("./verify-vsix");
 
@@ -41,7 +42,9 @@ const PACKAGE_BUILD_STAGES = new Set([
   "second-artifact-verification",
   "reproducibility",
   "artifact-publication",
+  "published-output-receipt",
   "published-artifact-verification",
+  "published-sidecar-verification",
   "github-output",
   "completion",
 ]);
@@ -674,9 +677,10 @@ function capturePackageBuildOutputAfterCommand(
   return receipt;
 }
 
-function packageBuildError(stage) {
+function packageBuildError(stage, primaryError) {
   const safeStage = PACKAGE_BUILD_STAGES.has(stage) ? stage : "unexpected";
-  return new Error(`Release package build failed [${safeStage}].`);
+  const diagnostic = verificationFailureDiagnostic(primaryError);
+  return new Error(`Release package build failed [${safeStage}${diagnostic ? `:${diagnostic}` : ""}].`);
 }
 
 function settlePackageBuildDirectory(
@@ -693,12 +697,13 @@ function settlePackageBuildDirectory(
   } catch (cleanupError) {
     if (!primaryError) throw cleanupError;
     const safeStage = PACKAGE_BUILD_STAGES.has(stage) ? stage : "unexpected";
+    const diagnostic = verificationFailureDiagnostic(primaryError);
     throw new Error(
       `Release package build failed and its temporary tree was preserved `
-      + `[${safeStage}:cleanup-refused].`,
+      + `[${safeStage}${diagnostic ? `:${diagnostic}` : ""}:cleanup-refused].`,
     );
   }
-  if (primaryError) throw packageBuildError(stage);
+  if (primaryError) throw packageBuildError(stage, primaryError);
   return true;
 }
 
@@ -819,12 +824,14 @@ async function main() {
     writeAtomically(checksumPath, `${first.sha256}  ${filename}\n`);
     writeAtomically(provenancePath, `${JSON.stringify(provenance, null, 2)}\n`);
 
-    buildStage = "published-artifact-verification";
+    buildStage = "published-output-receipt";
     const publishedReceipt = capturePackageBuildOutput(outputDirectory, outputPath);
+    buildStage = "published-artifact-verification";
     const written = await verifyFreshVsix(outputPath, {
       expectedIdentity: publishedReceipt.identity,
       sourceSha: sourceReference,
     });
+    buildStage = "published-sidecar-verification";
     validateSidecars(outputPath, written, {
       expectedSourceSha: sourceSha,
       requirePublishable: releaseBuild,
@@ -858,8 +865,9 @@ async function main() {
     } else if (!releaseBuild) {
       console.log("Release mode was not requested; this development artifact is explicitly non-publishable.");
     }
-  } catch {
-    primaryError = true;
+  } catch (error) {
+    // A falsy thrown value is still a failed build; diagnostics are optional.
+    primaryError = error || true;
   }
   settlePackageBuildDirectory(
     tempDirectory,

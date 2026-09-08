@@ -34,6 +34,11 @@ const { bindConnectionManager } = require("../util/connectionManager");
 const { analyzeUpstreamGaps } = require("../util/upstreamGapAnalyzer");
 const { createBulkPreflightPresenceEvidence } = require("../util/exactPackageEvidence");
 const { PULL_STATUS } = require("../util/upstreamPullService");
+const { UpstreamPullService } = require("../util/upstreamPullService");
+const { UpstreamRuntime } = require("../util/upstreamRuntime");
+const { CloudsmithAPI } = require("../util/cloudsmithAPI");
+const { CloudsmithProvider } = require("../views/cloudsmithProvider");
+const { fetchWorkspaceRepositories } = require("../util/workspaceRepositoryFetcher");
 const { UpstreamOperationScheduler } = require("../util/upstreamOperationScheduler");
 const { DiagnosticsPublisher } = require("../util/diagnosticsPublisher");
 const { getFoundDependencyKey } = require("../util/foundDependencyKey");
@@ -393,6 +398,181 @@ suite("DependencyHealthProvider Test Suite", () => {
       showWarningMessage: async () => undefined,
       showErrorMessage: async () => undefined,
       ...overrides,
+    };
+  }
+
+  async function createProcessingPullWorkflow() {
+    const manager = createMutableConnectionManager();
+    const context = {
+      secrets: { onDidChange() {} },
+      globalState: new FakeMemento(),
+      workspaceState: new FakeMemento(),
+    };
+    bindConnectionManager(context, manager);
+    const settlement = deferred();
+    const verificationStarted = deferred();
+    const heldExplorerStarted = deferred();
+    const heldExplorer = deferred();
+    const progressCancellation = createCancellationSource();
+    const requests = [];
+    const messages = [];
+    const artifactNames = new Set();
+    const dependencies = Array.from({ length: 6 }, (_unused, index) => ({
+      ...createProblemDependency(`processing-${index}`, "1.0.0", "/project/package.json"),
+      cloudsmithStatus: "ABSENT",
+    }));
+    let settled = false;
+    let holdExplorer = false;
+    let activeRegistry = 0;
+    let maximumActiveRegistry = 0;
+    const repository = { slug: "repo-a", slug_perm: "repo-a", name: "Lifecycle repository" };
+    const sibling = canonicalHealthRecord("valid-sibling", {
+      is_copyable: true,
+      num_vulnerabilities: 0,
+      security_scan_status: "Scan Detected No Vulnerabilities",
+    });
+    const packageRecord = (dependency, completed = settled) => canonicalHealthRecord(dependency.name, {
+      status_str: completed ? "Completed" : "Syncing",
+      status_reason: "",
+      is_sync_in_progress: !completed,
+      is_sync_completed: completed,
+      is_copyable: completed,
+      num_vulnerabilities: 0,
+      security_scan_status: completed
+        ? "Scan Detected No Vulnerabilities"
+        : "Awaiting Security Scan",
+    });
+    const jsonResponse = (value, url) => new Response(JSON.stringify(value), {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        ...(Array.isArray(value) ? {
+          "x-pagination-page": "1",
+          "x-pagination-pagetotal": "1",
+          "x-pagination-pagesize": url.searchParams.get("page_size") || "100",
+          "x-pagination-count": String(value.length),
+        } : {}),
+      },
+    });
+    const api = new CloudsmithAPI(context, {
+      credentialManager: { async getApiKey() { return "fixture-api-key"; } },
+      fetchImpl: async (input, options) => {
+        const url = new URL(input);
+        assert.strictEqual(options.method, "GET", "the workflow fixture must never write Cloudsmith data");
+        requests.push({ kind: "api", path: url.pathname, query: url.searchParams.get("query") });
+        if (url.pathname === "/v1/repos/workspace-a/") return jsonResponse([repository], url);
+        if (url.pathname === "/v1/quota/workspace-a/") return jsonResponse({ usage: {} }, url);
+        if (url.pathname.includes("/upstream/")) {
+          return jsonResponse(url.pathname.endsWith("/npm/") ? [{
+            name: "npm registry", slug_perm: "npm-upstream", is_active: true,
+            upstream_url: "https://registry.npmjs.org", format: "npm",
+          }] : [], url);
+        }
+        assert.strictEqual(url.pathname, "/v1/packages/workspace-a/repo-a/");
+        const query = url.searchParams.get("query");
+        if (query) {
+          const dependency = dependencies.find(candidate => query.includes(candidate.name));
+          assert.ok(dependency, "only an exact fixture dependency may be queried");
+          if (!artifactNames.has(dependency.name)) return jsonResponse([], url);
+          verificationStarted.resolve();
+          await settlement.promise;
+          return jsonResponse([packageRecord(dependency)], url);
+        }
+        const records = [sibling, ...dependencies.filter(dependency => (
+          artifactNames.has(dependency.name)
+        )).map(dependency => packageRecord(dependency))];
+        if (holdExplorer) {
+          heldExplorerStarted.resolve();
+          await heldExplorer.promise;
+        }
+        return jsonResponse(records, url);
+      },
+    });
+    const runtime = new UpstreamRuntime(context, { connectionManager: manager, cloudsmithAPI: api });
+    await runtime.initialize();
+    await runtime.resetForAccountChange(manager.getState());
+    const interaction = createUserInteraction({
+      withProgress: async (_options, task) => task({ report() {} }, progressCancellation.token),
+      showQuickPick: async items => items[0],
+      showWarningMessage: async (message, _options, action) => { messages.push(message); return action; },
+      showInformationMessage: async message => { messages.push(message); },
+      showErrorMessage: async message => { messages.push(message); },
+    });
+    const service = new UpstreamPullService(context, {
+      api,
+      connectionManager: manager,
+      credentialManager: { async getApiKey() { return "fixture-api-key"; } },
+      upstreamRuntime: runtime,
+      showQuickPick: interaction.showQuickPick,
+      showWarningMessage: interaction.showWarningMessage,
+      showInformationMessage: interaction.showInformationMessage,
+      showErrorMessage: interaction.showErrorMessage,
+      fetchImpl: async (input, options) => {
+        const url = new URL(input);
+        assert.strictEqual(url.hostname, "npm.cloudsmith.io");
+        assert.strictEqual(options.method, "GET");
+        activeRegistry += 1;
+        maximumActiveRegistry = Math.max(maximumActiveRegistry, activeRegistry);
+        try {
+          requests.push({ kind: "registry", path: url.pathname });
+          await Promise.resolve();
+          const dependency = dependencies.find(candidate => url.pathname.includes(candidate.name));
+          assert.ok(dependency);
+          if (url.pathname.endsWith(".tgz")) {
+            artifactNames.add(dependency.name);
+            return new Response("fixture artifact", { status: 200 });
+          }
+          return jsonResponse({
+            name: dependency.name,
+            version: dependency.version,
+            dist: {
+              tarball: `https://npm.cloudsmith.io/workspace-a/repo-a/${dependency.name}/-/fixture.tgz`,
+            },
+          }, url);
+        } finally {
+          activeRegistry -= 1;
+        }
+      },
+    });
+    const provider = new DependencyHealthProviderImplementation(context, null, {
+      connectionManager: manager,
+      accountResetOrchestrated: true,
+      upstreamGapRuntime: runtime,
+      upstreamPullService: service,
+      createCloudsmithAPI: () => api,
+      bulkVerificationDelaysMs: [0],
+      userInteraction: interaction,
+    });
+    installSuccessfulPullScan(provider, dependencies);
+    const explorer = new CloudsmithProvider(context, {
+      connectionManager: manager,
+      createCloudsmithAPI: () => api,
+      fetchWorkspaceRepositories: (scopeContext, workspace, options) => (
+        fetchWorkspaceRepositories(scopeContext, workspace, { ...options, cloudsmithAPI: api })
+      ),
+      upstreamInventory: runtime,
+    });
+    return {
+      provider, explorer, manager, requests, dependencies, verificationStarted, heldExplorerStarted,
+      progressCancellation, artifactNames,
+      maximumActiveRegistry: () => maximumActiveRegistry,
+      waitForVerification(pull) {
+        return Promise.race([
+          verificationStarted.promise,
+          pull.then(() => { throw new Error(`Pull completed before verification: ${messages.join("; ")}`); }),
+        ]);
+      },
+      settled: () => settled,
+      holdExplorer() { holdExplorer = true; },
+      releaseExplorer() { holdExplorer = false; heldExplorer.resolve(); },
+      settle() { settled = true; settlement.resolve(); },
+      async dispose() {
+        settlement.resolve();
+        heldExplorer.resolve();
+        explorer.dispose();
+        await provider.dispose();
+        await runtime.dispose();
+      },
     };
   }
 
@@ -4639,6 +4819,154 @@ suite("DependencyHealthProvider Test Suite", () => {
     await provider.pullDependencies();
 
     assert.strictEqual(refreshOptions.verificationReceipts, verificationReceipts);
+  });
+
+  test("real bulk pull publishes processing Explorer siblings before settlement and refreshes the same resources", async function () {
+    this.timeout(15000);
+    const originalConfiguration = vscode.workspace.getConfiguration;
+    vscode.workspace.getConfiguration = () => ({
+      get(key) {
+        if (key === "defaultWorkspace") return "workspace-a";
+        if (key === "showMaxPackages") return 30;
+        return false;
+      },
+    });
+    const workflow = await createProcessingPullWorkflow();
+    let pull;
+    let action;
+    try {
+      pull = workflow.provider.pullDependencies();
+      await workflow.waitForVerification(pull);
+      assert.strictEqual(workflow.settled(), false);
+      assert.strictEqual(workflow.artifactNames.size, 6, "all registry workers must finish before scan settlement");
+      assert.ok(workflow.maximumActiveRegistry() <= 5);
+      const roots = await workflow.explorer.getChildren();
+      const repository = roots.find(node => node.slug === "repo-a");
+      assert.ok(repository, "the real repository collection must publish its repository");
+      const children = await workflow.explorer.getChildren(repository);
+      const packages = children.filter(node => workflow.explorer.ownsPackageSelection(node));
+      assert.deepStrictEqual(packages.map(node => node.name).sort(), [
+        "valid-sibling", ...workflow.dependencies.map(dependency => dependency.name),
+      ].sort(), "processing package records must not hide valid sibling rows");
+      const pending = packages.find(node => node.name === "processing-0");
+      const sibling = packages.find(node => node.name === "valid-sibling");
+      const pendingItem = workflow.explorer.getTreeItem(pending);
+      const pendingCapabilities = pending.getActionCapabilities();
+      assert.strictEqual(pending.security_scan_status, "Awaiting Security Scan");
+      assert.strictEqual(pending.package.vulnerability.evidence, "unknown");
+      assert.ok(hasPackageAction(pendingCapabilities, PACKAGE_ACTIONS.OPEN));
+      assert.strictEqual(hasPackageAction(pendingCapabilities, PACKAGE_ACTIONS.INSTALL), false);
+      assert.strictEqual(hasPackageAction(pendingCapabilities, PACKAGE_ACTIONS.PROMOTE), false);
+      assert.strictEqual(pendingItem.contextValue,
+        encodePackageActionContext(PACKAGE_ACTION_CONTEXT_FAMILIES.PACKAGE, pendingCapabilities));
+      assert.strictEqual(children.some(node => node.terminalOutcome?.kind === "failed"), false);
+      const beforeIdentity = packageDomain.exactPackageIdentity(pending.package);
+      assert.strictEqual(packageAdapters.fromPackageSelection(sibling), sibling.package,
+        "the published sibling must retain its canonical command argument");
+      const opened = [];
+      action = registerOwnedOpenPackageCommand({
+        connectionManager: workflow.manager,
+        cloudsmithProvider: workflow.explorer,
+        opened,
+        targetUrl: "https://app.cloudsmith.com/packages/workspace-a/repo-a/valid-sibling-1.0.0/",
+      });
+      await vscode.commands.executeCommand(action.id, sibling);
+      assert.strictEqual(opened.length, 1, "a current sibling command must reach its real navigation consumer");
+      const packageRequests = () => workflow.requests.filter(request => (
+        request.kind === "api" && request.path.startsWith("/v1/packages/")
+      ));
+      assert.strictEqual(packageRequests().filter(request => !request.query).length, 1);
+      assert.strictEqual(workflow.requests.filter(request => request.kind === "registry").length, 12);
+      assert.ok(packageRequests().length <= 13, "one exact preflight and one verification per dependency bound request work");
+
+      workflow.settle();
+      await pull;
+      assert.deepStrictEqual(workflow.provider._fullTrees[0].dependencies.map(dependency => (
+        dependency.cloudsmithStatus
+      )), Array(6).fill("FOUND"), "real post-pull coverage refresh must publish found dependency rows");
+      const healthRoots = await workflow.provider.getChildren();
+      const healthRows = (await Promise.all(healthRoots.map(node => (
+        workflow.provider.getChildren(node)
+      )))).flat().filter(node => workflow.provider.ownsDependencySelection(node));
+      assert.strictEqual(healthRows.length, 6, "refreshed coverage must reach current Dependency Health rows");
+      assert.ok(healthRows.every(node => node.cloudsmithStatus === "FOUND" && node.package));
+      healthRows.forEach(node => assert.ok(node.getTreeItem().label));
+      assert.strictEqual(packageRequests().filter(request => request.query).length, 12,
+        "final coverage refresh must reuse the exact verification results");
+      workflow.explorer.refresh();
+      const refreshedRoots = await workflow.explorer.getChildren();
+      const refreshedRepository = refreshedRoots.find(node => node.slug === "repo-a");
+      const refreshed = (await workflow.explorer.getChildren(refreshedRepository))
+        .filter(node => workflow.explorer.ownsPackageSelection(node));
+      assert.strictEqual(refreshed.length, 7);
+      assert.strictEqual(new Set(refreshed.map(node => packageDomain.exactPackageIdentity(node.package))).size, 7);
+      const completed = refreshed.find(node => node.name === "processing-0");
+      assert.strictEqual(packageDomain.exactPackageIdentity(completed.package), beforeIdentity);
+      assert.strictEqual(completed.security_scan_status, "Scan Detected No Vulnerabilities");
+      assert.strictEqual(workflow.explorer.ownsPackageSelection(pending), false);
+      await vscode.commands.executeCommand(action.id, sibling);
+      assert.strictEqual(opened.length, 1, "obsolete selections cannot remain actionable after repository replacement");
+    } finally {
+      workflow.settle();
+      if (pull) await pull;
+      action?.dispose();
+      await workflow.dispose();
+      vscode.workspace.getConfiguration = originalConfiguration;
+    }
+  });
+
+  test("real bulk pull account and repository replacement suppresses held processing responses and cancelled coverage", async function () {
+    for (const replacement of ["account", "repository"]) {
+      this.timeout(15000);
+      const originalConfiguration = vscode.workspace.getConfiguration;
+      vscode.workspace.getConfiguration = () => ({
+        get(key) {
+          if (key === "defaultWorkspace") return "workspace-a";
+          if (key === "showMaxPackages") return 30;
+          return false;
+        },
+      });
+      const workflow = await createProcessingPullWorkflow();
+      let pull;
+      let publication;
+      try {
+        pull = workflow.provider.pullDependencies();
+        await workflow.waitForVerification(pull);
+        const roots = await workflow.explorer.getChildren();
+        const repository = roots.find(node => node.slug === "repo-a");
+        workflow.holdExplorer();
+        publication = workflow.explorer.getChildren(repository);
+        await workflow.heldExplorerStarted.promise;
+        if (replacement === "account") {
+          const account = workflow.manager.switchAccount();
+          await workflow.provider.resetForAccountChange(account);
+        } else {
+          workflow.progressCancellation.cancel();
+          workflow.explorer.refresh();
+          await workflow.explorer.getChildren();
+        }
+        const treeEvents = [];
+        const subscription = workflow.provider.onDidChangeTreeData(value => treeEvents.push(value));
+        workflow.settle();
+        workflow.releaseExplorer();
+        assert.deepStrictEqual(await publication, [], "late old-repository rows and notices must not publish");
+        await pull;
+        subscription.dispose();
+        assert.strictEqual(workflow.explorer.ownsRepositorySelection(repository), false);
+        assert.strictEqual(workflow.provider._fullTrees.some(tree => tree.dependencies.some(dependency => (
+          dependency.cloudsmithStatus === "FOUND"
+        ))), false, "cancelled or old-account coverage cannot acquire authority from a late response");
+        assert.strictEqual(workflow.provider._activeDependencyOperation, null);
+        assert.ok(treeEvents.length <= 1, "only cancellation cleanup may refresh after the old responses settle");
+      } finally {
+        workflow.settle();
+        workflow.releaseExplorer();
+        if (publication) await publication;
+        if (pull) await pull;
+        await workflow.dispose();
+        vscode.workspace.getConfiguration = originalConfiguration;
+      }
+    }
   });
 
   test("bulk verification retries only unresolved identities and final refresh reuses exact results", async () => {

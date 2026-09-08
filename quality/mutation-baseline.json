@@ -13,12 +13,12 @@
     "domain/authCapabilities.js",
     "domain/installGuidanceSupport.js",
     "domain/packageActionCapabilities.js",
-    "domain/packageAdapters.js:1336-1342",
+    "domain/packageAdapters.js:1416-1422",
     "util/searchQueryBuilder.js",
     "util/vulnerabilityReportProjection.js",
     "util/externalNavigation.js",
     "util/upstreamOperationScheduler.js:141-219",
-    "util/vulnerabilityStateService.js:616-718",
+    "util/vulnerabilityStateService.js:663-765",
     "util/installCommandBuilder.js:650-830"
   ],
   "measuredAtSha": "8831147d82a75bd57053a9c423a927ce481bb030",
@@ -56,7 +56,7 @@
       "ignored": 17,
       "score": 92.09
     },
-    "domain/packageAdapters.js:1336-1342": {
+    "domain/packageAdapters.js:1416-1422": {
       "testFiles": ["test/packageDomain.test.js"],
       "mutants": 8,
       "killed": 8,
@@ -96,7 +96,7 @@
       "ignored": 0,
       "score": 93.98
     },
-    "util/vulnerabilityStateService.js:616-718": {
+    "util/vulnerabilityStateService.js:663-765": {
       "testFiles": ["test/vulnerabilityStateService.test.js"],
       "mutants": 236,
       "killed": 226,
@@ -418,39 +418,39 @@
       "class": "idempotent-navigation-catch-reset"
     },
     {
-      "fingerprint": "bc4559a7726ef4101a12f889b299fb0977144c57803887b8f4cc88442b070994",
+      "fingerprint": "5d1d9086b03fa163b8c41df47a66872088c871f23d7e017e60d875e8b833d1f0",
       "class": "normalized-positive-count-guard"
     },
     {
-      "fingerprint": "ac867f08c38fa58a5454242e7629b8bfb2acefb7a469d13f3155068f48f3aabe",
+      "fingerprint": "f40fcf5523c0ce3be1b74c252ec350d015132dfa0b5838f85581d01a6b7b61a6",
       "class": "normalized-positive-count-guard"
     },
     {
-      "fingerprint": "34b42b5427ce9e924c8936c90226b23076d862a69c9a6fabb7512ffc4a4fd9cd",
+      "fingerprint": "bf13113b041b1fca0da7fe9a937951d5b6a75e4b62d10d310fbd5fc9a876ce91",
       "class": "normalized-positive-count-guard"
     },
     {
-      "fingerprint": "b48dcef6dd81bc21a56dffa95b52f444ceac9f20359f8cccf95d47035102dc78",
+      "fingerprint": "2b1391b0899ab285d712e5d5f263d9f1e1f1cc9fae455c5b3fc0ec7804f37c6c",
       "class": "normalized-positive-count-guard"
     },
     {
-      "fingerprint": "ee4ffc7d6c59af11c4616717c17020e2571d1e629ac23ba257c5dc0a175019f8",
+      "fingerprint": "c048710bd89b5ea9a765c01118fe797f130814103b3398dfa21c9c6d3eadc42e",
       "class": "normalized-positive-count-guard"
     },
     {
-      "fingerprint": "00050e7a3e909139b7ad05b24bfc9fcf3d69869709fba19a057ce4067d32849b",
+      "fingerprint": "bcffd8f74b583b1d2953878366083d29d3e8daf367e4cf6cab2168fcdf35f1f0",
       "class": "declared-kind-gates-record-consistency"
     },
     {
-      "fingerprint": "4a114aa9a71532ecf60d4b92931ed49c1aa1e5b742b471bf600a0bb62ae74f57",
+      "fingerprint": "a4887854fd6a4a6c1cf916827dea694727db90f661a9888f8b29eca27b0f8b3a",
       "class": "declared-kind-gates-record-consistency"
     },
     {
-      "fingerprint": "c5d96b6f6b1d6dd06e8eab7b54039c96964c81af31fc18d7312490674c4e7021",
+      "fingerprint": "5060e8ae4858054e123a4e76701fa492dec11e182a2488113f7faea4134e12c0",
       "class": "presentation-control-flow-dominance"
     },
     {
-      "fingerprint": "b7dbb0819b7cb07f8efd7c2c60058da4bf6d5c20e82d5c5048a406ea46824b29",
+      "fingerprint": "0041ffaa034c0a94984718a7bfff49ec2360459de46f77c5120fa82deab48399",
       "class": "presentation-control-flow-dominance"
     },
     {

@@ -1,6 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 
 const assert = require("assert");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -13,6 +14,8 @@ const {
   createCiQualificationProfile,
 } = require("../scripts/quality/qualification-profile");
 const {
+  runScannerProcess,
+  scanGeneratedEvidence,
   scanVsix,
 } = require("../scripts/quality/secret-scan");
 const {
@@ -20,7 +23,7 @@ const {
   removePackageBuildDirectory,
 } = require("../scripts/release/package-vsix");
 
-function writeZip(file, entries) {
+function writeZip(file, entries, options = {}) {
   return new Promise((resolve, reject) => {
     const archive = new yazl.ZipFile();
     const output = fs.createWriteStream(file, { flags: "wx", mode: 0o600 });
@@ -28,7 +31,7 @@ function writeZip(file, entries) {
     output.on("close", resolve);
     archive.outputStream.on("error", reject);
     archive.outputStream.pipe(output);
-    for (const [name, bytes] of entries) archive.addBuffer(Buffer.from(bytes), name);
+    for (const [name, bytes] of entries) archive.addBuffer(Buffer.from(bytes), name, options);
     archive.end();
   });
 }
@@ -109,6 +112,55 @@ suite("native host quality contracts", () => {
     assert.strictEqual(component.fileCount, 2);
     assert.deepStrictEqual(component.findings, []);
     assert.strictEqual(scans.length, 2);
+  });
+
+  test("generated ZIP scanning inherits complete regular-file stdin on this host", async () => {
+    const archivePath = ".quality/host/public.zip";
+    const textPath = ".quality/host/text.zip";
+    const target = path.join(scratch, archivePath);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    await writeZip(target, [["public.txt", Buffer.alloc(2 * 1024 * 1024, 0x61)]], {
+      compress: false,
+    });
+    const digest = crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex");
+    fs.writeFileSync(path.join(scratch, textPath), "NONSECRET_HOST_TRANSPORT_CHECK\n");
+    const processes = [];
+    const component = scanGeneratedEvidence(scratch, ".quality", {
+      execute(_executable, args, options) {
+        assert.strictEqual(args[0], "stdin");
+        // Replace only the external scanner; exercise native subprocess stdin and reports.
+        const result = runScannerProcess(process.execPath, ["-e", `
+          const fs = require('fs');
+          const crypto = require('crypto');
+          if (!fs.fstatSync(0).isFile()) {
+            fs.readSync(0, Buffer.alloc(4), 0, 4, null);
+            fs.closeSync(0);
+            process.stdout.write('[]\\n');
+          } else {
+            const bytes = fs.readFileSync(0);
+            if (crypto.createHash('sha256').update(bytes).digest('hex') === '${digest}') {
+              process.stdout.write('[]\\n');
+            } else if (bytes.toString() === 'NONSECRET_HOST_TRANSPORT_CHECK\\n') {
+              process.stdout.write(JSON.stringify([{
+                ruleId: 'synthetic-host-transport', file: 'stdin',
+                startLine: 1, endLine: 1, commit: null,
+              }]));
+              process.exitCode = 1;
+            } else {
+              process.exitCode = 2;
+            }
+          }
+        `], options);
+        processes.push({ status: result.status, error: result.error?.code || null });
+        return result;
+      },
+    });
+    assert.deepStrictEqual(processes, [{ status: 0, error: null }, { status: 1, error: null }]);
+    assert.strictEqual(component.snapshotManifest[0].sha256, digest);
+    assert.deepStrictEqual(component.findings, [{
+      ruleId: "synthetic-host-transport", path: textPath,
+      startLine: 1, endLine: 1, commit: null,
+    }]);
   });
 
   test("removes only an exact native package build tree", () => {

@@ -7,10 +7,9 @@ const { CloudsmithAPI } = require("../util/cloudsmithAPI");
 const { apiEndpoint } = require("../util/apiEndpoint");
 const { PaginatedFetch, replaceCollectionItems } = require("../util/paginatedFetch");
 const { formatApiError } = require("../util/errorFormatter");
-const { fromApiPackageRecord } = require("../domain/packageAdapters");
+const { fromRepositoryPackageItem, PackageAdapterError } = require("../domain/packageAdapters");
 const {
   entitlementCollectionIdentity,
-  packageCollectionIdentity,
   packageGroupCollectionIdentity,
 } = require("../util/collectionIdentity");
 const { sanitizeSafeInventoryUpstream } = require("../util/upstreamChecker");
@@ -321,6 +320,8 @@ class RepositoryNode {
     }
 
     let result;
+    const packageOutcomes = [];
+    let itemBoundaryError = null;
     try {
       const paginatedFetch = this._createPaginatedFetch(this._createCloudsmithAPI());
       const collectionOptions = {
@@ -351,10 +352,24 @@ class RepositoryNode {
         });
       } else {
         Object.assign(collectionOptions, {
-          validate: value => isPackageArray(value, this.workspace, this.slug),
+          validate: Array.isArray,
           canonicalIdentity: pkg => {
-            const canonical = canonicalizeRepositoryPackage(pkg, this.workspace, this.slug);
-            return canonical ? packageCollectionIdentity(canonical) : null;
+            try {
+              const outcome = fromRepositoryPackageItem(pkg, {
+                expectedWorkspace: this.workspace, expectedRepository: this.slug,
+              });
+              // An unidentifiable record consumes a transport slot, not a
+              // package identity. Such slots always leave the inventory partial.
+              const transportKey = outcome.resourceIdentity || JSON.stringify([
+                "unaccepted-repository-record", this.workspace, this.slug,
+                resume?.nextPage || 1, packageOutcomes.length,
+              ]);
+              packageOutcomes.push({ ...outcome, transportKey });
+              return transportKey;
+            } catch (error) {
+              itemBoundaryError = error;
+              throw error;
+            }
           },
         });
       }
@@ -368,6 +383,14 @@ class RepositoryNode {
     }
 
     if (!this._isOperationCurrent(operation)) return;
+    if (itemBoundaryError) {
+      this._commitPackageFailure(operation, localCollectionFailure(
+        PackageAdapterError.isTrusted(itemBoundaryError) && itemBoundaryError.unexpected === false
+          ? "invalid_response" : "unexpected",
+        "The repository package records could not be verified."
+      ));
+      return;
+    }
     if (!isCollectionResult(result)) {
       this._commitPackageFailure(operation, localCollectionFailure(
         "invalid_response",
@@ -381,46 +404,64 @@ class RepositoryNode {
       this._commitPackageResult(operation, result);
       return;
     }
-    this._commitPackageResult(operation, result);
+    this._commitPackageResult(operation, result, packageOutcomes);
   }
 
-  _commitPackageResult(operation, result) {
+  _commitPackageResult(operation, result, packageOutcomes = []) {
     if (!this._isOperationCurrent(operation)) return;
     const descriptor = operation.descriptor;
     const previous = this._packageState;
     const keys = new Set(previous.resultKeys);
     const appendedNodes = [];
+    let processingCount = previous.processingCount;
+    let rejectedCount = previous.rejectedCount;
+    const itemDiagnostics = [...previous.itemDiagnostics];
     let duplicateCount = result.duplicateCount || 0;
     try {
-      for (const item of result.items) {
+      for (const [index, item] of result.items.entries()) {
+        const outcome = descriptor.mode === "groups" ? null : (
+          packageOutcomes[index] || fromRepositoryPackageItem(item, {
+            expectedWorkspace: this.workspace, expectedRepository: this.slug,
+          })
+        );
         const canonical = descriptor.mode === "groups"
           ? canonicalizePackageGroup(item)
-          : canonicalizeRepositoryPackage(item, this.workspace, this.slug);
-        if (!canonical) throw new Error("invalid collection item");
+          : outcome.package;
+        if (!canonical && descriptor.mode === "groups") throw new Error("invalid collection item");
         const key = descriptor.mode === "groups"
           ? packageGroupCollectionIdentity(this.workspace, this.slug, canonical)
-          : packageCollectionIdentity(canonical);
+          : outcome.transportKey || outcome.resourceIdentity || JSON.stringify([
+            "unaccepted-repository-record", this.workspace, this.slug,
+            operation.resume?.nextPage || 1, index,
+          ]);
         if (keys.has(key)) {
           duplicateCount += 1;
           continue;
         }
         keys.add(key);
-        appendedNodes.push(this._createPackageNode(canonical, descriptor.mode));
+        if (canonical) appendedNodes.push(this._createPackageNode(canonical, descriptor.mode));
+        else {
+          if (outcome.processing) processingCount += 1;
+          else rejectedCount += 1;
+          if (itemDiagnostics.length < 20) itemDiagnostics.push(Object.freeze({ ...outcome.diagnostic }));
+        }
       }
-    } catch {
+    } catch (error) {
       this._commitPackageFailure(operation, localCollectionFailure(
-        "invalid_response",
-        "Cloudsmith returned an invalid package record."
+        descriptor.mode === "groups" || (PackageAdapterError.isTrusted(error) && error.unexpected === false)
+          ? "invalid_response" : "unexpected",
+        "The repository package rows could not be created."
       ));
       return;
     }
 
     const nodes = [...previous.nodes, ...appendedNodes];
     const crossPageDuplicate = duplicateCount > (result.duplicateCount || 0);
-    const complete = result.complete === true && !crossPageDuplicate;
-    const continuation = complete || crossPageDuplicate
+    const traversalComplete = result.complete === true && !crossPageDuplicate;
+    const complete = traversalComplete && processingCount === 0 && rejectedCount === 0;
+    const continuation = traversalComplete || crossPageDuplicate
       ? null
-      : validContinuation(result.continuation, descriptor.key, nodes.length, result);
+      : validContinuation(result.continuation, descriptor.key, keys.size, result);
     // A continuation failure is retryable. Once that exact page succeeds, the
     // prior failure no longer describes the collection and must not keep a
     // subsequently complete result labelled as partial.
@@ -431,7 +472,7 @@ class RepositoryNode {
         "Cloudsmith returned a package identity that was already loaded."
       ));
     }
-    const invalidContinuation = !complete
+    const invalidContinuation = !traversalComplete
       && !crossPageDuplicate
       && ((result.continuation && !continuation)
         || (result.termination === "page_batch" && !continuation));
@@ -441,13 +482,17 @@ class RepositoryNode {
         "Cloudsmith returned contradictory package continuation metadata."
       ));
     }
-    const capReached = !complete && !continuation && isCollectionCapReached(result, nodes.length);
+    const capReached = !traversalComplete && !continuation && isCollectionCapReached(result, keys.size);
     this._packageState = Object.freeze({
       initialized: true,
       nodes: Object.freeze(nodes),
       resultKeys: Object.freeze([...keys]),
       pagination: result.pagination,
       complete,
+      traversalComplete,
+      processingCount,
+      rejectedCount,
+      itemDiagnostics: Object.freeze(itemDiagnostics),
       partial: !complete && nodes.length > 0,
       continuation,
       failures: Object.freeze(failures),
@@ -663,7 +708,8 @@ class RepositoryNode {
       ));
     }
 
-    if (this._packageState.continuation && !this._activePackageLoad && !terminalNode) {
+    if (this._packageState.continuation && !this._activePackageLoad
+      && (!terminalNode || this._packageState.processingCount > 0 || this._packageState.rejectedCount > 0)) {
       children.push(new RepositoryLoadMoreNode(this, {
         kind: this._packageDescriptor?.mode === "groups" ? "package groups" : "packages",
         loadedCount: packages.length,
@@ -707,6 +753,17 @@ class RepositoryNode {
   _createPackageTerminalNode(packages) {
     const state = this._packageState;
     const activeFilter = this._getActiveFilter();
+    if (state.processingCount > 0 || state.rejectedCount > 0) {
+      const processingOnly = state.rejectedCount === 0 && state.failures.length === 0
+        && (state.traversalComplete || state.continuation);
+      return new RepositoryTerminalNode(processingOnly ? "processing" : "partial", this, {
+        label: processingOnly
+          ? `${state.processingCount} ${state.processingCount === 1 ? "package is" : "packages are"} still processing`
+          : "Some packages could not be loaded",
+        description: "Refresh",
+        tooltip: `${state.processingCount} processing; ${state.rejectedCount} could not be shown. Refresh to check again.`,
+      });
+    }
     if (packages.length === 0) {
       if (state.complete) {
         if (activeFilter) {
@@ -940,6 +997,10 @@ function createEmptyPackageState() {
     resultKeys: Object.freeze([]),
     pagination: null,
     complete: false,
+    traversalComplete: false,
+    processingCount: 0,
+    rejectedCount: 0,
+    itemDiagnostics: Object.freeze([]),
     partial: false,
     continuation: null,
     failures: Object.freeze([]),
@@ -1108,22 +1169,6 @@ function optionalString(value, maxLength = MAX_OPTIONAL_STRING_LENGTH) {
     && !/[\u0000-\u001f\u007f]/.test(value)
     ? value
     : null;
-}
-
-function canonicalizeRepositoryPackage(pkg, workspace, repository) {
-  try {
-    return fromApiPackageRecord(pkg, {
-      expectedWorkspace: workspace,
-      expectedRepository: repository,
-    });
-  } catch {
-    return null;
-  }
-}
-
-function isPackageArray(value, workspace, repository) {
-  return isRecordArray(value)
-    && value.every(pkg => canonicalizeRepositoryPackage(pkg, workspace, repository) !== null);
 }
 
 function canonicalPackageGroupFormat(group) {

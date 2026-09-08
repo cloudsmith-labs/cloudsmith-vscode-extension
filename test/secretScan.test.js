@@ -196,10 +196,10 @@ function syntheticGeneratedScanResult(options) {
   };
 }
 
-function writeZip(file, entries) {
+function writeZip(file, entries, options = {}) {
   return new Promise((resolve, reject) => {
     const archive = new yazl.ZipFile();
-    for (const [name, bytes] of entries) archive.addBuffer(Buffer.from(bytes), name);
+    for (const [name, bytes] of entries) archive.addBuffer(Buffer.from(bytes), name, options);
     const output = fs.createWriteStream(file, { flags: "wx", mode: 0o600 });
     output.on("error", reject);
     output.on("close", resolve);
@@ -3354,6 +3354,182 @@ suite("secret exposure gate", () => {
       identity: originalIdentity,
       sha256: crypto.createHash("sha256").update(originalBytes).digest("hex"),
     }]);
+  });
+
+  for (const extension of ["zip", "ZIP"]) {
+    test(`generated ${extension} evidence survives a scanner closing binary stdin early`, async () => {
+      const caseRoot = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "generated-zip-")));
+      const archivePath = `.quality/remote-ci/public.${extension}`;
+      const target = path.join(caseRoot, ...archivePath.split("/"));
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      await writeZip(target, [["public.txt", Buffer.alloc(2 * 1024 * 1024, 0x61)]], {
+        compress: false,
+      });
+      const archiveBytes = fs.readFileSync(target);
+      const archiveDigest = crypto.createHash("sha256").update(archiveBytes).digest("hex");
+      const processResults = [];
+      const component = scanGeneratedEvidence(caseRoot, ".quality", {
+        execute(_executable, args, options) {
+          assert.strictEqual(args[0], "stdin");
+          const result = runScannerProcess(process.execPath, ["-e", `
+            const fs = require('fs');
+            const crypto = require('crypto');
+            if (fs.fstatSync(0).isFile()) {
+              const bytes = fs.readFileSync(0);
+              if (bytes.length !== ${archiveBytes.length}
+                || crypto.createHash('sha256').update(bytes).digest('hex') !== '${archiveDigest}') {
+                process.exit(2);
+              }
+            } else {
+              fs.readSync(0, Buffer.alloc(4), 0, 4, null);
+              fs.closeSync(0);
+            }
+            process.stdout.write('[]\\n');
+          `], options);
+          processResults.push({ status: result.status, error: result.error?.code || null });
+          return result;
+        },
+      });
+      assert.deepStrictEqual(processResults, [{ status: 0, error: null }]);
+      assert.strictEqual(component.status, "scanned");
+      assert.deepStrictEqual(component.findings, []);
+      assert.strictEqual(component.snapshotManifest[0].path, archivePath);
+      assert.strictEqual(component.snapshotManifest[0].sha256, archiveDigest);
+    });
+  }
+
+  test("generated ZIP stdin descriptors preserve findings and adjacent text transport", () => {
+    const caseRoot = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "generated-zip-text-")));
+    const archivePath = ".quality/remote-ci/public.zip";
+    const textPath = ".quality/remote-ci/result.json";
+    fs.mkdirSync(path.join(caseRoot, ".quality", "remote-ci"), { recursive: true });
+    fs.writeFileSync(path.join(caseRoot, archivePath), "NONSECRET_TRANSPORT_CHECK\n");
+    fs.writeFileSync(path.join(caseRoot, textPath), "{}\n");
+    const descriptors = [];
+    const component = scanGeneratedEvidence(caseRoot, ".quality", {
+      label: "synthetic-snapshot",
+      execute(_executable, args, options) {
+        assert.strictEqual(args[0], "stdin");
+        assert.strictEqual(options.extraFileDescriptor, undefined);
+        if (Buffer.isBuffer(options.input)) {
+          assert.strictEqual(options.input.toString(), "{}\n");
+          return successfulProcess("[]\n");
+        }
+        assert.ok(Number.isSafeInteger(options.inputFileDescriptor));
+        descriptors.push(options.inputFileDescriptor);
+        assert.strictEqual(fs.readFileSync(options.inputFileDescriptor, "utf8"),
+          "NONSECRET_TRANSPORT_CHECK\n");
+        return { ...successfulProcess(JSON.stringify([{
+          ruleId: "synthetic-transport-sentinel", file: "stdin", startLine: 1, endLine: 1,
+          commit: null,
+        }])), status: 1 };
+      },
+    });
+    assert.strictEqual(descriptors.length, 1);
+    assert.throws(() => fs.fstatSync(descriptors[0]), { code: "EBADF" });
+    assert.deepStrictEqual(component.findings, [{
+      ruleId: "synthetic-transport-sentinel",
+      path: `synthetic-snapshot/${archivePath}`,
+      startLine: 1,
+      endLine: 1,
+      commit: null,
+    }]);
+  });
+
+  test("generated ZIP stdin descriptors reject asynchronous output and changed snapshots", () => {
+    for (const mutation of ["async-output", "path-replacement", "byte-change"]) {
+      const caseRoot = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "generated-zip-reject-")));
+      const archivePath = ".quality/remote-ci/public.zip";
+      const target = path.join(caseRoot, archivePath);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, "public fixture\n");
+      let descriptor;
+      assert.throws(() => scanGeneratedEvidence(caseRoot, ".quality", {
+        scanWithGitleaks(kind, logicalPath, options) {
+          assert.strictEqual(kind, "stdin");
+          assert.strictEqual(logicalPath, archivePath);
+          descriptor = options.inputFileDescriptor;
+          assert.ok(Number.isSafeInteger(descriptor));
+          if (mutation === "async-output") return Promise.resolve([]);
+          if (mutation === "path-replacement") {
+            fs.renameSync(options.descriptorSourcePath, `${options.descriptorSourcePath}.original`);
+          } else {
+            fs.chmodSync(options.descriptorSourcePath, 0o600);
+          }
+          fs.writeFileSync(options.descriptorSourcePath, "changed fixture\n");
+          return [];
+        },
+      }), /must complete synchronously on exact snapshot bytes/u, mutation);
+      assert.throws(() => fs.fstatSync(descriptor), { code: "EBADF" });
+    }
+  });
+
+  test("scanner stdin descriptors reject invalid or ambiguous transport before execution", () => {
+    const closedDescriptor = fs.openSync(
+      path.join(scratch, "closed-stdin-descriptor.txt"), "wx+", 0o600,
+    );
+    fs.closeSync(closedDescriptor);
+    const invalidOptions = [
+      { inputFileDescriptor: -1 },
+      { inputFileDescriptor: 1.5 },
+      { inputFileDescriptor: "0" },
+      { inputFileDescriptor: null },
+      { inputFileDescriptor: 0, input: Buffer.alloc(0) },
+      { inputFileDescriptor: 0, extraFileDescriptor: 3 },
+      { inputFileDescriptor: closedDescriptor },
+    ];
+    for (const options of invalidOptions) {
+      assert.throws(() => runScannerProcess(process.execPath, ["--version"], options),
+        /descriptor is invalid/u);
+      assert.throws(() => scanWithGitleaks("stdin", "public.zip", {
+        ...options,
+        execute() { assert.fail("invalid transport must not execute"); },
+      }), /descriptor is invalid/u);
+    }
+    const descriptor = fs.openSync(
+      path.join(scratch, "valid-stdin-descriptor.txt"), "wx+", 0o600,
+    );
+    try {
+      for (const conflict of [{ input: Buffer.alloc(0) }, { extraFileDescriptor: descriptor }]) {
+        const options = { inputFileDescriptor: descriptor, ...conflict };
+        assert.throws(() => runScannerProcess(process.execPath, ["--version"], options),
+          /descriptor is invalid/u);
+        assert.throws(() => scanWithGitleaks("stdin", "public.zip", {
+          ...options,
+          execute() { assert.fail("conflicting valid descriptors must not execute"); },
+        }), /descriptor is invalid/u);
+      }
+      for (const kind of ["git", "dir"]) {
+        assert.throws(() => scanWithGitleaks(kind, scratch, {
+          inputFileDescriptor: descriptor,
+          execute() { assert.fail("stdin descriptor must not reach other scan kinds"); },
+        }), /descriptor is invalid/u);
+      }
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  });
+
+  test("scanner stdin descriptors reject an owned pipe before execution", () => {
+    const scannerPath = path.join(ROOT, "scripts", "quality", "secret-scan.js");
+    const result = spawnSync(process.execPath, ["-e", `
+      const assert = require('assert');
+      const fs = require('fs');
+      const { runScannerProcess, scanWithGitleaks } = require(${JSON.stringify(scannerPath)});
+      assert.strictEqual(fs.fstatSync(0).isFile(), false);
+      assert.throws(() => runScannerProcess(process.execPath, ['--version'], {
+        inputFileDescriptor: 0,
+      }), /stdin descriptor is invalid/);
+      assert.throws(() => scanWithGitleaks('stdin', 'public.zip', {
+        inputFileDescriptor: 0,
+        execute() { assert.fail('nonregular input must not execute'); },
+      }), /stdin descriptor is invalid/);
+      process.stdout.write('nonregular-rejected');
+    `], { encoding: "utf8", input: "public fixture\n", timeout: 5_000 });
+    assert.strictEqual(result.error, undefined);
+    assert.strictEqual(result.signal, null);
+    assert.strictEqual(result.status, 0);
+    assert.strictEqual(result.stdout, "nonregular-rejected");
   });
 
   test("generated VSIX evidence uses descriptor transport while adjacent text uses stdin", () => {

@@ -173,11 +173,11 @@ function buildNonAuthQualityEnvironment(environment = process.env, overrides = {
 }
 
 function privateDirectory(directory, label, expected = null) {
-  const stat = fs.lstatSync(directory);
+  const stat = fs.lstatSync(directory, { bigint: true });
   if (stat.isSymbolicLink() || !stat.isDirectory()
     || !sameFilesystemPath(fs.realpathSync(directory), directory)
-    || (process.platform !== "win32" && (stat.mode & 0o077) !== 0)
-    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    || (process.platform !== "win32" && (stat.mode & 0o077n) !== 0n)
+    || (typeof process.getuid === "function" && stat.uid !== BigInt(process.getuid()))
     || (expected && (stat.dev !== expected.dev || stat.ino !== expected.ino))) {
     throw new Error(`${label} is not the exact creator-owned private directory.`);
   }
@@ -185,11 +185,11 @@ function privateDirectory(directory, label, expected = null) {
 }
 
 function privateFile(file, label, expected = null) {
-  const stat = fs.lstatSync(file);
+  const stat = fs.lstatSync(file, { bigint: true });
   if (stat.isSymbolicLink() || !stat.isFile()
     || !sameFilesystemPath(fs.realpathSync(file), file)
-    || (process.platform !== "win32" && (stat.mode & 0o077) !== 0)
-    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    || (process.platform !== "win32" && (stat.mode & 0o077n) !== 0n)
+    || (typeof process.getuid === "function" && stat.uid !== BigInt(process.getuid()))
     || (expected && (stat.dev !== expected.dev || stat.ino !== expected.ino))) {
     throw new Error(`${label} is not the exact creator-owned private file.`);
   }
@@ -698,8 +698,8 @@ function activeBoundaryIdentity(boundary) {
       `Non-auth quality ${name}`,
       identity.pathIdentities[name],
     );
-    if (stat.nlink !== 1
-      || (name === "cleanupTaint" ? !new Set([0, 1]).has(stat.size) : stat.size !== 0)) {
+    if (stat.nlink !== 1n
+      || (name === "cleanupTaint" ? !new Set([0n, 1n]).has(stat.size) : stat.size !== 0n)) {
       throw new Error(`Non-auth quality ${name} must remain exactly empty.`);
     }
   }
@@ -883,7 +883,7 @@ function createNonAuthQualityEnvironment(options = {}) {
   const createdRootEntries = [];
   try {
     root = fs.mkdtempSync(path.join(parent, NON_AUTH_BOUNDARY_PREFIX));
-    rootIdentity = fs.lstatSync(root);
+    rootIdentity = fs.lstatSync(root, { bigint: true });
     const canonicalRoot = fs.realpathSync(root);
     if (!sameFilesystemPath(root, canonicalRoot)) {
       throw new Error("Non-auth quality boundary root is not canonical.");
@@ -895,7 +895,7 @@ function createNonAuthQualityEnvironment(options = {}) {
     }
     if (process.platform !== "win32") fs.chmodSync(root, 0o700);
     privateDirectory(root, "Non-auth quality boundary", rootIdentity);
-    rootIdentity = fs.lstatSync(root);
+    rootIdentity = fs.lstatSync(root, { bigint: true });
 
     const paths = Object.freeze({
       home: createPrivateDirectory(root, "home", createdRootEntries),
@@ -931,7 +931,7 @@ function createNonAuthQualityEnvironment(options = {}) {
       identity: exactIdentity(markerIdentity),
     }));
     const pathIdentities = Object.freeze(Object.fromEntries(
-      Object.entries(paths).map(([name, target]) => [name, exactIdentity(fs.lstatSync(target))])
+      Object.entries(paths).map(([name, target]) => [name, exactIdentity(fs.lstatSync(target, { bigint: true }))])
     ));
     const cleanupTaintIdentity = cleanupEntryIdentity(
       fs.lstatSync(paths.cleanupTaint, { bigint: true }),
@@ -1015,7 +1015,7 @@ function cleanupNonAuthQualityEnvironment(boundary) {
       "Non-auth quality cleanup taint receipt",
       identity.pathIdentities.cleanupTaint,
     );
-    if (identity.preservedCleanupSubtrees.size > 0 || cleanupTaint.size !== 0) {
+    if (identity.preservedCleanupSubtrees.size > 0 || cleanupTaint.size !== 0n) {
       try {
         const preserved = quarantineCreatedBoundary(boundary.root, identity.rootIdentity);
         if (preserved.reoccupied) {

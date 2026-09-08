@@ -389,6 +389,88 @@ function fromSafeVersionApiRecord(record, options = {}) {
   }
 }
 
+// Explorer alone may represent an unaccepted record as a counted notice. This
+// is not an ExactPackage and must never be passed to an exact-package action.
+function fromRepositoryPackageItem(record, options) {
+  if (isExactPackage(record)) {
+    const pkg = fromApiPackageRecord(record, options);
+    return { package: pkg, resourceIdentity: JSON.stringify([pkg.workspace, pkg.repository, pkg.packageIdentifier]) };
+  }
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    return { package: null, resourceIdentity: null, processing: false,
+      diagnostic: { code: "invalid_record", field: "API package" } };
+  }
+  requireRecord(record, "API package", { plain: true });
+  requireRecord(options, "package adapter options", { plain: true });
+  // Validate scope before name, metadata or any other recoverable item field.
+  // An earlier item error must not hide an explicit foreign/conflicting scope.
+  for (const [field, aliases, expected] of [
+    ["workspace", ["workspace", "namespace", "cloudsmithWorkspace"], options.expectedWorkspace],
+    ["repository", ["repository", "cloudsmithRepo", "repo"], options.expectedRepository],
+  ]) {
+    boundaryPathPart(expected, field, 256);
+    const actual = consensusString(record, aliases, field, { required: false, unwrapDepth: 0 });
+    if (actual !== null) {
+      boundaryPathPart(actual, field, 256);
+      if (actual !== expected) throw adapterError("unexpected_scope", field, "The package scope conflicts with the requested repository.");
+    }
+  }
+  try {
+    const pkg = fromApiPackageRecord(record, options);
+    return { package: pkg, resourceIdentity: JSON.stringify([pkg.workspace, pkg.repository, pkg.packageIdentifier]) };
+  } catch (error) {
+    if (!isRecoverableRepositoryItemError(error)) throw error;
+    let resourceIdentity = null;
+    try {
+      const identifier = consensusString(record, ["packageIdentifier", "slug_perm", "slug_perm_raw"],
+        "packageIdentifier", { required: true, unwrapDepth: 0 });
+      boundaryPathPart(identifier, "packageIdentifier", 512);
+      resourceIdentity = JSON.stringify([options.expectedWorkspace, options.expectedRepository, identifier]);
+    } catch (identityError) {
+      if (!isRecoverableRepositoryItemError(identityError)) throw identityError;
+    }
+    return {
+      package: null,
+      resourceIdentity,
+      processing: hasVerifiedIncompleteIdentity(record, error),
+      diagnostic: { code: error.code, field: error.field },
+    };
+  }
+}
+
+function isRecoverableRepositoryItemError(error) {
+  return PackageAdapterError.isTrusted(error) && error.unexpected === false
+    && new Set(["missing_field", "invalid_alias", "invalid_string", "invalid_path_part", "wrapper_depth",
+      "conflicting_aliases", "invalid_boolean", "invalid_integer", "invalid_array"])
+      .has(error.code)
+    && new Set(["name", "version", "format", "workspace", "repository", "packageIdentifier",
+      "slug_perm", "slug_perm_raw", "slug", "status", "status_str", "status_str_raw",
+      "statusReason", "status_reason", "checksumSha256", "checksum_sha256", "cdnUrl", "cdn_url",
+      "copyable", "is_copyable", "downloads", "filename", "uploadedAt", "uploaded_at",
+      "versionDigest", "version_digest", "maxSeverity", "scanStatus", "max_severity",
+      "policy_violated", "deny_policy_violated", "license_policy_violated", "vulnerability_policy_violated"])
+      .has(error.field);
+}
+
+function hasVerifiedIncompleteIdentity(record, error) {
+  if (!["name", "version", "packageIdentifier"].includes(error.field)
+    || !["missing_field", "invalid_string"].includes(error.code)) return false;
+  // These boolean fields are documented separately from numeric status/stage.
+  // Missing fields and numeric status codes never establish processing.
+  const flags = ["is_sync_awaiting", "is_sync_in_flight", "is_sync_in_progress", "is_sync_completed", "is_sync_failed"];
+  const lifecycle = Object.fromEntries([...flags, "status", "status_str", "status_str_raw", "stage", "stage_str", "sync_progress"]
+    .map(field => [field, readOwn(record, field)]));
+  if (flags.some(field => lifecycle[field] !== undefined && typeof lifecycle[field] !== "boolean")) return false;
+  if (lifecycle.is_sync_completed === true || lifecycle.is_sync_failed === true
+    || lifecycle.status_str === "Completed" || lifecycle.status_str === "Failed") return false;
+  if ((lifecycle.status !== undefined && !Number.isSafeInteger(lifecycle.status))
+    || (lifecycle.stage !== undefined && !Number.isSafeInteger(lifecycle.stage))
+    || ["status_str", "status_str_raw", "stage_str"].some(field => lifecycle[field] !== undefined && typeof lifecycle[field] !== "string")
+    || (lifecycle.sync_progress !== undefined && (!Number.isSafeInteger(lifecycle.sync_progress)
+      || lifecycle.sync_progress < 0 || lifecycle.sync_progress > 100))) return false;
+  return flags.slice(0, 3).some(field => lifecycle[field] === true);
+}
+
 function enrichExactPackageCoordinate(record, suppliedName, suppliedQualifiers) {
   const hasSuppliedName = suppliedName !== undefined && suppliedName !== null;
   const hasSuppliedQualifiers = suppliedQualifiers !== undefined && suppliedQualifiers !== null;
@@ -783,18 +865,18 @@ function adaptFlatExactRecord(record, options) {
     format,
     qualifiers,
     slug: consensusString(record, ["slug"], "slug", { required: false, unwrapDepth }),
-    status: consensusString(
+    status: apiMetadataString(
       record,
       options.apiStatusTextOnly
         ? ["status_str", "status_str_raw"]
         : ["status", "status_str", "status_str_raw"],
       "status",
-      { required: false, unwrapDepth }
+      "status_str", options, unwrapDepth
     ),
-    statusReason: consensusString(record, [
+    statusReason: apiMetadataString(record, [
       "statusReason",
       "status_reason",
-    ], "statusReason", { required: false, unwrapDepth }),
+    ], "statusReason", "status_reason", options, unwrapDepth),
     copyable: consensusBoolean(record, ["copyable", "is_copyable"], "copyable", {
       required: false,
       unwrapDepth,
@@ -808,18 +890,15 @@ function adaptFlatExactRecord(record, options) {
       "uploadedAt",
       "uploaded_at",
     ], "uploadedAt", { required: false, unwrapDepth }),
-    checksumSha256: consensusString(record, [
+    checksumSha256: apiMetadataString(record, [
       "checksumSha256",
       "checksum_sha256",
-    ], "checksumSha256", { required: false, unwrapDepth }),
+    ], "checksumSha256", "checksum_sha256", options, unwrapDepth),
     versionDigest: consensusString(record, [
       "versionDigest",
       "version_digest",
     ], "versionDigest", { required: false, unwrapDepth }),
-    cdnUrl: consensusString(record, ["cdnUrl", "cdn_url"], "cdnUrl", {
-      required: false,
-      unwrapDepth,
-    }),
+    cdnUrl: apiMetadataString(record, ["cdnUrl", "cdn_url"], "cdnUrl", "cdn_url", options, unwrapDepth),
     filename: consensusString(record, ["filename"], "filename", {
       required: false,
       unwrapDepth,
@@ -1255,8 +1334,6 @@ function validateCanonicalProjection(record, pkg) {
     ["name", ["name"]],
     ["coordinateName", ["coordinateName"]],
     ["format", ["format"]],
-    ["slug", ["slug"]],
-    ["status", ["status", "status_str", "status_str_raw"]],
     ["statusReason", ["statusReason", "status_reason"]],
     ["checksumSha256", ["checksumSha256", "checksum_sha256"]],
     ["versionDigest", ["versionDigest", "version_digest"]],
@@ -1272,6 +1349,9 @@ function validateCanonicalProjection(record, pkg) {
     if (projected !== null && projected !== pkg[field]) {
       throw projectionConflict(field);
     }
+  }
+  for (const [field, aliases] of [["slug", ["slug"]], ["status", ["status", "status_str", "status_str_raw"]]]) {
+    validateCanonicalEmptyProjection(record, aliases, field, pkg[field]);
   }
   validateCanonicalEmptyProjection(record, ["version"], "version", pkg.version, {
     allowNumber: true,
@@ -1685,7 +1765,10 @@ function adaptVulnerability(record, options) {
     detected: positive,
     count: canonicalCount,
     maxSeverity: evidence === "clean" || !severityDetected ? null : rawMaxSeverity,
-    scanStatus: evidence === "unknown" ? null : scanStatus,
+    // Nonterminal scan text explains uncertainty. Contradictory completed scan
+    // claims still cannot accompany unknown evidence in the canonical model.
+    scanStatus: !unknown || (unrecognizedStatus && !statusConflict && !statusEvidence.invalid)
+      ? scanStatus : null,
   };
 }
 
@@ -1764,6 +1847,17 @@ function consensusString(record, aliases, field, options) {
     throw adapterError("missing_field", field, `The ${field} value is required.`);
   }
   return value;
+}
+
+function apiMetadataString(record, aliases, field, apiAlias, options, unwrapDepth) {
+  // Only these explicitly selected API fields permit empty strings in Package.
+  // Retain emptiness through consensus so an empty/nonempty alias conflict is
+  // rejected before the domain normalizes an agreed empty value to absence.
+  const candidates = aliases.map(alias => readScalarAlias(record, alias, {
+    allowEmpty: options.apiStatusTextOnly === true && alias === apiAlias,
+    unwrapDepth,
+  })).filter(candidate => candidate.supplied).map(candidate => candidate.value);
+  return consensusPrimitive(candidates, field);
 }
 
 function consensusBoolean(record, aliases, field, options) {
@@ -2164,6 +2258,7 @@ function snapshotPackageDomainError(error) {
 module.exports = {
   PackageAdapterError,
   fromApiPackageRecord,
+  fromRepositoryPackageItem,
   fromSafeVersionApiRecord,
   fromDependencyHealthNode,
   fromExactPackageSelectionIfPresent,

@@ -2,6 +2,7 @@
 
 ### Reliability and security
 
+- Kept repository package rows visible during synchronization and security scanning, with processing status and retry information for incomplete results.
 - Hardened Dependency Health across all 14 supported ecosystem families and their manifest and lockfile variants, improving direct/transitive relationships, provenance, large-graph handling, cancellation, and protection against false covered or complete results.
 - Made Dependency Health pull-through use registry-native artifact requests and exact target-repository verification across supported package formats.
 - Made broad package search and pagination reliable across overlapping requests, refreshes, account changes, and stale workspace or repository selections.

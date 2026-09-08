@@ -54,6 +54,7 @@ const {
   validateSidecars,
   validateArchivePath,
   verifyFreshVsix,
+  verificationFailureDiagnostic,
   verificationSourceSha,
   withStableArtifact,
 } = require("../scripts/release/verify-vsix");
@@ -127,6 +128,97 @@ function sidecarFixture() {
     sourceSha,
     verification,
   };
+}
+
+function packageCliFailureFixture(kind) {
+  const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "release-package-cli-")));
+  const repositoryRoot = path.resolve(__dirname, "..");
+  const receiptPath = path.join(directory, "external-response.json");
+  const preloadPath = path.join(directory, "external-response.cjs");
+  const configuration = {
+    kind,
+    manifestPath: path.join(repositoryRoot, "package.json"),
+    receiptPath,
+    vsceEntry: require.resolve("@vscode/vsce/out/main"),
+  };
+  // Only external command/filesystem responses are replaced. The child loads the
+  // real CLI, toolchain guards, output receipt, verifier, and exact cleanup path.
+  fs.writeFileSync(preloadPath, `
+    const fs = require("fs");
+    const childProcess = require("child_process");
+    const configuration = ${JSON.stringify(configuration)};
+    const originalSpawn = childProcess.spawnSync;
+    const originalRead = fs.readFileSync;
+    const receipt = { commandCalls: 0, manifestFailures: 0, gitFailures: 0, outputPath: null };
+    const saveReceipt = () => fs.writeFileSync(configuration.receiptPath, JSON.stringify(receipt));
+    childProcess.spawnSync = function(command, arguments_, options) {
+      if (configuration.kind === "inventory-command" && receipt.commandCalls === 1
+        && command === "git" && ["ls-tree", "ls-files"].includes(arguments_[0])) {
+        receipt.gitFailures += 1;
+        saveReceipt();
+        return { status: 1, signal: null, stdout: "",
+          stderr: "Non-auth quality gitGlobalConfig must remain exactly empty." };
+      }
+      if (command === process.execPath && arguments_.length === 7
+        && arguments_[0] === "--eval"
+        && arguments_[1] === "require(process.argv[1])(process.argv);"
+        && arguments_[2] === configuration.vsceEntry
+        && arguments_[3] === "package" && arguments_[4] === "--no-dependencies"
+        && arguments_[5] === "--out") {
+        receipt.commandCalls += 1;
+        receipt.outputPath = arguments_[6];
+        const bytes = Buffer.alloc(22);
+        if (configuration.kind !== "malformed-archive") {
+          // This bounded header reaches manifest and inventory reads. Archive
+          // acceptance is never reached because an external response rejects.
+          bytes.writeUInt32LE(0x06054b50, 0);
+          bytes.writeUInt16LE(1, 8);
+          bytes.writeUInt16LE(1, 10);
+        }
+        fs.writeFileSync(receipt.outputPath, bytes);
+        saveReceipt();
+        return { status: 0, signal: null, stdout: "", stderr: "" };
+      }
+      return originalSpawn.call(this, command, arguments_, options);
+    };
+    fs.readFileSync = function(filePath, ...arguments_) {
+      if (configuration.kind === "falsy-manifest" && receipt.commandCalls === 1
+        && receipt.manifestFailures === 0 && filePath === configuration.manifestPath) {
+        receipt.manifestFailures += 1;
+        saveReceipt();
+        throw null;
+      }
+      return originalRead.call(this, filePath, ...arguments_);
+    };
+  `);
+  const boundary = createNonAuthQualityEnvironment({ temporaryParent: directory });
+  try {
+    const result = spawnSync(process.execPath, [
+      "--require", preloadPath, path.join(repositoryRoot, "scripts/release/package-vsix.js"),
+    ], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      env: { ...boundary.environment, M9_REQUIRE_CLEAN: "0" },
+      maxBuffer: 1024 * 1024,
+      timeout: 30_000,
+      windowsHide: true,
+    });
+    assert.strictEqual(result.error, undefined);
+    assert.strictEqual(result.signal, null);
+    assert.strictEqual(fs.existsSync(receiptPath), true, "the real CLI must reach external VSCE");
+    const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    assert.strictEqual(receipt.commandCalls, 1, "verification failure must prevent a second build");
+    assert.strictEqual(receipt.manifestFailures, kind === "falsy-manifest" ? 1 : 0);
+    assert.strictEqual(receipt.gitFailures, kind === "inventory-command" ? 1 : 0);
+    const buildDirectory = path.dirname(receipt.outputPath);
+    assert.strictEqual(path.dirname(buildDirectory), boundary.paths.temporary);
+    assert.match(path.basename(buildDirectory), /^cloudsmith-vsix-/u);
+    assert.strictEqual(fs.existsSync(buildDirectory), false, "real settlement must remove the owned build tree");
+    return result;
+  } finally {
+    cleanupNonAuthQualityEnvironment(boundary);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 function auditLockfile(packageName = "affected") {
@@ -2161,6 +2253,227 @@ suite("M9 release gate helpers", () => {
         return true;
       },
     );
+  });
+
+  test("release package CLI preserves trusted verifier diagnostics through main catch and cleanup", function() {
+    this.timeout(35_000);
+    const result = packageCliFailureFixture("malformed-archive");
+    assert.strictEqual(result.status, 1);
+    assert.strictEqual(result.stdout, "");
+    assert.strictEqual(result.stderr.trim(),
+      "Release package build failed [first-artifact-verification:semantics:central-directory].");
+  });
+
+  test("release package CLI rejects falsy verifier failures through main catch and cleanup", function() {
+    this.timeout(35_000);
+    const result = packageCliFailureFixture("falsy-manifest");
+    assert.strictEqual(result.status, 1);
+    assert.strictEqual(result.stdout, "");
+    assert.strictEqual(result.stderr.trim(), "Release package build failed [first-artifact-verification].");
+  });
+
+  test("release package CLI identifies inventory Git failure without accepting cleanup text from Git", function() {
+    this.timeout(35_000);
+    const result = packageCliFailureFixture("inventory-command");
+    assert.strictEqual(result.status, 1);
+    assert.strictEqual(result.stdout, "");
+    assert.match(result.stderr.trim(),
+      /^Release package build failed \[first-artifact-verification:inventory-(?:commit|worktree):git-command\]\.$/u);
+  });
+
+  test("release inventory Git diagnostics distinguish setup, command, cleanup and combined failure", () => {
+    for (const scenario of ["setup", "command", "cleanup", "combined"]) {
+      const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "release-inventory-git-")));
+      let calls = 0;
+      let failure;
+      try {
+        const exercise = () => {
+          try {
+            runPackageGitCommand(["ls-files", "-s", "-z"], null, {
+              diagnosticPhase: "inventory-worktree",
+              temporaryParent: scenario === "setup" ? "relative" : directory,
+              spawnSync(_command, _arguments, options) {
+                calls += 1;
+                if (scenario === "cleanup" || scenario === "combined") {
+                  fs.writeFileSync(options.env.GIT_CONFIG_GLOBAL, "synthetic fixture bytes");
+                }
+                return {
+                  status: scenario === "command" || scenario === "combined" ? 1 : 0,
+                  stdout: Buffer.alloc(0),
+                  stderr: "Non-auth quality gitGlobalConfig must remain exactly empty.",
+                };
+              },
+            });
+          } catch (error) {
+            failure = error;
+          }
+        };
+        if (scenario === "cleanup" || scenario === "combined") withExpectedCleanupTaint(exercise);
+        else exercise();
+        assert.ok(failure, `${scenario} must reject through the real non-auth boundary`);
+        assert.strictEqual(calls, scenario === "setup" ? 0 : 1);
+        const check = {
+          setup: "git-environment-setup",
+          command: "git-command",
+          cleanup: "git-environment-cleanup-empty",
+          combined: "git-environment-cleanup-after-command",
+        }[scenario];
+        assert.strictEqual(verificationFailureDiagnostic(failure), `inventory-worktree:${check}`);
+      } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("release inventory Git diagnostics preserve hostile callback failures without reading properties", () => {
+    let accessed = false;
+    const failure = {};
+    for (const key of ["message", "code", "errors"]) {
+      Object.defineProperty(failure, key, {
+        get() { accessed = true; throw new Error("synthetic private accessor"); },
+      });
+    }
+    assert.throws(() => runPackageGitCommand(["ls-tree"], null, {
+      diagnosticPhase: "inventory-commit",
+      spawnSync() { throw failure; },
+    }), error => error === failure);
+    assert.strictEqual(accessed, false);
+    assert.strictEqual(verificationFailureDiagnostic(failure), "inventory-commit:git-spawn");
+  });
+
+  test("release package settlement retains trusted verification diagnostics without file values", async () => {
+    const fixture = sidecarFixture();
+    const incorrectIdentity = Object.freeze({
+      ...fixture.verification.artifactIdentity,
+      changedNanoseconds: String(BigInt(fixture.verification.artifactIdentity.changedNanoseconds) + 1n),
+    });
+    let failure;
+    try {
+      try {
+        await verifyFreshVsix(fixture.filePath, {
+          expectedIdentity: incorrectIdentity,
+          platform: "win32",
+          retryDelay() { assert.fail("identity mismatch must remain nonretryable"); },
+        });
+      } catch (error) {
+        failure = error;
+      }
+      assert.ok(failure, "the real fresh verification must reject the changed receipt");
+      for (const cleanupFails of [false, true]) {
+      assert.throws(
+        () => settlePackageBuildDirectory(
+          fixture.directory,
+          Object.freeze({}),
+          Object.freeze([]),
+          failure,
+          "first-artifact-verification",
+          { removePackageBuildDirectory() {
+            if (cleanupFails) throw new Error("synthetic untrusted cleanup details");
+            return true;
+          } },
+        ),
+        error => {
+          assert.match(error.message, /first-artifact-verification:snapshot:expected-identity:changedNanoseconds/u);
+          assert.doesNotMatch(error.message, /synthetic|release-sidecar|[0-9]{8}/u);
+          assert.strictEqual(error.message.includes("cleanup-refused"), cleanupFails);
+          return true;
+        },
+      );
+      }
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("release package diagnostics never inspect hostile semantic errors or change buffer cleanup", async () => {
+    const fixture = sidecarFixture();
+    let accessed = false;
+    const hostile = new Proxy(new Error("synthetic private message"), {
+      getOwnPropertyDescriptor() {
+        accessed = true;
+        throw new Error("synthetic private descriptor trap");
+      },
+    });
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    try {
+      for (const failure of [hostile, revoked.proxy, null, undefined, 0, false]) {
+        let allocation;
+        let rejected = false;
+        try {
+          await withStableArtifact(fixture.filePath, {}, async bytes => {
+            allocation = bytes;
+            throw failure;
+          });
+        } catch (error) {
+          rejected = true;
+          assert.strictEqual(error, failure);
+        }
+        assert.strictEqual(rejected, true);
+        assert.ok(allocation.every(byte => byte === 0));
+      }
+      assert.strictEqual(accessed, false);
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("release package settlement ignores forged diagnostics and untrusted error accessors", () => {
+    let accessed = false;
+    const accessorError = {};
+    for (const name of ["message", "code", "diagnostic", "verificationFailureDiagnostic"]) {
+      Object.defineProperty(accessorError, name, {
+        get() { accessed = true; throw new Error("synthetic private accessor detail"); },
+      });
+    }
+    const forged = { diagnostic: "snapshot:open:synthetic-private-value", code: "EBUSY" };
+    for (const failure of [accessorError, forged, true]) {
+      assert.throws(
+        () => settlePackageBuildDirectory(
+          "/synthetic/owned-build", Object.freeze({}), Object.freeze([]), failure,
+          "first-artifact-verification", { removePackageBuildDirectory() { return true; } },
+        ),
+        error => error.message === "Release package build failed [first-artifact-verification].",
+      );
+    }
+    assert.strictEqual(accessed, false);
+  });
+
+  test("release package settlement distinguishes trusted checksum and provenance diagnostics", () => {
+    for (const [kind, expected] of [
+      ["checksum", "sidecars:checksum-bytes"],
+      ["provenance", "sidecars:provenance-json"],
+    ]) {
+      const fixture = sidecarFixture();
+      let failure;
+      try {
+        fs.writeFileSync(kind === "checksum" ? fixture.checksumPath : fixture.provenancePath,
+          "synthetic untrusted sidecar content\n");
+        try {
+          validateSidecars(fixture.filePath, fixture.verification, {});
+        } catch (error) {
+          failure = error;
+        }
+        assert.ok(failure);
+        assert.throws(
+          () => settlePackageBuildDirectory(
+            fixture.directory,
+            Object.freeze({}),
+            Object.freeze([]),
+            failure,
+            "published-sidecar-verification",
+            { removePackageBuildDirectory() { return true; } },
+          ),
+          error => {
+            assert.ok(error.message.includes(expected));
+            assert.doesNotMatch(error.message, /synthetic|untrusted|release-sidecar/u);
+            return true;
+          },
+        );
+      } finally {
+        fs.rmSync(fixture.directory, { recursive: true, force: true });
+      }
+    }
   });
 
   test("release package settlement reports a fixed stage when cleanup would mask failure", () => {

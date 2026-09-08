@@ -9,6 +9,7 @@ const { spawnSync } = require("child_process");
 const Mocha = require("mocha");
 const yaml = require("js-yaml");
 const { withExpectedCleanupTaint } = require("./helpers/expectedCleanupTaint");
+const { runPackageGitCommand } = require("../scripts/release/verify-vsix");
 const {
   ROOT,
   gitVisibleFiles,
@@ -2363,6 +2364,132 @@ suite("Quality gate runner", () => {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
   });
+
+  function withLargeFilesystemIdentifier(scratch, field, callback) {
+    const originalLstat = fs.lstatSync;
+    const replacements = new Map();
+    const otherField = field === "dev" ? "ino" : "dev";
+    const exactStats = target => originalLstat.call(fs, target, { bigint: true });
+    const identityFor = stat => `${stat.dev}:${stat.ino}`;
+    const valueFor = stat => replacements.get(identityFor(stat))?.value
+      ?? ((1n << 54n) + (stat[field] << 3n) + 1n);
+    try {
+      // Node exposes the same filesystem identifier as Number by default and
+      // BigInt when requested. Values above the safe range can round as Number.
+      fs.lstatSync = function largeIdentifierStat(target, options) {
+        const stat = originalLstat.call(this, target, options);
+        if (typeof target === "string" && target.startsWith(`${scratch}${path.sep}`)) {
+          const exact = exactStats(target);
+          const value = valueFor(exact);
+          stat[field] = options?.bigint ? value : Number(value);
+          const otherValue = replacements.get(identityFor(exact))?.otherValue;
+          if (otherValue !== undefined) {
+            stat[otherField] = options?.bigint ? otherValue : Number(otherValue);
+          }
+        }
+        return stat;
+      };
+      return callback({
+        value(target) { return valueFor(exactStats(target)); },
+        replace(target, value, originalTarget) {
+          replacements.set(identityFor(exactStats(target)), {
+            value,
+            otherValue: exactStats(originalTarget)[otherField],
+          });
+        },
+      });
+    } finally {
+      fs.lstatSync = originalLstat;
+    }
+  }
+
+  for (const field of ["dev", "ino"]) {
+    test(`private non-auth large identifiers survive real Git inventory and exact cleanup (${field})`, () => {
+      const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-large-identity-")));
+      let commandCalls = 0;
+      try {
+        withLargeFilesystemIdentifier(scratch, field, () => {
+          const output = runPackageGitCommand(["ls-files", "-s", "-z"], null, {
+            diagnosticPhase: "inventory-worktree",
+            temporaryParent: scratch,
+            spawnSync(...arguments_) {
+              commandCalls += 1;
+              return spawnSync(...arguments_);
+            },
+          });
+          assert.strictEqual(Buffer.isBuffer(output), true);
+          assert.strictEqual(commandCalls, 1, "the real external Git command must finish before cleanup");
+          assert.deepStrictEqual(fs.readdirSync(scratch), []);
+        });
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const field of ["dev", "ino"]) {
+    test(`private non-auth large identifier collisions cannot authenticate or delete replacements (${field})`, () => {
+      const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-large-replacement-")));
+      try {
+        withLargeFilesystemIdentifier(scratch, field, model => {
+          const boundary = createNonAuthQualityEnvironment({ temporaryParent: scratch });
+          const replacement = path.join(scratch, "replacement-home");
+          fs.mkdirSync(replacement, { mode: 0o700 });
+          fs.writeFileSync(path.join(replacement, "preserve.txt"), "synthetic replacement survives\n");
+          const originalValue = model.value(boundary.paths.home);
+          const originalIdentity = fs.lstatSync(boundary.paths.home, { bigint: true });
+          const replacementValue = originalValue + 1n;
+          assert.notStrictEqual(originalValue, replacementValue);
+          assert.strictEqual(Number(originalValue), Number(replacementValue));
+          model.replace(replacement, replacementValue, boundary.paths.home);
+          fs.renameSync(boundary.paths.home, path.join(scratch, "original-home"));
+          fs.renameSync(replacement, boundary.paths.home);
+          const replacementIdentity = fs.lstatSync(boundary.paths.home, { bigint: true });
+          assert.strictEqual(replacementIdentity[field === "dev" ? "ino" : "dev"],
+            originalIdentity[field === "dev" ? "ino" : "dev"], "the other exact identity field must remain equal");
+          assert.notStrictEqual(replacementIdentity[field], originalIdentity[field]);
+          assert.throws(() => assertActiveNonAuthQualityBoundary(boundary),
+            /not the exact creator-owned private directory/u);
+          withExpectedCleanupTaint(() => {
+            assert.throws(() => cleanupNonAuthQualityEnvironment(boundary),
+              /not the exact creator-owned private directory/u);
+          });
+          assert.strictEqual(fs.readFileSync(path.join(boundary.paths.home, "preserve.txt"), "utf8"),
+            "synthetic replacement survives\n");
+        });
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const field of ["dev", "ino"]) {
+    test(`private non-auth large identifiers preserve creation rollback and its original failure (${field})`, () => {
+      const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cloudsmith-large-rollback-")));
+      const originalMkdir = fs.mkdirSync;
+      const failure = new Error("synthetic private directory creation failure");
+      let injected = false;
+      try {
+        withLargeFilesystemIdentifier(scratch, field, () => {
+          fs.mkdirSync = function failOwnedDirectoryCreation(target, options) {
+            if (!injected && typeof target === "string" && target.startsWith(`${scratch}${path.sep}`)
+              && path.basename(target) === "xdg-cache") {
+              injected = true;
+              throw failure;
+            }
+            return originalMkdir.call(this, target, options);
+          };
+          assert.throws(() => createNonAuthQualityEnvironment({ temporaryParent: scratch }),
+            error => error === failure);
+          assert.strictEqual(injected, true);
+          assert.deepStrictEqual(fs.readdirSync(scratch), []);
+        });
+      } finally {
+        fs.mkdirSync = originalMkdir;
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+    });
+  }
 
   test("private non-auth cleanup quarantines the owned inode before entry-bounded removal", () => {
     const scratch = fs.realpathSync(fs.mkdtempSync(path.join(

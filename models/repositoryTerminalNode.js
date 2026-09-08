@@ -7,6 +7,7 @@ const TERMINAL_CONTEXTS = Object.freeze({
   partial: "repositoryPackagesPartial",
   failed: "repositoryPackagesFailed",
   cancelled: "repositoryPackagesCancelled",
+  processing: "repositoryPackagesProcessing",
 });
 const TERMINAL_KINDS = new Set(Object.keys(TERMINAL_CONTEXTS));
 const TERMINAL_ACTIONS = new Set(["none", "retry", "change-filter"]);
@@ -58,6 +59,7 @@ class RepositoryTerminalNode {
 }
 
 function terminalLabel(kind, scope) {
+  if (kind === "processing") return "Packages are still processing";
   if (kind === "empty") {
     return scope === "filter" ? "No packages match filter" : "Repository is empty";
   }
@@ -73,6 +75,7 @@ function actionDescription(action) {
 }
 
 function terminalTooltip(kind, scope, action) {
+  if (kind === "processing") return "Packages are still processing. Refresh to check again.";
   if (kind === "empty") {
     return scope === "filter"
       ? "Change or clear the filter."
@@ -88,6 +91,7 @@ function terminalTooltip(kind, scope, action) {
 }
 
 function terminalIcon(kind, scope) {
+  if (kind === "processing") return "sync";
   if (kind === "empty") return scope === "filter" ? "filter" : "info";
   if (kind === "cancelled") return "circle-slash";
   return "warning";
