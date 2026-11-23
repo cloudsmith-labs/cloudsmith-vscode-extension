@@ -393,7 +393,10 @@ function evaluateTargetBoundAcceptance(options) {
           candidate, document, context, source
         );
       }
-      validated = lane.status === "passed" && authenticatedCiLaneProof;
+      validated = lane.status === "passed"
+        && lane.candidateReceiptFingerprint
+          === context.authenticatedCandidateReceipt?.fingerprint
+        && authenticatedCiLaneProof;
     } else {
       validated = context.validatedLaneStatuses?.[lane.id] === lane.status;
     }
@@ -950,7 +953,7 @@ function validateAttestationCandidate(document, source, context) {
 }
 
 function authenticatedCiProofValidated(candidate, document, context, source) {
-  if (!candidate) return false;
+  if (!candidate || !context.authenticatedCandidateArtifactPath) return false;
   try {
     const ciCandidate = candidateBindingFromReceipt(
       context.authenticatedCandidateReceipt,

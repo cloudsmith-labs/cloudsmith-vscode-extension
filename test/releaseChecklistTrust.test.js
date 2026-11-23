@@ -1935,6 +1935,15 @@ suite("Release checklist trust receipts", () => {
     });
     assert.ok(missing.errors.some(error => unvalidated.test(error)));
 
+    const missingVsix = evaluate(fixture, document, {
+      authenticatedCandidateArtifactPath: null,
+    });
+    assert.ok(missingVsix.errors.some(error => unvalidated.test(error)));
+
+    const mismatched = clone(document);
+    mismatched.lanes[0].candidateReceiptFingerprint = "5".repeat(64);
+    assert.ok(evaluate(fixture, mismatched).errors.some(error => unvalidated.test(error)));
+
     const crossed = evaluate(fixture, document, {
       authenticatedCandidateReceipt: {
         ...fixture.authenticatedCandidateReceipt,
