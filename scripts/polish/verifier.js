@@ -412,9 +412,10 @@ function validateFormatInventory() {
 
 function walkForJunk(files) {
   for (const file of files) {
-    const base = path.posix.basename(file);
-    if (/^(?:\.DS_Store|Thumbs\.db)$/.test(base) || /(?:~|\.swp)$/.test(base)) {
-      fail(`repository contains OS/editor junk: ${file}`);
+    for (const segment of file.split("/")) {
+      if (/^(?:\.DS_Store|Thumbs\.db)$/.test(segment) || /(?:~|\.swp)$/.test(segment)) {
+        fail(`repository contains OS/editor junk: ${file}`);
+      }
     }
   }
 }
