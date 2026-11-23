@@ -127,12 +127,16 @@ authenticated qualification matrix is green on the exact candidate SHA.
    exact SHA, including the reproducible VSIX artifact.
 4. Run the authenticated qualification lanes (`deep-quality.yml` /
    `npm run quality:qualification:*` locally) and `npm run quality:release`.
-5. Tag the release commit as `vX.Y.Z` — `npm run verify:version -- --release`
-   asserts the tag matches `HEAD`.
-6. Publish the CI-verified VSIX to the Visual Studio Marketplace
-   (`vsce publish`) and the Open VSX Registry (`ovsx publish`) under the
-   `Cloudsmith` publisher, then create the GitHub release with the VSIX,
-   checksums, and provenance sidecars attached.
+5. Tag the release commit as `vX.Y.Z`, then verify the tag against `HEAD`:
+   `GITHUB_REF_NAME=vX.Y.Z npm run verify:version -- --release`
+   (the release check reads the tag name from `GITHUB_REF_NAME`, which CI
+   sets automatically).
+6. Download the CI-verified VSIX artifact and publish that exact file —
+   `vsce publish --packagePath <vsix>` to the Visual Studio Marketplace and
+   `ovsx publish <vsix>` to the Open VSX Registry under the `Cloudsmith`
+   publisher. Do not let either publisher repackage the working tree. Then
+   create the GitHub release with the VSIX, checksums, and provenance
+   sidecars attached.
 
 ## License
 
