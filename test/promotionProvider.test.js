@@ -990,7 +990,6 @@ suite("Safe package promotion workflow", () => {
         format: "npm",
       },
       { workspace: "workspace", repository: "target" },
-      "credential-sentinel",
       null,
       harness.manager.getState(),
       { stopOnPresence: false }
