@@ -114,8 +114,9 @@ Report issues found in them instead of editing them.
 
 ## Releasing
 
-Releases are cut from `main` only after the full deterministic and
-authenticated qualification matrix is green on the exact candidate SHA.
+Release qualification is a pre-merge gate: it runs on the exact candidate
+SHA as the head of a **draft** pull request. `main` only receives the
+candidate after the acceptance artifact passes `npm run quality:release`.
 
 1. Confirm `package.json`, `package-lock.json`, and the top `CHANGELOG.md`
    heading all carry the release version (`npm run verify:version`).
@@ -123,28 +124,41 @@ authenticated qualification matrix is green on the exact candidate SHA.
    `npm run check`, `npm test`, `npm run test:mutation:core`,
    `npm run test:ui:smoke`, `npm run quality:full`,
    `npm run package && npm run package:verify`.
-3. Ensure the CI `Deterministic build candidate` workflow is green on the
-   exact SHA, including the reproducible VSIX artifact.
-4. Collect the remote CI proof on the exact candidate SHA:
-   `npm run quality:remote-ci:collect` writes the remote receipt
-   (`internal_docs/quality/remote-ci.json`, `remote-ci-api.json`) and the
-   `.quality/remote-ci/signed-out-ui` bundle.
-5. Run the authenticated qualification lanes (`deep-quality.yml` /
-   `npm run quality:qualification:*` locally) against the exact packaged
-   candidate.
+3. Push the candidate as a draft pull request and wait for CI
+   (`main.yml`, CodeQL, signed-out packaged UI) to go green on its head
+   SHA, including the reproducible VSIX artifact.
+4. Collect the remote CI proof while the draft PR is still open — the
+   collector requires a draft PR whose head branch and SHA match the
+   checkout:
+   `npm run quality:remote-ci:collect -- --pr <N> --main-run <run-id> --codeql-run <run-id>`
+   (writes `internal_docs/quality/remote-ci.json`, `remote-ci-api.json`,
+   and the `.quality/remote-ci/signed-out-ui` bundle).
+5. Run **both** required authenticated qualification lanes against the
+   exact packaged candidate — the release policy requires
+   `authenticated-local` *and* `authenticated-ci`; neither substitutes
+   for the other:
+   - `authenticated-local`: `npm run quality:qualification:prepare` and
+     `npm run quality:qualification:launch` in the dedicated persistent
+     local profile.
+   - `authenticated-ci`: dispatch `deep-quality.yml` on the candidate SHA;
+     its `authenticated-production-ui` job runs in the
+     `cloudsmith-release-qualification` environment and uploads the
+     `authenticated-ui-evidence-<sha>-<attempt>` artifact.
 6. Author the schema-v7 acceptance artifact
    `internal_docs/quality/current-candidate-acceptance.json` bound to the
    candidate SHA and tracked readiness policy, with
    `readinessTarget: "release"`, the exact evidence paths (remote CI
-   receipt and signed-out UI bundle, findings ledger, authenticated
-   qualification receipt), `operatorId`, `completedAt` inside the 24-hour
-   readiness window, zero open release blockers, and `checklistConfirmed`.
-   Then run `npm run quality:release`.
-7. Tag the release commit as `vX.Y.Z`, then verify the tag against `HEAD`:
+   receipt and signed-out UI bundle, findings ledger, and both
+   authenticated qualification receipts), `operatorId`, `completedAt`
+   inside the 24-hour readiness window, zero open release blockers, and
+   `checklistConfirmed`. Then run `npm run quality:release`.
+7. Merge the draft pull request, then tag the merge commit as `vX.Y.Z`
+   and verify the tag against `HEAD`:
    `GITHUB_REF_NAME=vX.Y.Z npm run verify:version -- --release`
    (the release check reads the tag name from `GITHUB_REF_NAME`, which CI
    sets automatically).
-8. Download the CI-verified VSIX artifact and publish that exact file —
+8. Download the CI-verified VSIX artifact built on the candidate SHA and
+   publish that exact file —
    `vsce publish --packagePath <vsix>` to the Visual Studio Marketplace and
    `ovsx publish <vsix>` to the Open VSX Registry under the `Cloudsmith`
    publisher. Do not let either publisher repackage the working tree. Then
