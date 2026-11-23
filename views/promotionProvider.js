@@ -83,7 +83,6 @@ class PromotionProvider {
     if (!account || !isAccountCurrent(this._connectionManager, account)) {
       return packageLocationFailure("stale_account", "The active Cloudsmith account is unavailable.");
     }
-    const apiKey = null;
     if (!isAccountCurrent(this._connectionManager, account)) {
       return packageLocationFailure(
         "authentication_unavailable",
@@ -131,7 +130,6 @@ class PromotionProvider {
       responseType: "array",
       validate: isPackageLocationArray,
       retry: "never",
-      apiKey,
       signal: options.signal,
       cancellationToken: options.cancellationToken,
     });
@@ -230,12 +228,11 @@ class PromotionProvider {
       account = captureAccount(this._connectionManager);
       if (!account) return await this._publishFailure(failureOutcome("authentication_unavailable"));
 
-      const apiKey = null;
       if (!this._isCurrent(operation, account)) {
         return await this._publishStaleOrFailure(operation, account, "authentication_unavailable");
       }
 
-      const sourceRead = await this._readSource(locator, apiKey, null, account);
+      const sourceRead = await this._readSource(locator, null, account);
       if (!sourceRead.ok) {
         const outcome = failureOutcome(sourceRead.errorCode);
         return await this._publish(outcome, operation, account, options);
@@ -258,7 +255,6 @@ class PromotionProvider {
         sourceRead.source,
         pipeline,
         account,
-        apiKey
       );
       if (!candidatesResult.ok) {
         const outcome = failureOutcome(candidatesResult.errorCode, { source: sourceRead.source });
@@ -269,7 +265,7 @@ class PromotionProvider {
         return await this._publish(outcome, operation, account, options);
       }
 
-      const presenceHints = await this._loadPresenceHints(sourceRead.source, apiKey, account);
+      const presenceHints = await this._loadPresenceHints(sourceRead.source, account);
       if (!this._isCurrent(operation, account)) {
         return await this._publish(this._staleOutcome(), operation, account, options);
       }
@@ -324,7 +320,6 @@ class PromotionProvider {
           selectedTarget,
           tagPlan,
           account,
-          apiKey,
           cancellationToken
         )
       );
@@ -369,7 +364,6 @@ class PromotionProvider {
         selectedTarget,
         tagPlan,
         account,
-        apiKey,
         null
       );
       if (
@@ -410,7 +404,6 @@ class PromotionProvider {
               finalPreflightResult.preflight,
               tagPlan,
               account,
-              apiKey,
               operation,
               progress,
               executionState
@@ -438,9 +431,9 @@ class PromotionProvider {
     }
   }
 
-  async preflight(locator, selectedTarget, tagPlan, account, apiKey, cancellationToken) {
+  async preflight(locator, selectedTarget, tagPlan, account, cancellationToken) {
     if (!this._isAccountCurrent(account)) return preflightFailure("account_changed");
-    const sourceRead = await this._readSource(locator, apiKey, cancellationToken, account);
+    const sourceRead = await this._readSource(locator, cancellationToken, account);
     if (!sourceRead.ok) return preflightFailure(sourceRead.errorCode, sourceRead.source);
     const sourceEligibilityError = promotionSourceEligibilityError(sourceRead.source);
     if (sourceEligibilityError) return preflightFailure(sourceEligibilityError, sourceRead.source);
@@ -449,11 +442,10 @@ class PromotionProvider {
     }
 
     const [targetRead, packageRead] = await Promise.all([
-      this._readTargetRepository(selectedTarget, apiKey, cancellationToken, account),
+      this._readTargetRepository(selectedTarget, cancellationToken, account),
       this._findTargetPackages(
         sourceRead.source,
         selectedTarget,
-        apiKey,
         cancellationToken,
         account,
         { stopOnPresence: true }
@@ -487,7 +479,7 @@ class PromotionProvider {
     return deepFreeze({ ok: true, preflight, errorCode: null });
   }
 
-  async execute(preflight, tagPlan, account, apiKey, operation, progress, executionState = {}) {
+  async execute(preflight, tagPlan, account, operation, progress, executionState = {}) {
     const base = {
       source: preflight.source,
       target: preflight.target,
@@ -500,7 +492,6 @@ class PromotionProvider {
 
     const copySourceRead = await this._verifySourceEligibleForWrite(
       preflight.source,
-      apiKey,
       account
     );
     if (!copySourceRead.ok) {
@@ -532,7 +523,7 @@ class PromotionProvider {
       copyResult = await this.api.post(
         copyEndpoint,
         { destination: `${preflight.target.workspace}/${preflight.target.repository}`, republish: false },
-        { apiKey, responseType: "object", validate: isRecord, retry: "never" }
+        { responseType: "object", validate: isRecord, retry: "never" }
       );
     } catch {
       copyResult = null;
@@ -554,14 +545,14 @@ class PromotionProvider {
           remoteState: "unchanged",
         });
       }
-      return this._ambiguousCopyOutcome(preflight, tagPlan, account, apiKey, base);
+      return this._ambiguousCopyOutcome(preflight, tagPlan, account, base);
     }
 
     let targetPackage;
     try {
       targetPackage = normalizeTargetPackage(copyResult.data, preflight.source, preflight.target);
     } catch {
-      return this._ambiguousCopyOutcome(preflight, tagPlan, account, apiKey, base);
+      return this._ambiguousCopyOutcome(preflight, tagPlan, account, base);
     }
 
     executionState.copy = createStage("succeeded", {
@@ -583,7 +574,6 @@ class PromotionProvider {
     const postCopyRead = await this._findTargetPackages(
       preflight.source,
       preflight.target,
-      apiKey,
       null,
       account,
       { stopOnPresence: false }
@@ -628,7 +618,6 @@ class PromotionProvider {
         preflight.source,
         tagPlan.source,
         account,
-        apiKey,
         operation
       );
       executionState.sourceTag = sourceTag;
@@ -641,7 +630,6 @@ class PromotionProvider {
         targetPackage.packageIdentifier,
         tagPlan.target,
         account,
-        apiKey,
         operation
       );
       executionState.targetTag = targetTag;
@@ -667,7 +655,6 @@ class PromotionProvider {
       targetPackage.packageIdentifier,
       tagPlan,
       account,
-      apiKey
     );
     executionState.reconciliation = reconciliation.ok
       ? createStage("succeeded", { evidence: "fresh_read" })
@@ -704,14 +691,13 @@ class PromotionProvider {
     });
   }
 
-  async _ambiguousCopyOutcome(preflight, tagPlan, account, apiKey, base) {
+  async _ambiguousCopyOutcome(preflight, tagPlan, account, base) {
     let reconciliation = createStage("ambiguous", { errorCode: "copy_outcome_unknown" });
     let remoteState = "possibly_changed";
     if (this._isAccountCurrent(account)) {
       const targetRead = await this._findTargetPackages(
         preflight.source,
         preflight.target,
-        apiKey,
         null,
         account,
         { stopOnPresence: false }
@@ -742,11 +728,10 @@ class PromotionProvider {
     });
   }
 
-  async _applySourceTags(source, requiredTags, account, apiKey, operation) {
+  async _applySourceTags(source, requiredTags, account, operation) {
     if (!this._isCurrent(operation, account)) return createStage("not_attempted", { required: true });
     const fresh = await this._readSource(
       { workspace: source.workspace, repository: source.repository, packageIdentifier: source.packageIdentifier },
-      apiKey,
       null,
       account
     );
@@ -767,7 +752,6 @@ class PromotionProvider {
       source.packageIdentifier,
       missing,
       account,
-      apiKey,
       "source",
       value => normalizeFreshSource(value, {
         workspace: source.workspace,
@@ -777,12 +761,11 @@ class PromotionProvider {
     );
   }
 
-  async _applyTargetTags(source, target, targetIdentifier, requiredTags, account, apiKey, operation) {
+  async _applyTargetTags(source, target, targetIdentifier, requiredTags, account, operation) {
     if (!this._isCurrent(operation, account)) return createStage("not_attempted", { required: true });
     const fresh = await this._findTargetPackages(
       source,
       target,
-      apiKey,
       null,
       account,
       { stopOnPresence: false }
@@ -800,7 +783,7 @@ class PromotionProvider {
       return createStage("not_required", { required: true, evidence: "fresh_read" });
     }
     if (!this._isCurrent(operation, account)) return createStage("not_attempted", { required: true });
-    const sourceRead = await this._verifySourceEligibleForWrite(source, apiKey, account);
+    const sourceRead = await this._verifySourceEligibleForWrite(source, account);
     if (!sourceRead.ok) {
       return createStage("failed", { required: true, errorCode: sourceRead.errorCode });
     }
@@ -810,7 +793,6 @@ class PromotionProvider {
       targetIdentifier,
       missing,
       account,
-      apiKey,
       "target",
       value => {
         const normalized = normalizeTargetPackage(value, source, target);
@@ -822,7 +804,7 @@ class PromotionProvider {
     );
   }
 
-  async _postTags(scope, identifier, tags, account, apiKey, side, normalizeResponse) {
+  async _postTags(scope, identifier, tags, account, side, normalizeResponse) {
     if (!this._isAccountCurrent(account)) return createStage("not_attempted", { required: true });
     const endpoint = apiEndpoint(["packages", scope.workspace, scope.repository, identifier, "tag"]);
     let result;
@@ -830,7 +812,7 @@ class PromotionProvider {
       result = await this.api.post(
         endpoint,
         { action: "add", tags },
-        { apiKey, responseType: "object", validate: isRecord, retry: "never" }
+        { responseType: "object", validate: isRecord, retry: "never" }
       );
     } catch {
       result = null;
@@ -876,16 +858,15 @@ class PromotionProvider {
     });
   }
 
-  async _reconcileFinalState(source, target, targetIdentifier, tagPlan, account, apiKey) {
+  async _reconcileFinalState(source, target, targetIdentifier, tagPlan, account) {
     if (!this._isAccountCurrent(account)) return { ok: false, errorCode: "account_changed" };
     const [sourceRead, targetRead] = await Promise.all([
       this._readSource(
         { workspace: source.workspace, repository: source.repository, packageIdentifier: source.packageIdentifier },
-        apiKey,
         null,
         account
       ),
-      this._findTargetPackages(source, target, apiKey, null, account, { stopOnPresence: false }),
+      this._findTargetPackages(source, target, null, account, { stopOnPresence: false }),
     ]);
     if (
       !this._isAccountCurrent(account)
@@ -905,7 +886,7 @@ class PromotionProvider {
     });
   }
 
-  async _readSource(locator, apiKey, cancellationToken, account) {
+  async _readSource(locator, cancellationToken, account) {
     if (!this._isAccountCurrent(account)) return { ok: false, errorCode: "account_changed" };
     const endpoint = apiEndpoint([
       "packages",
@@ -916,7 +897,6 @@ class PromotionProvider {
     let result;
     try {
       result = await this.api.get(endpoint, {
-        apiKey,
         responseType: "object",
         validate: isRecord,
         retry: "never",
@@ -933,14 +913,13 @@ class PromotionProvider {
     }
   }
 
-  async _verifySourceEligibleForWrite(source, apiKey, account) {
+  async _verifySourceEligibleForWrite(source, account) {
     const fresh = await this._readSource(
       {
         workspace: source.workspace,
         repository: source.repository,
         packageIdentifier: source.packageIdentifier,
       },
-      apiKey,
       null,
       account
     );
@@ -955,13 +934,12 @@ class PromotionProvider {
     return fresh;
   }
 
-  async _readTargetRepository(target, apiKey, cancellationToken, account) {
+  async _readTargetRepository(target, cancellationToken, account) {
     if (!this._isAccountCurrent(account)) return { ok: false, errorCode: "account_changed" };
     const endpoint = apiEndpoint(["repos", target.workspace, target.repository]);
     let result;
     try {
       result = await this.api.get(endpoint, {
-        apiKey,
         responseType: "object",
         validate: isRecord,
         retry: "never",
@@ -981,7 +959,7 @@ class PromotionProvider {
     }
   }
 
-  async _findTargetPackages(source, target, apiKey, cancellationToken, account, options = {}) {
+  async _findTargetPackages(source, target, cancellationToken, account, options = {}) {
     let endpoint;
     let query;
     try {
@@ -1020,7 +998,6 @@ class PromotionProvider {
             && candidate.repository === target.repository
           )),
           retry: "never",
-          apiKey,
           cancellationToken,
           resume,
           ...(resume ? { knownIdentities } : {}),
@@ -1078,7 +1055,7 @@ class PromotionProvider {
     }
   }
 
-  async _loadPresenceHints(source, apiKey, account) {
+  async _loadPresenceHints(source, account) {
     let endpoint;
     let query;
     try {
@@ -1109,7 +1086,6 @@ class PromotionProvider {
           candidate.namespace === source.workspace
         )),
         retry: "never",
-        apiKey,
       });
     } catch {
       return null;
@@ -1122,13 +1098,12 @@ class PromotionProvider {
     return repositories;
   }
 
-  async _loadTargetCandidates(source, pipeline, account, apiKey) {
+  async _loadTargetCandidates(source, pipeline, account) {
     if (!this._isAccountCurrent(account)) return { ok: false, errorCode: "account_changed" };
     let result;
     try {
       result = await this._fetchWorkspaceRepositories(this.context, source.workspace, {
         account,
-        apiKey,
         cloudsmithAPI: this.api,
         connectionManager: this._connectionManager,
         withProgress: this._withProgress,

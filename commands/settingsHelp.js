@@ -88,6 +88,8 @@ function registerSettingsHelpCommands(deps) {
   return registerCommands(registerCommand, [
     ["cloudsmith-vsc.setDefaultWorkspace", setDefaultWorkspace],
     ["cloudsmith-vsc.openSettings", openSettings],
+    // Published command ID from before the cloudsmith-vsc prefix convention;
+    // renaming would break user keybindings, so the legacy ID is retained.
     ["cloudsmith-vscode-extension.cloudsmithDocs", openDocumentation],
   ], deps);
 }
