@@ -126,11 +126,11 @@ function runSelfTests() {
       /package\.json contains a broad media glob/
     );
 
-    const junk = path.join(temporary, ".DS_Store");
-    fs.writeFileSync(junk, "bounded fixture\n");
-    expectFailure(() => walkForJunk(temporary), /repository contains OS\/editor junk: \.DS_Store/);
-    fs.unlinkSync(junk);
-    assert.doesNotThrow(() => walkForJunk(temporary));
+    expectFailure(
+      () => walkForJunk([".DS_Store"]),
+      /repository contains OS\/editor junk: \.DS_Store/
+    );
+    assert.doesNotThrow(() => walkForJunk(["keep.txt"]));
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }
