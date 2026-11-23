@@ -7,7 +7,6 @@ const root = path.resolve(__dirname, "../..");
 const severityRank = Object.freeze({ info: 0, low: 1, moderate: 2, high: 3, critical: 4 });
 const allowedInstallScripts = new Set([
   "node_modules/@vscode/vsce-sign",
-  "node_modules/keytar",
 ]);
 
 function advisoryId(advisory) {

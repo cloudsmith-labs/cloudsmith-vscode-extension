@@ -28,10 +28,10 @@ const {
 const SOURCE = Object.freeze({ sha: "a".repeat(40), fingerprint: "b".repeat(64) });
 const TOOL_PACKAGE = Object.freeze({
   name: "vscode-extension-tester",
-  version: "8.24.0",
+  version: "8.29.0",
   supportedVersions: Object.freeze({
-    "vscode-min": "1.129.1",
-    "vscode-max": "1.131.0",
+    "vscode-min": "1.145.3",
+    "vscode-max": "1.147.0",
   }),
 });
 

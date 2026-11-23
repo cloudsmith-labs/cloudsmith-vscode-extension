@@ -282,9 +282,9 @@ function testEvidence(step, source = SOURCE_IDENTITY) {
     schemaVersion: 1,
     tool: {
       core: "@stryker-mutator/core",
-      version: "10.0.0",
+      version: "10.1.1",
       runner: "@stryker-mutator/mocha-runner",
-      runnerVersion: "10.0.0",
+      runnerVersion: "10.1.1",
       engine: "mocha",
       engineVersion: "11.8.0",
     },
@@ -1034,9 +1034,9 @@ function validTrackedMutationBaseline() {
     schemaVersion: 1,
     tool: {
       core: "@stryker-mutator/core",
-      version: "10.0.0",
+      version: "10.1.1",
       runner: "@stryker-mutator/mocha-runner",
-      runnerVersion: "10.0.0",
+      runnerVersion: "10.1.1",
       engine: "mocha",
       engineVersion: "11.8.0",
       nodeVersion: "22.23.2",
@@ -1183,10 +1183,14 @@ function rawMutationReport(baseline, targets, values) {
       mutant.static ??= mutant.status === "Ignored";
       mutant.coveredBy ||= [];
       if (mutant.status === "Killed") {
+        mutant.duration ??= 0;
         mutant.statusReason ||= "The mutation was rejected by its exact owner test.";
         mutant.testsCompleted ??= Math.max(1, mutant.killedBy?.length || 0);
       } else if (mutant.status === "Survived") {
+        mutant.duration ??= 0;
         mutant.testsCompleted ??= mutant.coveredBy.length;
+      } else if (mutant.status === "Timeout") {
+        mutant.duration ??= 0;
       } else if (mutant.status === "Ignored") {
         mutant.statusReason ||= "Static mutant (and \"ignoreStatic\" was enabled)";
       }
@@ -6092,9 +6096,9 @@ suite("Quality mutation and UI harness boundaries", () => {
     const baseline = {
       tool: {
         core: "@stryker-mutator/core",
-        version: "10.0.0",
+        version: "10.1.1",
         runner: "@stryker-mutator/mocha-runner",
-        runnerVersion: "10.0.0",
+        runnerVersion: "10.1.1",
         engine: "mocha",
         engineVersion: "11.8.0",
         nodeVersion: "22.23.2",
