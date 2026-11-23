@@ -6090,6 +6090,100 @@ suite("Quality mutation and UI harness boundaries", () => {
     );
   });
 
+  test("binds exact non-negative duration evidence to run-status mutants", () => {
+    const target = "domain/authCapabilities.js";
+    const owner = "test/authCapabilities.test.js";
+    const baseline = {
+      tool: {
+        core: "@stryker-mutator/core",
+        version: "10.1.1",
+        runner: "@stryker-mutator/mocha-runner",
+        runnerVersion: "10.1.1",
+        engine: "mocha",
+        engineVersion: "11.8.0",
+        nodeVersion: "22.23.2",
+      },
+      scope: [target],
+      files: { [target]: { testFiles: [owner] } },
+      thresholds: { high: 95, low: 90 },
+    };
+    const report = rawMutationReport(baseline, [target], {
+      testFiles: { [owner]: { tests: [{ id: "duration-owner" }] } },
+      files: {
+        [target]: {
+          mutants: [
+            {
+              id: "duration-killed",
+              status: "Killed",
+              mutatorName: "StringLiteral",
+              replacement: "\"killed\"",
+              coveredBy: ["duration-owner"],
+              killedBy: ["duration-owner"],
+              location: { start: { line: 1, column: 0 }, end: { line: 1, column: 1 } },
+            },
+            {
+              id: "duration-survived",
+              status: "Survived",
+              mutatorName: "StringLiteral",
+              replacement: "\"survived\"",
+              coveredBy: ["duration-owner"],
+              location: { start: { line: 2, column: 0 }, end: { line: 2, column: 1 } },
+            },
+            {
+              id: "duration-timeout",
+              status: "Timeout",
+              mutatorName: "StringLiteral",
+              replacement: "\"timeout\"",
+              coveredBy: ["duration-owner"],
+              location: { start: { line: 3, column: 0 }, end: { line: 3, column: 1 } },
+            },
+            {
+              id: "duration-timeout-reasoned",
+              status: "Timeout",
+              mutatorName: "StringLiteral",
+              replacement: "\"timeout-reasoned\"",
+              coveredBy: ["duration-owner"],
+              statusReason: "The owner test exceeded the configured timeout.",
+              location: { start: { line: 4, column: 0 }, end: { line: 4, column: 1 } },
+            },
+          ],
+        },
+      },
+    });
+    assert.doesNotThrow(() => validateMutationTestOwnership(
+      report,
+      baseline.scope,
+      baseline
+    ));
+
+    for (const [index, status] of [[0, "Killed"], [1, "Survived"], [2, "Timeout"], [3, "Timeout"]]) {
+      for (const [variant, duration] of [
+        ["missing", undefined],
+        ["negative", -1],
+        ["non-finite", Number.NaN],
+        ["infinite", Number.POSITIVE_INFINITY],
+        ["non-numeric", "12"],
+      ]) {
+        const invalid = clone(report);
+        const mutant = invalid.files[target].mutants[index];
+        if (duration === undefined) delete mutant.duration;
+        else mutant.duration = duration;
+        assert.throws(
+          () => validateMutationTestOwnership(invalid, baseline.scope, baseline),
+          /status-specific raw mutant evidence/u,
+          `${status} ${variant} duration must fail closed`
+        );
+      }
+      const measured = clone(report);
+      measured.files[target].mutants[index].duration = 12.5;
+      assert.doesNotThrow(() => validateMutationTestOwnership(
+        measured,
+        baseline.scope,
+        baseline
+      ));
+    }
+  });
+
   test("binds ranged mutation targets to raw mutant locations", () => {
     const target = "util/upstreamOperationScheduler.js:141-219";
     const owner = "test/upstreamOperationScheduler.test.js";
