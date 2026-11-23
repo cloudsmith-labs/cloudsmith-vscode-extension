@@ -36,6 +36,7 @@ const {
   buildReleaseExposureResult,
   captureGeneratedEvidenceManifest,
 } = require("../scripts/quality/release-exposure-scan");
+const { policyFingerprint } = require("../scripts/quality/readiness-acceptance");
 const { UI_RESULT } = require("../scripts/quality/verify-ui-evidence");
 
 const SOURCE = Object.freeze({
@@ -1876,5 +1877,70 @@ suite("Release checklist trust receipts", () => {
     reusedEvidence.independentReview.evidence = [fixture.qualificationEvidence];
     const reusedEvidenceResult = evaluate(fixture, reusedEvidence);
     assert.ok(reusedEvidenceResult.errors.some(error => /separate review evidence/.test(error)));
+  });
+
+  test("independently validates the authenticated-CI lane for release acceptance", () => {
+    fs.copyFileSync(
+      path.join(__dirname, "..", "quality", "readiness-policy.json"),
+      path.join(fixture.root, "quality", "readiness-policy.json"),
+    );
+    const document = {
+      authenticatedAcceptance: true,
+      candidate: fixture.document.candidate,
+      candidateLaneStore: {
+        fingerprint: "1".repeat(64),
+        heads: {},
+        path: "internal_docs/quality/current-candidate-lanes.json",
+        sha256: "2".repeat(64),
+      },
+      checklistConfirmed: true,
+      completedAt: COMPLETED_AT,
+      evidence: fixture.document.evidence,
+      findingsFingerprint: fixture.document.findingsFingerprint,
+      historicalEvidence: [],
+      independentReview: null,
+      lanes: [{
+        id: "authenticated-ci",
+        status: "passed",
+        candidateReceiptFingerprint: fixture.authenticatedCandidateReceipt.fingerprint,
+        evidence: [fixture.qualificationEvidence],
+      }],
+      openNonBlockingRiskCount: 0,
+      openReleaseBlockerCount: 0,
+      operatorId: "qualification-operator",
+      readinessTarget: "release",
+      schemaVersion: 7,
+      source: SOURCE,
+      status: "passed",
+      summary: "fixture release acceptance",
+      targetPolicy: {
+        path: "quality/readiness-policy.json",
+        sha256: policyFingerprint(JSON.parse(
+          fs.readFileSync(path.join(fixture.root, "quality", "readiness-policy.json"), "utf8"),
+        )),
+      },
+      verdict: "TEAM-TEST READY",
+      visibleEnabledActions: null,
+      workflowResults: [],
+    };
+    const unvalidated = /lane authenticated-ci is not independently validated/u;
+
+    assert.ok(!evaluate(fixture, document).errors.some(error => unvalidated.test(error)));
+
+    const missing = evaluate(fixture, document, {
+      authenticatedCandidateArtifactPath: null,
+      authenticatedCandidateReceipt: null,
+      authenticatedExposureReceipt: null,
+      authenticatedReceipt: null,
+    });
+    assert.ok(missing.errors.some(error => unvalidated.test(error)));
+
+    const crossed = evaluate(fixture, document, {
+      authenticatedCandidateReceipt: {
+        ...fixture.authenticatedCandidateReceipt,
+        source: { sha: "3".repeat(40), fingerprint: "4".repeat(64) },
+      },
+    });
+    assert.ok(crossed.errors.some(error => unvalidated.test(error)));
   });
 });

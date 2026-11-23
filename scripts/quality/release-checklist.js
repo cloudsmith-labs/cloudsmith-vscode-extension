@@ -320,6 +320,7 @@ function evaluateTargetBoundAcceptance(options) {
 
   const laneInputs = [];
   const seenLanes = new Set();
+  let authenticatedCiLaneProof = null;
   if (!Array.isArray(document.lanes)) errors.push("Target-bound lanes must be an array.");
   for (const lane of Array.isArray(document.lanes) ? document.lanes : []) {
     if (!isPlainObject(lane)
@@ -386,6 +387,13 @@ function evaluateTargetBoundAcceptance(options) {
       validated = findingsState.errors.length === 0
         && document.findingsFingerprint === findingsState.fingerprint
         && lane.status === "passed";
+    } else if (lane.id === "authenticated-ci") {
+      if (authenticatedCiLaneProof === null) {
+        authenticatedCiLaneProof = authenticatedCiProofValidated(
+          candidate, document, context, source
+        );
+      }
+      validated = lane.status === "passed" && authenticatedCiLaneProof;
     } else {
       validated = context.validatedLaneStatuses?.[lane.id] === lane.status;
     }
@@ -939,6 +947,33 @@ function validateAttestationCandidate(document, source, context) {
     capturedAt: Number.isFinite(capturedAt) ? capturedAt : null,
     errors: uniqueSorted(errors),
   };
+}
+
+function authenticatedCiProofValidated(candidate, document, context, source) {
+  if (!candidate) return false;
+  try {
+    const ciCandidate = candidateBindingFromReceipt(
+      context.authenticatedCandidateReceipt,
+      {
+        root: context.root,
+        source,
+        artifactPath: context.authenticatedCandidateArtifactPath,
+        fileSystem: context.fileSystem,
+      },
+    );
+    if (ciCandidate.profileMode !== "ci") return false;
+    validateEquivalentCandidateProduct(candidate, ciCandidate);
+    validateCandidateCaptureWindow(context.authenticatedCandidateReceipt, document);
+    validateAuthenticatedExecutionReceipt(context.authenticatedReceipt, ciCandidate, source);
+    validateAuthenticatedExposureProof(
+      context.authenticatedExposureReceipt,
+      context.authenticatedCandidateReceipt,
+      source,
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function validateCandidateCaptureWindow(receipt, document) {
