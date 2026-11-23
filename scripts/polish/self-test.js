@@ -1,8 +1,10 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const assert = require("assert");
+const { spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { gitVisibleFiles } = require("../quality/common");
 const {
   APPROVED_MEDIA,
   validateCommandDocs,
@@ -131,6 +133,31 @@ function runSelfTests() {
       /repository contains OS\/editor junk: \.DS_Store/
     );
     assert.doesNotThrow(() => walkForJunk(["keep.txt"]));
+
+    const gitRoot = fs.mkdtempSync(path.join(temporary, "junk-repo-"));
+    const git = args => {
+      const result = spawnSync("git", args, { cwd: gitRoot, encoding: "utf8" });
+      assert.strictEqual(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+    };
+    git(["init"]);
+    fs.writeFileSync(path.join(gitRoot, ".gitignore"), ".DS_Store\n");
+    fs.writeFileSync(path.join(gitRoot, "keep.txt"), "bounded fixture\n");
+
+    fs.writeFileSync(path.join(gitRoot, ".DS_Store"), "junk\n");
+    assert.doesNotThrow(() => walkForJunk(gitVisibleFiles(gitRoot)));
+
+    fs.writeFileSync(path.join(gitRoot, "swap.swp"), "junk\n");
+    expectFailure(
+      () => walkForJunk(gitVisibleFiles(gitRoot)),
+      /repository contains OS\/editor junk: swap\.swp/
+    );
+    fs.unlinkSync(path.join(gitRoot, "swap.swp"));
+
+    git(["add", "-f", ".DS_Store"]);
+    expectFailure(
+      () => walkForJunk(gitVisibleFiles(gitRoot)),
+      /repository contains OS\/editor junk: \.DS_Store/
+    );
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }
