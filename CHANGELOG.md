@@ -19,6 +19,7 @@
 ### Vulnerability, upstream, and package workflows
 
 - Made vulnerability results fail-safe across clean, vulnerable, partial, unknown, and failed states so incomplete evidence is not presented as clean, with more reliable safe-version and quarantine remediation.
+- Documented the Cloudsmith vulnerability-scanning transition: legacy recurring scans are being switched off per workspace and the legacy scan endpoints remain available until March 31, 2027; packages without scan evidence continue to show an unknown or incomplete state rather than clean.
 - Improved upstream inventory, retries, resolution preview, Dependency Health coverage, and pull-through preparation while preserving partial-result truth and account isolation.
 - Made Command Palette, context-menu, and view-title actions state-aware, with deterministic package, workspace, and repository recovery for global commands and safe cancellation of stale prompts.
 
