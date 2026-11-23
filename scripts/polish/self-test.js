@@ -4,7 +4,7 @@ const { spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { gitVisibleFiles } = require("../quality/common");
+const { gitVisiblePaths } = require("../quality/common");
 const {
   APPROVED_MEDIA,
   validateCommandDocs,
@@ -144,18 +144,26 @@ function runSelfTests() {
     fs.writeFileSync(path.join(gitRoot, "keep.txt"), "bounded fixture\n");
 
     fs.writeFileSync(path.join(gitRoot, ".DS_Store"), "junk\n");
-    assert.doesNotThrow(() => walkForJunk(gitVisibleFiles(gitRoot)));
+    assert.doesNotThrow(() => walkForJunk(gitVisiblePaths(gitRoot)));
 
     fs.writeFileSync(path.join(gitRoot, "swap.swp"), "junk\n");
     expectFailure(
-      () => walkForJunk(gitVisibleFiles(gitRoot)),
+      () => walkForJunk(gitVisiblePaths(gitRoot)),
       /repository contains OS\/editor junk: swap\.swp/
     );
     fs.unlinkSync(path.join(gitRoot, "swap.swp"));
 
+    fs.symlinkSync("keep.txt", path.join(gitRoot, "linked.swp"));
+    git(["add", "linked.swp"]);
+    expectFailure(
+      () => walkForJunk(gitVisiblePaths(gitRoot)),
+      /repository contains OS\/editor junk: linked\.swp/
+    );
+    git(["rm", "-f", "linked.swp"]);
+
     git(["add", "-f", ".DS_Store"]);
     expectFailure(
-      () => walkForJunk(gitVisibleFiles(gitRoot)),
+      () => walkForJunk(gitVisiblePaths(gitRoot)),
       /repository contains OS\/editor junk: \.DS_Store/
     );
   } finally {

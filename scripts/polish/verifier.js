@@ -1,7 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const fs = require("fs");
 const path = require("path");
-const { gitVisibleFiles } = require("../quality/common");
+const { gitVisiblePaths } = require("../quality/common");
 const {
   FALLBACK_FORMATS,
   FORMAT_ICON_FILES,
@@ -457,7 +457,7 @@ function verifyRepository(root = path.resolve(__dirname, "../..")) {
   validateHelpLinks(HELP_LINKS, readme, manifest);
   validateFormatInventory();
   validateNoProductionSettingReads(root);
-  walkForJunk(gitVisibleFiles(root));
+  walkForJunk(gitVisiblePaths(root));
   for (const pattern of FORBIDDEN_DOC_PATTERNS) {
     if (pattern.test(readme)) fail(`README contains stale claim matching ${pattern}`);
   }
