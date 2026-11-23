@@ -958,7 +958,7 @@ function authenticatedCiProofValidated(candidate, document, context, source) {
     const ciCandidate = candidateBindingFromReceipt(
       context.authenticatedCandidateReceipt,
       {
-        root: context.root,
+        toolchainRoot: context.root,
         source,
         artifactPath: context.authenticatedCandidateArtifactPath,
         fileSystem: context.fileSystem,

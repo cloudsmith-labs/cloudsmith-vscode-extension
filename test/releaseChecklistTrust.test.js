@@ -1944,6 +1944,33 @@ suite("Release checklist trust receipts", () => {
     mismatched.lanes[0].candidateReceiptFingerprint = "5".repeat(64);
     assert.ok(evaluate(fixture, mismatched).errors.some(error => unvalidated.test(error)));
 
+    const runnerReceipt = clone(fixture.authenticatedCandidateReceipt);
+    runnerReceipt.artifact = {
+      ...runnerReceipt.artifact,
+      absoluteVsixPath: "/runner/checkout/out/development/cloudsmith-vsc-2.3.0.vsix",
+    };
+    delete runnerReceipt.fingerprint;
+    runnerReceipt.fingerprint = fingerprint(runnerReceipt);
+    const runnerExecution = clone(fixture.authenticatedReceipt);
+    runnerExecution.candidate = {
+      ...runnerExecution.candidate,
+      receiptFingerprint: runnerReceipt.fingerprint,
+    };
+    delete runnerExecution.fingerprint;
+    runnerExecution.fingerprint = fingerprint(runnerExecution);
+    const runnerExposure = clone(fixture.authenticatedExposureReceipt);
+    runnerExposure.candidateReceiptFingerprint = runnerReceipt.fingerprint;
+    delete runnerExposure.fingerprint;
+    runnerExposure.fingerprint = fingerprint(runnerExposure);
+    const stagedDocument = clone(document);
+    stagedDocument.lanes[0].candidateReceiptFingerprint = runnerReceipt.fingerprint;
+    const detached = evaluate(fixture, stagedDocument, {
+      authenticatedCandidateReceipt: runnerReceipt,
+      authenticatedExposureReceipt: runnerExposure,
+      authenticatedReceipt: runnerExecution,
+    });
+    assert.ok(!detached.errors.some(error => unvalidated.test(error)));
+
     const crossed = evaluate(fixture, document, {
       authenticatedCandidateReceipt: {
         ...fixture.authenticatedCandidateReceipt,
