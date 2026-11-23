@@ -147,7 +147,17 @@ candidate after the acceptance artifact passes `npm run quality:release`.
    - `authenticated-ci`: dispatch `deep-quality.yml` on the candidate SHA;
      its `authenticated-production-ui` job runs in the
      `cloudsmith-release-qualification` environment and uploads the
-     `authenticated-ui-evidence-<sha>-<attempt>` artifact.
+     `authenticated-ui-evidence-<sha>-<attempt>` artifact. Download that
+     artifact from the run (`gh run download <run-id> -n
+     authenticated-ui-evidence-<sha>-<attempt>`) and stage its members at
+     their expected runtime-proof paths —
+     `.quality/qualification/authenticated-candidate.json`,
+     `.quality/qualification/authenticated-candidate.vsix`,
+     `.quality/qualification/authenticated-ci.json`, and
+     `.quality/secrets/authenticated-ci.json` — leaving the receipts
+     unmodified so their candidate bindings still verify. These are
+     runtime proofs, distinct from the acceptance evidence references
+     authored under `internal_docs/quality/`.
 6. Capture the authenticated-local observation under
    `internal_docs/quality/` and aggregate the candidate lane store:
    `node scripts/quality/aggregate-candidate-lanes.js --authenticated-evidence internal_docs/quality/<observation>.json`
