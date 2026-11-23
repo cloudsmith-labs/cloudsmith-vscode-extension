@@ -140,6 +140,7 @@ function runSelfTests() {
       assert.strictEqual(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
     };
     git(["init"]);
+    git(["config", "core.excludesFile", "self-test-excludes"]);
     fs.writeFileSync(path.join(gitRoot, ".gitignore"), ".DS_Store\n");
     fs.writeFileSync(path.join(gitRoot, "keep.txt"), "bounded fixture\n");
 
