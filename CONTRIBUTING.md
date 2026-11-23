@@ -152,9 +152,13 @@ candidate after the acceptance artifact passes `npm run quality:release`.
    authenticated qualification receipts), `operatorId`, `completedAt`
    inside the 24-hour readiness window, zero open release blockers, and
    `checklistConfirmed`. Then run `npm run quality:release`.
-7. Merge the draft pull request, then tag the merge commit as `vX.Y.Z`
-   and verify the tag against `HEAD`:
-   `GITHUB_REF_NAME=vX.Y.Z npm run verify:version -- --release`
+7. Merge the draft pull request, then tag the **qualified candidate
+   SHA** — the pre-merge PR head, not the merge or squash commit — as
+   `vX.Y.Z`. The VSIX provenance, remote CI receipt, and acceptance
+   artifact all bind that SHA; `package:verify --current-source` rejects
+   the artifact at any other commit. Check out the candidate SHA and
+   verify the tag against it:
+   `git checkout <candidate-sha> && GITHUB_REF_NAME=vX.Y.Z npm run verify:version -- --release`
    (the release check reads the tag name from `GITHUB_REF_NAME`, which CI
    sets automatically).
 8. Download the CI-verified VSIX artifact built on the candidate SHA and
