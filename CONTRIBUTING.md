@@ -139,12 +139,19 @@ candidate after the acceptance artifact passes `npm run quality:release`.
    for the other:
    - `authenticated-local`: `npm run quality:qualification:prepare` and
      `npm run quality:qualification:launch` in the dedicated persistent
-     local profile.
+     local profile. On Linux and Windows automatic VS Code discovery is
+     unavailable — pass the pinned install explicitly, e.g.
+     `npm run quality:qualification:prepare -- --vscode-executable <path>`
+     (and `--vscode-cli <path>` where the CLI is separate).
    - `authenticated-ci`: dispatch `deep-quality.yml` on the candidate SHA;
      its `authenticated-production-ui` job runs in the
      `cloudsmith-release-qualification` environment and uploads the
      `authenticated-ui-evidence-<sha>-<attempt>` artifact.
-6. Author the schema-v7 acceptance artifact
+6. Capture the authenticated-local observation under
+   `internal_docs/quality/` and aggregate the candidate lane store:
+   `node scripts/quality/aggregate-candidate-lanes.js --authenticated-evidence internal_docs/quality/<observation>.json`
+   (writes `internal_docs/quality/current-candidate-lanes.json`).
+7. Author the schema-v7 acceptance artifact
    `internal_docs/quality/current-candidate-acceptance.json` bound to the
    candidate SHA and tracked readiness policy, with
    `readinessTarget: "release"`, the exact evidence paths (remote CI
@@ -152,7 +159,7 @@ candidate after the acceptance artifact passes `npm run quality:release`.
    authenticated qualification receipts), `operatorId`, `completedAt`
    inside the 24-hour readiness window, zero open release blockers, and
    `checklistConfirmed`. Then run `npm run quality:release`.
-7. Merge the draft pull request, then tag the **qualified candidate
+8. Merge the draft pull request, then tag the **qualified candidate
    SHA** — the pre-merge PR head, not the merge or squash commit — as
    `vX.Y.Z`. The VSIX provenance, remote CI receipt, and acceptance
    artifact all bind that SHA; `package:verify --current-source` rejects
@@ -161,7 +168,7 @@ candidate after the acceptance artifact passes `npm run quality:release`.
    `git checkout <candidate-sha> && GITHUB_REF_NAME=vX.Y.Z npm run verify:version -- --release`
    (the release check reads the tag name from `GITHUB_REF_NAME`, which CI
    sets automatically).
-8. Download the CI-verified VSIX artifact built on the candidate SHA and
+9. Download the CI-verified VSIX artifact built on the candidate SHA and
    publish that exact file —
    `vsce publish --packagePath <vsix>` to the Visual Studio Marketplace and
    `ovsx publish <vsix>` to the Open VSX Registry under the `Cloudsmith`
