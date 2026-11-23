@@ -1971,6 +1971,49 @@ suite("Release checklist trust receipts", () => {
     });
     assert.ok(!detached.errors.some(error => unvalidated.test(error)));
 
+    const windowsReceipt = clone(runnerReceipt);
+    windowsReceipt.toolchain = { ...windowsReceipt.toolchain, platform: "win32" };
+    windowsReceipt.profile = {
+      mode: "ci",
+      persistent: false,
+      root: "C:\\bounded\\authenticated-ci-profile",
+      testResourcesDir: "C:\\bounded\\authenticated-ci-profile",
+      userDataDir: "C:\\bounded\\authenticated-ci-profile\\settings",
+      extensionsDir: "C:\\bounded\\authenticated-ci-profile\\extensions",
+    };
+    windowsReceipt.artifact = {
+      ...windowsReceipt.artifact,
+      absoluteVsixPath: "C:\\runner\\checkout\\out\\development\\cloudsmith-vsc-2.3.0.vsix",
+    };
+    windowsReceipt.vscode = {
+      ...windowsReceipt.vscode,
+      cli: "C:\\bounded\\cli.cmd",
+      executable: "C:\\bounded\\code.exe",
+    };
+    delete windowsReceipt.fingerprint;
+    windowsReceipt.fingerprint = fingerprint(windowsReceipt);
+    const windowsBinding = candidateBindingFromReceipt(windowsReceipt, {
+      toolchainRoot: fixture.root,
+      source: SOURCE,
+      artifactPath: fixture.authenticatedCandidateArtifactPath,
+    });
+    const windowsExecution = clone(runnerExecution);
+    windowsExecution.candidate = windowsBinding;
+    delete windowsExecution.fingerprint;
+    windowsExecution.fingerprint = fingerprint(windowsExecution);
+    const windowsExposure = clone(runnerExposure);
+    windowsExposure.candidateReceiptFingerprint = windowsReceipt.fingerprint;
+    delete windowsExposure.fingerprint;
+    windowsExposure.fingerprint = fingerprint(windowsExposure);
+    const windowsDocument = clone(document);
+    windowsDocument.lanes[0].candidateReceiptFingerprint = windowsReceipt.fingerprint;
+    const windowsResult = evaluate(fixture, windowsDocument, {
+      authenticatedCandidateReceipt: windowsReceipt,
+      authenticatedExposureReceipt: windowsExposure,
+      authenticatedReceipt: windowsExecution,
+    });
+    assert.ok(!windowsResult.errors.some(error => unvalidated.test(error)));
+
     const crossed = evaluate(fixture, document, {
       authenticatedCandidateReceipt: {
         ...fixture.authenticatedCandidateReceipt,
