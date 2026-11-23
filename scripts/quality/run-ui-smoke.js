@@ -33,7 +33,7 @@ const PROBE_FILE = "ui-test/false-green-probe.test.js";
 const SUITE_FILE = "ui-test/smoke.test.js";
 const WORKFLOWS_PATH = "quality/critical-workflows.json";
 const NODE_VERSION = "22.23.2";
-const VSCODE_VERSION = "1.147.0";
+const VSCODE_VERSION = "1.140.0";
 const PROBE_TEST = "rejects a fresh intentionally incorrect Activity Bar selector";
 const SUITE_TESTS = Object.freeze([
   "installs, activates, and exposes the Cloudsmith Activity Bar container",

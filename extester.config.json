@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/vscode-extension-tester/resources/extester.schema.json",
   "setup": {
-    "vscodeVersion": "1.147.0",
+    "vscodeVersion": "1.140.0",
     "type": "stable",
     "storage": "./ui-test/RUN_THROUGH_QUALITY_RUNNER",
     "extensionsDir": "./ui-test/RUN_THROUGH_QUALITY_RUNNER",
@@ -16,7 +16,7 @@
     "testFiles": [
       "./ui-test/smoke.test.js"
     ],
-    "vscodeVersion": "1.147.0",
+    "vscodeVersion": "1.140.0",
     "type": "stable",
     "storage": "./ui-test/RUN_THROUGH_QUALITY_RUNNER",
     "extensionsDir": "./ui-test/RUN_THROUGH_QUALITY_RUNNER",

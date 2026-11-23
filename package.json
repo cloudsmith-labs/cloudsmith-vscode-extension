@@ -988,7 +988,11 @@
         },
         "cloudsmith-vsc.dependencyTreeDefaultView": {
           "type": "string",
-          "enum": ["direct", "flat", "tree"],
+          "enum": [
+            "direct",
+            "flat",
+            "tree"
+          ],
           "default": "flat",
           "description": "Default view mode for the Dependency Health panel."
         },
@@ -1002,20 +1006,32 @@
           "items": {
             "type": "string"
           },
-          "default": ["AGPL-3.0", "GPL-3.0", "GPL-2.0", "SSPL-1.0"],
+          "default": [
+            "AGPL-3.0",
+            "GPL-3.0",
+            "GPL-2.0",
+            "SSPL-1.0"
+          ],
           "description": "SPDX identifiers to treat as restrictive. Packages with these licenses will be flagged. These extend the built-in restrictive set."
         },
         "cloudsmith-vsc.promotionPipeline": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "description": "Optional ordered list of repository slugs for the promotion pipeline (for example, ['dev', 'staging', 'production']). When set, promotion suggests the next repository in the pipeline. When empty, all workspace repositories are shown."
         },
         "cloudsmith-vsc.promotionTags": {
           "type": "object",
           "default": {
-            "onPromote": ["promoted-to-{target}", "approved-{date}"],
-            "onReceive": ["promoted-from-{source}"]
+            "onPromote": [
+              "promoted-to-{target}",
+              "approved-{date}"
+            ],
+            "onReceive": [
+              "promoted-from-{source}"
+            ]
           },
           "description": "Tag templates applied when promoting packages. Supports {target}, {source}, {date} placeholders."
         },
@@ -1094,6 +1110,13 @@
     "test-exclude": {
       "glob": "14.0.6",
       "minimatch": "11.0.9"
+    },
+    "vscode-extension-tester": {
+      "glob": "14.0.6",
+      "minimatch": "11.0.9",
+      "selenium-webdriver": "4.51.0",
+      "@redhat-developer/locators": "1.25.1",
+      "@redhat-developer/page-objects": "1.25.1"
     }
   },
   "devDependencies": {
@@ -1109,7 +1132,7 @@
     "js-yaml": "4.3.2",
     "mocha": "11.8.0",
     "typescript": "5.9.3",
-    "vscode-extension-tester": "8.29.0",
+    "vscode-extension-tester": "8.28.1",
     "xml2js": "0.6.2",
     "yauzl": "3.4.0"
   },
