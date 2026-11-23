@@ -140,8 +140,9 @@ candidate after the acceptance artifact passes `npm run quality:release`.
    - `authenticated-local`: `npm run quality:qualification:prepare` and
      `npm run quality:qualification:launch` in the dedicated persistent
      local profile. On Linux and Windows automatic VS Code discovery is
-     unavailable — pass the pinned install explicitly, e.g.
-     `npm run quality:qualification:prepare -- --vscode-executable <path>`
+     unavailable — pass the pinned install explicitly to *both* commands,
+     e.g. `npm run quality:qualification:prepare -- --vscode-executable <path>`
+     and `npm run quality:qualification:launch -- --vscode-executable <path>`
      (and `--vscode-cli <path>` where the CLI is separate).
    - `authenticated-ci`: dispatch `deep-quality.yml` on the candidate SHA;
      its `authenticated-production-ui` job runs in the
