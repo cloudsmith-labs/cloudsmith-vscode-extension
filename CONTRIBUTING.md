@@ -38,7 +38,7 @@ npm ci --ignore-scripts --no-audit --no-fund
 ```bash
 npm run lint                 # ESLint, zero warnings allowed
 npm run syntax               # syntax validation of all JavaScript
-npm run build                # produces out/ builds
+npm run build                # validates runtime source and assets; emits nothing
 npm run verify:architecture  # production architecture + command parity
 npm run verify:polish        # docs/media/settings polish gate
 npm run verify:version       # package.json vs lockfile vs CHANGELOG
@@ -125,13 +125,26 @@ authenticated qualification matrix is green on the exact candidate SHA.
    `npm run package && npm run package:verify`.
 3. Ensure the CI `Deterministic build candidate` workflow is green on the
    exact SHA, including the reproducible VSIX artifact.
-4. Run the authenticated qualification lanes (`deep-quality.yml` /
-   `npm run quality:qualification:*` locally) and `npm run quality:release`.
-5. Tag the release commit as `vX.Y.Z`, then verify the tag against `HEAD`:
+4. Collect the remote CI proof on the exact candidate SHA:
+   `npm run quality:remote-ci:collect` writes the remote receipt
+   (`internal_docs/quality/remote-ci.json`, `remote-ci-api.json`) and the
+   `.quality/remote-ci/signed-out-ui` bundle.
+5. Run the authenticated qualification lanes (`deep-quality.yml` /
+   `npm run quality:qualification:*` locally) against the exact packaged
+   candidate.
+6. Author the schema-v7 acceptance artifact
+   `internal_docs/quality/current-candidate-acceptance.json` bound to the
+   candidate SHA and tracked readiness policy, with
+   `readinessTarget: "release"`, the exact evidence paths (remote CI
+   receipt and signed-out UI bundle, findings ledger, authenticated
+   qualification receipt), `operatorId`, `completedAt` inside the 24-hour
+   readiness window, zero open release blockers, and `checklistConfirmed`.
+   Then run `npm run quality:release`.
+7. Tag the release commit as `vX.Y.Z`, then verify the tag against `HEAD`:
    `GITHUB_REF_NAME=vX.Y.Z npm run verify:version -- --release`
    (the release check reads the tag name from `GITHUB_REF_NAME`, which CI
    sets automatically).
-6. Download the CI-verified VSIX artifact and publish that exact file —
+8. Download the CI-verified VSIX artifact and publish that exact file —
    `vsce publish --packagePath <vsix>` to the Visual Studio Marketplace and
    `ovsx publish <vsix>` to the Open VSX Registry under the `Cloudsmith`
    publisher. Do not let either publisher repackage the working tree. Then
