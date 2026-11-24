@@ -79,7 +79,6 @@ const NODE_VERSION = NODE_VERSION_BYTES.toString("utf8").trim();
 const NPM_VERSION = NPM_VERSION_BYTES.toString("utf8").trim();
 const NPM_INTEGRITY = JSON.parse(NPM_INTEGRITY_BYTES.toString("utf8"));
 const REVIEWED_SYNTHETIC_HISTORY_COMMITS = Object.freeze([
-  "8e54acd0430a7c1e9f6598d982e245afc5ef94a4",
   "8831147d82a75bd57053a9c423a927ce481bb030",
 ]);
 const REVIEWED_SYNTHETIC_HISTORY_PATH = "test/qualityHarness.test.js";
@@ -929,7 +928,6 @@ suite("secret exposure gate", () => {
   test("history classification binds two shifted fixture slots to each reviewed origin", async () => {
     const linesByCommit = new Map([
       [REVIEWED_SYNTHETIC_HISTORY_COMMITS[0], [173, 351]],
-      [REVIEWED_SYNTHETIC_HISTORY_COMMITS[1], [611, 877]],
     ]);
     const reviewed = reviewedSyntheticHistoryFindings(linesByCommit);
     const retained = {
@@ -958,7 +956,7 @@ suite("secret exposure gate", () => {
       },
     });
     assert.strictEqual(result.findingCount, 1);
-    assert.strictEqual(result.components[0].reviewedFixtureFindingCount, 4);
+    assert.strictEqual(result.components[0].reviewedFixtureFindingCount, 2);
     assert.strictEqual(
       result.components[0].reviewedFixturePolicyId,
       "qh-synthetic-cloudsmith-api-key-v3",
@@ -1056,7 +1054,7 @@ suite("secret exposure gate", () => {
 
     const markerMismatchGit = (executable, args, options) => {
       const result_ = reviewedSyntheticHistoryGit(linesByCommit)(executable, args, options);
-      if (args[0] !== "grep" || args.at(-3) !== REVIEWED_SYNTHETIC_HISTORY_COMMITS[1]) {
+      if (args[0] !== "grep" || args.at(-3) !== REVIEWED_SYNTHETIC_HISTORY_COMMITS[0]) {
         return result_;
       }
       const patterns = [];
@@ -1111,7 +1109,6 @@ suite("secret exposure gate", () => {
   test("history classification recognizes only the exact reviewed legacy location set", async () => {
     const linesByCommit = new Map([
       [REVIEWED_SYNTHETIC_HISTORY_COMMITS[0], [1731, 3567]],
-      [REVIEWED_SYNTHETIC_HISTORY_COMMITS[1], [2182, 4820]],
     ]);
     const synthetic = reviewedSyntheticHistoryFindings(linesByCommit);
     const legacy = [

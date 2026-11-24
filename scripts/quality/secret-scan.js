@@ -143,8 +143,9 @@ const EXACT_FILE_IDENTITY_KEYS = Object.freeze([
 const REVIEWED_SYNTHETIC_FIXTURE_PATH = "test/qualityHarness.test.js";
 const REVIEWED_SYNTHETIC_FIXTURE_RULE = "generic-api-key";
 const REVIEWED_SYNTHETIC_FIXTURE_POLICY = "qh-synthetic-cloudsmith-api-key-v3";
+// Reviewed history origins must stay reachable from fetched refs; entries for
+// deleted branches make the gate fail closed on missing objects.
 const REVIEWED_SYNTHETIC_FIXTURE_HISTORY_COMMITS = Object.freeze([
-  "8e54acd0430a7c1e9f6598d982e245afc5ef94a4",
   "8831147d82a75bd57053a9c423a927ce481bb030",
 ]);
 const REVIEWED_LEGACY_HISTORY_POLICY = "reviewed-disposable-credential-history-v1";

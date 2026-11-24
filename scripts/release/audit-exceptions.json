@@ -6,69 +6,54 @@
       "package": "diff",
       "severity": "low",
       "owner": "release-engineering",
-      "reviewedOn": "2026-09-01",
-      "expiresOn": "2026-09-25",
-      "rationale": "Development-only Mocha diff rendering; untrusted patches are not processed by the shipped extension.",
-      "rejectedFixes": [
-        {
-          "name": "@vscode/test-cli",
-          "version": "0.0.11",
-          "isSemVerMajor": true,
-          "reason": "npm proposes a breaking VS Code test-runner downgrade that does not update the explicitly pinned Mocha dependency."
-        },
-        {
-          "name": "mocha",
-          "version": "12.0.0",
-          "isSemVerMajor": true,
-          "reason": "npm proposes a semver-major Mocha 12 runner change, while @vscode/test-cli 0.0.15 requires Mocha ^11.7.6; changing only the direct pin would retain a nested vulnerable Mocha 11 path rather than provide a complete supported fix."
-        }
-      ]
+      "reviewedOn": "2026-11-23",
+      "expiresOn": "2027-02-15",
+      "rationale": "Development-only Mocha diff rendering via the pinned test suite; untrusted patch input is never processed and the shipped extension has zero runtime dependencies."
+    },
+    {
+      "advisoryId": "GHSA-3g3m-2fjr-6pw4",
+      "package": "glob",
+      "severity": "moderate",
+      "owner": "release-engineering",
+      "reviewedOn": "2026-11-23",
+      "expiresOn": "2027-02-15",
+      "rationale": "Development-only glob usage inside the pinned Mocha and @vscode/test-cli spec discovery paths. The advisory requires traversal to be cancelled through AbortSignal; repository test commands do not drive abortable glob traversal, and the shipped extension has zero runtime dependencies."
+    },
+    {
+      "advisoryId": "GHSA-g3hv-75wg-m249",
+      "package": "minimatch",
+      "severity": "moderate",
+      "owner": "release-engineering",
+      "reviewedOn": "2026-11-23",
+      "expiresOn": "2027-02-15",
+      "rationale": "Development-only minimatch usage inside the pinned Mocha and @vscode/test-cli matching paths against checked-in spec patterns. Patterns are not attacker-controlled and the shipped extension has zero runtime dependencies."
     },
     {
       "advisoryId": "GHSA-5c6j-r48x-rmvq",
       "package": "serialize-javascript",
       "severity": "high",
       "owner": "release-engineering",
-      "reviewedOn": "2026-09-01",
-      "expiresOn": "2026-09-25",
-      "rationale": "Development-only Mocha parallel-worker option serialization; the reviewed test commands do not enable Mocha parallel mode, so this path is not reached in CI or the shipped extension.",
-      "rejectedFixes": [
-        {
-          "name": "@vscode/test-cli",
-          "version": "0.0.11",
-          "isSemVerMajor": true,
-          "reason": "npm proposes a breaking VS Code test-runner downgrade that does not update the explicitly pinned Mocha dependency."
-        },
-        {
-          "name": "mocha",
-          "version": "12.0.0",
-          "isSemVerMajor": true,
-          "reason": "npm proposes a semver-major Mocha 12 runner change, while @vscode/test-cli 0.0.15 requires Mocha ^11.7.6; changing only the direct pin would retain a nested vulnerable Mocha 11 path rather than provide a complete supported fix."
-        }
-      ]
+      "reviewedOn": "2026-11-23",
+      "expiresOn": "2027-02-15",
+      "rationale": "Development-only Mocha parallel-worker option serialization; the reviewed test commands do not enable Mocha parallel mode, so this path is not reached in CI or the shipped extension."
     },
     {
       "advisoryId": "GHSA-qj8w-gfj5-8c6v",
       "package": "serialize-javascript",
       "severity": "moderate",
       "owner": "release-engineering",
-      "reviewedOn": "2026-09-01",
-      "expiresOn": "2026-09-25",
-      "rationale": "Development-only Mocha parallel-worker option serialization; the reviewed test commands do not enable Mocha parallel mode, so attacker-controlled array-like values do not reach this path in CI or the shipped extension.",
-      "rejectedFixes": [
-        {
-          "name": "@vscode/test-cli",
-          "version": "0.0.11",
-          "isSemVerMajor": true,
-          "reason": "npm proposes a breaking VS Code test-runner downgrade that does not update the explicitly pinned Mocha dependency."
-        },
-        {
-          "name": "mocha",
-          "version": "12.0.0",
-          "isSemVerMajor": true,
-          "reason": "npm proposes a semver-major Mocha 12 runner change, while @vscode/test-cli 0.0.15 requires Mocha ^11.7.6; changing only the direct pin would retain a nested vulnerable Mocha 11 path rather than provide a complete supported fix."
-        }
-      ]
+      "reviewedOn": "2026-11-23",
+      "expiresOn": "2027-02-15",
+      "rationale": "Development-only Mocha parallel-worker option serialization; the reviewed test commands do not enable Mocha parallel mode, so attacker-controlled array-like values do not reach this path in CI or the shipped extension."
+    },
+    {
+      "advisoryId": "GHSA-m5mm-p8h7-m29v",
+      "package": "serialize-javascript",
+      "severity": "low",
+      "owner": "release-engineering",
+      "reviewedOn": "2026-11-23",
+      "expiresOn": "2027-02-15",
+      "rationale": "Development-only Mocha parallel-worker option serialization; the reviewed test commands do not enable Mocha parallel mode, so serialized output is never embedded in a rendered page in CI or the shipped extension."
     }
   ]
 }

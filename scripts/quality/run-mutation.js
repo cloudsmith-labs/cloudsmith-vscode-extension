@@ -494,22 +494,24 @@ function validateRawMutantStatus(mutant) {
     "coveredBy", "id", "location", "mutatorName", "replacement", "static", "status",
   ];
   let statusKeys = {
-    Killed: ["killedBy", "statusReason", "testsCompleted"],
-    Survived: ["testsCompleted"],
+    Killed: ["duration", "killedBy", "statusReason", "testsCompleted"],
+    Survived: ["duration", "testsCompleted"],
     Ignored: ["statusReason"],
     NoCoverage: [],
     CompileError: ["statusReason"],
     RuntimeError: ["statusReason"],
-    Timeout: [],
+    Timeout: ["duration"],
   }[mutant?.status];
   if (mutant?.status === "Timeout"
     && Object.prototype.hasOwnProperty.call(mutant, "statusReason")) {
-    statusKeys = ["statusReason"];
+    statusKeys = ["duration", "statusReason"];
   }
   const exactKeys = statusKeys && uniqueSorted([...commonKeys, ...statusKeys]);
   const coveredBy = mutant?.coveredBy;
   if (!exactKeys
     || JSON.stringify(uniqueSorted(Object.keys(mutant || {}))) !== JSON.stringify(exactKeys)
+    || (statusKeys.includes("duration")
+      && (!Number.isFinite(mutant.duration) || mutant.duration < 0))
     || typeof mutant.mutatorName !== "string" || mutant.mutatorName.length === 0
     || typeof mutant.replacement !== "string"
     || typeof mutant.static !== "boolean"

@@ -227,7 +227,6 @@ function auditLockfile(packageName = "affected") {
   };
   for (const packagePath of [
     "node_modules/@vscode/vsce-sign",
-    "node_modules/keytar",
   ]) {
     packages[packagePath] = {
       version: "1.0.0",
