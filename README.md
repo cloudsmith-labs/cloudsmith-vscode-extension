@@ -53,6 +53,8 @@ Workspace and repository context menus include scoped search and filter shortcut
 
 Vulnerability state is derived from canonical scan evidence. A package is shown as clean only when the available result authoritatively reports no known vulnerabilities; incomplete or failed data is not presented as clean.
 
+> Cloudsmith is replacing its legacy Trivy vulnerability scanning with continuous OSV-based vulnerability detection. Recurring legacy scans are being switched off per workspace during the transition, and the legacy scan endpoints remain available until March 31, 2027. While a workspace has no scan evidence, packages show an unknown or incomplete vulnerability state rather than clean.
+
 **Show vulnerabilities** opens severity, CVSS, description, affected version, and fix-version details. **Find safe version** searches for eligible alternatives and offers follow-up package actions. Quarantine reasoning is presented separately through **Explain quarantine**, which shows the current reason and policy details when available.
 
 A vulnerable quarantined package keeps **Show vulnerabilities**, **Find safe version**, **Explain quarantine**, and the read-only **Show promotion status** action available. **Copy install command**, **Show install command**, and **Promote package** remain unavailable while the package is quarantined.
