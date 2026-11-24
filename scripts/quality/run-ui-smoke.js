@@ -71,6 +71,7 @@ const SAFE_FAILURE_MESSAGES = Object.freeze({
   UI_SMOKE_FAILED: "The black-box UI smoke did not produce authoritative passed evidence.",
   UI_SOURCE_DRIFT: "The black-box UI source changed during qualification.",
   UI_SUITE_INVALID: "The black-box UI suite did not produce exact passed evidence.",
+  UI_TOOL_RUNTIME_UNSUPPORTED: "The canonical Node.js runtime does not match the black-box UI pin.",
   UI_TOOL_UNSUPPORTED: "The pinned black-box UI tool and VS Code versions are incompatible.",
 });
 
@@ -81,7 +82,7 @@ async function runUiSmoke(options = {}) {
   try {
     validateRuntime(root, process.version);
   } catch {
-    throw safeFailure("UI_TOOL_UNSUPPORTED");
+    throw safeFailure("UI_TOOL_RUNTIME_UNSUPPORTED");
   }
   const platform = options.platform || process.platform;
   const architecture = options.architecture || process.arch;
@@ -408,8 +409,10 @@ function validateToolContract(root, toolOverride, nodeVersion = process.versions
     throw safeFailure("UI_TOOL_UNSUPPORTED");
   }
   const toolPackage = toolOverride || require(resolveExtesterPackage(root));
-  if (nodeVersion !== NODE_VERSION
-    || toolPackage.name !== "vscode-extension-tester"
+  if (nodeVersion !== NODE_VERSION) {
+    throw safeFailure("UI_TOOL_RUNTIME_UNSUPPORTED");
+  }
+  if (toolPackage.name !== "vscode-extension-tester"
     || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(toolPackage.version || "")
     || !isPlainObject(toolPackage.supportedVersions)
     || compareVersions(VSCODE_VERSION, toolPackage.supportedVersions["vscode-min"]) < 0

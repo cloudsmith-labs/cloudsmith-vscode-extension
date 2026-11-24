@@ -974,12 +974,14 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
     errors.push("Live status artifact has invalid reason or errors.");
   }
   if (value.status === "passed") {
-    const targetBoundAcceptance = value.readinessTarget === "team-test";
+    const targetBoundAcceptance = ["team-test", "release"].includes(value.readinessTarget);
     if (value.authenticatedAcceptance !== "recorded"
-      || !new Set([
-        "TEAM-TEST READY",
-        "TEAM-TEST READY WITH RISKS",
-      ]).has(value.verdict)
+      || (value.readinessTarget === "release"
+        ? value.verdict !== null
+        : !new Set([
+          "TEAM-TEST READY",
+          "TEAM-TEST READY WITH RISKS",
+        ]).has(value.verdict))
       || (!targetBoundAcceptance
         && JSON.stringify(value.passedWorkflowIds) !== JSON.stringify(value.requiredWorkflowIds))
       || (!targetBoundAcceptance
@@ -997,7 +999,7 @@ function validateDerivedLiveStatus(value, requiredWorkflowIds = [], findingsStat
     if (targetBoundAcceptance
       && (value.inputPath !== DEFAULT_LIVE_INPUT
         || !/^[a-f0-9]{64}$/u.test(value.targetPolicyFingerprint || ""))) {
-      errors.push("Passed TEAM-TEST status does not bind the tracked TEAM-TEST policy.");
+      errors.push("Passed target-bound status does not bind the tracked readiness policy.");
     }
     if (value.candidate === null) {
       errors.push("Passed live status artifact does not bind a qualification candidate.");
@@ -1816,7 +1818,7 @@ function releaseReadinessStatus(values) {
   const allAuthenticatedPassed = requiredAuthenticated.length > 0
     && requiredAuthenticated.every(workflow => workflow.authenticatedStatus === "PASS");
   const targetPolicySatisfied = values.liveQualification.status === "passed"
-    && values.liveQualification.readinessTarget === "team-test"
+    && ["team-test", "release"].includes(values.liveQualification.readinessTarget)
     && /^[a-f0-9]{64}$/u.test(values.liveQualification.targetPolicyFingerprint || "");
   const remoteSignedOutPassed = values.remoteCi.status === "passed"
     && values.remoteCi.signedOutUiArtifact !== null;

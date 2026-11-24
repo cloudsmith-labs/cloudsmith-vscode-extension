@@ -841,6 +841,92 @@ suite("two-lane release-readiness model", () => {
     assert.strictEqual(predatesCi.verdict, "NOT TEAM-TEST READY");
   });
 
+  test("accepts a passed release-target acceptance for release readiness", () => {
+    const qualificationHomeDirectory = fs.realpathSync(os.tmpdir());
+    const qualificationProfileRoot = path.join(
+      qualificationHomeDirectory,
+      ".cloudsmith-vscode-qualification",
+    );
+    const localReceipt = candidateReceipt({
+      profile: {
+        mode: "local",
+        persistent: true,
+        root: qualificationProfileRoot,
+        testResourcesDir: qualificationProfileRoot,
+        userDataDir: path.join(qualificationProfileRoot, "user-data"),
+        extensionsDir: path.join(qualificationProfileRoot, "extensions"),
+      },
+    });
+    const findingsFingerprint = "4".repeat(64);
+    const artifact = {
+      schemaVersion: 4,
+      source: SOURCE,
+      candidate: candidateBindingFromReceipt(localReceipt, {
+        source: SOURCE,
+        homeDirectory: qualificationHomeDirectory,
+      }),
+      inputPath: "internal_docs/quality/current-candidate-acceptance.json",
+      status: "passed",
+      authenticatedAcceptance: "recorded",
+      verdict: null,
+      readinessTarget: "release",
+      targetPolicyFingerprint: "c".repeat(64),
+      requiredWorkflowIds: [],
+      passedWorkflowIds: [],
+      missingWorkflowIds: [],
+      workflowMatrix: [],
+      attestationFingerprint: "4".repeat(64),
+      evidenceManifest: [{
+        path: "internal_docs/quality/findings.jsonl",
+        sha256: findingsFingerprint,
+      }],
+      findingsFingerprint,
+      openReleaseBlockerCount: 0,
+      visibleEnabledActions: { status: "passed", silentNoOpCount: 0 },
+      reason: null,
+      errors: [],
+    };
+    const findingsState = {
+      fingerprint: findingsFingerprint,
+      openReleaseBlockerCount: 0,
+    };
+    assert.deepStrictEqual(
+      validateDerivedLiveStatus(artifact, [], findingsState),
+      [],
+    );
+
+    const readiness = releaseReadinessStatus({
+      profile: "release",
+      deterministicStatus: "passed",
+      impact: { status: "passed" },
+      mutation: { status: "passed" },
+      blackBoxUi: { status: "passed" },
+      remoteCi: { status: "passed", completedAt: "2026-08-29T20:00:00.000Z" },
+      liveQualification: {
+        status: "passed",
+        completedAt: "2026-08-29T21:00:00.000Z",
+        authenticatedAcceptance: "recorded",
+        verdict: null,
+        readinessTarget: "release",
+        targetPolicyFingerprint: "c".repeat(64),
+      },
+      findings: {
+        status: "passed",
+        releaseBlocking: 0,
+        deterministicReleaseBlocking: 0,
+        liveReleaseBlocking: 0,
+      },
+      workflowCoverage: [{
+        criticality: "release-critical",
+        deterministicStatus: "passed",
+        authenticatedRequired: true,
+        authenticatedStatus: "PASS",
+      }],
+    });
+    assert.strictEqual(readiness.status, "passed");
+    assert.strictEqual(readiness.verdict, null);
+  });
+
   test("derived status rejects unobserved PARTIAL and not-authorized rows", () => {
     const base = {
       schemaVersion: 4,

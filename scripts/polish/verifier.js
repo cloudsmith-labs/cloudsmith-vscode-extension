@@ -1,6 +1,7 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const fs = require("fs");
 const path = require("path");
+const { gitVisiblePaths } = require("../quality/common");
 const {
   FALLBACK_FORMATS,
   FORMAT_ICON_FILES,
@@ -409,15 +410,13 @@ function validateFormatInventory() {
   }
 }
 
-function walkForJunk(root, relative = "") {
-  const skipped = new Set([".git", "node_modules", "out", ".vscode-test"]);
-  for (const entry of fs.readdirSync(path.join(root, relative), { withFileTypes: true })) {
-    if (skipped.has(entry.name)) continue;
-    const child = relative ? `${relative}/${entry.name}` : entry.name;
-    if (/^(?:\.DS_Store|Thumbs\.db)$/.test(entry.name) || /(?:~|\.swp)$/.test(entry.name)) {
-      fail(`repository contains OS/editor junk: ${child}`);
+function walkForJunk(files) {
+  for (const file of files) {
+    for (const segment of file.split("/")) {
+      if (/^(?:\.DS_Store|Thumbs\.db)$/.test(segment) || /(?:~|\.swp)$/.test(segment)) {
+        fail(`repository contains OS/editor junk: ${file}`);
+      }
     }
-    if (entry.isDirectory()) walkForJunk(root, child);
   }
 }
 
@@ -459,7 +458,7 @@ function verifyRepository(root = path.resolve(__dirname, "../..")) {
   validateHelpLinks(HELP_LINKS, readme, manifest);
   validateFormatInventory();
   validateNoProductionSettingReads(root);
-  walkForJunk(root);
+  walkForJunk(gitVisiblePaths(root));
   for (const pattern of FORBIDDEN_DOC_PATTERNS) {
     if (pattern.test(readme)) fail(`README contains stale claim matching ${pattern}`);
   }

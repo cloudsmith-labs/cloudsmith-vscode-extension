@@ -1,8 +1,10 @@
 // Copyright 2026 Cloudsmith Ltd. All rights reserved.
 const assert = require("assert");
+const { spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { gitVisiblePaths } = require("../quality/common");
 const {
   APPROVED_MEDIA,
   validateCommandDocs,
@@ -126,11 +128,56 @@ function runSelfTests() {
       /package\.json contains a broad media glob/
     );
 
-    const junk = path.join(temporary, ".DS_Store");
-    fs.writeFileSync(junk, "bounded fixture\n");
-    expectFailure(() => walkForJunk(temporary), /repository contains OS\/editor junk: \.DS_Store/);
-    fs.unlinkSync(junk);
-    assert.doesNotThrow(() => walkForJunk(temporary));
+    expectFailure(
+      () => walkForJunk([".DS_Store"]),
+      /repository contains OS\/editor junk: \.DS_Store/
+    );
+    assert.doesNotThrow(() => walkForJunk(["keep.txt"]));
+
+    const gitRoot = fs.mkdtempSync(path.join(temporary, "junk-repo-"));
+    const git = (args, input) => {
+      const result = spawnSync("git", args, { cwd: gitRoot, encoding: "utf8", input });
+      assert.strictEqual(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+      return result.stdout;
+    };
+    git(["init"]);
+    git(["config", "core.excludesFile", "self-test-excludes"]);
+    fs.writeFileSync(path.join(gitRoot, ".gitignore"), ".DS_Store\n");
+    fs.writeFileSync(path.join(gitRoot, "keep.txt"), "bounded fixture\n");
+
+    fs.writeFileSync(path.join(gitRoot, ".DS_Store"), "junk\n");
+    assert.doesNotThrow(() => walkForJunk(gitVisiblePaths(gitRoot)));
+
+    fs.writeFileSync(path.join(gitRoot, "swap.swp"), "junk\n");
+    expectFailure(
+      () => walkForJunk(gitVisiblePaths(gitRoot)),
+      /repository contains OS\/editor junk: swap\.swp/
+    );
+    fs.unlinkSync(path.join(gitRoot, "swap.swp"));
+
+    // Stage a mode-120000 symlink entry directly: fs.symlinkSync requires
+    // privileges unavailable to ordinary Windows accounts.
+    const linkTarget = git(["hash-object", "-w", "--stdin"], "keep.txt").trim();
+    git(["update-index", "--add", "--cacheinfo", `120000,${linkTarget},linked.swp`]);
+    expectFailure(
+      () => walkForJunk(gitVisiblePaths(gitRoot)),
+      /repository contains OS\/editor junk: linked\.swp/
+    );
+    git(["update-index", "--force-remove", "linked.swp"]);
+
+    fs.mkdirSync(path.join(gitRoot, "backup~"));
+    fs.writeFileSync(path.join(gitRoot, "backup~", "keep.js"), "bounded fixture\n");
+    expectFailure(
+      () => walkForJunk(gitVisiblePaths(gitRoot)),
+      /repository contains OS\/editor junk: backup~\/keep\.js/
+    );
+    fs.rmSync(path.join(gitRoot, "backup~"), { recursive: true, force: true });
+
+    git(["add", "-f", ".DS_Store"]);
+    expectFailure(
+      () => walkForJunk(gitVisiblePaths(gitRoot)),
+      /repository contains OS\/editor junk: \.DS_Store/
+    );
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }

@@ -301,7 +301,7 @@ suite("signed-out black-box UI runner contract", function () {
     const harness = createHarness(repositories);
     assert.throws(
       () => validateToolContract(harness.repositoryRoot, TOOL_PACKAGE, "22.23.1"),
-      error => error.code === "UI_TOOL_UNSUPPORTED"
+      error => error.code === "UI_TOOL_RUNTIME_UNSUPPORTED"
     );
   });
 
@@ -336,7 +336,7 @@ suite("signed-out black-box UI runner contract", function () {
       fs.writeFileSync(target, bytes);
     }
 
-    await assertSafeRejection(harness.run, "UI_TOOL_UNSUPPORTED");
+    await assertSafeRejection(harness.run, "UI_TOOL_RUNTIME_UNSUPPORTED");
 
     assert.strictEqual(boundaryCreations, 0);
     assert.strictEqual(runtimeValidations, 1);

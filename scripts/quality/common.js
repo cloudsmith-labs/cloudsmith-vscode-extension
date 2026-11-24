@@ -312,7 +312,7 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 
-function gitVisibleFiles(root = ROOT) {
+function gitVisiblePaths(root = ROOT) {
   const result = spawnSync(
     "git",
     ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
@@ -322,10 +322,14 @@ function gitVisibleFiles(root = ROOT) {
   if (result.signal || result.status !== 0) {
     throw new Error("Git file discovery failed for quality verification.");
   }
-  return uniqueSorted(result.stdout.split("\0").filter(Boolean).map(normalizePath).filter(file => {
+  return uniqueSorted(result.stdout.split("\0").filter(Boolean).map(normalizePath));
+}
+
+function gitVisibleFiles(root = ROOT) {
+  return gitVisiblePaths(root).filter(file => {
     const target = path.join(root, file);
     return fs.existsSync(target) && fs.lstatSync(target).isFile();
-  }));
+  });
 }
 
 function summarizeMutationReport(report) {
@@ -373,6 +377,7 @@ module.exports = {
   resolveGitVisibleRegularFile,
   isPlainObject,
   gitVisibleFiles,
+  gitVisiblePaths,
   matchesPattern,
   normalizePath,
   patternToRegExp,

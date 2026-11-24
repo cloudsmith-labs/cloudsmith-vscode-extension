@@ -281,12 +281,12 @@ function digestStableSingleLinkFile(file, options = {}) {
   });
 }
 
-function profileRootIdentity(mode, root) {
+function profileRootIdentity(mode, root, pathModule = path) {
   if (!new Set(["ci", "local"]).has(mode)
     || typeof root !== "string"
-    || !path.isAbsolute(root)
-    || path.resolve(root) !== root
-    || path.normalize(root) !== root
+    || !pathModule.isAbsolute(root)
+    || pathModule.resolve(root) !== root
+    || pathModule.normalize(root) !== root
     || /[\u0000-\u001f\u007f]/u.test(root)) {
     throw new Error("Qualification candidate profile identity is invalid.");
   }
@@ -333,6 +333,7 @@ function candidateBindingFromReceipt(receipt, options = {}) {
     || !new Set(["darwin", "linux", "win32"]).has(toolchain.platform)) {
     throw new Error("Qualification candidate toolchain provenance is invalid.");
   }
+  const receiptPath = toolchain.platform === "win32" ? path.win32 : path.posix;
   const toolchainRoot = options.toolchainRoot || options.root;
   if (toolchainRoot) {
     const readVersionPin = name => withStableSingleLinkFile(
@@ -407,7 +408,7 @@ function candidateBindingFromReceipt(receipt, options = {}) {
     || artifact.entryCount > MAX_VSIX_ENTRIES
     || typeof artifact.vsixPath !== "string"
     || !allowedArtifactPaths.has(artifact.vsixPath)
-    || !absoluteNormalizedPath(artifact.absoluteVsixPath)) {
+    || !absoluteNormalizedPath(artifact.absoluteVsixPath, receiptPath)) {
     throw new Error("Qualification candidate VSIX provenance is invalid.");
   }
   if (options.root
@@ -432,8 +433,8 @@ function candidateBindingFromReceipt(receipt, options = {}) {
     || !new Set(["ci", "local"]).has(profile.mode)
     || profile.persistent !== (profile.mode === "local")
     || profile.testResourcesDir !== profile.root
-    || profile.userDataDir !== path.join(profile.root, expectedUserDataName)
-    || profile.extensionsDir !== path.join(profile.root, "extensions")) {
+    || profile.userDataDir !== receiptPath.join(profile.root, expectedUserDataName)
+    || profile.extensionsDir !== receiptPath.join(profile.root, "extensions")) {
     throw new Error("Qualification candidate profile binding is invalid.");
   }
   if (profile.mode === "local") {
@@ -450,13 +451,13 @@ function candidateBindingFromReceipt(receipt, options = {}) {
       throw new Error("Qualification candidate local profile root is not canonical.");
     }
   }
-  const rootIdentity = profileRootIdentity(profile.mode, profile.root);
+  const rootIdentity = profileRootIdentity(profile.mode, profile.root, receiptPath);
 
   const vscode = receipt.vscode;
   if (!hasExactKeys(vscode, ["cli", "executable", "version"])
     || !/^\d+\.\d+\.\d+$/u.test(vscode.version || "")
-    || !absoluteNormalizedPath(vscode.executable)
-    || !absoluteNormalizedPath(vscode.cli)
+    || !absoluteNormalizedPath(vscode.executable, receiptPath)
+    || !absoluteNormalizedPath(vscode.cli, receiptPath)
     || !hasExactKeys(receipt.launch, ["developmentPath", "status"])
     || receipt.launch.developmentPath !== false
     || !new Set(["not-requested", "command-accepted"]).has(receipt.launch.status)) {
@@ -609,11 +610,11 @@ function validateAuthenticatedExecutionReceipt(receipt, candidate, source) {
   return receipt;
 }
 
-function absoluteNormalizedPath(value) {
+function absoluteNormalizedPath(value, pathModule = path) {
   return typeof value === "string"
-    && path.isAbsolute(value)
-    && path.resolve(value) === value
-    && path.normalize(value) === value
+    && pathModule.isAbsolute(value)
+    && pathModule.resolve(value) === value
+    && pathModule.normalize(value) === value
     && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
